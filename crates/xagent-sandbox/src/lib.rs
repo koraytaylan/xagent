@@ -8,4 +8,5 @@ pub mod agent;
 pub mod physics;
 pub mod recording;
 pub mod renderer;
+pub mod ui;
 pub mod world;

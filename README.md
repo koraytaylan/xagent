@@ -44,7 +44,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, `WorldConfig`, and the `CognitiveArchitecture` trait. No logic — just types. |
 | **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
-| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, HUD, CSV logging, and the main event loop. |
+| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (docked sidebar, agent detail tabs, console), CSV logging, and the main event loop. |
 
 ### Communication Flow
 
@@ -120,7 +120,7 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ## 4. The Sandbox World
 
-The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend).
+The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides a docked tab layout: a left sidebar with the agent list, a main area with the 3D viewport and agent detail tabs, and a bottom console for event logs.
 
 ### Terrain & Biomes
 
@@ -153,19 +153,9 @@ When brain persistence is enabled (default), three guardrails prevent suicide lo
 
 Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), and the brain's core drive is minimizing prediction error.
 
-### Behavioral Significance Coloring
+### Agent Palette Colors
 
-Agent color is computed dynamically based on behavioral significance:
-
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-```
-
-- **Gray** `[0.55, 0.55, 0.55]` when significance ≈ 0 (random/uninformed behavior)
-- **Bright red** `[0.95, 0.15, 0.10]` when significance → 1 (informed, learned behavior)
-- **Dead agents** render as dark gray `[0.25, 0.25, 0.25]`
-
-This replaces the old static 8-color palette — agent color now reflects cognitive state.
+Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.25, 0.25, 0.25]`. This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
 
 ### Multi-Agent & Food Scarcity
 
@@ -216,13 +206,15 @@ cargo run --release -- --config experiment.json
 
 ## 6. Controls Reference
 
+### Keyboard & Mouse
+
 | Key | Action |
 |-----|--------|
 | `W` / `A` / `S` / `D` | Move camera forward / left / backward / right |
 | `E` | Move camera up |
 | `Shift` | Move camera down |
-| Mouse drag | Rotate camera (yaw/pitch) |
-| Scroll wheel | Zoom camera in/out |
+| Mouse drag (on viewport) | Rotate camera (yaw/pitch) |
+| Scroll wheel (on viewport) | Zoom camera in/out |
 | `P` / `Space` | Pause / resume simulation |
 | `1` | Speed 1× (1 tick/frame) |
 | `2` | Speed 2× (2 ticks/frame) |
@@ -230,12 +222,21 @@ cargo run --release -- --config experiment.json
 | `4` | Speed 10× (10 ticks/frame) |
 | `5` | Speed 100× (100 ticks/frame) |
 | `6` | Speed 1000× (1000 ticks/frame) |
-| Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist / reset) |
 | `N` | Spawn new agent (default config) |
 | `M` | Spawn mutated agent (±10% parameter variation) |
-| `Tab` | Cycle telemetry display to next agent |
 | `Esc` | Print session summary and exit |
+
+### egui UI Interaction
+
+| Action | Effect |
+|--------|--------|
+| Click agent in sidebar | Select / focus that agent |
+| Double-click agent in sidebar | Open an agent detail tab in the dock area |
+| Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| Close detail tab | Click the × on the tab header |
+
+Camera controls (drag, scroll) are routed to the 3D viewport only when the pointer is hovering over it; interacting with the sidebar or detail tabs does not move the camera.
 
 ---
 
@@ -318,6 +319,8 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 | **ADAPTED** | ≥ 20% | Efficient foraging, consistent hazard avoidance, deliberate behavior |
 
 ### Key Metrics to Watch
+
+These metrics are visible in the **sidebar** (compact vitals and sparkline charts) and in **agent detail tabs** (full vitals grid, brain info, and scrollable history charts). The CSV log files also record all metrics per tick.
 
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
@@ -413,6 +416,7 @@ xagent/
 │       │   │   ├── camera.rs   # Free-fly camera with mouse look
 │       │   │   ├── hud.rs      # HUD bar overlay (energy, integrity, etc.)
 │       │   │   └── font.rs     # Bitmap font atlas + text rendering
+│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot)
 │       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
 │           └── integration.rs  # 14 integration tests

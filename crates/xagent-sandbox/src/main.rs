@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use egui_wgpu;
 use glam::Vec3;
 use log::info;
 use rand::Rng;
@@ -23,6 +24,7 @@ use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
+use xagent_sandbox::ui::{AgentSnapshot, EguiIntegration, Tab, TabContext};
 
 use xagent_sandbox::world::WorldState;
 
@@ -178,6 +180,8 @@ struct App {
 
     // Telemetry selection
     selected_agent_idx: usize,
+    viewport_hovered: bool,
+    chart_window: usize,
 
     // CSV metrics logger
     logger: Option<MetricsLogger>,
@@ -206,6 +210,15 @@ struct App {
 
     // Selection marker above focused agent
     marker_gpu: Option<GpuMesh>,
+
+    // egui integration (IDE-style UI overlay)
+    egui: Option<EguiIntegration>,
+
+    // Console log buffer for the bottom panel
+    console_log: VecDeque<String>,
+
+    // egui_dock tab state
+    dock_state: egui_dock::DockState<Tab>,
 }
 
 impl App {
@@ -246,6 +259,8 @@ impl App {
             total_prediction_error: 0.0,
             error_count: 0,
             selected_agent_idx: 0,
+            viewport_hovered: false,
+            chart_window: 120,
             logger,
             agent_instance_buffer: None,
             agent_instance_count: 0,
@@ -258,16 +273,16 @@ impl App {
             heatmap_gpu: None,
             trail_gpu: None,
             marker_gpu: None,
+            egui: None,
+            console_log: VecDeque::new(),
+            dock_state: egui_dock::DockState::new(vec![Tab::Sandbox]),
         }
     }
 
     /// Spawn a new agent with the given BrainConfig at a random position.
     fn spawn_agent(&mut self, config: BrainConfig, generation: u32) {
         if self.agents.len() >= MAX_AGENTS {
-            println!(
-                "[SPAWN] Max agents ({}) reached, cannot spawn more",
-                MAX_AGENTS
-            );
+            self.log_msg(format!("[SPAWN] Max agents ({}) reached", MAX_AGENTS));
             return;
         }
         let Some(world) = &self.world else { return };
@@ -285,13 +300,20 @@ impl App {
         agent.generation = generation;
         agent.persist_brain = self.persist_brain;
 
-        let color = agent.color;
-        println!(
-            "[SPAWN] Agent {} (gen {}) spawned at ({:.1}, {:.1}) — color: ({:.2}, {:.2}, {:.2})",
-            id, generation, x, z, color[0], color[1], color[2]
-        );
+        self.log_msg(format!(
+            "[SPAWN] Agent {} (gen {}) at ({:.1}, {:.1})",
+            id, generation, x, z
+        ));
 
         self.agents.push(agent);
+    }
+
+    fn log_msg(&mut self, msg: String) {
+        println!("{}", msg);
+        self.console_log.push_back(msg);
+        if self.console_log.len() > 200 {
+            self.console_log.pop_front();
+        }
     }
 
     /// Spawn a child agent near a parent, with mutated config.
@@ -543,7 +565,19 @@ impl ApplicationHandler for App {
 
         self.world = Some(world);
         self.renderer = Some(renderer);
-        self.window = Some(window);
+        self.window = Some(window.clone());
+
+        // ── egui integration ───────────────────────────────────────
+        {
+            let r = self.renderer.as_ref().unwrap();
+            self.egui = Some(EguiIntegration::new(
+                &r.device,
+                r.config.format,
+                &window,
+                r.config.width,
+                r.config.height,
+            ));
+        }
 
         // ── spawn initial agent ────────────────────────────────────
         self.spawn_agent(self.brain_config.clone(), 0);
@@ -574,6 +608,22 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
+        // Forward every event to egui first.
+        // If egui consumed it (pointer over a panel, typing in a text field, etc.)
+        // we skip our own camera/sim key handling for that event.
+        let egui_consumed = if let (Some(egui), Some(window)) =
+            (&mut self.egui, &self.window)
+        {
+            egui.on_window_event(window, &event)
+        } else {
+            false
+        };
+
+        // For mouse/scroll events over the 3D viewport, let camera controls through.
+        // The viewport_hovered flag is set each frame when the pointer is over the
+        // viewport image. When it's over other egui panels, block camera input.
+        let pointer_on_viewport = self.viewport_hovered;
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("Window close requested, shutting down");
@@ -589,7 +639,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !egui_consumed => {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {
                     // ── camera controls ─────────────────────────────
@@ -689,7 +739,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if pointer_on_viewport => {
                 if button == MouseButton::Left {
                     self.camera.is_mouse_dragging = state == ElementState::Pressed;
                     if state == ElementState::Released {
@@ -702,12 +752,14 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. }
+                if pointer_on_viewport || self.camera.is_mouse_dragging =>
+            {
                 self.cursor_pos = (position.x, position.y);
                 self.camera.process_mouse_move(position.x, position.y);
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if pointer_on_viewport => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
@@ -810,6 +862,36 @@ impl ApplicationHandler for App {
                                 // Record trail breadcrumb
                                 agent.record_trail();
 
+                                // Push sparkline history (keep last 120 samples)
+                                if run_brain {
+                                    let t = agent.brain.telemetry();
+                                    let cap = 10_000;
+                                    let h = &mut agent.prediction_error_history;
+                                    if h.len() >= cap { h.pop_front(); }
+                                    h.push_back(t.prediction_error.clamp(0.0, 1.0));
+                                    let h = &mut agent.exploration_rate_history;
+                                    if h.len() >= cap { h.pop_front(); }
+                                    h.push_back(agent.brain.action_selector.exploration_rate());
+                                    let ef = agent.body.body.internal.energy
+                                        / agent.body.body.internal.max_energy.max(0.001);
+                                    let h = &mut agent.energy_history;
+                                    if h.len() >= cap { h.pop_front(); }
+                                    h.push_back(ef.clamp(0.0, 1.0));
+                                    let inf = agent.body.body.internal.integrity
+                                        / agent.body.body.internal.max_integrity.max(0.001);
+                                    let h = &mut agent.integrity_history;
+                                    if h.len() >= cap { h.pop_front(); }
+                                    h.push_back(inf.clamp(0.0, 1.0));
+                                    let vals = agent.brain.action_selector.global_action_values();
+                                    let mut aw = [0.0f32; 8];
+                                    for (j, v) in vals.iter().enumerate().take(8) {
+                                        aw[j] = *v;
+                                    }
+                                    let h = &mut agent.action_weight_history;
+                                    if h.len() >= cap { h.pop_front(); }
+                                    h.push_back(aw);
+                                }
+
                                 if run_brain && i == self.selected_agent_idx {
                                     let life_ticks = agent.age(self.tick);
                                     log_tick_to_csv(
@@ -855,6 +937,7 @@ impl ApplicationHandler for App {
                             }
 
                             // Handle death/respawn
+                            let mut event_msgs: Vec<String> = Vec::new();
                             for agent in &mut self.agents {
                                 if !agent.body.body.alive && agent.respawn_cooldown == 0 {
                                     let life_ticks = agent.age(self.tick);
@@ -867,10 +950,10 @@ impl ApplicationHandler for App {
                                     };
                                     // Death signal: retroactively punish actions that led here
                                     agent.brain.death_signal();
-                                    log::debug!(
-                                        "[DEATH] Agent {} (gen {}) died at tick {} (lived {} ticks) — cause: {}",
-                                        agent.id, agent.generation, self.tick, life_ticks, cause
-                                    );
+                                    event_msgs.push(format!(
+                                        "[DEATH] Agent {} died ({}), lived {} ticks",
+                                        agent.id, cause, life_ticks
+                                    ));
                                     agent.respawn_cooldown = RESPAWN_COOLDOWN_FRAMES;
                                 } else if !agent.body.body.alive && agent.respawn_cooldown > 0 {
                                     agent.respawn_cooldown -= 1;
@@ -896,33 +979,22 @@ impl ApplicationHandler for App {
                                             // Death trauma: 20% memory reinforcement decay
                                             agent.brain.trauma(0.2);
                                         }
-                                        log::debug!(
-                                            "[RESPAWN] Agent {} respawned at ({:.1}, {:.1}) — brain {}",
-                                            agent.id, x, z,
-                                            if agent.persist_brain { "PERSISTED" } else { "RESET" }
-                                        );
+                                        event_msgs.push(format!(
+                                            "[RESPAWN] Agent {} at ({:.1}, {:.1})",
+                                            agent.id, x, z
+                                        ));
                                     }
+                                }
+                            }
+                            for msg in event_msgs {
+                                self.console_log.push_back(msg);
+                                if self.console_log.len() > 200 {
+                                    self.console_log.pop_front();
                                 }
                             }
                         }
 
                         self.tick += 1;
-
-                        // Reproduction — disabled: agents now interact and
-                        // compete over scarce food instead of reproducing.
-                        // children_to_spawn.clear();
-                        // for (i, agent) in self.agents.iter().enumerate() {
-                        //     if agent.can_reproduce(self.tick)
-                        //         && !agent.has_reproduced
-                        //         && self.agents.len() + children_to_spawn.len() < MAX_AGENTS
-                        //     {
-                        //         children_to_spawn.push(i);
-                        //     }
-                        // }
-                        // for &parent_idx in &children_to_spawn {
-                        //     self.agents[parent_idx].has_reproduced = true;
-                        //     self.spawn_child(parent_idx);
-                        // }
 
                         // (telemetry is shown on-screen via HUD — no console spam)
                     }
@@ -1016,23 +1088,17 @@ impl ApplicationHandler for App {
                         .iter()
                         .map(|a| {
                             let color = if !a.body.body.alive {
-                                [0.25, 0.25, 0.25] // dead
+                                use xagent_sandbox::agent::srgb_to_linear;
+                                [srgb_to_linear(0.25), srgb_to_linear(0.25), srgb_to_linear(0.25)]
                             } else {
-                                // Color by behavioral significance:
-                                // gray (random) → bright red (truly adapted)
-                                let t = &a.brain.telemetry();
-                                let sig = t.exploitation_ratio
-                                    * (1.0 - t.prediction_error.clamp(0.0, 1.0))
-                                    * t.memory_utilization;
-                                // Cubic curve: agents must genuinely adapt before
-                                // turning red. Linear was too generous — 0.3 raw score
-                                // already looked bright. Now 0.3³ = 0.027, barely tinted.
-                                let s = sig.clamp(0.0, 1.0).powi(3);
-                                // Lerp: gray [0.55, 0.55, 0.55] → red [0.95, 0.15, 0.10]
+                                // Use the agent's assigned palette color, converted
+                                // from sRGB to linear so the sRGB framebuffer
+                                // produces the correct final color matching the sidebar.
+                                use xagent_sandbox::agent::srgb_to_linear;
                                 [
-                                    0.55 + s * 0.40,
-                                    0.55 - s * 0.40,
-                                    0.55 - s * 0.45,
+                                    srgb_to_linear(a.color[0]),
+                                    srgb_to_linear(a.color[1]),
+                                    srgb_to_linear(a.color[2]),
                                 ]
                             };
                             InstanceData {
@@ -1183,13 +1249,324 @@ impl ApplicationHandler for App {
                     if let Some(mk) = mk { mesh_vec.push(mk); }
 
                     let vp = self.camera.view_projection_matrix();
-                    match renderer.render_frame(
-                        &mesh_vec,
-                        &vp,
-                        inst_buf,
-                        inst_count,
-                    ) {
-                        Ok(()) => {}
+
+                    // ── Offscreen 3D → egui surface pipeline ──────────
+                    match renderer.begin_frame() {
+                        Ok(mut frame_ctx) => {
+                            // 1) Render 3D scene to offscreen viewport texture
+                            if let Some(egui) = &self.egui {
+                                renderer.render_3d_offscreen(
+                                    &mesh_vec,
+                                    &vp,
+                                    inst_buf,
+                                    inst_count,
+                                    &mut frame_ctx.encoder,
+                                    &egui.viewport_color_view,
+                                    &egui.viewport_depth_view,
+                                );
+                            }
+
+                            // 2) Render egui UI to the surface (viewport texture embedded)
+                            if let (Some(egui), Some(window)) =
+                                (&mut self.egui, &self.window)
+                            {
+                                let screen = egui_wgpu::ScreenDescriptor {
+                                    size_in_pixels: [
+                                        renderer.config.width,
+                                        renderer.config.height,
+                                    ],
+                                    pixels_per_point: window.scale_factor() as f32,
+                                };
+
+                                let tick = self.tick;
+                                let speed = self.speed_multiplier;
+                                let fps = self.fps;
+                                let paused = self.paused;
+                                let viewport_tex_id = egui.viewport_texture_id;
+                                let ppp = window.scale_factor() as f32;
+                                let mut desired_vp = (0u32, 0u32);
+                                let selected_idx = self.selected_agent_idx;
+
+                                // Snapshot agent data for the UI closure
+                                let agent_snaps: Vec<AgentSnapshot> = self.agents.iter().map(|a| {
+                                    let telemetry = a.brain.telemetry();
+                                    AgentSnapshot {
+                                        id: a.id,
+                                        gen: a.generation,
+                                        energy: a.body.body.internal.energy,
+                                        max_energy: a.body.body.internal.max_energy,
+                                        integrity: a.body.body.internal.integrity,
+                                        max_integrity: a.body.body.internal.max_integrity,
+                                        alive: a.body.body.alive,
+                                        deaths: a.death_count,
+                                        color: a.color,
+                                        longest_life: a.longest_life,
+                                        exploration_rate: a.brain.action_selector.exploration_rate(),
+                                        prediction_error: telemetry.prediction_error,
+                                        action_weights: a.brain.action_selector.global_action_values().to_vec(),
+                                        prediction_error_history: a.prediction_error_history.iter().copied().collect(),
+                                        exploration_rate_history: a.exploration_rate_history.iter().copied().collect(),
+                                        energy_history: a.energy_history.iter().copied().collect(),
+                                        integrity_history: a.integrity_history.iter().copied().collect(),
+                                        action_weight_history: a.action_weight_history.iter().copied().collect(),
+                                    }
+                                }).collect();
+
+                                let console_lines: Vec<&str> = self.console_log.iter()
+                                    .map(|s| s.as_str()).collect();
+
+                                let mut clicked_agent_idx: Option<usize> = None;
+                                let mut open_agent_tab: Option<u32> = None;
+                                let mut vp_hovered = false;
+                                let mut chart_win = self.chart_window;
+                                let dock_state = &mut self.dock_state;
+
+                                egui.render(
+                                    window,
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &mut frame_ctx.encoder,
+                                    &frame_ctx.view,
+                                    screen,
+                                    |ctx| {
+                                        // ── Top bar ──────────────────────────
+                                        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("xagent")
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(120, 200, 255)),
+                                                );
+                                                ui.separator();
+                                                ui.label(format!("Tick: {}", tick));
+                                                ui.separator();
+                                                ui.label(format!("Speed: {}x", speed));
+                                                ui.separator();
+                                                ui.label(format!("FPS: {:.0}", fps));
+                                                ui.separator();
+                                                ui.label(format!("Agents: {}", agent_snaps.len()));
+                                                if paused {
+                                                    ui.separator();
+                                                    ui.label(
+                                                        egui::RichText::new("⏸ PAUSED")
+                                                            .color(egui::Color32::YELLOW),
+                                                    );
+                                                }
+                                            });
+                                        });
+
+                                        // ── Bottom console ───────────────────
+                                        egui::TopBottomPanel::bottom("console")
+                                            .resizable(true)
+                                            .default_height(120.0)
+                                            .show(ctx, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Console")
+                                                        .small()
+                                                        .color(egui::Color32::GRAY),
+                                                );
+                                                ui.separator();
+                                                egui::ScrollArea::vertical()
+                                                    .stick_to_bottom(true)
+                                                    .show(ui, |ui| {
+                                                        for line in &console_lines {
+                                                            let color = if line.contains("[DEATH]") {
+                                                                egui::Color32::from_rgb(255, 100, 100)
+                                                            } else if line.contains("[SPAWN]") || line.contains("[RESPAWN]") {
+                                                                egui::Color32::from_rgb(100, 255, 100)
+                                                            } else {
+                                                                egui::Color32::LIGHT_GRAY
+                                                            };
+                                                            ui.label(
+                                                                egui::RichText::new(*line)
+                                                                    .monospace()
+                                                                    .size(11.0)
+                                                                    .color(color),
+                                                            );
+                                                        }
+                                                    });
+                                            });
+
+                                        // ── Left sidebar: agent list ─────────
+                                        egui::SidePanel::left("agent_list")
+                                            .resizable(true)
+                                            .default_width(200.0)
+                                            .show(ctx, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Agents")
+                                                        .strong()
+                                                        .size(14.0),
+                                                );
+                                                ui.separator();
+                                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                                    for (idx, snap) in agent_snaps.iter().enumerate() {
+                                                        let is_selected = idx == selected_idx;
+                                                        let color = egui::Color32::from_rgb(
+                                                            (snap.color[0] * 255.0) as u8,
+                                                            (snap.color[1] * 255.0) as u8,
+                                                            (snap.color[2] * 255.0) as u8,
+                                                        );
+                                                        let frame = if is_selected {
+                                                            egui::Frame::NONE
+                                                                .fill(egui::Color32::from_rgba_premultiplied(60, 60, 80, 255))
+                                                                .inner_margin(4.0)
+                                                                .corner_radius(3.0)
+                                                        } else {
+                                                            egui::Frame::NONE
+                                                                .inner_margin(4.0)
+                                                        };
+                                                        let response = frame.show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let (rect, _) = ui.allocate_exact_size(
+                                                                    egui::vec2(10.0, 10.0),
+                                                                    egui::Sense::hover(),
+                                                                );
+                                                                ui.painter().circle_filled(
+                                                                    rect.center(),
+                                                                    5.0,
+                                                                    color,
+                                                                );
+                                                                let status = if !snap.alive { "💀" } else { "" };
+                                                                ui.label(format!(
+                                                                    "Agent {} (g{}) {}",
+                                                                    snap.id, snap.gen, status
+                                                                ));
+                                                            });
+                                                            // Compact vitals: E/I bars + combined history chart
+                                                            let energy_frac = snap.energy / snap.max_energy.max(0.001);
+                                                            let integrity_frac = snap.integrity / snap.max_integrity.max(0.001);
+                                                            let bar_h = 4.0;
+
+                                                            egui::Grid::new(format!("sidebar_vitals_{}", snap.id))
+                                                                .num_columns(2)
+                                                                .spacing([4.0, 1.0])
+                                                                .show(ui, |ui| {
+                                                                    ui.label(egui::RichText::new("E").small().color(egui::Color32::GRAY));
+                                                                    let e_color = if energy_frac > 0.5 {
+                                                                        egui::Color32::from_rgb(80, 200, 80)
+                                                                    } else if energy_frac > 0.25 {
+                                                                        egui::Color32::YELLOW
+                                                                    } else {
+                                                                        egui::Color32::from_rgb(220, 60, 60)
+                                                                    };
+                                                                    ui.add(egui::ProgressBar::new(energy_frac)
+                                                                        .fill(e_color)
+                                                                        .desired_height(bar_h));
+                                                                    ui.end_row();
+
+                                                                    ui.label(egui::RichText::new("I").small().color(egui::Color32::GRAY));
+                                                                    ui.add(egui::ProgressBar::new(integrity_frac)
+                                                                        .fill(egui::Color32::from_rgb(100, 150, 255))
+                                                                        .desired_height(bar_h));
+                                                                    ui.end_row();
+                                                                });
+
+                                                            // Combined 4-line mini chart (last 10k ticks, no legend)
+                                                            let chart_h = 28.0;
+                                                            let chart_w = ui.available_width().max(40.0);
+                                                            let (chart_rect, _) = ui.allocate_exact_size(
+                                                                egui::vec2(chart_w, chart_h),
+                                                                egui::Sense::hover(),
+                                                            );
+                                                            let p = ui.painter();
+                                                            p.rect_filled(chart_rect, 1.0, egui::Color32::from_gray(25));
+                                                            let sidebar_window = 10_000;
+                                                            let series: [(&[f32], egui::Color32); 4] = [
+                                                                (&snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
+                                                                (&snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
+                                                                (&snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
+                                                                (&snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
+                                                            ];
+                                                            for &(full_data, color) in &series {
+                                                                let start = full_data.len().saturating_sub(sidebar_window);
+                                                                let data = &full_data[start..];
+                                                                if data.len() < 2 { continue; }
+                                                                let n = data.len();
+                                                                let pts: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
+                                                                    let x = chart_rect.left() + (i as f32 / (n - 1) as f32) * chart_rect.width();
+                                                                    let y = chart_rect.bottom() - v.clamp(0.0, 1.0) * chart_rect.height();
+                                                                    egui::pos2(x, y)
+                                                                }).collect();
+                                                                let stroke = egui::Stroke::new(1.0, color);
+                                                                for pair in pts.windows(2) {
+                                                                    p.line_segment([pair[0], pair[1]], stroke);
+                                                                }
+                                                            }
+
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "Deaths: {} | Best: {}t",
+                                                                    snap.deaths, snap.longest_life
+                                                                ))
+                                                                .small()
+                                                                .color(egui::Color32::GRAY),
+                                                            );
+                                                        });
+                                                        let resp = response.response.interact(egui::Sense::click());
+                                                        if resp.clicked() {
+                                                            clicked_agent_idx = Some(idx);
+                                                        }
+                                                        if resp.double_clicked() {
+                                                            open_agent_tab = Some(snap.id);
+                                                        }
+                                                        ui.add_space(2.0);
+                                                    }
+                                                });
+                                            });
+
+                                        // ── Central dock area (tabs) ─────────
+                                        egui::CentralPanel::default()
+                                            .frame(egui::Frame::NONE)
+                                            .show(ctx, |ui| {
+                                                let mut tab_ctx = TabContext {
+                                                    viewport_tex_id,
+                                                    ppp,
+                                                    desired_vp: &mut desired_vp,
+                                                    viewport_hovered: &mut vp_hovered,
+                                                    chart_window: &mut chart_win,
+                                                    agents: &agent_snaps,
+                                                };
+                                                egui_dock::DockArea::new(dock_state)
+                                                    .style(egui_dock::Style::from_egui(ui.style().as_ref()))
+                                                    .show_inside(ui, &mut tab_ctx);
+                                            });
+                                    },
+                                );
+
+                                self.viewport_hovered = vp_hovered;
+                                self.chart_window = chart_win;
+
+                                // Handle agent selection from sidebar click
+                                if let Some(idx) = clicked_agent_idx {
+                                    self.selected_agent_idx = idx;
+                                }
+
+                                // Handle double-click → open agent detail tab
+                                if let Some(agent_id) = open_agent_tab {
+                                    let tab = Tab::AgentDetail(agent_id);
+                                    // Check if tab already exists
+                                    let already_open = self.dock_state.iter_all_tabs()
+                                        .any(|(_, t)| *t == tab);
+                                    if !already_open {
+                                        self.dock_state.push_to_focused_leaf(tab);
+                                    }
+                                }
+
+                                // Resize offscreen textures if the panel changed size (takes effect next frame)
+                                if desired_vp.0 > 0 && desired_vp.1 > 0 {
+                                    egui.resize_viewport(
+                                        &renderer.device,
+                                        desired_vp.0,
+                                        desired_vp.1,
+                                    );
+                                    // Update camera aspect to match viewport
+                                    self.camera.aspect =
+                                        desired_vp.0 as f32 / desired_vp.1.max(1) as f32;
+                                }
+                            }
+
+                            renderer.finish_frame(frame_ctx);
+                        }
                         Err(wgpu::SurfaceError::Lost) => {
                             let w = renderer.config.width;
                             let h = renderer.config.height;

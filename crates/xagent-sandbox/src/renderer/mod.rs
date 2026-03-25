@@ -7,6 +7,15 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::world::Mesh;
+
+/// In-flight frame state returned by `render_frame` so the caller can
+/// append additional render passes (e.g. egui) before submitting.
+pub struct FrameContext {
+    pub encoder: wgpu::CommandEncoder,
+    pub surface_output: wgpu::SurfaceTexture,
+    pub view: wgpu::TextureView,
+}
+
 use font::{TextItem, TextRenderer};
 use hud::HudBar;
 
@@ -591,11 +600,110 @@ impl Renderer {
 
     pub fn render(&mut self, meshes: &[GpuMesh], view_proj: &glam::Mat4) -> Result<(), wgpu::SurfaceError> {
         let refs: Vec<&GpuMesh> = meshes.iter().collect();
-        self.render_frame(&refs, view_proj, None, 0)
+        let ctx = self.render_frame(&refs, view_proj, None, 0)?;
+        self.finish_frame(ctx);
+        Ok(())
     }
 
     pub fn render_refs(&mut self, meshes: &[&GpuMesh], view_proj: &glam::Mat4) -> Result<(), wgpu::SurfaceError> {
-        self.render_frame(meshes, view_proj, None, 0)
+        let ctx = self.render_frame(meshes, view_proj, None, 0)?;
+        self.finish_frame(ctx);
+        Ok(())
+    }
+
+    /// Acquire the surface texture and create a command encoder.
+    /// Use this when you want to manually orchestrate render passes (3D offscreen → egui surface).
+    pub fn begin_frame(&mut self) -> Result<FrameContext, wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame_encoder"),
+        });
+        Ok(FrameContext { encoder, surface_output: output, view })
+    }
+
+    /// Render the 3D scene + agents + HUD + text to an offscreen texture pair.
+    /// The encoder is provided externally so that egui can append its pass afterwards.
+    pub fn render_3d_offscreen(
+        &mut self,
+        meshes: &[&GpuMesh],
+        view_proj: &glam::Mat4,
+        agent_instance_buffer: Option<&wgpu::Buffer>,
+        agent_instance_count: u32,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+    ) {
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&view_proj.to_cols_array()),
+        );
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen_3d_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.53, g: 0.81, b: 0.92, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // 3D scene
+            pass.set_pipeline(&self.render_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for mesh in meshes {
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
+
+            // Instanced agents
+            if let Some(inst_buf) = agent_instance_buffer {
+                if agent_instance_count > 0 {
+                    let inst_stride = std::mem::size_of::<InstanceData>() as u64;
+                    pass.set_pipeline(&self.instance_pipeline);
+                    pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.unit_cube_vb.slice(..));
+                    pass.set_vertex_buffer(1, inst_buf.slice(..agent_instance_count as u64 * inst_stride));
+                    pass.set_index_buffer(self.unit_cube_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..self.unit_cube_num_indices, 0, 0..agent_instance_count);
+                }
+            }
+
+            // HUD overlay
+            if self.hud_num_indices > 0 {
+                pass.set_pipeline(&self.hud_pipeline);
+                pass.set_vertex_buffer(0, self.hud_vb.slice(..));
+                pass.set_index_buffer(self.hud_ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.hud_num_indices, 0, 0..1);
+            }
+
+            // Text overlay
+            if self.text_num_indices > 0 {
+                pass.set_pipeline(&self.text_renderer.pipeline);
+                pass.set_bind_group(0, &self.text_renderer.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.text_vb.slice(..));
+                pass.set_index_buffer(self.text_ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.text_num_indices, 0, 0..1);
+            }
+        }
     }
 
     /// Update HUD overlay geometry. Call only when HUD content changes.
@@ -646,7 +754,7 @@ impl Renderer {
         view_proj: &glam::Mat4,
         agent_instance_buffer: Option<&wgpu::Buffer>,
         agent_instance_count: u32,
-    ) -> Result<(), wgpu::SurfaceError> {
+    ) -> Result<FrameContext, wgpu::SurfaceError> {
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -730,10 +838,18 @@ impl Renderer {
             }
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        Ok(FrameContext {
+            encoder,
+            surface_output: output,
+            view,
+        })
+    }
 
-        Ok(())
+    /// Submit the command buffer and present the surface.
+    /// Call this after appending any additional render passes (e.g. egui) to `ctx.encoder`.
+    pub fn finish_frame(&self, ctx: FrameContext) {
+        self.queue.submit(std::iter::once(ctx.encoder.finish()));
+        ctx.surface_output.present();
     }
 }
 

@@ -223,6 +223,11 @@ impl ActionSelector {
         self.exploration_rate
     }
 
+    /// Global (state-independent) action biases for telemetry.
+    pub fn global_action_values(&self) -> &[f32] {
+        &self.global_action_values
+    }
+
     /// Fraction of actions that were exploitative (informed) [0.0, 1.0].
     pub fn exploitation_ratio(&self) -> f32 {
         if self.total_actions == 0 {

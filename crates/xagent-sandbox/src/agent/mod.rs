@@ -119,6 +119,13 @@ pub struct Agent {
     pub trail_dirty: bool,
     /// Cached motor command for ticks where the brain is decimated.
     pub cached_motor: xagent_shared::MotorCommand,
+    /// Rolling history for sidebar sparklines (capped length).
+    pub prediction_error_history: std::collections::VecDeque<f32>,
+    pub exploration_rate_history: std::collections::VecDeque<f32>,
+    pub energy_history: std::collections::VecDeque<f32>,
+    pub integrity_history: std::collections::VecDeque<f32>,
+    /// Per-tick action weight snapshots for chart (each entry is [f32; 8]).
+    pub action_weight_history: std::collections::VecDeque<[f32; 8]>,
 }
 
 impl Agent {
@@ -141,6 +148,11 @@ impl Agent {
             trail: Vec::with_capacity(256),
             trail_dirty: false,
             cached_motor: xagent_shared::MotorCommand::default(),
+            prediction_error_history: std::collections::VecDeque::with_capacity(128),
+            exploration_rate_history: std::collections::VecDeque::with_capacity(128),
+            energy_history: std::collections::VecDeque::with_capacity(128),
+            integrity_history: std::collections::VecDeque::with_capacity(128),
+            action_weight_history: std::collections::VecDeque::with_capacity(128),
         }
     }
 
@@ -216,8 +228,24 @@ pub fn mutate_config(parent: &BrainConfig) -> BrainConfig {
     }
 }
 
+/// Convert a single sRGB channel value to linear space.
+/// This ensures colors rendered through an sRGB framebuffer match egui's sRGB display.
+pub fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Generate a cube mesh at the given position with the given color.
+/// Color is expected in sRGB space and is converted to linear for the GPU pipeline.
 pub fn generate_agent_mesh(position: Vec3, size: f32, color: [f32; 3]) -> Mesh {
+    let linear = [
+        srgb_to_linear(color[0]),
+        srgb_to_linear(color[1]),
+        srgb_to_linear(color[2]),
+    ];
     let h = size / 2.0;
     let p = position;
 
@@ -234,12 +262,12 @@ pub fn generate_agent_mesh(position: Vec3, size: f32, color: [f32; 3]) -> Mesh {
     ];
 
     let face_colors: [[f32; 3]; 6] = [
-        color,
-        [color[0] * 0.9, color[1] * 0.9, color[2] * 0.9],
-        [color[0] * 0.8, color[1] * 0.8, color[2] * 0.8],
-        [color[0] * 0.7, color[1] * 0.7, color[2] * 0.7],
-        [color[0] * 0.85, color[1] * 0.85, color[2] * 0.85],
-        [color[0] * 0.75, color[1] * 0.75, color[2] * 0.75],
+        linear,
+        [linear[0] * 0.9, linear[1] * 0.9, linear[2] * 0.9],
+        [linear[0] * 0.8, linear[1] * 0.8, linear[2] * 0.8],
+        [linear[0] * 0.7, linear[1] * 0.7, linear[2] * 0.7],
+        [linear[0] * 0.85, linear[1] * 0.85, linear[2] * 0.85],
+        [linear[0] * 0.75, linear[1] * 0.75, linear[2] * 0.75],
     ];
 
     #[rustfmt::skip]

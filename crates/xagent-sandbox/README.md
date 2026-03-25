@@ -14,6 +14,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | Agent lifecycle (spawn, death, respawn, reproduction) | `agent/mod.rs` + `main.rs` |
 | Multi-agent management | `main.rs` |
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
+| egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
 | CSV telemetry recording | `recording.rs` |
 | Event loop & orchestration | `main.rs` |
@@ -35,7 +36,10 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
 │       │             │             │             │              │          │
-│       │     ┌───────┴──────┐      │             │              │          │
+│  ┌────┴─────┐                                                            │
+│  │  ui.rs   │  egui integration (EguiIntegration, TabViewer, dock)       │
+│  └──────────┘                                                            │
+│       │             │             │             │              │          │
 │       │     │ WorldState   │◄─────┤             │              │          │
 │       │     │  .terrain    │      │ step()      │              │          │
 │       │     │  .biome_map  │      │  reads &    │              │          │
@@ -134,6 +138,8 @@ Free-fly camera with 6-DOF movement:
 
 #### HUD Overlay (`renderer/hud.rs`)
 
+> **Note:** The legacy HUD pipeline still exists and renders status bars as a wgpu overlay. However, the primary UI is now the **egui** layer (see `ui.rs` below), which provides the sidebar, docked agent detail tabs, and bottom console. The HUD bars remain as a fallback rendering path.
+
 `HudBar` represents a single status bar in NDC space (−1..1):
 
 ```rust
@@ -175,6 +181,31 @@ Fully procedural — no external font files.
 - `TextVertex` has `position [f32; 3]`, `uv [f32; 2]`, `color [f32; 4]` (36 bytes).
 - Text is rendered by emitting one textured quad (4 verts, 6 indices) per character.
 - The text pipeline uses `ALPHA_BLENDING` and `FilterMode::Nearest`.
+
+### 3.1b egui UI Layer (`ui.rs`)
+
+The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as an overlay on top of the wgpu 3D scene.
+
+#### Key Types
+
+| Type | Role |
+|---|---|
+| `EguiIntegration` | Owns the egui context, winit integration state, wgpu renderer, and the offscreen texture that embeds the 3D viewport inside an egui panel. |
+| `Tab` | Enum — `Sandbox` (the 3D viewport, always open) or `AgentDetail(u32)` (per-agent detail view). |
+| `TabViewer` | Implements `egui_dock::TabViewer` to render each tab's content (viewport image or agent detail UI). |
+| `AgentSnapshot` | Per-frame copy of an agent's vitals, brain metrics, action weights, and history buffers — decouples the UI from the simulation's mutable state. |
+| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, and agent snapshots. |
+
+#### Layout
+
+- **Left sidebar** — Agent list with colored dots, compact energy/integrity bars, a combined 4-line sparkline chart (energy green, integrity blue, prediction error orange, exploration purple), death count, and best life duration.
+- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
+- **Agent detail tabs** — Color dot + heading, vitals grid (energy/integrity bars), statistics (deaths, longest life, age), brain info (prediction error, exploration rate), action weights grid (8 bars), a **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), and an **Action Weight History** chart (8-line with auto-scaled Y axis, shared zoom).
+- **Bottom console** — Scrollable log of death/spawn/respawn events.
+
+#### Viewport Integration
+
+The 3D scene is rendered to an **offscreen wgpu texture**, which is then displayed as an `egui::Image` inside the Sandbox tab. Camera drag and scroll events are forwarded to the 3D camera only when the pointer is hovering over the viewport pane (tracked via `viewport_hovered`). This prevents UI interactions in the sidebar or detail tabs from moving the camera.
 
 ---
 
@@ -333,7 +364,7 @@ pub struct Agent {
     pub id: u32,
     pub body: AgentBody,
     pub brain: Brain,
-    pub color: [f32; 3],       // dynamic behavioral significance color
+    pub color: [f32; 3],       // static palette color (matches sidebar)
     pub birth_tick: u64,
     pub death_count: u32,
     pub generation: u32,       // life iteration (incremented on each death/respawn)
@@ -346,17 +377,7 @@ pub struct Agent {
 }
 ```
 
-**Behavioral significance coloring** — Agent color is computed dynamically each frame based on a composite behavioral significance score:
-
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-```
-
-- **Gray** `[0.55, 0.55, 0.55]` when significance ≈ 0 (random/uninformed behavior)
-- **Bright red** `[0.95, 0.15, 0.10]` when significance → 1 (informed, learned behavior)
-- Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
-
-This replaces the old static 8-color palette (`AGENT_COLORS`). Color now communicates cognitive state: you can see at a glance which agents have learned and which are still exploring randomly.
+**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
 
 **Agent mesh** — 2.0-unit cube with 6-face shading (each face darkened by factors
 1.0, 0.9, 0.8, 0.7, 0.85, 0.75). Combined into a single vertex buffer for all agents.
@@ -680,9 +701,17 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |
 | `M` | Spawn a new agent (mutated config) |
-| `Tab` | Cycle telemetry focus to next agent |
 | `H` | Toggle heatmap overlay for selected agent |
 | `Escape` | Print session summary and quit |
+
+### egui UI Interaction
+
+| Action | Effect |
+|---|---|
+| Click agent in sidebar | Select / focus that agent |
+| Double-click agent in sidebar | Open an agent detail tab |
+| Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| Close detail tab | Click the × on the tab header |
 
 ### Visual Cues
 
@@ -690,8 +719,7 @@ cargo run -p xagent-sandbox -- --config my_config.json
 |---|---|
 | Yellow diamond | Floating marker above the currently selected agent |
 | Colored ribbon trail | Linear ribbon of selected agent's full life path (distance-sampled, up to 4000 points, dirty-flag rebuild) |
-| Gray agent | Random/uninformed behavior (low significance score) |
-| Red-tinted agent | Increasingly adapted (significance³ curve, hard to reach) |
+| Palette-colored agent | Each agent has a unique static color matching its sidebar dot |
 | Heatmap overlay (`H`) | Blue→yellow→red cells showing where the selected agent spent time |
 
 ---
@@ -818,28 +846,13 @@ Agents are stored in a `Vec<Agent>`. The main loop iterates by index so it can
 build the "other agents" list for inter-agent perception while maintaining mutable
 access to the current agent.
 
-### Behavioral Significance Coloring
+### Agent Palette Colors
 
-Agent color is no longer a static palette. Instead, each agent's color is computed
-dynamically from a composite behavioral significance score:
-
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-color_t = significance³   (cubic curve — agents must truly adapt to turn red)
-```
-
-The cubic power curve ensures agents don't appear red prematurely. A raw score of
-0.3 (moderately informed) only produces a color shift of 0.027 — barely visible.
-Only genuinely adapted agents (score > 0.7) get a noticeably red tint.
-
-The color interpolates from gray to bright red:
-- **significance ≈ 0**: `[0.55, 0.55, 0.55]` (gray — random/uninformed)
-- **significance → 1**: `[0.95, 0.15, 0.10]` (bright red — informed, learned)
-- **Dead agents**: `[0.25, 0.25, 0.25]` (dark gray)
+Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
 
 ### Selection Marker
 
-The currently focused agent (via right-click or Tab) is highlighted with a bright
+The currently focused agent (selected via the sidebar or right-click) is highlighted with a bright
 yellow diamond marker floating above it. The diamond has 8 triangular faces arranged
 as an octahedron shape, making the selected agent easy to spot even in crowded scenes.
 
@@ -867,12 +880,12 @@ death/respawn.
 
 ### Telemetry Focus
 
-`Tab` cycles `selected_agent_idx` through the agent list. Right-click selects the
-nearest agent via screen-space projection. The selected agent is indicated by a
-yellow diamond marker floating above it. Its data drives:
-- HUD bars (energy, integrity, prediction error, exploration rate)
-- Agent info text: "Agent N | Gen N | Deaths: N", "Phase: X | Quality: N%", "Tick: N  Speed: Nx"
-- "Agents: alive/total" counter at top-right below the FPS counter
+Clicking an agent in the **sidebar** selects it; double-clicking opens a dedicated
+detail tab in the dock area. The selected agent is indicated by a yellow diamond
+marker floating above it in the 3D viewport. Its data drives:
+- **Sidebar**: colored dot, compact energy/integrity bars, 4-line sparkline chart (energy green, integrity blue, prediction error orange, exploration purple), death count, best life
+- **Agent detail tab**: full vitals grid, statistics (deaths, longest life, age), brain info (prediction error, exploration), action weights grid (8 bars), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), Action Weight History chart (8-line, auto-scaled Y axis)
+- **Bottom console**: scrollable log showing death/spawn/respawn events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
 - CSV logging

@@ -1,0 +1,24 @@
+[package]
+name = "xagent-sandbox"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "xagent"
+path = "src/main.rs"
+
+[dependencies]
+xagent-shared = { path = "../xagent-shared" }
+xagent-brain = { path = "../xagent-brain" }
+glam = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytemuck = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+wgpu = "24"
+winit = "0.30"
+noise = "0.9"
+pollster = "0.4"

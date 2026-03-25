@@ -1,0 +1,10 @@
+[package]
+name = "xagent-brain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xagent-shared = { path = "../xagent-shared" }
+glam = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true }

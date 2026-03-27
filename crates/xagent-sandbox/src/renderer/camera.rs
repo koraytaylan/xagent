@@ -27,15 +27,15 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Create a camera at position (0, 10, 20) looking roughly toward the world origin.
+    /// Create a camera positioned for a bird's-eye overview of the entire sandbox.
     ///
-    /// Initial yaw is -π/2 (facing -Z) with a slight downward pitch (-0.3 rad ≈ -17°)
-    /// to give a good overview of the terrain below.
+    /// With a 256×256 world and 45° vertical FOV, height ~300 captures the full area.
+    /// Pitch of -1.2 rad (≈ -69°) gives a steep overhead view with depth cues.
     pub fn new(aspect: f32) -> Self {
         Self {
-            position: Vec3::new(0.0, 10.0, 20.0),
+            position: Vec3::new(0.0, 300.0, 120.0),
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: -0.3,
+            pitch: -1.2,
             aspect,
             fov_y: 45.0_f32.to_radians(),
             z_near: 0.1,
@@ -122,9 +122,9 @@ impl Camera {
 
     /// Reset camera to the default overview position above the world origin.
     pub fn reset(&mut self) {
-        self.position = Vec3::new(0.0, 10.0, 20.0);
+        self.position = Vec3::new(0.0, 300.0, 120.0);
         self.yaw = -std::f32::consts::FRAC_PI_2;
-        self.pitch = -0.3;
+        self.pitch = -1.2;
     }
 
     /// Compute the view matrix (world-to-camera transform) using right-handed look-at.

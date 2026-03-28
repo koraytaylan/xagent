@@ -407,6 +407,68 @@ impl PatternMemory {
             }
         }
     }
+
+    /// Memory capacity (max number of patterns).
+    pub fn max_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Representation dimensionality.
+    pub fn representation_dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Flatten all pattern data into contiguous buffers for GPU upload.
+    /// Returns (data\[capacity × dim\], active_mask\[capacity\]).
+    /// Inactive slots have active_mask\[i\] = 0 and data is zeroed.
+    pub fn gpu_pattern_data(&self) -> (Vec<f32>, Vec<u32>) {
+        let mut data = vec![0.0f32; self.capacity * self.dim];
+        let mut active = vec![0u32; self.capacity];
+        for (i, p) in self.patterns.iter().enumerate() {
+            if let Some(pat) = p {
+                active[i] = 1;
+                let start = i * self.dim;
+                let end = start + self.dim;
+                if pat.state.data.len() == self.dim {
+                    data[start..end].copy_from_slice(&pat.state.data);
+                }
+            }
+        }
+        (data, active)
+    }
+
+    /// Recall patterns using pre-computed similarity scores (from GPU).
+    /// `scores` must be \[capacity\] in length. Values < -1.5 are treated as inactive.
+    pub fn recall_with_gpu_similarities(
+        &mut self,
+        scores: &[f32],
+        budget: usize,
+    ) -> Vec<EncodedState> {
+        self.scored_scratch.clear();
+        for (i, &sim) in scores.iter().enumerate().take(self.capacity) {
+            if sim > -1.5 {
+                self.scored_scratch.push((i, sim));
+            }
+        }
+
+        self.scored_scratch.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.scored_scratch.truncate(budget);
+
+        for k in 0..self.scored_scratch.len() {
+            let idx = self.scored_scratch[k].0;
+            if let Some(ref mut pat) = self.patterns[idx] {
+                pat.last_accessed = self.current_tick;
+                pat.activation_count += 1;
+            }
+        }
+
+        self.scored_scratch
+            .iter()
+            .filter_map(|&(idx, _)| self.patterns[idx].as_ref().map(|p| p.state.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

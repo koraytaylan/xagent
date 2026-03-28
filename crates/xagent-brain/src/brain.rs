@@ -2,7 +2,7 @@ use xagent_shared::{BrainConfig, MotorCommand, SensoryFrame};
 
 use crate::action::ActionSelector;
 use crate::capacity::CapacityManager;
-use crate::encoder::SensoryEncoder;
+use crate::encoder::{EncodedState, SensoryEncoder};
 use crate::homeostasis::{HomeostaticMonitor, HomeostaticState};
 use crate::memory::PatternMemory;
 use crate::predictor::Predictor;
@@ -110,16 +110,39 @@ impl Brain {
 
     /// Process one tick: sensory input → motor output.
     pub fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
+        let encoded = self.encoder.encode(frame);
+        self.tick_inner(frame, encoded, None)
+    }
+
+    /// Process one tick using GPU-computed encode and recall results.
+    /// `gpu_encoded` is the GPU-computed encoded state (dim floats).
+    /// `gpu_similarities` is the GPU-computed similarity scores (memory_capacity floats).
+    pub fn tick_gpu(
+        &mut self,
+        frame: &SensoryFrame,
+        gpu_encoded: &[f32],
+        gpu_similarities: &[f32],
+    ) -> MotorCommand {
+        let encoded = EncodedState {
+            data: gpu_encoded.to_vec(),
+        };
+        self.tick_inner(frame, encoded, Some(gpu_similarities))
+    }
+
+    /// Shared implementation for both CPU and GPU tick paths.
+    fn tick_inner(
+        &mut self,
+        frame: &SensoryFrame,
+        encoded: EncodedState,
+        gpu_similarities: Option<&[f32]>,
+    ) -> MotorCommand {
         self.tick_count += 1;
 
-        // 1. Encode sensory input into internal representation
-        let encoded = self.encoder.encode(frame);
-
-        // 2. Compute homeostatic gradient from interoceptive signals
+        // 1. Compute homeostatic gradient from interoceptive signals
         let homeo_state: HomeostaticState =
             self.homeostasis.update(frame.energy_signal, frame.integrity_signal);
 
-        // 3. Compute prediction error from previous tick's prediction
+        // 2. Compute prediction error from previous tick's prediction
         let mut scalar_error = 0.0_f32;
 
         if let Some(prev_prediction) = self.predictor.last_prediction() {
@@ -140,23 +163,21 @@ impl Brain {
             self.predictor.record_error(scalar_error);
         }
 
-        // 4. Adaptive recall budget based on prediction error
+        // 3. Adaptive recall budget based on prediction error
         let (recall_budget, _surprise_budget) =
             self.capacity.allocate_recall_budget_adaptive(scalar_error);
 
-        // 5. Recall relevant patterns from memory (within capacity budget)
-        let recalled = self.memory.recall(&encoded, recall_budget);
+        // 4. Recall relevant patterns (GPU or CPU path)
+        let recalled = match gpu_similarities {
+            Some(sims) => self.memory.recall_with_gpu_similarities(sims, recall_budget),
+            None => self.memory.recall(&encoded, recall_budget),
+        };
         self.capacity.report_usage(recalled.len());
 
-        // 6. Predict next state from current + recalled patterns
+        // 5. Predict next state from current + recalled patterns
         let prediction = self.predictor.predict(&encoded, &recalled);
 
-        // 6b. Multi-step rollout for prospective evaluation.
-        // Instead of giving the action selector a 1-tick prediction (barely
-        // different from current state), we simulate the agent's trajectory
-        // N steps into the future. This turns prediction_error=0 from a
-        // useless metric into genuine foresight: the agent can "see" that
-        // its current trajectory leads into a danger zone 30 ticks from now.
+        // 5b. Multi-step rollout for prospective evaluation.
         let confidence = 1.0 - scalar_error.clamp(0.0, 1.0);
         let look_ahead = (confidence * MAX_LOOK_AHEAD as f32) as usize;
         let prospection_prediction = if look_ahead > 1 {
@@ -165,14 +186,13 @@ impl Brain {
             prediction.clone()
         };
 
-        // 7. Store current state as a pattern
+        // 6. Store current state as a pattern
         self.memory.store(encoded.clone());
 
-        // 8. Decay old patterns
+        // 7. Decay old patterns
         self.memory.decay(self.config.decay_rate);
 
-        // 9. Select action based on predictions, homeostatic state, and prediction error
-        // Pass the multi-step rollout prediction for prospection (not the 1-step)
+        // 8. Select action based on predictions, homeostatic state, and prediction error
         let command = self.action_selector.select(
             &encoded,
             &prospection_prediction,
@@ -183,10 +203,10 @@ impl Brain {
             &mut self.memory,
         );
 
-        // 10. Record prediction for next tick's error computation
+        // 9. Record prediction for next tick's error computation
         self.predictor.record_prediction(prediction);
 
-        // 11. Compute behavior quality metrics
+        // 10. Compute behavior quality metrics
         let exploitation_ratio = self.action_selector.exploitation_ratio();
         let exploration_rate = self.action_selector.exploration_rate();
         let decision_quality = (1.0 - scalar_error.clamp(0.0, 1.0))
@@ -194,7 +214,7 @@ impl Brain {
             * (1.0 + homeo_state.gradient).clamp(0.0, 2.0)
             / 2.0;
 
-        // 12. Update telemetry
+        // 11. Update telemetry
         self.last_telemetry = BrainTelemetry {
             tick: self.tick_count,
             prediction_error: scalar_error,

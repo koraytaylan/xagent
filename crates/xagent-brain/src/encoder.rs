@@ -88,6 +88,32 @@ impl SensoryEncoder {
         EncodedState { data: self.encode_scratch.clone() }
     }
 
+    /// Extract features from a sensory frame into a flat buffer (GPU upload helper).
+    pub fn extract_features(&mut self, frame: &SensoryFrame) -> &[f32] {
+        self.extract_features_into(frame);
+        &self.feature_scratch[..self.feature_count]
+    }
+
+    /// Encoder weights, row-major \[feature_count × representation_dim\].
+    pub fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+
+    /// Encoder bias terms \[representation_dim\].
+    pub fn biases(&self) -> &[f32] {
+        &self.biases
+    }
+
+    /// Number of input features (visual bins × 3 + non-visual).
+    pub fn feature_count(&self) -> usize {
+        self.feature_count
+    }
+
+    /// Output dimensionality.
+    pub fn representation_dim(&self) -> usize {
+        self.representation_dim
+    }
+
     /// Adapt encoding weights using Hebbian-inspired L2 regularization.
     ///
     /// Instead of trying to backprop through the predictor (which is too

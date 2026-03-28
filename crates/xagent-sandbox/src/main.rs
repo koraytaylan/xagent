@@ -1090,6 +1090,21 @@ impl ApplicationHandler for App {
                     // Lazily initialize GPU compute if --gpu-brain was requested
                     self.ensure_gpu_compute();
 
+                    // Pre-allocate GPU batch buffers outside tick loop (reused each tick)
+                    let gpu_n = self.agents.len();
+                    let (gpu_dim, gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
+                        (gpu.dim() as usize, gpu.feature_count() as usize, gpu.memory_capacity() as usize)
+                    } else {
+                        (0, 0, 0)
+                    };
+                    let mut all_features: Vec<f32> = Vec::with_capacity(gpu_n * gpu_fc);
+                    let mut all_weights: Vec<f32> = Vec::with_capacity(gpu_n * gpu_fc * gpu_dim);
+                    let mut all_biases: Vec<f32> = Vec::with_capacity(gpu_n * gpu_dim);
+                    let mut all_patterns: Vec<f32> = Vec::with_capacity(gpu_n * gpu_cap * gpu_dim);
+                    let mut all_active: Vec<u32> = Vec::with_capacity(gpu_n * gpu_cap);
+                    let mut frames: Vec<Option<SensoryFrame>> = vec![None; gpu_n];
+                    let mut agent_dims: Vec<(usize, usize)> = vec![(gpu_dim, gpu_cap); gpu_n];
+
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
                         ticks_run += 1;
@@ -1104,27 +1119,29 @@ impl ApplicationHandler for App {
                             );
 
                             // ── Phase 2: Brain ticks ──
-                            if self.gpu_compute.is_some() {
+                            // Check if any agent needs brain this tick
+                            let tick = self.tick;
+                            let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
+                                a.body.body.alive && (tick + i as u64) % brain_stride == 0
+                            });
+
+                            if self.gpu_compute.is_some() && any_brain {
                                 // GPU path: batch encode + recall on GPU, then
                                 // tick brains with pre-computed results.
                                 let world_ref: &WorldState = &*world;
-                                let tick = self.tick;
                                 let all_pos = &all_positions;
-                                let n = self.agents.len();
                                 let gpu = self.gpu_compute.as_ref().unwrap();
-                                let dim = gpu.dim() as usize;
-                                let fc = gpu.feature_count() as usize;
-                                let cap = gpu.memory_capacity() as usize;
+                                let dim = gpu_dim;
+                                let cap = gpu_cap;
 
-                                let mut all_features = Vec::with_capacity(n * fc);
-                                let mut all_weights = Vec::with_capacity(n * fc * dim);
-                                let mut all_biases = Vec::with_capacity(n * dim);
-                                let mut all_patterns = Vec::with_capacity(n * cap * dim);
-                                let mut all_active = Vec::with_capacity(n * cap);
-                                let mut frames: Vec<Option<SensoryFrame>> =
-                                    vec![None; n];
-                                // Per-agent actual dimensions for output slicing
-                                let mut agent_dims: Vec<(usize, usize)> = vec![(dim, cap); n];
+                                // Clear reusable buffers
+                                all_features.clear();
+                                all_weights.clear();
+                                all_biases.clear();
+                                all_patterns.clear();
+                                all_active.clear();
+                                for f in frames.iter_mut() { *f = None; }
+                                for d in agent_dims.iter_mut() { *d = (dim, cap); }
 
                                 for (i, agent) in self.agents.iter_mut().enumerate() {
                                     let alive = agent.body.body.alive;
@@ -1200,7 +1217,7 @@ impl ApplicationHandler for App {
                                         record_agent_histories(agent);
                                     }
                                 }
-                            } else {
+                            } else if any_brain {
                                 // CPU path: rayon parallel brain ticks
                                 let world_ref: &WorldState = &*world;
                                 let tick = self.tick;

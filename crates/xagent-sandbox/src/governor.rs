@@ -32,6 +32,9 @@ pub struct Governor {
     pub current_node_id: Option<i64>,
     pub generation: u32,
     pub gen_tick: u64,
+    /// Generations evaluated since last backtrack (or start). Used as cooldown
+    /// so new branches get `patience` generations to prove themselves.
+    pub gens_since_backtrack: u32,
 }
 
 impl Governor {
@@ -72,6 +75,7 @@ impl Governor {
             current_node_id: Some(root_id),
             generation: 0,
             gen_tick: 0,
+            gens_since_backtrack: 0,
         })
     }
 
@@ -105,6 +109,7 @@ impl Governor {
             current_node_id: Some(node_id),
             generation,
             gen_tick: 0,
+            gens_since_backtrack: 0,
         })
     }
 
@@ -301,9 +306,13 @@ impl Governor {
         next_gen
     }
 
-    /// Check if fitness has regressed for the last `patience` generations
-    /// compared to the peak of ancestors beyond them. This gives each branch
-    /// `patience` generations to prove itself before backtracking.
+    /// Check if the current branch should be abandoned. Uses two mechanisms:
+    /// 1. **Cooldown**: after a backtrack, wait `patience` generations before
+    ///    checking again so new branches get a fair chance.
+    /// 2. **Recent-best vs ancestor-peak**: the best fitness among the last
+    ///    `patience` generations must be below the peak of all ancestors
+    ///    beyond the window. This catches both steady declines and oscillating
+    ///    declines (bad-good-bad-good) that never produce consecutive regressions.
     pub fn should_backtrack(&self) -> bool {
         let node_id = match self.current_node_id {
             Some(id) => id,
@@ -312,11 +321,15 @@ impl Governor {
 
         let patience = self.config.patience as usize;
 
-        // Walk up the tree collecting fitness values.
-        // We need `patience` recent values + at least 1 ancestor beyond them.
+        // Cooldown: give branches patience generations to prove themselves
+        if (self.gens_since_backtrack as usize) < patience {
+            return false;
+        }
+
+        // Walk up the tree collecting fitness values (newest first)
         let mut fitnesses: Vec<f32> = Vec::new();
         let mut current = Some(node_id);
-        let needed = patience + 2; // patience recent + enough ancestors
+        let needed = patience + 2;
 
         while let Some(nid) = current {
             if fitnesses.len() >= needed {
@@ -347,15 +360,18 @@ impl Governor {
             return false;
         }
 
-        // fitnesses[0..patience] are the recent generations (newest first).
-        // fitnesses[patience..] are the ancestors beyond the patience window.
-        // Backtrack if ALL recent generations are below the peak ancestor.
-        let recent = &fitnesses[..patience];
-        let peak = fitnesses[patience..]
+        // Best fitness in the last `patience` generations
+        let recent_best = fitnesses[..patience]
             .iter()
             .cloned()
             .fold(f32::MIN, f32::max);
-        recent.iter().all(|&f| f < peak)
+        // Peak of all ancestors beyond the recent window
+        let ancestor_peak = fitnesses[patience..]
+            .iter()
+            .cloned()
+            .fold(f32::MIN, f32::max);
+
+        recent_best < ancestor_peak
     }
 
     /// Backtrack to the last improving node and try a different direction.
@@ -440,6 +456,7 @@ impl Governor {
                                 let new_node_id = self.db.last_insert_rowid();
                                 self.current_node_id = Some(new_node_id);
                                 self.gen_tick = 0;
+                                self.gens_since_backtrack = 0;
                                 return Some(base_config);
                             }
                         }
@@ -778,5 +795,299 @@ fn record_mutations(
                 params![node_id, name, direction, parent_fitness as f64],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xagent_shared::{BrainConfig, GovernorConfig};
+
+    fn test_governor(patience: u32) -> Governor {
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience,
+            max_generations: 0,
+        };
+        let brain = BrainConfig::default();
+        Governor::new(":memory:", config, &brain, "{}").unwrap()
+    }
+
+    /// Insert a node with known fitness directly into the DB.
+    fn insert_node(gov: &Governor, parent_id: Option<i64>, generation: u32, fitness: f32) -> i64 {
+        let config_json = serde_json::to_string(&BrainConfig::default()).unwrap();
+        gov.db
+            .execute(
+                "INSERT INTO node (run_id, parent_id, generation, config_json,
+                 best_fitness, avg_fitness, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
+                params![
+                    gov.run_id,
+                    parent_id,
+                    generation,
+                    config_json,
+                    fitness as f64,
+                    fitness as f64,
+                ],
+            )
+            .unwrap();
+        gov.db.last_insert_rowid()
+    }
+
+    fn set_fitness(gov: &Governor, node_id: i64, fitness: f32) {
+        gov.db
+            .execute(
+                "UPDATE node SET best_fitness = ?1, avg_fitness = ?2 WHERE id = ?3",
+                params![fitness as f64, fitness as f64, node_id],
+            )
+            .unwrap();
+    }
+
+    // ─── should_backtrack tests ────────────────────────────────────
+
+    #[test]
+    fn single_regression_does_not_trigger_backtrack() {
+        // With patience=2, a single generation declining should not backtrack.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.95);
+
+        let child = insert_node(&gov, Some(root_id), 1, 0.90);
+        gov.current_node_id = Some(child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 3; // past cooldown
+
+        // Only 2 values [0.90, 0.95], need patience+1=3 to decide
+        assert!(!gov.should_backtrack());
+    }
+
+    #[test]
+    fn two_regressions_below_peak_triggers_backtrack() {
+        // root(0.98) → A(0.95) → B(0.90)
+        // Both recent values below peak → backtrack.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.95);
+        let b = insert_node(&gov, Some(a), 2, 0.90);
+
+        gov.current_node_id = Some(b);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 3;
+
+        // recent = [0.90, 0.95], recent_best = 0.95
+        // ancestors = [0.98], peak = 0.98 → 0.95 < 0.98 → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn cooldown_prevents_immediate_rebacktrack() {
+        // Even with terrible fitness, cooldown blocks backtracking.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.90);
+        let b = insert_node(&gov, Some(a), 2, 0.85);
+
+        gov.current_node_id = Some(b);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 1; // only 1 gen since last backtrack
+
+        assert!(!gov.should_backtrack());
+    }
+
+    #[test]
+    fn after_backtrack_branch_gets_full_patience() {
+        // After backtracking, the new branch must survive `patience` generations
+        // before the check kicks in again.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        // Simulate: backtrack happened, new child of root created
+        let new_child = insert_node(&gov, Some(root_id), 1, 0.92);
+        gov.current_node_id = Some(new_child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 1; // just 1 gen since backtrack
+
+        // Cooldown blocks despite 0.92 < 0.98
+        assert!(!gov.should_backtrack());
+
+        // After patience generations pass, the check fires
+        let grandchild = insert_node(&gov, Some(new_child), 2, 0.89);
+        gov.current_node_id = Some(grandchild);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 2;
+
+        // recent = [0.89, 0.92], recent_best = 0.92
+        // ancestors = [0.98], peak = 0.98 → 0.92 < 0.98 → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn improvement_in_recent_window_prevents_backtrack() {
+        // root(0.90) → A(0.95) → B(0.97)
+        // The branch is improving — no backtrack.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.90);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.95);
+        let b = insert_node(&gov, Some(a), 2, 0.97);
+
+        gov.current_node_id = Some(b);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 3;
+
+        // recent = [0.97, 0.95], recent_best = 0.97
+        // ancestors = [0.90], peak = 0.90 → 0.97 > 0.90 → no backtrack
+        assert!(!gov.should_backtrack());
+    }
+
+    #[test]
+    fn oscillating_decline_triggers_backtrack() {
+        // root(0.98) → A(0.93) → B(0.95) → C(0.91)
+        // Oscillating but overall declining — should backtrack.
+        let mut gov = test_governor(3);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.93);
+        let b = insert_node(&gov, Some(a), 2, 0.95);
+        let c = insert_node(&gov, Some(b), 3, 0.91);
+
+        gov.current_node_id = Some(c);
+        gov.generation = 3;
+        gov.gens_since_backtrack = 4;
+
+        // recent = [0.91, 0.95, 0.93], recent_best = 0.95
+        // ancestors = [0.98], peak = 0.98 → 0.95 < 0.98 → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    // ─── backtrack tests ───────────────────────────────────────────
+
+    #[test]
+    fn backtrack_creates_sibling_node() {
+        // After backtracking, the new node should be a child of the ancestor,
+        // not a deeper child of the current node.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.90);
+        // Record a mutation so backtrack sees memory_capacity +1.0 as tried
+        gov.db
+            .execute(
+                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
+                 VALUES (?1, 'memory_capacity', 1.0, 0.98)",
+                params![a],
+            )
+            .unwrap();
+
+        gov.current_node_id = Some(a);
+        gov.generation = 1;
+
+        let config = gov.backtrack();
+        assert!(config.is_some());
+
+        // New node is a child of root (sibling of A), not child of A
+        let new_node_id = gov.current_node_id.unwrap();
+        let parent_of_new: Option<i64> = gov
+            .db
+            .query_row(
+                "SELECT parent_id FROM node WHERE id = ?1",
+                params![new_node_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_of_new, Some(root_id));
+
+        // A is marked backtracked
+        let a_status: String = gov
+            .db
+            .query_row(
+                "SELECT status FROM node WHERE id = ?1",
+                params![a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_status, "backtracked");
+    }
+
+    #[test]
+    fn backtrack_resets_cooldown() {
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.90);
+        gov.current_node_id = Some(a);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 5;
+
+        let _ = gov.backtrack();
+        assert_eq!(gov.gens_since_backtrack, 0);
+    }
+
+    #[test]
+    fn backtrack_picks_untried_direction() {
+        // If memory_capacity +1.0 is tried, should pick memory_capacity -1.0 next.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.90);
+        gov.db
+            .execute(
+                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
+                 VALUES (?1, 'memory_capacity', 1.0, 0.98)",
+                params![a],
+            )
+            .unwrap();
+
+        gov.current_node_id = Some(a);
+        gov.generation = 1;
+
+        // First backtrack should succeed (memory_capacity -1.0 is untried)
+        assert!(gov.backtrack().is_some());
+
+        // Record -1.0 direction as tried for the second child
+        let second_child = gov.current_node_id.unwrap();
+        gov.db
+            .execute(
+                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
+                 VALUES (?1, 'memory_capacity', -1.0, 0.98)",
+                params![second_child],
+            )
+            .unwrap();
+
+        // Mark second child as backtracked and try again
+        gov.db
+            .execute(
+                "UPDATE node SET status = 'backtracked' WHERE id = ?1",
+                params![second_child],
+            )
+            .unwrap();
+
+        // Third backtrack: memory_capacity exhausted, tries processing_slots +1.0
+        gov.current_node_id = Some(second_child);
+        assert!(gov.backtrack().is_some());
+    }
+
+    #[test]
+    fn not_enough_history_prevents_backtrack() {
+        // With only 1 generation of data, should never backtrack.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.50);
+
+        gov.gens_since_backtrack = 10; // past cooldown
+        // Only root node — 1 fitness value < patience+1=3
+        assert!(!gov.should_backtrack());
     }
 }

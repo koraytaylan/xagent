@@ -502,6 +502,7 @@ impl App {
             let fitness = gov.evaluate(&self.agents);
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
+            gov.gens_since_backtrack += 1;
 
             let gen = gov.generation;
             let best_fit = fitness.first().map(|f| f.composite_fitness).unwrap_or(0.0);
@@ -2250,6 +2251,7 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
         // Evaluate
         let fitness = governor.evaluate(&agents);
         governor.log_generation(&fitness);
+        governor.gens_since_backtrack += 1;
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",
             gen_elapsed.as_secs_f64(),

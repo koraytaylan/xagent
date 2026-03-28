@@ -494,16 +494,19 @@ impl Governor {
             fitness.iter().map(|f| f.composite_fitness).sum::<f32>() / fitness.len() as f32
         };
 
-        println!("╔══════════════════════════════════════════════════════╗");
-        println!(
-            "║  Generation {:>4}  │  Best: {:.4}  │  Avg: {:.4}       ║",
+        let w = 64; // inner width between ║ chars
+        let bar = "═".repeat(w);
+        println!("╔{}╗", bar);
+        let header = format!(
+            "  Generation {:>4}  │  Best: {:.4}  │  Avg: {:.4}",
             self.generation, best, avg,
         );
-        println!("╠══════════════════════════════════════════════════════╣");
+        println!("║{:<w$}║", header, w = w);
+        println!("╠{}╣", bar);
 
         for (i, f) in fitness.iter().take(5).enumerate() {
-            println!(
-                "║  #{} Agent {:>2} │ alive:{:>6} food:{:>4} cells:{:>4} fit:{:.3} ║",
+            let line = format!(
+                "  #{} Agent {:>2} │ alive:{:>6} food:{:>4} cells:{:>4} fit:{:.3}",
                 i + 1,
                 f.agent_index,
                 f.total_ticks_alive,
@@ -511,21 +514,23 @@ impl Governor {
                 f.cells_explored,
                 f.composite_fitness,
             );
+            println!("║{:<w$}║", line, w = w);
         }
 
         if let Some(best_config) = fitness.first() {
             let c = &best_config.config;
-            println!("╠══════════════════════════════════════════════════════╣");
-            println!(
-                "║  Config: mem={} slots={} dim={} lr={:.4} decay={:.4}  ║",
+            println!("╠{}╣", bar);
+            let cfg_line = format!(
+                "  Config: mem={} slots={} dim={} lr={:.4} decay={:.4}",
                 c.memory_capacity,
                 c.processing_slots,
                 c.representation_dim,
                 c.learning_rate,
                 c.decay_rate,
             );
+            println!("║{:<w$}║", cfg_line, w = w);
         }
-        println!("╚══════════════════════════════════════════════════════╝");
+        println!("╚{}╝", bar);
     }
 
     /// Update the wall_time_secs for the current run.

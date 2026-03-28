@@ -2318,9 +2318,15 @@ fn dump_tree(db_path: &str) {
             .best_fitness
             .map(|f| format!("{:.4}", f))
             .unwrap_or_else(|| "—".into());
-        let mutation_str = match (&node.mutated_param, node.mutation_direction) {
-            (Some(p), Some(d)) => format!(" ({}{})", p, if d > 0.0 { "↑" } else { "↓" }),
-            _ => String::new(),
+        let mutation_str = if node.mutations.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = node
+                .mutations
+                .iter()
+                .map(|(p, d)| format!("{}{}", p, if *d > 0.0 { "↑" } else { "↓" }))
+                .collect();
+            format!(" ({})", parts.join(" "))
         };
         let status_marker = match node.status.as_str() {
             "backtracked" => " ✗",

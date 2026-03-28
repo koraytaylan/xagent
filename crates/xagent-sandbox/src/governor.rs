@@ -301,7 +301,10 @@ impl Governor {
         next_gen
     }
 
-    /// Check if fitness has regressed for `patience` consecutive generations.
+    /// Check if fitness has regressed compared to the peak within recent
+    /// `patience` generations. This avoids the problem where oscillating
+    /// fitness (down-up-down-up) never triggers with a strictly-consecutive
+    /// regression check.
     pub fn should_backtrack(&self) -> bool {
         let node_id = match self.current_node_id {
             Some(id) => id,
@@ -311,10 +314,10 @@ impl Governor {
         // Walk up the tree collecting recent fitness values
         let mut fitnesses: Vec<f32> = Vec::new();
         let mut current = Some(node_id);
-        let needed = self.config.patience as usize + 1;
+        let window = self.config.patience as usize + 1;
 
         while let Some(nid) = current {
-            if fitnesses.len() >= needed {
+            if fitnesses.len() >= window {
                 break;
             }
             match self.db.query_row(
@@ -341,14 +344,11 @@ impl Governor {
             return false;
         }
 
-        // Check if each generation was worse than its predecessor
-        // fitnesses[0] is current (newest), fitnesses[1] is parent, etc.
-        let regression_count = fitnesses
-            .windows(2)
-            .take_while(|w| w[0] <= w[1])
-            .count();
-
-        regression_count >= self.config.patience as usize
+        // fitnesses[0] is current (newest), fitnesses[last] is oldest in window.
+        // Backtrack if the current fitness is worse than the peak in the window.
+        let current_fit = fitnesses[0];
+        let peak = fitnesses[1..].iter().cloned().fold(f32::MIN, f32::max);
+        current_fit < peak
     }
 
     /// Backtrack to the last improving node and try a different direction.
@@ -422,7 +422,17 @@ impl Governor {
                                     param,
                                     if dir > 0.0 { "↑" } else { "↓" }
                                 );
-                                self.current_node_id = Some(node_id);
+                                // Create a NEW child node so evaluate() won't overwrite the ancestor
+                                self.generation += 1;
+                                let child_config_json = serde_json::to_string(&base_config).unwrap_or_default();
+                                let _ = self.db.execute(
+                                    "INSERT INTO node (run_id, parent_id, generation, config_json, status)
+                                     VALUES (?1, ?2, ?3, ?4, 'active')",
+                                    params![self.run_id, Some(node_id), self.generation, child_config_json],
+                                );
+                                let new_node_id = self.db.last_insert_rowid();
+                                self.current_node_id = Some(new_node_id);
+                                self.gen_tick = 0;
                                 return Some(base_config);
                             }
                         }
@@ -504,32 +514,58 @@ impl Governor {
     pub fn tree_nodes(&self) -> Vec<TreeNode> {
         let mut stmt = match self.db.prepare(
             "SELECT id, parent_id, generation, best_fitness, avg_fitness,
-                    mutated_param, mutation_direction, status
+                    config_json, status
              FROM node WHERE run_id = ?1 ORDER BY id",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
 
-        let rows = stmt
+        let mut nodes: Vec<TreeNode> = match stmt
             .query_map(params![self.run_id], |row| {
+                let config_json: String = row.get(5)?;
+                let config: Option<BrainConfig> = serde_json::from_str(&config_json).ok();
                 Ok(TreeNode {
                     id: row.get(0)?,
                     parent_id: row.get(1)?,
                     generation: row.get(2)?,
                     best_fitness: row.get::<_, Option<f64>>(3)?.map(|v| v as f32),
                     avg_fitness: row.get::<_, Option<f64>>(4)?.map(|v| v as f32),
-                    mutated_param: row.get(5)?,
-                    mutation_direction: row.get::<_, Option<f64>>(6)?.map(|v| v as f32),
-                    status: row.get(7)?,
+                    status: row.get(6)?,
+                    config,
+                    mutations: Vec::new(),
                 })
             })
-            .ok();
+        {
+            Ok(r) => r.flatten().collect(),
+            Err(_) => return Vec::new(),
+        };
 
-        match rows {
-            Some(r) => r.flatten().collect(),
-            None => Vec::new(),
+        // Load mutations for all nodes in one query
+        if let Ok(mut mut_stmt) = self.db.prepare(
+            "SELECT m.node_id, m.param_name, m.direction
+             FROM mutation m
+             JOIN node n ON m.node_id = n.id
+             WHERE n.run_id = ?1
+             ORDER BY m.node_id, m.id",
+        ) {
+            if let Ok(rows) = mut_stmt.query_map(params![self.run_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            }) {
+                for r in rows.flatten() {
+                    let (node_id, param, dir) = r;
+                    if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
+                        node.mutations.push((param, dir));
+                    }
+                }
+            }
         }
+
+        nodes
     }
 
     /// Get the seed BrainConfig from the run table (original starting config).
@@ -632,9 +668,11 @@ pub struct TreeNode {
     pub generation: u32,
     pub best_fitness: Option<f32>,
     pub avg_fitness: Option<f32>,
-    pub mutated_param: Option<String>,
-    pub mutation_direction: Option<f32>,
     pub status: String,
+    /// Per-node config (deserialized for display)
+    pub config: Option<BrainConfig>,
+    /// Summary of mutations from parent: e.g. "learning_rate↑ decay_rate↓"
+    pub mutations: Vec<(String, f64)>,
 }
 
 // ── Schema & helpers ────────────────────────────────────────────────────

@@ -1046,17 +1046,43 @@ impl<'a> TabContext<'a> {
         nodes: &[crate::governor::TreeNode],
         current_id: Option<i64>,
     ) {
+        // Build depth map from parent-child relationships
+        let mut depth_map: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
         for node in nodes {
-            let indent = "  ".repeat(node.generation as usize);
+            let depth = match node.parent_id {
+                Some(pid) => depth_map.get(&pid).copied().unwrap_or(0) + 1,
+                None => 0,
+            };
+            depth_map.insert(node.id, depth);
+        }
+
+        for node in nodes {
+            let depth = depth_map.get(&node.id).copied().unwrap_or(0);
+            let indent = "  ".repeat(depth);
             let fitness_str = node
                 .best_fitness
                 .map(|f| format!("{:.4}", f))
                 .unwrap_or_else(|| "—".into());
-            let mutation_str = match (&node.mutated_param, node.mutation_direction) {
-                (Some(p), Some(d)) => {
-                    format!(" ({}{})", p, if d > 0.0 { "↑" } else { "↓" })
-                }
-                _ => String::new(),
+
+            let mutation_str = if node.mutations.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = node
+                    .mutations
+                    .iter()
+                    .map(|(p, d)| {
+                        let short = match p.as_str() {
+                            "memory_capacity" => "mem",
+                            "processing_slots" => "slots",
+                            "representation_dim" => "repr",
+                            "learning_rate" => "lr",
+                            "decay_rate" => "decay",
+                            other => other,
+                        };
+                        format!("{}{}", short, if *d > 0.0 { "↑" } else { "↓" })
+                    })
+                    .collect();
+                format!(" ({})", parts.join(" "))
             };
 
             let is_current = Some(node.id) == current_id;

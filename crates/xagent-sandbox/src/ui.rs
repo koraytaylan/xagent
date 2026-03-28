@@ -9,6 +9,8 @@ use egui_wgpu::ScreenDescriptor;
 pub enum Tab {
     /// The 3D sandbox viewport (always open, cannot be closed).
     Sandbox,
+    /// Evolution dashboard (always open, cannot be closed).
+    Evolution,
     /// Agent detail view, keyed by agent ID.
     AgentDetail(u32),
 }
@@ -35,6 +37,41 @@ pub struct AgentSnapshot {
     pub action_weight_history: Vec<[f32; 8]>,
 }
 
+/// Snapshot of evolution state for UI rendering (rebuilt from governor each frame).
+pub struct EvolutionSnapshot {
+    pub generation: u32,
+    pub gen_tick: u64,
+    pub tick_budget: u64,
+    pub population_size: usize,
+    pub elitism_count: usize,
+    pub patience: u32,
+    pub wall_time_secs: f64,
+    pub ticks_per_sec: f64,
+    pub tree_nodes: Vec<crate::governor::TreeNode>,
+    pub current_node_id: Option<i64>,
+    pub current_config: Option<xagent_shared::BrainConfig>,
+    pub fitness_history: Vec<(u32, f32, f32)>, // (generation, best, avg)
+}
+
+impl Default for EvolutionSnapshot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            gen_tick: 0,
+            tick_budget: 50_000,
+            population_size: 10,
+            elitism_count: 3,
+            patience: 3,
+            wall_time_secs: 0.0,
+            ticks_per_sec: 0.0,
+            tree_nodes: Vec::new(),
+            current_node_id: None,
+            current_config: None,
+            fitness_history: Vec::new(),
+        }
+    }
+}
+
 /// Context passed to the TabViewer so it can render both viewport and agent detail tabs.
 pub struct TabContext<'a> {
     pub viewport_tex_id: egui::TextureId,
@@ -44,6 +81,7 @@ pub struct TabContext<'a> {
     /// Number of history samples visible in the detail chart (zoom level).
     pub chart_window: &'a mut usize,
     pub agents: &'a [AgentSnapshot],
+    pub evolution: &'a EvolutionSnapshot,
 }
 
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,
@@ -257,6 +295,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
     fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
         match tab {
             Tab::Sandbox => egui::Id::new("tab_sandbox"),
+            Tab::Evolution => egui::Id::new("tab_evolution"),
             Tab::AgentDetail(id) => egui::Id::new("tab_agent_detail").with(*id),
         }
     }
@@ -264,6 +303,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
             Tab::Sandbox => "🌍 Sandbox".into(),
+            Tab::Evolution => "📊 Evolution".into(),
             Tab::AgentDetail(id) => {
                 let name = self.agents.iter()
                     .find(|a| a.id == *id)
@@ -291,6 +331,13 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                 );
                 *self.viewport_hovered = resp.hovered() || resp.dragged();
             }
+            Tab::Evolution => {
+                egui::ScrollArea::vertical()
+                    .id_salt("evolution_tab_scroll")
+                    .show(ui, |ui| {
+                        Self::render_evolution_tab(ui, self.evolution);
+                    });
+            }
             Tab::AgentDetail(id) => {
                 if let Some(snap) = self.agents.iter().find(|a| a.id == *id) {
                     egui::ScrollArea::vertical()
@@ -306,8 +353,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
     }
 
     fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
-        // Sandbox tab cannot be closed
-        !matches!(tab, Tab::Sandbox)
+        !matches!(tab, Tab::Sandbox | Tab::Evolution)
     }
 }
 
@@ -583,6 +629,185 @@ impl<'a> TabContext<'a> {
                     aw_painter.line_segment([pair[0], pair[1]], stroke);
                 }
             }
+        }
+    }
+
+    fn render_evolution_tab(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
+        ui.heading(format!("Generation {}", evo.generation));
+        ui.add_space(4.0);
+
+        let progress = if evo.tick_budget > 0 {
+            evo.gen_tick as f32 / evo.tick_budget as f32
+        } else {
+            0.0
+        };
+        ui.add(
+            egui::ProgressBar::new(progress)
+                .text(format!(
+                    "{} / {} ticks ({:.0}%)",
+                    evo.gen_tick, evo.tick_budget, progress * 100.0,
+                ))
+                .animate(true),
+        );
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            let hours = (evo.wall_time_secs / 3600.0) as u64;
+            let mins = ((evo.wall_time_secs % 3600.0) / 60.0) as u64;
+            let secs = (evo.wall_time_secs % 60.0) as u64;
+            ui.label(format!("⏱ {}h {:02}m {:02}s", hours, mins, secs));
+            ui.separator();
+            ui.label(format!("{:.0} ticks/sec", evo.ticks_per_sec));
+            ui.separator();
+            ui.label(format!("Pop: {} | Elite: {} | Patience: {}",
+                             evo.population_size, evo.elitism_count, evo.patience));
+        });
+        ui.separator();
+
+        if let Some(cfg) = &evo.current_config {
+            ui.collapsing("🧬 Best Config", |ui| {
+                egui::Grid::new("config_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("memory_capacity");
+                        ui.monospace(format!("{}", cfg.memory_capacity));
+                        ui.end_row();
+                        ui.label("processing_slots");
+                        ui.monospace(format!("{}", cfg.processing_slots));
+                        ui.end_row();
+                        ui.label("visual_encoding_size");
+                        ui.monospace(format!("{}", cfg.visual_encoding_size));
+                        ui.end_row();
+                        ui.label("representation_dim");
+                        ui.monospace(format!("{}", cfg.representation_dim));
+                        ui.end_row();
+                        ui.label("learning_rate");
+                        ui.monospace(format!("{:.5}", cfg.learning_rate));
+                        ui.end_row();
+                        ui.label("decay_rate");
+                        ui.monospace(format!("{:.5}", cfg.decay_rate));
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(4.0);
+        }
+
+        if !evo.fitness_history.is_empty() {
+            ui.collapsing("📈 Fitness Over Generations", |ui| {
+                let avail = ui.available_width().max(200.0);
+                let chart_height = 120.0;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(avail, chart_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+
+                let max_fit = evo
+                    .fitness_history
+                    .iter()
+                    .map(|(_, b, _)| *b)
+                    .fold(0.0f32, f32::max)
+                    .max(0.01);
+
+                let n = evo.fitness_history.len();
+                if n >= 2 {
+                    let best_pts: Vec<egui::Pos2> = evo
+                        .fitness_history
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, best, _))| {
+                            egui::pos2(
+                                rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
+                                rect.bottom() - (best / max_fit) * rect.height(),
+                            )
+                        })
+                        .collect();
+                    for pair in best_pts.windows(2) {
+                        painter.line_segment(
+                            [pair[0], pair[1]],
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(50, 200, 80)),
+                        );
+                    }
+
+                    let avg_pts: Vec<egui::Pos2> = evo
+                        .fitness_history
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, _, avg))| {
+                            egui::pos2(
+                                rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
+                                rect.bottom() - (avg / max_fit) * rect.height(),
+                            )
+                        })
+                        .collect();
+                    for pair in avg_pts.windows(2) {
+                        painter.line_segment(
+                            [pair[0], pair[1]],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 180, 50)),
+                        );
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(50, 200, 80), "● Best");
+                    ui.colored_label(egui::Color32::from_rgb(200, 180, 50), "● Avg");
+                    ui.label(format!("Max: {:.4}", max_fit));
+                });
+            });
+            ui.add_space(4.0);
+        }
+
+        if !evo.tree_nodes.is_empty() {
+            ui.collapsing("🌳 Evolution Tree", |ui| {
+                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id);
+            });
+        }
+    }
+
+    fn render_tree(
+        ui: &mut egui::Ui,
+        nodes: &[crate::governor::TreeNode],
+        current_id: Option<i64>,
+    ) {
+        for node in nodes {
+            let indent = "  ".repeat(node.generation as usize);
+            let fitness_str = node
+                .best_fitness
+                .map(|f| format!("{:.4}", f))
+                .unwrap_or_else(|| "—".into());
+            let mutation_str = match (&node.mutated_param, node.mutation_direction) {
+                (Some(p), Some(d)) => {
+                    format!(" ({}{})", p, if d > 0.0 { "↑" } else { "↓" })
+                }
+                _ => String::new(),
+            };
+
+            let is_current = Some(node.id) == current_id;
+            let text = format!(
+                "{}Gen {} [{}] fit={}{}",
+                indent, node.generation, node.id, fitness_str, mutation_str,
+            );
+
+            let color = match node.status.as_str() {
+                "backtracked" => egui::Color32::from_rgb(180, 60, 60),
+                "exhausted" => egui::Color32::GRAY,
+                _ if is_current => egui::Color32::from_rgb(80, 220, 120),
+                _ => egui::Color32::from_gray(180),
+            };
+
+            ui.horizontal(|ui| {
+                if is_current {
+                    ui.label(egui::RichText::new("★").color(egui::Color32::GOLD));
+                }
+                ui.label(egui::RichText::new(&text).color(color).monospace());
+                match node.status.as_str() {
+                    "backtracked" => { ui.label(egui::RichText::new("✗").small()); }
+                    "exhausted" => { ui.label(egui::RichText::new("⊘").small()); }
+                    _ => {}
+                }
+            });
         }
     }
 }

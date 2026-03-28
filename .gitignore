@@ -3,3 +3,6 @@
 *.swo
 .DS_Store
 xagent_log_*.csv
+*.db
+*.db-shm
+*.db-wal

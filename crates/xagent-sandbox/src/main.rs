@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::Parser;
 use egui_wgpu;
@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use xagent_brain::Brain;
-use xagent_shared::{BrainConfig, FullConfig, WorldConfig};
+use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
 use xagent_sandbox::agent::senses::OtherAgent;
 use xagent_sandbox::agent::{
@@ -24,7 +24,8 @@ use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
-use xagent_sandbox::ui::{AgentSnapshot, EguiIntegration, Tab, TabContext};
+use xagent_sandbox::governor::Governor;
+use xagent_sandbox::ui::{AgentSnapshot, EguiIntegration, EvolutionSnapshot, Tab, TabContext};
 
 use xagent_sandbox::world::WorldState;
 
@@ -64,6 +65,22 @@ struct Cli {
     /// Enable CSV metrics logging to file
     #[arg(long)]
     log: bool,
+
+    /// SQLite database path for evolution state (default: xagent.db)
+    #[arg(long, default_value = "xagent.db")]
+    db: String,
+
+    /// Resume evolution from existing database
+    #[arg(long)]
+    resume: bool,
+
+    /// Maximum generations to run (0 = unlimited)
+    #[arg(long)]
+    generations: Option<u64>,
+
+    /// Print evolution tree from database and exit
+    #[arg(long)]
+    dump_tree: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -95,7 +112,7 @@ fn resolve_config(cli: &Cli) -> FullConfig {
                 std::process::exit(1);
             }
         };
-        FullConfig { brain, world }
+        FullConfig { brain, world, governor: GovernorConfig::default() }
     };
 
     // CLI overrides
@@ -170,6 +187,7 @@ struct App {
     // Speed controls (multiplier for simulation rate)
     speed_multiplier: u32,
     paused: bool,
+    render_3d: bool,
 
     // Brain persistence default
     persist_brain: bool,
@@ -217,12 +235,24 @@ struct App {
     // Console log buffer for the bottom panel
     console_log: VecDeque<String>,
 
+    // Evolution governor (always active)
+    governor: Option<Governor>,
+    evo_snapshot: EvolutionSnapshot,
+    evo_gen_tick: u64,
+    evo_wall_start: Instant,
+
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
 }
 
 impl App {
-    fn new(brain_config: BrainConfig, world_config: WorldConfig, enable_logging: bool) -> Self {
+    fn new(
+        brain_config: BrainConfig,
+        world_config: WorldConfig,
+        governor_config: GovernorConfig,
+        enable_logging: bool,
+        db_path: &str,
+    ) -> Self {
         let logger = if enable_logging {
             match MetricsLogger::new() {
                 Ok(l) => {
@@ -236,6 +266,23 @@ impl App {
             }
         } else {
             None
+        };
+
+        let world_config_json = serde_json::to_string(&world_config).unwrap_or_default();
+        let governor = match Governor::new(
+            db_path,
+            governor_config,
+            &brain_config,
+            &world_config_json,
+        ) {
+            Ok(g) => {
+                println!("[GOVERNOR] Initialized with db: {}", db_path);
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("[GOVERNOR] Failed to initialize: {}", e);
+                None
+            }
         };
 
         Self {
@@ -255,6 +302,7 @@ impl App {
             sim_accumulator: 0.0,
             speed_multiplier: 1,
             paused: false,
+            render_3d: true,
             persist_brain: true,
             total_prediction_error: 0.0,
             error_count: 0,
@@ -275,7 +323,11 @@ impl App {
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
-            dock_state: egui_dock::DockState::new(vec![Tab::Sandbox]),
+            governor,
+            evo_snapshot: EvolutionSnapshot::default(),
+            evo_gen_tick: 0,
+            evo_wall_start: Instant::now(),
+            dock_state: egui_dock::DockState::new(vec![Tab::Sandbox, Tab::Evolution]),
         }
     }
 
@@ -712,6 +764,13 @@ impl ApplicationHandler for App {
                             if self.heatmap_enabled { "ON" } else { "OFF" }
                         );
                     }
+                    PhysicalKey::Code(KeyCode::KeyG) if pressed => {
+                        self.render_3d = !self.render_3d;
+                        self.log_msg(format!(
+                            "[SIM] 3D render: {}",
+                            if self.render_3d { "ON" } else { "OFF (fast mode)" }
+                        ));
+                    }
 
                     // ── agent spawning ──────────────────────────────
                     PhysicalKey::Code(KeyCode::KeyN) if pressed => {
@@ -791,7 +850,11 @@ impl ApplicationHandler for App {
                 if !self.paused {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     // Cap per-frame ticks proportional to speed, with a reasonable ceiling
-                    let max_ticks = (self.speed_multiplier * 2).min(2000);
+                    let max_ticks = if self.render_3d {
+                        (self.speed_multiplier * 2).min(2000)
+                    } else {
+                        (self.speed_multiplier * 10).min(10000)
+                    };
                     let mut ticks_run = 0u32;
 
                     // Brain decimation: at high speed, run brain every Nth tick
@@ -855,7 +918,9 @@ impl ApplicationHandler for App {
                                 );
                                 if consumed {
                                     self.food_dirty = true;
+                                    agent.food_consumed += 1;
                                 }
+                                agent.total_ticks_alive += 1;
 
                                 // Record position for heatmap
                                 agent.record_heatmap(world.config.world_size);
@@ -1254,16 +1319,18 @@ impl ApplicationHandler for App {
                     match renderer.begin_frame() {
                         Ok(mut frame_ctx) => {
                             // 1) Render 3D scene to offscreen viewport texture
-                            if let Some(egui) = &self.egui {
-                                renderer.render_3d_offscreen(
-                                    &mesh_vec,
-                                    &vp,
-                                    inst_buf,
-                                    inst_count,
-                                    &mut frame_ctx.encoder,
-                                    &egui.viewport_color_view,
+                            if self.render_3d {
+                                if let Some(egui) = &self.egui {
+                                    renderer.render_3d_offscreen(
+                                        &mesh_vec,
+                                        &vp,
+                                        inst_buf,
+                                        inst_count,
+                                        &mut frame_ctx.encoder,
+                                        &egui.viewport_color_view,
                                     &egui.viewport_depth_view,
                                 );
+                            }
                             }
 
                             // 2) Render egui UI to the surface (viewport texture embedded)
@@ -1282,6 +1349,7 @@ impl ApplicationHandler for App {
                                 let speed = self.speed_multiplier;
                                 let fps = self.fps;
                                 let paused = self.paused;
+                                let render_3d = self.render_3d;
                                 let viewport_tex_id = egui.viewport_texture_id;
                                 let ppp = window.scale_factor() as f32;
                                 let mut desired_vp = (0u32, 0u32);
@@ -1311,6 +1379,16 @@ impl ApplicationHandler for App {
                                         action_weight_history: a.action_weight_history.iter().copied().collect(),
                                     }
                                 }).collect();
+
+                                // Build evolution snapshot for the UI
+                                self.evo_snapshot.gen_tick = self.evo_gen_tick;
+                                self.evo_snapshot.wall_time_secs =
+                                    self.evo_wall_start.elapsed().as_secs_f64();
+                                if let Some(gov) = &self.governor {
+                                    self.evo_snapshot.tree_nodes = gov.tree_nodes();
+                                    self.evo_snapshot.current_node_id = gov.current_node_id;
+                                }
+                                let evo_snap = &self.evo_snapshot;
 
                                 let console_lines: Vec<&str> = self.console_log.iter()
                                     .map(|s| s.as_str()).collect();
@@ -1350,6 +1428,13 @@ impl ApplicationHandler for App {
                                                     ui.label(
                                                         egui::RichText::new("⏸ PAUSED")
                                                             .color(egui::Color32::YELLOW),
+                                                    );
+                                                }
+                                                if !render_3d {
+                                                    ui.separator();
+                                                    ui.label(
+                                                        egui::RichText::new("⚡ FAST (G)")
+                                                            .color(egui::Color32::from_rgb(255, 160, 50)),
                                                     );
                                                 }
                                             });
@@ -1525,6 +1610,7 @@ impl ApplicationHandler for App {
                                                     viewport_hovered: &mut vp_hovered,
                                                     chart_window: &mut chart_win,
                                                     agents: &agent_snaps,
+                                                    evolution: &evo_snap,
                                                 };
                                                 egui_dock::DockArea::new(dock_state)
                                                     .style(egui_dock::Style::from_egui(ui.style().as_ref()))
@@ -1808,54 +1894,217 @@ fn log_tick_to_csv(
     }
 }
 
-// ── Headless simulation loop ───────────────────────────────────────────
+// ── Headless evolution loop ─────────────────────────────────────────────
 
-fn run_headless(config: FullConfig) {
-    info!("Running in headless mode (no window)");
-    let tick_duration = Duration::from_secs_f32(1.0 / config.world.tick_rate);
+fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
+    use xagent_sandbox::governor::Governor;
+
+    info!("Running headless evolution");
     let dt = 1.0 / config.world.tick_rate;
+    let world_json = serde_json::to_string(&config.world).unwrap_or_default();
+    let start_time = Instant::now();
 
-    let mut world = WorldState::new(config.world);
-    let spawn_y = world.terrain.height_at(0.0, 0.0) + 1.0;
-    let mut agent_body = AgentBody::new(Vec3::new(0.0, spawn_y, 0.0));
-    let mut brain = Brain::new(config.brain.clone());
-    let mut tick: u64 = 0;
+    let mut governor = if resume {
+        println!("Resuming from {}", db_path);
+        Governor::resume(db_path).expect("Failed to resume from database")
+    } else {
+        Governor::new(db_path, config.governor.clone(), &config.brain, &world_json)
+            .expect("Failed to initialize governor database")
+    };
+
+    let seed_config = governor.current_config().unwrap_or(config.brain.clone());
+    println!(
+        "Population: {} | Tick budget: {} | Elitism: {} | Patience: {}",
+        governor.config.population_size,
+        governor.config.tick_budget,
+        governor.config.elitism_count,
+        governor.config.patience,
+    );
+
+    let mut current_configs: Vec<BrainConfig> =
+        (0..governor.config.population_size)
+            .map(|i| {
+                if i == 0 {
+                    seed_config.clone()
+                } else {
+                    mutate_config(&seed_config)
+                }
+            })
+            .collect();
 
     loop {
-        if agent_body.body.alive {
-            let frame = senses::extract_senses(&agent_body, &world, tick);
-            let motor = brain.tick(&frame);
-            xagent_sandbox::physics::step(&mut agent_body, &motor, &mut world, dt);
-            world.update(dt);
-            tick += 1;
-
-            if tick % 100 == 0 {
-                let t = brain.telemetry();
-                let energy_pct =
-                    agent_body.body.internal.energy_signal() * 100.0;
-                let integrity_pct =
-                    agent_body.body.internal.integrity_signal() * 100.0;
-                println!(
-                    "[Tick {:>5}] Energy: {:.1}% | Integrity: {:.1}% | PredErr: {:.2} | Mem: {}/{}",
-                    tick,
-                    energy_pct,
-                    integrity_pct,
-                    t.prediction_error,
-                    t.memory_active_count,
-                    brain.config.memory_capacity,
-                );
-            }
-        } else if tick > 0 {
-            let spawn_y = world.terrain.height_at(0.0, 0.0) + 1.0;
-            agent_body = AgentBody::new(Vec3::new(0.0, spawn_y, 0.0));
-            brain = Brain::new(config.brain.clone());
-            tick = 0;
-            log::debug!(
-                "[RESPAWN] Agent died and has been respawned with a fresh brain"
-            );
+        if governor.evolution_complete() {
+            println!("\n✓ Evolution complete after {} generations", governor.generation);
+            break;
         }
 
-        std::thread::sleep(tick_duration);
+        // Initialize world and agents for this generation
+        let mut world = WorldState::new(config.world.clone());
+        let mut agents: Vec<Agent> = current_configs
+            .iter()
+            .enumerate()
+            .map(|(i, cfg)| {
+                let mut rng = rand::rng();
+                let half = world.config.world_size / 2.0 - 5.0;
+                let x: f32 = rng.random_range(-half..half);
+                let z: f32 = rng.random_range(-half..half);
+                let y = world.terrain.height_at(x, z) + 1.0;
+                Agent::new(i as u32, Vec3::new(x, y, z), cfg.clone(), 0)
+            })
+            .collect();
+
+        governor.gen_tick = 0;
+
+        // Run generation
+        let gen_start = Instant::now();
+        let mut tick: u64 = 0;
+        while !governor.generation_complete() {
+            // Build other-agents list for sensory extraction
+            let positions: Vec<(Vec3, bool)> = agents
+                .iter()
+                .map(|a| (a.body.body.position, a.body.body.alive))
+                .collect();
+
+            for i in 0..agents.len() {
+                let agent = &mut agents[i];
+                if agent.body.body.alive {
+                    let others: Vec<OtherAgent> = positions
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, (pos, alive))| OtherAgent {
+                            position: *pos,
+                            alive: *alive,
+                        })
+                        .collect();
+
+                    let frame = senses::extract_senses_with_others(
+                        &agent.body, &world, tick, &others,
+                    );
+                    let motor = agent.brain.tick(&frame);
+                    let consumed = xagent_sandbox::physics::step(
+                        &mut agent.body, &motor, &mut world, dt,
+                    );
+                    if consumed {
+                        agent.food_consumed += 1;
+                    }
+                    agent.total_ticks_alive += 1;
+                    agent.record_heatmap(world.config.world_size);
+                } else {
+                    // Respawn with same config, fresh brain
+                    let mut rng = rand::rng();
+                    let half = world.config.world_size / 2.0 - 5.0;
+                    let x: f32 = rng.random_range(-half..half);
+                    let z: f32 = rng.random_range(-half..half);
+                    let y = world.terrain.height_at(x, z) + 1.0;
+                    agent.body = AgentBody::new(Vec3::new(x, y, z));
+                    agent.brain = Brain::new(agent.brain.config.clone());
+                    agent.death_count += 1;
+                    agent.life_start_tick = tick;
+                }
+            }
+
+            world.update(dt);
+            tick += 1;
+            governor.tick();
+
+            // Progress indicator every 10% of budget
+            if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
+                let pct = (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
+                print!("\rGen {} [{:>3}%]", governor.generation, pct);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        }
+        println!(); // newline after progress
+
+        let gen_elapsed = gen_start.elapsed();
+
+        // Evaluate
+        let fitness = governor.evaluate(&agents);
+        governor.log_generation(&fitness);
+        println!(
+            "  Time: {:.1}s | {:.0} ticks/sec",
+            gen_elapsed.as_secs_f64(),
+            governor.config.tick_budget as f64 / gen_elapsed.as_secs_f64(),
+        );
+
+        // Update wall time
+        governor.update_wall_time(start_time.elapsed().as_secs_f64());
+
+        // Check for regression and possibly backtrack
+        if governor.should_backtrack() {
+            println!("⚠ Fitness regressed for {} consecutive generations — backtracking",
+                     governor.config.patience);
+            if let Some(base_config) = governor.backtrack() {
+                current_configs = (0..governor.config.population_size)
+                    .map(|i| {
+                        if i == 0 {
+                            base_config.clone()
+                        } else {
+                            mutate_config(&base_config)
+                        }
+                    })
+                    .collect();
+                continue;
+            } else {
+                println!("✗ Tree exhausted — no more backtrack targets");
+                break;
+            }
+        }
+
+        // Select and breed
+        current_configs = governor.select_and_breed(&fitness);
+    }
+
+    let total_time = start_time.elapsed();
+    println!(
+        "\nTotal wall time: {:.1}s | {} generations",
+        total_time.as_secs_f64(),
+        governor.generation,
+    );
+}
+
+/// Print evolution tree from database and exit.
+fn dump_tree(db_path: &str) {
+    use xagent_sandbox::governor::Governor;
+
+    let gov = match Governor::resume(db_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Failed to open database '{}': {}", db_path, e);
+            std::process::exit(1);
+        }
+    };
+
+    let nodes = gov.tree_nodes();
+    if nodes.is_empty() {
+        println!("No evolution nodes found in {}", db_path);
+        return;
+    }
+
+    println!("Evolution Tree ({} nodes):", nodes.len());
+    println!("─────────────────────────────────────────────");
+    for node in &nodes {
+        let indent = "  ".repeat(node.generation as usize);
+        let fitness_str = node
+            .best_fitness
+            .map(|f| format!("{:.4}", f))
+            .unwrap_or_else(|| "—".into());
+        let mutation_str = match (&node.mutated_param, node.mutation_direction) {
+            (Some(p), Some(d)) => format!(" ({}{})", p, if d > 0.0 { "↑" } else { "↓" }),
+            _ => String::new(),
+        };
+        let status_marker = match node.status.as_str() {
+            "backtracked" => " ✗",
+            "exhausted" => " ⊘",
+            "active" if Some(node.id) == gov.current_node_id => " ★",
+            _ => "",
+        };
+        println!(
+            "{}Gen {:>3} [{}] fitness={}{}{} ",
+            indent, node.generation, node.id, fitness_str, mutation_str, status_marker,
+        );
     }
 }
 
@@ -1866,7 +2115,12 @@ fn main() {
     info!("xagent sandbox starting...");
     println!("xagent v0.1.0 \u{2014} Emergent Cognitive Agent Sandbox");
 
-    let config = resolve_config(&cli);
+    let mut config = resolve_config(&cli);
+
+    // Override generations from CLI
+    if let Some(gens) = cli.generations {
+        config.governor.max_generations = gens;
+    }
 
     if cli.dump_config {
         let json = serde_json::to_string_pretty(&config)
@@ -1875,13 +2129,24 @@ fn main() {
         return;
     }
 
+    if cli.dump_tree {
+        dump_tree(&cli.db);
+        return;
+    }
+
     print_config(&config);
 
     if cli.no_render {
-        run_headless(config);
+        run_headless(config, &cli.db, cli.resume);
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let mut app = App::new(config.brain, config.world, cli.log);
+        let mut app = App::new(
+            config.brain,
+            config.world,
+            config.governor,
+            cli.log,
+            &cli.db,
+        );
         event_loop.run_app(&mut app).expect("Event loop error");
     }
 }

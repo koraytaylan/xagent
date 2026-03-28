@@ -75,6 +75,35 @@ pub struct FullConfig {
     pub brain: BrainConfig,
     #[serde(default)]
     pub world: WorldConfig,
+    #[serde(default)]
+    pub governor: GovernorConfig,
+}
+
+/// Configuration for the evolution governor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernorConfig {
+    /// Number of agents per generation.
+    pub population_size: usize,
+    /// Simulation ticks per generation before evaluation.
+    pub tick_budget: u64,
+    /// Number of top agents whose configs survive to the next generation.
+    pub elitism_count: usize,
+    /// Maximum number of generations to run (0 = unlimited).
+    pub max_generations: u64,
+    /// Consecutive generations of fitness regression before backtracking.
+    pub patience: u32,
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            population_size: 10,
+            tick_budget: 50_000,
+            elitism_count: 3,
+            max_generations: 0,
+            patience: 3,
+        }
+    }
 }
 
 impl Default for BrainConfig {

@@ -111,6 +111,10 @@ pub struct Agent {
     pub persist_brain: bool,
     /// Whether this agent has already reproduced in its current life.
     pub has_reproduced: bool,
+    /// Total food items consumed across all lives (cumulative for evolution scoring).
+    pub food_consumed: u32,
+    /// Total ticks spent alive across all lives (cumulative for evolution scoring).
+    pub total_ticks_alive: u64,
     /// Position visit counts for heatmap visualization.
     pub heatmap: Vec<u32>,
     /// Distance-sampled control points for trail visualization (current life only).
@@ -144,6 +148,8 @@ impl Agent {
             respawn_cooldown: 0,
             persist_brain: true,
             has_reproduced: false,
+            food_consumed: 0,
+            total_ticks_alive: 0,
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],
             trail: Vec::with_capacity(256),
             trail_dirty: false,
@@ -202,6 +208,34 @@ impl Agent {
     pub fn reset_trail(&mut self) {
         self.trail.clear();
         self.trail_dirty = true;
+    }
+
+    /// Number of unique heatmap cells visited (non-zero entries).
+    pub fn unique_cells_explored(&self) -> u32 {
+        self.heatmap.iter().filter(|&&c| c > 0).count() as u32
+    }
+
+    /// Reset per-generation stats for evolution. Keeps BrainConfig (the "genome")
+    /// but zeroes cumulative fitness counters and resets the body/brain.
+    pub fn reset_for_new_life(&mut self, position: Vec3, tick: u64) {
+        self.body = AgentBody::new(position);
+        self.brain = Brain::new(self.brain.config.clone());
+        self.death_count = 0;
+        self.generation = 0;
+        self.life_start_tick = tick;
+        self.longest_life = 0;
+        self.respawn_cooldown = 0;
+        self.has_reproduced = false;
+        self.food_consumed = 0;
+        self.total_ticks_alive = 0;
+        self.heatmap.fill(0);
+        self.trail.clear();
+        self.trail_dirty = true;
+        self.prediction_error_history.clear();
+        self.exploration_rate_history.clear();
+        self.energy_history.clear();
+        self.integrity_history.clear();
+        self.action_weight_history.clear();
     }
 }
 

@@ -108,7 +108,6 @@ pub struct Agent {
     pub life_start_tick: u64,
     pub longest_life: u64,
     pub respawn_cooldown: u32,
-    pub persist_brain: bool,
     /// Whether this agent has already reproduced in its current life.
     pub has_reproduced: bool,
     /// Total food items consumed across all lives (cumulative for evolution scoring).
@@ -146,7 +145,6 @@ impl Agent {
             life_start_tick: tick,
             longest_life: 0,
             respawn_cooldown: 0,
-            persist_brain: true,
             has_reproduced: false,
             food_consumed: 0,
             total_ticks_alive: 0,

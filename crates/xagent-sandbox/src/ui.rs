@@ -37,37 +37,70 @@ pub struct AgentSnapshot {
     pub action_weight_history: Vec<[f32; 8]>,
 }
 
+/// The lifecycle state of the evolution system.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvolutionState {
+    /// No session in the DB — user should configure params and press Start.
+    Idle,
+    /// A previous session was found — show summary, offer Resume or Reset.
+    HasSession { generation: u32 },
+    /// Evolution is actively running.
+    Running,
+    /// Evolution is paused (user hit Pause).
+    Paused,
+}
+
+/// Actions the evolution tab can request from the main loop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvolutionAction {
+    None,
+    Start,
+    Resume,
+    Pause,
+    Unpause,
+    Reset,
+}
+
 /// Snapshot of evolution state for UI rendering (rebuilt from governor each frame).
 pub struct EvolutionSnapshot {
+    pub state: EvolutionState,
     pub generation: u32,
     pub gen_tick: u64,
     pub tick_budget: u64,
     pub population_size: usize,
     pub elitism_count: usize,
     pub patience: u32,
+    pub max_generations: u64,
     pub wall_time_secs: f64,
     pub ticks_per_sec: f64,
     pub tree_nodes: Vec<crate::governor::TreeNode>,
     pub current_node_id: Option<i64>,
     pub current_config: Option<xagent_shared::BrainConfig>,
     pub fitness_history: Vec<(u32, f32, f32)>, // (generation, best, avg)
+    // Editable fields for Idle state (pre-start configuration)
+    pub edit_brain: xagent_shared::BrainConfig,
+    pub edit_governor: xagent_shared::GovernorConfig,
 }
 
 impl Default for EvolutionSnapshot {
     fn default() -> Self {
         Self {
+            state: EvolutionState::Idle,
             generation: 0,
             gen_tick: 0,
             tick_budget: 50_000,
             population_size: 10,
             elitism_count: 3,
             patience: 3,
+            max_generations: 0,
             wall_time_secs: 0.0,
             ticks_per_sec: 0.0,
             tree_nodes: Vec::new(),
             current_node_id: None,
             current_config: None,
             fitness_history: Vec::new(),
+            edit_brain: xagent_shared::BrainConfig::default(),
+            edit_governor: xagent_shared::GovernorConfig::default(),
         }
     }
 }
@@ -81,7 +114,8 @@ pub struct TabContext<'a> {
     /// Number of history samples visible in the detail chart (zoom level).
     pub chart_window: &'a mut usize,
     pub agents: &'a [AgentSnapshot],
-    pub evolution: &'a EvolutionSnapshot,
+    pub evolution: &'a mut EvolutionSnapshot,
+    pub evolution_action: &'a mut EvolutionAction,
 }
 
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,
@@ -335,7 +369,10 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                 egui::ScrollArea::vertical()
                     .id_salt("evolution_tab_scroll")
                     .show(ui, |ui| {
-                        Self::render_evolution_tab(ui, self.evolution);
+                        let action = Self::render_evolution_tab(ui, self.evolution);
+                        if action != EvolutionAction::None {
+                            *self.evolution_action = action;
+                        }
                     });
             }
             Tab::AgentDetail(id) => {
@@ -632,10 +669,240 @@ impl<'a> TabContext<'a> {
         }
     }
 
-    fn render_evolution_tab(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
-        ui.heading(format!("Generation {}", evo.generation));
+    fn render_evolution_tab(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) -> EvolutionAction {
+        let mut action = EvolutionAction::None;
+
+        match &evo.state {
+            EvolutionState::Idle => {
+                ui.heading("🧬 New Evolution Run");
+                ui.add_space(8.0);
+                ui.label("Configure parameters below, then press Start.");
+                ui.add_space(12.0);
+
+                Self::render_config_editor(ui, evo);
+                ui.add_space(12.0);
+
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("▶  Start Evolution").strong(),
+                ).min_size(egui::vec2(200.0, 36.0))).clicked() {
+                    action = EvolutionAction::Start;
+                }
+            }
+
+            EvolutionState::HasSession { generation } => {
+                ui.heading("🧬 Previous Session Found");
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "An evolution run was found at generation {}.",
+                    generation,
+                ));
+                ui.add_space(8.0);
+
+                Self::render_config_summary(ui, evo);
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("▶  Resume").strong(),
+                    ).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                        action = EvolutionAction::Resume;
+                    }
+                    ui.add_space(16.0);
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("🗑  Reset & Start Fresh")
+                            .color(egui::Color32::from_rgb(220, 80, 80)),
+                    ).min_size(egui::vec2(180.0, 36.0))).clicked() {
+                        action = EvolutionAction::Reset;
+                    }
+                });
+            }
+
+            EvolutionState::Running | EvolutionState::Paused => {
+                let is_running = evo.state == EvolutionState::Running;
+                Self::render_running_dashboard(ui, evo, is_running, &mut action);
+            }
+        }
+
+        action
+    }
+
+    fn render_config_editor(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
+        ui.collapsing("🧠 Brain Config", |ui| {
+            egui::Grid::new("brain_edit_grid")
+                .num_columns(2)
+                .spacing([20.0, 6.0])
+                .show(ui, |ui| {
+                    let b = &mut evo.edit_brain;
+
+                    ui.label("memory_capacity");
+                    let mut mc = b.memory_capacity as i32;
+                    ui.add(egui::DragValue::new(&mut mc).range(4..=1024).speed(1));
+                    b.memory_capacity = mc.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("processing_slots");
+                    let mut ps = b.processing_slots as i32;
+                    ui.add(egui::DragValue::new(&mut ps).range(1..=64).speed(1));
+                    b.processing_slots = ps.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("visual_encoding_size");
+                    let mut ve = b.visual_encoding_size as i32;
+                    ui.add(egui::DragValue::new(&mut ve).range(2..=128).speed(1));
+                    b.visual_encoding_size = ve.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("representation_dim");
+                    let mut rd = b.representation_dim as i32;
+                    ui.add(egui::DragValue::new(&mut rd).range(4..=512).speed(1));
+                    b.representation_dim = rd.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("learning_rate");
+                    ui.add(egui::DragValue::new(&mut b.learning_rate)
+                        .range(0.0001..=1.0).speed(0.001).max_decimals(5));
+                    ui.end_row();
+
+                    ui.label("decay_rate");
+                    ui.add(egui::DragValue::new(&mut b.decay_rate)
+                        .range(0.0001..=1.0).speed(0.001).max_decimals(5));
+                    ui.end_row();
+                });
+        });
+
+        ui.collapsing("⚙ Governor Config", |ui| {
+            egui::Grid::new("gov_edit_grid")
+                .num_columns(2)
+                .spacing([20.0, 6.0])
+                .show(ui, |ui| {
+                    let g = &mut evo.edit_governor;
+
+                    ui.label("population_size");
+                    let mut ps = g.population_size as i32;
+                    ui.add(egui::DragValue::new(&mut ps).range(2..=100).speed(1));
+                    g.population_size = ps.max(2) as usize;
+                    ui.end_row();
+
+                    ui.label("tick_budget");
+                    let mut tb = g.tick_budget as i64;
+                    ui.add(egui::DragValue::new(&mut tb).range(1000..=1_000_000).speed(1000));
+                    g.tick_budget = tb.max(1000) as u64;
+                    ui.end_row();
+
+                    ui.label("elitism_count");
+                    let mut ec = g.elitism_count as i32;
+                    ui.add(egui::DragValue::new(&mut ec).range(1..=50).speed(1));
+                    g.elitism_count = ec.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("max_generations");
+                    let mut mg = g.max_generations as i64;
+                    ui.add(egui::DragValue::new(&mut mg).range(0..=100_000).speed(1));
+                    g.max_generations = mg.max(0) as u64;
+                    ui.end_row();
+
+                    ui.label("patience");
+                    let mut p = g.patience as i32;
+                    ui.add(egui::DragValue::new(&mut p).range(1..=20).speed(1));
+                    g.patience = p.max(1) as u32;
+                    ui.end_row();
+                });
+        });
+    }
+
+    fn render_config_summary(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
+        if let Some(cfg) = &evo.current_config {
+            ui.collapsing("🧠 Brain Config", |ui| {
+                egui::Grid::new("brain_summary_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("memory_capacity");
+                        ui.monospace(format!("{}", cfg.memory_capacity));
+                        ui.end_row();
+                        ui.label("processing_slots");
+                        ui.monospace(format!("{}", cfg.processing_slots));
+                        ui.end_row();
+                        ui.label("visual_encoding_size");
+                        ui.monospace(format!("{}", cfg.visual_encoding_size));
+                        ui.end_row();
+                        ui.label("representation_dim");
+                        ui.monospace(format!("{}", cfg.representation_dim));
+                        ui.end_row();
+                        ui.label("learning_rate");
+                        ui.monospace(format!("{:.5}", cfg.learning_rate));
+                        ui.end_row();
+                        ui.label("decay_rate");
+                        ui.monospace(format!("{:.5}", cfg.decay_rate));
+                        ui.end_row();
+                    });
+            });
+        }
+
+        ui.collapsing("⚙ Governor Config", |ui| {
+            egui::Grid::new("gov_summary_grid")
+                .num_columns(2)
+                .spacing([20.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("population_size");
+                    ui.monospace(format!("{}", evo.population_size));
+                    ui.end_row();
+                    ui.label("tick_budget");
+                    ui.monospace(format!("{}", evo.tick_budget));
+                    ui.end_row();
+                    ui.label("elitism_count");
+                    ui.monospace(format!("{}", evo.elitism_count));
+                    ui.end_row();
+                    ui.label("max_generations");
+                    ui.monospace(format!("{}", evo.max_generations));
+                    ui.end_row();
+                    ui.label("patience");
+                    ui.monospace(format!("{}", evo.patience));
+                    ui.end_row();
+                });
+        });
+
+        if !evo.fitness_history.is_empty() {
+            Self::render_fitness_chart(ui, evo);
+        }
+
+        if !evo.tree_nodes.is_empty() {
+            ui.collapsing("🌳 Evolution Tree", |ui| {
+                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id);
+            });
+        }
+    }
+
+    fn render_running_dashboard(
+        ui: &mut egui::Ui,
+        evo: &EvolutionSnapshot,
+        is_running: bool,
+        action: &mut EvolutionAction,
+    ) {
+        // ── Header + controls ───────────────────────────────
+        ui.horizontal(|ui| {
+            ui.heading(format!("Generation {}", evo.generation));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("🗑 Reset")
+                        .color(egui::Color32::from_rgb(220, 80, 80)),
+                )).clicked() {
+                    *action = EvolutionAction::Reset;
+                }
+                if is_running {
+                    if ui.button("⏸ Pause").clicked() {
+                        *action = EvolutionAction::Pause;
+                    }
+                } else {
+                    if ui.button("▶ Resume").clicked() {
+                        *action = EvolutionAction::Unpause;
+                    }
+                }
+            });
+        });
         ui.add_space(4.0);
 
+        // ── Progress bar ────────────────────────────────────
         let progress = if evo.tick_budget > 0 {
             evo.gen_tick as f32 / evo.tick_budget as f32
         } else {
@@ -647,10 +914,11 @@ impl<'a> TabContext<'a> {
                     "{} / {} ticks ({:.0}%)",
                     evo.gen_tick, evo.tick_budget, progress * 100.0,
                 ))
-                .animate(true),
+                .animate(is_running),
         );
         ui.add_space(8.0);
 
+        // ── Timing stats ────────────────────────────────────
         ui.horizontal(|ui| {
             let hours = (evo.wall_time_secs / 3600.0) as u64;
             let mins = ((evo.wall_time_secs % 3600.0) / 60.0) as u64;
@@ -664,6 +932,7 @@ impl<'a> TabContext<'a> {
         });
         ui.separator();
 
+        // ── Current best config ─────────────────────────────
         if let Some(cfg) = &evo.current_config {
             ui.collapsing("🧬 Best Config", |ui| {
                 egui::Grid::new("config_grid")
@@ -693,77 +962,83 @@ impl<'a> TabContext<'a> {
             ui.add_space(4.0);
         }
 
+        // ── Fitness chart ───────────────────────────────────
         if !evo.fitness_history.is_empty() {
-            ui.collapsing("📈 Fitness Over Generations", |ui| {
-                let avail = ui.available_width().max(200.0);
-                let chart_height = 120.0;
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(avail, chart_height),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
-
-                let max_fit = evo
-                    .fitness_history
-                    .iter()
-                    .map(|(_, b, _)| *b)
-                    .fold(0.0f32, f32::max)
-                    .max(0.01);
-
-                let n = evo.fitness_history.len();
-                if n >= 2 {
-                    let best_pts: Vec<egui::Pos2> = evo
-                        .fitness_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, best, _))| {
-                            egui::pos2(
-                                rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
-                                rect.bottom() - (best / max_fit) * rect.height(),
-                            )
-                        })
-                        .collect();
-                    for pair in best_pts.windows(2) {
-                        painter.line_segment(
-                            [pair[0], pair[1]],
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(50, 200, 80)),
-                        );
-                    }
-
-                    let avg_pts: Vec<egui::Pos2> = evo
-                        .fitness_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, _, avg))| {
-                            egui::pos2(
-                                rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
-                                rect.bottom() - (avg / max_fit) * rect.height(),
-                            )
-                        })
-                        .collect();
-                    for pair in avg_pts.windows(2) {
-                        painter.line_segment(
-                            [pair[0], pair[1]],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 180, 50)),
-                        );
-                    }
-                }
-
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(50, 200, 80), "● Best");
-                    ui.colored_label(egui::Color32::from_rgb(200, 180, 50), "● Avg");
-                    ui.label(format!("Max: {:.4}", max_fit));
-                });
-            });
-            ui.add_space(4.0);
+            Self::render_fitness_chart(ui, evo);
         }
 
+        // ── Evolution tree ──────────────────────────────────
         if !evo.tree_nodes.is_empty() {
             ui.collapsing("🌳 Evolution Tree", |ui| {
                 Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id);
             });
         }
+    }
+
+    fn render_fitness_chart(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
+        ui.collapsing("📈 Fitness Over Generations", |ui| {
+            let avail = ui.available_width().max(200.0);
+            let chart_height = 120.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(avail, chart_height),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+
+            let max_fit = evo
+                .fitness_history
+                .iter()
+                .map(|(_, b, _)| *b)
+                .fold(0.0f32, f32::max)
+                .max(0.01);
+
+            let n = evo.fitness_history.len();
+            if n >= 2 {
+                let best_pts: Vec<egui::Pos2> = evo
+                    .fitness_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, best, _))| {
+                        egui::pos2(
+                            rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
+                            rect.bottom() - (best / max_fit) * rect.height(),
+                        )
+                    })
+                    .collect();
+                for pair in best_pts.windows(2) {
+                    painter.line_segment(
+                        [pair[0], pair[1]],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(50, 200, 80)),
+                    );
+                }
+
+                let avg_pts: Vec<egui::Pos2> = evo
+                    .fitness_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, _, avg))| {
+                        egui::pos2(
+                            rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
+                            rect.bottom() - (avg / max_fit) * rect.height(),
+                        )
+                    })
+                    .collect();
+                for pair in avg_pts.windows(2) {
+                    painter.line_segment(
+                        [pair[0], pair[1]],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 180, 50)),
+                    );
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(50, 200, 80), "● Best");
+                ui.colored_label(egui::Color32::from_rgb(200, 180, 50), "● Avg");
+                ui.label(format!("Max: {:.4}", max_fit));
+            });
+        });
+        ui.add_space(4.0);
     }
 
     fn render_tree(

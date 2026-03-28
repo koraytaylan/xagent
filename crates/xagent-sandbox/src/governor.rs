@@ -531,6 +531,97 @@ impl Governor {
             None => Vec::new(),
         }
     }
+
+    /// Get the seed BrainConfig from the run table (original starting config).
+    pub fn seed_brain_config(&self) -> Option<BrainConfig> {
+        let json: String = self
+            .db
+            .query_row(
+                "SELECT brain_config FROM run WHERE id = ?1",
+                params![self.run_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    /// Fitness history: (generation, best_fitness, avg_fitness) for all evaluated nodes.
+    pub fn fitness_history(&self) -> Vec<(u32, f32, f32)> {
+        let mut stmt = match self.db.prepare(
+            "SELECT generation, best_fitness, avg_fitness FROM node
+             WHERE run_id = ?1 AND best_fitness IS NOT NULL
+             ORDER BY generation ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![self.run_id], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, f32>(1)?,
+                row.get::<_, f32>(2)?,
+            ))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+}
+
+/// Check whether a database file has an existing evolution session.
+/// Returns Some((generation, GovernorConfig, BrainConfig)) if a session exists.
+pub fn check_existing_session(
+    db_path: &str,
+) -> Option<(u32, GovernorConfig, BrainConfig)> {
+    let db = Connection::open(db_path).ok()?;
+    // Check if the run table even exists
+    let table_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='run'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if table_count == 0 {
+        return None;
+    }
+    let (governor_json, brain_json): (String, String) = db
+        .query_row(
+            "SELECT governor_config, brain_config FROM run ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let run_id: i64 = db
+        .query_row("SELECT id FROM run ORDER BY id DESC LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .ok()?;
+    let generation: u32 = db
+        .query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM node WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let gov_config: GovernorConfig =
+        serde_json::from_str(&governor_json).unwrap_or_default();
+    let brain_config: BrainConfig =
+        serde_json::from_str(&brain_json).unwrap_or_default();
+    Some((generation, gov_config, brain_config))
+}
+
+/// Delete the database file to start fresh.
+pub fn reset_database(db_path: &str) -> std::io::Result<()> {
+    let path = std::path::Path::new(db_path);
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    // Also remove WAL/SHM files if present
+    let wal = format!("{}-wal", db_path);
+    let shm = format!("{}-shm", db_path);
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(&shm);
+    Ok(())
 }
 
 /// A node in the evolution tree for UI display.

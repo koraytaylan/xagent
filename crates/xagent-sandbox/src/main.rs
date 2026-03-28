@@ -24,8 +24,11 @@ use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
-use xagent_sandbox::governor::Governor;
-use xagent_sandbox::ui::{AgentSnapshot, EguiIntegration, EvolutionSnapshot, Tab, TabContext};
+use xagent_sandbox::governor::{check_existing_session, reset_database, Governor};
+use xagent_sandbox::ui::{
+    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, Tab,
+    TabContext,
+};
 
 use xagent_sandbox::world::WorldState;
 
@@ -189,9 +192,6 @@ struct App {
     paused: bool,
     render_3d: bool,
 
-    // Brain persistence default
-    persist_brain: bool,
-
     // Session statistics
     total_prediction_error: f64,
     error_count: u64,
@@ -235,11 +235,13 @@ struct App {
     // Console log buffer for the bottom panel
     console_log: VecDeque<String>,
 
-    // Evolution governor (always active)
+    // Evolution governor (created on Start/Resume, not on App init)
     governor: Option<Governor>,
     evo_snapshot: EvolutionSnapshot,
     evo_gen_tick: u64,
     evo_wall_start: Instant,
+    db_path: String,
+    governor_config: GovernorConfig,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
@@ -268,22 +270,37 @@ impl App {
             None
         };
 
-        let world_config_json = serde_json::to_string(&world_config).unwrap_or_default();
-        let governor = match Governor::new(
-            db_path,
-            governor_config,
-            &brain_config,
-            &world_config_json,
-        ) {
-            Ok(g) => {
-                println!("[GOVERNOR] Initialized with db: {}", db_path);
-                Some(g)
+        // Check for existing session to determine initial UI state
+        let mut evo_snapshot = EvolutionSnapshot::default();
+        evo_snapshot.edit_brain = brain_config.clone();
+        evo_snapshot.edit_governor = governor_config.clone();
+
+        match check_existing_session(db_path) {
+            Some((gen, prev_gov, prev_brain)) => {
+                evo_snapshot.state = EvolutionState::HasSession { generation: gen };
+                evo_snapshot.generation = gen;
+                evo_snapshot.current_config = Some(prev_brain);
+                evo_snapshot.population_size = prev_gov.population_size;
+                evo_snapshot.tick_budget = prev_gov.tick_budget;
+                evo_snapshot.elitism_count = prev_gov.elitism_count;
+                evo_snapshot.patience = prev_gov.patience;
+                evo_snapshot.max_generations = prev_gov.max_generations;
+                // Also load tree/fitness from DB for the summary view
+                if let Ok(gov) = Governor::resume(db_path) {
+                    evo_snapshot.tree_nodes = gov.tree_nodes();
+                    evo_snapshot.current_node_id = gov.current_node_id;
+                    evo_snapshot.fitness_history = gov.fitness_history();
+                }
+                println!(
+                    "[GOVERNOR] Found previous session at generation {} in {}",
+                    gen, db_path
+                );
             }
-            Err(e) => {
-                eprintln!("[GOVERNOR] Failed to initialize: {}", e);
-                None
+            None => {
+                evo_snapshot.state = EvolutionState::Idle;
+                println!("[GOVERNOR] No previous session — ready to configure");
             }
-        };
+        }
 
         Self {
             brain_config,
@@ -301,9 +318,8 @@ impl App {
             last_frame: Instant::now(),
             sim_accumulator: 0.0,
             speed_multiplier: 1,
-            paused: false,
+            paused: true,
             render_3d: true,
-            persist_brain: true,
             total_prediction_error: 0.0,
             error_count: 0,
             selected_agent_idx: 0,
@@ -323,11 +339,13 @@ impl App {
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
-            governor,
-            evo_snapshot: EvolutionSnapshot::default(),
+            governor: None,
+            evo_snapshot,
             evo_gen_tick: 0,
             evo_wall_start: Instant::now(),
-            dock_state: egui_dock::DockState::new(vec![Tab::Sandbox, Tab::Evolution]),
+            db_path: db_path.to_string(),
+            governor_config,
+            dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
         }
     }
 
@@ -350,7 +368,6 @@ impl App {
 
         let mut agent = Agent::new(id, Vec3::new(x, y, z), config, self.tick);
         agent.generation = generation;
-        agent.persist_brain = self.persist_brain;
 
         self.log_msg(format!(
             "[SPAWN] Agent {} (gen {}) at ({:.1}, {:.1})",
@@ -358,6 +375,107 @@ impl App {
         ));
 
         self.agents.push(agent);
+    }
+
+    fn handle_evolution_action(&mut self, action: EvolutionAction) {
+        match action {
+            EvolutionAction::None => {}
+            EvolutionAction::Start => {
+                let brain_config = self.evo_snapshot.edit_brain.clone();
+                let gov_config = self.evo_snapshot.edit_governor.clone();
+                let world_json =
+                    serde_json::to_string(&self.world_config).unwrap_or_default();
+                match Governor::new(&self.db_path, gov_config.clone(), &brain_config, &world_json)
+                {
+                    Ok(gov) => {
+                        self.governor = Some(gov);
+                        self.governor_config = gov_config.clone();
+                        self.brain_config = brain_config;
+                        self.evo_snapshot.state = EvolutionState::Running;
+                        self.evo_snapshot.population_size = gov_config.population_size;
+                        self.evo_snapshot.tick_budget = gov_config.tick_budget;
+                        self.evo_snapshot.elitism_count = gov_config.elitism_count;
+                        self.evo_snapshot.patience = gov_config.patience;
+                        self.evo_snapshot.max_generations = gov_config.max_generations;
+                        self.evo_wall_start = Instant::now();
+                        self.evo_gen_tick = 0;
+                        self.paused = false;
+                        self.spawn_evolution_population();
+                        self.log_msg("[EVOLUTION] Started new run".into());
+                    }
+                    Err(e) => {
+                        self.log_msg(format!("[EVOLUTION] Failed to start: {}", e));
+                    }
+                }
+            }
+            EvolutionAction::Resume => {
+                match Governor::resume(&self.db_path) {
+                    Ok(gov) => {
+                        let cfg = gov.current_config();
+                        self.evo_snapshot.state = EvolutionState::Running;
+                        self.evo_snapshot.generation = gov.generation;
+                        self.governor_config = gov.config.clone();
+                        if let Some(c) = &cfg {
+                            self.brain_config = c.clone();
+                        }
+                        self.governor = Some(gov);
+                        self.evo_wall_start = Instant::now();
+                        self.evo_gen_tick = 0;
+                        self.paused = false;
+                        self.spawn_evolution_population();
+                        self.log_msg("[EVOLUTION] Resumed from database".into());
+                    }
+                    Err(e) => {
+                        self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
+                    }
+                }
+            }
+            EvolutionAction::Pause => {
+                self.evo_snapshot.state = EvolutionState::Paused;
+                self.paused = true;
+                self.log_msg("[EVOLUTION] Paused".into());
+            }
+            EvolutionAction::Unpause => {
+                self.evo_snapshot.state = EvolutionState::Running;
+                self.paused = false;
+                self.log_msg("[EVOLUTION] Resumed".into());
+            }
+            EvolutionAction::Reset => {
+                self.governor = None;
+                self.agents.clear();
+                self.next_agent_id = 0;
+                self.tick = 0;
+                self.evo_gen_tick = 0;
+                self.paused = true;
+                if let Err(e) = reset_database(&self.db_path) {
+                    self.log_msg(format!("[EVOLUTION] Failed to reset DB: {}", e));
+                }
+                self.evo_snapshot = EvolutionSnapshot::default();
+                self.evo_snapshot.edit_brain = self.brain_config.clone();
+                self.evo_snapshot.edit_governor = self.governor_config.clone();
+                self.log_msg("[EVOLUTION] Reset — ready to start fresh".into());
+            }
+        }
+    }
+
+    fn spawn_evolution_population(&mut self) {
+        self.agents.clear();
+        self.next_agent_id = 0;
+        self.tick = 0;
+        let seed = if let Some(gov) = &self.governor {
+            gov.current_config().unwrap_or(self.brain_config.clone())
+        } else {
+            self.brain_config.clone()
+        };
+        let pop_size = self.governor_config.population_size;
+        for i in 0..pop_size {
+            let cfg = if i == 0 {
+                seed.clone()
+            } else {
+                mutate_config(&seed)
+            };
+            self.spawn_agent(cfg, 0);
+        }
     }
 
     fn log_msg(&mut self, msg: String) {
@@ -400,7 +518,6 @@ impl App {
 
         let mut child = Agent::new(id, Vec3::new(cx, cy, cz), child_config, self.tick);
         child.generation = parent_gen + 1;
-        child.persist_brain = self.persist_brain;
 
         println!(
             "[REPRODUCE] Agent {} (gen {}) → child Agent {} (gen {}) at ({:.1}, {:.1})",
@@ -631,25 +748,14 @@ impl ApplicationHandler for App {
             ));
         }
 
-        // ── spawn initial agent ────────────────────────────────────
-        self.spawn_agent(self.brain_config.clone(), 0);
-
         self.tick = 0;
         self.last_frame = Instant::now();
 
         println!(
-            "[CONTROLS] P/Space = pause | 1-4 = speed | R = toggle brain persist | ESC = quit"
+            "[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D | ESC = quit"
         );
         println!(
             "[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry"
-        );
-        println!(
-            "[SIM] Brain on death: {}",
-            if self.persist_brain {
-                "PERSIST (learning preserved)"
-            } else {
-                "RESET (fresh brain)"
-            }
         );
         info!("Renderer + world + brain initialized — agent is alive");
     }
@@ -713,11 +819,15 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     PhysicalKey::Code(KeyCode::KeyP | KeyCode::Space) if pressed => {
-                        self.paused = !self.paused;
-                        println!(
-                            "[SIM] {}",
-                            if self.paused { "PAUSED" } else { "RESUMED" }
-                        );
+                        match self.evo_snapshot.state {
+                            EvolutionState::Running => {
+                                self.handle_evolution_action(EvolutionAction::Pause);
+                            }
+                            EvolutionState::Paused => {
+                                self.handle_evolution_action(EvolutionAction::Unpause);
+                            }
+                            _ => {}
+                        }
                     }
                     PhysicalKey::Code(KeyCode::Digit1) if pressed => {
                         self.speed_multiplier = 1;
@@ -742,20 +852,6 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Digit6) if pressed => {
                         self.speed_multiplier = 1000;
                         println!("[SIM] Speed: 1000x ({} ticks/sec)", SIM_RATE as u32 * 1000);
-                    }
-                    PhysicalKey::Code(KeyCode::KeyR) if pressed => {
-                        self.persist_brain = !self.persist_brain;
-                        for a in &mut self.agents {
-                            a.persist_brain = self.persist_brain;
-                        }
-                        println!(
-                            "[SIM] Brain on death: {}",
-                            if self.persist_brain {
-                                "PERSIST (learning preserved)"
-                            } else {
-                                "RESET (fresh brain)"
-                            }
-                        );
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
@@ -1038,12 +1134,7 @@ impl ApplicationHandler for App {
                                         agent.has_reproduced = false;
                                         agent.generation += 1;
                                         agent.reset_trail();
-                                        if !agent.persist_brain {
-                                            agent.brain = Brain::new(agent.brain.config.clone());
-                                        } else {
-                                            // Death trauma: 20% memory reinforcement decay
-                                            agent.brain.trauma(0.2);
-                                        }
+                                        agent.brain = Brain::new(agent.brain.config.clone());
                                         event_msgs.push(format!(
                                             "[RESPAWN] Agent {} at ({:.1}, {:.1})",
                                             agent.id, x, z
@@ -1300,6 +1391,8 @@ impl ApplicationHandler for App {
                 let inst_buf = self.agent_instance_buffer.as_ref();
                 let inst_count = self.agent_instance_count;
 
+                let mut pending_evo_action = EvolutionAction::None;
+
                 if let Some(renderer) = &mut self.renderer {
                     let t = self.terrain_gpu.as_ref();
                     let f = self.food_gpu.as_ref();
@@ -1348,8 +1441,8 @@ impl ApplicationHandler for App {
                                 let tick = self.tick;
                                 let speed = self.speed_multiplier;
                                 let fps = self.fps;
-                                let paused = self.paused;
                                 let render_3d = self.render_3d;
+                                let evo_state = self.evo_snapshot.state.clone();
                                 let viewport_tex_id = egui.viewport_texture_id;
                                 let ppp = window.scale_factor() as f32;
                                 let mut desired_vp = (0u32, 0u32);
@@ -1387,8 +1480,11 @@ impl ApplicationHandler for App {
                                 if let Some(gov) = &self.governor {
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
+                                    self.evo_snapshot.fitness_history = gov.fitness_history();
                                 }
-                                let evo_snap = &self.evo_snapshot;
+                                // Move snapshot out so we can pass &mut to the closure
+                                let mut evo_snap = std::mem::take(&mut self.evo_snapshot);
+                                let mut evo_action = EvolutionAction::None;
 
                                 let console_lines: Vec<&str> = self.console_log.iter()
                                     .map(|s| s.as_str()).collect();
@@ -1423,12 +1519,32 @@ impl ApplicationHandler for App {
                                                 ui.label(format!("FPS: {:.0}", fps));
                                                 ui.separator();
                                                 ui.label(format!("Agents: {}", agent_snaps.len()));
-                                                if paused {
-                                                    ui.separator();
-                                                    ui.label(
-                                                        egui::RichText::new("⏸ PAUSED")
-                                                            .color(egui::Color32::YELLOW),
-                                                    );
+                                                ui.separator();
+                                                match &evo_state {
+                                                    EvolutionState::Idle => {
+                                                        ui.label(
+                                                            egui::RichText::new("⏹ IDLE")
+                                                                .color(egui::Color32::GRAY),
+                                                        );
+                                                    }
+                                                    EvolutionState::HasSession { generation } => {
+                                                        ui.label(
+                                                            egui::RichText::new(format!("💾 SESSION @ Gen {}", generation))
+                                                                .color(egui::Color32::from_rgb(100, 180, 255)),
+                                                        );
+                                                    }
+                                                    EvolutionState::Running => {
+                                                        ui.label(
+                                                            egui::RichText::new("▶ RUNNING")
+                                                                .color(egui::Color32::from_rgb(50, 200, 80)),
+                                                        );
+                                                    }
+                                                    EvolutionState::Paused => {
+                                                        ui.label(
+                                                            egui::RichText::new("⏸ PAUSED")
+                                                                .color(egui::Color32::YELLOW),
+                                                        );
+                                                    }
                                                 }
                                                 if !render_3d {
                                                     ui.separator();
@@ -1610,7 +1726,8 @@ impl ApplicationHandler for App {
                                                     viewport_hovered: &mut vp_hovered,
                                                     chart_window: &mut chart_win,
                                                     agents: &agent_snaps,
-                                                    evolution: &evo_snap,
+                                                    evolution: &mut evo_snap,
+                                                    evolution_action: &mut evo_action,
                                                 };
                                                 egui_dock::DockArea::new(dock_state)
                                                     .style(egui_dock::Style::from_egui(ui.style().as_ref()))
@@ -1621,6 +1738,12 @@ impl ApplicationHandler for App {
 
                                 self.viewport_hovered = vp_hovered;
                                 self.chart_window = chart_win;
+
+                                // Restore evolution snapshot (may have been mutated by UI)
+                                self.evo_snapshot = evo_snap;
+
+                                // Defer evolution action to after the renderer borrow
+                                pending_evo_action = evo_action;
 
                                 // Handle agent selection from sidebar click
                                 if let Some(idx) = clicked_agent_idx {
@@ -1668,6 +1791,9 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // Handle evolution actions (outside renderer borrow)
+                self.handle_evolution_action(pending_evo_action);
             }
 
             _ => {}

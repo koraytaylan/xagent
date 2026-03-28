@@ -75,7 +75,7 @@ impl Governor {
             current_node_id: Some(root_id),
             generation: 0,
             gen_tick: 0,
-            gens_since_backtrack: 0,
+            gens_since_backtrack: u32::MAX / 2,
         })
     }
 
@@ -109,7 +109,7 @@ impl Governor {
             current_node_id: Some(node_id),
             generation,
             gen_tick: 0,
-            gens_since_backtrack: 0,
+            gens_since_backtrack: u32::MAX / 2,
         })
     }
 
@@ -296,14 +296,14 @@ impl Governor {
         next_gen
     }
 
-    /// Check if the current branch should be abandoned. Uses two mechanisms:
-    /// 1. **Cooldown**: after a backtrack, wait `patience` generations before
-    ///    checking again so new branches get a fair chance.
-    /// 2. **Stagnation**: count how many consecutive recent generations failed
-    ///    to beat the all-time peak of their ancestors. If `patience` consecutive
-    ///    generations are all below the peak set by some older generation,
-    ///    backtrack. Each generation is compared against the peak of ALL
-    ///    generations older than itself, not just a fixed window.
+    /// Check if the current branch should be abandoned.
+    ///
+    /// A generation is only "successful" if its fitness beats the all-time
+    /// peak of every older ancestor. If it doesn't, backtrack immediately.
+    ///
+    /// `patience` controls the **post-backtrack cooldown only**: after a
+    /// backtrack, the new branch gets `patience` free evaluations before
+    /// the check fires again. The initial chain has no cooldown.
     pub fn should_backtrack(&self) -> bool {
         let node_id = match self.current_node_id {
             Some(id) => id,
@@ -312,9 +312,9 @@ impl Governor {
 
         let patience = self.config.patience as usize;
 
-        // Cooldown: give branches patience generations to prove themselves.
-        // gens_since_backtrack is incremented after each evaluate, so with
-        // patience=N the branch gets N full evaluations before the check fires.
+        // Cooldown: after a backtrack, give the new branch patience
+        // generations to prove itself. The initial chain starts with
+        // gens_since_backtrack high, so no cooldown applies at start.
         if (self.gens_since_backtrack as usize) <= patience {
             return false;
         }
@@ -344,32 +344,18 @@ impl Governor {
             }
         }
 
-        // Need at least patience+1 values (patience recent + 1 reference)
-        if fitnesses.len() <= patience {
+        if fitnesses.len() < 2 {
             return false;
         }
 
-        // Suffix maximums: suffix_max[i] = max of fitnesses[i..]
-        // Used to find the peak of all generations older than generation i.
-        let n = fitnesses.len();
-        let mut suffix_max = vec![f32::MIN; n + 1];
-        for i in (0..n).rev() {
-            suffix_max[i] = suffix_max[i + 1].max(fitnesses[i]);
-        }
+        // Current generation must beat the peak of ALL older generations
+        let current_fit = fitnesses[0];
+        let ancestor_peak = fitnesses[1..]
+            .iter()
+            .cloned()
+            .fold(f32::MIN, f32::max);
 
-        // Count consecutive stagnant generations from newest.
-        // A generation is "stagnant" if it failed to set a new all-time high
-        // (i.e., its fitness is below the peak of ALL older generations).
-        let mut stagnation = 0usize;
-        for i in 0..patience {
-            if fitnesses[i] < suffix_max[i + 1] {
-                stagnation += 1;
-            } else {
-                break;
-            }
-        }
-
-        stagnation >= patience
+        current_fit < ancestor_peak
     }
 
     /// Backtrack to the last improving node and try a different direction.
@@ -851,103 +837,32 @@ mod tests {
     // ─── should_backtrack tests ────────────────────────────────────
 
     #[test]
-    fn single_regression_does_not_trigger_backtrack() {
-        // With patience=2, a single generation declining should not backtrack.
-        let mut gov = test_governor(2);
+    fn no_initial_cooldown_for_fresh_start() {
+        // gens_since_backtrack starts high so the check fires from Gen 1.
+        let gov = test_governor(3);
+        assert!((gov.gens_since_backtrack as usize) > gov.config.patience as usize);
+    }
+
+    #[test]
+    fn single_regression_triggers_backtrack() {
+        // Any regression below ancestor peak triggers immediate backtrack
+        // (patience only controls post-backtrack cooldown, not tolerance).
+        let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
         set_fitness(&gov, root_id, 0.95);
 
         let child = insert_node(&gov, Some(root_id), 1, 0.90);
         gov.current_node_id = Some(child);
         gov.generation = 1;
-        gov.gens_since_backtrack = 3; // past cooldown
+        gov.gens_since_backtrack = u32::MAX / 2; // no cooldown
 
-        // Only 2 values [0.90, 0.95], need patience+1=3 to decide
-        assert!(!gov.should_backtrack());
-    }
-
-    #[test]
-    fn two_regressions_below_peak_triggers_backtrack() {
-        // root(0.98) → A(0.95) → B(0.90)
-        // Both recent values below peak → backtrack.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.95);
-        let b = insert_node(&gov, Some(a), 2, 0.90);
-
-        gov.current_node_id = Some(b);
-        gov.generation = 2;
-        gov.gens_since_backtrack = 3;
-
-        // recent = [0.90, 0.95], recent_best = 0.95
-        // ancestors = [0.98], peak = 0.98 → 0.95 < 0.98 → backtrack
+        // 0.90 < max(0.95) → backtrack
         assert!(gov.should_backtrack());
     }
 
     #[test]
-    fn cooldown_prevents_immediate_rebacktrack() {
-        // Even with terrible fitness, cooldown blocks backtracking.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.90);
-        let b = insert_node(&gov, Some(a), 2, 0.85);
-
-        gov.current_node_id = Some(b);
-        gov.generation = 2;
-        gov.gens_since_backtrack = 1; // only 1 gen since last backtrack
-
-        assert!(!gov.should_backtrack());
-
-        // Also blocked at exactly patience (boundary)
-        gov.gens_since_backtrack = 2;
-        assert!(!gov.should_backtrack());
-    }
-
-    #[test]
-    fn after_backtrack_branch_gets_full_patience() {
-        // After backtracking, the new branch must survive `patience` generations
-        // before the check kicks in again.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        // Simulate: backtrack happened, new child of root created
-        let new_child = insert_node(&gov, Some(root_id), 1, 0.92);
-        gov.current_node_id = Some(new_child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 1; // just 1 gen since backtrack
-
-        // Cooldown blocks despite 0.92 < 0.98
-        assert!(!gov.should_backtrack());
-
-        // After patience+1 generations, the check fires
-        let grandchild = insert_node(&gov, Some(new_child), 2, 0.89);
-        gov.current_node_id = Some(grandchild);
-        gov.generation = 2;
-        gov.gens_since_backtrack = 2;
-
-        // Still in cooldown (2 <= 2)
-        assert!(!gov.should_backtrack());
-
-        // One more generation tips past cooldown
-        let great_gc = insert_node(&gov, Some(grandchild), 3, 0.87);
-        gov.current_node_id = Some(great_gc);
-        gov.generation = 3;
-        gov.gens_since_backtrack = 3;
-
-        // recent = [0.87, 0.89], recent_best = 0.89
-        // ancestors = [0.92, 0.98], peak = 0.98 → 0.89 < 0.98 → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn improvement_in_recent_window_prevents_backtrack() {
-        // root(0.90) → A(0.95) → B(0.97)
-        // The branch is improving — no backtrack.
+    fn improvement_prevents_backtrack() {
+        // Current gen beats the ancestor peak → no backtrack.
         let mut gov = test_governor(2);
         let root_id = gov.current_node_id.unwrap();
         set_fitness(&gov, root_id, 0.90);
@@ -957,87 +872,86 @@ mod tests {
 
         gov.current_node_id = Some(b);
         gov.generation = 2;
-        gov.gens_since_backtrack = 3;
+        gov.gens_since_backtrack = u32::MAX / 2;
 
-        // recent = [0.97, 0.95], recent_best = 0.97
-        // ancestors = [0.90], peak = 0.90 → 0.97 > 0.90 → no backtrack
+        // 0.97 > max(0.95, 0.90) → no backtrack
         assert!(!gov.should_backtrack());
     }
 
     #[test]
-    fn oscillating_decline_triggers_backtrack() {
-        // root(0.98) → A(0.93) → B(0.95) → C(0.91)
-        // Oscillating but overall declining — should backtrack.
-        let mut gov = test_governor(3);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.93);
-        let b = insert_node(&gov, Some(a), 2, 0.95);
-        let c = insert_node(&gov, Some(b), 3, 0.91);
-
-        gov.current_node_id = Some(c);
-        gov.generation = 3;
-        gov.gens_since_backtrack = 4;
-
-        // recent = [0.91, 0.95, 0.93], recent_best = 0.95
-        // ancestors = [0.98], peak = 0.98 → 0.95 < 0.98 → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn patience_1_grants_one_free_generation() {
-        // With patience=1, the branch should get 1 full evaluation before
-        // the check fires — not zero (the previous off-by-one bug).
-        let mut gov = test_governor(1);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let child = insert_node(&gov, Some(root_id), 1, 0.90);
-        gov.current_node_id = Some(child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 1; // just evaluated 1st gen after backtrack
-
-        // Cooldown: 1 <= 1 → skip. The branch gets its 1 free generation.
-        assert!(!gov.should_backtrack());
-
-        // After 2 evaluations, check fires
-        let grandchild = insert_node(&gov, Some(child), 2, 0.85);
-        gov.current_node_id = Some(grandchild);
-        gov.generation = 2;
-        gov.gens_since_backtrack = 2;
-
-        // 2 <= 1 → false → check: B(0.85) < peak-of-older(0.98) → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn peak_in_recent_window_does_not_mask_regression() {
-        // root(0.15) → A(0.25) → B(0.18)
-        // A set a new peak. B failed to beat it.
-        // Old bug: with patience=2, B and A were both in the "recent window,"
-        // so recent_best=0.25 > ancestor_peak=0.15 → no backtrack.
-        // Fixed: B is compared against peak of ALL older gens (0.25 from A).
-        let mut gov = test_governor(1);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.15);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.25);
-        let b = insert_node(&gov, Some(a), 2, 0.18);
-
-        gov.current_node_id = Some(b);
-        gov.generation = 2;
-        gov.gens_since_backtrack = 3;
-
-        // B(0.18) < peak-of-older(0.25 from A) → stagnation=1 >= patience=1
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn peak_in_window_needs_full_patience_to_trigger() {
-        // Same scenario but patience=2: one regression isn't enough.
+    fn cooldown_prevents_immediate_rebacktrack() {
+        // Even with terrible fitness, cooldown blocks backtracking.
         let mut gov = test_governor(2);
         let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let child = insert_node(&gov, Some(root_id), 1, 0.50);
+        gov.current_node_id = Some(child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 1; // within cooldown
+
+        assert!(!gov.should_backtrack());
+
+        // Also blocked at exactly patience (boundary)
+        gov.gens_since_backtrack = 2;
+        assert!(!gov.should_backtrack());
+
+        // Past cooldown → check fires: 0.50 < 0.98 → backtrack
+        gov.gens_since_backtrack = 3;
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn after_backtrack_branch_gets_patience_cooldown() {
+        // After backtracking, the new branch gets exactly `patience`
+        // free evaluations before the check fires again.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let new_child = insert_node(&gov, Some(root_id), 1, 0.80);
+        gov.current_node_id = Some(new_child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 1;
+
+        // Cooldown: 1 <= 2 → skip
+        assert!(!gov.should_backtrack());
+
+        gov.gens_since_backtrack = 2;
+        // Cooldown: 2 <= 2 → skip
+        assert!(!gov.should_backtrack());
+
+        gov.gens_since_backtrack = 3;
+        // Past cooldown: 0.80 < 0.98 → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn patience_1_gives_one_free_gen() {
+        // With patience=1, the branch gets exactly 1 free evaluation.
+        let mut gov = test_governor(1);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.98);
+
+        let child = insert_node(&gov, Some(root_id), 1, 0.85);
+        gov.current_node_id = Some(child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = 1;
+
+        // Cooldown: 1 <= 1 → skip
+        assert!(!gov.should_backtrack());
+
+        gov.gens_since_backtrack = 2;
+        // Past cooldown: 0.85 < 0.98 → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn peak_in_ancestors_not_masked_by_intermediate() {
+        // root(0.15) → A(0.25) → B(0.18)
+        // B(0.18) < peak-of-older(0.25 from A) → backtrack
+        let mut gov = test_governor(1);
+        let root_id = gov.current_node_id.unwrap();
         set_fitness(&gov, root_id, 0.15);
 
         let a = insert_node(&gov, Some(root_id), 1, 0.25);
@@ -1045,26 +959,16 @@ mod tests {
 
         gov.current_node_id = Some(b);
         gov.generation = 2;
-        gov.gens_since_backtrack = 3;
+        gov.gens_since_backtrack = u32::MAX / 2;
 
-        // Only 1 stagnant gen, patience requires 2
-        assert!(!gov.should_backtrack());
-
-        // Add C also below peak
-        let c = insert_node(&gov, Some(b), 3, 0.20);
-        gov.current_node_id = Some(c);
-        gov.generation = 3;
-        gov.gens_since_backtrack = 4;
-
-        // C(0.20) and B(0.18) both below A's peak (0.25) → stagnation=2
         assert!(gov.should_backtrack());
     }
 
     #[test]
-    fn deep_ancestor_peak_still_triggers_backtrack() {
-        // Peak is far back in the chain, not in the immediate parent.
-        // root(0.50) → A(0.20) → B(0.30) → C(0.25) → D(0.28)
-        // With patience=2: D and C both below root's 0.50.
+    fn deep_ancestor_peak_triggers_backtrack() {
+        // Peak is far back in the chain.
+        // root(0.50) → A(0.20) → B(0.30) → C(0.25)
+        // C(0.25) < max(0.30, 0.20, 0.50) = 0.50 → backtrack
         let mut gov = test_governor(2);
         let root_id = gov.current_node_id.unwrap();
         set_fitness(&gov, root_id, 0.50);
@@ -1072,14 +976,39 @@ mod tests {
         let a = insert_node(&gov, Some(root_id), 1, 0.20);
         let b = insert_node(&gov, Some(a), 2, 0.30);
         let c = insert_node(&gov, Some(b), 3, 0.25);
-        let d = insert_node(&gov, Some(c), 4, 0.28);
 
-        gov.current_node_id = Some(d);
-        gov.generation = 4;
-        gov.gens_since_backtrack = 5;
+        gov.current_node_id = Some(c);
+        gov.generation = 3;
+        gov.gens_since_backtrack = u32::MAX / 2;
 
-        // D(0.28) < 0.50, C(0.25) < 0.50 → stagnation=2 → backtrack
         assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn not_enough_history_prevents_backtrack() {
+        // With only the root node, should never backtrack (need 2+ values).
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.50);
+
+        gov.gens_since_backtrack = u32::MAX / 2;
+        assert!(!gov.should_backtrack());
+    }
+
+    #[test]
+    fn exact_tie_does_not_trigger_backtrack() {
+        // If current gen equals the ancestor peak, it's not a regression.
+        let mut gov = test_governor(1);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.50);
+
+        let child = insert_node(&gov, Some(root_id), 1, 0.50);
+        gov.current_node_id = Some(child);
+        gov.generation = 1;
+        gov.gens_since_backtrack = u32::MAX / 2;
+
+        // 0.50 < 0.50 is false → no backtrack
+        assert!(!gov.should_backtrack());
     }
 
     // ─── backtrack tests ───────────────────────────────────────────
@@ -1190,17 +1119,5 @@ mod tests {
         // Third backtrack: memory_capacity exhausted, tries processing_slots +1.0
         gov.current_node_id = Some(second_child);
         assert!(gov.backtrack().is_some());
-    }
-
-    #[test]
-    fn not_enough_history_prevents_backtrack() {
-        // With only 1 generation of data, should never backtrack.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.50);
-
-        gov.gens_since_backtrack = 10; // past cooldown
-        // Only root node — 1 fitness value < patience+1=3
-        assert!(!gov.should_backtrack());
     }
 }

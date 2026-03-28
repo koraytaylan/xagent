@@ -299,10 +299,11 @@ impl Governor {
     /// Check if the current branch should be abandoned. Uses two mechanisms:
     /// 1. **Cooldown**: after a backtrack, wait `patience` generations before
     ///    checking again so new branches get a fair chance.
-    /// 2. **Recent-best vs ancestor-peak**: the best fitness among the last
-    ///    `patience` generations must be below the peak of all ancestors
-    ///    beyond the window. This catches both steady declines and oscillating
-    ///    declines (bad-good-bad-good) that never produce consecutive regressions.
+    /// 2. **Stagnation**: count how many consecutive recent generations failed
+    ///    to beat the all-time peak of their ancestors. If `patience` consecutive
+    ///    generations are all below the peak set by some older generation,
+    ///    backtrack. Each generation is compared against the peak of ALL
+    ///    generations older than itself, not just a fixed window.
     pub fn should_backtrack(&self) -> bool {
         let node_id = match self.current_node_id {
             Some(id) => id,
@@ -318,15 +319,11 @@ impl Governor {
             return false;
         }
 
-        // Walk up the tree collecting fitness values (newest first)
+        // Walk the entire ancestor chain collecting fitness values (newest first)
         let mut fitnesses: Vec<f32> = Vec::new();
         let mut current = Some(node_id);
-        let needed = patience + 2;
 
         while let Some(nid) = current {
-            if fitnesses.len() >= needed {
-                break;
-            }
             match self.db.query_row(
                 "SELECT best_fitness, parent_id FROM node WHERE id = ?1",
                 params![nid],
@@ -347,23 +344,32 @@ impl Governor {
             }
         }
 
-        // Need at least patience+1 values (patience recent + 1 ancestor)
+        // Need at least patience+1 values (patience recent + 1 reference)
         if fitnesses.len() <= patience {
             return false;
         }
 
-        // Best fitness in the last `patience` generations
-        let recent_best = fitnesses[..patience]
-            .iter()
-            .cloned()
-            .fold(f32::MIN, f32::max);
-        // Peak of all ancestors beyond the recent window
-        let ancestor_peak = fitnesses[patience..]
-            .iter()
-            .cloned()
-            .fold(f32::MIN, f32::max);
+        // Suffix maximums: suffix_max[i] = max of fitnesses[i..]
+        // Used to find the peak of all generations older than generation i.
+        let n = fitnesses.len();
+        let mut suffix_max = vec![f32::MIN; n + 1];
+        for i in (0..n).rev() {
+            suffix_max[i] = suffix_max[i + 1].max(fitnesses[i]);
+        }
 
-        recent_best < ancestor_peak
+        // Count consecutive stagnant generations from newest.
+        // A generation is "stagnant" if it failed to set a new all-time high
+        // (i.e., its fitness is below the peak of ALL older generations).
+        let mut stagnation = 0usize;
+        for i in 0..patience {
+            if fitnesses[i] < suffix_max[i + 1] {
+                stagnation += 1;
+            } else {
+                break;
+            }
+        }
+
+        stagnation >= patience
     }
 
     /// Backtrack to the last improving node and try a different direction.
@@ -1001,8 +1007,78 @@ mod tests {
         gov.generation = 2;
         gov.gens_since_backtrack = 2;
 
-        // 2 <= 1 → false → check: recent=[0.85], ancestors=[0.90, 0.98]
-        // 0.85 < 0.98 → backtrack
+        // 2 <= 1 → false → check: B(0.85) < peak-of-older(0.98) → backtrack
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn peak_in_recent_window_does_not_mask_regression() {
+        // root(0.15) → A(0.25) → B(0.18)
+        // A set a new peak. B failed to beat it.
+        // Old bug: with patience=2, B and A were both in the "recent window,"
+        // so recent_best=0.25 > ancestor_peak=0.15 → no backtrack.
+        // Fixed: B is compared against peak of ALL older gens (0.25 from A).
+        let mut gov = test_governor(1);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.15);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.25);
+        let b = insert_node(&gov, Some(a), 2, 0.18);
+
+        gov.current_node_id = Some(b);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 3;
+
+        // B(0.18) < peak-of-older(0.25 from A) → stagnation=1 >= patience=1
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn peak_in_window_needs_full_patience_to_trigger() {
+        // Same scenario but patience=2: one regression isn't enough.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.15);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.25);
+        let b = insert_node(&gov, Some(a), 2, 0.18);
+
+        gov.current_node_id = Some(b);
+        gov.generation = 2;
+        gov.gens_since_backtrack = 3;
+
+        // Only 1 stagnant gen, patience requires 2
+        assert!(!gov.should_backtrack());
+
+        // Add C also below peak
+        let c = insert_node(&gov, Some(b), 3, 0.20);
+        gov.current_node_id = Some(c);
+        gov.generation = 3;
+        gov.gens_since_backtrack = 4;
+
+        // C(0.20) and B(0.18) both below A's peak (0.25) → stagnation=2
+        assert!(gov.should_backtrack());
+    }
+
+    #[test]
+    fn deep_ancestor_peak_still_triggers_backtrack() {
+        // Peak is far back in the chain, not in the immediate parent.
+        // root(0.50) → A(0.20) → B(0.30) → C(0.25) → D(0.28)
+        // With patience=2: D and C both below root's 0.50.
+        let mut gov = test_governor(2);
+        let root_id = gov.current_node_id.unwrap();
+        set_fitness(&gov, root_id, 0.50);
+
+        let a = insert_node(&gov, Some(root_id), 1, 0.20);
+        let b = insert_node(&gov, Some(a), 2, 0.30);
+        let c = insert_node(&gov, Some(b), 3, 0.25);
+        let d = insert_node(&gov, Some(c), 4, 0.28);
+
+        gov.current_node_id = Some(d);
+        gov.generation = 4;
+        gov.gens_since_backtrack = 5;
+
+        // D(0.28) < 0.50, C(0.25) < 0.50 → stagnation=2 → backtrack
         assert!(gov.should_backtrack());
     }
 

@@ -238,7 +238,6 @@ struct App {
     // Evolution governor (created on Start/Resume, not on App init)
     governor: Option<Governor>,
     evo_snapshot: EvolutionSnapshot,
-    evo_gen_tick: u64,
     evo_wall_start: Instant,
     db_path: String,
     governor_config: GovernorConfig,
@@ -341,7 +340,6 @@ impl App {
             console_log: VecDeque::new(),
             governor: None,
             evo_snapshot,
-            evo_gen_tick: 0,
             evo_wall_start: Instant::now(),
             db_path: db_path.to_string(),
             governor_config,
@@ -398,7 +396,6 @@ impl App {
                         self.evo_snapshot.patience = gov_config.patience;
                         self.evo_snapshot.max_generations = gov_config.max_generations;
                         self.evo_wall_start = Instant::now();
-                        self.evo_gen_tick = 0;
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Started new run".into());
@@ -420,7 +417,6 @@ impl App {
                         }
                         self.governor = Some(gov);
                         self.evo_wall_start = Instant::now();
-                        self.evo_gen_tick = 0;
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Resumed from database".into());
@@ -445,7 +441,6 @@ impl App {
                 self.agents.clear();
                 self.next_agent_id = 0;
                 self.tick = 0;
-                self.evo_gen_tick = 0;
                 self.paused = true;
                 if let Err(e) = reset_database(&self.db_path) {
                     self.log_msg(format!("[EVOLUTION] Failed to reset DB: {}", e));
@@ -475,6 +470,95 @@ impl App {
                 mutate_config(&seed)
             };
             self.spawn_agent(cfg, 0);
+        }
+    }
+
+    fn spawn_population_from_configs(&mut self, configs: &[BrainConfig]) {
+        self.agents.clear();
+        self.next_agent_id = 0;
+        self.tick = 0;
+        for cfg in configs {
+            self.spawn_agent(cfg.clone(), 0);
+        }
+    }
+
+    /// Evaluate the current generation, advance to the next (or finish).
+    fn advance_generation(&mut self) {
+        enum GenOutcome {
+            Finished(String),
+            Backtrack(Vec<BrainConfig>, String),
+            BacktrackExhausted(String),
+            NextGen(Vec<BrainConfig>, String),
+        }
+
+        let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
+
+        let outcome = {
+            let gov = match self.governor.as_mut() {
+                Some(g) => g,
+                None => return,
+            };
+
+            let fitness = gov.evaluate(&self.agents);
+            gov.log_generation(&fitness);
+            gov.update_wall_time(wall_secs);
+
+            let gen = gov.generation;
+            let best_fit = fitness.first().map(|f| f.composite_fitness).unwrap_or(0.0);
+            let gen_msg = format!(
+                "[EVOLUTION] Gen {} complete — best fitness: {:.2}",
+                gen, best_fit
+            );
+
+            if gov.evolution_complete() {
+                GenOutcome::Finished(gen_msg)
+            } else if gov.should_backtrack() {
+                let patience = gov.config.patience;
+                if let Some(base_config) = gov.backtrack() {
+                    let pop_size = gov.config.population_size;
+                    let configs: Vec<BrainConfig> = (0..pop_size)
+                        .map(|i| {
+                            if i == 0 { base_config.clone() } else { mutate_config(&base_config) }
+                        })
+                        .collect();
+                    let bt_msg = format!(
+                        "[EVOLUTION] Fitness regressed for {} gens — backtracking",
+                        patience
+                    );
+                    GenOutcome::Backtrack(configs, format!("{}\n{}", gen_msg, bt_msg))
+                } else {
+                    GenOutcome::BacktrackExhausted(gen_msg)
+                }
+            } else {
+                let next_configs = gov.select_and_breed(&fitness);
+                GenOutcome::NextGen(next_configs, gen_msg)
+            }
+        };
+        // Governor borrow released — safe to call self methods
+        match outcome {
+            GenOutcome::Finished(msg) => {
+                self.log_msg(msg);
+                self.log_msg(format!(
+                    "[EVOLUTION] Finished after {} generations",
+                    self.governor.as_ref().map(|g| g.generation).unwrap_or(0)
+                ));
+                self.evo_snapshot.state = EvolutionState::Paused;
+                self.paused = true;
+            }
+            GenOutcome::Backtrack(configs, msg) => {
+                self.log_msg(msg);
+                self.spawn_population_from_configs(&configs);
+            }
+            GenOutcome::BacktrackExhausted(msg) => {
+                self.log_msg(msg);
+                self.log_msg("[EVOLUTION] Tree exhausted — no backtrack targets".into());
+                self.evo_snapshot.state = EvolutionState::Paused;
+                self.paused = true;
+            }
+            GenOutcome::NextGen(configs, msg) => {
+                self.log_msg(msg);
+                self.spawn_population_from_configs(&configs);
+            }
         }
     }
 
@@ -1152,7 +1236,19 @@ impl ApplicationHandler for App {
 
                         self.tick += 1;
 
+                        // ── Governor tick tracking ──────────────
+                        if let Some(gov) = &mut self.governor {
+                            gov.tick();
+                        }
+
                         // (telemetry is shown on-screen via HUD — no console spam)
+                    }
+
+                    // ── Generation completion check (after tick batch) ──
+                    if let Some(gov) = &self.governor {
+                        if gov.generation_complete() {
+                            self.advance_generation();
+                        }
                     }
 
                     // Clamp accumulator to prevent unbounded buildup
@@ -1474,13 +1570,18 @@ impl ApplicationHandler for App {
                                 }).collect();
 
                                 // Build evolution snapshot for the UI
-                                self.evo_snapshot.gen_tick = self.evo_gen_tick;
-                                self.evo_snapshot.wall_time_secs =
-                                    self.evo_wall_start.elapsed().as_secs_f64();
                                 if let Some(gov) = &self.governor {
+                                    self.evo_snapshot.gen_tick = gov.gen_tick;
+                                    self.evo_snapshot.generation = gov.generation;
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
                                     self.evo_snapshot.fitness_history = gov.fitness_history();
+                                }
+                                let wall = self.evo_wall_start.elapsed().as_secs_f64();
+                                self.evo_snapshot.wall_time_secs = wall;
+                                if wall > 0.0 {
+                                    self.evo_snapshot.ticks_per_sec =
+                                        self.evo_snapshot.gen_tick as f64 / wall;
                                 }
                                 // Move snapshot out so we can pass &mut to the closure
                                 let mut evo_snap = std::mem::take(&mut self.evo_snapshot);

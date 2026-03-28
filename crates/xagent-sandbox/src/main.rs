@@ -7,6 +7,7 @@ use egui_wgpu;
 use glam::Vec3;
 use log::info;
 use rand::Rng;
+use rayon::prelude::*;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -1000,14 +1001,13 @@ impl ApplicationHandler for App {
                     // repeated heap allocations (12 agents × 10 ticks = 120/frame).
                     let mut all_positions: Vec<(Vec3, bool)> =
                         Vec::with_capacity(self.agents.len());
-                    let mut others_buf: Vec<OtherAgent> =
-                        Vec::with_capacity(self.agents.len());
 
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
                         ticks_run += 1;
 
                         if let Some(world) = &mut self.world {
+                            // ── Phase 1: Snapshot positions (sequential) ──
                             all_positions.clear();
                             all_positions.extend(
                                 self.agents
@@ -1015,38 +1015,116 @@ impl ApplicationHandler for App {
                                     .map(|a| (a.body.body.position, a.body.body.alive)),
                             );
 
+                            // ── Phase 2: Brain ticks in parallel ──
+                            // Each agent's brain is independent; world is read-only here.
+                            {
+                                let world_ref: &WorldState = &*world;
+                                let tick = self.tick;
+                                let all_pos = &all_positions;
+
+                                self.agents
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .for_each(|(i, agent)| {
+                                        if !agent.body.body.alive {
+                                            return;
+                                        }
+                                        let run_brain =
+                                            (tick + i as u64) % brain_stride == 0;
+                                        if !run_brain {
+                                            return;
+                                        }
+
+                                        let others: Vec<OtherAgent> = all_pos
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(j, _)| *j != i)
+                                            .map(|(_, (pos, alive))| OtherAgent {
+                                                position: *pos,
+                                                alive: *alive,
+                                            })
+                                            .collect();
+
+                                        let frame =
+                                            senses::extract_senses_with_others(
+                                                &agent.body,
+                                                world_ref,
+                                                tick,
+                                                &others,
+                                            );
+
+                                        let m = agent.brain.tick(&frame);
+                                        agent.cached_motor = m;
+
+                                        // Record sparkline histories
+                                        let t = agent.brain.telemetry();
+                                        let cap = 10_000;
+                                        let h = &mut agent.prediction_error_history;
+                                        if h.len() >= cap {
+                                            h.pop_front();
+                                        }
+                                        h.push_back(
+                                            t.prediction_error.clamp(0.0, 1.0),
+                                        );
+                                        let h = &mut agent.exploration_rate_history;
+                                        if h.len() >= cap {
+                                            h.pop_front();
+                                        }
+                                        h.push_back(
+                                            agent
+                                                .brain
+                                                .action_selector
+                                                .exploration_rate(),
+                                        );
+                                        let ef = agent.body.body.internal.energy
+                                            / agent
+                                                .body
+                                                .body
+                                                .internal
+                                                .max_energy
+                                                .max(0.001);
+                                        let h = &mut agent.energy_history;
+                                        if h.len() >= cap {
+                                            h.pop_front();
+                                        }
+                                        h.push_back(ef.clamp(0.0, 1.0));
+                                        let inf = agent.body.body.internal.integrity
+                                            / agent
+                                                .body
+                                                .body
+                                                .internal
+                                                .max_integrity
+                                                .max(0.001);
+                                        let h = &mut agent.integrity_history;
+                                        if h.len() >= cap {
+                                            h.pop_front();
+                                        }
+                                        h.push_back(inf.clamp(0.0, 1.0));
+                                        let vals = agent
+                                            .brain
+                                            .action_selector
+                                            .global_action_values();
+                                        let mut aw = [0.0f32; 8];
+                                        for (j, v) in vals.iter().enumerate().take(8)
+                                        {
+                                            aw[j] = *v;
+                                        }
+                                        let h = &mut agent.action_weight_history;
+                                        if h.len() >= cap {
+                                            h.pop_front();
+                                        }
+                                        h.push_back(aw);
+                                    });
+                            }
+
+                            // ── Phase 3: Physics + stats (sequential, mutates world) ──
                             for i in 0..self.agents.len() {
                                 let agent = &mut self.agents[i];
                                 if !agent.body.body.alive {
                                     continue;
                                 }
 
-                                // Stagger brain ticks across agents so CPU load
-                                // is spread evenly across frames.
-                                let run_brain = (self.tick + i as u64) % brain_stride == 0;
-
-                                let motor = if run_brain {
-                                    others_buf.clear();
-                                    for (j, (pos, alive)) in all_positions.iter().enumerate() {
-                                        if j != i {
-                                            others_buf.push(OtherAgent {
-                                                position: *pos,
-                                                alive: *alive,
-                                            });
-                                        }
-                                    }
-
-                                    let frame = senses::extract_senses_with_others(
-                                        &agent.body, world, self.tick, &others_buf,
-                                    );
-
-                                    let m = agent.brain.tick(&frame);
-                                    agent.cached_motor = m.clone();
-                                    m
-                                } else {
-                                    agent.cached_motor.clone()
-                                };
-
+                                let motor = agent.cached_motor.clone();
                                 let consumed = xagent_sandbox::physics::step(
                                     &mut agent.body, &motor, world, SIM_DT,
                                 );
@@ -1055,54 +1133,28 @@ impl ApplicationHandler for App {
                                     agent.food_consumed += 1;
                                 }
                                 agent.total_ticks_alive += 1;
-
-                                // Record position for heatmap
                                 agent.record_heatmap(world.config.world_size);
-                                // Record trail breadcrumb
                                 agent.record_trail();
 
-                                // Push sparkline history (keep last 120 samples)
-                                if run_brain {
-                                    let t = agent.brain.telemetry();
-                                    let cap = 10_000;
-                                    let h = &mut agent.prediction_error_history;
-                                    if h.len() >= cap { h.pop_front(); }
-                                    h.push_back(t.prediction_error.clamp(0.0, 1.0));
-                                    let h = &mut agent.exploration_rate_history;
-                                    if h.len() >= cap { h.pop_front(); }
-                                    h.push_back(agent.brain.action_selector.exploration_rate());
-                                    let ef = agent.body.body.internal.energy
-                                        / agent.body.body.internal.max_energy.max(0.001);
-                                    let h = &mut agent.energy_history;
-                                    if h.len() >= cap { h.pop_front(); }
-                                    h.push_back(ef.clamp(0.0, 1.0));
-                                    let inf = agent.body.body.internal.integrity
-                                        / agent.body.body.internal.max_integrity.max(0.001);
-                                    let h = &mut agent.integrity_history;
-                                    if h.len() >= cap { h.pop_front(); }
-                                    h.push_back(inf.clamp(0.0, 1.0));
-                                    let vals = agent.brain.action_selector.global_action_values();
-                                    let mut aw = [0.0f32; 8];
-                                    for (j, v) in vals.iter().enumerate().take(8) {
-                                        aw[j] = *v;
-                                    }
-                                    let h = &mut agent.action_weight_history;
-                                    if h.len() >= cap { h.pop_front(); }
-                                    h.push_back(aw);
-                                }
-
+                                let run_brain =
+                                    (self.tick + i as u64) % brain_stride == 0;
                                 if run_brain && i == self.selected_agent_idx {
                                     let life_ticks = agent.age(self.tick);
                                     log_tick_to_csv(
-                                        &mut self.logger, agent, world, &motor, life_ticks,
+                                        &mut self.logger,
+                                        agent,
+                                        world,
+                                        &motor,
+                                        life_ticks,
                                     );
                                     self.total_prediction_error +=
-                                        agent.brain.telemetry().prediction_error as f64;
+                                        agent.brain.telemetry().prediction_error
+                                            as f64;
                                     self.error_count += 1;
                                 }
                             }
 
-                            // Agent-agent collision resolution
+                            // ── Phase 4: Collision resolution (sequential) ──
                             {
                                 let min_dist: f32 = 2.0;
                                 let min_dist_sq = min_dist * min_dist;
@@ -2146,23 +2198,35 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
                 .map(|a| (a.body.body.position, a.body.body.alive))
                 .collect();
 
-            for i in 0..agents.len() {
-                let agent = &mut agents[i];
-                if agent.body.body.alive {
-                    let others: Vec<OtherAgent> = positions
+            // ── Parallel brain ticks ──
+            {
+                let world_ref: &WorldState = &world;
+                let pos = &positions;
+                agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
+                    if !agent.body.body.alive {
+                        return;
+                    }
+                    let others: Vec<OtherAgent> = pos
                         .iter()
                         .enumerate()
                         .filter(|(j, _)| *j != i)
-                        .map(|(_, (pos, alive))| OtherAgent {
-                            position: *pos,
+                        .map(|(_, (p, alive))| OtherAgent {
+                            position: *p,
                             alive: *alive,
                         })
                         .collect();
-
                     let frame = senses::extract_senses_with_others(
-                        &agent.body, &world, tick, &others,
+                        &agent.body, world_ref, tick, &others,
                     );
-                    let motor = agent.brain.tick(&frame);
+                    agent.cached_motor = agent.brain.tick(&frame);
+                });
+            }
+
+            // ── Sequential physics + respawn (mutates world) ──
+            for i in 0..agents.len() {
+                let agent = &mut agents[i];
+                if agent.body.body.alive {
+                    let motor = agent.cached_motor.clone();
                     let consumed = xagent_sandbox::physics::step(
                         &mut agent.body, &motor, &mut world, dt,
                     );

@@ -301,23 +301,25 @@ impl Governor {
         next_gen
     }
 
-    /// Check if fitness has regressed compared to the peak within recent
-    /// `patience` generations. This avoids the problem where oscillating
-    /// fitness (down-up-down-up) never triggers with a strictly-consecutive
-    /// regression check.
+    /// Check if fitness has regressed for the last `patience` generations
+    /// compared to the peak of ancestors beyond them. This gives each branch
+    /// `patience` generations to prove itself before backtracking.
     pub fn should_backtrack(&self) -> bool {
         let node_id = match self.current_node_id {
             Some(id) => id,
             None => return false,
         };
 
-        // Walk up the tree collecting recent fitness values
+        let patience = self.config.patience as usize;
+
+        // Walk up the tree collecting fitness values.
+        // We need `patience` recent values + at least 1 ancestor beyond them.
         let mut fitnesses: Vec<f32> = Vec::new();
         let mut current = Some(node_id);
-        let window = self.config.patience as usize + 1;
+        let needed = patience + 2; // patience recent + enough ancestors
 
         while let Some(nid) = current {
-            if fitnesses.len() >= window {
+            if fitnesses.len() >= needed {
                 break;
             }
             match self.db.query_row(
@@ -340,15 +342,20 @@ impl Governor {
             }
         }
 
-        if fitnesses.len() < 2 {
+        // Need at least patience+1 values (patience recent + 1 ancestor)
+        if fitnesses.len() <= patience {
             return false;
         }
 
-        // fitnesses[0] is current (newest), fitnesses[last] is oldest in window.
-        // Backtrack if the current fitness is worse than the peak in the window.
-        let current_fit = fitnesses[0];
-        let peak = fitnesses[1..].iter().cloned().fold(f32::MIN, f32::max);
-        current_fit < peak
+        // fitnesses[0..patience] are the recent generations (newest first).
+        // fitnesses[patience..] are the ancestors beyond the patience window.
+        // Backtrack if ALL recent generations are below the peak ancestor.
+        let recent = &fitnesses[..patience];
+        let peak = fitnesses[patience..]
+            .iter()
+            .cloned()
+            .fold(f32::MIN, f32::max);
+        recent.iter().all(|&f| f < peak)
     }
 
     /// Backtrack to the last improving node and try a different direction.

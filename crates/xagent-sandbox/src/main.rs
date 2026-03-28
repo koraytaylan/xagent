@@ -24,7 +24,7 @@ use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
-use xagent_sandbox::governor::{check_existing_session, reset_database, Governor};
+use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, Tab,
     TabContext,
@@ -484,16 +484,9 @@ impl App {
 
     /// Evaluate the current generation, advance to the next (or finish).
     fn advance_generation(&mut self) {
-        enum GenOutcome {
-            Finished(String),
-            Backtrack(Vec<BrainConfig>, String),
-            BacktrackExhausted(String),
-            NextGen(Vec<BrainConfig>, String),
-        }
-
         let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
 
-        let outcome = {
+        let result = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -502,63 +495,23 @@ impl App {
             let fitness = gov.evaluate(&self.agents);
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
-            gov.gens_since_backtrack += 1;
-
-            let gen = gov.generation;
-            let best_fit = fitness.first().map(|f| f.composite_fitness).unwrap_or(0.0);
-            let gen_msg = format!(
-                "[EVOLUTION] Gen {} complete — best fitness: {:.2}",
-                gen, best_fit
-            );
-
-            if gov.evolution_complete() {
-                GenOutcome::Finished(gen_msg)
-            } else if gov.should_backtrack() {
-                let patience = gov.config.patience;
-                if let Some(base_config) = gov.backtrack() {
-                    let pop_size = gov.config.population_size;
-                    let configs: Vec<BrainConfig> = (0..pop_size)
-                        .map(|i| {
-                            if i == 0 { base_config.clone() } else { mutate_config(&base_config) }
-                        })
-                        .collect();
-                    let bt_msg = format!(
-                        "[EVOLUTION] Fitness regressed for {} gens — backtracking",
-                        patience
-                    );
-                    GenOutcome::Backtrack(configs, format!("{}\n{}", gen_msg, bt_msg))
-                } else {
-                    GenOutcome::BacktrackExhausted(gen_msg)
-                }
-            } else {
-                let next_configs = gov.select_and_breed(&fitness);
-                GenOutcome::NextGen(next_configs, gen_msg)
-            }
+            gov.advance(&fitness)
         };
+
         // Governor borrow released — safe to call self methods
-        match outcome {
-            GenOutcome::Finished(msg) => {
-                self.log_msg(msg);
-                self.log_msg(format!(
-                    "[EVOLUTION] Finished after {} generations",
-                    self.governor.as_ref().map(|g| g.generation).unwrap_or(0)
-                ));
-                self.evo_snapshot.state = EvolutionState::Paused;
-                self.paused = true;
-            }
-            GenOutcome::Backtrack(configs, msg) => {
-                self.log_msg(msg);
+        match result {
+            AdvanceResult::Continue { configs, messages } => {
+                for msg in messages {
+                    self.log_msg(msg);
+                }
                 self.spawn_population_from_configs(&configs);
             }
-            GenOutcome::BacktrackExhausted(msg) => {
-                self.log_msg(msg);
-                self.log_msg("[EVOLUTION] Tree exhausted — no backtrack targets".into());
+            AdvanceResult::Finished { messages } => {
+                for msg in messages {
+                    self.log_msg(msg);
+                }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
-            }
-            GenOutcome::NextGen(configs, msg) => {
-                self.log_msg(msg);
-                self.spawn_population_from_configs(&configs);
             }
         }
     }
@@ -2125,7 +2078,7 @@ fn log_tick_to_csv(
 // ── Headless evolution loop ─────────────────────────────────────────────
 
 fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
-    use xagent_sandbox::governor::Governor;
+    use xagent_sandbox::governor::{AdvanceResult, Governor};
 
     info!("Running headless evolution");
     let dt = 1.0 / config.world.tick_rate;
@@ -2251,7 +2204,6 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
         // Evaluate
         let fitness = governor.evaluate(&agents);
         governor.log_generation(&fitness);
-        governor.gens_since_backtrack += 1;
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",
             gen_elapsed.as_secs_f64(),
@@ -2261,29 +2213,21 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool) {
         // Update wall time
         governor.update_wall_time(start_time.elapsed().as_secs_f64());
 
-        // Check for regression and possibly backtrack
-        if governor.should_backtrack() {
-            println!("⚠ Fitness regressed for {} consecutive generations — backtracking",
-                     governor.config.patience);
-            if let Some(base_config) = governor.backtrack() {
-                current_configs = (0..governor.config.population_size)
-                    .map(|i| {
-                        if i == 0 {
-                            base_config.clone()
-                        } else {
-                            mutate_config(&base_config)
-                        }
-                    })
-                    .collect();
-                continue;
-            } else {
-                println!("✗ Tree exhausted — no more backtrack targets");
+        // Advance
+        match governor.advance(&fitness) {
+            AdvanceResult::Continue { configs, messages } => {
+                for msg in &messages {
+                    println!("{}", msg);
+                }
+                current_configs = configs;
+            }
+            AdvanceResult::Finished { messages } => {
+                for msg in &messages {
+                    println!("{}", msg);
+                }
                 break;
             }
         }
-
-        // Select and breed
-        current_configs = governor.select_and_breed(&fitness);
     }
 
     let total_time = start_time.elapsed();
@@ -2331,8 +2275,9 @@ fn dump_tree(db_path: &str) {
             format!(" ({})", parts.join(" "))
         };
         let status_marker = match node.status.as_str() {
-            "backtracked" => " ✗",
+            "failed" => " ✗",
             "exhausted" => " ⊘",
+            "successful" => " ✓",
             "active" if Some(node.id) == gov.current_node_id => " ★",
             _ => "",
         };

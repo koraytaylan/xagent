@@ -1092,8 +1092,9 @@ impl<'a> TabContext<'a> {
             );
 
             let color = match node.status.as_str() {
-                "backtracked" => egui::Color32::from_rgb(180, 60, 60),
+                "failed" => egui::Color32::from_rgb(180, 60, 60),
                 "exhausted" => egui::Color32::GRAY,
+                "successful" => egui::Color32::from_rgb(100, 200, 100),
                 _ if is_current => egui::Color32::from_rgb(80, 220, 120),
                 _ => egui::Color32::from_gray(180),
             };
@@ -1104,8 +1105,9 @@ impl<'a> TabContext<'a> {
                 }
                 ui.label(egui::RichText::new(&text).color(color).monospace());
                 match node.status.as_str() {
-                    "backtracked" => { ui.label(egui::RichText::new("✗").small()); }
+                    "failed" => { ui.label(egui::RichText::new("✗").small()); }
                     "exhausted" => { ui.label(egui::RichText::new("⊘").small()); }
+                    "successful" => { ui.label(egui::RichText::new("✓").small()); }
                     _ => {}
                 }
             });

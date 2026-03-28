@@ -23,8 +23,33 @@ pub struct AgentFitness {
     pub composite_fitness: f32,
 }
 
+/// Result of `Governor::advance()` — tells the caller what to do next.
+pub enum AdvanceResult {
+    /// Simulation continues — spawn the given configs for the next generation.
+    Continue {
+        configs: Vec<BrainConfig>,
+        messages: Vec<String>,
+    },
+    /// Max generations reached — stop the simulation.
+    Finished {
+        messages: Vec<String>,
+    },
+}
+
 /// The evolution governor. Owns the SQLite connection and drives the
-/// generational loop: evaluate → select → breed → repeat.
+/// generational loop: evaluate → advance → breed → repeat.
+///
+/// # Algorithm
+///
+/// A generation "succeeds" only if its fitness strictly exceeds the global
+/// `best_score`. Successful nodes become the new spawn parent (tree deepens).
+/// Failed nodes are dead ends — the governor spawns another child from the
+/// current spawn parent with different mutations.
+///
+/// Each node may spawn at most `patience` children. When the limit is
+/// reached, the node is "exhausted" and the governor cascades up to its
+/// parent. If the root exhausts, `best_score` rolls back to the root's own
+/// fitness, its attempt counter resets, and evolution continues.
 pub struct Governor {
     pub db: Connection,
     pub config: GovernorConfig,
@@ -32,9 +57,10 @@ pub struct Governor {
     pub current_node_id: Option<i64>,
     pub generation: u32,
     pub gen_tick: u64,
-    /// Generations evaluated since last backtrack (or start). Used as cooldown
-    /// so new branches get `patience` generations to prove themselves.
-    pub gens_since_backtrack: u32,
+    /// Global best fitness across all successful generations.
+    pub best_score: f32,
+    /// The node from which the next child will be spawned.
+    pub spawn_parent_id: Option<i64>,
 }
 
 impl Governor {
@@ -68,6 +94,12 @@ impl Governor {
         )?;
         let root_id = db.last_insert_rowid();
 
+        // Persist spawn parent for resume
+        db.execute(
+            "UPDATE run SET best_score = -1, spawn_parent_id = ?1 WHERE id = ?2",
+            params![root_id, run_id],
+        )?;
+
         Ok(Self {
             db,
             config,
@@ -75,7 +107,8 @@ impl Governor {
             current_node_id: Some(root_id),
             generation: 0,
             gen_tick: 0,
-            gens_since_backtrack: u32::MAX / 2,
+            best_score: -1.0,
+            spawn_parent_id: Some(root_id),
         })
     }
 
@@ -85,11 +118,13 @@ impl Governor {
         let db = Connection::open(db_path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
-        let (run_id, governor_json): (i64, String) = db.query_row(
-            "SELECT id, governor_config FROM run ORDER BY id DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (run_id, governor_json, best_score, spawn_parent_id): (i64, String, f64, Option<i64>) =
+            db.query_row(
+                "SELECT id, governor_config, COALESCE(best_score, -1), spawn_parent_id
+                 FROM run ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
 
         let config: GovernorConfig =
             serde_json::from_str(&governor_json).unwrap_or_default();
@@ -109,7 +144,8 @@ impl Governor {
             current_node_id: Some(node_id),
             generation,
             gen_tick: 0,
-            gens_since_backtrack: u32::MAX / 2,
+            best_score: best_score as f32,
+            spawn_parent_id,
         })
     }
 
@@ -134,7 +170,8 @@ impl Governor {
 
     /// Whether we've reached the maximum number of generations (0 = unlimited).
     pub fn evolution_complete(&self) -> bool {
-        self.config.max_generations > 0 && self.generation as u64 >= self.config.max_generations
+        self.config.max_generations > 0
+            && (self.generation + 1) as u64 >= self.config.max_generations
     }
 
     /// Advance the generation tick counter.
@@ -226,245 +263,200 @@ impl Governor {
         results
     }
 
-    /// Select the top performers and breed mutated offspring to fill the population.
-    /// Returns a Vec of BrainConfigs for the next generation's agents.
-    pub fn select_and_breed(&mut self, fitness: &[AgentFitness]) -> Vec<BrainConfig> {
-        let elite_count = self.config.elitism_count.min(fitness.len());
-        let pop_size = self.config.population_size;
+    /// Process the evaluation results and advance to the next generation.
+    ///
+    /// Call this after `evaluate()`. Returns configs for the next population
+    /// and log messages describing what happened.
+    pub fn advance(&mut self, fitness: &[AgentFitness]) -> AdvanceResult {
+        let gen_fit = fitness
+            .first()
+            .map(|f| f.composite_fitness)
+            .unwrap_or(0.0);
+        let mut messages = Vec::new();
 
-        // Elite configs survive
-        let elites: Vec<BrainConfig> = fitness[..elite_count]
-            .iter()
-            .map(|f| f.config.clone())
-            .collect();
+        // Score this generation
+        if gen_fit > self.best_score {
+            // ★ Success — this generation beat the global best
+            self.best_score = gen_fit;
+            let _ = self.db.execute(
+                "UPDATE node SET status = 'successful', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
+                params![self.current_node_id, gen_fit as f64],
+            );
+            self.spawn_parent_id = self.current_node_id;
+            messages.push(format!("[EVOLUTION] ★ New best: {:.4}", gen_fit));
+        } else {
+            // ✗ Failure — didn't beat the best score
+            let _ = self.db.execute(
+                "UPDATE node SET status = 'failed', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
+                params![self.current_node_id, gen_fit as f64],
+            );
+            messages.push(format!(
+                "[EVOLUTION] ✗ Failed ({:.4} ≤ best {:.4})",
+                gen_fit, self.best_score
+            ));
 
-        let best_config = elites.first().cloned().unwrap_or_default();
+            // Check if spawn parent has exhausted its patience
+            if let Some(parent_id) = self.spawn_parent_id {
+                let attempts: i64 = self
+                    .db
+                    .query_row(
+                        "SELECT spawn_attempts FROM node WHERE id = ?1",
+                        params![parent_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
 
-        // Fill remaining slots by round-robin mutation of elites
-        let mut next_gen = elites.clone();
-        let mut elite_idx = 0;
-        while next_gen.len() < pop_size {
-            let parent = &elites[elite_idx % elite_count];
-            let child = mutate_config(parent);
-            next_gen.push(child);
-            elite_idx += 1;
+                if attempts >= self.config.patience as i64 {
+                    self.cascade_exhaustion(parent_id, &mut messages);
+                }
+            }
         }
 
-        // Record mutation info for the new node
-        // The "mutated_param" for the node is a summary — individual mutations
-        // are recorded in the mutation table
-        let parent_node_id = self.current_node_id;
-        let parent_fitness = fitness.first().map(|f| f.composite_fitness).unwrap_or(0.0);
+        // Check completion after scoring but before breeding
+        if self.evolution_complete() {
+            self.persist_state();
+            messages.push(format!(
+                "[EVOLUTION] Finished after {} generations",
+                self.generation
+            ));
+            return AdvanceResult::Finished { messages };
+        }
 
-        // Create new node for next generation
+        // Breed the next generation from the current spawn parent
+        let configs = self.breed_next_generation(fitness);
+        self.persist_state();
+
+        AdvanceResult::Continue { configs, messages }
+    }
+
+    /// Walk up the tree when a node exhausts its patience.
+    ///
+    /// Non-root nodes are marked `exhausted` and the governor cascades to
+    /// their parent. If the root itself exhausts, `best_score` is rolled
+    /// back to the root's own fitness and its attempt counter resets.
+    fn cascade_exhaustion(&mut self, node_id: i64, messages: &mut Vec<String>) {
+        let (gen, parent_id): (u32, Option<i64>) = self
+            .db
+            .query_row(
+                "SELECT generation, parent_id FROM node WHERE id = ?1",
+                params![node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, None));
+
+        match parent_id {
+            Some(pid) => {
+                // Non-root: mark exhausted, check parent
+                let _ = self.db.execute(
+                    "UPDATE node SET status = 'exhausted' WHERE id = ?1",
+                    params![node_id],
+                );
+                messages.push(format!(
+                    "[EVOLUTION] Gen {} exhausted — backtracking",
+                    gen
+                ));
+
+                let parent_attempts: i64 = self
+                    .db
+                    .query_row(
+                        "SELECT spawn_attempts FROM node WHERE id = ?1",
+                        params![pid],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+
+                if parent_attempts >= self.config.patience as i64 {
+                    self.cascade_exhaustion(pid, messages);
+                } else {
+                    self.spawn_parent_id = Some(pid);
+                }
+            }
+            None => {
+                // Root exhaustion: roll back best_score, reset attempts
+                let root_fitness: f64 = self
+                    .db
+                    .query_row(
+                        "SELECT COALESCE(best_fitness, 0) FROM node WHERE id = ?1",
+                        params![node_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0.0);
+                self.best_score = root_fitness as f32;
+
+                let _ = self.db.execute(
+                    "UPDATE node SET spawn_attempts = 0 WHERE id = ?1",
+                    params![node_id],
+                );
+                self.spawn_parent_id = Some(node_id);
+                messages.push(format!(
+                    "[EVOLUTION] Root exhausted — best score rolled back to {:.4}",
+                    self.best_score
+                ));
+            }
+        }
+    }
+
+    /// Create the next generation node as a child of `spawn_parent_id`.
+    /// Increments the parent's spawn_attempts and returns population configs.
+    fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
+        let spawn_parent = match self.spawn_parent_id {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let parent_config = match self.db.query_row(
+            "SELECT config_json FROM node WHERE id = ?1",
+            params![spawn_parent],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(json) => serde_json::from_str::<BrainConfig>(&json).unwrap_or_default(),
+            Err(_) => BrainConfig::default(),
+        };
+
+        let base_config = mutate_config(&parent_config);
+
         self.generation += 1;
-        let config_json = serde_json::to_string(&best_config).unwrap_or_default();
-
+        let config_json = serde_json::to_string(&base_config).unwrap_or_default();
         let _ = self.db.execute(
             "INSERT INTO node (run_id, parent_id, generation, config_json, status)
              VALUES (?1, ?2, ?3, ?4, 'active')",
-            params![
-                self.run_id,
-                parent_node_id,
-                self.generation,
-                config_json,
-            ],
+            params![self.run_id, Some(spawn_parent), self.generation, config_json],
         );
         let new_node_id = self.db.last_insert_rowid();
         self.current_node_id = Some(new_node_id);
         self.gen_tick = 0;
 
-        // Record mutations (compare best config to parent node's config)
-        if let Some(parent_id) = parent_node_id {
-            if let Ok(parent_json) = self.db.query_row(
-                "SELECT config_json FROM node WHERE id = ?1",
-                params![parent_id],
-                |row| row.get::<_, String>(0),
-            ) {
-                if let Ok(parent_config) = serde_json::from_str::<BrainConfig>(&parent_json) {
-                    record_mutations(
-                        &self.db,
-                        new_node_id,
-                        &parent_config,
-                        &best_config,
-                        parent_fitness,
-                    );
-                }
-            }
-        }
-
-        next_gen
-    }
-
-    /// Check if the current branch should be abandoned.
-    ///
-    /// A generation is only "successful" if its fitness beats the all-time
-    /// peak of every older ancestor. If it doesn't, backtrack immediately.
-    ///
-    /// `patience` controls the **post-backtrack cooldown only**: after a
-    /// backtrack, the new branch gets `patience` free evaluations before
-    /// the check fires again. The initial chain has no cooldown.
-    pub fn should_backtrack(&self) -> bool {
-        let node_id = match self.current_node_id {
-            Some(id) => id,
-            None => return false,
-        };
-
-        let patience = self.config.patience as usize;
-
-        // Cooldown: after a backtrack, give the new branch patience
-        // generations to prove itself. The initial chain starts with
-        // gens_since_backtrack high, so no cooldown applies at start.
-        if (self.gens_since_backtrack as usize) <= patience {
-            return false;
-        }
-
-        // Walk the entire ancestor chain collecting fitness values (newest first)
-        let mut fitnesses: Vec<f32> = Vec::new();
-        let mut current = Some(node_id);
-
-        while let Some(nid) = current {
-            match self.db.query_row(
-                "SELECT best_fitness, parent_id FROM node WHERE id = ?1",
-                params![nid],
-                |row| {
-                    let f: Option<f64> = row.get(0)?;
-                    let p: Option<i64> = row.get(1)?;
-                    Ok((f.map(|v| v as f32), p))
-                },
-            ) {
-                Ok((Some(f), parent)) => {
-                    fitnesses.push(f);
-                    current = parent;
-                }
-                Ok((None, parent)) => {
-                    current = parent;
-                }
-                Err(_) => break,
-            }
-        }
-
-        if fitnesses.len() < 2 {
-            return false;
-        }
-
-        // Current generation must beat the peak of ALL older generations
-        let current_fit = fitnesses[0];
-        let ancestor_peak = fitnesses[1..]
-            .iter()
-            .cloned()
-            .fold(f32::MIN, f32::max);
-
-        current_fit < ancestor_peak
-    }
-
-    /// Backtrack to the last improving node and try a different direction.
-    /// Returns the BrainConfig to use for the next generation, or None if
-    /// we can't backtrack further.
-    pub fn backtrack(&mut self) -> Option<BrainConfig> {
-        let current_id = self.current_node_id?;
-
-        // Mark current node as backtracked
+        // Count this child against the parent's patience
         let _ = self.db.execute(
-            "UPDATE node SET status = 'backtracked' WHERE id = ?1",
-            params![current_id],
+            "UPDATE node SET spawn_attempts = spawn_attempts + 1 WHERE id = ?1",
+            params![spawn_parent],
         );
 
-        // Walk up to find a node that still has untried parameter directions
-        let mut candidate = self.db.query_row(
-            "SELECT parent_id FROM node WHERE id = ?1",
-            params![current_id],
-            |row| row.get::<_, Option<i64>>(0),
-        ).ok()?;
+        // Record which parameters were mutated
+        let parent_fitness = self.best_score;
+        record_mutations(
+            &self.db,
+            new_node_id,
+            &parent_config,
+            &base_config,
+            parent_fitness,
+        );
 
-        while let Some(node_id) = candidate {
-            // Get all mutable param names
-            let all_params = vec![
-                "memory_capacity",
-                "processing_slots",
-                "representation_dim",
-                "learning_rate",
-                "decay_rate",
-            ];
-
-            // Get params+directions already tried from this node
-            let mut tried: Vec<(String, f64)> = Vec::new();
-            {
-                let mut stmt = self
-                    .db
-                    .prepare(
-                        "SELECT DISTINCT m.param_name, m.direction FROM mutation m
-                         JOIN node n ON m.node_id = n.id
-                         WHERE n.parent_id = ?1",
-                    )
-                    .ok()?;
-                let rows = stmt
-                    .query_map(params![node_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                    })
-                    .ok()?;
-                for r in rows.flatten() {
-                    tried.push(r);
-                }
-            }
-
-            // Find an untried param+direction
-            for param in &all_params {
-                for &dir in &[1.0f64, -1.0] {
-                    let already = tried
-                        .iter()
-                        .any(|(p, d)| p == *param && (*d - dir).abs() < 0.1);
-                    if !already {
-                        // Found an untried direction — use this node's config
-                        if let Ok(config) = self.db.query_row(
-                            "SELECT config_json FROM node WHERE id = ?1",
-                            params![node_id],
-                            |row| row.get::<_, String>(0),
-                        ) {
-                            if let Ok(base_config) = serde_json::from_str::<BrainConfig>(&config) {
-                                log::info!(
-                                    "[BACKTRACK] Reverting to node {} (gen {}), trying {} {}",
-                                    node_id,
-                                    self.generation,
-                                    param,
-                                    if dir > 0.0 { "↑" } else { "↓" }
-                                );
-                                // Create a NEW child node so evaluate() won't overwrite the ancestor
-                                self.generation += 1;
-                                let child_config_json = serde_json::to_string(&base_config).unwrap_or_default();
-                                let _ = self.db.execute(
-                                    "INSERT INTO node (run_id, parent_id, generation, config_json, status)
-                                     VALUES (?1, ?2, ?3, ?4, 'active')",
-                                    params![self.run_id, Some(node_id), self.generation, child_config_json],
-                                );
-                                let new_node_id = self.db.last_insert_rowid();
-                                self.current_node_id = Some(new_node_id);
-                                self.gen_tick = 0;
-                                self.gens_since_backtrack = 0;
-                                return Some(base_config);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // All directions exhausted at this node — mark and go up
-            let _ = self.db.execute(
-                "UPDATE node SET status = 'exhausted' WHERE id = ?1",
-                params![node_id],
-            );
-            candidate = self
-                .db
-                .query_row(
-                    "SELECT parent_id FROM node WHERE id = ?1",
-                    params![node_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .ok()?;
+        // Population: base config + mutated variants
+        let pop_size = self.config.population_size;
+        let mut configs = vec![base_config.clone()];
+        while configs.len() < pop_size {
+            configs.push(mutate_config(&base_config));
         }
+        configs
+    }
 
-        log::warn!("[BACKTRACK] No viable backtrack target found — tree exhausted");
-        None
+    /// Persist best_score and spawn_parent_id for resume.
+    fn persist_state(&self) {
+        let _ = self.db.execute(
+            "UPDATE run SET best_score = ?1, spawn_parent_id = ?2 WHERE id = ?3",
+            params![self.best_score as f64, self.spawn_parent_id, self.run_id],
+        );
     }
 
     /// Print a generation summary to stdout.
@@ -699,7 +691,9 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             brain_config TEXT NOT NULL,
             world_config TEXT NOT NULL,
             started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            wall_time_secs REAL DEFAULT 0
+            wall_time_secs REAL DEFAULT 0,
+            best_score REAL DEFAULT -1,
+            spawn_parent_id INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS node (
@@ -713,6 +707,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             mutated_param TEXT,
             mutation_direction REAL,
             status TEXT DEFAULT 'active',
+            spawn_attempts INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -804,320 +799,320 @@ mod tests {
         Governor::new(":memory:", config, &brain, "{}").unwrap()
     }
 
-    /// Insert a node with known fitness directly into the DB.
-    fn insert_node(gov: &Governor, parent_id: Option<i64>, generation: u32, fitness: f32) -> i64 {
-        let config_json = serde_json::to_string(&BrainConfig::default()).unwrap();
+    // ─── advance tests ──────────────────────────────────────────────
+
+    /// Create a mock AgentFitness slice with a single entry at the given fitness.
+    fn mock_fitness(fitness: f32) -> Vec<AgentFitness> {
+        vec![AgentFitness {
+            agent_index: 0,
+            config: BrainConfig::default(),
+            total_ticks_alive: 50000,
+            death_count: 0,
+            food_consumed: 50,
+            cells_explored: 4096,
+            composite_fitness: fitness,
+        }]
+    }
+
+    /// Helper to read a node's status from the DB.
+    fn node_status(gov: &Governor, node_id: i64) -> String {
         gov.db
-            .execute(
-                "INSERT INTO node (run_id, parent_id, generation, config_json,
-                 best_fitness, avg_fitness, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
-                params![
-                    gov.run_id,
-                    parent_id,
-                    generation,
-                    config_json,
-                    fitness as f64,
-                    fitness as f64,
-                ],
-            )
-            .unwrap();
-        gov.db.last_insert_rowid()
-    }
-
-    fn set_fitness(gov: &Governor, node_id: i64, fitness: f32) {
-        gov.db
-            .execute(
-                "UPDATE node SET best_fitness = ?1, avg_fitness = ?2 WHERE id = ?3",
-                params![fitness as f64, fitness as f64, node_id],
-            )
-            .unwrap();
-    }
-
-    // ─── should_backtrack tests ────────────────────────────────────
-
-    #[test]
-    fn no_initial_cooldown_for_fresh_start() {
-        // gens_since_backtrack starts high so the check fires from Gen 1.
-        let gov = test_governor(3);
-        assert!((gov.gens_since_backtrack as usize) > gov.config.patience as usize);
-    }
-
-    #[test]
-    fn single_regression_triggers_backtrack() {
-        // Any regression below ancestor peak triggers immediate backtrack
-        // (patience only controls post-backtrack cooldown, not tolerance).
-        let mut gov = test_governor(3);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.95);
-
-        let child = insert_node(&gov, Some(root_id), 1, 0.90);
-        gov.current_node_id = Some(child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = u32::MAX / 2; // no cooldown
-
-        // 0.90 < max(0.95) → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn improvement_prevents_backtrack() {
-        // Current gen beats the ancestor peak → no backtrack.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.90);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.95);
-        let b = insert_node(&gov, Some(a), 2, 0.97);
-
-        gov.current_node_id = Some(b);
-        gov.generation = 2;
-        gov.gens_since_backtrack = u32::MAX / 2;
-
-        // 0.97 > max(0.95, 0.90) → no backtrack
-        assert!(!gov.should_backtrack());
-    }
-
-    #[test]
-    fn cooldown_prevents_immediate_rebacktrack() {
-        // Even with terrible fitness, cooldown blocks backtracking.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let child = insert_node(&gov, Some(root_id), 1, 0.50);
-        gov.current_node_id = Some(child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 1; // within cooldown
-
-        assert!(!gov.should_backtrack());
-
-        // Also blocked at exactly patience (boundary)
-        gov.gens_since_backtrack = 2;
-        assert!(!gov.should_backtrack());
-
-        // Past cooldown → check fires: 0.50 < 0.98 → backtrack
-        gov.gens_since_backtrack = 3;
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn after_backtrack_branch_gets_patience_cooldown() {
-        // After backtracking, the new branch gets exactly `patience`
-        // free evaluations before the check fires again.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let new_child = insert_node(&gov, Some(root_id), 1, 0.80);
-        gov.current_node_id = Some(new_child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 1;
-
-        // Cooldown: 1 <= 2 → skip
-        assert!(!gov.should_backtrack());
-
-        gov.gens_since_backtrack = 2;
-        // Cooldown: 2 <= 2 → skip
-        assert!(!gov.should_backtrack());
-
-        gov.gens_since_backtrack = 3;
-        // Past cooldown: 0.80 < 0.98 → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn patience_1_gives_one_free_gen() {
-        // With patience=1, the branch gets exactly 1 free evaluation.
-        let mut gov = test_governor(1);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let child = insert_node(&gov, Some(root_id), 1, 0.85);
-        gov.current_node_id = Some(child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 1;
-
-        // Cooldown: 1 <= 1 → skip
-        assert!(!gov.should_backtrack());
-
-        gov.gens_since_backtrack = 2;
-        // Past cooldown: 0.85 < 0.98 → backtrack
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn peak_in_ancestors_not_masked_by_intermediate() {
-        // root(0.15) → A(0.25) → B(0.18)
-        // B(0.18) < peak-of-older(0.25 from A) → backtrack
-        let mut gov = test_governor(1);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.15);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.25);
-        let b = insert_node(&gov, Some(a), 2, 0.18);
-
-        gov.current_node_id = Some(b);
-        gov.generation = 2;
-        gov.gens_since_backtrack = u32::MAX / 2;
-
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn deep_ancestor_peak_triggers_backtrack() {
-        // Peak is far back in the chain.
-        // root(0.50) → A(0.20) → B(0.30) → C(0.25)
-        // C(0.25) < max(0.30, 0.20, 0.50) = 0.50 → backtrack
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.50);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.20);
-        let b = insert_node(&gov, Some(a), 2, 0.30);
-        let c = insert_node(&gov, Some(b), 3, 0.25);
-
-        gov.current_node_id = Some(c);
-        gov.generation = 3;
-        gov.gens_since_backtrack = u32::MAX / 2;
-
-        assert!(gov.should_backtrack());
-    }
-
-    #[test]
-    fn not_enough_history_prevents_backtrack() {
-        // With only the root node, should never backtrack (need 2+ values).
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.50);
-
-        gov.gens_since_backtrack = u32::MAX / 2;
-        assert!(!gov.should_backtrack());
-    }
-
-    #[test]
-    fn exact_tie_does_not_trigger_backtrack() {
-        // If current gen equals the ancestor peak, it's not a regression.
-        let mut gov = test_governor(1);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.50);
-
-        let child = insert_node(&gov, Some(root_id), 1, 0.50);
-        gov.current_node_id = Some(child);
-        gov.generation = 1;
-        gov.gens_since_backtrack = u32::MAX / 2;
-
-        // 0.50 < 0.50 is false → no backtrack
-        assert!(!gov.should_backtrack());
-    }
-
-    // ─── backtrack tests ───────────────────────────────────────────
-
-    #[test]
-    fn backtrack_creates_sibling_node() {
-        // After backtracking, the new node should be a child of the ancestor,
-        // not a deeper child of the current node.
-        let mut gov = test_governor(2);
-        let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
-
-        let a = insert_node(&gov, Some(root_id), 1, 0.90);
-        // Record a mutation so backtrack sees memory_capacity +1.0 as tried
-        gov.db
-            .execute(
-                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
-                 VALUES (?1, 'memory_capacity', 1.0, 0.98)",
-                params![a],
-            )
-            .unwrap();
-
-        gov.current_node_id = Some(a);
-        gov.generation = 1;
-
-        let config = gov.backtrack();
-        assert!(config.is_some());
-
-        // New node is a child of root (sibling of A), not child of A
-        let new_node_id = gov.current_node_id.unwrap();
-        let parent_of_new: Option<i64> = gov
-            .db
-            .query_row(
-                "SELECT parent_id FROM node WHERE id = ?1",
-                params![new_node_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(parent_of_new, Some(root_id));
-
-        // A is marked backtracked
-        let a_status: String = gov
-            .db
             .query_row(
                 "SELECT status FROM node WHERE id = ?1",
-                params![a],
+                params![node_id],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(a_status, "backtracked");
+            .unwrap()
+    }
+
+    /// Helper to read a node's spawn_attempts from the DB.
+    fn node_attempts(gov: &Governor, node_id: i64) -> i64 {
+        gov.db
+            .query_row(
+                "SELECT spawn_attempts FROM node WHERE id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Helper to read a node's parent_id from the DB.
+    fn node_parent(gov: &Governor, node_id: i64) -> Option<i64> {
+        gov.db
+            .query_row(
+                "SELECT parent_id FROM node WHERE id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
-    fn backtrack_resets_cooldown() {
-        let mut gov = test_governor(2);
+    fn gen_0_always_succeeds() {
+        let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
+        assert_eq!(gov.best_score, -1.0);
 
-        let a = insert_node(&gov, Some(root_id), 1, 0.90);
-        gov.current_node_id = Some(a);
-        gov.generation = 1;
-        gov.gens_since_backtrack = 5;
-
-        let _ = gov.backtrack();
-        assert_eq!(gov.gens_since_backtrack, 0);
+        let result = gov.advance(&mock_fitness(0.1));
+        assert!(matches!(result, AdvanceResult::Continue { .. }));
+        assert_eq!(gov.best_score, 0.1);
+        assert_eq!(node_status(&gov, root_id), "successful");
     }
 
     #[test]
-    fn backtrack_picks_untried_direction() {
-        // If memory_capacity +1.0 is tried, should pick memory_capacity -1.0 next.
-        let mut gov = test_governor(2);
+    fn success_deepens_tree() {
+        let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
-        set_fitness(&gov, root_id, 0.98);
 
-        let a = insert_node(&gov, Some(root_id), 1, 0.90);
-        gov.db
-            .execute(
-                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
-                 VALUES (?1, 'memory_capacity', 1.0, 0.98)",
-                params![a],
-            )
-            .unwrap();
+        // Gen 0: fitness 0.1 → success
+        gov.advance(&mock_fitness(0.1));
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
 
-        gov.current_node_id = Some(a);
-        gov.generation = 1;
+        let gen1_id = gov.current_node_id.unwrap();
+        assert_ne!(gen1_id, root_id);
+        assert_eq!(node_parent(&gov, gen1_id), Some(root_id));
 
-        // First backtrack should succeed (memory_capacity -1.0 is untried)
-        assert!(gov.backtrack().is_some());
+        // Gen 1: fitness 0.2 → success, spawn_parent deepens to gen1
+        gov.advance(&mock_fitness(0.2));
+        assert_eq!(gov.best_score, 0.2);
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(node_status(&gov, gen1_id), "successful");
+    }
 
-        // Record -1.0 direction as tried for the second child
-        let second_child = gov.current_node_id.unwrap();
-        gov.db
-            .execute(
-                "INSERT INTO mutation (node_id, param_name, direction, parent_fitness)
-                 VALUES (?1, 'memory_capacity', -1.0, 0.98)",
-                params![second_child],
-            )
-            .unwrap();
+    #[test]
+    fn failure_stays_at_parent() {
+        let mut gov = test_governor(3);
+        let _root_id = gov.current_node_id.unwrap();
 
-        // Mark second child as backtracked and try again
-        gov.db
-            .execute(
-                "UPDATE node SET status = 'backtracked' WHERE id = ?1",
-                params![second_child],
-            )
-            .unwrap();
+        // Gen 0: success
+        gov.advance(&mock_fitness(0.1));
+        let gen1_id = gov.current_node_id.unwrap();
 
-        // Third backtrack: memory_capacity exhausted, tries processing_slots +1.0
-        gov.current_node_id = Some(second_child);
-        assert!(gov.backtrack().is_some());
+        // Gen 1: success
+        gov.advance(&mock_fitness(0.2));
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+
+        let gen2_id = gov.current_node_id.unwrap();
+
+        // Gen 2: failure (0.18 ≤ 0.2) — spawn_parent stays at gen1
+        gov.advance(&mock_fitness(0.18));
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(node_status(&gov, gen2_id), "failed");
+
+        // Gen 3 should be a child of gen1 (not gen2)
+        let gen3_id = gov.current_node_id.unwrap();
+        assert_eq!(node_parent(&gov, gen3_id), Some(gen1_id));
+    }
+
+    #[test]
+    fn patience_triggers_exhaustion() {
+        let mut gov = test_governor(3);
+
+        // Gen 0: success (best=0.1)
+        gov.advance(&mock_fitness(0.1));
+        let gen1_id = gov.current_node_id.unwrap();
+
+        // Gen 1: success (best=0.2)
+        gov.advance(&mock_fitness(0.2));
+        let gen1_node = gov.spawn_parent_id.unwrap();
+        assert_eq!(gen1_node, gen1_id);
+
+        // Gen 2: fail
+        gov.advance(&mock_fitness(0.18));
+        assert_eq!(node_attempts(&gov, gen1_node), 2);
+
+        // Gen 3: fail
+        gov.advance(&mock_fitness(0.19));
+        assert_eq!(node_attempts(&gov, gen1_node), 3);
+
+        // Gen 4: fail → gen1 exhausted (3 children = patience)
+        let root_id = node_parent(&gov, gen1_node).unwrap();
+        gov.advance(&mock_fitness(0.2)); // not strictly greater
+        assert_eq!(node_status(&gov, gen1_node), "exhausted");
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+    }
+
+    #[test]
+    fn exhaustion_cascades_to_grandparent() {
+        let mut gov = test_governor(2);
+
+        // Gen 0 → success
+        gov.advance(&mock_fitness(0.1));
+        let root_id = node_parent(&gov, gov.current_node_id.unwrap()).unwrap();
+
+        // Gen 1 → success (best=0.2)
+        gov.advance(&mock_fitness(0.2));
+        let gen1_id = gov.spawn_parent_id.unwrap();
+
+        // Gen 2: fail → gen1.attempts=2
+        gov.advance(&mock_fitness(0.15));
+        // Gen 3: fail → gen1.attempts=2, triggers exhaustion
+        //   gen1 exhausted → cascade to root (root.attempts=1, < patience=2)
+        gov.advance(&mock_fitness(0.15));
+        assert_eq!(node_status(&gov, gen1_id), "exhausted");
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+    }
+
+    #[test]
+    fn root_exhaustion_rolls_back_best_score() {
+        let mut gov = test_governor(2);
+
+        // Gen 0: success (best=0.1)
+        gov.advance(&mock_fitness(0.1));
+        let root_id = node_parent(&gov, gov.current_node_id.unwrap()).unwrap();
+
+        // Gen 1: success (best=0.2)
+        gov.advance(&mock_fitness(0.2));
+        let gen1_id = gov.spawn_parent_id.unwrap();
+
+        // Gen 2, Gen 3: fail → gen1 exhausted → root.attempts=2 (gen1 + gen2_child)
+        gov.advance(&mock_fitness(0.15));
+        gov.advance(&mock_fitness(0.15));
+        assert_eq!(node_status(&gov, gen1_id), "exhausted");
+
+        // Now spawning from root. Root has attempts=1 (from gen1).
+        // Gen 5: fail → root.attempts=2 → root exhausted, reset to 0, then breed adds 1
+        gov.advance(&mock_fitness(0.12));
+        assert_eq!(gov.best_score, 0.1); // rolled back to root's fitness
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(node_attempts(&gov, root_id), 1); // reset to 0, then breed incremented to 1
+    }
+
+    #[test]
+    fn after_root_reset_children_can_succeed() {
+        let mut gov = test_governor(1);
+
+        // Gen 0: success (best=0.1)
+        gov.advance(&mock_fitness(0.1));
+        let root_id = node_parent(&gov, gov.current_node_id.unwrap()).unwrap();
+
+        // Gen 1: success (best=0.2)
+        gov.advance(&mock_fitness(0.2));
+
+        // Gen 2: fail → gen1 exhausted (patience=1)
+        gov.advance(&mock_fitness(0.15));
+        // gen1 exhausted, cascade to root. root.attempts = 1 >= patience=1 → root exhausted
+        assert_eq!(gov.best_score, 0.1); // rolled back
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+
+        // Gen 3: 0.11 > 0.1 → success!
+        gov.advance(&mock_fitness(0.11));
+        assert_eq!(gov.best_score, 0.11);
+    }
+
+    #[test]
+    fn equal_fitness_is_not_success() {
+        let mut gov = test_governor(3);
+
+        // Gen 0: success (best=0.5)
+        gov.advance(&mock_fitness(0.5));
+        let root_id = gov.spawn_parent_id.unwrap();
+
+        // Gen 1: fitness = 0.5 (same as best) → FAILURE (not strictly greater)
+        let gen1_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.5));
+        assert_eq!(node_status(&gov, gen1_id), "failed");
+        assert_eq!(gov.best_score, 0.5);
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+    }
+
+    #[test]
+    fn full_trace_matches_user_example() {
+        // Reproduces the exact sequence from the requirements:
+        // Gen 0..9 with patience=3
+        let mut gov = test_governor(3);
+        let root_id = gov.current_node_id.unwrap();
+
+        // Gen 0: fit=0.1 → success (best=0.1)
+        gov.advance(&mock_fitness(0.1));
+        assert_eq!(gov.best_score, 0.1);
+        assert_eq!(node_status(&gov, root_id), "successful");
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+
+        // Gen 1: fit=0.2 → success (best=0.2)
+        let gen1_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.2));
+        assert_eq!(gov.best_score, 0.2);
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+
+        // Gen 2: fit=0.18 → fail
+        let gen2_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.18));
+        assert_eq!(node_status(&gov, gen2_id), "failed");
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+
+        // Gen 3: fit=0.19 → fail
+        let gen3_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.19));
+        assert_eq!(node_status(&gov, gen3_id), "failed");
+
+        // Gen 4: fit=0.2 → fail (not strictly greater), patience reached
+        let gen4_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.2));
+        assert_eq!(node_status(&gov, gen4_id), "failed");
+        assert_eq!(node_status(&gov, gen1_id), "exhausted");
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        // best_score still 0.2
+
+        // Gen 5: fit=0.12 → fail (child of root)
+        let gen5_id = gov.current_node_id.unwrap();
+        assert_eq!(node_parent(&gov, gen5_id), Some(root_id));
+        gov.advance(&mock_fitness(0.12));
+        assert_eq!(node_status(&gov, gen5_id), "failed");
+
+        // Gen 6: fit=0.13 → fail, root patience reached → rollback
+        let gen6_id = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness(0.13));
+        assert_eq!(node_status(&gov, gen6_id), "failed");
+        assert_eq!(gov.best_score, 0.1); // rolled back to root's fitness
+        assert_eq!(gov.spawn_parent_id, Some(root_id));
+
+        // Gen 7: fit=0.11 → success (0.11 > 0.1)
+        let gen7_id = gov.current_node_id.unwrap();
+        assert_eq!(node_parent(&gov, gen7_id), Some(root_id));
+        gov.advance(&mock_fitness(0.11));
+        assert_eq!(gov.best_score, 0.11);
+        assert_eq!(gov.spawn_parent_id, Some(gen7_id));
+        assert_eq!(node_status(&gov, gen7_id), "successful");
+
+        // Gen 8: fit=0.12 → success
+        let gen8_id = gov.current_node_id.unwrap();
+        assert_eq!(node_parent(&gov, gen8_id), Some(gen7_id));
+        gov.advance(&mock_fitness(0.12));
+        assert_eq!(gov.best_score, 0.12);
+        assert_eq!(gov.spawn_parent_id, Some(gen8_id));
+
+        // Gen 9: fit=0.13 → success
+        let gen9_id = gov.current_node_id.unwrap();
+        assert_eq!(node_parent(&gov, gen9_id), Some(gen8_id));
+        gov.advance(&mock_fitness(0.13));
+        assert_eq!(gov.best_score, 0.13);
+    }
+
+    #[test]
+    fn breed_increments_spawn_attempts() {
+        let mut gov = test_governor(3);
+        let root_id = gov.current_node_id.unwrap();
+
+        assert_eq!(node_attempts(&gov, root_id), 0);
+        gov.advance(&mock_fitness(0.1)); // creates gen1 from root
+        assert_eq!(node_attempts(&gov, root_id), 1);
+    }
+
+    #[test]
+    fn evolution_complete_returns_finished() {
+        let config = GovernorConfig {
+            population_size: 2,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 3,
+            max_generations: 1,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Gen 0 evaluation → max_generations=1 reached
+        let result = gov.advance(&mock_fitness(0.5));
+        assert!(matches!(result, AdvanceResult::Finished { .. }));
     }
 }

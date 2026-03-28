@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
-use crate::agent::{mutate_config, Agent};
+use crate::agent::{mutate_config, Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
@@ -166,31 +166,21 @@ impl Governor {
             })
             .collect();
 
-        // Normalize each axis to [0, 1] relative to generation max
-        let max_alive = results
-            .iter()
-            .map(|r| r.total_ticks_alive)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
-        let max_food = results
-            .iter()
-            .map(|r| r.food_consumed)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
-        let max_cells = results
-            .iter()
-            .map(|r| r.cells_explored)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
+        // Absolute fitness scoring — no intra-generational normalization.
+        // Each axis uses a meaningful denominator so scores reflect real quality.
+        let tick_budget = self.config.tick_budget as f32;
+        let total_grid_cells = (HEATMAP_RES * HEATMAP_RES) as f32;
+        let food_target = (tick_budget / 1000.0).max(10.0);
 
         for r in &mut results {
-            let norm_alive = r.total_ticks_alive as f32 / max_alive;
-            let norm_food = r.food_consumed as f32 / max_food;
-            let norm_cells = r.cells_explored as f32 / max_cells;
-            r.composite_fitness = norm_alive * 0.4 + norm_food * 0.3 + norm_cells * 0.3;
+            // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.5, 9 → 0.1
+            let survival = 1.0 / (1.0 + r.death_count as f32);
+            // Foraging: food per generation, capped at target
+            let foraging = (r.food_consumed as f32 / food_target).min(1.0);
+            // Exploration: fraction of world grid visited
+            let exploration = (r.cells_explored as f32 / total_grid_cells).min(1.0);
+
+            r.composite_fitness = survival * 0.4 + foraging * 0.3 + exploration * 0.3;
         }
 
         // Insert agent_result records

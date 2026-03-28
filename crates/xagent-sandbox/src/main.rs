@@ -434,11 +434,11 @@ impl App {
         if !self.gpu_brain || self.agents.is_empty() {
             return;
         }
-        let brain = &self.agents[0].brain;
         let n = self.agents.len() as u32;
-        let dim = brain.config.representation_dim as u32;
-        let fc = brain.encoder.feature_count() as u32;
-        let cap = brain.config.memory_capacity as u32;
+        // Use max across all agents — mutations may give different structural params
+        let dim = self.agents.iter().map(|a| a.brain.config.representation_dim).max().unwrap() as u32;
+        let fc = self.agents.iter().map(|a| a.brain.encoder.feature_count()).max().unwrap() as u32;
+        let cap = self.agents.iter().map(|a| a.brain.memory.max_capacity()).max().unwrap() as u32;
 
         if let Some(ref gpu) = self.gpu_compute {
             if gpu.matches_config(n, dim, fc, cap) {
@@ -1123,24 +1123,21 @@ impl ApplicationHandler for App {
                                 let mut all_active = Vec::with_capacity(n * cap);
                                 let mut frames: Vec<Option<SensoryFrame>> =
                                     vec![None; n];
+                                // Per-agent actual dimensions for output slicing
+                                let mut agent_dims: Vec<(usize, usize)> = vec![(dim, cap); n];
 
                                 for (i, agent) in self.agents.iter_mut().enumerate() {
                                     let alive = agent.body.body.alive;
                                     let run = alive
                                         && (tick + i as u64) % brain_stride == 0;
                                     if !run {
-                                        all_features
-                                            .extend(std::iter::repeat(0.0).take(fc));
-                                        all_weights.extend(
-                                            std::iter::repeat(0.0).take(fc * dim),
+                                        gpu.pad_agent_into(
+                                            &[], &[], &[], &[], &[],
+                                            0, 0, 0,
+                                            &mut all_features, &mut all_weights,
+                                            &mut all_biases, &mut all_patterns,
+                                            &mut all_active,
                                         );
-                                        all_biases
-                                            .extend(std::iter::repeat(0.0).take(dim));
-                                        all_patterns.extend(
-                                            std::iter::repeat(0.0).take(cap * dim),
-                                        );
-                                        all_active
-                                            .extend(std::iter::repeat(0u32).take(cap));
                                         continue;
                                     }
                                     let others: Vec<OtherAgent> = all_pos
@@ -1159,16 +1156,27 @@ impl ApplicationHandler for App {
                                         &others,
                                     );
                                     let feats =
-                                        agent.brain.encoder.extract_features(&frame);
-                                    all_features.extend_from_slice(feats);
-                                    all_weights
-                                        .extend_from_slice(agent.brain.encoder.weights());
-                                    all_biases
-                                        .extend_from_slice(agent.brain.encoder.biases());
+                                        agent.brain.encoder.extract_features(&frame)
+                                            .to_vec();
+                                    let agent_dim = agent.brain.config.representation_dim;
+                                    let agent_fc = agent.brain.encoder.feature_count();
+                                    let agent_cap = agent.brain.memory.max_capacity();
+                                    let weights = agent.brain.encoder.weights().to_vec();
+                                    let biases = agent.brain.encoder.biases().to_vec();
                                     let (pats, mask) =
                                         agent.brain.memory.gpu_pattern_data();
-                                    all_patterns.extend(pats);
-                                    all_active.extend(mask);
+                                    gpu.pad_agent_into(
+                                        &feats,
+                                        &weights,
+                                        &biases,
+                                        &pats,
+                                        &mask,
+                                        agent_dim, agent_fc, agent_cap,
+                                        &mut all_features, &mut all_weights,
+                                        &mut all_biases, &mut all_patterns,
+                                        &mut all_active,
+                                    );
+                                    agent_dims[i] = (agent_dim, agent_cap);
                                     frames[i] = Some(frame);
                                 }
 
@@ -1182,10 +1190,11 @@ impl ApplicationHandler for App {
 
                                 for (i, agent) in self.agents.iter_mut().enumerate() {
                                     if let Some(frame) = &frames[i] {
+                                        let (a_dim, a_cap) = agent_dims[i];
                                         let enc =
-                                            &encoded[i * dim..(i + 1) * dim];
+                                            &encoded[i * dim..i * dim + a_dim];
                                         let sim = &similarities
-                                            [i * cap..(i + 1) * cap];
+                                            [i * cap..i * cap + a_cap];
                                         agent.cached_motor =
                                             agent.brain.tick_gpu(frame, enc, sim);
                                         record_agent_histories(agent);
@@ -2308,11 +2317,10 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
         // Initialize GPU compute if requested
         let mut gpu_compute: Option<GpuBrainCompute> = None;
         if gpu_brain && !agents.is_empty() {
-            let brain = &agents[0].brain;
             let n = agents.len() as u32;
-            let dim = brain.config.representation_dim as u32;
-            let fc = brain.encoder.feature_count() as u32;
-            let cap = brain.config.memory_capacity as u32;
+            let dim = agents.iter().map(|a| a.brain.config.representation_dim).max().unwrap() as u32;
+            let fc = agents.iter().map(|a| a.brain.encoder.feature_count()).max().unwrap() as u32;
+            let cap = agents.iter().map(|a| a.brain.memory.max_capacity()).max().unwrap() as u32;
             if gpu_compute.as_ref().map_or(true, |g: &GpuBrainCompute| !g.matches_config(n, dim, fc, cap)) {
                 gpu_compute = GpuBrainCompute::try_new(n, dim, fc, cap);
             }
@@ -2344,14 +2352,17 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
                 let mut all_patterns = Vec::with_capacity(n * cap * dim);
                 let mut all_active = Vec::with_capacity(n * cap);
                 let mut frames: Vec<Option<SensoryFrame>> = vec![None; n];
+                let mut agent_dims: Vec<(usize, usize)> = vec![(dim, cap); n];
 
                 for (i, agent) in agents.iter_mut().enumerate() {
                     if !agent.body.body.alive {
-                        all_features.extend(std::iter::repeat(0.0).take(fc));
-                        all_weights.extend(std::iter::repeat(0.0).take(fc * dim));
-                        all_biases.extend(std::iter::repeat(0.0).take(dim));
-                        all_patterns.extend(std::iter::repeat(0.0).take(cap * dim));
-                        all_active.extend(std::iter::repeat(0u32).take(cap));
+                        gpu.pad_agent_into(
+                            &[], &[], &[], &[], &[],
+                            0, 0, 0,
+                            &mut all_features, &mut all_weights,
+                            &mut all_biases, &mut all_patterns,
+                            &mut all_active,
+                        );
                         continue;
                     }
                     let others: Vec<OtherAgent> = pos
@@ -2366,13 +2377,24 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
                     let frame = senses::extract_senses_with_others(
                         &agent.body, world_ref, tick, &others,
                     );
-                    let feats = agent.brain.encoder.extract_features(&frame);
-                    all_features.extend_from_slice(feats);
-                    all_weights.extend_from_slice(agent.brain.encoder.weights());
-                    all_biases.extend_from_slice(agent.brain.encoder.biases());
+                    let feats = agent.brain.encoder.extract_features(&frame).to_vec();
+                    let agent_dim = agent.brain.config.representation_dim;
+                    let agent_fc = agent.brain.encoder.feature_count();
+                    let agent_cap = agent.brain.memory.max_capacity();
+                    let weights = agent.brain.encoder.weights().to_vec();
+                    let biases = agent.brain.encoder.biases().to_vec();
                     let (pats, mask) = agent.brain.memory.gpu_pattern_data();
-                    all_patterns.extend(pats);
-                    all_active.extend(mask);
+                    gpu.pad_agent_into(
+                        &feats,
+                        &weights,
+                        &biases,
+                        &pats, &mask,
+                        agent_dim, agent_fc, agent_cap,
+                        &mut all_features, &mut all_weights,
+                        &mut all_biases, &mut all_patterns,
+                        &mut all_active,
+                    );
+                    agent_dims[i] = (agent_dim, agent_cap);
                     frames[i] = Some(frame);
                 }
 
@@ -2382,8 +2404,9 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
 
                 for (i, agent) in agents.iter_mut().enumerate() {
                     if let Some(frame) = &frames[i] {
-                        let enc = &encoded[i * dim..(i + 1) * dim];
-                        let sim = &similarities[i * cap..(i + 1) * cap];
+                        let (a_dim, a_cap) = agent_dims[i];
+                        let enc = &encoded[i * dim..i * dim + a_dim];
+                        let sim = &similarities[i * cap..i * cap + a_cap];
                         agent.cached_motor = agent.brain.tick_gpu(frame, enc, sim);
                     }
                 }

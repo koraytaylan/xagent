@@ -484,6 +484,81 @@ impl GpuBrainCompute {
     pub fn memory_capacity(&self) -> u32 {
         self.memory_capacity
     }
+
+    /// Append one agent's brain data to the batch accumulators, padding to
+    /// the GPU pipeline's expected (dim, feature_count, memory_capacity).
+    ///
+    /// Call this for every agent slot (active or inactive). For inactive
+    /// agents pass empty slices and `agent_dim = agent_fc = agent_cap = 0`.
+    pub fn pad_agent_into(
+        &self,
+        features: &[f32],
+        weights: &[f32],
+        biases: &[f32],
+        patterns: &[f32],
+        active: &[u32],
+        agent_dim: usize,
+        agent_fc: usize,
+        agent_cap: usize,
+        all_features: &mut Vec<f32>,
+        all_weights: &mut Vec<f32>,
+        all_biases: &mut Vec<f32>,
+        all_patterns: &mut Vec<f32>,
+        all_active: &mut Vec<u32>,
+    ) {
+        let dim = self.dim as usize;
+        let fc = self.feature_count as usize;
+        let cap = self.memory_capacity as usize;
+
+        // Features: [agent_fc] → [fc] (pad trailing zeros)
+        let f_copy = features.len().min(fc);
+        all_features.extend_from_slice(&features[..f_copy]);
+        if fc > f_copy {
+            all_features.extend(std::iter::repeat(0.0f32).take(fc - f_copy));
+        }
+
+        // Biases: [agent_dim] → [dim]
+        let b_copy = biases.len().min(dim);
+        all_biases.extend_from_slice(&biases[..b_copy]);
+        if dim > b_copy {
+            all_biases.extend(std::iter::repeat(0.0f32).take(dim - b_copy));
+        }
+
+        // Weights: [agent_fc × agent_dim] row-major → [fc × dim]
+        for r in 0..fc {
+            if r < agent_fc && agent_dim > 0 {
+                let src = r * agent_dim;
+                let copy_len = agent_dim.min(dim);
+                all_weights.extend_from_slice(&weights[src..src + copy_len]);
+                if dim > agent_dim {
+                    all_weights.extend(std::iter::repeat(0.0f32).take(dim - agent_dim));
+                }
+            } else {
+                all_weights.extend(std::iter::repeat(0.0f32).take(dim));
+            }
+        }
+
+        // Patterns: [agent_cap × agent_dim] → [cap × dim]
+        for p in 0..cap {
+            if p < agent_cap && agent_dim > 0 {
+                let src = p * agent_dim;
+                let copy_len = agent_dim.min(dim);
+                all_patterns.extend_from_slice(&patterns[src..src + copy_len]);
+                if dim > agent_dim {
+                    all_patterns.extend(std::iter::repeat(0.0f32).take(dim - agent_dim));
+                }
+            } else {
+                all_patterns.extend(std::iter::repeat(0.0f32).take(dim));
+            }
+        }
+
+        // Active mask: [agent_cap] → [cap]
+        let a_copy = active.len().min(cap);
+        all_active.extend_from_slice(&active[..a_copy]);
+        if cap > a_copy {
+            all_active.extend(std::iter::repeat(0u32).take(cap - a_copy));
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -735,5 +810,128 @@ mod tests {
                 sims[idx]
             );
         }
+    }
+
+    /// Verify that `pad_agent_into` correctly handles agents with smaller
+    /// dimensions than the GPU pipeline expects — the exact scenario that
+    /// causes buffer overruns when mutations change structural params.
+    #[test]
+    fn gpu_padding_preserves_encode_results() {
+        // GPU pipeline sized for the larger agent: dim=4, fc=3, cap=3
+        let gpu_dim = 4u32;
+        let gpu_fc = 3u32;
+        let gpu_cap = 3u32;
+        let gpu = match try_gpu(2, gpu_dim, gpu_fc, gpu_cap) {
+            Some(g) => g,
+            None => {
+                eprintln!("No GPU available, skipping test");
+                return;
+            }
+        };
+
+        // Agent 0: uses the full pipeline dimensions (dim=4, fc=3, cap=3)
+        let feats_0 = vec![1.0, 0.5, 0.2];
+        let weights_0: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1).collect(); // 3×4
+        let biases_0 = vec![0.01, 0.02, 0.03, 0.04];
+        let pats_0 = vec![0.7, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]; // 3×4
+        let active_0 = vec![1u32, 1, 0];
+
+        // Agent 1: smaller dimensions (dim=3, fc=2, cap=2) — the mutation case
+        let feats_1 = vec![0.8, 0.3];
+        let weights_1: Vec<f32> = (0..6).map(|i| (i as f32) * 0.15).collect(); // 2×3
+        let biases_1 = vec![0.05, 0.06, 0.07];
+        let pats_1 = vec![0.5, 0.5, 0.5, 0.0, 0.0, 0.0]; // 2×3
+        let active_1 = vec![1u32, 0];
+
+        let dim = gpu_dim as usize;
+        let fc = gpu_fc as usize;
+        let cap = gpu_cap as usize;
+
+        let mut all_features = Vec::with_capacity(2 * fc);
+        let mut all_weights = Vec::with_capacity(2 * fc * dim);
+        let mut all_biases = Vec::with_capacity(2 * dim);
+        let mut all_patterns = Vec::with_capacity(2 * cap * dim);
+        let mut all_active = Vec::with_capacity(2 * cap);
+
+        // Agent 0: no padding needed (exact match)
+        gpu.pad_agent_into(
+            &feats_0, &weights_0, &biases_0, &pats_0, &active_0,
+            4, 3, 3,
+            &mut all_features, &mut all_weights, &mut all_biases,
+            &mut all_patterns, &mut all_active,
+        );
+        // Agent 1: needs padding
+        gpu.pad_agent_into(
+            &feats_1, &weights_1, &biases_1, &pats_1, &active_1,
+            3, 2, 2,
+            &mut all_features, &mut all_weights, &mut all_biases,
+            &mut all_patterns, &mut all_active,
+        );
+
+        // Verify buffer sizes are correct
+        assert_eq!(all_features.len(), 2 * fc, "features buffer wrong size");
+        assert_eq!(all_weights.len(), 2 * fc * dim, "weights buffer wrong size");
+        assert_eq!(all_biases.len(), 2 * dim, "biases buffer wrong size");
+        assert_eq!(all_patterns.len(), 2 * cap * dim, "patterns buffer wrong size");
+        assert_eq!(all_active.len(), 2 * cap, "active buffer wrong size");
+
+        // Dispatch on GPU
+        let (encoded, sims) = gpu.dispatch(
+            &all_features, &all_weights, &all_biases, &all_patterns, &all_active,
+        );
+
+        // Verify agent 0 encode matches CPU reference (full dims)
+        let cpu_enc_0 = cpu_encode(&feats_0, &weights_0, &biases_0, 4);
+        for d in 0..4 {
+            assert!(
+                (encoded[d] - cpu_enc_0[d]).abs() < 1e-4,
+                "Agent 0 dim {}: GPU={} CPU={}",
+                d, encoded[d], cpu_enc_0[d]
+            );
+        }
+
+        // Verify agent 1 encode: first 3 dims should match CPU with padded layout
+        // The padded weights for agent 1 are: row0=[0,0.15,0.3,0], row1=[0.45,0.6,0.75,0], row2=[0,0,0,0]
+        // So CPU encode with padded layout gives same first 3 dims
+        let padded_weights_1: Vec<f32> = {
+            let mut w = Vec::new();
+            // row 0 of agent 1: weights_1[0..3] padded to dim=4
+            w.extend_from_slice(&weights_1[0..3]);
+            w.push(0.0);
+            // row 1
+            w.extend_from_slice(&weights_1[3..6]);
+            w.push(0.0);
+            // row 2 (padding row)
+            w.extend_from_slice(&[0.0; 4]);
+            w
+        };
+        let padded_feats_1 = vec![0.8, 0.3, 0.0];
+        let padded_biases_1 = vec![0.05, 0.06, 0.07, 0.0];
+        let cpu_enc_1 = cpu_encode(&padded_feats_1, &padded_weights_1, &padded_biases_1, 4);
+        for d in 0..3 {
+            assert!(
+                (encoded[dim + d] - cpu_enc_1[d]).abs() < 1e-4,
+                "Agent 1 dim {}: GPU={} CPU={}",
+                d, encoded[dim + d], cpu_enc_1[d]
+            );
+        }
+        // Dim 3 of agent 1 should be tanh(0) = 0 (padding)
+        assert!(
+            encoded[dim + 3].abs() < 1e-4,
+            "Agent 1 padded dim should be ~0, got {}",
+            encoded[dim + 3]
+        );
+
+        // Verify agent 1 inactive pattern (slot 1) and padding slot (slot 2)
+        assert!(
+            sims[cap + 1] < -1.5,
+            "Agent 1 inactive pattern should be -2.0, got {}",
+            sims[cap + 1]
+        );
+        assert!(
+            sims[cap + 2] < -1.5,
+            "Agent 1 padding slot should be -2.0, got {}",
+            sims[cap + 2]
+        );
     }
 }

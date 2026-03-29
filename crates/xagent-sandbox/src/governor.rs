@@ -5,11 +5,12 @@
 //! All state is persisted in a SQLite database (`xagent.db`), enabling resume
 //! and post-hoc analysis of the evolution tree.
 
+use rand::Rng;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
-use crate::agent::{mutate_config_with_strength, Agent, HEATMAP_RES};
+use crate::agent::{crossover_config, mutate_config_with_strength, Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
@@ -34,6 +35,14 @@ pub enum AdvanceResult {
     Finished {
         messages: Vec<String>,
     },
+}
+
+/// An independent evolutionary lineage within the island model.
+#[derive(Clone, Debug)]
+struct Island {
+    spawn_parent_id: Option<i64>,
+    best_score: f32,
+    elite_configs: Vec<BrainConfig>,
 }
 
 /// The evolution governor. Owns the SQLite connection and drives the
@@ -61,15 +70,23 @@ pub struct Governor {
     pub current_node_id: Option<i64>,
     pub generation: u32,
     pub gen_tick: u64,
-    /// Global best fitness across all successful generations.
-    pub best_score: f32,
-    /// The node from which the next child will be spawned.
-    pub spawn_parent_id: Option<i64>,
-    /// Configs from the most recent successful generation (for elitism).
-    elite_configs: Vec<BrainConfig>,
+    /// Independent evolutionary lineages.
+    islands: Vec<Island>,
+    /// Index of the island currently being evaluated (round-robin).
+    active_island: usize,
 }
 
 impl Governor {
+    /// Global best score across all islands.
+    pub fn best_score(&self) -> f32 {
+        self.islands.iter().map(|i| i.best_score).fold(-1.0_f32, f32::max)
+    }
+
+    /// Active island's spawn parent (for tree display).
+    pub fn spawn_parent_id(&self) -> Option<i64> {
+        self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id)
+    }
+
     /// Create a new governor, initializing the database schema and inserting
     /// a new run record. `db_path` is the SQLite file path.
     pub fn new(
@@ -106,6 +123,15 @@ impl Governor {
             params![root_id, run_id],
         )?;
 
+        let num_islands = config.num_islands.max(1);
+        let islands: Vec<Island> = (0..num_islands)
+            .map(|_| Island {
+                spawn_parent_id: Some(root_id),
+                best_score: -1.0,
+                elite_configs: Vec::new(),
+            })
+            .collect();
+
         Ok(Self {
             db,
             config,
@@ -113,9 +139,8 @@ impl Governor {
             current_node_id: Some(root_id),
             generation: 0,
             gen_tick: 0,
-            best_score: -1.0,
-            spawn_parent_id: Some(root_id),
-            elite_configs: Vec::new(),
+            islands,
+            active_island: 0,
         })
     }
 
@@ -144,6 +169,16 @@ impl Governor {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
+        // Reconstruct all islands from the persisted best state
+        let num_islands = config.num_islands.max(1);
+        let islands: Vec<Island> = (0..num_islands)
+            .map(|_| Island {
+                spawn_parent_id,
+                best_score: best_score as f32,
+                elite_configs: Vec::new(),
+            })
+            .collect();
+
         Ok(Self {
             db,
             config,
@@ -151,9 +186,8 @@ impl Governor {
             current_node_id: Some(node_id),
             generation,
             gen_tick: 0,
-            best_score: best_score as f32,
-            spawn_parent_id,
-            elite_configs: Vec::new(),
+            islands,
+            active_island: 0,
         })
     }
 
@@ -271,28 +305,60 @@ impl Governor {
         results
     }
 
+    /// Reduce per-agent fitness to per-config-group fitness by averaging.
+    /// Groups agents by `index / eval_repeats` and averages composite_fitness.
+    fn reduce_fitness(&self, fitness: &[AgentFitness]) -> Vec<AgentFitness> {
+        let repeats = self.config.eval_repeats.max(1);
+        let mut groups: Vec<AgentFitness> = Vec::new();
+        for chunk in fitness.chunks(repeats) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let avg_fitness =
+                chunk.iter().map(|f| f.composite_fitness).sum::<f32>() / chunk.len() as f32;
+            let best = chunk
+                .iter()
+                .max_by(|a, b| {
+                    a.composite_fitness
+                        .partial_cmp(&b.composite_fitness)
+                        .unwrap()
+                })
+                .unwrap();
+            groups.push(AgentFitness {
+                composite_fitness: avg_fitness,
+                ..best.clone()
+            });
+        }
+        groups.sort_by(|a, b| {
+            b.composite_fitness
+                .partial_cmp(&a.composite_fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        groups
+    }
+
     /// Process the evaluation results and advance to the next generation.
     ///
     /// Call this after `evaluate()`. Returns configs for the next population
     /// and log messages describing what happened.
     pub fn advance(&mut self, fitness: &[AgentFitness]) -> AdvanceResult {
-        let gen_fit = fitness
-            .first()
-            .map(|f| f.composite_fitness)
-            .unwrap_or(0.0);
+        let reduced = self.reduce_fitness(fitness);
+        let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
 
+        let island = &mut self.islands[self.active_island];
+
         // Score this generation
-        if gen_fit >= self.best_score {
-            // ★ Success — this generation met or beat the global best
-            self.best_score = gen_fit;
+        if gen_fit >= island.best_score {
+            // ★ Success — this generation met or beat the island best
+            island.best_score = gen_fit;
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
             );
-            self.spawn_parent_id = self.current_node_id;
+            island.spawn_parent_id = self.current_node_id;
             // Store elite configs from this successful generation
-            self.elite_configs = fitness
+            island.elite_configs = reduced
                 .iter()
                 .take(self.config.elitism_count)
                 .map(|f| f.config.clone())
@@ -306,11 +372,11 @@ impl Governor {
             );
             messages.push(format!(
                 "[EVOLUTION] ✗ Failed ({:.4} ≤ best {:.4})",
-                gen_fit, self.best_score
+                gen_fit, island.best_score
             ));
 
             // Check if spawn parent has exhausted its patience
-            if let Some(parent_id) = self.spawn_parent_id {
+            if let Some(parent_id) = island.spawn_parent_id {
                 let attempts: i64 = self
                     .db
                     .query_row(
@@ -338,6 +404,46 @@ impl Governor {
 
         // Breed the next generation from the current spawn parent
         let configs = self.breed_next_generation(fitness);
+
+        // Rotate to next island
+        if self.islands.len() > 1 {
+            self.active_island = (self.active_island + 1) % self.islands.len();
+        }
+
+        // Migration: every migration_interval generations, spread best config
+        if self.config.migration_interval > 0
+            && self.generation % self.config.migration_interval as u32 == 0
+            && self.islands.len() > 1
+        {
+            let best_island_idx = self
+                .islands
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.best_score.partial_cmp(&b.best_score).unwrap()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+
+            if let Some(best_elite) =
+                self.islands[best_island_idx].elite_configs.first().cloned()
+            {
+                for (i, island) in self.islands.iter_mut().enumerate() {
+                    if i != best_island_idx {
+                        if island.elite_configs.len() >= self.config.elitism_count {
+                            island.elite_configs.pop();
+                        }
+                        island.elite_configs.insert(0, best_elite.clone());
+                    }
+                }
+                messages.push(format!(
+                    "[EVOLUTION] Migration: island {} config spread to {} others",
+                    best_island_idx,
+                    self.islands.len() - 1
+                ));
+            }
+        }
+
         self.persist_state();
 
         AdvanceResult::Continue { configs, messages }
@@ -383,21 +489,21 @@ impl Governor {
                 if parent_attempts >= self.config.patience as i64 {
                     self.cascade_exhaustion(pid, messages);
                 } else {
-                    self.spawn_parent_id = Some(pid);
+                    self.islands[self.active_island].spawn_parent_id = Some(pid);
                 }
             }
             None => {
                 // Root exhaustion: partial rollback preserves most progress
-                self.best_score *= 0.95;
+                self.islands[self.active_island].best_score *= 0.95;
 
                 let _ = self.db.execute(
                     "UPDATE node SET spawn_attempts = 0 WHERE id = ?1",
                     params![node_id],
                 );
-                self.spawn_parent_id = Some(node_id);
+                self.islands[self.active_island].spawn_parent_id = Some(node_id);
                 messages.push(format!(
                     "[EVOLUTION] Root exhausted — best score rolled back to {:.4} (×0.95)",
-                    self.best_score
+                    self.islands[self.active_island].best_score
                 ));
             }
         }
@@ -407,7 +513,8 @@ impl Governor {
     /// Increments the parent's spawn_attempts and returns population configs.
     /// Uses elitism to preserve top configs and adaptive mutation strength.
     fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
-        let spawn_parent = match self.spawn_parent_id {
+        let island = &self.islands[self.active_island];
+        let spawn_parent = match island.spawn_parent_id {
             Some(id) => id,
             None => return Vec::new(),
         };
@@ -456,7 +563,7 @@ impl Governor {
         );
 
         // Record which parameters were mutated
-        let parent_fitness = self.best_score;
+        let parent_fitness = self.best_score();
         record_mutations(
             &self.db,
             new_node_id,
@@ -465,31 +572,73 @@ impl Governor {
             parent_fitness,
         );
 
-        // Population slot 0: unmutated champion (the spawn parent's exact config)
+        // Compute unique config count for eval_repeats noise reduction
         let pop_size = self.config.population_size;
-        let elite_count = self.config.elitism_count.min(pop_size.saturating_sub(1));
-        let mut configs = vec![parent_config.clone()];
+        let repeats = self.config.eval_repeats.max(1);
+        let unique_count = (pop_size / repeats).max(1);
+        let elite_count = self.config.elitism_count.min(unique_count.saturating_sub(1));
+
+        // Population slot 0: unmutated champion (the spawn parent's exact config)
+        let mut unique_configs = vec![parent_config.clone()];
 
         // Elitism: mutate top configs from the last SUCCESSFUL generation
-        for elite in self.elite_configs.iter().take(elite_count) {
-            if configs.len() >= pop_size {
+        let island = &self.islands[self.active_island];
+        for elite in island.elite_configs.iter().take(elite_count) {
+            if unique_configs.len() >= unique_count {
                 break;
             }
-            configs.push(mutate_config_with_strength(elite, effective_strength));
+            unique_configs.push(mutate_config_with_strength(elite, effective_strength));
         }
 
-        // Fill remaining slots from the spawn parent's config
-        while configs.len() < pop_size {
-            configs.push(mutate_config_with_strength(&parent_config, effective_strength));
+        // Crossover offspring from elite pairs
+        if island.elite_configs.len() >= 2 {
+            let crossover_count = 3.min(unique_count / 3);
+            let mut rng = rand::rng();
+            for _ in 0..crossover_count {
+                if unique_configs.len() >= unique_count {
+                    break;
+                }
+                let idx_a = rng.random_range(0..island.elite_configs.len());
+                let idx_b = rng.random_range(0..island.elite_configs.len());
+                let child = crossover_config(
+                    &island.elite_configs[idx_a],
+                    &island.elite_configs[idx_b],
+                );
+                unique_configs.push(mutate_config_with_strength(&child, effective_strength));
+            }
         }
+
+        // Fill remaining unique slots from the spawn parent's config
+        while unique_configs.len() < unique_count {
+            unique_configs.push(mutate_config_with_strength(&parent_config, effective_strength));
+        }
+
+        // Repeat each config eval_repeats times to fill pop_size slots
+        let mut configs = Vec::with_capacity(pop_size);
+        for uc in &unique_configs {
+            for _ in 0..repeats {
+                if configs.len() >= pop_size {
+                    break;
+                }
+                configs.push(uc.clone());
+            }
+        }
+
         configs
     }
 
     /// Persist best_score and spawn_parent_id for resume.
     fn persist_state(&self) {
+        // Save the best island's state
+        let best_score = self.best_score();
+        let best_island = self
+            .islands
+            .iter()
+            .max_by(|a, b| a.best_score.partial_cmp(&b.best_score).unwrap());
+        let spawn_parent = best_island.and_then(|i| i.spawn_parent_id);
         let _ = self.db.execute(
             "UPDATE run SET best_score = ?1, spawn_parent_id = ?2 WHERE id = ?3",
-            params![self.best_score as f64, self.spawn_parent_id, self.run_id],
+            params![best_score as f64, spawn_parent, self.run_id],
         );
     }
 
@@ -829,6 +978,9 @@ mod tests {
             patience,
             max_generations: 0,
             mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
@@ -886,11 +1038,11 @@ mod tests {
     fn gen_0_always_succeeds() {
         let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
-        assert_eq!(gov.best_score, -1.0);
+        assert_eq!(gov.best_score(), -1.0);
 
         let result = gov.advance(&mock_fitness(0.1));
         assert!(matches!(result, AdvanceResult::Continue { .. }));
-        assert_eq!(gov.best_score, 0.1);
+        assert_eq!(gov.best_score(), 0.1);
         assert_eq!(node_status(&gov, root_id), "successful");
     }
 
@@ -901,7 +1053,7 @@ mod tests {
 
         // Gen 0: fitness 0.1 → success
         gov.advance(&mock_fitness(0.1));
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
         let gen1_id = gov.current_node_id.unwrap();
         assert_ne!(gen1_id, root_id);
@@ -909,8 +1061,8 @@ mod tests {
 
         // Gen 1: fitness 0.2 → success, spawn_parent deepens to gen1
         gov.advance(&mock_fitness(0.2));
-        assert_eq!(gov.best_score, 0.2);
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.best_score(), 0.2);
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
         assert_eq!(node_status(&gov, gen1_id), "successful");
     }
 
@@ -925,13 +1077,13 @@ mod tests {
 
         // Gen 1: success
         gov.advance(&mock_fitness(0.2));
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
 
         let gen2_id = gov.current_node_id.unwrap();
 
         // Gen 2: failure (0.18 ≤ 0.2) — spawn_parent stays at gen1
         gov.advance(&mock_fitness(0.18));
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
         assert_eq!(node_status(&gov, gen2_id), "failed");
 
         // Gen 3 should be a child of gen1 (not gen2)
@@ -949,7 +1101,7 @@ mod tests {
 
         // Gen 1: success (best=0.2)
         gov.advance(&mock_fitness(0.2));
-        let gen1_node = gov.spawn_parent_id.unwrap();
+        let gen1_node = gov.spawn_parent_id().unwrap();
         assert_eq!(gen1_node, gen1_id);
 
         // Gen 2: fail
@@ -964,7 +1116,7 @@ mod tests {
         let root_id = node_parent(&gov, gen1_node).unwrap();
         gov.advance(&mock_fitness(0.19));
         assert_eq!(node_status(&gov, gen1_node), "exhausted");
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
     }
 
     #[test]
@@ -977,7 +1129,7 @@ mod tests {
 
         // Gen 1 → success (best=0.2)
         gov.advance(&mock_fitness(0.2));
-        let gen1_id = gov.spawn_parent_id.unwrap();
+        let gen1_id = gov.spawn_parent_id().unwrap();
 
         // Gen 2: fail → gen1.attempts=2
         gov.advance(&mock_fitness(0.15));
@@ -985,7 +1137,7 @@ mod tests {
         //   gen1 exhausted → cascade to root (root.attempts=1, < patience=2)
         gov.advance(&mock_fitness(0.15));
         assert_eq!(node_status(&gov, gen1_id), "exhausted");
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
     }
 
     #[test]
@@ -998,7 +1150,7 @@ mod tests {
 
         // Gen 1: success (best=0.2)
         gov.advance(&mock_fitness(0.2));
-        let gen1_id = gov.spawn_parent_id.unwrap();
+        let gen1_id = gov.spawn_parent_id().unwrap();
 
         // Gen 2, Gen 3: fail → gen1 exhausted → root.attempts=2 (gen1 + gen2_child)
         gov.advance(&mock_fitness(0.15));
@@ -1009,8 +1161,8 @@ mod tests {
         // Gen 5: fail → root.attempts=2 → root exhausted, partial rollback, then breed adds 1
         gov.advance(&mock_fitness(0.12));
         // Partial rollback: 0.2 * 0.95 = 0.19
-        assert!((gov.best_score - 0.19).abs() < 0.001);
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert!((gov.best_score() - 0.19).abs() < 0.001);
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
         assert_eq!(node_attempts(&gov, root_id), 1); // reset to 0, then breed incremented to 1
     }
 
@@ -1029,12 +1181,12 @@ mod tests {
         gov.advance(&mock_fitness(0.15));
         // gen1 exhausted, cascade to root. root.attempts = 1 >= patience=1 → root exhausted
         // Partial rollback: 0.2 * 0.95 = 0.19
-        assert!((gov.best_score - 0.19).abs() < 0.001);
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert!((gov.best_score() - 0.19).abs() < 0.001);
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
         // Gen 3: 0.19 >= 0.19 → success (ties accepted)!
         gov.advance(&mock_fitness(0.19));
-        assert!((gov.best_score - 0.19).abs() < 0.001);
+        assert!((gov.best_score() - 0.19).abs() < 0.001);
     }
 
     #[test]
@@ -1043,17 +1195,17 @@ mod tests {
 
         // Gen 0: success (best=0.5)
         gov.advance(&mock_fitness(0.5));
-        let root_id = gov.spawn_parent_id.unwrap();
+        let root_id = gov.spawn_parent_id().unwrap();
 
         // Gen 1: fitness = 0.5 (same as best) → SUCCESS (>= accepts ties)
         let gen1_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.5));
         assert_eq!(node_status(&gov, gen1_id), "successful");
-        assert_eq!(gov.best_score, 0.5);
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.best_score(), 0.5);
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
 
         // Spawn parent moved to gen1 (not stuck at root)
-        assert_ne!(gov.spawn_parent_id, Some(root_id));
+        assert_ne!(gov.spawn_parent_id(), Some(root_id));
     }
 
     #[test]
@@ -1064,21 +1216,21 @@ mod tests {
 
         // Gen 0: fit=0.1 → success (best=0.1)
         gov.advance(&mock_fitness(0.1));
-        assert_eq!(gov.best_score, 0.1);
+        assert_eq!(gov.best_score(), 0.1);
         assert_eq!(node_status(&gov, root_id), "successful");
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
         // Gen 1: fit=0.2 → success (best=0.2)
         let gen1_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.2));
-        assert_eq!(gov.best_score, 0.2);
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.best_score(), 0.2);
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
 
         // Gen 2: fit=0.18 → fail
         let gen2_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.18));
         assert_eq!(node_status(&gov, gen2_id), "failed");
-        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+        assert_eq!(gov.spawn_parent_id(), Some(gen1_id));
 
         // Gen 3: fit=0.19 → fail
         let gen3_id = gov.current_node_id.unwrap();
@@ -1089,8 +1241,8 @@ mod tests {
         let gen4_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.2));
         assert_eq!(node_status(&gov, gen4_id), "successful");
-        assert_eq!(gov.spawn_parent_id, Some(gen4_id));
-        assert_eq!(gov.best_score, 0.2);
+        assert_eq!(gov.spawn_parent_id(), Some(gen4_id));
+        assert_eq!(gov.best_score(), 0.2);
 
         // Gen 5: fit=0.15 → fail (child of gen4)
         let gen5_id = gov.current_node_id.unwrap();
@@ -1108,9 +1260,9 @@ mod tests {
         // depending on exact count, may cascade further
 
         // Verify system is still alive and can continue
-        let fit_before = gov.best_score;
+        let fit_before = gov.best_score();
         gov.advance(&mock_fitness(fit_before + 0.01));
-        assert!(gov.best_score >= fit_before);
+        assert!(gov.best_score() >= fit_before);
     }
 
     #[test]
@@ -1132,6 +1284,9 @@ mod tests {
             patience: 3,
             max_generations: 1,
             mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1150,7 +1305,7 @@ mod tests {
 
         // Gen 1: success (best=0.6), spawn_parent becomes gen1
         gov.advance(&mock_fitness(0.6));
-        let gen1_id = gov.spawn_parent_id.unwrap();
+        let gen1_id = gov.spawn_parent_id().unwrap();
         // gen1 now has spawn_attempts=1 (from breeding gen2)
 
         // Gen 2: fail → gen1 gains another attempt
@@ -1177,6 +1332,9 @@ mod tests {
             patience: 100, // high patience so adaptive ramp stays near base
             max_generations: 0,
             mutation_strength: 0.001,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1227,7 +1385,7 @@ mod tests {
 
         // Gen 0: advance with elite fitness → SUCCESS, stores elite_configs
         gov.advance(&elite_fitness);
-        assert!(!gov.elite_configs.is_empty());
+        assert!(!gov.islands[gov.active_island].elite_configs.is_empty());
 
         // breed_next_generation uses stored elite_configs from the successful gen
         let configs = gov.breed_next_generation(&mock_fitness(0.01));
@@ -1255,7 +1413,7 @@ mod tests {
 
         // Gen 0: success — root becomes spawn parent
         gov.advance(&mock_fitness(0.1));
-        let spawn_id = gov.spawn_parent_id.unwrap();
+        let spawn_id = gov.spawn_parent_id().unwrap();
 
         // Get the spawn parent's config from the DB (what breed uses)
         let parent_json: String = gov.db
@@ -1276,5 +1434,143 @@ mod tests {
         assert_eq!(configs[0].representation_dim, parent_config.representation_dim);
         assert!((configs[0].learning_rate - parent_config.learning_rate).abs() < f32::EPSILON);
         assert!((configs[0].decay_rate - parent_config.decay_rate).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn noise_reduction_averages_fitness() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 1,
+            migration_interval: 0,
+        };
+        let brain = BrainConfig::default();
+        let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // 4 agents, eval_repeats=2 → 2 groups of 2
+        let fitness = vec![
+            AgentFitness {
+                agent_index: 0,
+                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
+                composite_fitness: 0.8,
+            },
+            AgentFitness {
+                agent_index: 1,
+                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
+                composite_fitness: 0.6,
+            },
+            AgentFitness {
+                agent_index: 2,
+                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
+                composite_fitness: 0.5,
+            },
+            AgentFitness {
+                agent_index: 3,
+                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
+                composite_fitness: 0.9,
+            },
+        ];
+
+        let reduced = gov.reduce_fitness(&fitness);
+        assert_eq!(reduced.len(), 2);
+        // Group 0: avg of 0.8 and 0.6 = 0.7
+        // Group 1: avg of 0.5 and 0.9 = 0.7
+        // Both average to 0.7, sorted descending
+        let avg0 = reduced[0].composite_fitness;
+        let avg1 = reduced[1].composite_fitness;
+        assert!((avg0 - 0.7).abs() < 0.01, "expected ~0.7, got {}", avg0);
+        assert!((avg1 - 0.7).abs() < 0.01, "expected ~0.7, got {}", avg1);
+    }
+
+    #[test]
+    fn island_rotation() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 3,
+            migration_interval: 0,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        assert_eq!(gov.active_island, 0);
+        gov.advance(&mock_fitness(0.1));
+        assert_eq!(gov.active_island, 1);
+        gov.advance(&mock_fitness(0.2));
+        assert_eq!(gov.active_island, 2);
+        gov.advance(&mock_fitness(0.3));
+        assert_eq!(gov.active_island, 0); // wraps around
+    }
+
+    #[test]
+    fn crossover_combines_parents() {
+        use crate::agent::crossover_config;
+
+        let a = BrainConfig {
+            memory_capacity: 1000,
+            processing_slots: 100,
+            visual_encoding_size: 64,
+            representation_dim: 500,
+            learning_rate: 0.9,
+            decay_rate: 0.9,
+        };
+        let b = BrainConfig {
+            memory_capacity: 1,
+            processing_slots: 1,
+            visual_encoding_size: 64,
+            representation_dim: 1,
+            learning_rate: 0.001,
+            decay_rate: 0.001,
+        };
+
+        // Run crossover many times — with probability 1-(0.5^5)^N the child
+        // will have at least one param from each parent
+        let mut has_a_param = false;
+        let mut has_b_param = false;
+        for _ in 0..50 {
+            let child = crossover_config(&a, &b);
+            if child.memory_capacity == a.memory_capacity
+                || child.processing_slots == a.processing_slots
+                || child.representation_dim == a.representation_dim
+            {
+                has_a_param = true;
+            }
+            if child.memory_capacity == b.memory_capacity
+                || child.processing_slots == b.processing_slots
+                || child.representation_dim == b.representation_dim
+            {
+                has_b_param = true;
+            }
+            // visual_encoding_size always from parent a
+            assert_eq!(child.visual_encoding_size, a.visual_encoding_size);
+        }
+        assert!(has_a_param, "crossover never picked from parent A");
+        assert!(has_b_param, "crossover never picked from parent B");
     }
 }

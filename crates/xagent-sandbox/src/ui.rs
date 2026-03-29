@@ -71,6 +71,9 @@ pub struct EvolutionSnapshot {
     pub elitism_count: usize,
     pub patience: u32,
     pub max_generations: u64,
+    pub eval_repeats: usize,
+    pub num_islands: usize,
+    pub migration_interval: u32,
     pub wall_time_secs: f64,
     pub ticks_per_sec: f64,
     pub tree_nodes: Vec<crate::governor::TreeNode>,
@@ -93,6 +96,9 @@ impl Default for EvolutionSnapshot {
             elitism_count: 3,
             patience: 5,
             max_generations: 0,
+            eval_repeats: 2,
+            num_islands: 3,
+            migration_interval: 5,
             wall_time_secs: 0.0,
             ticks_per_sec: 0.0,
             tree_nodes: Vec::new(),
@@ -806,6 +812,24 @@ impl<'a> TabContext<'a> {
                     ui.add(egui::DragValue::new(&mut p).range(1..=20).speed(1));
                     g.patience = p.max(1) as u32;
                     ui.end_row();
+
+                    ui.label("eval_repeats");
+                    let mut er = g.eval_repeats as i32;
+                    ui.add(egui::DragValue::new(&mut er).range(1..=5).speed(1));
+                    g.eval_repeats = er.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("num_islands");
+                    let mut ni = g.num_islands as i32;
+                    ui.add(egui::DragValue::new(&mut ni).range(1..=10).speed(1));
+                    g.num_islands = ni.max(1) as usize;
+                    ui.end_row();
+
+                    ui.label("migration_interval");
+                    let mut mi = g.migration_interval as i32;
+                    ui.add(egui::DragValue::new(&mut mi).range(0..=50).speed(1));
+                    g.migration_interval = mi.max(0) as u32;
+                    ui.end_row();
                 });
         });
     }
@@ -858,6 +882,15 @@ impl<'a> TabContext<'a> {
                     ui.end_row();
                     ui.label("patience");
                     ui.monospace(format!("{}", evo.patience));
+                    ui.end_row();
+                    ui.label("eval_repeats");
+                    ui.monospace(format!("{}", evo.eval_repeats));
+                    ui.end_row();
+                    ui.label("num_islands");
+                    ui.monospace(format!("{}", evo.num_islands));
+                    ui.end_row();
+                    ui.label("migration_interval");
+                    ui.monospace(format!("{}", evo.migration_interval));
                     ui.end_row();
                 });
         });

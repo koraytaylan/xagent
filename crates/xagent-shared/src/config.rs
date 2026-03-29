@@ -95,10 +95,31 @@ pub struct GovernorConfig {
     /// Base mutation strength (0.1 = ±10%). Scales up with failed attempts.
     #[serde(default = "default_mutation_strength")]
     pub mutation_strength: f32,
+    /// How many times each unique config is evaluated per generation (noise reduction).
+    #[serde(default = "default_eval_repeats")]
+    pub eval_repeats: usize,
+    /// Number of independent evolutionary lineages (island model).
+    #[serde(default = "default_num_islands")]
+    pub num_islands: usize,
+    /// Generations between best-config migration across islands.
+    #[serde(default = "default_migration_interval")]
+    pub migration_interval: u32,
 }
 
 fn default_mutation_strength() -> f32 {
     0.1
+}
+
+fn default_eval_repeats() -> usize {
+    2
+}
+
+fn default_num_islands() -> usize {
+    3
+}
+
+fn default_migration_interval() -> u32 {
+    5
 }
 
 impl Default for GovernorConfig {
@@ -110,6 +131,9 @@ impl Default for GovernorConfig {
             max_generations: 0,
             patience: 5,
             mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 3,
+            migration_interval: 5,
         }
     }
 }

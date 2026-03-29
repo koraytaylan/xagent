@@ -346,6 +346,9 @@ impl App {
                 evo_snapshot.elitism_count = prev_gov.elitism_count;
                 evo_snapshot.patience = prev_gov.patience;
                 evo_snapshot.max_generations = prev_gov.max_generations;
+                evo_snapshot.eval_repeats = prev_gov.eval_repeats;
+                evo_snapshot.num_islands = prev_gov.num_islands;
+                evo_snapshot.migration_interval = prev_gov.migration_interval;
                 // Also load tree/fitness from DB for the summary view
                 if let Ok(gov) = Governor::resume(db_path) {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
@@ -499,6 +502,9 @@ impl App {
                         self.evo_snapshot.elitism_count = gov_config.elitism_count;
                         self.evo_snapshot.patience = gov_config.patience;
                         self.evo_snapshot.max_generations = gov_config.max_generations;
+                        self.evo_snapshot.eval_repeats = gov_config.eval_repeats;
+                        self.evo_snapshot.num_islands = gov_config.num_islands;
+                        self.evo_snapshot.migration_interval = gov_config.migration_interval;
                         self.evo_wall_start = Instant::now();
                         self.paused = false;
                         self.spawn_evolution_population();

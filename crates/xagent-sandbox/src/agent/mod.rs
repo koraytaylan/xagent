@@ -268,6 +268,39 @@ pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> Brain
     }
 }
 
+/// Uniform crossover: randomly pick each parameter from parent A or B.
+pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
+    let mut rng = rand::rng();
+    BrainConfig {
+        memory_capacity: if rng.random::<f32>() < 0.5 {
+            a.memory_capacity
+        } else {
+            b.memory_capacity
+        },
+        processing_slots: if rng.random::<f32>() < 0.5 {
+            a.processing_slots
+        } else {
+            b.processing_slots
+        },
+        visual_encoding_size: a.visual_encoding_size,
+        representation_dim: if rng.random::<f32>() < 0.5 {
+            a.representation_dim
+        } else {
+            b.representation_dim
+        },
+        learning_rate: if rng.random::<f32>() < 0.5 {
+            a.learning_rate
+        } else {
+            b.learning_rate
+        },
+        decay_rate: if rng.random::<f32>() < 0.5 {
+            a.decay_rate
+        } else {
+            b.decay_rate
+        },
+    }
+}
+
 /// Convert a single sRGB channel value to linear space.
 /// This ensures colors rendered through an sRGB framebuffer match egui's sRGB display.
 pub fn srgb_to_linear(c: f32) -> f32 {

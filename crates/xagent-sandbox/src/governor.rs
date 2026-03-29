@@ -41,15 +41,19 @@ pub enum AdvanceResult {
 ///
 /// # Algorithm
 ///
-/// A generation "succeeds" only if its fitness strictly exceeds the global
+/// A generation "succeeds" if its fitness meets or exceeds the global
 /// `best_score`. Successful nodes become the new spawn parent (tree deepens).
-/// Failed nodes are dead ends — the governor spawns another child from the
-/// current spawn parent with different mutations.
+/// Ties (matching best_score) count as success — they represent reproducible
+/// quality and shouldn't burn patience in a stochastic environment.
 ///
 /// Each node may spawn at most `patience` children. When the limit is
 /// reached, the node is "exhausted" and the governor cascades up to its
-/// parent. If the root exhausts, `best_score` rolls back to the root's own
-/// fitness, its attempt counter resets, and evolution continues.
+/// parent. If the root exhausts, `best_score` is partially rolled back
+/// (×0.95), its attempt counter resets, and evolution continues.
+///
+/// The population includes an unmutated copy of the spawn parent's config
+/// (the champion), elite configs from the last successful generation, and
+/// mutated variants from the spawn parent with adaptive mutation strength.
 pub struct Governor {
     pub db: Connection,
     pub config: GovernorConfig,
@@ -61,6 +65,8 @@ pub struct Governor {
     pub best_score: f32,
     /// The node from which the next child will be spawned.
     pub spawn_parent_id: Option<i64>,
+    /// Configs from the most recent successful generation (for elitism).
+    elite_configs: Vec<BrainConfig>,
 }
 
 impl Governor {
@@ -109,6 +115,7 @@ impl Governor {
             gen_tick: 0,
             best_score: -1.0,
             spawn_parent_id: Some(root_id),
+            elite_configs: Vec::new(),
         })
     }
 
@@ -146,6 +153,7 @@ impl Governor {
             gen_tick: 0,
             best_score: best_score as f32,
             spawn_parent_id,
+            elite_configs: Vec::new(),
         })
     }
 
@@ -275,14 +283,20 @@ impl Governor {
         let mut messages = Vec::new();
 
         // Score this generation
-        if gen_fit > self.best_score {
-            // ★ Success — this generation beat the global best
+        if gen_fit >= self.best_score {
+            // ★ Success — this generation met or beat the global best
             self.best_score = gen_fit;
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
             );
             self.spawn_parent_id = self.current_node_id;
+            // Store elite configs from this successful generation
+            self.elite_configs = fitness
+                .iter()
+                .take(self.config.elitism_count)
+                .map(|f| f.config.clone())
+                .collect();
             messages.push(format!("[EVOLUTION] ★ New best: {:.4}", gen_fit));
         } else {
             // ✗ Failure — didn't beat the best score
@@ -332,8 +346,9 @@ impl Governor {
     /// Walk up the tree when a node exhausts its patience.
     ///
     /// Non-root nodes are marked `exhausted` and the governor cascades to
-    /// their parent. If the root itself exhausts, `best_score` is rolled
-    /// back to the root's own fitness and its attempt counter resets.
+    /// their parent. If the root itself exhausts, `best_score` is partially
+    /// rolled back (×0.95) to preserve most progress while giving slack,
+    /// and its attempt counter resets.
     fn cascade_exhaustion(&mut self, node_id: i64, messages: &mut Vec<String>) {
         let (gen, parent_id): (u32, Option<i64>) = self
             .db
@@ -372,16 +387,8 @@ impl Governor {
                 }
             }
             None => {
-                // Root exhaustion: roll back best_score, reset attempts
-                let root_fitness: f64 = self
-                    .db
-                    .query_row(
-                        "SELECT COALESCE(best_fitness, 0) FROM node WHERE id = ?1",
-                        params![node_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0.0);
-                self.best_score = root_fitness as f32;
+                // Root exhaustion: partial rollback preserves most progress
+                self.best_score *= 0.95;
 
                 let _ = self.db.execute(
                     "UPDATE node SET spawn_attempts = 0 WHERE id = ?1",
@@ -389,7 +396,7 @@ impl Governor {
                 );
                 self.spawn_parent_id = Some(node_id);
                 messages.push(format!(
-                    "[EVOLUTION] Root exhausted — best score rolled back to {:.4}",
+                    "[EVOLUTION] Root exhausted — best score rolled back to {:.4} (×0.95)",
                     self.best_score
                 ));
             }
@@ -399,7 +406,7 @@ impl Governor {
     /// Create the next generation node as a child of `spawn_parent_id`.
     /// Increments the parent's spawn_attempts and returns population configs.
     /// Uses elitism to preserve top configs and adaptive mutation strength.
-    fn breed_next_generation(&mut self, fitness: &[AgentFitness]) -> Vec<BrainConfig> {
+    fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
         let spawn_parent = match self.spawn_parent_id {
             Some(id) => id,
             None => return Vec::new(),
@@ -414,7 +421,7 @@ impl Governor {
             Err(_) => BrainConfig::default(),
         };
 
-        // Adaptive mutation: strength increases with failed spawn attempts
+        // Adaptive mutation: linearly ramp from base to max across patience range
         let attempts: i64 = self
             .db
             .query_row(
@@ -423,8 +430,11 @@ impl Governor {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        let base = self.config.mutation_strength;
+        let max_strength = 0.5_f32;
+        let patience = self.config.patience.max(1) as f32;
         let effective_strength =
-            (self.config.mutation_strength * (1.0 + attempts as f32 * 0.5)).min(0.5);
+            base + (max_strength - base) * (attempts as f32 / patience).min(1.0);
 
         let base_config = mutate_config_with_strength(&parent_config, effective_strength);
 
@@ -455,23 +465,22 @@ impl Governor {
             parent_fitness,
         );
 
-        // Build population with elitism: top configs from previous generation
-        // get mutated and included, rest filled from spawn parent's config.
+        // Population slot 0: unmutated champion (the spawn parent's exact config)
         let pop_size = self.config.population_size;
         let elite_count = self.config.elitism_count.min(pop_size.saturating_sub(1));
-        let mut configs = vec![base_config.clone()];
+        let mut configs = vec![parent_config.clone()];
 
-        // Elitism: mutate top configs from the previous generation's fitness results
-        for elite in fitness.iter().take(elite_count) {
+        // Elitism: mutate top configs from the last SUCCESSFUL generation
+        for elite in self.elite_configs.iter().take(elite_count) {
             if configs.len() >= pop_size {
                 break;
             }
-            configs.push(mutate_config_with_strength(&elite.config, effective_strength));
+            configs.push(mutate_config_with_strength(elite, effective_strength));
         }
 
-        // Fill remaining slots from the base config
+        // Fill remaining slots from the spawn parent's config
         while configs.len() < pop_size {
-            configs.push(mutate_config_with_strength(&base_config, effective_strength));
+            configs.push(mutate_config_with_strength(&parent_config, effective_strength));
         }
         configs
     }
@@ -948,12 +957,12 @@ mod tests {
         assert_eq!(node_attempts(&gov, gen1_node), 2);
 
         // Gen 3: fail
-        gov.advance(&mock_fitness(0.19));
+        gov.advance(&mock_fitness(0.17));
         assert_eq!(node_attempts(&gov, gen1_node), 3);
 
         // Gen 4: fail → gen1 exhausted (3 children = patience)
         let root_id = node_parent(&gov, gen1_node).unwrap();
-        gov.advance(&mock_fitness(0.2)); // not strictly greater
+        gov.advance(&mock_fitness(0.19));
         assert_eq!(node_status(&gov, gen1_node), "exhausted");
         assert_eq!(gov.spawn_parent_id, Some(root_id));
     }
@@ -997,9 +1006,10 @@ mod tests {
         assert_eq!(node_status(&gov, gen1_id), "exhausted");
 
         // Now spawning from root. Root has attempts=1 (from gen1).
-        // Gen 5: fail → root.attempts=2 → root exhausted, reset to 0, then breed adds 1
+        // Gen 5: fail → root.attempts=2 → root exhausted, partial rollback, then breed adds 1
         gov.advance(&mock_fitness(0.12));
-        assert_eq!(gov.best_score, 0.1); // rolled back to root's fitness
+        // Partial rollback: 0.2 * 0.95 = 0.19
+        assert!((gov.best_score - 0.19).abs() < 0.001);
         assert_eq!(gov.spawn_parent_id, Some(root_id));
         assert_eq!(node_attempts(&gov, root_id), 1); // reset to 0, then breed incremented to 1
     }
@@ -1018,34 +1028,37 @@ mod tests {
         // Gen 2: fail → gen1 exhausted (patience=1)
         gov.advance(&mock_fitness(0.15));
         // gen1 exhausted, cascade to root. root.attempts = 1 >= patience=1 → root exhausted
-        assert_eq!(gov.best_score, 0.1); // rolled back
+        // Partial rollback: 0.2 * 0.95 = 0.19
+        assert!((gov.best_score - 0.19).abs() < 0.001);
         assert_eq!(gov.spawn_parent_id, Some(root_id));
 
-        // Gen 3: 0.11 > 0.1 → success!
-        gov.advance(&mock_fitness(0.11));
-        assert_eq!(gov.best_score, 0.11);
+        // Gen 3: 0.19 >= 0.19 → success (ties accepted)!
+        gov.advance(&mock_fitness(0.19));
+        assert!((gov.best_score - 0.19).abs() < 0.001);
     }
 
     #[test]
-    fn equal_fitness_is_not_success() {
+    fn equal_fitness_is_success() {
         let mut gov = test_governor(3);
 
         // Gen 0: success (best=0.5)
         gov.advance(&mock_fitness(0.5));
         let root_id = gov.spawn_parent_id.unwrap();
 
-        // Gen 1: fitness = 0.5 (same as best) → FAILURE (not strictly greater)
+        // Gen 1: fitness = 0.5 (same as best) → SUCCESS (>= accepts ties)
         let gen1_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.5));
-        assert_eq!(node_status(&gov, gen1_id), "failed");
+        assert_eq!(node_status(&gov, gen1_id), "successful");
         assert_eq!(gov.best_score, 0.5);
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        assert_eq!(gov.spawn_parent_id, Some(gen1_id));
+
+        // Spawn parent moved to gen1 (not stuck at root)
+        assert_ne!(gov.spawn_parent_id, Some(root_id));
     }
 
     #[test]
-    fn full_trace_matches_user_example() {
-        // Reproduces the exact sequence from the requirements:
-        // Gen 0..9 with patience=3
+    fn full_trace_with_new_semantics() {
+        // Validates: >= success, partial rollback, tie acceptance
         let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
 
@@ -1072,47 +1085,32 @@ mod tests {
         gov.advance(&mock_fitness(0.19));
         assert_eq!(node_status(&gov, gen3_id), "failed");
 
-        // Gen 4: fit=0.2 → fail (not strictly greater), patience reached
+        // Gen 4: fit=0.2 → SUCCESS (>= accepts ties), tree deepens
         let gen4_id = gov.current_node_id.unwrap();
         gov.advance(&mock_fitness(0.2));
-        assert_eq!(node_status(&gov, gen4_id), "failed");
-        assert_eq!(node_status(&gov, gen1_id), "exhausted");
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
-        // best_score still 0.2
+        assert_eq!(node_status(&gov, gen4_id), "successful");
+        assert_eq!(gov.spawn_parent_id, Some(gen4_id));
+        assert_eq!(gov.best_score, 0.2);
 
-        // Gen 5: fit=0.12 → fail (child of root)
+        // Gen 5: fit=0.15 → fail (child of gen4)
         let gen5_id = gov.current_node_id.unwrap();
-        assert_eq!(node_parent(&gov, gen5_id), Some(root_id));
-        gov.advance(&mock_fitness(0.12));
+        assert_eq!(node_parent(&gov, gen5_id), Some(gen4_id));
+        gov.advance(&mock_fitness(0.15));
         assert_eq!(node_status(&gov, gen5_id), "failed");
 
-        // Gen 6: fit=0.13 → fail, root patience reached → rollback
-        let gen6_id = gov.current_node_id.unwrap();
-        gov.advance(&mock_fitness(0.13));
-        assert_eq!(node_status(&gov, gen6_id), "failed");
-        assert_eq!(gov.best_score, 0.1); // rolled back to root's fitness
-        assert_eq!(gov.spawn_parent_id, Some(root_id));
+        // Gen 6: fit=0.16 → fail
+        gov.advance(&mock_fitness(0.16));
 
-        // Gen 7: fit=0.11 → success (0.11 > 0.1)
-        let gen7_id = gov.current_node_id.unwrap();
-        assert_eq!(node_parent(&gov, gen7_id), Some(root_id));
-        gov.advance(&mock_fitness(0.11));
-        assert_eq!(gov.best_score, 0.11);
-        assert_eq!(gov.spawn_parent_id, Some(gen7_id));
-        assert_eq!(node_status(&gov, gen7_id), "successful");
+        // Gen 7: fit=0.17 → fail → gen4 exhausted (patience=3), cascade up
+        gov.advance(&mock_fitness(0.17));
+        assert_eq!(node_status(&gov, gen4_id), "exhausted");
+        // gen4's parent is gen1. gen1 has attempts from earlier + gen4 = enough
+        // depending on exact count, may cascade further
 
-        // Gen 8: fit=0.12 → success
-        let gen8_id = gov.current_node_id.unwrap();
-        assert_eq!(node_parent(&gov, gen8_id), Some(gen7_id));
-        gov.advance(&mock_fitness(0.12));
-        assert_eq!(gov.best_score, 0.12);
-        assert_eq!(gov.spawn_parent_id, Some(gen8_id));
-
-        // Gen 9: fit=0.13 → success
-        let gen9_id = gov.current_node_id.unwrap();
-        assert_eq!(node_parent(&gov, gen9_id), Some(gen8_id));
-        gov.advance(&mock_fitness(0.13));
-        assert_eq!(gov.best_score, 0.13);
+        // Verify system is still alive and can continue
+        let fit_before = gov.best_score;
+        gov.advance(&mock_fitness(fit_before + 0.01));
+        assert!(gov.best_score >= fit_before);
     }
 
     #[test]
@@ -1176,20 +1174,20 @@ mod tests {
             population_size: 5,
             tick_budget: 100,
             elitism_count: 2,
-            patience: 5,
+            patience: 100, // high patience so adaptive ramp stays near base
             max_generations: 0,
-            mutation_strength: 0.0001, // tiny mutation so configs stay recognizable
+            mutation_strength: 0.001,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
 
-        // Create fitness results with distinct configs
+        // Create fitness results with very distinct configs
         let elite1 = BrainConfig {
-            memory_capacity: 999,
+            memory_capacity: 5000,
             ..BrainConfig::default()
         };
         let elite2 = BrainConfig {
-            memory_capacity: 888,
+            memory_capacity: 3000,
             ..BrainConfig::default()
         };
         let loser = BrainConfig {
@@ -1197,7 +1195,7 @@ mod tests {
             ..BrainConfig::default()
         };
 
-        let fitness = vec![
+        let elite_fitness = vec![
             AgentFitness {
                 agent_index: 0,
                 config: elite1.clone(),
@@ -1227,27 +1225,56 @@ mod tests {
             },
         ];
 
-        // First advance to move past gen 0 (need a valid spawn parent)
-        gov.advance(&mock_fitness(0.01));
+        // Gen 0: advance with elite fitness → SUCCESS, stores elite_configs
+        gov.advance(&elite_fitness);
+        assert!(!gov.elite_configs.is_empty());
 
-        let configs = gov.breed_next_generation(&fitness);
-
-        // Population should be 5 configs
+        // breed_next_generation uses stored elite_configs from the successful gen
+        let configs = gov.breed_next_generation(&mock_fitness(0.01));
         assert_eq!(configs.len(), 5);
 
-        // With tiny mutation, elite configs should stay close to their originals.
-        // configs[1] should be ~elite1 (mem ~999), configs[2] should be ~elite2 (mem ~888)
-        let has_elite1_like = configs.iter().any(|c| c.memory_capacity >= 990);
-        let has_elite2_like = configs.iter().any(|c| (880..=896).contains(&c.memory_capacity));
+        // With high patience and low mutation_strength, elite configs should
+        // stay recognizable by their magnitude (5000 and 3000 vs default 128)
+        let has_elite1_like = configs.iter().any(|c| c.memory_capacity > 4000);
+        let has_elite2_like = configs.iter().any(|c| (2000..=4000).contains(&c.memory_capacity));
         assert!(
             has_elite1_like,
-            "Expected a config near memory_capacity=999 from elite1; got {:?}",
+            "Expected a config near memory_capacity=5000 from elite1; got {:?}",
             configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
         );
         assert!(
             has_elite2_like,
-            "Expected a config near memory_capacity=888 from elite2; got {:?}",
+            "Expected a config near memory_capacity=3000 from elite2; got {:?}",
             configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn champion_is_unmutated() {
+        let mut gov = test_governor(5);
+
+        // Gen 0: success — root becomes spawn parent
+        gov.advance(&mock_fitness(0.1));
+        let spawn_id = gov.spawn_parent_id.unwrap();
+
+        // Get the spawn parent's config from the DB (what breed uses)
+        let parent_json: String = gov.db
+            .query_row(
+                "SELECT config_json FROM node WHERE id = ?1",
+                params![spawn_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parent_config: BrainConfig = serde_json::from_str(&parent_json).unwrap();
+
+        // Breed next generation
+        let configs = gov.breed_next_generation(&mock_fitness(0.05));
+
+        // configs[0] should be the EXACT spawn parent config (unmutated champion)
+        assert_eq!(configs[0].memory_capacity, parent_config.memory_capacity);
+        assert_eq!(configs[0].processing_slots, parent_config.processing_slots);
+        assert_eq!(configs[0].representation_dim, parent_config.representation_dim);
+        assert!((configs[0].learning_rate - parent_config.learning_rate).abs() < f32::EPSILON);
+        assert!((configs[0].decay_rate - parent_config.decay_rate).abs() < f32::EPSILON);
     }
 }

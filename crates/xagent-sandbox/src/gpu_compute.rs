@@ -451,9 +451,29 @@ impl GpuBrainCompute {
 
         self.queue.submit(std::iter::once(cmd.finish()));
 
-        // Read back results
-        let encoded = read_staging(&self.device, &self.encoded_staging, enc_size);
-        let similarities = read_staging(&self.device, &self.similarities_staging, sim_size);
+        // Read back both staging buffers with a single poll
+        let enc_slice = self.encoded_staging.slice(..enc_size);
+        let sim_slice = self.similarities_staging.slice(..sim_size);
+
+        let (tx_enc, rx_enc) = std::sync::mpsc::channel();
+        let (tx_sim, rx_sim) = std::sync::mpsc::channel();
+        enc_slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_enc.send(r); });
+        sim_slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_sim.send(r); });
+
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+
+        rx_enc.recv().expect("GPU map channel closed").expect("GPU buffer map failed");
+        rx_sim.recv().expect("GPU map channel closed").expect("GPU buffer map failed");
+
+        let enc_data = enc_slice.get_mapped_range();
+        let encoded: Vec<f32> = bytemuck::cast_slice(&enc_data).to_vec();
+        drop(enc_data);
+        self.encoded_staging.unmap();
+
+        let sim_data = sim_slice.get_mapped_range();
+        let similarities: Vec<f32> = bytemuck::cast_slice(&sim_data).to_vec();
+        drop(sim_data);
+        self.similarities_staging.unmap();
 
         (encoded, similarities)
     }
@@ -586,25 +606,6 @@ fn bg_buf<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a
         binding,
         resource: buffer.as_entire_binding(),
     }
-}
-
-/// Synchronously map a staging buffer and read its contents as f32s.
-fn read_staging(device: &wgpu::Device, buffer: &wgpu::Buffer, size: u64) -> Vec<f32> {
-    let slice = buffer.slice(..size);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    device.poll(wgpu::Maintain::Wait).panic_on_timeout();
-    rx.recv()
-        .expect("GPU map channel closed")
-        .expect("GPU buffer map failed");
-
-    let data = slice.get_mapped_range();
-    let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    buffer.unmap();
-    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

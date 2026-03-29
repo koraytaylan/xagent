@@ -11,13 +11,26 @@
 //! # Architecture
 //!
 //! The module creates its own wgpu device and queue, independent of the renderer.
-//! On Apple Silicon, this shares the same physical GPU via unified memory — the
-//! "upload/download" is effectively zero-copy (shared physical pages).
+//! Note: even on Apple Silicon unified memory, `queue.write_buffer` performs a
+//! CPU-side staging copy internally. The pipeline uses double-buffered staging
+//! and async readback to overlap GPU compute with CPU sensory extraction.
 //!
-//! Two compute passes per tick:
+//! Two compute passes per dispatch:
 //! 1. **Encode**: features × weights + biases → tanh → encoded state (per agent)
 //! 2. **Recall**: cosine similarity between encoded state and all memory patterns
 //!    (per agent × per pattern), using workgroup-level parallel reduction
+//!
+//! # Pipelining
+//!
+//! The `submit()` / `collect()` API allows the caller to overlap GPU compute
+//! with CPU work:
+//! 1. `collect()` — read previous dispatch results (GPU already finished)
+//! 2. CPU does sensory extraction in parallel (rayon)
+//! 3. `submit()` — kick off new GPU dispatch (returns immediately)
+//! 4. GPU computes while CPU prepares next tick
+//!
+//! This introduces a 1-brain-tick latency in motor responses (negligible for
+//! evolution) but eliminates synchronous GPU blocking.
 //!
 //! # Performance
 //!
@@ -196,9 +209,11 @@ pub struct GpuBrainCompute {
     mem_active_buf: wgpu::Buffer,
     similarities_buf: wgpu::Buffer,
 
-    // CPU-readable staging buffers
-    encoded_staging: wgpu::Buffer,
-    similarities_staging: wgpu::Buffer,
+    // Double-buffered staging for pipelined async readback
+    encoded_staging: [wgpu::Buffer; 2],
+    similarities_staging: [wgpu::Buffer; 2],
+    staging_idx: usize,
+    has_in_flight: bool,
 
     encode_bind_group: wgpu::BindGroup,
     recall_bind_group: wgpu::BindGroup,
@@ -312,9 +327,14 @@ impl GpuBrainCompute {
             mapped_at_creation: false,
         });
 
-        let encoded_staging = make_staging(&device, "encoded-staging", encoded_size);
-        let similarities_staging =
-            make_staging(&device, "similarities-staging", similarities_size);
+        let encoded_staging = [
+            make_staging(&device, "encoded-staging-0", encoded_size),
+            make_staging(&device, "encoded-staging-1", encoded_size),
+        ];
+        let similarities_staging = [
+            make_staging(&device, "similarities-staging-0", similarities_size),
+            make_staging(&device, "similarities-staging-1", similarities_size),
+        ];
 
         // Bind groups (auto-derived layouts from pipelines)
         let encode_bgl = encode_pipeline.get_bind_group_layout(0);
@@ -367,32 +387,27 @@ impl GpuBrainCompute {
             similarities_buf,
             encoded_staging,
             similarities_staging,
+            staging_idx: 0,
+            has_in_flight: false,
             encode_bind_group,
             recall_bind_group,
         })
     }
 
-    /// Upload brain state for all agents and dispatch encode + recall on GPU.
+    /// Submit GPU compute work asynchronously.
     ///
-    /// Returns `(encoded_states, similarity_scores)` packed contiguously:
-    /// - `encoded_states`: `[num_agents × dim]` — the encoded representations
-    /// - `similarity_scores`: `[num_agents × memory_capacity]` — cosine similarities
-    ///   (inactive patterns marked as -2.0)
-    ///
-    /// # Arguments
-    /// - `features`: `[num_agents × feature_count]` extracted sensory features
-    /// - `enc_weights`: `[num_agents × feature_count × dim]` encoder weight matrices
-    /// - `enc_biases`: `[num_agents × dim]` encoder bias vectors
-    /// - `mem_patterns`: `[num_agents × memory_capacity × dim]` memory pattern data
-    /// - `mem_active`: `[num_agents × memory_capacity]` active mask (1=active, 0=empty)
-    pub fn dispatch(
-        &self,
+    /// Uploads data, dispatches encode + recall shaders, copies results to a
+    /// staging buffer, and requests an async map — then returns immediately
+    /// without waiting for the GPU. Call `collect()` later to read back the
+    /// results (typically after doing CPU-side sensory extraction in parallel).
+    pub fn submit(
+        &mut self,
         features: &[f32],
         enc_weights: &[f32],
         enc_biases: &[f32],
         mem_patterns: &[f32],
         mem_active: &[u32],
-    ) -> (Vec<f32>, Vec<f32>) {
+    ) {
         // Upload input data
         self.queue
             .write_buffer(&self.features_buf, 0, bytemuck::cast_slice(features));
@@ -437,45 +452,80 @@ impl GpuBrainCompute {
             pass.dispatch_workgroups(self.memory_capacity, self.num_agents, 1);
         }
 
-        // Copy results to staging buffers for CPU readback
+        // Copy results to the current staging pair
+        let widx = self.staging_idx;
         let enc_size = (self.num_agents * self.dim) as u64 * 4;
         let sim_size = (self.num_agents * self.memory_capacity) as u64 * 4;
-        cmd.copy_buffer_to_buffer(&self.encoded_buf, 0, &self.encoded_staging, 0, enc_size);
         cmd.copy_buffer_to_buffer(
-            &self.similarities_buf,
-            0,
-            &self.similarities_staging,
-            0,
-            sim_size,
+            &self.encoded_buf, 0, &self.encoded_staging[widx], 0, enc_size,
+        );
+        cmd.copy_buffer_to_buffer(
+            &self.similarities_buf, 0, &self.similarities_staging[widx], 0, sim_size,
         );
 
         self.queue.submit(std::iter::once(cmd.finish()));
 
-        // Read back both staging buffers with a single poll
-        let enc_slice = self.encoded_staging.slice(..enc_size);
-        let sim_slice = self.similarities_staging.slice(..sim_size);
+        // Request async mapping (don't block)
+        self.encoded_staging[widx]
+            .slice(..enc_size)
+            .map_async(wgpu::MapMode::Read, |_| {});
+        self.similarities_staging[widx]
+            .slice(..sim_size)
+            .map_async(wgpu::MapMode::Read, |_| {});
 
-        let (tx_enc, rx_enc) = std::sync::mpsc::channel();
-        let (tx_sim, rx_sim) = std::sync::mpsc::channel();
-        enc_slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_enc.send(r); });
-        sim_slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx_sim.send(r); });
+        self.staging_idx = 1 - self.staging_idx;
+        self.has_in_flight = true;
+    }
+
+    /// Collect results from the most recent `submit()` call.
+    ///
+    /// Polls the GPU to ensure the mapping is complete, then reads back the
+    /// staging buffers. In the pipelined flow the GPU has been computing
+    /// while the CPU did sensory extraction, so the poll typically returns
+    /// almost immediately.
+    ///
+    /// Returns `None` if no work is in flight.
+    pub fn collect(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        if !self.has_in_flight {
+            return None;
+        }
+
+        let read_idx = 1 - self.staging_idx;
 
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
 
-        rx_enc.recv().expect("GPU map channel closed").expect("GPU buffer map failed");
-        rx_sim.recv().expect("GPU map channel closed").expect("GPU buffer map failed");
+        let enc_size = (self.num_agents * self.dim) as u64 * 4;
+        let sim_size = (self.num_agents * self.memory_capacity) as u64 * 4;
 
+        let enc_slice = self.encoded_staging[read_idx].slice(..enc_size);
         let enc_data = enc_slice.get_mapped_range();
         let encoded: Vec<f32> = bytemuck::cast_slice(&enc_data).to_vec();
         drop(enc_data);
-        self.encoded_staging.unmap();
+        self.encoded_staging[read_idx].unmap();
 
+        let sim_slice = self.similarities_staging[read_idx].slice(..sim_size);
         let sim_data = sim_slice.get_mapped_range();
         let similarities: Vec<f32> = bytemuck::cast_slice(&sim_data).to_vec();
         drop(sim_data);
-        self.similarities_staging.unmap();
+        self.similarities_staging[read_idx].unmap();
 
-        (encoded, similarities)
+        self.has_in_flight = false;
+
+        Some((encoded, similarities))
+    }
+
+    /// Synchronous dispatch: submit + collect. Convenience wrapper used by
+    /// tests and when pipelining isn't needed.
+    pub fn dispatch(
+        &mut self,
+        features: &[f32],
+        enc_weights: &[f32],
+        enc_biases: &[f32],
+        mem_patterns: &[f32],
+        mem_active: &[u32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.submit(features, enc_weights, enc_biases, mem_patterns, mem_active);
+        self.collect().expect("collect after submit must return results")
     }
 
     /// Whether the current config matches the given dimensions.
@@ -648,7 +698,7 @@ mod tests {
 
     #[test]
     fn gpu_encode_matches_cpu() {
-        let gpu = match try_gpu(1, 4, 3, 2) {
+        let mut gpu = match try_gpu(1, 4, 3, 2) {
             Some(g) => g,
             None => {
                 eprintln!("No GPU available, skipping test");
@@ -685,7 +735,7 @@ mod tests {
     fn gpu_recall_matches_cpu() {
         let dim = 4u32;
         let capacity = 3u32;
-        let gpu = match try_gpu(1, dim, 3, capacity) {
+        let mut gpu = match try_gpu(1, dim, 3, capacity) {
             Some(g) => g,
             None => {
                 eprintln!("No GPU available, skipping test");
@@ -757,7 +807,7 @@ mod tests {
         let dim = 4u32;
         let fc = 2u32;
         let cap = 2u32;
-        let gpu = match try_gpu(n, dim, fc, cap) {
+        let mut gpu = match try_gpu(n, dim, fc, cap) {
             Some(g) => g,
             None => {
                 eprintln!("No GPU available, skipping test");
@@ -822,7 +872,7 @@ mod tests {
         let gpu_dim = 4u32;
         let gpu_fc = 3u32;
         let gpu_cap = 3u32;
-        let gpu = match try_gpu(2, gpu_dim, gpu_fc, gpu_cap) {
+        let mut gpu = match try_gpu(2, gpu_dim, gpu_fc, gpu_cap) {
             Some(g) => g,
             None => {
                 eprintln!("No GPU available, skipping test");

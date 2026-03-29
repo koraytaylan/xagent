@@ -736,19 +736,19 @@ impl<'a> TabContext<'a> {
 
                     ui.label("memory_capacity");
                     let mut mc = b.memory_capacity as i32;
-                    ui.add(egui::DragValue::new(&mut mc).range(4..=1024).speed(1));
+                    ui.add(egui::DragValue::new(&mut mc).range(4..=8192).speed(1));
                     b.memory_capacity = mc.max(1) as usize;
                     ui.end_row();
 
                     ui.label("processing_slots");
                     let mut ps = b.processing_slots as i32;
-                    ui.add(egui::DragValue::new(&mut ps).range(1..=64).speed(1));
+                    ui.add(egui::DragValue::new(&mut ps).range(1..=256).speed(1));
                     b.processing_slots = ps.max(1) as usize;
                     ui.end_row();
 
                     ui.label("visual_encoding_size");
                     let mut ve = b.visual_encoding_size as i32;
-                    ui.add(egui::DragValue::new(&mut ve).range(2..=128).speed(1));
+                    ui.add(egui::DragValue::new(&mut ve).range(2..=512).speed(1));
                     b.visual_encoding_size = ve.max(1) as usize;
                     ui.end_row();
 

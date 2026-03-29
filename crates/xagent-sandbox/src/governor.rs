@@ -284,17 +284,13 @@ impl Governor {
             );
         }
 
-        // Update node fitness
-        let best = results
-            .iter()
-            .map(|r| r.composite_fitness)
-            .fold(0.0f32, f32::max);
+        // Update node avg fitness (best_fitness is set by advance() after noise reduction)
         let avg = results.iter().map(|r| r.composite_fitness).sum::<f32>()
             / results.len().max(1) as f32;
 
         let _ = self.db.execute(
-            "UPDATE node SET best_fitness = ?1, avg_fitness = ?2 WHERE id = ?3",
-            params![best, avg, node_id],
+            "UPDATE node SET avg_fitness = ?1 WHERE id = ?2",
+            params![avg, node_id],
         );
 
         results.sort_by(|a, b| {
@@ -306,11 +302,15 @@ impl Governor {
     }
 
     /// Reduce per-agent fitness to per-config-group fitness by averaging.
-    /// Groups agents by `index / eval_repeats` and averages composite_fitness.
+    /// Groups agents by `agent_index / eval_repeats` and averages composite_fitness.
+    /// Must restore spawn order first since evaluate() sorts by fitness.
     fn reduce_fitness(&self, fitness: &[AgentFitness]) -> Vec<AgentFitness> {
         let repeats = self.config.eval_repeats.max(1);
+        // Restore original spawn order so chunks match same-config groups
+        let mut ordered = fitness.to_vec();
+        ordered.sort_by_key(|f| f.agent_index);
         let mut groups: Vec<AgentFitness> = Vec::new();
-        for chunk in fitness.chunks(repeats) {
+        for chunk in ordered.chunks(repeats) {
             if chunk.is_empty() {
                 continue;
             }
@@ -353,7 +353,7 @@ impl Governor {
             // ★ Success — this generation met or beat the island best
             island.best_score = gen_fit;
             let _ = self.db.execute(
-                "UPDATE node SET status = 'successful', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
+                "UPDATE node SET status = 'successful', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
             );
             island.spawn_parent_id = self.current_node_id;
@@ -367,7 +367,7 @@ impl Governor {
         } else {
             // ✗ Failure — didn't beat the best score
             let _ = self.db.execute(
-                "UPDATE node SET status = 'failed', best_fitness = MAX(COALESCE(best_fitness, 0), ?2) WHERE id = ?1",
+                "UPDATE node SET status = 'failed', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
             );
             messages.push(format!(
@@ -1502,6 +1502,61 @@ mod tests {
         let avg1 = reduced[1].composite_fitness;
         assert!((avg0 - 0.7).abs() < 0.01, "expected ~0.7, got {}", avg0);
         assert!((avg1 - 0.7).abs() < 0.01, "expected ~0.7, got {}", avg1);
+    }
+
+    #[test]
+    fn noise_reduction_handles_sorted_input() {
+        // evaluate() returns results sorted by fitness descending.
+        // reduce_fitness must restore spawn order before chunking.
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 1,
+            migration_interval: 0,
+        };
+        let brain = BrainConfig::default();
+        let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Config A: agents 0,1 → fitness 0.3, 0.5 → correct avg = 0.4
+        // Config B: agents 2,3 → fitness 0.9, 0.1 → correct avg = 0.5
+        // Sorted by fitness descending (as evaluate returns):
+        let fitness = vec![
+            AgentFitness {
+                agent_index: 2, composite_fitness: 0.9,
+                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+            },
+            AgentFitness {
+                agent_index: 1, composite_fitness: 0.5,
+                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+            },
+            AgentFitness {
+                agent_index: 0, composite_fitness: 0.3,
+                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+            },
+            AgentFitness {
+                agent_index: 3, composite_fitness: 0.1,
+                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+            },
+        ];
+
+        let reduced = gov.reduce_fitness(&fitness);
+        assert_eq!(reduced.len(), 2);
+        // Without the sort fix, chunks would be (agent2=0.9, agent1=0.5)=0.7
+        // and (agent0=0.3, agent3=0.1)=0.2 — wrong pairing!
+        // With the fix: (agent0=0.3, agent1=0.5)=0.4, (agent2=0.9, agent3=0.1)=0.5
+        let best = reduced[0].composite_fitness;
+        let second = reduced[1].composite_fitness;
+        assert!((best - 0.5).abs() < 0.01, "expected ~0.5, got {}", best);
+        assert!((second - 0.4).abs() < 0.01, "expected ~0.4, got {}", second);
     }
 
     #[test]

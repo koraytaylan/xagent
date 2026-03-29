@@ -32,6 +32,11 @@
 //! This introduces a 1-brain-tick latency in motor responses (negligible for
 //! evolution) but eliminates synchronous GPU blocking.
 //!
+//! **Note:** In per-frame mode, GPU brain ticks run at frame rate (~60Hz)
+//! regardless of the simulation speed multiplier. At high speeds (100x+),
+//! CPU rayon provides significantly more brain ticks per second. GPU mode
+//! is primarily useful for large agent populations (50+) at normal speed.
+//!
 //! # Performance
 //!
 //! For 10 agents the GPU dispatch overhead (~50-100μs) dominates the actual
@@ -416,6 +421,17 @@ impl GpuBrainCompute {
         mem_patterns: &[f32],
         mem_active: &[u32],
     ) {
+        let widx = self.staging_idx;
+
+        // If a previous dispatch targeting this staging pair was never collected,
+        // unmap the buffers so they can be used as copy destinations again.
+        // This prevents a wgpu validation error when try_collect() returns None
+        // for 2+ consecutive frames (the double-buffer wraps around).
+        if self.has_in_flight {
+            self.encoded_staging[widx].unmap();
+            self.similarities_staging[widx].unmap();
+        }
+
         // Upload input data
         self.queue
             .write_buffer(&self.features_buf, 0, bytemuck::cast_slice(features));
@@ -461,7 +477,6 @@ impl GpuBrainCompute {
         }
 
         // Copy results to the current staging pair
-        let widx = self.staging_idx;
         let enc_size = (self.num_agents * self.dim) as u64 * 4;
         let sim_size = (self.num_agents * self.memory_capacity) as u64 * 4;
         cmd.copy_buffer_to_buffer(
@@ -480,14 +495,18 @@ impl GpuBrainCompute {
         let enc_flag = self.enc_mapped.clone();
         self.encoded_staging[widx]
             .slice(..enc_size)
-            .map_async(wgpu::MapMode::Read, move |_| {
-                enc_flag.store(true, Ordering::Release);
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    enc_flag.store(true, Ordering::Release);
+                }
             });
         let sim_flag = self.sim_mapped.clone();
         self.similarities_staging[widx]
             .slice(..sim_size)
-            .map_async(wgpu::MapMode::Read, move |_| {
-                sim_flag.store(true, Ordering::Release);
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    sim_flag.store(true, Ordering::Release);
+                }
             });
 
         self.staging_idx = 1 - self.staging_idx;

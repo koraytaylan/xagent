@@ -296,6 +296,12 @@ struct App {
     // so collect() can apply results with the matching frames.
     gpu_prev_frames: Vec<Option<SensoryFrame>>,
     gpu_prev_agent_dims: Vec<(usize, usize)>,
+    // Reusable batch buffers for GPU submit (avoid per-frame allocation)
+    gpu_batch_features: Vec<f32>,
+    gpu_batch_weights: Vec<f32>,
+    gpu_batch_biases: Vec<f32>,
+    gpu_batch_patterns: Vec<f32>,
+    gpu_batch_active: Vec<u32>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
@@ -403,6 +409,11 @@ impl App {
             gpu_compute: None,
             gpu_prev_frames: Vec::new(),
             gpu_prev_agent_dims: Vec::new(),
+            gpu_batch_features: Vec::new(),
+            gpu_batch_weights: Vec::new(),
+            gpu_batch_biases: Vec::new(),
+            gpu_batch_patterns: Vec::new(),
+            gpu_batch_active: Vec::new(),
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
         }
     }
@@ -1101,7 +1112,7 @@ impl ApplicationHandler for App {
 
                     // Pre-allocate GPU batch buffers (reused each frame)
                     let gpu_n = self.agents.len();
-                    let (gpu_dim, gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
+                    let (gpu_dim, _gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
                         (gpu.dim() as usize, gpu.feature_count() as usize, gpu.memory_capacity() as usize)
                     } else {
                         (0, 0, 0)
@@ -1394,11 +1405,11 @@ impl ApplicationHandler for App {
 
                             // Batch into GPU buffers + store frames for next collect
                             let gpu = self.gpu_compute.as_mut().unwrap();
-                            let mut all_features = Vec::with_capacity(gpu_n * gpu_fc);
-                            let mut all_weights = Vec::with_capacity(gpu_n * gpu_fc * gpu_dim);
-                            let mut all_biases = Vec::with_capacity(gpu_n * gpu_dim);
-                            let mut all_patterns = Vec::with_capacity(gpu_n * gpu_cap * gpu_dim);
-                            let mut all_active: Vec<u32> = Vec::with_capacity(gpu_n * gpu_cap);
+                            self.gpu_batch_features.clear();
+                            self.gpu_batch_weights.clear();
+                            self.gpu_batch_biases.clear();
+                            self.gpu_batch_patterns.clear();
+                            self.gpu_batch_active.clear();
 
                             self.gpu_prev_frames.clear();
                             self.gpu_prev_frames.resize(gpu_n, None);
@@ -1411,9 +1422,11 @@ impl ApplicationHandler for App {
                                         &d.feats, &d.weights, &d.biases,
                                         &d.pats, &d.mask,
                                         d.agent_dim, d.agent_fc, d.agent_cap,
-                                        &mut all_features, &mut all_weights,
-                                        &mut all_biases, &mut all_patterns,
-                                        &mut all_active,
+                                        &mut self.gpu_batch_features,
+                                        &mut self.gpu_batch_weights,
+                                        &mut self.gpu_batch_biases,
+                                        &mut self.gpu_batch_patterns,
+                                        &mut self.gpu_batch_active,
                                     );
                                     self.gpu_prev_agent_dims[i] = (d.agent_dim, d.agent_cap);
                                     self.gpu_prev_frames[i] = Some(d.frame);
@@ -1421,17 +1434,20 @@ impl ApplicationHandler for App {
                                     gpu.pad_agent_into(
                                         &[], &[], &[], &[], &[],
                                         0, 0, 0,
-                                        &mut all_features, &mut all_weights,
-                                        &mut all_biases, &mut all_patterns,
-                                        &mut all_active,
+                                        &mut self.gpu_batch_features,
+                                        &mut self.gpu_batch_weights,
+                                        &mut self.gpu_batch_biases,
+                                        &mut self.gpu_batch_patterns,
+                                        &mut self.gpu_batch_active,
                                     );
                                 }
                             }
 
                             // Submit once per frame (async, returns immediately)
                             gpu.submit(
-                                &all_features, &all_weights, &all_biases,
-                                &all_patterns, &all_active,
+                                &self.gpu_batch_features, &self.gpu_batch_weights,
+                                &self.gpu_batch_biases, &self.gpu_batch_patterns,
+                                &self.gpu_batch_active,
                             );
                         }
                     }

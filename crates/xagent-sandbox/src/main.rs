@@ -1108,9 +1108,6 @@ impl ApplicationHandler for App {
                     // Lazily initialize GPU compute if --gpu-brain was requested
                     self.ensure_gpu_compute();
 
-                    let gpu_mode = self.gpu_compute.is_some();
-
-                    // Pre-allocate GPU batch buffers (reused each frame)
                     let gpu_n = self.agents.len();
                     let (gpu_dim, _gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
                         (gpu.dim() as usize, gpu.feature_count() as usize, gpu.memory_capacity() as usize)
@@ -1118,9 +1115,8 @@ impl ApplicationHandler for App {
                         (0, 0, 0)
                     };
 
-                    // ── GPU COLLECT: apply previous frame's GPU results ──
-                    if gpu_mode {
-                        let gpu = self.gpu_compute.as_mut().unwrap();
+                    // ── GPU COLLECT: always drain in-flight results ──
+                    if let Some(gpu) = self.gpu_compute.as_mut() {
                         if let Some((encoded, similarities)) = gpu.try_collect() {
                             for (i, agent) in self.agents.iter_mut().enumerate() {
                                 if i < self.gpu_prev_frames.len() {
@@ -1137,6 +1133,16 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // ── Adaptive GPU/CPU decision ──
+                    // GPU dispatches once per frame → 1 brain tick per frame.
+                    // CPU rayon runs brain_stride-decimated ticks inside the loop.
+                    // Use GPU only when expected brain ticks ≤ 2 per frame so
+                    // agents get equivalent cognitive throughput either way.
+                    let expected_ticks = (self.sim_accumulator / SIM_DT)
+                        .min(max_ticks as f32) as u64;
+                    let expected_brain_ticks = expected_ticks / brain_stride;
+                    let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
+
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
                         ticks_run += 1;
@@ -1150,11 +1156,11 @@ impl ApplicationHandler for App {
                                     .map(|a| (a.body.body.position, a.body.body.alive)),
                             );
 
-                            // ── Phase 2: Brain ticks (CPU path only) ──
-                            // In GPU mode, agents use cached_motor set by
-                            // the per-frame collect above. No GPU calls in
-                            // the tick loop — this is the key perf fix.
-                            if !gpu_mode {
+                            // ── Phase 2: Brain ticks (CPU rayon) ──
+                            // When GPU is active this frame, agents use
+                            // cached_motor from the per-frame collect above.
+                            // Otherwise, CPU rayon runs brain with stride.
+                            if !use_gpu {
                                 let tick = self.tick;
                                 let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
                                     a.body.body.alive && (tick + i as u64) % brain_stride == 0
@@ -1343,7 +1349,7 @@ impl ApplicationHandler for App {
                     }
 
                     // ── GPU SUBMIT: extract senses once per frame, submit async ──
-                    if gpu_mode && ticks_run > 0 {
+                    if use_gpu && ticks_run > 0 {
                         if let Some(world) = &self.world {
                             // Snapshot current positions
                             all_positions.clear();

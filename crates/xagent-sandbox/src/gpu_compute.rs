@@ -32,16 +32,23 @@
 //! This introduces a 1-brain-tick latency in motor responses (negligible for
 //! evolution) but eliminates synchronous GPU blocking.
 //!
-//! **Note:** In per-frame mode, GPU brain ticks run at frame rate (~60Hz)
-//! regardless of the simulation speed multiplier. At high speeds (100x+),
-//! CPU rayon provides significantly more brain ticks per second. GPU mode
-//! is primarily useful for large agent populations (50+) at normal speed.
+//! **Adaptive scheduling:** The caller decides per-frame whether to use the
+//! GPU path (1 dispatch/frame) or CPU rayon (brain_stride-decimated ticks
+//! inside the simulation loop). When speed is low (≤~16×), expected brain
+//! ticks per frame ≤ 2, so one GPU dispatch matches CPU throughput. At higher
+//! speeds, the caller automatically switches to CPU rayon to preserve
+//! cognitive throughput. This ensures agents get equivalent brain tick rates
+//! regardless of which compute path is active.
+//!
+//! # Performance
 //!
 //! # Performance
 //!
 //! For 10 agents the GPU dispatch overhead (~50-100μs) dominates the actual
 //! compute time. GPU becomes advantageous above ~50 agents. Use `--gpu-brain`
-//! to opt in; the default rayon CPU path is faster for small populations.
+//! to opt in; the caller uses an adaptive scheduler that automatically falls
+//! back to CPU rayon when the speed multiplier would cause GPU mode to deliver
+//! fewer brain ticks than the CPU path (roughly above 10-16× speed).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

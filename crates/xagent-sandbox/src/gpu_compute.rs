@@ -42,15 +42,13 @@
 //!
 //! # Performance
 //!
-//! # Performance
-//!
 //! For 10 agents the GPU dispatch overhead (~50-100μs) dominates the actual
 //! compute time. GPU becomes advantageous above ~50 agents. Use `--gpu-brain`
 //! to opt in; the caller uses an adaptive scheduler that automatically falls
 //! back to CPU rayon when the speed multiplier would cause GPU mode to deliver
 //! fewer brain ticks than the CPU path (roughly above 10-16× speed).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
@@ -229,9 +227,12 @@ pub struct GpuBrainCompute {
     staging_idx: usize,
     has_in_flight: bool,
 
-    // Non-blocking completion flags set by map_async callbacks
-    enc_mapped: Arc<AtomicBool>,
-    sim_mapped: Arc<AtomicBool>,
+    // Non-blocking completion: map_async callbacks write the submit_seq they
+    // belong to. try_collect() checks that both match the current submit_seq,
+    // preventing stale callbacks from a prior submit being mistaken as ready.
+    submit_seq: u64,
+    enc_mapped_seq: Arc<AtomicU64>,
+    sim_mapped_seq: Arc<AtomicU64>,
 
     encode_bind_group: wgpu::BindGroup,
     recall_bind_group: wgpu::BindGroup,
@@ -407,8 +408,9 @@ impl GpuBrainCompute {
             similarities_staging,
             staging_idx: 0,
             has_in_flight: false,
-            enc_mapped: Arc::new(AtomicBool::new(false)),
-            sim_mapped: Arc::new(AtomicBool::new(false)),
+            submit_seq: 0,
+            enc_mapped_seq: Arc::new(AtomicU64::new(0)),
+            sim_mapped_seq: Arc::new(AtomicU64::new(0)),
             encode_bind_group,
             recall_bind_group,
         })
@@ -495,24 +497,24 @@ impl GpuBrainCompute {
 
         self.queue.submit(std::iter::once(cmd.finish()));
 
-        // Request async mapping with completion flags
-        self.enc_mapped.store(false, Ordering::Release);
-        self.sim_mapped.store(false, Ordering::Release);
+        // Request async mapping with sequence-tagged completion
+        self.submit_seq += 1;
+        let seq = self.submit_seq;
 
-        let enc_flag = self.enc_mapped.clone();
+        let enc_flag = self.enc_mapped_seq.clone();
         self.encoded_staging[widx]
             .slice(..enc_size)
             .map_async(wgpu::MapMode::Read, move |result| {
                 if result.is_ok() {
-                    enc_flag.store(true, Ordering::Release);
+                    enc_flag.store(seq, Ordering::Release);
                 }
             });
-        let sim_flag = self.sim_mapped.clone();
+        let sim_flag = self.sim_mapped_seq.clone();
         self.similarities_staging[widx]
             .slice(..sim_size)
             .map_async(wgpu::MapMode::Read, move |result| {
                 if result.is_ok() {
-                    sim_flag.store(true, Ordering::Release);
+                    sim_flag.store(seq, Ordering::Release);
                 }
             });
 
@@ -524,6 +526,8 @@ impl GpuBrainCompute {
     ///
     /// If the GPU hasn't finished yet, returns `None` — agents should
     /// keep using their cached motor commands. Never blocks the caller.
+    /// Uses sequence numbers to ensure only the latest submit's callbacks
+    /// are accepted (prevents stale callback races under GPU pressure).
     pub fn try_collect(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
         if !self.has_in_flight {
             return None;
@@ -531,8 +535,9 @@ impl GpuBrainCompute {
 
         self.device.poll(wgpu::Maintain::Poll);
 
-        if !self.enc_mapped.load(Ordering::Acquire)
-            || !self.sim_mapped.load(Ordering::Acquire)
+        let seq = self.submit_seq;
+        if self.enc_mapped_seq.load(Ordering::Acquire) != seq
+            || self.sim_mapped_seq.load(Ordering::Acquire) != seq
         {
             return None;
         }

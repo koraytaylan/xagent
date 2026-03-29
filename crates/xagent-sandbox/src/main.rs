@@ -1115,24 +1115,6 @@ impl ApplicationHandler for App {
                         (0, 0, 0)
                     };
 
-                    // ── GPU COLLECT: always drain in-flight results ──
-                    if let Some(gpu) = self.gpu_compute.as_mut() {
-                        if let Some((encoded, similarities)) = gpu.try_collect() {
-                            for (i, agent) in self.agents.iter_mut().enumerate() {
-                                if i < self.gpu_prev_frames.len() {
-                                    if let Some(frame) = &self.gpu_prev_frames[i] {
-                                        let (a_dim, a_cap) = self.gpu_prev_agent_dims[i];
-                                        let enc = &encoded[i * gpu_dim..i * gpu_dim + a_dim];
-                                        let sim = &similarities[i * gpu_cap..i * gpu_cap + a_cap];
-                                        agent.cached_motor =
-                                            agent.brain.tick_gpu(frame, enc, sim);
-                                        record_agent_histories(agent);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // ── Adaptive GPU/CPU decision ──
                     // GPU dispatches once per frame → 1 brain tick per frame.
                     // CPU rayon runs brain_stride-decimated ticks inside the loop.
@@ -1142,6 +1124,31 @@ impl ApplicationHandler for App {
                         .min(max_ticks as f32) as u64;
                     let expected_brain_ticks = expected_ticks / brain_stride;
                     let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
+
+                    // ── GPU COLLECT: always drain in-flight results ──
+                    // try_collect() unmaps staging buffers even if we don't
+                    // apply the results, preventing stale buffer buildup.
+                    // Only apply brain results when GPU is the active path
+                    // this frame — avoids a spurious double brain tick on
+                    // GPU→CPU transitions.
+                    if let Some(gpu) = self.gpu_compute.as_mut() {
+                        if let Some((encoded, similarities)) = gpu.try_collect() {
+                            if use_gpu {
+                                for (i, agent) in self.agents.iter_mut().enumerate() {
+                                    if i < self.gpu_prev_frames.len() {
+                                        if let Some(frame) = &self.gpu_prev_frames[i] {
+                                            let (a_dim, a_cap) = self.gpu_prev_agent_dims[i];
+                                            let enc = &encoded[i * gpu_dim..i * gpu_dim + a_dim];
+                                            let sim = &similarities[i * gpu_cap..i * gpu_cap + a_cap];
+                                            agent.cached_motor =
+                                                agent.brain.tick_gpu(frame, enc, sim);
+                                            record_agent_histories(agent);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;

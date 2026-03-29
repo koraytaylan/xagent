@@ -91,7 +91,7 @@ impl Default for EvolutionSnapshot {
             tick_budget: 50_000,
             population_size: 10,
             elitism_count: 3,
-            patience: 3,
+            patience: 5,
             max_generations: 0,
             wall_time_secs: 0.0,
             ticks_per_sec: 0.0,

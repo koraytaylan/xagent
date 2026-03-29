@@ -92,6 +92,13 @@ pub struct GovernorConfig {
     pub max_generations: u64,
     /// Consecutive generations of fitness regression before backtracking.
     pub patience: u32,
+    /// Base mutation strength (0.1 = ±10%). Scales up with failed attempts.
+    #[serde(default = "default_mutation_strength")]
+    pub mutation_strength: f32,
+}
+
+fn default_mutation_strength() -> f32 {
+    0.1
 }
 
 impl Default for GovernorConfig {
@@ -101,7 +108,8 @@ impl Default for GovernorConfig {
             tick_budget: 50_000,
             elitism_count: 3,
             max_generations: 0,
-            patience: 3,
+            patience: 5,
+            mutation_strength: 0.1,
         }
     }
 }

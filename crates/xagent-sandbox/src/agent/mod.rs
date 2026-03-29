@@ -239,14 +239,22 @@ impl Agent {
 
 /// Create a mutated BrainConfig from a parent config (±10% per param).
 pub fn mutate_config(parent: &BrainConfig) -> BrainConfig {
+    mutate_config_with_strength(parent, 0.1)
+}
+
+/// Create a mutated BrainConfig with a configurable mutation strength.
+/// `strength` controls the perturbation range: e.g. 0.1 → ±10%, 0.3 → ±30%.
+pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> BrainConfig {
     let mut rng = rand::rng();
+    let lo = 1.0 - strength;
+    let hi = 1.0 + strength;
 
     let perturb_f = |rng: &mut rand::rngs::ThreadRng, v: f32| -> f32 {
-        let factor: f32 = rng.random_range(0.9..1.1);
+        let factor: f32 = rng.random_range(lo..hi);
         (v * factor).max(0.0001)
     };
     let perturb_u = |rng: &mut rand::rngs::ThreadRng, v: usize| -> usize {
-        let factor: f32 = rng.random_range(0.9..1.1);
+        let factor: f32 = rng.random_range(lo..hi);
         ((v as f32 * factor).round() as usize).max(1)
     };
 

@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
-use crate::agent::{mutate_config, Agent, HEATMAP_RES};
+use crate::agent::{mutate_config_with_strength, Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
@@ -206,15 +206,15 @@ impl Governor {
         // Absolute fitness scoring — no intra-generational normalization.
         // Each axis uses a meaningful denominator so scores reflect real quality.
         let tick_budget = self.config.tick_budget as f32;
-        let total_grid_cells = (HEATMAP_RES * HEATMAP_RES) as f32;
+        let total_grid_cells = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
         let food_target = (tick_budget / 1000.0).max(10.0);
 
         for r in &mut results {
-            // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.5, 9 → 0.1
-            let survival = 1.0 / (1.0 + r.death_count as f32);
+            // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.67, 2 → 0.5
+            let survival = 1.0 / (1.0 + r.death_count as f32 * 0.5);
             // Foraging: food per generation, capped at target
             let foraging = (r.food_consumed as f32 / food_target).min(1.0);
-            // Exploration: fraction of world grid visited
+            // Exploration: fraction of reachable grid visited (25% of total = perfect)
             let exploration = (r.cells_explored as f32 / total_grid_cells).min(1.0);
 
             r.composite_fitness = survival * 0.4 + foraging * 0.3 + exploration * 0.3;
@@ -398,7 +398,8 @@ impl Governor {
 
     /// Create the next generation node as a child of `spawn_parent_id`.
     /// Increments the parent's spawn_attempts and returns population configs.
-    fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
+    /// Uses elitism to preserve top configs and adaptive mutation strength.
+    fn breed_next_generation(&mut self, fitness: &[AgentFitness]) -> Vec<BrainConfig> {
         let spawn_parent = match self.spawn_parent_id {
             Some(id) => id,
             None => return Vec::new(),
@@ -413,7 +414,19 @@ impl Governor {
             Err(_) => BrainConfig::default(),
         };
 
-        let base_config = mutate_config(&parent_config);
+        // Adaptive mutation: strength increases with failed spawn attempts
+        let attempts: i64 = self
+            .db
+            .query_row(
+                "SELECT spawn_attempts FROM node WHERE id = ?1",
+                params![spawn_parent],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let effective_strength =
+            (self.config.mutation_strength * (1.0 + attempts as f32 * 0.5)).min(0.5);
+
+        let base_config = mutate_config_with_strength(&parent_config, effective_strength);
 
         self.generation += 1;
         let config_json = serde_json::to_string(&base_config).unwrap_or_default();
@@ -442,11 +455,23 @@ impl Governor {
             parent_fitness,
         );
 
-        // Population: base config + mutated variants
+        // Build population with elitism: top configs from previous generation
+        // get mutated and included, rest filled from spawn parent's config.
         let pop_size = self.config.population_size;
+        let elite_count = self.config.elitism_count.min(pop_size.saturating_sub(1));
         let mut configs = vec![base_config.clone()];
+
+        // Elitism: mutate top configs from the previous generation's fitness results
+        for elite in fitness.iter().take(elite_count) {
+            if configs.len() >= pop_size {
+                break;
+            }
+            configs.push(mutate_config_with_strength(&elite.config, effective_strength));
+        }
+
+        // Fill remaining slots from the base config
         while configs.len() < pop_size {
-            configs.push(mutate_config(&base_config));
+            configs.push(mutate_config_with_strength(&base_config, effective_strength));
         }
         configs
     }
@@ -794,6 +819,7 @@ mod tests {
             elitism_count: 3,
             patience,
             max_generations: 0,
+            mutation_strength: 0.1,
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
@@ -1107,6 +1133,7 @@ mod tests {
             elitism_count: 1,
             patience: 3,
             max_generations: 1,
+            mutation_strength: 0.1,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1114,5 +1141,113 @@ mod tests {
         // Gen 0 evaluation → max_generations=1 reached
         let result = gov.advance(&mock_fitness(0.5));
         assert!(matches!(result, AdvanceResult::Finished { .. }));
+    }
+
+    #[test]
+    fn adaptive_mutation_strength_increases_with_attempts() {
+        let mut gov = test_governor(5);
+
+        // Gen 0: success (best=0.5), breeds gen1 from root
+        gov.advance(&mock_fitness(0.5));
+
+        // Gen 1: success (best=0.6), spawn_parent becomes gen1
+        gov.advance(&mock_fitness(0.6));
+        let gen1_id = gov.spawn_parent_id.unwrap();
+        // gen1 now has spawn_attempts=1 (from breeding gen2)
+
+        // Gen 2: fail → gen1 gains another attempt
+        gov.advance(&mock_fitness(0.55));
+        let attempts_after_fail1 = node_attempts(&gov, gen1_id);
+        assert_eq!(attempts_after_fail1, 2);
+
+        // Gen 3: fail → gen1 gains another attempt
+        gov.advance(&mock_fitness(0.55));
+        let attempts_after_fail2 = node_attempts(&gov, gen1_id);
+        assert_eq!(attempts_after_fail2, 3);
+
+        // Effective strength at breeding was: 0.1 * (1.0 + attempts * 0.5)
+        // After 2 attempts: 0.1 * 2.0 = 0.2, after 3: 0.1 * 2.5 = 0.25
+        assert!(attempts_after_fail2 > attempts_after_fail1);
+    }
+
+    #[test]
+    fn elitism_preserves_top_configs() {
+        let config = GovernorConfig {
+            population_size: 5,
+            tick_budget: 100,
+            elitism_count: 2,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.0001, // tiny mutation so configs stay recognizable
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Create fitness results with distinct configs
+        let elite1 = BrainConfig {
+            memory_capacity: 999,
+            ..BrainConfig::default()
+        };
+        let elite2 = BrainConfig {
+            memory_capacity: 888,
+            ..BrainConfig::default()
+        };
+        let loser = BrainConfig {
+            memory_capacity: 1,
+            ..BrainConfig::default()
+        };
+
+        let fitness = vec![
+            AgentFitness {
+                agent_index: 0,
+                config: elite1.clone(),
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 50,
+                cells_explored: 100,
+                composite_fitness: 0.9,
+            },
+            AgentFitness {
+                agent_index: 1,
+                config: elite2.clone(),
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 40,
+                cells_explored: 80,
+                composite_fitness: 0.8,
+            },
+            AgentFitness {
+                agent_index: 2,
+                config: loser.clone(),
+                total_ticks_alive: 10,
+                death_count: 5,
+                food_consumed: 1,
+                cells_explored: 2,
+                composite_fitness: 0.1,
+            },
+        ];
+
+        // First advance to move past gen 0 (need a valid spawn parent)
+        gov.advance(&mock_fitness(0.01));
+
+        let configs = gov.breed_next_generation(&fitness);
+
+        // Population should be 5 configs
+        assert_eq!(configs.len(), 5);
+
+        // With tiny mutation, elite configs should stay close to their originals.
+        // configs[1] should be ~elite1 (mem ~999), configs[2] should be ~elite2 (mem ~888)
+        let has_elite1_like = configs.iter().any(|c| c.memory_capacity >= 990);
+        let has_elite2_like = configs.iter().any(|c| (880..=896).contains(&c.memory_capacity));
+        assert!(
+            has_elite1_like,
+            "Expected a config near memory_capacity=999 from elite1; got {:?}",
+            configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
+        );
+        assert!(
+            has_elite2_like,
+            "Expected a config near memory_capacity=888 from elite2; got {:?}",
+            configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
+        );
     }
 }

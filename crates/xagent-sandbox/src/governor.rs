@@ -402,13 +402,14 @@ impl Governor {
             return AdvanceResult::Finished { messages };
         }
 
-        // Breed the next generation from the current spawn parent
-        let configs = self.breed_next_generation(fitness);
-
-        // Rotate to next island
+        // Rotate to next island BEFORE breeding so the new generation
+        // belongs to the island that will evaluate it in the next advance() call.
         if self.islands.len() > 1 {
             self.active_island = (self.active_island + 1) % self.islands.len();
         }
+
+        // Breed the next generation from the (now-rotated) island's spawn parent
+        let configs = self.breed_next_generation(fitness);
 
         // Migration: every migration_interval generations, spread best config
         if self.config.migration_interval > 0

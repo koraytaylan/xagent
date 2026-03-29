@@ -226,6 +226,7 @@ pub struct GpuBrainCompute {
     similarities_staging: [wgpu::Buffer; 2],
     staging_idx: usize,
     has_in_flight: bool,
+    staging_mapped: [bool; 2],
 
     // Non-blocking completion: map_async callbacks write the submit_seq they
     // belong to. try_collect() checks that both match the current submit_seq,
@@ -408,6 +409,7 @@ impl GpuBrainCompute {
             similarities_staging,
             staging_idx: 0,
             has_in_flight: false,
+            staging_mapped: [false; 2],
             submit_seq: 0,
             enc_mapped_seq: Arc::new(AtomicU64::new(0)),
             sim_mapped_seq: Arc::new(AtomicU64::new(0)),
@@ -432,13 +434,13 @@ impl GpuBrainCompute {
     ) {
         let widx = self.staging_idx;
 
-        // If a previous dispatch targeting this staging pair was never collected,
-        // unmap the buffers so they can be used as copy destinations again.
-        // This prevents a wgpu validation error when try_collect() returns None
-        // for 2+ consecutive frames (the double-buffer wraps around).
-        if self.has_in_flight {
+        // If a previous dispatch mapped this staging pair and it was never
+        // collected, unmap it so it can be used as a copy destination again.
+        // Only unmap buffers that are actually mapped (avoids wgpu panic).
+        if self.staging_mapped[widx] {
             self.encoded_staging[widx].unmap();
             self.similarities_staging[widx].unmap();
+            self.staging_mapped[widx] = false;
         }
 
         // Upload input data
@@ -518,6 +520,7 @@ impl GpuBrainCompute {
                 }
             });
 
+        self.staging_mapped[widx] = true;
         self.staging_idx = 1 - self.staging_idx;
         self.has_in_flight = true;
     }
@@ -574,6 +577,7 @@ impl GpuBrainCompute {
         drop(sim_data);
         self.similarities_staging[read_idx].unmap();
 
+        self.staging_mapped[read_idx] = false;
         self.has_in_flight = false;
 
         Some((encoded, similarities))

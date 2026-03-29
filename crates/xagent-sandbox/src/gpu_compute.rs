@@ -38,6 +38,8 @@
 //! compute time. GPU becomes advantageous above ~50 agents. Use `--gpu-brain`
 //! to opt in; the default rayon CPU path is faster for small populations.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// Parameters passed to both compute shaders as a uniform buffer.
@@ -215,6 +217,10 @@ pub struct GpuBrainCompute {
     staging_idx: usize,
     has_in_flight: bool,
 
+    // Non-blocking completion flags set by map_async callbacks
+    enc_mapped: Arc<AtomicBool>,
+    sim_mapped: Arc<AtomicBool>,
+
     encode_bind_group: wgpu::BindGroup,
     recall_bind_group: wgpu::BindGroup,
 }
@@ -389,6 +395,8 @@ impl GpuBrainCompute {
             similarities_staging,
             staging_idx: 0,
             has_in_flight: false,
+            enc_mapped: Arc::new(AtomicBool::new(false)),
+            sim_mapped: Arc::new(AtomicBool::new(false)),
             encode_bind_group,
             recall_bind_group,
         })
@@ -465,34 +473,60 @@ impl GpuBrainCompute {
 
         self.queue.submit(std::iter::once(cmd.finish()));
 
-        // Request async mapping (don't block)
+        // Request async mapping with completion flags
+        self.enc_mapped.store(false, Ordering::Release);
+        self.sim_mapped.store(false, Ordering::Release);
+
+        let enc_flag = self.enc_mapped.clone();
         self.encoded_staging[widx]
             .slice(..enc_size)
-            .map_async(wgpu::MapMode::Read, |_| {});
+            .map_async(wgpu::MapMode::Read, move |_| {
+                enc_flag.store(true, Ordering::Release);
+            });
+        let sim_flag = self.sim_mapped.clone();
         self.similarities_staging[widx]
             .slice(..sim_size)
-            .map_async(wgpu::MapMode::Read, |_| {});
+            .map_async(wgpu::MapMode::Read, move |_| {
+                sim_flag.store(true, Ordering::Release);
+            });
 
         self.staging_idx = 1 - self.staging_idx;
         self.has_in_flight = true;
     }
 
-    /// Collect results from the most recent `submit()` call.
+    /// Non-blocking collect: poll GPU and return results if ready.
     ///
-    /// Polls the GPU to ensure the mapping is complete, then reads back the
-    /// staging buffers. In the pipelined flow the GPU has been computing
-    /// while the CPU did sensory extraction, so the poll typically returns
-    /// almost immediately.
-    ///
-    /// Returns `None` if no work is in flight.
-    pub fn collect(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+    /// If the GPU hasn't finished yet, returns `None` — agents should
+    /// keep using their cached motor commands. Never blocks the caller.
+    pub fn try_collect(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
         if !self.has_in_flight {
             return None;
         }
 
-        let read_idx = 1 - self.staging_idx;
+        self.device.poll(wgpu::Maintain::Poll);
+
+        if !self.enc_mapped.load(Ordering::Acquire)
+            || !self.sim_mapped.load(Ordering::Acquire)
+        {
+            return None;
+        }
+
+        self.read_mapped_staging()
+    }
+
+    /// Blocking collect: waits for GPU results. Used by `dispatch()` and
+    /// end-of-generation flush where we must have results.
+    pub fn collect_blocking(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        if !self.has_in_flight {
+            return None;
+        }
 
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        self.read_mapped_staging()
+    }
+
+    fn read_mapped_staging(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        let read_idx = 1 - self.staging_idx;
 
         let enc_size = (self.num_agents * self.dim) as u64 * 4;
         let sim_size = (self.num_agents * self.memory_capacity) as u64 * 4;
@@ -514,8 +548,7 @@ impl GpuBrainCompute {
         Some((encoded, similarities))
     }
 
-    /// Synchronous dispatch: submit + collect. Convenience wrapper used by
-    /// tests and when pipelining isn't needed.
+    /// Synchronous dispatch: submit + blocking collect. Used by tests.
     pub fn dispatch(
         &mut self,
         features: &[f32],
@@ -525,7 +558,7 @@ impl GpuBrainCompute {
         mem_active: &[u32],
     ) -> (Vec<f32>, Vec<f32>) {
         self.submit(features, enc_weights, enc_biases, mem_patterns, mem_active);
-        self.collect().expect("collect after submit must return results")
+        self.collect_blocking().expect("collect after submit must return results")
     }
 
     /// Whether the current config matches the given dimensions.

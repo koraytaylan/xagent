@@ -292,6 +292,11 @@ struct App {
     gpu_brain: bool,
     gpu_compute: Option<xagent_sandbox::gpu_compute::GpuBrainCompute>,
 
+    // Per-frame GPU pipeline state: stores previous frame's sensory data
+    // so collect() can apply results with the matching frames.
+    gpu_prev_frames: Vec<Option<SensoryFrame>>,
+    gpu_prev_agent_dims: Vec<(usize, usize)>,
+
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
 }
@@ -396,6 +401,8 @@ impl App {
             governor_config,
             gpu_brain,
             gpu_compute: None,
+            gpu_prev_frames: Vec::new(),
+            gpu_prev_agent_dims: Vec::new(),
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
         }
     }
@@ -1090,20 +1097,34 @@ impl ApplicationHandler for App {
                     // Lazily initialize GPU compute if --gpu-brain was requested
                     self.ensure_gpu_compute();
 
-                    // Pre-allocate GPU batch buffers outside tick loop (reused each tick)
+                    let gpu_mode = self.gpu_compute.is_some();
+
+                    // Pre-allocate GPU batch buffers (reused each frame)
                     let gpu_n = self.agents.len();
                     let (gpu_dim, gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
                         (gpu.dim() as usize, gpu.feature_count() as usize, gpu.memory_capacity() as usize)
                     } else {
                         (0, 0, 0)
                     };
-                    let mut all_features: Vec<f32> = Vec::with_capacity(gpu_n * gpu_fc);
-                    let mut all_weights: Vec<f32> = Vec::with_capacity(gpu_n * gpu_fc * gpu_dim);
-                    let mut all_biases: Vec<f32> = Vec::with_capacity(gpu_n * gpu_dim);
-                    let mut all_patterns: Vec<f32> = Vec::with_capacity(gpu_n * gpu_cap * gpu_dim);
-                    let mut all_active: Vec<u32> = Vec::with_capacity(gpu_n * gpu_cap);
-                    let mut prev_frames: Vec<Option<SensoryFrame>> = vec![None; gpu_n];
-                    let mut prev_agent_dims: Vec<(usize, usize)> = vec![(gpu_dim, gpu_cap); gpu_n];
+
+                    // ── GPU COLLECT: apply previous frame's GPU results ──
+                    if gpu_mode {
+                        let gpu = self.gpu_compute.as_mut().unwrap();
+                        if let Some((encoded, similarities)) = gpu.try_collect() {
+                            for (i, agent) in self.agents.iter_mut().enumerate() {
+                                if i < self.gpu_prev_frames.len() {
+                                    if let Some(frame) = &self.gpu_prev_frames[i] {
+                                        let (a_dim, a_cap) = self.gpu_prev_agent_dims[i];
+                                        let enc = &encoded[i * gpu_dim..i * gpu_dim + a_dim];
+                                        let sim = &similarities[i * gpu_cap..i * gpu_cap + a_cap];
+                                        agent.cached_motor =
+                                            agent.brain.tick_gpu(frame, enc, sim);
+                                        record_agent_histories(agent);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
@@ -1118,166 +1139,56 @@ impl ApplicationHandler for App {
                                     .map(|a| (a.body.body.position, a.body.body.alive)),
                             );
 
-                            // ── Phase 2: Brain ticks ──
-                            // Check if any agent needs brain this tick
-                            let tick = self.tick;
-                            let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
-                                a.body.body.alive && (tick + i as u64) % brain_stride == 0
-                            });
+                            // ── Phase 2: Brain ticks (CPU path only) ──
+                            // In GPU mode, agents use cached_motor set by
+                            // the per-frame collect above. No GPU calls in
+                            // the tick loop — this is the key perf fix.
+                            if !gpu_mode {
+                                let tick = self.tick;
+                                let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
+                                    a.body.body.alive && (tick + i as u64) % brain_stride == 0
+                                });
 
-                            if self.gpu_compute.is_some() && any_brain {
-                                // GPU path: pipelined async dispatch.
-                                // Collect previous results → apply → extract new senses → submit.
-                                let gpu = self.gpu_compute.as_mut().unwrap();
-                                let dim = gpu_dim;
-                                let cap = gpu_cap;
+                                if any_brain {
+                                    let world_ref: &WorldState = &*world;
+                                    let all_pos = &all_positions;
 
-                                // Phase A: Collect previous GPU results and apply
-                                if let Some((encoded, similarities)) = gpu.collect() {
-                                    for (i, agent) in self.agents.iter_mut().enumerate() {
-                                        if let Some(frame) = &prev_frames[i] {
-                                            let (a_dim, a_cap) = prev_agent_dims[i];
-                                            let enc = &encoded[i * dim..i * dim + a_dim];
-                                            let sim = &similarities[i * cap..i * cap + a_cap];
-                                            agent.cached_motor =
-                                                agent.brain.tick_gpu(frame, enc, sim);
-                                            record_agent_histories(agent);
-                                        }
-                                    }
-                                }
-
-                                // Phase B: Parallel sensory extraction (rayon)
-                                let world_ref: &WorldState = &*world;
-                                let all_pos = &all_positions;
-                                struct AgentGpuSlice {
-                                    feats: Vec<f32>,
-                                    weights: Vec<f32>,
-                                    biases: Vec<f32>,
-                                    pats: Vec<f32>,
-                                    mask: Vec<u32>,
-                                    agent_dim: usize,
-                                    agent_fc: usize,
-                                    agent_cap: usize,
-                                    frame: SensoryFrame,
-                                }
-                                let per_agent: Vec<Option<AgentGpuSlice>> =
                                     self.agents
                                         .par_iter_mut()
                                         .enumerate()
-                                        .map(|(i, agent)| {
-                                            let alive = agent.body.body.alive;
-                                            let run = alive
-                                                && (tick + i as u64) % brain_stride == 0;
-                                            if !run {
-                                                return None;
+                                        .for_each(|(i, agent)| {
+                                            if !agent.body.body.alive {
+                                                return;
                                             }
+                                            let run_brain =
+                                                (tick + i as u64) % brain_stride == 0;
+                                            if !run_brain {
+                                                return;
+                                            }
+
                                             let others: Vec<OtherAgent> = all_pos
                                                 .iter()
                                                 .enumerate()
                                                 .filter(|(j, _)| *j != i)
-                                                .map(|(_, (pos, a))| OtherAgent {
+                                                .map(|(_, (pos, alive))| OtherAgent {
                                                     position: *pos,
-                                                    alive: *a,
+                                                    alive: *alive,
                                                 })
                                                 .collect();
-                                            let frame = senses::extract_senses_with_others(
-                                                &agent.body, world_ref, tick, &others,
-                                            );
-                                            let feats = agent.brain.encoder
-                                                .extract_features(&frame).to_vec();
-                                            let weights = agent.brain.encoder.weights().to_vec();
-                                            let biases = agent.brain.encoder.biases().to_vec();
-                                            let (pats, mask) = agent.brain.memory.gpu_pattern_data();
-                                            Some(AgentGpuSlice {
-                                                feats, weights, biases, pats, mask,
-                                                agent_dim: agent.brain.config.representation_dim,
-                                                agent_fc: agent.brain.encoder.feature_count(),
-                                                agent_cap: agent.brain.memory.max_capacity(),
-                                                frame,
-                                            })
-                                        })
-                                        .collect();
 
-                                // Phase C: Sequential batching + store frames
-                                all_features.clear();
-                                all_weights.clear();
-                                all_biases.clear();
-                                all_patterns.clear();
-                                all_active.clear();
+                                            let frame =
+                                                senses::extract_senses_with_others(
+                                                    &agent.body,
+                                                    world_ref,
+                                                    tick,
+                                                    &others,
+                                                );
 
-                                for (i, data) in per_agent.into_iter().enumerate() {
-                                    if let Some(d) = data {
-                                        gpu.pad_agent_into(
-                                            &d.feats, &d.weights, &d.biases,
-                                            &d.pats, &d.mask,
-                                            d.agent_dim, d.agent_fc, d.agent_cap,
-                                            &mut all_features, &mut all_weights,
-                                            &mut all_biases, &mut all_patterns,
-                                            &mut all_active,
-                                        );
-                                        prev_agent_dims[i] = (d.agent_dim, d.agent_cap);
-                                        prev_frames[i] = Some(d.frame);
-                                    } else {
-                                        gpu.pad_agent_into(
-                                            &[], &[], &[], &[], &[],
-                                            0, 0, 0,
-                                            &mut all_features, &mut all_weights,
-                                            &mut all_biases, &mut all_patterns,
-                                            &mut all_active,
-                                        );
-                                        prev_frames[i] = None;
-                                    }
+                                            agent.cached_motor =
+                                                agent.brain.tick(&frame);
+                                            record_agent_histories(agent);
+                                        });
                                 }
-
-                                // Phase D: Async GPU dispatch (returns immediately)
-                                gpu.submit(
-                                    &all_features,
-                                    &all_weights,
-                                    &all_biases,
-                                    &all_patterns,
-                                    &all_active,
-                                );
-                            } else if any_brain {
-                                // CPU path: rayon parallel brain ticks
-                                let world_ref: &WorldState = &*world;
-                                let tick = self.tick;
-                                let all_pos = &all_positions;
-
-                                self.agents
-                                    .par_iter_mut()
-                                    .enumerate()
-                                    .for_each(|(i, agent)| {
-                                        if !agent.body.body.alive {
-                                            return;
-                                        }
-                                        let run_brain =
-                                            (tick + i as u64) % brain_stride == 0;
-                                        if !run_brain {
-                                            return;
-                                        }
-
-                                        let others: Vec<OtherAgent> = all_pos
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(j, _)| *j != i)
-                                            .map(|(_, (pos, alive))| OtherAgent {
-                                                position: *pos,
-                                                alive: *alive,
-                                            })
-                                            .collect();
-
-                                        let frame =
-                                            senses::extract_senses_with_others(
-                                                &agent.body,
-                                                world_ref,
-                                                tick,
-                                                &others,
-                                            );
-
-                                        agent.cached_motor =
-                                            agent.brain.tick(&frame);
-                                        record_agent_histories(agent);
-                                    });
                             }
 
                             // ── Phase 3: Physics + stats (sequential, mutates world) ──
@@ -1417,6 +1328,111 @@ impl ApplicationHandler for App {
                     if let Some(gov) = &self.governor {
                         if gov.generation_complete() {
                             self.advance_generation();
+                        }
+                    }
+
+                    // ── GPU SUBMIT: extract senses once per frame, submit async ──
+                    if gpu_mode && ticks_run > 0 {
+                        if let Some(world) = &self.world {
+                            // Snapshot current positions
+                            all_positions.clear();
+                            all_positions.extend(
+                                self.agents
+                                    .iter()
+                                    .map(|a| (a.body.body.position, a.body.body.alive)),
+                            );
+                            let world_ref: &WorldState = world;
+                            let all_pos = &all_positions;
+                            let tick = self.tick;
+
+                            // Parallel sensory extraction for ALL alive agents
+                            struct AgentGpuSlice {
+                                feats: Vec<f32>,
+                                weights: Vec<f32>,
+                                biases: Vec<f32>,
+                                pats: Vec<f32>,
+                                mask: Vec<u32>,
+                                agent_dim: usize,
+                                agent_fc: usize,
+                                agent_cap: usize,
+                                frame: SensoryFrame,
+                            }
+                            let per_agent: Vec<Option<AgentGpuSlice>> =
+                                self.agents
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(i, agent)| {
+                                        if !agent.body.body.alive {
+                                            return None;
+                                        }
+                                        let others: Vec<OtherAgent> = all_pos
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(j, _)| *j != i)
+                                            .map(|(_, (pos, a))| OtherAgent {
+                                                position: *pos,
+                                                alive: *a,
+                                            })
+                                            .collect();
+                                        let frame = senses::extract_senses_with_others(
+                                            &agent.body, world_ref, tick, &others,
+                                        );
+                                        let feats = agent.brain.encoder
+                                            .extract_features(&frame).to_vec();
+                                        let weights = agent.brain.encoder.weights().to_vec();
+                                        let biases = agent.brain.encoder.biases().to_vec();
+                                        let (pats, mask) = agent.brain.memory.gpu_pattern_data();
+                                        Some(AgentGpuSlice {
+                                            feats, weights, biases, pats, mask,
+                                            agent_dim: agent.brain.config.representation_dim,
+                                            agent_fc: agent.brain.encoder.feature_count(),
+                                            agent_cap: agent.brain.memory.max_capacity(),
+                                            frame,
+                                        })
+                                    })
+                                    .collect();
+
+                            // Batch into GPU buffers + store frames for next collect
+                            let gpu = self.gpu_compute.as_mut().unwrap();
+                            let mut all_features = Vec::with_capacity(gpu_n * gpu_fc);
+                            let mut all_weights = Vec::with_capacity(gpu_n * gpu_fc * gpu_dim);
+                            let mut all_biases = Vec::with_capacity(gpu_n * gpu_dim);
+                            let mut all_patterns = Vec::with_capacity(gpu_n * gpu_cap * gpu_dim);
+                            let mut all_active: Vec<u32> = Vec::with_capacity(gpu_n * gpu_cap);
+
+                            self.gpu_prev_frames.clear();
+                            self.gpu_prev_frames.resize(gpu_n, None);
+                            self.gpu_prev_agent_dims.clear();
+                            self.gpu_prev_agent_dims.resize(gpu_n, (gpu_dim, gpu_cap));
+
+                            for (i, data) in per_agent.into_iter().enumerate() {
+                                if let Some(d) = data {
+                                    gpu.pad_agent_into(
+                                        &d.feats, &d.weights, &d.biases,
+                                        &d.pats, &d.mask,
+                                        d.agent_dim, d.agent_fc, d.agent_cap,
+                                        &mut all_features, &mut all_weights,
+                                        &mut all_biases, &mut all_patterns,
+                                        &mut all_active,
+                                    );
+                                    self.gpu_prev_agent_dims[i] = (d.agent_dim, d.agent_cap);
+                                    self.gpu_prev_frames[i] = Some(d.frame);
+                                } else {
+                                    gpu.pad_agent_into(
+                                        &[], &[], &[], &[], &[],
+                                        0, 0, 0,
+                                        &mut all_features, &mut all_weights,
+                                        &mut all_biases, &mut all_patterns,
+                                        &mut all_active,
+                                    );
+                                }
+                            }
+
+                            // Submit once per frame (async, returns immediately)
+                            gpu.submit(
+                                &all_features, &all_weights, &all_biases,
+                                &all_patterns, &all_active,
+                            );
                         }
                     }
 
@@ -2292,7 +2308,7 @@ fn log_tick_to_csv(
 
 // ── Headless evolution loop ─────────────────────────────────────────────
 
-fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool) {
+fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain: bool) {
     use xagent_sandbox::governor::{AdvanceResult, Governor};
 
     info!("Running headless evolution");
@@ -2351,30 +2367,9 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
 
         governor.gen_tick = 0;
 
-        // Initialize GPU compute if requested
-        let mut gpu_compute: Option<GpuBrainCompute> = None;
-        if gpu_brain && !agents.is_empty() {
-            let n = agents.len() as u32;
-            let dim = agents.iter().map(|a| a.brain.config.representation_dim).max().unwrap() as u32;
-            let fc = agents.iter().map(|a| a.brain.encoder.feature_count()).max().unwrap() as u32;
-            let cap = agents.iter().map(|a| a.brain.memory.max_capacity()).max().unwrap() as u32;
-            if gpu_compute.as_ref().map_or(true, |g: &GpuBrainCompute| !g.matches_config(n, dim, fc, cap)) {
-                gpu_compute = GpuBrainCompute::try_new(n, dim, fc, cap);
-            }
-        }
-
         // Run generation
         let gen_start = Instant::now();
         let mut tick: u64 = 0;
-
-        // Pipelined GPU state: previous dispatch's frames and dimensions
-        let (gpu_dim, gpu_cap) = if let Some(ref g) = gpu_compute {
-            (g.dim() as usize, g.memory_capacity() as usize)
-        } else {
-            (0, 0)
-        };
-        let mut prev_frames: Vec<Option<SensoryFrame>> = vec![None; agents.len()];
-        let mut prev_agent_dims: Vec<(usize, usize)> = vec![(gpu_dim, gpu_cap); agents.len()];
 
         while !governor.generation_complete() {
             // Build other-agents list for sensory extraction
@@ -2383,110 +2378,8 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
                 .map(|a| (a.body.body.position, a.body.body.alive))
                 .collect();
 
-            // ── Brain ticks ──
-            if let Some(ref mut gpu) = gpu_compute {
-                // GPU path: pipelined async dispatch
-                let dim = gpu_dim;
-                let cap = gpu_cap;
-
-                // Phase A: Collect previous GPU results and apply
-                if let Some((encoded, similarities)) = gpu.collect() {
-                    for (i, agent) in agents.iter_mut().enumerate() {
-                        if let Some(frame) = &prev_frames[i] {
-                            let (a_dim, a_cap) = prev_agent_dims[i];
-                            let enc = &encoded[i * dim..i * dim + a_dim];
-                            let sim = &similarities[i * cap..i * cap + a_cap];
-                            agent.cached_motor = agent.brain.tick_gpu(frame, enc, sim);
-                        }
-                    }
-                }
-
-                // Phase B: Parallel sensory extraction (rayon)
-                let world_ref: &WorldState = &world;
-                let pos = &positions;
-                struct AgentGpuSlice {
-                    feats: Vec<f32>,
-                    weights: Vec<f32>,
-                    biases: Vec<f32>,
-                    pats: Vec<f32>,
-                    mask: Vec<u32>,
-                    agent_dim: usize,
-                    agent_fc: usize,
-                    agent_cap: usize,
-                    frame: SensoryFrame,
-                }
-                let per_agent: Vec<Option<AgentGpuSlice>> = agents
-                    .par_iter_mut()
-                    .enumerate()
-                    .map(|(i, agent)| {
-                        if !agent.body.body.alive {
-                            return None;
-                        }
-                        let others: Vec<OtherAgent> = pos
-                            .iter()
-                            .enumerate()
-                            .filter(|(j, _)| *j != i)
-                            .map(|(_, (p, alive))| OtherAgent {
-                                position: *p,
-                                alive: *alive,
-                            })
-                            .collect();
-                        let frame = senses::extract_senses_with_others(
-                            &agent.body, world_ref, tick, &others,
-                        );
-                        let feats = agent.brain.encoder.extract_features(&frame).to_vec();
-                        let weights = agent.brain.encoder.weights().to_vec();
-                        let biases = agent.brain.encoder.biases().to_vec();
-                        let (pats, mask) = agent.brain.memory.gpu_pattern_data();
-                        Some(AgentGpuSlice {
-                            feats, weights, biases, pats, mask,
-                            agent_dim: agent.brain.config.representation_dim,
-                            agent_fc: agent.brain.encoder.feature_count(),
-                            agent_cap: agent.brain.memory.max_capacity(),
-                            frame,
-                        })
-                    })
-                    .collect();
-
-                // Phase C: Sequential batching + store frames
-                let n = agents.len();
-                let fc = gpu.feature_count() as usize;
-                let mut all_features = Vec::with_capacity(n * fc);
-                let mut all_weights = Vec::with_capacity(n * fc * dim);
-                let mut all_biases = Vec::with_capacity(n * dim);
-                let mut all_patterns = Vec::with_capacity(n * cap * dim);
-                let mut all_active = Vec::with_capacity(n * cap);
-
-                for (i, data) in per_agent.into_iter().enumerate() {
-                    if let Some(d) = data {
-                        gpu.pad_agent_into(
-                            &d.feats, &d.weights, &d.biases,
-                            &d.pats, &d.mask,
-                            d.agent_dim, d.agent_fc, d.agent_cap,
-                            &mut all_features, &mut all_weights,
-                            &mut all_biases, &mut all_patterns,
-                            &mut all_active,
-                        );
-                        prev_agent_dims[i] = (d.agent_dim, d.agent_cap);
-                        prev_frames[i] = Some(d.frame);
-                    } else {
-                        gpu.pad_agent_into(
-                            &[], &[], &[], &[], &[],
-                            0, 0, 0,
-                            &mut all_features, &mut all_weights,
-                            &mut all_biases, &mut all_patterns,
-                            &mut all_active,
-                        );
-                        prev_frames[i] = None;
-                    }
-                }
-
-                // Phase D: Async GPU dispatch
-                gpu.submit(
-                    &all_features, &all_weights, &all_biases, &all_patterns, &all_active,
-                );
-            } else {
-                // CPU rayon path
+            // ── Brain ticks (CPU rayon — faster than GPU for small populations) ──
+            {
                 let world_ref: &WorldState = &world;
                 let pos = &positions;
                 agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
@@ -2546,20 +2439,6 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, gpu_brain: bool
                 print!("\rGen {} [{:>3}%]", governor.generation, pct);
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
-            }
-        }
-
-        // Flush: collect final GPU dispatch results before fitness evaluation
-        if let Some(ref mut gpu) = gpu_compute {
-            if let Some((encoded, similarities)) = gpu.collect() {
-                for (i, agent) in agents.iter_mut().enumerate() {
-                    if let Some(frame) = &prev_frames[i] {
-                        let (a_dim, a_cap) = prev_agent_dims[i];
-                        let enc = &encoded[i * gpu_dim..i * gpu_dim + a_dim];
-                        let sim = &similarities[i * gpu_cap..i * gpu_cap + a_cap];
-                        agent.cached_motor = agent.brain.tick_gpu(frame, enc, sim);
-                    }
-                }
             }
         }
 

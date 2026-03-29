@@ -261,11 +261,18 @@ impl GpuBrainCompute {
 
         log::info!("[GPU-COMPUTE] Adapter: {:?}", adapter.get_info());
 
+        // Request the adapter's actual max storage buffer binding size
+        // instead of the conservative 128MB default.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("xagent-compute"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
@@ -315,6 +322,20 @@ impl GpuBrainCompute {
         let mem_patterns_size = n * c * d * 4;
         let mem_active_size = n * c * 4;
         let similarities_size = n * c * 4;
+
+        // Guard: bail if any buffer exceeds the device's storage binding limit
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        let largest = enc_weights_size
+            .max(mem_patterns_size)
+            .max(features_size);
+        if largest > max_binding {
+            log::warn!(
+                "[GPU-COMPUTE] Largest buffer ({:.1} MB) exceeds device limit ({:.1} MB) — falling back to CPU",
+                largest as f64 / 1_048_576.0,
+                max_binding as f64 / 1_048_576.0,
+            );
+            return None;
+        }
 
         // Create buffers
         let params = GpuParams {

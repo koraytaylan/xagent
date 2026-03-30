@@ -43,6 +43,9 @@ struct Island {
     spawn_parent_id: Option<i64>,
     best_score: f32,
     elite_configs: Vec<BrainConfig>,
+    /// Per-island patience counter at the current spawn parent.
+    /// Authoritative for exhaustion decisions (DB spawn_attempts is display-only).
+    attempts: u32,
 }
 
 /// The evolution governor. Owns the SQLite connection and drives the
@@ -50,15 +53,16 @@ struct Island {
 ///
 /// # Algorithm
 ///
-/// A generation "succeeds" if its fitness meets or exceeds the global
+/// A generation "succeeds" if its fitness meets or exceeds the island's
 /// `best_score`. Successful nodes become the new spawn parent (tree deepens).
 /// Ties (matching best_score) count as success — they represent reproducible
 /// quality and shouldn't burn patience in a stochastic environment.
 ///
-/// Each node may spawn at most `patience` children. When the limit is
-/// reached, the node is "exhausted" and the governor cascades up to its
-/// parent. If the root exhausts, `best_score` is partially rolled back
-/// (×0.95), its attempt counter resets, and evolution continues.
+/// Each island tracks its own patience counter (`attempts`). When attempts
+/// reach `patience`, the island backtracks one level up the tree and gets
+/// a fresh patience budget. If the island is already at root, `best_score`
+/// is partially rolled back (×0.95) and attempts reset. No recursive cascade
+/// — each level gets its own full patience budget per island.
 ///
 /// The population includes an unmutated copy of the spawn parent's config
 /// (the champion), elite configs from the last successful generation, and
@@ -129,6 +133,7 @@ impl Governor {
                 spawn_parent_id: Some(root_id),
                 best_score: -1.0,
                 elite_configs: Vec::new(),
+                attempts: 0,
             })
             .collect();
 
@@ -176,6 +181,7 @@ impl Governor {
                 spawn_parent_id,
                 best_score: best_score as f32,
                 elite_configs: Vec::new(),
+                attempts: 0,
             })
             .collect();
 
@@ -363,6 +369,7 @@ impl Governor {
                 .take(self.config.elitism_count)
                 .map(|f| f.config.clone())
                 .collect();
+            island.attempts = 0;
             messages.push(format!("[EVOLUTION] ★ New best: {:.4}", gen_fit));
         } else {
             // ✗ Failure — didn't beat the best score
@@ -375,20 +382,10 @@ impl Governor {
                 gen_fit, island.best_score
             ));
 
-            // Check if spawn parent has exhausted its patience
-            if let Some(parent_id) = island.spawn_parent_id {
-                let attempts: i64 = self
-                    .db
-                    .query_row(
-                        "SELECT spawn_attempts FROM node WHERE id = ?1",
-                        params![parent_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                if attempts >= self.config.patience as i64 {
-                    self.cascade_exhaustion(parent_id, &mut messages);
-                }
+            // Check if this island has exhausted its patience at current spawn parent
+            let should_backtrack = island.attempts >= self.config.patience;
+            if should_backtrack {
+                self.backtrack_island(&mut messages);
             }
         }
 
@@ -450,61 +447,51 @@ impl Governor {
         AdvanceResult::Continue { configs, messages }
     }
 
-    /// Walk up the tree when a node exhausts its patience.
+    /// Backtrack one level when the island exhausts patience at its current
+    /// spawn parent. Marks the node as exhausted (for tree display) and moves
+    /// the island to the parent node with a fresh patience budget.
     ///
-    /// Non-root nodes are marked `exhausted` and the governor cascades to
-    /// their parent. If the root itself exhausts, `best_score` is partially
-    /// rolled back (×0.95) to preserve most progress while giving slack,
-    /// and its attempt counter resets.
-    fn cascade_exhaustion(&mut self, node_id: i64, messages: &mut Vec<String>) {
-        let (gen, parent_id): (u32, Option<i64>) = self
+    /// If the island is already at root, partially rolls back `best_score`
+    /// (×0.95) to give slack for re-exploration.
+    fn backtrack_island(&mut self, messages: &mut Vec<String>) {
+        let island = &mut self.islands[self.active_island];
+        let spawn_id = match island.spawn_parent_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Mark the exhausted node in the DB (informational for tree display)
+        let _ = self.db.execute(
+            "UPDATE node SET status = 'exhausted' WHERE id = ?1",
+            params![spawn_id],
+        );
+
+        let parent_id: Option<i64> = self
             .db
             .query_row(
-                "SELECT generation, parent_id FROM node WHERE id = ?1",
-                params![node_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT parent_id FROM node WHERE id = ?1",
+                params![spawn_id],
+                |row| row.get(0),
             )
-            .unwrap_or((0, None));
+            .unwrap_or(None);
 
         match parent_id {
             Some(pid) => {
-                // Non-root: mark exhausted, check parent
-                let _ = self.db.execute(
-                    "UPDATE node SET status = 'exhausted' WHERE id = ?1",
-                    params![node_id],
-                );
+                // Non-root: move up one level, fresh patience budget
+                island.spawn_parent_id = Some(pid);
+                island.attempts = 0;
                 messages.push(format!(
-                    "[EVOLUTION] Gen {} exhausted — backtracking",
-                    gen
+                    "[EVOLUTION] Island {} exhausted — backtracking",
+                    self.active_island
                 ));
-
-                let parent_attempts: i64 = self
-                    .db
-                    .query_row(
-                        "SELECT spawn_attempts FROM node WHERE id = ?1",
-                        params![pid],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                if parent_attempts >= self.config.patience as i64 {
-                    self.cascade_exhaustion(pid, messages);
-                } else {
-                    self.islands[self.active_island].spawn_parent_id = Some(pid);
-                }
             }
             None => {
                 // Root exhaustion: partial rollback preserves most progress
-                self.islands[self.active_island].best_score *= 0.95;
-
-                let _ = self.db.execute(
-                    "UPDATE node SET spawn_attempts = 0 WHERE id = ?1",
-                    params![node_id],
-                );
-                self.islands[self.active_island].spawn_parent_id = Some(node_id);
+                island.best_score *= 0.95;
+                island.attempts = 0;
                 messages.push(format!(
-                    "[EVOLUTION] Root exhausted — best score rolled back to {:.4} (×0.95)",
-                    self.islands[self.active_island].best_score
+                    "[EVOLUTION] Island {} root exhausted — best score rolled back to {:.4} (×0.95)",
+                    self.active_island, island.best_score
                 ));
             }
         }
@@ -514,8 +501,7 @@ impl Governor {
     /// Increments the parent's spawn_attempts and returns population configs.
     /// Uses elitism to preserve top configs and adaptive mutation strength.
     fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
-        let island = &self.islands[self.active_island];
-        let spawn_parent = match island.spawn_parent_id {
+        let spawn_parent = match self.islands[self.active_island].spawn_parent_id {
             Some(id) => id,
             None => return Vec::new(),
         };
@@ -530,14 +516,7 @@ impl Governor {
         };
 
         // Adaptive mutation: linearly ramp from base to max across patience range
-        let attempts: i64 = self
-            .db
-            .query_row(
-                "SELECT spawn_attempts FROM node WHERE id = ?1",
-                params![spawn_parent],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let attempts = self.islands[self.active_island].attempts;
         let base = self.config.mutation_strength;
         let max_strength = 0.5_f32;
         let patience = self.config.patience.max(1) as f32;
@@ -557,7 +536,10 @@ impl Governor {
         self.current_node_id = Some(new_node_id);
         self.gen_tick = 0;
 
-        // Count this child against the parent's patience
+        // Increment per-island attempts (authoritative for patience tracking)
+        self.islands[self.active_island].attempts += 1;
+
+        // Also increment DB spawn_attempts for display/history
         let _ = self.db.execute(
             "UPDATE node SET spawn_attempts = spawn_attempts + 1 WHERE id = ?1",
             params![spawn_parent],
@@ -1153,18 +1135,20 @@ mod tests {
         gov.advance(&mock_fitness(0.2));
         let gen1_id = gov.spawn_parent_id().unwrap();
 
-        // Gen 2, Gen 3: fail → gen1 exhausted → root.attempts=2 (gen1 + gen2_child)
+        // Gen 2, Gen 3: fail → gen1 exhausted → backtrack to root (fresh patience)
         gov.advance(&mock_fitness(0.15));
         gov.advance(&mock_fitness(0.15));
         assert_eq!(node_status(&gov, gen1_id), "exhausted");
+        assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
-        // Now spawning from root. Root has attempts=1 (from gen1).
-        // Gen 5: fail → root.attempts=2 → root exhausted, partial rollback, then breed adds 1
+        // Now at root with fresh patience budget.
+        // Gen 4: fail → attempts=1 at root
+        gov.advance(&mock_fitness(0.12));
+        // Gen 5: fail → attempts=2 at root → root exhausted, partial rollback
         gov.advance(&mock_fitness(0.12));
         // Partial rollback: 0.2 * 0.95 = 0.19
         assert!((gov.best_score() - 0.19).abs() < 0.001);
         assert_eq!(gov.spawn_parent_id(), Some(root_id));
-        assert_eq!(node_attempts(&gov, root_id), 1); // reset to 0, then breed incremented to 1
     }
 
     #[test]
@@ -1178,14 +1162,16 @@ mod tests {
         // Gen 1: success (best=0.2)
         gov.advance(&mock_fitness(0.2));
 
-        // Gen 2: fail → gen1 exhausted (patience=1)
+        // Gen 2: fail → gen1 exhausted (patience=1), backtrack to root
         gov.advance(&mock_fitness(0.15));
-        // gen1 exhausted, cascade to root. root.attempts = 1 >= patience=1 → root exhausted
-        // Partial rollback: 0.2 * 0.95 = 0.19
-        assert!((gov.best_score() - 0.19).abs() < 0.001);
         assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
-        // Gen 3: 0.19 >= 0.19 → success (ties accepted)!
+        // Gen 3: fail at root → root exhausted, partial rollback
+        gov.advance(&mock_fitness(0.15));
+        // Partial rollback: 0.2 * 0.95 = 0.19
+        assert!((gov.best_score() - 0.19).abs() < 0.001);
+
+        // Gen 4: 0.19 >= 0.19 → success (ties accepted)!
         gov.advance(&mock_fitness(0.19));
         assert!((gov.best_score() - 0.19).abs() < 0.001);
     }
@@ -1582,6 +1568,47 @@ mod tests {
         assert_eq!(gov.active_island, 2);
         gov.advance(&mock_fitness(0.3));
         assert_eq!(gov.active_island, 0); // wraps around
+    }
+
+    #[test]
+    fn per_island_attempts_are_isolated() {
+        // With 3 islands, each island's patience counter must be independent.
+        // Previously, shared DB spawn_attempts caused cross-contamination:
+        // all islands incrementing root's spawn_attempts meant root exhausted
+        // after patience/num_islands rounds instead of patience rounds per island.
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 3,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 3,
+            migration_interval: 0,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+        let root_id = gov.current_node_id.unwrap();
+
+        // Gen 0-2: all islands succeed (move off root)
+        gov.advance(&mock_fitness(0.1));
+        gov.advance(&mock_fitness(0.1));
+        gov.advance(&mock_fitness(0.1));
+
+        // 3 rounds: island 0 always fails, islands 1 and 2 always succeed
+        for _ in 0..3 {
+            gov.advance(&mock_fitness(0.05)); // island 0: fail
+            gov.advance(&mock_fitness(0.2));  // island 1: success
+            gov.advance(&mock_fitness(0.2));  // island 2: success
+        }
+
+        // Island 0 exhausted at root and went through root exhaustion,
+        // but islands 1 and 2 should NOT be affected — they should still
+        // be at their most recent successful nodes, not stuck at root.
+        assert_eq!(gov.islands[0].spawn_parent_id, Some(root_id));
+        assert_ne!(gov.islands[1].spawn_parent_id, Some(root_id));
+        assert_ne!(gov.islands[2].spawn_parent_id, Some(root_id));
     }
 
     #[test]

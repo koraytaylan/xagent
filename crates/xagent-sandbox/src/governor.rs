@@ -76,18 +76,28 @@ pub struct Governor {
     islands: Vec<Island>,
     /// Index of the island currently being evaluated (round-robin).
     active_island: usize,
+    /// Cached best_score value (updated on advance).
+    cached_best_score: f32,
+    /// Cached tree nodes (invalidated on advance).
+    cached_tree_nodes: Option<Vec<TreeNode>>,
 }
 
 impl Governor {
     /// Global best fitness across all evaluated nodes in this run.
     pub fn best_score(&self) -> f32 {
-        self.db
+        self.cached_best_score
+    }
+
+    /// Refresh the cached best score from the database.
+    fn refresh_best_score(&mut self) {
+        self.cached_best_score = self
+            .db
             .query_row(
                 "SELECT COALESCE(MAX(best_fitness), -1.0) FROM node WHERE run_id = ?1",
                 params![self.run_id],
                 |row| row.get::<_, f64>(0),
             )
-            .unwrap_or(-1.0) as f32
+            .unwrap_or(-1.0) as f32;
     }
 
     /// Active island's spawn parent (for tree display).
@@ -166,6 +176,8 @@ impl Governor {
             gen_tick: 0,
             islands,
             active_island: 0,
+            cached_best_score: -1.0,
+            cached_tree_nodes: None,
         })
     }
 
@@ -204,7 +216,7 @@ impl Governor {
             })
             .collect();
 
-        Ok(Self {
+        let mut gov = Self {
             db,
             config,
             run_id,
@@ -213,7 +225,11 @@ impl Governor {
             gen_tick: 0,
             islands,
             active_island: 0,
-        })
+            cached_best_score: -1.0,
+            cached_tree_nodes: None,
+        };
+        gov.refresh_best_score();
+        Ok(gov)
     }
 
     /// Get the seed BrainConfig for the current node.
@@ -391,6 +407,7 @@ impl Governor {
                 .map(|f| f.config.clone())
                 .collect();
             island.attempts = 0;
+            self.refresh_best_score();
             let global_best = self.best_score();
             if gen_fit >= global_best {
                 messages.push(format!("[EVOLUTION] ★ New global best: {:.4}", gen_fit));
@@ -420,6 +437,8 @@ impl Governor {
 
         // Check completion after scoring but before breeding
         if self.evolution_complete() {
+            self.refresh_best_score();
+            self.cached_tree_nodes = None;
             self.persist_state();
             messages.push(format!(
                 "[EVOLUTION] Finished after {} generations",
@@ -481,6 +500,10 @@ impl Governor {
                 ));
             }
         }
+
+        // Invalidate caches after DB changes
+        self.refresh_best_score();
+        self.cached_tree_nodes = None;
 
         self.persist_state();
 
@@ -720,7 +743,18 @@ impl Governor {
     }
 
     /// Get the evolution tree as a list of nodes for UI visualization.
-    pub fn tree_nodes(&self) -> Vec<TreeNode> {
+    /// Returns a cached copy if the tree hasn't changed since last call.
+    pub fn tree_nodes(&mut self) -> Vec<TreeNode> {
+        if let Some(cached) = &self.cached_tree_nodes {
+            return cached.clone();
+        }
+        let nodes = self.tree_nodes_from_db();
+        self.cached_tree_nodes = Some(nodes.clone());
+        nodes
+    }
+
+    /// Fetch tree nodes directly from the database.
+    fn tree_nodes_from_db(&self) -> Vec<TreeNode> {
         let mut stmt = match self.db.prepare(
             "SELECT id, parent_id, generation, best_fitness, avg_fitness,
                     config_json, status

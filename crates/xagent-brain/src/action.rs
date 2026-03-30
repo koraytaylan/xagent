@@ -338,6 +338,11 @@ impl ActionSelector {
             let age = now.saturating_sub(rec.tick) as f32;
             let temporal = (-age * CREDIT_DECAY_RATE).exp();
 
+            // M2: Skip entries where temporal decay makes credit negligible
+            if temporal < 0.01 {
+                continue;
+            }
+
             // State-conditioned credit: modulate by cosine similarity between
             // the current (event-triggering) state and the recorded state.
             // This makes credit assignment context-dependent — only actions
@@ -442,18 +447,20 @@ impl ActionSelector {
     }
 
     fn best_action(&self, preferences: &[f32; NUM_ACTIONS]) -> usize {
-        // Find the max value, then randomly pick among tied actions.
-        // Without this, max_by returns the LAST tied index (action 7),
-        // creating a deterministic initial bias.
         let max_val = preferences.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut rng = rand::rng();
-        let tied: Vec<usize> = (0..NUM_ACTIONS)
-            .filter(|&a| (preferences[a] - max_val).abs() < 1e-6)
-            .collect();
-        if tied.is_empty() {
+        let mut tied = [0usize; NUM_ACTIONS];
+        let mut tied_count = 0;
+        for a in 0..NUM_ACTIONS {
+            if (preferences[a] - max_val).abs() < 1e-6 {
+                tied[tied_count] = a;
+                tied_count += 1;
+            }
+        }
+        if tied_count == 0 {
             0
         } else {
-            tied[rng.random_range(0..tied.len())]
+            tied[rng.random_range(0..tied_count)]
         }
     }
 

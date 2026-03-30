@@ -145,16 +145,20 @@ impl Brain {
         let mut scalar_error = 0.0_f32;
 
         if let Some(prev_prediction) = self.predictor.last_prediction() {
+            let prev_prediction = prev_prediction.clone();
             scalar_error = self.predictor.prediction_error(&prev_prediction, &encoded);
-            let error_vec = Predictor::prediction_error_vec(&prev_prediction, &encoded);
 
             let modulated_lr = self.config.learning_rate * (1.0 + homeo_state.gradient.abs());
 
             // Learn: update memory reinforcements
             self.memory.learn(&encoded, scalar_error, modulated_lr);
 
-            // Learn: update predictor weights via gradient descent
-            self.predictor.learn(&error_vec, prev_prediction.data(), modulated_lr);
+            // Compute error vector into scratch, then learn from it
+            // We use the static version to avoid borrow conflict with learn()
+            {
+                let error_vec = Predictor::prediction_error_vec(&prev_prediction, &encoded);
+                self.predictor.learn(&error_vec, prev_prediction.data(), modulated_lr);
+            }
 
             // Learn: adapt encoder weights
             self.encoder.adapt(scalar_error, modulated_lr);

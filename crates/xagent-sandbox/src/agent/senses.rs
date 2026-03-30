@@ -24,6 +24,29 @@ pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64, frame: &
     extract_senses_with_others(agent, world, tick, &[], frame)
 }
 
+/// Produce a sensory frame with awareness of other agents given as a
+/// shared positions slice. Skips agent at `self_index` automatically.
+pub fn extract_senses_with_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    tick: u64,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    frame: &mut SensoryFrame,
+) {
+    sample_vision_positions(agent, world, all_positions, self_index, &mut frame.vision);
+    frame.velocity = agent.body.velocity;
+    frame.facing = agent.body.facing;
+    frame.angular_velocity = agent.angular_velocity;
+    frame.energy_signal = agent.body.internal.energy_signal();
+    frame.integrity_signal = agent.body.internal.integrity_signal();
+    frame.energy_delta = agent.energy_delta();
+    frame.integrity_delta = agent.integrity_delta();
+    frame.touch_contacts.clear();
+    detect_touch_positions(agent, world, all_positions, self_index, &mut frame.touch_contacts);
+    frame.tick = tick;
+}
+
 /// Produce a sensory frame with awareness of other agents.
 /// Writes into `frame` to avoid heap allocation (reuses existing buffers).
 pub fn extract_senses_with_others(
@@ -228,5 +251,126 @@ fn detect_touch(agent: &AgentBody, world: &WorldState, contacts: &mut Vec<TouchC
             intensity: 0.5,
             surface_tag: TOUCH_HAZARD,
         });
+    }
+}
+
+// ── position-slice variants (C2: avoid Vec<OtherAgent> allocation) ──────
+
+/// Vision sampling using a shared positions slice.
+fn sample_vision_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    vf: &mut VisualField,
+) {
+    let w = vf.width;
+    let h = vf.height;
+    vf.clear();
+
+    let half_fov = (90.0_f32 / 2.0).to_radians();
+    let tan_hf = half_fov.tan();
+
+    let pos = agent.body.position;
+    let fwd = agent.body.facing;
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x).normalize_or_zero();
+
+    let max_dist: f32 = 50.0;
+    let step: f32 = 1.0;
+
+    for row in 0..h {
+        for col in 0..w {
+            let u = (col as f32 / (w - 1) as f32) * 2.0 - 1.0;
+            let v = (row as f32 / (h - 1) as f32) * 2.0 - 1.0;
+
+            let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
+
+            let (color, depth) = march_ray_positions(pos, ray, world, max_dist, step, all_positions, self_index);
+
+            let idx = (row * w + col) as usize;
+            let ci = idx * 4;
+            vf.color[ci] = color[0];
+            vf.color[ci + 1] = color[1];
+            vf.color[ci + 2] = color[2];
+            vf.color[ci + 3] = color[3];
+            vf.depth[idx] = depth / max_dist;
+        }
+    }
+}
+
+/// Ray marching using shared positions slice (skips self_index).
+fn march_ray_positions(
+    origin: Vec3,
+    dir: Vec3,
+    world: &WorldState,
+    max_dist: f32,
+    step: f32,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+) -> ([f32; 4], f32) {
+    let sky: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
+    let agent_color: [f32; 4] = [0.9, 0.2, 0.6, 1.0];
+    let agent_radius_sq: f32 = 1.5 * 1.5;
+
+    if dir.y > 0.3 {
+        let origin_h = world.terrain.height_at(origin.x, origin.z);
+        if origin.y > origin_h {
+            return (sky, max_dist);
+        }
+    }
+
+    let mut t = 0.0_f32;
+    while t < max_dist {
+        let p = origin + dir * t;
+
+        for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
+            if j == self_index || !alive {
+                continue;
+            }
+            let diff = p - *other_pos;
+            if diff.length_squared() < agent_radius_sq {
+                return (agent_color, t);
+            }
+        }
+
+        let gh = world.terrain.height_at(p.x, p.z);
+        if p.y <= gh {
+            let c = match world.biome_map.biome_at(p.x, p.z) {
+                BiomeType::FoodRich => [0.15, 0.50, 0.10, 1.0],
+                BiomeType::Barren => [0.50, 0.40, 0.20, 1.0],
+                BiomeType::Danger => [0.60, 0.20, 0.10, 1.0],
+            };
+            return (c, t);
+        }
+        t += step;
+    }
+    (sky, max_dist)
+}
+
+/// Touch detection using shared positions slice.
+fn detect_touch_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    contacts: &mut Vec<TouchContact>,
+) {
+    detect_touch(agent, world, contacts);
+
+    let agent_touch_range = 5.0;
+    let pos = agent.body.position;
+    for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
+        if j == self_index || !*alive {
+            continue;
+        }
+        let diff = *other_pos - pos;
+        let dist = diff.length();
+        if dist < agent_touch_range && dist > 0.01 {
+            contacts.push(TouchContact {
+                direction: diff.normalize_or_zero(),
+                intensity: 1.0 - (dist / agent_touch_range),
+                surface_tag: TOUCH_AGENT,
+            });
+        }
     }
 }

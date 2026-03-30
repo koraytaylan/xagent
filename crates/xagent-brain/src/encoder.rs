@@ -33,6 +33,10 @@ pub struct SensoryEncoder {
     feature_scratch: Vec<f32>,
     /// Reusable scratch buffer for encoded output.
     encode_scratch: Vec<f32>,
+    /// Accumulated weight scale factor for deferred L2 decay.
+    pending_scale: f32,
+    /// Number of adapt() calls since last materialization.
+    adapt_count: u32,
 }
 
 /// Maximum representation dimensionality. Sized for stack allocation.
@@ -106,6 +110,8 @@ impl SensoryEncoder {
             biases,
             feature_scratch: vec![0.0; feature_count],
             encode_scratch: vec![0.0; representation_dim],
+            pending_scale: 1.0,
+            adapt_count: 0,
         }
     }
 
@@ -113,15 +119,14 @@ impl SensoryEncoder {
     pub fn encode(&mut self, frame: &SensoryFrame) -> EncodedState {
         self.extract_features_into(frame);
 
-        // Project features through weights into representation space
-        // Weights stored row-major [repr_dim × feature_count] for contiguous inner-loop access
+        let scale = self.pending_scale;
         for i in 0..self.representation_dim {
             let mut sum = self.biases[i];
             let row_base = i * self.feature_count;
             for j in 0..self.feature_count {
                 sum += self.feature_scratch[j] * self.weights[row_base + j];
             }
-            self.encode_scratch[i] = crate::fast_tanh(sum);
+            self.encode_scratch[i] = crate::fast_tanh(sum * scale);
         }
 
         EncodedState::from_slice(&self.encode_scratch[..self.representation_dim])
@@ -134,7 +139,9 @@ impl SensoryEncoder {
     }
 
     /// Encoder weights, row-major \[representation_dim × feature_count\].
-    pub fn weights(&self) -> &[f32] {
+    /// Materializes any pending scale factor before returning.
+    pub fn weights(&mut self) -> &[f32] {
+        self.materialize_scale();
         &self.weights
     }
 
@@ -155,13 +162,30 @@ impl SensoryEncoder {
 
     /// Adapt encoding weights using Hebbian-inspired L2 regularization.
     ///
-    /// Instead of trying to backprop through the predictor (which is too
-    /// indirect), we apply slight regularization to keep weights bounded.
+    /// Instead of multiplying every weight each tick, we accumulate a scalar
+    /// scale factor and materialize it every 32 ticks. The encode() path
+    /// applies the pending scale on-the-fly during the dot product.
     pub fn adapt(&mut self, _error: f32, learning_rate: f32) {
-        for w in &mut self.weights {
-            *w *= 1.0 - (learning_rate * L2_REGULARIZATION_FACTOR);
-            *w = w.clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);
+        self.pending_scale *= 1.0 - (learning_rate * L2_REGULARIZATION_FACTOR);
+        self.adapt_count += 1;
+
+        // Materialize every 32 ticks to prevent floating-point underflow
+        if self.adapt_count >= 32 {
+            self.materialize_scale();
         }
+    }
+
+    /// Apply the accumulated scale factor to all weights and reset.
+    fn materialize_scale(&mut self) {
+        if (self.pending_scale - 1.0).abs() > 1e-10 {
+            let s = self.pending_scale;
+            for w in &mut self.weights {
+                *w *= s;
+                *w = w.clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);
+            }
+            self.pending_scale = 1.0;
+        }
+        self.adapt_count = 0;
     }
 
     /// Extract features from raw sensory data into the scratch buffer.
@@ -278,7 +302,10 @@ mod tests {
         let mut enc = SensoryEncoder::new(8, 4);
         let weights_before: Vec<f32> = enc.weights.clone();
         let _ = enc.encode(&make_frame(0.5, 0.5));
-        enc.adapt(0.5, 0.1);
+        // Call adapt enough times to trigger materialization
+        for _ in 0..32 {
+            enc.adapt(0.5, 0.1);
+        }
         assert_ne!(enc.weights, weights_before, "Weights should change after adapt");
     }
 

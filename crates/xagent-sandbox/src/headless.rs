@@ -11,7 +11,6 @@ use rand::Rng;
 use rayon::prelude::*;
 use xagent_shared::{BrainConfig, FullConfig};
 
-use crate::agent::senses::OtherAgent;
 use crate::agent::{mutate_config, senses, Agent, AgentBody};
 use crate::governor::{AdvanceResult, Governor};
 use crate::world::WorldState;
@@ -93,17 +92,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                     if !agent.body.body.alive {
                         return;
                     }
-                    let others: Vec<OtherAgent> = pos
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != i)
-                        .map(|(_, (p, alive))| OtherAgent {
-                            position: *p,
-                            alive: *alive,
-                        })
-                        .collect();
-                    senses::extract_senses_with_others(
-                        &agent.body, world_ref, tick, &others,
+                    senses::extract_senses_with_positions(
+                        &agent.body, world_ref, tick, pos, i,
                         &mut agent.cached_frame,
                     );
                     agent.cached_motor = agent.brain.tick(&agent.cached_frame);
@@ -188,7 +178,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
 
 /// Print evolution tree from database and exit.
 pub fn dump_tree(db_path: &str) {
-    let gov = match Governor::resume(db_path) {
+    let mut gov = match Governor::resume(db_path) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Failed to open database '{}': {}", db_path, e);

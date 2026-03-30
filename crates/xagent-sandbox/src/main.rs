@@ -15,7 +15,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, SensoryFrame, WorldConfig};
 
-use xagent_sandbox::agent::senses::OtherAgent;
 use xagent_sandbox::agent::{
     mutate_config, senses, Agent, AgentBody, MAX_AGENTS,
 };
@@ -269,6 +268,7 @@ struct App {
     // Heatmap overlay
     heatmap_enabled: bool,
     heatmap_gpu: Option<GpuMesh>,
+    heatmap_dirty: bool,
 
     // Trail overlay for selected agent
     trail_gpu: Option<GpuMesh>,
@@ -351,7 +351,7 @@ impl App {
                 evo_snapshot.num_islands = prev_gov.num_islands;
                 evo_snapshot.migration_interval = prev_gov.migration_interval;
                 // Also load tree/fitness from DB for the summary view
-                if let Ok(gov) = Governor::resume(db_path) {
+                if let Ok(mut gov) = Governor::resume(db_path) {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
                     evo_snapshot.current_node_id = gov.current_node_id;
                     evo_snapshot.fitness_history = gov.fitness_history();
@@ -400,6 +400,7 @@ impl App {
             cursor_pos: (0.0, 0.0),
             heatmap_enabled: false,
             heatmap_gpu: None,
+            heatmap_dirty: false,
             trail_gpu: None,
             marker_gpu: None,
             egui: None,
@@ -1004,6 +1005,7 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
+                        self.heatmap_dirty = true;
                         println!(
                             "[SIM] Heatmap: {}",
                             if self.heatmap_enabled { "ON" } else { "OFF" }
@@ -1208,21 +1210,12 @@ impl ApplicationHandler for App {
                                                 return;
                                             }
 
-                                            let others: Vec<OtherAgent> = all_pos
-                                                .iter()
-                                                .enumerate()
-                                                .filter(|(j, _)| *j != i)
-                                                .map(|(_, (pos, alive))| OtherAgent {
-                                                    position: *pos,
-                                                    alive: *alive,
-                                                })
-                                                .collect();
-
-                                            senses::extract_senses_with_others(
+                                            senses::extract_senses_with_positions(
                                                 &agent.body,
                                                 world_ref,
                                                 tick,
-                                                &others,
+                                                all_pos,
+                                                i,
                                                 &mut agent.cached_frame,
                                             );
 
@@ -1302,6 +1295,7 @@ impl ApplicationHandler for App {
                             if respawned {
                                 self.food_dirty = true;
                             }
+                            self.heatmap_dirty = true;
 
                             // Handle death/respawn
                             let mut event_msgs: Vec<String> = Vec::new();
@@ -1407,17 +1401,8 @@ impl ApplicationHandler for App {
                                         if !agent.body.body.alive {
                                             return None;
                                         }
-                                        let others: Vec<OtherAgent> = all_pos
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(j, _)| *j != i)
-                                            .map(|(_, (pos, a))| OtherAgent {
-                                                position: *pos,
-                                                alive: *a,
-                                            })
-                                            .collect();
-                                        senses::extract_senses_with_others(
-                                            &agent.body, world_ref, tick, &others,
+                                        senses::extract_senses_with_positions(
+                                            &agent.body, world_ref, tick, all_pos, i,
                                             &mut agent.cached_frame,
                                         );
                                         let feats = agent.brain.encoder
@@ -1425,6 +1410,8 @@ impl ApplicationHandler for App {
                                         let weights = agent.brain.encoder.weights().to_vec();
                                         let biases = agent.brain.encoder.biases().to_vec();
                                         let (pats, mask) = agent.brain.memory.gpu_pattern_data();
+                                        let pats = pats.to_vec();
+                                        let mask = mask.to_vec();
                                         Some(AgentGpuSlice {
                                             feats, weights, biases, pats, mask,
                                             agent_dim: agent.brain.config.representation_dim,
@@ -1513,7 +1500,7 @@ impl ApplicationHandler for App {
                 }
 
                 // ── rebuild heatmap overlay ─────────────────────────
-                if self.heatmap_enabled {
+                if self.heatmap_enabled && self.heatmap_dirty {
                     if let (Some(renderer), Some(world), Some(heatmap_gpu)) =
                         (&self.renderer, &self.world, &mut self.heatmap_gpu)
                     {
@@ -1526,8 +1513,11 @@ impl ApplicationHandler for App {
                             heatmap_gpu.update_from_mesh(&renderer.queue, &mesh);
                         }
                     }
-                } else if let Some(heatmap_gpu) = &mut self.heatmap_gpu {
-                    heatmap_gpu.num_indices = 0;
+                    self.heatmap_dirty = false;
+                } else if !self.heatmap_enabled {
+                    if let Some(heatmap_gpu) = &mut self.heatmap_gpu {
+                        heatmap_gpu.num_indices = 0;
+                    }
                 }
 
                 // ── rebuild trail overlay for selected agent (only when changed) ──
@@ -1805,7 +1795,7 @@ impl ApplicationHandler for App {
                                 }).collect();
 
                                 // Build evolution snapshot for the UI
-                                if let Some(gov) = &self.governor {
+                                if let Some(gov) = &mut self.governor {
                                     self.evo_snapshot.gen_tick = gov.gen_tick;
                                     self.evo_snapshot.generation = gov.generation;
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();

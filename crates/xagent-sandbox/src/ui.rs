@@ -1079,71 +1079,135 @@ impl<'a> TabContext<'a> {
         nodes: &[crate::governor::TreeNode],
         current_id: Option<i64>,
     ) {
-        // Build depth map from parent-child relationships
-        let mut depth_map: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-        for node in nodes {
-            let depth = match node.parent_id {
-                Some(pid) => depth_map.get(&pid).copied().unwrap_or(0) + 1,
-                None => 0,
-            };
-            depth_map.insert(node.id, depth);
+        if nodes.is_empty() {
+            return;
         }
 
+        // Build children map: parent_id → list of child nodes
+        let mut children_map: std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>> =
+            std::collections::HashMap::new();
         for node in nodes {
-            let depth = depth_map.get(&node.id).copied().unwrap_or(0);
-            let indent = "  ".repeat(depth);
-            let fitness_str = node
-                .best_fitness
-                .map(|f| format!("{:.4}", f))
-                .unwrap_or_else(|| "—".into());
+            children_map.entry(node.parent_id).or_default().push(node);
+        }
 
-            let mutation_str = if node.mutations.is_empty() {
-                String::new()
-            } else {
-                let parts: Vec<String> = node
-                    .mutations
-                    .iter()
-                    .map(|(p, d)| {
-                        let short = match p.as_str() {
-                            "memory_capacity" => "mem",
-                            "processing_slots" => "slots",
-                            "representation_dim" => "repr",
-                            "learning_rate" => "lr",
-                            "decay_rate" => "decay",
-                            other => other,
-                        };
-                        format!("{}{}", short, if *d > 0.0 { "↑" } else { "↓" })
-                    })
-                    .collect();
-                format!(" ({})", parts.join(" "))
-            };
+        // Find path from current node to root for default expansion
+        let mut expanded_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if let Some(current) = current_id {
+            let node_map: std::collections::HashMap<i64, &crate::governor::TreeNode> =
+                nodes.iter().map(|n| (n.id, n)).collect();
+            let mut id = Some(current);
+            while let Some(nid) = id {
+                expanded_ids.insert(nid);
+                id = node_map.get(&nid).and_then(|n| n.parent_id);
+            }
+        }
 
-            let is_current = Some(node.id) == current_id;
-            let text = format!(
-                "{}Gen {} [{}] fit={}{}",
-                indent, node.generation, node.id, fitness_str, mutation_str,
-            );
+        // Render from root nodes (parent_id = None)
+        if let Some(roots) = children_map.get(&None) {
+            for root in roots {
+                Self::render_tree_node(ui, root, &children_map, &expanded_ids, current_id);
+            }
+        }
+    }
 
-            let color = match node.status.as_str() {
-                "failed" => egui::Color32::from_rgb(180, 60, 60),
-                "exhausted" => egui::Color32::GRAY,
-                "successful" => egui::Color32::from_rgb(100, 200, 100),
-                _ if is_current => egui::Color32::from_rgb(80, 220, 120),
-                _ => egui::Color32::from_gray(180),
-            };
+    fn render_tree_node(
+        ui: &mut egui::Ui,
+        node: &crate::governor::TreeNode,
+        children_map: &std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>>,
+        expanded_ids: &std::collections::HashSet<i64>,
+        current_id: Option<i64>,
+    ) {
+        let has_children = children_map.get(&Some(node.id)).map_or(false, |c| !c.is_empty());
+        let is_current = Some(node.id) == current_id;
+        let is_on_path = expanded_ids.contains(&node.id);
 
-            ui.horizontal(|ui| {
-                if is_current {
-                    ui.label(egui::RichText::new("★").color(egui::Color32::GOLD));
-                }
-                ui.label(egui::RichText::new(&text).color(color).monospace());
-                match node.status.as_str() {
-                    "failed" => { ui.label(egui::RichText::new("✗").small()); }
-                    "exhausted" => { ui.label(egui::RichText::new("⊘").small()); }
-                    "successful" => { ui.label(egui::RichText::new("✓").small()); }
-                    _ => {}
+        let label = Self::format_tree_label(node, is_current);
+        let color = match node.status.as_str() {
+            "failed" => egui::Color32::from_rgb(180, 60, 60),
+            "exhausted" => egui::Color32::GRAY,
+            "successful" => egui::Color32::from_rgb(100, 200, 100),
+            _ if is_current => egui::Color32::from_rgb(80, 220, 120),
+            _ => egui::Color32::from_gray(180),
+        };
+
+        if has_children {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(&label).color(color).monospace().size(11.0),
+            )
+            .id_salt(node.id)
+            .default_open(is_on_path)
+            .show(ui, |ui| {
+                if let Some(children) = children_map.get(&Some(node.id)) {
+                    for child in children {
+                        Self::render_tree_node(ui, child, children_map, expanded_ids, current_id);
+                    }
                 }
             });
+        } else {
+            // Leaf node — label with small indent to align with collapsible siblings
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.label(egui::RichText::new(&label).color(color).monospace().size(11.0));
+            });
         }
+    }
+
+    fn format_tree_label(node: &crate::governor::TreeNode, is_current: bool) -> String {
+        let fitness_str = node
+            .best_fitness
+            .map(|f| format!("{:.4}", f))
+            .unwrap_or_else(|| "—".into());
+
+        let mutation_str = if node.mutations.is_empty() {
+            String::new()
+        } else if let Some(config) = &node.config {
+            let parts: Vec<String> = node
+                .mutations
+                .iter()
+                .map(|(p, d)| {
+                    let arrow = if *d > 0.0 { "↑" } else { "↓" };
+                    match p.as_str() {
+                        "memory_capacity" => format!("mem{}{}", arrow, config.memory_capacity),
+                        "processing_slots" => format!("slots{}{}", arrow, config.processing_slots),
+                        "representation_dim" => format!("repr{}{}", arrow, config.representation_dim),
+                        "learning_rate" => format!("lr{}{:.4}", arrow, config.learning_rate),
+                        "decay_rate" => format!("decay{}{:.4}", arrow, config.decay_rate),
+                        other => format!("{}{}", other, arrow),
+                    }
+                })
+                .collect();
+            format!(" ({})", parts.join(" "))
+        } else {
+            let parts: Vec<String> = node
+                .mutations
+                .iter()
+                .map(|(p, d)| {
+                    let short = match p.as_str() {
+                        "memory_capacity" => "mem",
+                        "processing_slots" => "slots",
+                        "representation_dim" => "repr",
+                        "learning_rate" => "lr",
+                        "decay_rate" => "decay",
+                        other => other,
+                    };
+                    format!("{}{}", short, if *d > 0.0 { "↑" } else { "↓" })
+                })
+                .collect();
+            format!(" ({})", parts.join(" "))
+        };
+
+        let status_icon = match node.status.as_str() {
+            "failed" => " ✗",
+            "exhausted" => " ⊘",
+            "successful" => " ✓",
+            _ => "",
+        };
+
+        let current_marker = if is_current { "★ " } else { "" };
+
+        format!(
+            "{}Gen {} fit={}{}{}",
+            current_marker, node.generation, fitness_str, mutation_str, status_icon,
+        )
     }
 }

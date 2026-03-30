@@ -1156,9 +1156,20 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // ── Frame time budget: never block UI longer than this ──
+                    const TICK_BUDGET_MS: u128 = 12;
+                    let tick_start = Instant::now();
+
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
                         ticks_run += 1;
+
+                        // Yield to UI every 16 ticks to maintain responsiveness
+                        if ticks_run % 16 == 0
+                            && tick_start.elapsed().as_millis() >= TICK_BUDGET_MS
+                        {
+                            break;
+                        }
 
                         if let Some(world) = &mut self.world {
                             // ── Phase 1: Snapshot positions (sequential) ──
@@ -1471,8 +1482,10 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Clamp accumulator to prevent unbounded buildup
-                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * 3.0);
+                    // Clamp accumulator: allow up to max_ticks worth of
+                    // carry-over so the time budget can spread ticks across
+                    // multiple frames, but never accumulate more than that.
+                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
 
                     // Mark HUD dirty if any ticks ran this frame
                     if ticks_run > 0 {

@@ -7,6 +7,8 @@
 pub mod agent;
 pub mod governor;
 pub mod gpu_compute;
+pub mod headless;
+pub mod overlay;
 pub mod physics;
 pub mod recording;
 pub mod renderer;

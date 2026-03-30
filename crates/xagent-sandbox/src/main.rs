@@ -26,6 +26,8 @@ use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::gpu_compute::GpuBrainCompute;
+use xagent_sandbox::headless;
+use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, Tab,
     TabContext,
@@ -1516,7 +1518,7 @@ impl ApplicationHandler for App {
                         (&self.renderer, &self.world, &mut self.heatmap_gpu)
                     {
                         if let Some(agent) = self.agents.get(self.selected_agent_idx) {
-                            let mesh = build_heatmap_mesh(
+                            let mesh = overlay::build_heatmap_mesh(
                                 &agent.heatmap,
                                 world.config.world_size,
                                 &world.terrain,
@@ -1535,7 +1537,7 @@ impl ApplicationHandler for App {
                     if let Some(agent) = self.agents.get_mut(self.selected_agent_idx) {
                         if agent.trail_dirty {
                             if agent.trail.len() > 1 && agent.body.body.alive {
-                                let mesh = build_trail_mesh(
+                                let mesh = overlay::build_trail_mesh(
                                     &agent.trail,
                                     &agent.color,
                                 );
@@ -1556,7 +1558,7 @@ impl ApplicationHandler for App {
                 {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         if agent.body.body.alive {
-                            let mesh = build_marker_mesh(agent.body.body.position);
+                            let mesh = overlay::build_marker_mesh(agent.body.body.position);
                             marker_gpu.update_from_mesh(&renderer.queue, &mesh);
                         } else {
                             marker_gpu.num_indices = 0;
@@ -2143,186 +2145,6 @@ impl ApplicationHandler for App {
 
 // ── Free functions to avoid borrow conflicts ───────────────────────────
 
-/// Build a flat-quad mesh showing the selected agent's position heatmap.
-/// Each non-zero cell becomes a colored quad slightly above the terrain.
-fn build_heatmap_mesh(
-    heatmap: &[u32],
-    world_size: f32,
-    terrain: &xagent_sandbox::world::terrain::TerrainData,
-) -> xagent_sandbox::world::Mesh {
-    use xagent_sandbox::agent::HEATMAP_RES;
-    use xagent_sandbox::renderer::Vertex;
-
-    let max_count = heatmap.iter().copied().max().unwrap_or(1).max(1) as f32;
-    let half = world_size / 2.0;
-    let cell = world_size / HEATMAP_RES as f32;
-    let mut vertices = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    for cz in 0..HEATMAP_RES {
-        for cx in 0..HEATMAP_RES {
-            let count = heatmap[cz * HEATMAP_RES + cx];
-            if count == 0 {
-                continue;
-            }
-            let t = (count as f32 / max_count).clamp(0.0, 1.0);
-            // blue → yellow → red
-            let color = if t < 0.5 {
-                let s = t * 2.0;
-                [s, s, 1.0 - s]
-            } else {
-                let s = (t - 0.5) * 2.0;
-                [1.0, 1.0 - s, 0.0]
-            };
-
-            let x0 = -half + cx as f32 * cell;
-            let z0 = -half + cz as f32 * cell;
-            let xm = x0 + cell * 0.5;
-            let zm = z0 + cell * 0.5;
-            let y = terrain.height_at(xm, zm) + 0.5;
-
-            let base = vertices.len() as u32;
-            vertices.push(Vertex { position: [x0, y, z0], color });
-            vertices.push(Vertex { position: [x0 + cell, y, z0], color });
-            vertices.push(Vertex { position: [x0 + cell, y, z0 + cell], color });
-            vertices.push(Vertex { position: [x0, y, z0 + cell], color });
-            // CCW winding from above (normal pointing +Y)
-            indices.extend_from_slice(&[
-                base, base + 2, base + 1,
-                base, base + 3, base + 2,
-            ]);
-        }
-    }
-
-    xagent_sandbox::world::Mesh { vertices, indices }
-}
-
-/// Build a linear ribbon trail from the agent's distance-sampled control points.
-/// No spline interpolation — the 3-unit sampling distance is dense enough for
-/// visually smooth curves while keeping CPU cost negligible.
-/// Only rebuilt when the trail dirty flag is set.
-fn build_trail_mesh(
-    points: &[[f32; 3]],
-    agent_color: &[f32; 3],
-) -> xagent_sandbox::world::Mesh {
-    use xagent_sandbox::renderer::Vertex;
-
-    let n = points.len();
-    if n < 2 {
-        return xagent_sandbox::world::Mesh {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-        };
-    }
-
-    let num_segments = n - 1;
-    let mut vertices = Vec::with_capacity(num_segments * 4);
-    let mut indices: Vec<u32> = Vec::with_capacity(num_segments * 6);
-
-    let ribbon_half_width: f32 = 0.3;
-    let y_offset: f32 = 0.3;
-
-    for i in 0..num_segments {
-        let a = points[i];
-        let b = points[i + 1];
-
-        // Gentle fade: oldest 20% fades from 0.3→0.7, rest is 0.7
-        let progress = i as f32 / num_segments as f32;
-        let brightness = if progress < 0.2 {
-            0.3 + (progress / 0.2) * 0.4
-        } else {
-            0.7
-        };
-        let color = [
-            agent_color[0] * brightness,
-            agent_color[1] * brightness,
-            agent_color[2] * brightness,
-        ];
-
-        // Perpendicular in XZ plane for ribbon width
-        let dx = b[0] - a[0];
-        let dz = b[2] - a[2];
-        let len = (dx * dx + dz * dz).sqrt().max(0.001);
-        let px = -dz / len * ribbon_half_width;
-        let pz = dx / len * ribbon_half_width;
-
-        let base = vertices.len() as u32;
-        vertices.push(Vertex {
-            position: [a[0] + px, a[1] + y_offset, a[2] + pz],
-            color,
-        });
-        vertices.push(Vertex {
-            position: [a[0] - px, a[1] + y_offset, a[2] - pz],
-            color,
-        });
-        vertices.push(Vertex {
-            position: [b[0] - px, b[1] + y_offset, b[2] - pz],
-            color,
-        });
-        vertices.push(Vertex {
-            position: [b[0] + px, b[1] + y_offset, b[2] + pz],
-            color,
-        });
-
-        indices.extend_from_slice(&[
-            base, base + 2, base + 1,
-            base, base + 3, base + 2,
-        ]);
-    }
-
-    xagent_sandbox::world::Mesh { vertices, indices }
-}
-
-/// Build a small diamond marker hovering above the given position.
-fn build_marker_mesh(position: glam::Vec3) -> xagent_sandbox::world::Mesh {
-    use xagent_sandbox::renderer::Vertex;
-
-    let cx = position.x;
-    let cy = position.y + 5.0; // float above agent
-    let cz = position.z;
-    let r: f32 = 1.2; // diamond radius
-    let h: f32 = 1.8; // diamond height (top to bottom)
-    let color = [1.0, 1.0, 0.2]; // bright yellow
-
-    // Diamond: 4 equatorial points + top + bottom
-    let top = [cx, cy + h * 0.5, cz];
-    let bot = [cx, cy - h * 0.5, cz];
-    let n = [cx, cy, cz - r]; // north
-    let s = [cx, cy, cz + r]; // south
-    let e = [cx + r, cy, cz];
-    let w = [cx - r, cy, cz];
-
-    let shade_top = [color[0], color[1], color[2]];
-    let shade_side = [color[0] * 0.75, color[1] * 0.75, color[2] * 0.75];
-    let shade_bot = [color[0] * 0.5, color[1] * 0.5, color[2] * 0.5];
-
-    // 8 triangular faces (4 upper, 4 lower)
-    let mut vertices = Vec::with_capacity(24);
-    let mut indices: Vec<u32> = Vec::with_capacity(24);
-
-    // Upper faces
-    let upper_faces = [(n, e), (e, s), (s, w), (w, n)];
-    for (a, b) in &upper_faces {
-        let base = vertices.len() as u32;
-        vertices.push(Vertex { position: top, color: shade_top });
-        vertices.push(Vertex { position: *a, color: shade_side });
-        vertices.push(Vertex { position: *b, color: shade_side });
-        indices.extend_from_slice(&[base, base + 1, base + 2]);
-    }
-
-    // Lower faces
-    let lower_faces = [(e, n), (s, e), (w, s), (n, w)];
-    for (a, b) in &lower_faces {
-        let base = vertices.len() as u32;
-        vertices.push(Vertex { position: bot, color: shade_bot });
-        vertices.push(Vertex { position: *a, color: shade_side });
-        vertices.push(Vertex { position: *b, color: shade_side });
-        indices.extend_from_slice(&[base, base + 1, base + 2]);
-    }
-
-    xagent_sandbox::world::Mesh { vertices, indices }
-}
-
 fn log_tick_to_csv(
     logger: &mut Option<MetricsLogger>,
     agent: &Agent,
@@ -2354,235 +2176,6 @@ fn log_tick_to_csv(
     }
 }
 
-// ── Headless evolution loop ─────────────────────────────────────────────
-
-fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain: bool) {
-    use xagent_sandbox::governor::{AdvanceResult, Governor};
-
-    info!("Running headless evolution");
-    let dt = 1.0 / config.world.tick_rate;
-    let world_json = serde_json::to_string(&config.world).unwrap_or_default();
-    let start_time = Instant::now();
-
-    let mut governor = if resume {
-        println!("Resuming from {}", db_path);
-        Governor::resume(db_path).expect("Failed to resume from database")
-    } else {
-        Governor::new(db_path, config.governor.clone(), &config.brain, &world_json)
-            .expect("Failed to initialize governor database")
-    };
-
-    let seed_config = governor.current_config().unwrap_or(config.brain.clone());
-    println!(
-        "Population: {} | Tick budget: {} | Elitism: {} | Patience: {}",
-        governor.config.population_size,
-        governor.config.tick_budget,
-        governor.config.elitism_count,
-        governor.config.patience,
-    );
-
-    let mut current_configs: Vec<BrainConfig> =
-        (0..governor.config.population_size)
-            .map(|i| {
-                if i == 0 {
-                    seed_config.clone()
-                } else {
-                    mutate_config(&seed_config)
-                }
-            })
-            .collect();
-
-    loop {
-        if governor.evolution_complete() {
-            println!("\n✓ Evolution complete after {} generations", governor.generation);
-            break;
-        }
-
-        // Initialize world and agents for this generation
-        let mut world = WorldState::new(config.world.clone());
-        let mut agents: Vec<Agent> = current_configs
-            .iter()
-            .enumerate()
-            .map(|(i, cfg)| {
-                let mut rng = rand::rng();
-                let half = world.config.world_size / 2.0 - 5.0;
-                let x: f32 = rng.random_range(-half..half);
-                let z: f32 = rng.random_range(-half..half);
-                let y = world.terrain.height_at(x, z) + 1.0;
-                Agent::new(i as u32, Vec3::new(x, y, z), cfg.clone(), 0)
-            })
-            .collect();
-
-        governor.gen_tick = 0;
-
-        // Run generation
-        let gen_start = Instant::now();
-        let mut tick: u64 = 0;
-
-        while !governor.generation_complete() {
-            // Build other-agents list for sensory extraction
-            let positions: Vec<(Vec3, bool)> = agents
-                .iter()
-                .map(|a| (a.body.body.position, a.body.body.alive))
-                .collect();
-
-            // ── Brain ticks (CPU rayon — faster than GPU for small populations) ──
-            {
-                let world_ref: &WorldState = &world;
-                let pos = &positions;
-                agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
-                    if !agent.body.body.alive {
-                        return;
-                    }
-                    let others: Vec<OtherAgent> = pos
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != i)
-                        .map(|(_, (p, alive))| OtherAgent {
-                            position: *p,
-                            alive: *alive,
-                        })
-                        .collect();
-                    senses::extract_senses_with_others(
-                        &agent.body, world_ref, tick, &others,
-                        &mut agent.cached_frame,
-                    );
-                    agent.cached_motor = agent.brain.tick(&agent.cached_frame);
-                });
-            }
-
-            // ── Sequential physics + respawn (mutates world) ──
-            for i in 0..agents.len() {
-                let agent = &mut agents[i];
-                if agent.body.body.alive {
-                    let motor = agent.cached_motor.clone();
-                    let consumed = xagent_sandbox::physics::step(
-                        &mut agent.body, &motor, &mut world, dt,
-                    );
-                    if consumed {
-                        agent.food_consumed += 1;
-                    }
-                    agent.total_ticks_alive += 1;
-                    agent.record_heatmap(world.config.world_size);
-                } else {
-                    // Respawn: death trauma + learning signal, keep memories
-                    let mut rng = rand::rng();
-                    let half = world.config.world_size / 2.0 - 5.0;
-                    let x: f32 = rng.random_range(-half..half);
-                    let z: f32 = rng.random_range(-half..half);
-                    let y = world.terrain.height_at(x, z) + 1.0;
-                    agent.body = AgentBody::new(Vec3::new(x, y, z));
-                    agent.brain.death_signal();
-                    agent.brain.trauma(0.5);
-                    agent.death_count += 1;
-                    agent.life_start_tick = tick;
-                }
-            }
-
-            world.update(dt);
-            tick += 1;
-            governor.tick();
-
-            // Progress indicator every 10% of budget
-            if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
-                let pct = (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
-                print!("\rGen {} [{:>3}%]", governor.generation, pct);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-        }
-
-        println!(); // newline after progress
-
-        let gen_elapsed = gen_start.elapsed();
-
-        // Evaluate
-        let fitness = governor.evaluate(&agents);
-        governor.log_generation(&fitness);
-        println!(
-            "  Time: {:.1}s | {:.0} ticks/sec",
-            gen_elapsed.as_secs_f64(),
-            governor.config.tick_budget as f64 / gen_elapsed.as_secs_f64(),
-        );
-
-        // Update wall time
-        governor.update_wall_time(start_time.elapsed().as_secs_f64());
-
-        // Advance
-        match governor.advance(&fitness) {
-            AdvanceResult::Continue { configs, messages } => {
-                for msg in &messages {
-                    println!("{}", msg);
-                }
-                current_configs = configs;
-            }
-            AdvanceResult::Finished { messages } => {
-                for msg in &messages {
-                    println!("{}", msg);
-                }
-                break;
-            }
-        }
-    }
-
-    let total_time = start_time.elapsed();
-    println!(
-        "\nTotal wall time: {:.1}s | {} generations",
-        total_time.as_secs_f64(),
-        governor.generation,
-    );
-}
-
-/// Print evolution tree from database and exit.
-fn dump_tree(db_path: &str) {
-    use xagent_sandbox::governor::Governor;
-
-    let gov = match Governor::resume(db_path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Failed to open database '{}': {}", db_path, e);
-            std::process::exit(1);
-        }
-    };
-
-    let nodes = gov.tree_nodes();
-    if nodes.is_empty() {
-        println!("No evolution nodes found in {}", db_path);
-        return;
-    }
-
-    println!("Evolution Tree ({} nodes):", nodes.len());
-    println!("─────────────────────────────────────────────");
-    for node in &nodes {
-        let indent = "  ".repeat(node.generation as usize);
-        let fitness_str = node
-            .best_fitness
-            .map(|f| format!("{:.4}", f))
-            .unwrap_or_else(|| "—".into());
-        let mutation_str = if node.mutations.is_empty() {
-            String::new()
-        } else {
-            let parts: Vec<String> = node
-                .mutations
-                .iter()
-                .map(|(p, d)| format!("{}{}", p, if *d > 0.0 { "↑" } else { "↓" }))
-                .collect();
-            format!(" ({})", parts.join(" "))
-        };
-        let status_marker = match node.status.as_str() {
-            "failed" => " ✗",
-            "exhausted" => " ⊘",
-            "successful" => " ✓",
-            "active" if Some(node.id) == gov.current_node_id => " ★",
-            _ => "",
-        };
-        println!(
-            "{}Gen {:>3} [{}] fitness={}{}{} ",
-            indent, node.generation, node.id, fitness_str, mutation_str, status_marker,
-        );
-    }
-}
-
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -2605,14 +2198,14 @@ fn main() {
     }
 
     if cli.dump_tree {
-        dump_tree(&cli.db);
+        headless::dump_tree(&cli.db);
         return;
     }
 
     print_config(&config);
 
     if cli.no_render {
-        run_headless(config, &cli.db, cli.resume, cli.gpu_brain);
+        headless::run_headless(config, &cli.db, cli.resume, cli.gpu_brain);
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let mut app = App::new(

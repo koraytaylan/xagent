@@ -297,6 +297,9 @@ struct App {
     // so collect() can apply results with the matching frames.
     gpu_prev_frames: Vec<Option<SensoryFrame>>,
     gpu_prev_agent_dims: Vec<(usize, usize)>,
+    // Pre-allocated output buffers for GPU collect (avoid per-frame allocation)
+    gpu_encoded_out: Vec<f32>,
+    gpu_similarities_out: Vec<f32>,
     // Reusable batch buffers for GPU submit (avoid per-frame allocation)
     gpu_batch_features: Vec<f32>,
     gpu_batch_weights: Vec<f32>,
@@ -414,6 +417,8 @@ impl App {
             gpu_compute: None,
             gpu_prev_frames: Vec::new(),
             gpu_prev_agent_dims: Vec::new(),
+            gpu_encoded_out: Vec::new(),
+            gpu_similarities_out: Vec::new(),
             gpu_batch_features: Vec::new(),
             gpu_batch_weights: Vec::new(),
             gpu_batch_biases: Vec::new(),
@@ -1135,20 +1140,23 @@ impl ApplicationHandler for App {
                     let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
 
                     // ── GPU COLLECT: always drain in-flight results ──
-                    // try_collect() unmaps staging buffers even if we don't
+                    // try_collect_into() unmaps staging buffers even if we don't
                     // apply the results, preventing stale buffer buildup.
                     // Only apply brain results when GPU is the active path
                     // this frame — avoids a spurious double brain tick on
                     // GPU→CPU transitions.
-                    if let Some(gpu) = self.gpu_compute.as_mut() {
-                        if let Some((encoded, similarities)) = gpu.try_collect() {
-                            if use_gpu {
+                    {
+                        let gpu_opt = &mut self.gpu_compute;
+                        let enc_out = &mut self.gpu_encoded_out;
+                        let sim_out = &mut self.gpu_similarities_out;
+                        if let Some(gpu) = gpu_opt.as_mut() {
+                            if gpu.try_collect_into(enc_out, sim_out) && use_gpu {
                                 for (i, agent) in self.agents.iter_mut().enumerate() {
                                     if i < self.gpu_prev_frames.len() {
                                         if let Some(frame) = &self.gpu_prev_frames[i] {
                                             let (a_dim, a_cap) = self.gpu_prev_agent_dims[i];
-                                            let enc = &encoded[i * gpu_dim..i * gpu_dim + a_dim];
-                                            let sim = &similarities[i * gpu_cap..i * gpu_cap + a_cap];
+                                            let enc = &enc_out[i * gpu_dim..i * gpu_dim + a_dim];
+                                            let sim = &sim_out[i * gpu_cap..i * gpu_cap + a_cap];
                                             agent.cached_motor =
                                                 agent.brain.tick_gpu(frame, enc, sim);
                                             record_agent_histories(agent);

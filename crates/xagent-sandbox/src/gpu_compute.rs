@@ -546,15 +546,19 @@ impl GpuBrainCompute {
         self.has_in_flight = true;
     }
 
-    /// Non-blocking collect: poll GPU and return results if ready.
+    /// Non-blocking collect into pre-allocated output buffers.
     ///
-    /// If the GPU hasn't finished yet, returns `None` — agents should
+    /// If the GPU hasn't finished yet, returns `false` — agents should
     /// keep using their cached motor commands. Never blocks the caller.
     /// Uses sequence numbers to ensure only the latest submit's callbacks
     /// are accepted (prevents stale callback races under GPU pressure).
-    pub fn try_collect(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+    pub fn try_collect_into(
+        &mut self,
+        encoded_out: &mut Vec<f32>,
+        similarities_out: &mut Vec<f32>,
+    ) -> bool {
         if !self.has_in_flight {
-            return None;
+            return false;
         }
 
         self.device.poll(wgpu::Maintain::Poll);
@@ -563,45 +567,57 @@ impl GpuBrainCompute {
         if self.enc_mapped_seq.load(Ordering::Acquire) != seq
             || self.sim_mapped_seq.load(Ordering::Acquire) != seq
         {
-            return None;
+            return false;
         }
 
-        self.read_mapped_staging()
+        self.read_mapped_staging_into(encoded_out, similarities_out);
+        true
     }
 
-    /// Blocking collect: waits for GPU results. Used by `dispatch()` and
-    /// end-of-generation flush where we must have results.
-    pub fn collect_blocking(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+    /// Blocking collect into pre-allocated output buffers.
+    /// Used by `dispatch()` and end-of-generation flush where we must have results.
+    pub fn collect_blocking_into(
+        &mut self,
+        encoded_out: &mut Vec<f32>,
+        similarities_out: &mut Vec<f32>,
+    ) -> bool {
         if !self.has_in_flight {
-            return None;
+            return false;
         }
 
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
-        self.read_mapped_staging()
+        self.read_mapped_staging_into(encoded_out, similarities_out);
+        true
     }
 
-    fn read_mapped_staging(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+    fn read_mapped_staging_into(
+        &mut self,
+        encoded_out: &mut Vec<f32>,
+        similarities_out: &mut Vec<f32>,
+    ) {
         let read_idx = 1 - self.staging_idx;
 
-        let enc_size = (self.num_agents * self.dim) as u64 * 4;
-        let sim_size = (self.num_agents * self.memory_capacity) as u64 * 4;
+        let enc_len = (self.num_agents * self.dim) as usize;
+        let sim_len = (self.num_agents * self.memory_capacity) as usize;
 
-        let enc_slice = self.encoded_staging[read_idx].slice(..enc_size);
+        let enc_slice = self.encoded_staging[read_idx].slice(..(enc_len as u64 * 4));
         let enc_data = enc_slice.get_mapped_range();
-        let encoded: Vec<f32> = bytemuck::cast_slice(&enc_data).to_vec();
+        let src: &[f32] = bytemuck::cast_slice(&enc_data);
+        encoded_out.clear();
+        encoded_out.extend_from_slice(src);
         drop(enc_data);
         self.encoded_staging[read_idx].unmap();
 
-        let sim_slice = self.similarities_staging[read_idx].slice(..sim_size);
+        let sim_slice = self.similarities_staging[read_idx].slice(..(sim_len as u64 * 4));
         let sim_data = sim_slice.get_mapped_range();
-        let similarities: Vec<f32> = bytemuck::cast_slice(&sim_data).to_vec();
+        let src: &[f32] = bytemuck::cast_slice(&sim_data);
+        similarities_out.clear();
+        similarities_out.extend_from_slice(src);
         drop(sim_data);
         self.similarities_staging[read_idx].unmap();
 
         self.staging_mapped[read_idx] = false;
         self.has_in_flight = false;
-
-        Some((encoded, similarities))
     }
 
     /// Synchronous dispatch: submit + blocking collect. Used by tests.
@@ -614,7 +630,10 @@ impl GpuBrainCompute {
         mem_active: &[u32],
     ) -> (Vec<f32>, Vec<f32>) {
         self.submit(features, enc_weights, enc_biases, mem_patterns, mem_active);
-        self.collect_blocking().expect("collect after submit must return results")
+        let mut enc = Vec::new();
+        let mut sim = Vec::new();
+        assert!(self.collect_blocking_into(&mut enc, &mut sim), "collect after submit must return results");
+        (enc, sim)
     }
 
     /// Whether the current config matches the given dimensions.

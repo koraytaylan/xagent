@@ -321,7 +321,8 @@ fn sensory_frame_has_correct_dimensions() {
     let spawn_y = world.terrain.height_at(0.0, 0.0) + 2.0;
     let agent = agent_at(Vec3::new(0.0, spawn_y, 0.0));
 
-    let frame = xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0);
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     assert_eq!(frame.vision.width, 8, "Visual field width should be 8");
     assert_eq!(frame.vision.height, 6, "Visual field height should be 6");
@@ -347,7 +348,8 @@ fn interoception_matches_body_state() {
     agent.body.internal.energy = 75.0;
     agent.body.internal.integrity = 60.0;
 
-    let frame = xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0);
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     let expected_energy = agent.body.internal.energy_signal();
     let expected_integrity = agent.body.internal.integrity_signal();

@@ -114,11 +114,12 @@ impl SensoryEncoder {
         self.extract_features_into(frame);
 
         // Project features through weights into representation space
+        // Weights stored row-major [repr_dim × feature_count] for contiguous inner-loop access
         for i in 0..self.representation_dim {
             let mut sum = self.biases[i];
+            let row_base = i * self.feature_count;
             for j in 0..self.feature_count {
-                let w_idx = j * self.representation_dim + i;
-                sum += self.feature_scratch[j] * self.weights[w_idx];
+                sum += self.feature_scratch[j] * self.weights[row_base + j];
             }
             self.encode_scratch[i] = crate::fast_tanh(sum);
         }
@@ -132,7 +133,7 @@ impl SensoryEncoder {
         &self.feature_scratch[..self.feature_count]
     }
 
-    /// Encoder weights, row-major \[feature_count × representation_dim\].
+    /// Encoder weights, row-major \[representation_dim × feature_count\].
     pub fn weights(&self) -> &[f32] {
         &self.weights
     }

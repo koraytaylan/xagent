@@ -95,7 +95,7 @@ fn encode_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var sum = enc_biases[out_base + d];
     for (var j = 0u; j < params.feature_count; j = j + 1u) {
-        sum = sum + features[feat_base + j] * enc_weights[weight_base + j * params.dim + d];
+        sum = sum + features[feat_base + j] * enc_weights[weight_base + d * params.feature_count + j];
     }
     encoded[out_base + d] = tanh(sum);
 }
@@ -767,8 +767,9 @@ mod tests {
         let mut out = vec![0.0f32; dim];
         for i in 0..dim {
             let mut sum = biases[i];
+            let row_base = i * feature_count;
             for j in 0..feature_count {
-                sum += features[j] * weights[j * dim + i];
+                sum += features[j] * weights[row_base + j];
             }
             out[i] = sum.tanh();
         }

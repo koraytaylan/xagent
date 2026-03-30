@@ -19,40 +19,42 @@ pub struct OtherAgent {
 }
 
 /// Produce a full sensory frame from current agent & world state.
-pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64) -> SensoryFrame {
-    extract_senses_with_others(agent, world, tick, &[])
+/// Writes into `frame` to avoid heap allocation (reuses existing buffers).
+pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64, frame: &mut SensoryFrame) {
+    extract_senses_with_others(agent, world, tick, &[], frame)
 }
 
 /// Produce a sensory frame with awareness of other agents.
+/// Writes into `frame` to avoid heap allocation (reuses existing buffers).
 pub fn extract_senses_with_others(
     agent: &AgentBody,
     world: &WorldState,
     tick: u64,
     others: &[OtherAgent],
-) -> SensoryFrame {
-    SensoryFrame {
-        vision: sample_vision(agent, world, others),
-        velocity: agent.body.velocity,
-        facing: agent.body.facing,
-        angular_velocity: agent.angular_velocity,
-        energy_signal: agent.body.internal.energy_signal(),
-        integrity_signal: agent.body.internal.integrity_signal(),
-        energy_delta: agent.energy_delta(),
-        integrity_delta: agent.integrity_delta(),
-        touch_contacts: detect_touch_with_others(agent, world, others),
-        tick,
-    }
+    frame: &mut SensoryFrame,
+) {
+    sample_vision(agent, world, others, &mut frame.vision);
+    frame.velocity = agent.body.velocity;
+    frame.facing = agent.body.facing;
+    frame.angular_velocity = agent.angular_velocity;
+    frame.energy_signal = agent.body.internal.energy_signal();
+    frame.integrity_signal = agent.body.internal.integrity_signal();
+    frame.energy_delta = agent.energy_delta();
+    frame.integrity_delta = agent.integrity_delta();
+    frame.touch_contacts.clear();
+    detect_touch_with_others(agent, world, others, &mut frame.touch_contacts);
+    frame.tick = tick;
 }
 
 // ── vision ──────────────────────────────────────────────────────────────
 
 /// Low-resolution raycast sampling of terrain colors in front of the agent.
 /// Resolution is 8×6 (48 rays) with step size 1.0 for efficient marching.
-/// Also detects other agents along each ray.
-fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent]) -> VisualField {
-    let w = 8_u32;
-    let h = 6_u32;
-    let mut vf = VisualField::new(w, h);
+/// Also detects other agents along each ray. Writes into existing `vf` buffer.
+fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], vf: &mut VisualField) {
+    let w = vf.width;
+    let h = vf.height;
+    vf.clear();
 
     let half_fov = (90.0_f32 / 2.0).to_radians();
     let tan_hf = half_fov.tan();
@@ -82,7 +84,6 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent]) -
             vf.depth[idx] = depth / max_dist;
         }
     }
-    vf
 }
 
 /// Fixed-step ray marching for terrain and agent intersection.
@@ -150,13 +151,14 @@ fn march_ray(
 
 /// Detect all touch contacts including other agents.
 /// Agent-to-agent touch range is 5.0 units with intensity inversely proportional
-/// to distance.
+/// to distance. Appends to the provided contacts buffer.
 fn detect_touch_with_others(
     agent: &AgentBody,
     world: &WorldState,
     others: &[OtherAgent],
-) -> Vec<TouchContact> {
-    let mut contacts = detect_touch(agent, world);
+    contacts: &mut Vec<TouchContact>,
+) {
+    detect_touch(agent, world, contacts);
 
     // Other agents as touch contacts
     let agent_touch_range = 5.0;
@@ -175,19 +177,18 @@ fn detect_touch_with_others(
             });
         }
     }
-
-    contacts
 }
 
 /// Detect touch contacts from environmental features (food, terrain edges, hazards).
+/// Uses the spatial grid for O(1) food proximity lookup.
 /// Touch range for food is 3.0 units, terrain edge detection starts at 3.0 units
 /// from world boundary. Hazard zones produce a constant downward contact.
-fn detect_touch(agent: &AgentBody, world: &WorldState) -> Vec<TouchContact> {
-    let mut contacts = Vec::new();
+fn detect_touch(agent: &AgentBody, world: &WorldState, contacts: &mut Vec<TouchContact>) {
     let pos = agent.body.position;
 
-    // Nearby food
-    for food in &world.food_items {
+    // Nearby food via spatial grid
+    for idx in world.food_grid.query_nearby(pos.x, pos.z) {
+        let food = &world.food_items[idx];
         if food.consumed {
             continue;
         }
@@ -228,6 +229,4 @@ fn detect_touch(agent: &AgentBody, world: &WorldState) -> Vec<TouchContact> {
             surface_tag: TOUCH_HAZARD,
         });
     }
-
-    contacts
 }

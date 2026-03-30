@@ -139,27 +139,32 @@ pub fn step(
 }
 
 /// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.
+/// Uses the spatial grid for O(1) lookup instead of scanning all food items.
 /// Awards food_energy_value to the agent and marks the food as consumed
-/// with a 30-second respawn timer. Returns `true` if food was consumed.
+/// with a 10-second respawn timer. Returns `true` if food was consumed.
 fn try_consume(agent: &mut AgentBody, world: &mut WorldState) -> bool {
     let pos = agent.body.position;
     let mut best: Option<(usize, f32)> = None;
 
-    for (i, food) in world.food_items.iter().enumerate() {
+    for idx in world.food_grid.query_nearby(pos.x, pos.z) {
+        let food = &world.food_items[idx];
         if food.consumed {
             continue;
         }
         let d = (food.position - pos).length();
         if d < FOOD_CONSUME_RADIUS {
             if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((i, d));
+                best = Some((idx, d));
             }
         }
     }
 
     if let Some((idx, _)) = best {
+        let fx = world.food_items[idx].position.x;
+        let fz = world.food_items[idx].position.z;
         world.food_items[idx].consumed = true;
         world.food_items[idx].respawn_timer = 10.0;
+        world.food_grid.remove(idx, fx, fz);
         agent.body.internal.energy = (agent.body.internal.energy + world.config.food_energy_value)
             .min(agent.body.internal.max_energy);
         true

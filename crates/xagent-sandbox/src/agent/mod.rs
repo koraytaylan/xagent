@@ -5,7 +5,7 @@ use crate::world::Mesh;
 use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
-use xagent_shared::{BodyState, BrainConfig, InternalState};
+use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
 /// `HEATMAP_RES × HEATMAP_RES` grid. Each cell tracks how many ticks
@@ -129,6 +129,8 @@ pub struct Agent {
     pub integrity_history: std::collections::VecDeque<f32>,
     /// Per-tick action weight snapshots for chart (each entry is [f32; 8]).
     pub action_weight_history: std::collections::VecDeque<[f32; 8]>,
+    /// Pre-allocated sensory frame buffer, reused each tick to avoid heap churn.
+    pub cached_frame: SensoryFrame,
 }
 
 impl Agent {
@@ -157,6 +159,7 @@ impl Agent {
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
             action_weight_history: std::collections::VecDeque::with_capacity(128),
+            cached_frame: SensoryFrame::new_blank(8, 6),
         }
     }
 

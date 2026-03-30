@@ -2,12 +2,14 @@
 
 pub mod biome;
 pub mod entity;
+pub mod spatial;
 pub mod terrain;
 
 use xagent_shared::WorldConfig;
 
 use self::biome::BiomeMap;
 use self::entity::FoodItem;
+use self::spatial::FoodGrid;
 use self::terrain::TerrainData;
 use crate::renderer::Vertex;
 
@@ -22,6 +24,7 @@ pub struct WorldState {
     pub terrain: TerrainData,
     pub biome_map: BiomeMap,
     pub food_items: Vec<FoodItem>,
+    pub food_grid: FoodGrid,
     pub config: WorldConfig,
 }
 
@@ -34,11 +37,13 @@ impl WorldState {
         let terrain = TerrainData::generate(config.world_size, 128, terrain_seed);
         let biome_map = BiomeMap::new(biome_seed);
         let food_items = entity::spawn_food(&terrain, &biome_map, config.food_density);
+        let food_grid = FoodGrid::from_items(&food_items);
 
         Self {
             terrain,
             biome_map,
             food_items,
+            food_grid,
             config,
         }
     }
@@ -54,7 +59,12 @@ impl WorldState {
     }
 
     /// Tick food respawn timers. Returns `true` if any food respawned.
+    /// Rebuilds the spatial grid when food positions change.
     pub fn update(&mut self, dt: f32) -> bool {
-        entity::update_food(&mut self.food_items, dt, &self.terrain, &self.biome_map)
+        let changed = entity::update_food(&mut self.food_items, dt, &self.terrain, &self.biome_map);
+        if changed {
+            self.food_grid.rebuild(&self.food_items);
+        }
+        changed
     }
 }

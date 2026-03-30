@@ -1216,16 +1216,16 @@ impl ApplicationHandler for App {
                                                 })
                                                 .collect();
 
-                                            let frame =
-                                                senses::extract_senses_with_others(
-                                                    &agent.body,
-                                                    world_ref,
-                                                    tick,
-                                                    &others,
-                                                );
+                                            senses::extract_senses_with_others(
+                                                &agent.body,
+                                                world_ref,
+                                                tick,
+                                                &others,
+                                                &mut agent.cached_frame,
+                                            );
 
                                             agent.cached_motor =
-                                                agent.brain.tick(&frame);
+                                                agent.brain.tick(&agent.cached_frame);
                                             record_agent_histories(agent);
                                         });
                                 }
@@ -1414,11 +1414,12 @@ impl ApplicationHandler for App {
                                                 alive: *a,
                                             })
                                             .collect();
-                                        let frame = senses::extract_senses_with_others(
+                                        senses::extract_senses_with_others(
                                             &agent.body, world_ref, tick, &others,
+                                            &mut agent.cached_frame,
                                         );
                                         let feats = agent.brain.encoder
-                                            .extract_features(&frame).to_vec();
+                                            .extract_features(&agent.cached_frame).to_vec();
                                         let weights = agent.brain.encoder.weights().to_vec();
                                         let biases = agent.brain.encoder.biases().to_vec();
                                         let (pats, mask) = agent.brain.memory.gpu_pattern_data();
@@ -1427,7 +1428,7 @@ impl ApplicationHandler for App {
                                             agent_dim: agent.brain.config.representation_dim,
                                             agent_fc: agent.brain.encoder.feature_count(),
                                             agent_cap: agent.brain.memory.max_capacity(),
-                                            frame,
+                                            frame: agent.cached_frame.clone(),
                                         })
                                     })
                                     .collect();
@@ -2442,10 +2443,11 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain: boo
                             alive: *alive,
                         })
                         .collect();
-                    let frame = senses::extract_senses_with_others(
+                    senses::extract_senses_with_others(
                         &agent.body, world_ref, tick, &others,
+                        &mut agent.cached_frame,
                     );
-                    agent.cached_motor = agent.brain.tick(&frame);
+                    agent.cached_motor = agent.brain.tick(&agent.cached_frame);
                 });
             }
 

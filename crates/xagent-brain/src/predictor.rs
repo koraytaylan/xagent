@@ -94,10 +94,12 @@ impl Predictor {
         }
 
         // Apply prediction weights to current state
+        // Weights stored row-major [dim × dim] for contiguous inner-loop access
         for i in 0..self.dim {
             let mut sum = 0.0;
+            let row_base = i * self.dim;
             for j in 0..self.dim {
-                sum += current.data()[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[row_base + j];
             }
             self.scratch[i] = sum;
         }
@@ -176,10 +178,11 @@ impl Predictor {
             let err_i = error_vec.get(i).copied().unwrap_or(0.0);
             let pred_i = predicted.get(i).copied().unwrap_or(0.0);
             // tanh'(x) = 1 - tanh(x)²
-            let tanh_deriv = 1.0 - pred_i.powi(2);
+            let tanh_deriv = 1.0 - pred_i * pred_i;
+            let row_base = i * dim;
             for j in 0..dim {
                 let grad = (err_i * tanh_deriv * input[j]).clamp(-GRADIENT_CLAMP, GRADIENT_CLAMP);
-                let idx = j * dim + i;
+                let idx = row_base + j;
                 self.weights[idx] -= learning_rate * grad;
                 self.weights[idx] = self.weights[idx].clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);
             }
@@ -236,8 +239,9 @@ impl Predictor {
         let mut output = vec![0.0f32; self.dim];
         for i in 0..self.dim {
             let mut sum = 0.0;
+            let row_base = i * self.dim;
             for j in 0..self.dim {
-                sum += current.data()[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[row_base + j];
             }
             output[i] = fast_tanh(sum);
         }

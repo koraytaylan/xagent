@@ -80,9 +80,14 @@ impl PatternMemory {
         }
     }
 
+    /// Advance the internal clock by one tick. Must be called once per brain
+    /// tick to keep recency-based decay working correctly.
+    pub fn advance_tick(&mut self) {
+        self.current_tick += 1;
+    }
+
     /// Store a new pattern. Overwrites the weakest existing pattern if full.
     pub fn store(&mut self, state: EncodedState) {
-        self.current_tick += 1;
         self.next_generation += 1;
 
         let prev_idx = self.last_stored_idx;
@@ -124,7 +129,12 @@ impl PatternMemory {
     }
 
     /// Recall the top-N most similar patterns, within budget.
-    pub fn recall(&mut self, query: &EncodedState, budget: usize) -> Vec<EncodedState> {
+    /// Returns (encoded_state, similarity_score) pairs.
+    pub fn recall(
+        &mut self,
+        query: &EncodedState,
+        budget: usize,
+    ) -> Vec<(EncodedState, f32)> {
         self.scored_scratch.clear();
         for (i, p) in self.patterns.iter().enumerate() {
             if let Some(pat) = p.as_ref() {
@@ -146,14 +156,17 @@ impl PatternMemory {
 
         self.scored_scratch
             .iter()
-            .filter_map(|&(idx, _)| {
-                self.patterns[idx].as_ref().map(|p| p.state.clone())
+            .filter_map(|&(idx, sim)| {
+                self.patterns[idx]
+                    .as_ref()
+                    .map(|p| (p.state.clone(), sim))
             })
             .collect()
     }
 
     /// Recall patterns weighted by similarity to the query.
     /// Returns (encoded_state, similarity_score) pairs.
+    #[allow(dead_code)]
     pub fn recall_weighted(
         &mut self,
         query: &EncodedState,
@@ -285,7 +298,6 @@ impl PatternMemory {
     /// Smart decay: patterns that were accessed recently or frequently decay
     /// slower. Removes patterns that fall below threshold.
     pub fn decay(&mut self, base_rate: f32) {
-        self.current_tick += 1;
         let tick = self.current_tick;
         for pattern in self.patterns.iter_mut() {
             if let Some(ref mut p) = pattern {
@@ -443,7 +455,7 @@ impl PatternMemory {
         &mut self,
         scores: &[f32],
         budget: usize,
-    ) -> Vec<EncodedState> {
+    ) -> Vec<(EncodedState, f32)> {
         self.scored_scratch.clear();
         for (i, &sim) in scores.iter().enumerate().take(self.capacity) {
             if sim > -1.5 {
@@ -466,7 +478,11 @@ impl PatternMemory {
 
         self.scored_scratch
             .iter()
-            .filter_map(|&(idx, _)| self.patterns[idx].as_ref().map(|p| p.state.clone()))
+            .filter_map(|&(idx, sim)| {
+                self.patterns[idx]
+                    .as_ref()
+                    .map(|p| (p.state.clone(), sim))
+            })
             .collect()
     }
 }
@@ -490,7 +506,7 @@ mod tests {
         let results = mem.recall(&make_state(&[0.9, 0.1, 0.0, 0.0]), 1);
         assert_eq!(results.len(), 1);
         // Should recall the pattern most similar to query
-        assert!(results[0].data[0] > 0.5, "Should recall the [1,0,0,0] pattern");
+        assert!(results[0].0.data[0] > 0.5, "Should recall the [1,0,0,0] pattern");
     }
 
     #[test]
@@ -501,6 +517,7 @@ mod tests {
 
         // Decay many times — smart decay is slower, so we need more iterations
         for _ in 0..500 {
+            mem.advance_tick();
             mem.decay(0.01);
         }
         assert_eq!(mem.active_count(), 0, "Pattern should have decayed away");
@@ -519,6 +536,7 @@ mod tests {
 
         // Decay
         for _ in 0..80 {
+            mem.advance_tick();
             mem.decay(0.01);
         }
 

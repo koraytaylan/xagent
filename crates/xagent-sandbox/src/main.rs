@@ -13,7 +13,6 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
-use xagent_brain::Brain;
 use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, SensoryFrame, WorldConfig};
 
 use xagent_sandbox::agent::senses::OtherAgent;
@@ -1339,7 +1338,7 @@ impl ApplicationHandler for App {
                                         agent.has_reproduced = false;
                                         agent.generation += 1;
                                         agent.reset_trail();
-                                        agent.brain = Brain::new(agent.brain.config.clone());
+                                        agent.brain.trauma(0.5);
                                         event_msgs.push(format!(
                                             "[RESPAWN] Agent {} at ({:.1}, {:.1})",
                                             agent.id, x, z
@@ -2464,14 +2463,15 @@ fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain: boo
                     agent.total_ticks_alive += 1;
                     agent.record_heatmap(world.config.world_size);
                 } else {
-                    // Respawn with same config, fresh brain
+                    // Respawn: death trauma + learning signal, keep memories
                     let mut rng = rand::rng();
                     let half = world.config.world_size / 2.0 - 5.0;
                     let x: f32 = rng.random_range(-half..half);
                     let z: f32 = rng.random_range(-half..half);
                     let y = world.terrain.height_at(x, z) + 1.0;
                     agent.body = AgentBody::new(Vec3::new(x, y, z));
-                    agent.brain = Brain::new(agent.brain.config.clone());
+                    agent.brain.death_signal();
+                    agent.brain.trauma(0.5);
                     agent.death_count += 1;
                     agent.life_start_tick = tick;
                 }

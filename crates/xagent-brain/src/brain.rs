@@ -137,6 +137,7 @@ impl Brain {
         gpu_similarities: Option<&[f32]>,
     ) -> MotorCommand {
         self.tick_count += 1;
+        self.memory.advance_tick();
 
         // 1. Compute homeostatic gradient from interoceptive signals
         let homeo_state: HomeostaticState =
@@ -167,15 +168,15 @@ impl Brain {
         let (recall_budget, _surprise_budget) =
             self.capacity.allocate_recall_budget_adaptive(scalar_error);
 
-        // 4. Recall relevant patterns (GPU or CPU path)
+        // 4. Recall relevant patterns with similarity scores (GPU or CPU path)
         let recalled = match gpu_similarities {
             Some(sims) => self.memory.recall_with_gpu_similarities(sims, recall_budget),
             None => self.memory.recall(&encoded, recall_budget),
         };
         self.capacity.report_usage(recalled.len());
 
-        // 5. Predict next state from current + recalled patterns
-        let prediction = self.predictor.predict(&encoded, &recalled);
+        // 5. Predict next state using pre-computed similarity scores
+        let prediction = self.predictor.predict_weighted(&encoded, &recalled);
 
         // 5b. Multi-step rollout for prospective evaluation.
         let confidence = 1.0 - scalar_error.clamp(0.0, 1.0);

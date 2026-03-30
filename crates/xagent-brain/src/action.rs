@@ -143,7 +143,7 @@ impl ActionSelector {
         &mut self,
         current: &EncodedState,
         prediction: &EncodedState,
-        recalled: &[EncodedState],
+        recalled: &[(EncodedState, f32)],
         homeostatic_gradient: f32,
         prediction_error: f32,
         urgency: f32,
@@ -539,7 +539,8 @@ mod tests {
         let mut sel = ActionSelector::new(4);
         let state = make_state(&[0.5, 0.3, -0.1, 0.2]);
         let pred = make_state(&[0.5, 0.3, -0.1, 0.2]);
-        let recalled = vec![make_state(&[0.1; 4]); 8];
+        let recalled: Vec<(EncodedState, f32)> = vec![make_state(&[0.1; 4]); 8]
+            .into_iter().map(|s| (s, 0.5)).collect();
         let mut mem = PatternMemory::new(10, 4);
 
         // Low prediction error
@@ -631,7 +632,8 @@ mod tests {
         let rate_unstable = sel.exploration_rate();
 
         // Many recalled patterns (stable)
-        let recalled = vec![make_state(&[0.1; 4]); 12];
+        let recalled: Vec<(EncodedState, f32)> = vec![make_state(&[0.1; 4]); 12]
+            .into_iter().map(|s| (s, 0.5)).collect();
         sel.select(&state, &pred, &recalled, 0.0, 0.1, 0.0, &mut mem);
         let rate_stable = sel.exploration_rate();
 

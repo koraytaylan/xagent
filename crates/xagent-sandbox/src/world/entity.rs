@@ -82,22 +82,24 @@ pub fn generate_food_mesh(items: &[FoodItem]) -> Mesh {
 /// Tick respawn timers for consumed food. When a food item respawns it
 /// relocates to a new random position in a food-rich biome, forcing agents
 /// to forage rather than camp a single spot.
+/// Tick food respawn timers. Returns indices of food items that respawned.
 pub fn update_food(
     items: &mut [FoodItem],
     dt: f32,
     terrain: &TerrainData,
     biome_map: &BiomeMap,
-) -> bool {
-    let mut any_respawned = false;
+    respawned_indices: &mut Vec<usize>,
+) {
+    respawned_indices.clear();
     let mut rng = rand::rng();
     let half = terrain.size / 2.0;
 
-    for item in items.iter_mut() {
+    for (i, item) in items.iter_mut().enumerate() {
         if item.consumed {
             item.respawn_timer -= dt;
             if item.respawn_timer <= 0.0 {
                 item.consumed = false;
-                any_respawned = true;
+                respawned_indices.push(i);
 
                 // Relocate to a new random food-rich position
                 for _ in 0..64 {
@@ -112,7 +114,6 @@ pub fn update_food(
             }
         }
     }
-    any_respawned
 }
 
 // ── helper ──────────────────────────────────────────────────────────────

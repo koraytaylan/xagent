@@ -1770,8 +1770,17 @@ impl ApplicationHandler for App {
                                 let selected_idx = self.selected_agent_idx;
 
                                 // Snapshot agent data for the UI closure
+                                let snap_window = self.chart_window * 2;
                                 let agent_snaps: Vec<AgentSnapshot> = self.agents.iter().map(|a| {
                                     let telemetry = a.brain.telemetry();
+                                    let tail = |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
+                                        let skip = d.len().saturating_sub(snap_window);
+                                        d.iter().skip(skip).copied().collect()
+                                    };
+                                    let tail_aw = |d: &std::collections::VecDeque<[f32; 8]>| -> Vec<[f32; 8]> {
+                                        let skip = d.len().saturating_sub(snap_window);
+                                        d.iter().skip(skip).copied().collect()
+                                    };
                                     AgentSnapshot {
                                         id: a.id,
                                         gen: a.generation,
@@ -1786,11 +1795,11 @@ impl ApplicationHandler for App {
                                         exploration_rate: a.brain.action_selector.exploration_rate(),
                                         prediction_error: telemetry.prediction_error,
                                         action_weights: a.brain.action_selector.global_action_values().to_vec(),
-                                        prediction_error_history: a.prediction_error_history.iter().copied().collect(),
-                                        exploration_rate_history: a.exploration_rate_history.iter().copied().collect(),
-                                        energy_history: a.energy_history.iter().copied().collect(),
-                                        integrity_history: a.integrity_history.iter().copied().collect(),
-                                        action_weight_history: a.action_weight_history.iter().copied().collect(),
+                                        prediction_error_history: tail(&a.prediction_error_history),
+                                        exploration_rate_history: tail(&a.exploration_rate_history),
+                                        energy_history: tail(&a.energy_history),
+                                        integrity_history: tail(&a.integrity_history),
+                                        action_weight_history: tail_aw(&a.action_weight_history),
                                     }
                                 }).collect();
 

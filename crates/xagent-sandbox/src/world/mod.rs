@@ -26,6 +26,8 @@ pub struct WorldState {
     pub food_items: Vec<FoodItem>,
     pub food_grid: FoodGrid,
     pub config: WorldConfig,
+    /// Scratch buffer for respawned food indices (avoids allocation per tick).
+    respawned_scratch: Vec<usize>,
 }
 
 impl WorldState {
@@ -35,7 +37,7 @@ impl WorldState {
         let terrain_seed = config.seed as u32;
         let biome_seed = (config.seed.wrapping_add(95)) as u32;
         let terrain = TerrainData::generate(config.world_size, 128, terrain_seed);
-        let biome_map = BiomeMap::new(biome_seed);
+        let biome_map = BiomeMap::new(biome_seed, config.world_size);
         let food_items = entity::spawn_food(&terrain, &biome_map, config.food_density);
         let food_grid = FoodGrid::from_items(&food_items);
 
@@ -45,6 +47,7 @@ impl WorldState {
             food_items,
             food_grid,
             config,
+            respawned_scratch: Vec::new(),
         }
     }
 
@@ -59,12 +62,19 @@ impl WorldState {
     }
 
     /// Tick food respawn timers. Returns `true` if any food respawned.
-    /// Rebuilds the spatial grid when food positions change.
+    /// Uses incremental grid inserts instead of full rebuild.
     pub fn update(&mut self, dt: f32) -> bool {
-        let changed = entity::update_food(&mut self.food_items, dt, &self.terrain, &self.biome_map);
-        if changed {
-            self.food_grid.rebuild(&self.food_items);
+        entity::update_food(
+            &mut self.food_items,
+            dt,
+            &self.terrain,
+            &self.biome_map,
+            &mut self.respawned_scratch,
+        );
+        for &idx in &self.respawned_scratch {
+            let pos = self.food_items[idx].position;
+            self.food_grid.insert(idx, pos.x, pos.z);
         }
-        changed
+        !self.respawned_scratch.is_empty()
     }
 }

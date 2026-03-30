@@ -82,6 +82,10 @@ impl HomeostaticMonitor {
     /// Positive gradient = internal state improving (good).
     /// Negative gradient = internal state worsening (bad).
     pub fn update(&mut self, energy_signal: f32, integrity_signal: f32) -> HomeostaticState {
+        // Guard against NaN inputs (e.g. from max_energy=0 division)
+        let energy_signal = if energy_signal.is_finite() { energy_signal } else { 0.0 };
+        let integrity_signal = if integrity_signal.is_finite() { integrity_signal } else { 0.0 };
+
         let energy_delta = energy_signal - self.prev_energy;
         let integrity_delta = integrity_signal - self.prev_integrity;
 

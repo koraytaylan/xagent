@@ -5,6 +5,7 @@ use crate::encoder::EncodedState;
 
 // --- Constants ---
 const MAX_ASSOCIATION_STRENGTH: f32 = 5.0;
+const MAX_ASSOCIATIONS_PER_PATTERN: usize = 16;
 const MAX_REINFORCEMENT: f32 = 10.0;
 const SIMILARITY_THRESHOLD: f32 = 0.3;
 const HIGH_SIMILARITY_THRESHOLD: f32 = 0.5;
@@ -128,6 +129,20 @@ impl PatternMemory {
         self.last_stored_idx = Some(slot);
     }
 
+    /// Partial-sort scored_scratch to keep top `budget` entries by descending score.
+    fn top_k_scratch(&mut self, budget: usize) {
+        if self.scored_scratch.len() > budget && budget > 0 {
+            self.scored_scratch.select_nth_unstable_by(budget - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            self.scored_scratch.truncate(budget);
+        }
+        // Sort the remaining K for deterministic ordering
+        self.scored_scratch.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     /// Recall the top-N most similar patterns, within budget.
     /// Returns (encoded_state, similarity_score) pairs.
     pub fn recall(
@@ -142,46 +157,9 @@ impl PatternMemory {
             }
         }
 
-        self.scored_scratch.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        self.scored_scratch.truncate(budget);
+        self.top_k_scratch(budget);
 
         // Update access metadata for recalled patterns
-        for k in 0..self.scored_scratch.len() {
-            let idx = self.scored_scratch[k].0;
-            if let Some(ref mut pat) = self.patterns[idx] {
-                pat.last_accessed = self.current_tick;
-                pat.activation_count += 1;
-            }
-        }
-
-        self.scored_scratch
-            .iter()
-            .filter_map(|&(idx, sim)| {
-                self.patterns[idx]
-                    .as_ref()
-                    .map(|p| (p.state.clone(), sim))
-            })
-            .collect()
-    }
-
-    /// Recall patterns weighted by similarity to the query.
-    /// Returns (encoded_state, similarity_score) pairs.
-    #[allow(dead_code)]
-    pub fn recall_weighted(
-        &mut self,
-        query: &EncodedState,
-        budget: usize,
-    ) -> Vec<(EncodedState, f32)> {
-        self.scored_scratch.clear();
-        for (i, p) in self.patterns.iter().enumerate() {
-            if let Some(pat) = p.as_ref() {
-                self.scored_scratch.push((i, self.similarity(&pat.state, query)));
-            }
-        }
-
-        self.scored_scratch.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        self.scored_scratch.truncate(budget);
-
         for k in 0..self.scored_scratch.len() {
             let idx = self.scored_scratch[k].0;
             if let Some(ref mut pat) = self.patterns[idx] {
@@ -270,7 +248,7 @@ impl PatternMemory {
             .enumerate()
             .filter_map(|(i, p)| {
                 p.as_ref()
-                    .map(|pat| (i, Self::cosine_similarity(&pat.state.data, &current.data)))
+                    .map(|pat| (i, Self::cosine_similarity(pat.state.data(), current.data())))
             })
             .filter(|&(_, sim)| sim > SIMILARITY_THRESHOLD)
             .collect();
@@ -346,7 +324,7 @@ impl PatternMemory {
 
     /// Compute cosine similarity between two encoded states (public for use by other modules).
     pub fn cosine_similarity_states(a: &EncodedState, b: &EncodedState) -> f32 {
-        Self::cosine_similarity(&a.data, &b.data)
+        Self::cosine_similarity(a.data(), b.data())
     }
 
     fn find_slot(&self) -> usize {
@@ -391,7 +369,7 @@ impl PatternMemory {
     }
 
     fn similarity(&self, a: &EncodedState, b: &EncodedState) -> f32 {
-        Self::cosine_similarity(&a.data, &b.data)
+        Self::cosine_similarity(a.data(), b.data())
     }
 
     pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -410,12 +388,25 @@ impl PatternMemory {
             if let Some(link) = pattern.associations.iter_mut().find(|l| l.target_idx == to) {
                 link.strength = (link.strength + strength).min(MAX_ASSOCIATION_STRENGTH);
                 link.target_generation = target_gen;
-            } else {
+            } else if pattern.associations.len() < MAX_ASSOCIATIONS_PER_PATTERN {
                 pattern.associations.push(AssociationLink {
                     target_idx: to,
                     target_generation: target_gen,
                     strength,
                 });
+            } else {
+                // Replace the weakest link if the new one is stronger
+                if let Some(weakest) = pattern
+                    .associations
+                    .iter_mut()
+                    .min_by(|a, b| a.strength.partial_cmp(&b.strength).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    if strength > weakest.strength {
+                        weakest.target_idx = to;
+                        weakest.target_generation = target_gen;
+                        weakest.strength = strength;
+                    }
+                }
             }
         }
     }
@@ -441,8 +432,8 @@ impl PatternMemory {
                 active[i] = 1;
                 let start = i * self.dim;
                 let end = start + self.dim;
-                if pat.state.data.len() == self.dim {
-                    data[start..end].copy_from_slice(&pat.state.data);
+                if pat.state.len() == self.dim {
+                    data[start..end].copy_from_slice(pat.state.data());
                 }
             }
         }
@@ -463,10 +454,7 @@ impl PatternMemory {
             }
         }
 
-        self.scored_scratch.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        self.scored_scratch.truncate(budget);
+        self.top_k_scratch(budget);
 
         for k in 0..self.scored_scratch.len() {
             let idx = self.scored_scratch[k].0;
@@ -492,9 +480,7 @@ mod tests {
     use super::*;
 
     fn make_state(vals: &[f32]) -> EncodedState {
-        EncodedState {
-            data: vals.to_vec(),
-        }
+        EncodedState::from_slice(vals)
     }
 
     #[test]
@@ -506,7 +492,7 @@ mod tests {
         let results = mem.recall(&make_state(&[0.9, 0.1, 0.0, 0.0]), 1);
         assert_eq!(results.len(), 1);
         // Should recall the pattern most similar to query
-        assert!(results[0].0.data[0] > 0.5, "Should recall the [1,0,0,0] pattern");
+        assert!(results[0].0.data()[0] > 0.5, "Should recall the [1,0,0,0] pattern");
     }
 
     #[test]
@@ -663,12 +649,8 @@ mod tests {
     fn trauma_reduces_reinforcement() {
         let dim = 8;
         let mut mem = PatternMemory::new(10, dim);
-        let s1 = EncodedState {
-            data: vec![1.0; dim],
-        };
-        let s2 = EncodedState {
-            data: vec![0.5; dim],
-        };
+        let s1 = EncodedState::from_slice(&vec![1.0; dim]);
+        let s2 = EncodedState::from_slice(&vec![0.5; dim]);
         mem.store(s1);
         mem.store(s2);
         assert_eq!(mem.active_count(), 2);
@@ -700,9 +682,7 @@ mod tests {
     fn trauma_removes_weak_patterns() {
         let dim = 4;
         let mut mem = PatternMemory::new(10, dim);
-        let s = EncodedState {
-            data: vec![1.0; dim],
-        };
+        let s = EncodedState::from_slice(&vec![1.0; dim]);
         mem.store(s);
         assert_eq!(mem.active_count(), 1);
 

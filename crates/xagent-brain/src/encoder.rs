@@ -35,11 +35,49 @@ pub struct SensoryEncoder {
     encode_scratch: Vec<f32>,
 }
 
+/// Maximum representation dimensionality. Sized for stack allocation.
+pub const MAX_REPR_DIM: usize = 128;
+
 /// Internal representation produced by encoding.
+/// Uses a fixed-size stack buffer to avoid heap allocation on every brain tick.
 #[derive(Clone, Debug)]
 pub struct EncodedState {
-    /// The representation vector.
-    pub data: Vec<f32>,
+    buf: [f32; MAX_REPR_DIM],
+    len: usize,
+}
+
+impl EncodedState {
+    /// Create a new EncodedState from a slice. Panics if slice.len() > MAX_REPR_DIM.
+    pub fn from_slice(data: &[f32]) -> Self {
+        assert!(data.len() <= MAX_REPR_DIM, "representation_dim {} exceeds MAX_REPR_DIM {}", data.len(), MAX_REPR_DIM);
+        let mut buf = [0.0f32; MAX_REPR_DIM];
+        buf[..data.len()].copy_from_slice(data);
+        Self { buf, len: data.len() }
+    }
+
+    /// Create a zeroed EncodedState of the given dimension.
+    pub fn zeros(dim: usize) -> Self {
+        assert!(dim <= MAX_REPR_DIM);
+        Self { buf: [0.0f32; MAX_REPR_DIM], len: dim }
+    }
+
+    /// Access the active data as a slice.
+    #[inline]
+    pub fn data(&self) -> &[f32] {
+        &self.buf[..self.len]
+    }
+
+    /// Access the active data as a mutable slice.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.buf[..self.len]
+    }
+
+    /// Length of the representation.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
 }
 
 impl SensoryEncoder {
@@ -82,10 +120,10 @@ impl SensoryEncoder {
                 let w_idx = j * self.representation_dim + i;
                 sum += self.feature_scratch[j] * self.weights[w_idx];
             }
-            self.encode_scratch[i] = sum.tanh();
+            self.encode_scratch[i] = crate::fast_tanh(sum);
         }
 
-        EncodedState { data: self.encode_scratch.clone() }
+        EncodedState::from_slice(&self.encode_scratch[..self.representation_dim])
     }
 
     /// Extract features from a sensory frame into a flat buffer (GPU upload helper).
@@ -218,8 +256,8 @@ mod tests {
         let b = enc.encode(&make_frame(0.51, 0.8));
         let c = enc.encode(&make_frame(0.0, 0.1));
 
-        let sim_ab = cosine_sim(&a.data, &b.data);
-        let sim_ac = cosine_sim(&a.data, &c.data);
+        let sim_ab = cosine_sim(a.data(), b.data());
+        let sim_ac = cosine_sim(a.data(), c.data());
 
         assert!(
             sim_ab > sim_ac,
@@ -231,7 +269,7 @@ mod tests {
     fn encoding_dimension_matches_config() {
         let mut enc = SensoryEncoder::new(32, 16);
         let state = enc.encode(&make_frame(0.5, 0.5));
-        assert_eq!(state.data.len(), 32);
+        assert_eq!(state.len(), 32);
     }
 
     #[test]
@@ -248,7 +286,7 @@ mod tests {
         let mut enc = SensoryEncoder::new(16, 8);
         let a = enc.encode(&make_frame(0.0, 0.1));
         let b = enc.encode(&make_frame(1.0, 0.9));
-        let sim = cosine_sim(&a.data, &b.data);
+        let sim = cosine_sim(a.data(), b.data());
         assert!(
             sim < 0.99,
             "Very different inputs should produce different encodings: sim={sim}"
@@ -261,7 +299,7 @@ mod tests {
         let frame = make_frame(0.5, 0.8);
         let a = enc.encode(&frame);
         let b = enc.encode(&frame);
-        assert_eq!(a.data, b.data, "Same input should produce same output");
+        assert_eq!(a.data(), b.data(), "Same input should produce same output");
     }
 
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {

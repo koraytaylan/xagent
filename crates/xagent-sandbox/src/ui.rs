@@ -760,7 +760,7 @@ impl<'a> TabContext<'a> {
 
                     ui.label("representation_dim");
                     let mut rd = b.representation_dim as i32;
-                    ui.add(egui::DragValue::new(&mut rd).range(4..=512).speed(1));
+                    ui.add(egui::DragValue::new(&mut rd).range(4..=128).speed(1));
                     b.representation_dim = rd.max(1) as usize;
                     ui.end_row();
 

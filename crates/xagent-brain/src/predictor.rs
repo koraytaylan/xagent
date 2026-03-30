@@ -17,13 +17,7 @@ const CONTEXT_WEIGHT_LR: f32 = 0.01;
 const CONTEXT_WEIGHT_MIN: f32 = 0.05;
 const CONTEXT_WEIGHT_MAX: f32 = 0.5;
 
-/// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
-#[inline(always)]
-fn fast_tanh(x: f32) -> f32 {
-    if x.abs() > 4.5 { return x.signum(); }
-    let x2 = x * x;
-    x * (27.0 + x2) / (27.0 + 9.0 * x2)
-}
+use crate::fast_tanh;
 
 /// Predicts the next encoded state given the current state and recalled patterns.
 ///
@@ -103,7 +97,7 @@ impl Predictor {
         for i in 0..self.dim {
             let mut sum = 0.0;
             for j in 0..self.dim {
-                sum += current.data[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[j * self.dim + i];
             }
             self.scratch[i] = sum;
         }
@@ -115,23 +109,21 @@ impl Predictor {
                 for (state, sim) in recalled {
                     let w = self.context_weight * sim.max(0.0) / total_sim;
                     for i in 0..self.dim {
-                        self.scratch[i] += state.data[i] * w;
+                        self.scratch[i] += state.data()[i] * w;
                     }
                 }
             }
         }
 
         // Cache the effective input for weight updates
-        self.last_input = Some(current.data.clone());
+        self.last_input = Some(current.data().to_vec());
 
         // Normalize with fast tanh approximation
         for val in self.scratch.iter_mut() {
             *val = fast_tanh(*val);
         }
 
-        EncodedState {
-            data: self.scratch.clone(),
-        }
+        EncodedState::from_slice(&self.scratch[..self.dim])
     }
 
     /// Convenience: predict with unweighted recalled states (uniform weight).
@@ -139,7 +131,7 @@ impl Predictor {
         let weighted: Vec<(EncodedState, f32)> = recalled
             .iter()
             .map(|s| {
-                let sim = PatternMemory::cosine_similarity(&current.data, &s.data).max(0.0);
+                let sim = PatternMemory::cosine_similarity(current.data(), s.data()).max(0.0);
                 (s.clone(), sim)
             })
             .collect();
@@ -149,9 +141,9 @@ impl Predictor {
     /// Compute per-dimension error vector: predicted − actual.
     pub fn prediction_error_vec(predicted: &EncodedState, actual: &EncodedState) -> Vec<f32> {
         predicted
-            .data
+            .data()
             .iter()
-            .zip(actual.data.iter())
+            .zip(actual.data().iter())
             .map(|(p, a)| p - a)
             .collect()
     }
@@ -159,9 +151,9 @@ impl Predictor {
     /// Compute scalar prediction error (RMSE).
     pub fn prediction_error(&self, predicted: &EncodedState, actual: &EncodedState) -> f32 {
         let mse: f32 = predicted
-            .data
+            .data()
             .iter()
-            .zip(actual.data.iter())
+            .zip(actual.data().iter())
             .map(|(p, a)| (p - a).powi(2))
             .sum::<f32>()
             / self.dim as f32;
@@ -245,11 +237,11 @@ impl Predictor {
         for i in 0..self.dim {
             let mut sum = 0.0;
             for j in 0..self.dim {
-                sum += current.data[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[j * self.dim + i];
             }
             output[i] = fast_tanh(sum);
         }
-        EncodedState { data: output }
+        EncodedState::from_slice(&output[..self.dim])
     }
 
     /// Multi-step rollout: iteratively predict N steps into the future.
@@ -276,9 +268,7 @@ mod tests {
     use super::*;
 
     fn make_state(vals: &[f32]) -> EncodedState {
-        EncodedState {
-            data: vals.to_vec(),
-        }
+        EncodedState::from_slice(vals)
     }
 
     #[test]
@@ -302,7 +292,7 @@ mod tests {
             let predicted = pred.predict(&state_a, &[]);
             let error = pred.prediction_error(&predicted, &state_b);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
             pred.record_error(error);
             errors.push(error);
         }
@@ -331,9 +321,9 @@ mod tests {
 
         // Predictions should differ when context is provided
         let diff: f32 = pred_no_ctx
-            .data
+            .data()
             .iter()
-            .zip(pred_with_ctx.data.iter())
+            .zip(pred_with_ctx.data().iter())
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(diff > 0.001, "Context should influence prediction, diff={diff}");
@@ -378,7 +368,7 @@ mod tests {
             let predicted = pred.predict(&state_a, &[]);
             let error = pred.prediction_error(&predicted, &state_b);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
             last_error = error;
         }
 
@@ -398,7 +388,7 @@ mod tests {
         let mutable_result = pred.predict(&state, &[]);
         let pure_result = pred.predict_pure(&state);
 
-        for (a, b) in mutable_result.data.iter().zip(pure_result.data.iter()) {
+        for (a, b) in mutable_result.data().iter().zip(pure_result.data().iter()) {
             assert!(
                 (a - b).abs() < 1e-5,
                 "predict_pure should match predict (no context): {a} vs {b}"
@@ -427,8 +417,8 @@ mod tests {
 
         // With near-identity weights (0.9 diagonal), rollout contracts toward zero
         let far = pred.rollout(&state, 100);
-        let magnitude: f32 = far.data.iter().map(|x| x.abs()).sum();
-        let initial_magnitude: f32 = state.data.iter().map(|x| x.abs()).sum();
+        let magnitude: f32 = far.data().iter().map(|x| x.abs()).sum();
+        let initial_magnitude: f32 = state.data().iter().map(|x| x.abs()).sum();
 
         assert!(
             magnitude < initial_magnitude,
@@ -447,7 +437,7 @@ mod tests {
         for _ in 0..200 {
             let predicted = pred.predict(&state_a, &[]);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
         }
 
         // 1-step rollout from A should be close to B
@@ -460,7 +450,7 @@ mod tests {
 
         // Multi-step rollout should continue the trajectory (not crash/NaN)
         let far = pred.rollout(&state_a, 30);
-        for val in &far.data {
+        for val in far.data() {
             assert!(!val.is_nan(), "Rollout should not produce NaN");
             assert!(val.abs() <= 1.0, "Rollout values should stay in tanh range");
         }

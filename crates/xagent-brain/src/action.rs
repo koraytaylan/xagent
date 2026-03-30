@@ -155,8 +155,8 @@ impl ActionSelector {
         // Snapshot current state for state-conditioned credit assignment.
         // Credit is modulated by cosine similarity to this state, so only
         // actions taken in similar contexts get reinforced/penalized.
-        let dim = self.repr_dim.min(current.data.len());
-        self.current_state[..dim].copy_from_slice(&current.data[..dim]);
+        let dim = self.repr_dim.min(current.len());
+        self.current_state[..dim].copy_from_slice(&current.data()[..dim]);
 
         // --- Temporal credit assignment ---
         self.assign_credit(homeostatic_gradient, true);
@@ -276,12 +276,12 @@ impl ActionSelector {
     /// Compute action preferences: dot(weights[a], state) + global_bias[a].
     fn compute_preferences(&self, state: &EncodedState) -> [f32; NUM_ACTIONS] {
         let mut prefs = [0.0f32; NUM_ACTIONS];
-        let dim = self.repr_dim.min(state.data.len());
+        let dim = self.repr_dim.min(state.len());
         for a in 0..NUM_ACTIONS {
             let offset = a * self.repr_dim;
             let mut dot = 0.0f32;
             for i in 0..dim {
-                dot += self.action_weights[offset + i] * state.data[i];
+                dot += self.action_weights[offset + i] * state.data()[i];
             }
             prefs[a] = dot + self.global_action_values[a];
         }
@@ -293,12 +293,12 @@ impl ActionSelector {
     /// predicted future state. Global biases are excluded to avoid double-counting.
     fn compute_state_preferences(&self, state: &EncodedState) -> [f32; NUM_ACTIONS] {
         let mut prefs = [0.0f32; NUM_ACTIONS];
-        let dim = self.repr_dim.min(state.data.len());
+        let dim = self.repr_dim.min(state.len());
         for a in 0..NUM_ACTIONS {
             let offset = a * self.repr_dim;
             let mut dot = 0.0f32;
             for i in 0..dim {
-                dot += self.action_weights[offset + i] * state.data[i];
+                dot += self.action_weights[offset + i] * state.data()[i];
             }
             prefs[a] = dot;
         }
@@ -421,9 +421,9 @@ impl ActionSelector {
         let s_offset = self.history_cursor * dim;
 
         // Copy state snapshot into ring
-        let copy_len = dim.min(state.data.len());
+        let copy_len = dim.min(state.len());
         self.state_ring[s_offset..s_offset + copy_len]
-            .copy_from_slice(&state.data[..copy_len]);
+            .copy_from_slice(&state.data()[..copy_len]);
 
         let rec = ActionRecord {
             action_idx,
@@ -529,9 +529,7 @@ mod tests {
     use super::*;
 
     fn make_state(vals: &[f32]) -> EncodedState {
-        EncodedState {
-            data: vals.to_vec(),
-        }
+        EncodedState::from_slice(vals)
     }
 
     #[test]
@@ -753,7 +751,7 @@ mod tests {
 
         // Preferences should be bounded
         let prefs = sel.compute_preferences(&danger_state);
-        let state_norm: f32 = danger_state.data.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let state_norm: f32 = danger_state.data().iter().map(|v| v * v).sum::<f32>().sqrt();
         let max_possible = MAX_WEIGHT_NORM * state_norm + 10.0;
         for a in 0..NUM_ACTIONS {
             assert!(

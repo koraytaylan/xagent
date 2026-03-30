@@ -123,9 +123,7 @@ impl Brain {
         gpu_encoded: &[f32],
         gpu_similarities: &[f32],
     ) -> MotorCommand {
-        let encoded = EncodedState {
-            data: gpu_encoded.to_vec(),
-        };
+        let encoded = EncodedState::from_slice(gpu_encoded);
         self.tick_inner(frame, encoded, Some(gpu_similarities))
     }
 
@@ -156,7 +154,7 @@ impl Brain {
             self.memory.learn(&encoded, scalar_error, modulated_lr);
 
             // Learn: update predictor weights via gradient descent
-            self.predictor.learn(&error_vec, &prev_prediction.data, modulated_lr);
+            self.predictor.learn(&error_vec, prev_prediction.data(), modulated_lr);
 
             // Learn: adapt encoder weights
             self.encoder.adapt(scalar_error, modulated_lr);

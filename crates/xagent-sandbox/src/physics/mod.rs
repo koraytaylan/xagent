@@ -138,37 +138,6 @@ pub fn step(
     consumed
 }
 
-/// Resolve agent-agent collisions by pushing overlapping agents apart.
-/// Call this after all individual agent physics steps. Works with a flat slice
-/// of `AgentBody` values that can be indexed for split borrowing.
-pub fn resolve_agent_collisions(agents: &mut [AgentBody]) {
-    let min_dist: f32 = 2.0;
-    let min_dist_sq = min_dist * min_dist;
-    let n = agents.len();
-
-    for i in 0..n {
-        if !agents[i].body.alive {
-            continue;
-        }
-        for j in (i + 1)..n {
-            if !agents[j].body.alive {
-                continue;
-            }
-            let diff = agents[j].body.position - agents[i].body.position;
-            let dist_sq = diff.length_squared();
-            if dist_sq < min_dist_sq && dist_sq > 0.001 {
-                let dist = dist_sq.sqrt();
-                let overlap = min_dist - dist;
-                let push = diff.normalize() * (overlap * 0.5);
-                // Use split_at_mut to get non-overlapping mutable refs
-                let (left, right) = agents.split_at_mut(j);
-                left[i].body.position -= push;
-                right[0].body.position += push;
-            }
-        }
-    }
-}
-
 /// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.
 /// Awards food_energy_value to the agent and marks the food as consumed
 /// with a 30-second respawn timer. Returns `true` if food was consumed.

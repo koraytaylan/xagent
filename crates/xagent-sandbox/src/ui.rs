@@ -1130,13 +1130,21 @@ impl<'a> TabContext<'a> {
             _ => egui::Color32::from_gray(180),
         };
 
+        let is_dead_end = matches!(node.status.as_str(), "failed" | "exhausted");
+
         if has_children {
-            egui::CollapsingHeader::new(
+            let mut header = egui::CollapsingHeader::new(
                 egui::RichText::new(&label).color(color).monospace().size(11.0),
             )
             .id_salt(node.id)
-            .default_open(is_on_path)
-            .show(ui, |ui| {
+            .default_open(is_on_path);
+
+            // Force-collapse dead-end branches not on the active path
+            if is_dead_end && !is_on_path {
+                header = header.open(Some(false));
+            }
+
+            header.show(ui, |ui| {
                 if let Some(children) = children_map.get(&Some(node.id)) {
                     for child in children {
                         Self::render_tree_node(ui, child, children_map, expanded_ids, current_id);
@@ -1197,13 +1205,13 @@ impl<'a> TabContext<'a> {
         };
 
         let status_icon = match node.status.as_str() {
-            "failed" => " ✗",
-            "exhausted" => " ⊘",
-            "successful" => " ✓",
+            "failed" => " [X]",
+            "exhausted" => " [--]",
+            "successful" => " [OK]",
             _ => "",
         };
 
-        let current_marker = if is_current { "★ " } else { "" };
+        let current_marker = if is_current { ">> " } else { "" };
 
         format!(
             "{}Gen {} fit={}{}{}",

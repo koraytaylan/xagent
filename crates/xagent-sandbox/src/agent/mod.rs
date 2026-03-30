@@ -5,6 +5,7 @@ use crate::world::Mesh;
 use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
+use xagent_brain::encoder::MAX_REPR_DIM;
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -265,7 +266,7 @@ pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> Brain
         memory_capacity: perturb_u(&mut rng, parent.memory_capacity),
         processing_slots: perturb_u(&mut rng, parent.processing_slots),
         visual_encoding_size: parent.visual_encoding_size,
-        representation_dim: perturb_u(&mut rng, parent.representation_dim),
+        representation_dim: perturb_u(&mut rng, parent.representation_dim).min(MAX_REPR_DIM),
         learning_rate: perturb_f(&mut rng, parent.learning_rate),
         decay_rate: perturb_f(&mut rng, parent.decay_rate),
     }
@@ -286,11 +287,11 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             b.processing_slots
         },
         visual_encoding_size: a.visual_encoding_size,
-        representation_dim: if rng.random::<f32>() < 0.5 {
+        representation_dim: (if rng.random::<f32>() < 0.5 {
             a.representation_dim
         } else {
             b.representation_dim
-        },
+        }).min(MAX_REPR_DIM),
         learning_rate: if rng.random::<f32>() < 0.5 {
             a.learning_rate
         } else {

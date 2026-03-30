@@ -41,7 +41,6 @@ pub enum AdvanceResult {
 #[derive(Clone, Debug)]
 struct Island {
     spawn_parent_id: Option<i64>,
-    best_score: f32,
     elite_configs: Vec<BrainConfig>,
     /// Per-island patience counter at the current spawn parent.
     /// Authoritative for exhaustion decisions (DB spawn_attempts is display-only).
@@ -53,16 +52,15 @@ struct Island {
 ///
 /// # Algorithm
 ///
-/// A generation "succeeds" if its fitness meets or exceeds the island's
-/// `best_score`. Successful nodes become the new spawn parent (tree deepens).
-/// Ties (matching best_score) count as success — they represent reproducible
-/// quality and shouldn't burn patience in a stochastic environment.
+/// A generation "succeeds" if its fitness meets or exceeds the **spawn
+/// parent's** fitness (not the island's all-time best). This enables
+/// gradual development: each branch only needs to improve on its parent,
+/// and backtracking naturally lowers the bar to wherever you backtrack to.
 ///
 /// Each island tracks its own patience counter (`attempts`). When attempts
 /// reach `patience`, the island backtracks one level up the tree and gets
-/// a fresh patience budget. If the island is already at root, `best_score`
-/// is partially rolled back (×0.95) and attempts reset. No recursive cascade
-/// — each level gets its own full patience budget per island.
+/// a fresh patience budget. If the island is already at root, attempts
+/// reset and exploration continues with the root as spawn parent.
 ///
 /// The population includes an unmutated copy of the spawn parent's config
 /// (the champion), elite configs from the last successful generation, and
@@ -81,14 +79,37 @@ pub struct Governor {
 }
 
 impl Governor {
-    /// Global best score across all islands.
+    /// Global best fitness across all evaluated nodes in this run.
     pub fn best_score(&self) -> f32 {
-        self.islands.iter().map(|i| i.best_score).fold(-1.0_f32, f32::max)
+        self.db
+            .query_row(
+                "SELECT COALESCE(MAX(best_fitness), -1.0) FROM node WHERE run_id = ?1",
+                params![self.run_id],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(-1.0) as f32
     }
 
     /// Active island's spawn parent (for tree display).
     pub fn spawn_parent_id(&self) -> Option<i64> {
         self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id)
+    }
+
+    /// Fitness of the active island's current spawn parent.
+    /// This is the bar a new generation must beat (beat-the-parent model).
+    /// Returns -1.0 for root nodes that haven't been evaluated yet.
+    fn spawn_parent_fitness(&self) -> f32 {
+        let spawn_id = match self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id) {
+            Some(id) => id,
+            None => return -1.0,
+        };
+        self.db
+            .query_row(
+                "SELECT COALESCE(best_fitness, -1.0) FROM node WHERE id = ?1",
+                params![spawn_id],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(-1.0) as f32
     }
 
     /// Create a new governor, initializing the database schema and inserting
@@ -131,7 +152,6 @@ impl Governor {
         let islands: Vec<Island> = (0..num_islands)
             .map(|_| Island {
                 spawn_parent_id: Some(root_id),
-                best_score: -1.0,
                 elite_configs: Vec::new(),
                 attempts: 0,
             })
@@ -155,12 +175,12 @@ impl Governor {
         let db = Connection::open(db_path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
-        let (run_id, governor_json, best_score, spawn_parent_id): (i64, String, f64, Option<i64>) =
+        let (run_id, governor_json, spawn_parent_id): (i64, String, Option<i64>) =
             db.query_row(
-                "SELECT id, governor_config, COALESCE(best_score, -1), spawn_parent_id
+                "SELECT id, governor_config, spawn_parent_id
                  FROM run ORDER BY id DESC LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
 
         let config: GovernorConfig =
@@ -179,7 +199,6 @@ impl Governor {
         let islands: Vec<Island> = (0..num_islands)
             .map(|_| Island {
                 spawn_parent_id,
-                best_score: best_score as f32,
                 elite_configs: Vec::new(),
                 attempts: 0,
             })
@@ -352,12 +371,14 @@ impl Governor {
         let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
 
+        // Look up the spawn parent's fitness — this is the bar to beat
+        let parent_fitness = self.spawn_parent_fitness();
+
         let island = &mut self.islands[self.active_island];
 
-        // Score this generation
-        if gen_fit >= island.best_score {
-            // ★ Success — this generation met or beat the island best
-            island.best_score = gen_fit;
+        // Score this generation against its parent (not the all-time best)
+        if gen_fit >= parent_fitness {
+            // ★ Success — this generation improved on its parent
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
@@ -370,16 +391,24 @@ impl Governor {
                 .map(|f| f.config.clone())
                 .collect();
             island.attempts = 0;
-            messages.push(format!("[EVOLUTION] ★ New best: {:.4}", gen_fit));
+            let global_best = self.best_score();
+            if gen_fit >= global_best {
+                messages.push(format!("[EVOLUTION] ★ New global best: {:.4}", gen_fit));
+            } else {
+                messages.push(format!(
+                    "[EVOLUTION] ✓ Beat parent ({:.4} → {:.4}, global best: {:.4})",
+                    parent_fitness, gen_fit, global_best
+                ));
+            }
         } else {
-            // ✗ Failure — didn't beat the best score
+            // ✗ Failure — didn't beat the parent
             let _ = self.db.execute(
                 "UPDATE node SET status = 'failed', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_fit as f64],
             );
             messages.push(format!(
-                "[EVOLUTION] ✗ Failed ({:.4} ≤ best {:.4})",
-                gen_fit, island.best_score
+                "[EVOLUTION] ✗ Failed ({:.4} < parent {:.4})",
+                gen_fit, parent_fitness
             ));
 
             // Check if this island has exhausted its patience at current spawn parent
@@ -413,13 +442,24 @@ impl Governor {
             && self.generation % self.config.migration_interval as u32 == 0
             && self.islands.len() > 1
         {
+            // Find island with highest spawn parent fitness
             let best_island_idx = self
                 .islands
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    a.best_score.partial_cmp(&b.best_score).unwrap()
+                .map(|(i, island)| {
+                    let fit = island.spawn_parent_id.map_or(-1.0, |id| {
+                        self.db
+                            .query_row(
+                                "SELECT COALESCE(best_fitness, -1.0) FROM node WHERE id = ?1",
+                                params![id],
+                                |row| row.get::<_, f64>(0),
+                            )
+                            .unwrap_or(-1.0)
+                    });
+                    (i, fit)
                 })
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
@@ -451,8 +491,9 @@ impl Governor {
     /// spawn parent. Marks the node as exhausted (for tree display) and moves
     /// the island to the parent node with a fresh patience budget.
     ///
-    /// If the island is already at root, partially rolls back `best_score`
-    /// (×0.95) to give slack for re-exploration.
+    /// With beat-the-parent scoring, backtracking naturally lowers the bar
+    /// to the parent's fitness, enabling exploration of alternative branches.
+    /// At root, patience simply resets — no artificial score rollback needed.
     fn backtrack_island(&mut self, messages: &mut Vec<String>) {
         let island = &mut self.islands[self.active_island];
         let spawn_id = match island.spawn_parent_id {
@@ -477,7 +518,8 @@ impl Governor {
 
         match parent_id {
             Some(pid) => {
-                // Non-root: move up one level, fresh patience budget
+                // Non-root: move up one level, fresh patience budget.
+                // The bar automatically lowers to pid's fitness.
                 island.spawn_parent_id = Some(pid);
                 island.attempts = 0;
                 messages.push(format!(
@@ -486,12 +528,12 @@ impl Governor {
                 ));
             }
             None => {
-                // Root exhaustion: partial rollback preserves most progress
-                island.best_score *= 0.95;
+                // Root exhaustion: reset patience and keep exploring from root.
+                // Since we compare against the parent (root) fitness, no rollback needed.
                 island.attempts = 0;
                 messages.push(format!(
-                    "[EVOLUTION] Island {} root exhausted — best score rolled back to {:.4} (×0.95)",
-                    self.active_island, island.best_score
+                    "[EVOLUTION] Island {} root exhausted — resetting patience",
+                    self.active_island
                 ));
             }
         }
@@ -546,7 +588,7 @@ impl Governor {
         );
 
         // Record which parameters were mutated
-        let parent_fitness = self.best_score();
+        let parent_fitness = self.spawn_parent_fitness();
         record_mutations(
             &self.db,
             new_node_id,
@@ -612,13 +654,9 @@ impl Governor {
 
     /// Persist best_score and spawn_parent_id for resume.
     fn persist_state(&self) {
-        // Save the best island's state
         let best_score = self.best_score();
-        let best_island = self
-            .islands
-            .iter()
-            .max_by(|a, b| a.best_score.partial_cmp(&b.best_score).unwrap());
-        let spawn_parent = best_island.and_then(|i| i.spawn_parent_id);
+        // Pick the active island's spawn parent for resume
+        let spawn_parent = self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id);
         let _ = self.db.execute(
             "UPDATE run SET best_score = ?1, spawn_parent_id = ?2 WHERE id = ?3",
             params![best_score as f64, spawn_parent, self.run_id],
@@ -1124,14 +1162,14 @@ mod tests {
     }
 
     #[test]
-    fn root_exhaustion_rolls_back_best_score() {
+    fn root_exhaustion_resets_patience() {
         let mut gov = test_governor(2);
 
-        // Gen 0: success (best=0.1)
+        // Gen 0: success — beats root (root has no fitness = -1.0)
         gov.advance(&mock_fitness(0.1));
         let root_id = node_parent(&gov, gov.current_node_id.unwrap()).unwrap();
 
-        // Gen 1: success (best=0.2)
+        // Gen 1: success (beats gen0's 0.1)
         gov.advance(&mock_fitness(0.2));
         let gen1_id = gov.spawn_parent_id().unwrap();
 
@@ -1142,38 +1180,37 @@ mod tests {
         assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
         // Now at root with fresh patience budget.
-        // Gen 4: fail → attempts=1 at root
-        gov.advance(&mock_fitness(0.12));
-        // Gen 5: fail → attempts=2 at root → root exhausted, partial rollback
-        gov.advance(&mock_fitness(0.12));
-        // Partial rollback: 0.2 * 0.95 = 0.19
-        assert!((gov.best_score() - 0.19).abs() < 0.001);
+        // Gen 4: fail at root (0.05 < root's 0.1)
+        gov.advance(&mock_fitness(0.05));
+        // Gen 5: fail at root → root exhausted, patience resets (no rollback)
+        gov.advance(&mock_fitness(0.05));
+        // Global best is still 0.2 (from gen1, stored in DB)
+        assert!((gov.best_score() - 0.2).abs() < 0.001);
+        // Still at root
         assert_eq!(gov.spawn_parent_id(), Some(root_id));
     }
 
     #[test]
-    fn after_root_reset_children_can_succeed() {
+    fn backtrack_lowers_bar_to_parent() {
         let mut gov = test_governor(1);
 
-        // Gen 0: success (best=0.1)
+        // Gen 0: success — beats root (-1.0), root's fitness becomes 0.1
         gov.advance(&mock_fitness(0.1));
         let root_id = node_parent(&gov, gov.current_node_id.unwrap()).unwrap();
 
-        // Gen 1: success (best=0.2)
+        // Gen 1: success (0.2 >= gen0's 0.1)
         gov.advance(&mock_fitness(0.2));
 
-        // Gen 2: fail → gen1 exhausted (patience=1), backtrack to root
+        // Gen 2: fail (0.15 < gen1's 0.2) → gen1 exhausted (patience=1), backtrack to root
         gov.advance(&mock_fitness(0.15));
         assert_eq!(gov.spawn_parent_id(), Some(root_id));
 
-        // Gen 3: fail at root → root exhausted, partial rollback
-        gov.advance(&mock_fitness(0.15));
-        // Partial rollback: 0.2 * 0.95 = 0.19
-        assert!((gov.best_score() - 0.19).abs() < 0.001);
-
-        // Gen 4: 0.19 >= 0.19 → success (ties accepted)!
-        gov.advance(&mock_fitness(0.19));
-        assert!((gov.best_score() - 0.19).abs() < 0.001);
+        // Gen 3: now only needs to beat root's fitness (0.1), NOT the global best (0.2)
+        // 0.12 >= 0.1 → SUCCESS under beat-the-parent model
+        gov.advance(&mock_fitness(0.12));
+        assert_ne!(gov.spawn_parent_id(), Some(root_id)); // moved past root
+        // Global best is still 0.2
+        assert!((gov.best_score() - 0.2).abs() < 0.001);
     }
 
     #[test]
@@ -1197,7 +1234,7 @@ mod tests {
 
     #[test]
     fn full_trace_with_new_semantics() {
-        // Validates: >= success, partial rollback, tie acceptance
+        // Validates: >= success, beat-the-parent, tie acceptance, backtracking
         let mut gov = test_governor(3);
         let root_id = gov.current_node_id.unwrap();
 

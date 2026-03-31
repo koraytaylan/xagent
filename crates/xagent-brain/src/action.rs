@@ -193,11 +193,17 @@ impl ActionSelector {
         self.assign_credit(homeostatic_gradient, true);
 
         // --- Adaptive exploration rate ---
+        // Base of 0.15 (was 0.4): with weight inheritance and a trained predictor,
+        // the champion already knows useful behaviors. A 40% random noise rate
+        // makes coherent multi-tick actions (like approaching food) nearly
+        // impossible: P(10 uninterrupted ticks) = 0.9%. At 12.5% exploration
+        // (typical for an inherited champion), P(10 ticks) = 26%.
+        // Novel situations still get high exploration via novelty_bonus.
         let stability = recalled.len() as f32 / 16.0;
         let novelty_bonus = (prediction_error * 2.0).min(0.4);
         let urgency_penalty = (urgency * 0.4).min(0.5);
         self.exploration_rate =
-            (0.4 - stability * 0.2 + novelty_bonus - urgency_penalty).clamp(0.10, 0.85);
+            (0.15 - stability * 0.1 + novelty_bonus - urgency_penalty).clamp(0.05, 0.85);
 
         // Compute action preferences from RAW features (full spatial specificity)
         let mut preferences = self.compute_raw_preferences(raw_features);

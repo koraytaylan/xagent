@@ -88,9 +88,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
             })
             .collect();
 
-        // Inherit learned weights into champion agents
+        // ALL agents inherit action weights (raw-feature policy is config-independent).
+        // This gives mutants the same behavioral baseline so evolution tests whether
+        // different brain architectures improve learning beyond the inherited policy.
         if let Some(ref state) = inherited_state {
-            for agent in agents.iter_mut().take(repeats) {
+            for agent in agents.iter_mut() {
                 agent.brain.import_learned_state(state);
             }
         }

@@ -643,9 +643,15 @@ impl App {
                 let repeats = self.governor_config.eval_repeats.max(1);
                 self.spawn_population_from_configs(&configs);
                 // Inherit learned weights into champion agents (first eval_repeats slots).
-                // Champions share the parent's BrainConfig, so dimensions always match.
+                // ALL agents inherit the action weights, not just champions.
+                // Action weights are 8×201 (raw features) — independent of
+                // repr_dim, so they're compatible with any BrainConfig.
+                // This gives mutants the same behavioral baseline as the
+                // champion, so evolution can test whether a mutant's brain
+                // architecture helps it improve BEYOND that baseline.
+                // Predictor weights are only inherited by matching-dim agents.
                 if let Some(ref state) = inherited_state {
-                    for agent in self.agents.iter_mut().take(repeats) {
+                    for agent in self.agents.iter_mut() {
                         agent.brain.import_learned_state(state);
                     }
                 }

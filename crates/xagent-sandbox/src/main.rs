@@ -28,8 +28,8 @@ use xagent_sandbox::gpu_compute::GpuBrainCompute;
 use xagent_sandbox::headless;
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
-    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, SortMode,
-    Tab, TabContext, WorldSnapshot,
+    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
+    SortMode, Tab, TabContext, WorldSnapshot,
 };
 
 use xagent_sandbox::world::WorldState;
@@ -316,6 +316,9 @@ struct App {
     // Replay recording
     recording: Option<xagent_sandbox::replay::GenerationRecording>,
     last_recording: Option<xagent_sandbox::replay::GenerationRecording>,
+
+    // Replay playback state
+    replay_state: ReplayState,
 }
 
 impl App {
@@ -436,6 +439,7 @@ impl App {
             world_snapshot: WorldSnapshot::default(),
             recording: None,
             last_recording: None,
+            replay_state: ReplayState::default(),
         }
     }
 
@@ -1616,6 +1620,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Advance replay playback
+                if self.replay_state.active && self.replay_state.playing {
+                    let advance = (self.replay_state.speed as u64).max(1);
+                    self.replay_state.current_tick = (self.replay_state.current_tick + advance)
+                        .min(self.replay_state.total_ticks.saturating_sub(1));
+                    if self.replay_state.current_tick >= self.replay_state.total_ticks.saturating_sub(1) {
+                        self.replay_state.playing = false;
+                    }
+                }
+
                 // Fix selected index if agents were removed
                 if !self.agents.is_empty() {
                     self.selected_agent_idx =
@@ -2022,6 +2036,8 @@ impl ApplicationHandler for App {
                                 let mut chart_win = self.chart_window;
                                 let mut sort_mode = self.sort_mode;
                                 let dock_state = &mut self.dock_state;
+                                let replay_state = &mut self.replay_state;
+                                let last_recording = self.last_recording.as_ref();
 
                                 egui.render(
                                     window,
@@ -2300,6 +2316,8 @@ impl ApplicationHandler for App {
                                                     evolution: &mut evo_snap,
                                                     evolution_action: &mut evo_action,
                                                     world: &world_snap,
+                                                    replay: replay_state,
+                                                    recording: last_recording,
                                                 };
                                                 egui_dock::DockArea::new(dock_state)
                                                     .style(egui_dock::Style::from_egui(ui.style().as_ref()))

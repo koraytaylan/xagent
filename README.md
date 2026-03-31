@@ -44,7 +44,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, `WorldConfig`, and the `CognitiveArchitecture` trait. No logic — just types. |
 | **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
-| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (docked sidebar, agent detail tabs, console), CSV logging, and the main event loop. |
+| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, CSV logging, and the main event loop. |
 
 ### Communication Flow
 
@@ -95,7 +95,7 @@ encode → recall → predict → compare → learn → act
    - **Encoder weights** receive L2 regularization to stay bounded
    - **Learning rate** is modulated by homeostatic gradient magnitude
 
-6. **Act** — The `ActionSelector` chooses a motor command via a learned linear policy — a weight matrix mapping encoded state to action preferences. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration uses uniform random action selection (10–85% of ticks, adaptive).
+6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%).
 
 ### Homeostatic Feedback
 
@@ -120,7 +120,7 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ## 4. The Sandbox World
 
-The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides a docked tab layout: a left sidebar with the agent list, a main area with the 3D viewport and agent detail tabs, and a bottom console for event logs.
+The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides a docked tab layout: a sortable left sidebar with the agent list, a main area with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, decision stream, and replay playback controls), and a bottom console for event logs.
 
 ### Terrain & Biomes
 
@@ -231,9 +231,12 @@ cargo run --release -- --config experiment.json
 
 | Action | Effect |
 |--------|--------|
+| Sort dropdown (sidebar top) | Sort agent list by ID, Energy, Integrity, Deaths, etc. |
 | Click agent in sidebar | Select / focus that agent |
 | Double-click agent in sidebar | Open an agent detail tab in the dock area |
 | Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| "Replay Gen N" button (detail tab) | Enter replay mode for the last completed generation |
+| Timeline scrubber (replay mode) | Scrub through recorded ticks |
 | Close detail tab | Click the × on the tab header |
 
 Camera controls (drag, scroll) are routed to the 3D viewport only when the pointer is hovering over it; interacting with the sidebar or detail tabs does not move the camera.
@@ -320,7 +323,7 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 
 ### Key Metrics to Watch
 
-These metrics are visible in the **sidebar** (compact vitals and sparkline charts) and in **agent detail tabs** (full vitals grid, brain info, and scrollable history charts). The CSV log files also record all metrics per tick.
+These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning). The CSV log files also record all metrics per tick. Completed generations can be replayed via the built-in replay system.
 
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
@@ -389,7 +392,7 @@ xagent/
 │   │   ├── README.md           # Deep dive into brain internals
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports
-│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry
+│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry + DecisionSnapshot
 │   │       ├── encoder.rs      # SensoryEncoder (feature extraction + projection)
 │   │       ├── memory.rs       # PatternMemory (store, recall, associate, decay)
 │   │       ├── predictor.rs    # Predictor (state prediction + gradient descent)
@@ -416,7 +419,8 @@ xagent/
 │       │   │   ├── camera.rs   # Free-fly camera with mouse look
 │       │   │   ├── hud.rs      # HUD bar overlay (energy, integrity, etc.)
 │       │   │   └── font.rs     # Bitmap font atlas + text rendering
-│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot)
+│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot, WorldSnapshot, ReplayState)
+│       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
 │       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
 │           └── integration.rs  # 14 integration tests

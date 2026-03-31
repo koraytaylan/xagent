@@ -17,6 +17,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
 | CSV telemetry recording | `recording.rs` |
+| Per-generation replay recording & playback | `replay.rs` |
 | Event loop & orchestration | `main.rs` |
 
 ---
@@ -31,7 +32,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ recording  │  │
 │  │          │  │          │  │          │  │          │  │            │  │
 │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │recording.rs│  │
-│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
+│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │ replay.rs  │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
@@ -61,11 +62,13 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │     a. extract_senses() → SensoryFrame            │         │          │
 │  │     b. brain.tick(frame) → MotorCommand            │         │          │
 │  │     c. physics::step(agent, motor, world)         │         │          │
-│  │     d. death/respawn/reproduction checks          │         │          │
-│  │  3. Rebuild meshes (agents, food)                 │         │          │
-│  │  4. Build HUD bars                                │         │          │
-│  │  5. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  6. Log telemetry to CSV                          │                    │
+│  │     d. Record tick data + food events to replay   │         │          │
+│  │     e. death/respawn/reproduction checks          │         │          │
+│  │  3. Advance replay playback (if active)           │         │          │
+│  │  4. Rebuild meshes (agents, food)                 │         │          │
+│  │  5. Build HUD bars                                │         │          │
+│  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
+│  │  7. Log telemetry to CSV                          │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -191,16 +194,18 @@ The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as 
 | Type | Role |
 |---|---|
 | `EguiIntegration` | Owns the egui context, winit integration state, wgpu renderer, and the offscreen texture that embeds the 3D viewport inside an egui panel. |
-| `Tab` | Enum — `Sandbox` (the 3D viewport, always open) or `AgentDetail(u32)` (per-agent detail view). |
-| `TabViewer` | Implements `egui_dock::TabViewer` to render each tab's content (viewport image or agent detail UI). |
-| `AgentSnapshot` | Per-frame copy of an agent's vitals, brain metrics, action weights, and history buffers — decouples the UI from the simulation's mutable state. |
-| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, and agent snapshots. |
+| `Tab` | Enum — `Sandbox` (3D viewport, always open), `Evolution` (evolution dashboard), or `AgentDetail(u32)` (per-agent detail view). |
+| `SortMode` | Enum — 7 sorting options for the sidebar agent list: Id, Energy, Integrity, Deaths, LongestLife, PredictionError, Fitness. |
+| `AgentSnapshot` | Per-frame copy of an agent's vitals, brain metrics, motor output, decision log, vision data, position, and history buffers — decouples the UI from the simulation's mutable state. |
+| `WorldSnapshot` | Per-frame world state for the mini-map: world size, food positions, and a cached 256x256 biome texture. |
+| `ReplayState` | Playback state for the replay system: active flag, current tick, playing/paused, speed multiplier, total ticks, selected agent index. |
+| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, agent snapshots, world snapshot, replay state, and last generation recording. |
 
 #### Layout
 
-- **Left sidebar** — Agent list with colored dots, compact energy/integrity bars, a combined 4-line sparkline chart (energy green, integrity blue, prediction error orange, exploration purple), death count, and best life duration.
-- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
-- **Agent detail tabs** — Color dot + heading, vitals grid (energy/integrity bars), statistics (deaths, longest life, age), brain info (prediction error, exploration rate), action weights grid (8 bars), a **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), and an **Action Weight History** chart (8-line with auto-scaled Y axis, shared zoom).
+- **Left sidebar** — Sort dropdown (by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, Fitness), agent list with colored dots, compact energy/integrity bars, phase label, death count, food consumed, and best life duration.
+- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; the **Evolution** tab shows the evolution dashboard; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
+- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), **Agent Vision** display (8x6 upscaled color grid showing what the agent sees), **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
 - **Bottom console** — Scrollable log of death/spawn/respawn events.
 
 #### Viewport Integration
@@ -330,7 +335,9 @@ pub struct FoodItem {
 14. **Biome effects** — in `Danger`: `integrity -= hazard_damage_rate`.
 15. **Integrity regen** — if `energy_signal > 0.5` and not full, `integrity += regen_rate`.
 16. **Auto-consume food** — find nearest non-consumed food within 2.5 units regardless
-    of action. Consume it: `energy += food_energy_value` (capped at max).
+    of action. Consume it: `energy += food_energy_value` (capped at max). Returns
+    `Some(food_index)` with the consumed item's index (used by the replay recording
+    system to track food events), or `None` if no food was consumed.
 17. **Death check** — if `energy ≤ 0` or `integrity ≤ 0`, set `alive = false`.
 
 #### Agent-Agent Collision
@@ -374,6 +381,9 @@ pub struct Agent {
     pub persist_brain: bool,   // if true, brain survives death
     pub has_reproduced: bool,  // once per life
     pub cached_motor: MotorCommand, // cached motor command for brain-decimated ticks
+    pub decision_log: VecDeque<DecisionSnapshot>, // last 256 brain decisions (ring buffer)
+    pub food_consumed: u32,    // cumulative food consumed
+    pub total_ticks_alive: u64, // cumulative ticks alive across all lives
 }
 ```
 
@@ -461,7 +471,7 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Recording & Telemetry (`recording.rs`)
+### 3.5 Recording, Telemetry & Replay (`recording.rs`, `replay.rs`)
 
 #### CSV Format
 
@@ -484,6 +494,38 @@ generation
 - Writes are buffered via `BufWriter<File>`.
 - **Flushed every 100 ticks** for crash safety.
 - Final flush on session exit (`print_session_summary()`).
+
+#### Per-Generation Replay Recording (`replay.rs`)
+
+The replay system captures per-tick agent state during evolution runs, enabling
+post-hoc playback of any completed generation.
+
+**Data Structures:**
+
+| Struct | Purpose |
+|--------|---------|
+| `TickRecord` | Per-tick per-agent snapshot: position, yaw, alive, energy, integrity, motor output, exploration rate, prediction error, gradient, urgency, credit magnitude, patterns recalled, phase, and optional vision keyframe |
+| `FoodEvent` | Sparse food state change: tick, food index, consumed flag, new position (on respawn) |
+| `GenerationRecording` | Complete generation recording: agent info, flat-array tick records (`tick * agent_count + agent_idx`), sparse food events, initial food positions |
+
+**Storage Strategy:**
+- Tick records are stored in a flat `Vec<TickRecord>` indexed as `tick * agent_count + agent_idx`
+- Vision data (192 floats per agent) is only stored at keyframes (every 30 ticks) to save memory
+- Food events are sparse — only recorded when food is consumed or respawns
+- Initial food positions are stored once for reconstruction via `food_at_tick()`
+
+**Integration Points:**
+- Recording starts when a new generation spawns (`spawn_evolution_population` / `spawn_population_from_configs`)
+- Per-tick data is captured after physics and collision resolution
+- Food consumption events are captured when `physics::step()` returns `Some(food_index)`
+- Food respawn events are captured from `WorldState::last_respawned_indices()`
+- When a generation completes, the recording moves to `last_recording` for playback
+
+**Playback:**
+- The agent detail tab shows a "Replay Gen N" button when a recording is available
+- Timeline scrubber, play/pause, and speed controls (0.5x–8x)
+- Builds temporary `AgentSnapshot` and `WorldSnapshot` from recorded data at the current tick
+- Food positions are reconstructed by replaying food events up to the current tick
 
 #### Console Telemetry
 
@@ -883,8 +925,8 @@ death/respawn.
 Clicking an agent in the **sidebar** selects it; double-clicking opens a dedicated
 detail tab in the dock area. The selected agent is indicated by a yellow diamond
 marker floating above it in the 3D viewport. Its data drives:
-- **Sidebar**: colored dot, compact energy/integrity bars, 4-line sparkline chart (energy green, integrity blue, prediction error orange, exploration purple), death count, best life
-- **Agent detail tab**: full vitals grid, statistics (deaths, longest life, age), brain info (prediction error, exploration), action weights grid (8 bars), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), Action Weight History chart (8-line, auto-scaled Y axis)
+- **Sidebar**: colored dot, compact energy/integrity bars, phase label, death count, food consumed, best life. Sortable by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, or Fitness via dropdown.
+- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), **Agent Vision** (8x6 upscaled color grid), **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, 0.5x–8x speed, live/replay toggle).
 - **Bottom console**: scrollable log showing death/spawn/respawn events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)

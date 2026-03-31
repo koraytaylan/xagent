@@ -194,6 +194,35 @@ impl Default for WorldSnapshot {
     }
 }
 
+/// State for the replay playback controls.
+pub struct ReplayState {
+    /// Whether replay mode is active.
+    pub active: bool,
+    /// Current playback tick.
+    pub current_tick: u64,
+    /// Whether playback is running (auto-advancing).
+    pub playing: bool,
+    /// Playback speed multiplier (1.0 = normal).
+    pub speed: f32,
+    /// Total ticks available in the recording.
+    pub total_ticks: u64,
+    /// Selected agent index in the recording.
+    pub selected_agent_idx: usize,
+}
+
+impl Default for ReplayState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            current_tick: 0,
+            playing: false,
+            speed: 1.0,
+            total_ticks: 0,
+            selected_agent_idx: 0,
+        }
+    }
+}
+
 /// Context passed to the TabViewer so it can render both viewport and agent detail tabs.
 pub struct TabContext<'a> {
     pub viewport_tex_id: egui::TextureId,
@@ -206,6 +235,8 @@ pub struct TabContext<'a> {
     pub evolution: &'a mut EvolutionSnapshot,
     pub evolution_action: &'a mut EvolutionAction,
     pub world: &'a WorldSnapshot,
+    pub replay: &'a mut ReplayState,
+    pub recording: Option<&'a crate::replay::GenerationRecording>,
 }
 
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,
@@ -470,7 +501,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                     egui::ScrollArea::vertical()
                         .id_salt(format!("agent_detail_scroll_{}", id))
                         .show(ui, |ui| {
-                            Self::render_agent_detail(ui, snap, self.chart_window, self.world, self.agents);
+                            Self::render_agent_detail(ui, snap, self.chart_window, self.world, self.agents, self.replay, self.recording);
                         });
                 } else {
                     ui.label(format!("Agent {} no longer exists.", id));
@@ -491,6 +522,8 @@ impl<'a> TabContext<'a> {
         chart_window: &mut usize,
         world: &WorldSnapshot,
         all_agents: &[AgentSnapshot],
+        replay: &mut ReplayState,
+        recording: Option<&crate::replay::GenerationRecording>,
     ) {
         let color = egui::Color32::from_rgb(
             (snap.color[0] * 255.0) as u8,
@@ -521,6 +554,191 @@ impl<'a> TabContext<'a> {
         });
         ui.separator();
 
+        // ── Replay Controls ──
+        if let Some(rec) = recording {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if replay.active {
+                    if ui.button("Live").clicked() {
+                        replay.active = false;
+                        replay.playing = false;
+                    }
+                } else if ui.button(format!("Replay Gen {}", rec.generation)).clicked() {
+                    replay.active = true;
+                    replay.current_tick = 0;
+                    replay.total_ticks = rec.total_ticks;
+                    replay.playing = false;
+                    replay.selected_agent_idx = rec.agent_info.iter()
+                        .position(|(id, _)| *id == snap.id)
+                        .unwrap_or(0);
+                }
+
+                if replay.active {
+                    ui.separator();
+                    if replay.playing {
+                        if ui.button("Pause").clicked() {
+                            replay.playing = false;
+                        }
+                    } else if ui.button("Play").clicked() {
+                        replay.playing = true;
+                    }
+
+                    if ui.button("Reset").clicked() {
+                        replay.current_tick = 0;
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Speed:").small());
+                    for &spd in &[0.5_f32, 1.0, 2.0, 4.0, 8.0] {
+                        let label = if spd == 1.0 { "1x".to_string() } else { format!("{}x", spd) };
+                        if ui.selectable_label((replay.speed - spd).abs() < 0.01, &label).clicked() {
+                            replay.speed = spd;
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Tick {}/{}", replay.current_tick, replay.total_ticks
+                        ))
+                        .monospace()
+                        .small(),
+                    );
+                }
+            });
+
+            if replay.active {
+                let mut tick_f = replay.current_tick as f32;
+                let max_f = replay.total_ticks.saturating_sub(1).max(1) as f32;
+                ui.add(egui::Slider::new(&mut tick_f, 0.0..=max_f).show_value(false));
+                replay.current_tick = tick_f as u64;
+            }
+            ui.separator();
+        }
+
+        // If replay is active, build snapshot from recording
+        let replay_snap;
+        let effective_snap = if replay.active {
+            if let Some(rec) = recording {
+                if let Some(record) = rec.get(replay.current_tick, replay.selected_agent_idx) {
+                    let (id, color) = rec.agent_info[replay.selected_agent_idx];
+                    replay_snap = AgentSnapshot {
+                        id,
+                        gen: rec.generation,
+                        energy: record.energy,
+                        max_energy: 1.0,
+                        integrity: record.integrity,
+                        max_integrity: 1.0,
+                        alive: record.alive,
+                        deaths: 0,
+                        color,
+                        longest_life: 0,
+                        exploration_rate: record.exploration_rate,
+                        prediction_error: record.prediction_error,
+                        forward_weight_norm: 0.0,
+                        turn_weight_norm: 0.0,
+                        prediction_error_history: Vec::new(),
+                        exploration_rate_history: Vec::new(),
+                        energy_history: Vec::new(),
+                        integrity_history: Vec::new(),
+                        decision_log: Vec::new(),
+                        gradient: record.gradient,
+                        urgency: record.urgency,
+                        food_consumed: 0,
+                        total_ticks_alive: replay.current_tick,
+                        motor_forward: record.motor_forward,
+                        motor_turn: record.motor_turn,
+                        phase: crate::replay::GenerationRecording::phase_label(record.phase),
+                        vision_color: record.vision_color.clone().unwrap_or_default(),
+                        vision_width: 8,
+                        vision_height: 6,
+                        position: record.position,
+                        yaw: record.yaw,
+                    };
+                    &replay_snap
+                } else {
+                    snap
+                }
+            } else {
+                snap
+            }
+        } else {
+            snap
+        };
+
+        // Build effective world for replay (food positions from recording)
+        let replay_world;
+        let effective_world = if replay.active {
+            if let Some(rec) = recording {
+                let food = rec.food_at_tick(replay.current_tick);
+                replay_world = WorldSnapshot {
+                    world_size: world.world_size,
+                    food_positions: food.iter()
+                        .filter(|(_, consumed)| !consumed)
+                        .map(|(p, _)| [p[0], p[2]])
+                        .collect(),
+                    biome_texture: world.biome_texture.clone(),
+                };
+                &replay_world
+            } else {
+                world
+            }
+        } else {
+            world
+        };
+
+        // Build effective agents for replay (all agents at this tick)
+        let replay_agents;
+        let effective_agents = if replay.active {
+            if let Some(rec) = recording {
+                if let Some(tick_records) = rec.get_tick(replay.current_tick) {
+                    replay_agents = tick_records.iter().enumerate().map(|(i, r)| {
+                        let (id, color) = rec.agent_info[i];
+                        AgentSnapshot {
+                            id,
+                            gen: rec.generation,
+                            energy: r.energy,
+                            max_energy: 1.0,
+                            integrity: r.integrity,
+                            max_integrity: 1.0,
+                            alive: r.alive,
+                            deaths: 0,
+                            color,
+                            longest_life: 0,
+                            exploration_rate: r.exploration_rate,
+                            prediction_error: r.prediction_error,
+                            forward_weight_norm: 0.0,
+                            turn_weight_norm: 0.0,
+                            prediction_error_history: Vec::new(),
+                            exploration_rate_history: Vec::new(),
+                            energy_history: Vec::new(),
+                            integrity_history: Vec::new(),
+                            decision_log: Vec::new(),
+                            gradient: r.gradient,
+                            urgency: r.urgency,
+                            food_consumed: 0,
+                            total_ticks_alive: 0,
+                            motor_forward: r.motor_forward,
+                            motor_turn: r.motor_turn,
+                            phase: crate::replay::GenerationRecording::phase_label(r.phase),
+                            vision_color: Vec::new(),
+                            vision_width: 8,
+                            vision_height: 6,
+                            position: r.position,
+                            yaw: r.yaw,
+                        }
+                    }).collect::<Vec<_>>();
+                    &replay_agents[..]
+                } else {
+                    all_agents
+                }
+            } else {
+                all_agents
+            }
+        } else {
+            all_agents
+        };
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             // -- Vitals + Motor --
             ui.columns(2, |cols| {
@@ -528,8 +746,8 @@ impl<'a> TabContext<'a> {
                 cols[0].label(egui::RichText::new("Vitals").strong());
                 cols[0].add_space(4.0);
 
-                let energy_frac = snap.energy / snap.max_energy.max(0.001);
-                let integrity_frac = snap.integrity / snap.max_integrity.max(0.001);
+                let energy_frac = effective_snap.energy / effective_snap.max_energy.max(0.001);
+                let integrity_frac = effective_snap.integrity / effective_snap.max_integrity.max(0.001);
 
                 egui::Grid::new("vitals_grid")
                     .num_columns(2)
@@ -537,7 +755,7 @@ impl<'a> TabContext<'a> {
                     .show(&mut cols[0], |ui| {
                         ui.label("Energy:");
                         ui.add(egui::ProgressBar::new(energy_frac)
-                            .text(format!("{:.1}/{:.0}", snap.energy, snap.max_energy))
+                            .text(format!("{:.1}/{:.0}", effective_snap.energy, effective_snap.max_energy))
                             .fill(if energy_frac > 0.5 {
                                 egui::Color32::from_rgb(80, 200, 80)
                             } else if energy_frac > 0.25 {
@@ -549,7 +767,7 @@ impl<'a> TabContext<'a> {
 
                         ui.label("Integrity:");
                         ui.add(egui::ProgressBar::new(integrity_frac)
-                            .text(format!("{:.1}/{:.0}", snap.integrity, snap.max_integrity))
+                            .text(format!("{:.1}/{:.0}", effective_snap.integrity, effective_snap.max_integrity))
                             .fill(egui::Color32::from_rgb(100, 150, 255)));
                         ui.end_row();
                     });
@@ -557,18 +775,18 @@ impl<'a> TabContext<'a> {
                 cols[0].add_space(8.0);
                 cols[0].label(egui::RichText::new("Statistics").strong());
                 cols[0].add_space(4.0);
-                cols[0].label(format!("Deaths: {}", snap.deaths));
-                cols[0].label(format!("Food consumed: {}", snap.food_consumed));
-                cols[0].label(format!("Longest life: {} ticks", snap.longest_life));
-                cols[0].label(format!("Total alive: {} ticks", snap.total_ticks_alive));
+                cols[0].label(format!("Deaths: {}", effective_snap.deaths));
+                cols[0].label(format!("Food consumed: {}", effective_snap.food_consumed));
+                cols[0].label(format!("Longest life: {} ticks", effective_snap.longest_life));
+                cols[0].label(format!("Total alive: {} ticks", effective_snap.total_ticks_alive));
 
                 // Right column: brain + motor
                 cols[1].label(egui::RichText::new("Brain").strong());
                 cols[1].add_space(4.0);
-                cols[1].label(format!("Exploration: {:.1}%", snap.exploration_rate * 100.0));
-                cols[1].label(format!("Pred. error: {:.4}", snap.prediction_error));
-                cols[1].label(format!("Gradient: {:+.4}", snap.gradient));
-                cols[1].label(format!("Urgency: {:.2}", snap.urgency));
+                cols[1].label(format!("Exploration: {:.1}%", effective_snap.exploration_rate * 100.0));
+                cols[1].label(format!("Pred. error: {:.4}", effective_snap.prediction_error));
+                cols[1].label(format!("Gradient: {:+.4}", effective_snap.gradient));
+                cols[1].label(format!("Urgency: {:.2}", effective_snap.urgency));
 
                 cols[1].add_space(8.0);
                 cols[1].label(egui::RichText::new("Motor Output").strong());
@@ -579,7 +797,7 @@ impl<'a> TabContext<'a> {
                     .spacing([8.0, 4.0])
                     .show(&mut cols[1], |ui| {
                         ui.label("Forward:");
-                        let fwd = snap.motor_forward;
+                        let fwd = effective_snap.motor_forward;
                         let fwd_color = if fwd >= 0.0 {
                             egui::Color32::from_rgb(80, 200, 80)
                         } else {
@@ -592,7 +810,7 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
 
                         ui.label("Turn:");
-                        let trn = snap.motor_turn;
+                        let trn = effective_snap.motor_turn;
                         let trn_color = if trn >= 0.0 {
                             egui::Color32::from_rgb(100, 150, 255)
                         } else {
@@ -605,11 +823,11 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
 
                         ui.label("Fwd norm:");
-                        ui.label(format!("{:.3}", snap.forward_weight_norm));
+                        ui.label(format!("{:.3}", effective_snap.forward_weight_norm));
                         ui.end_row();
 
                         ui.label("Turn norm:");
-                        ui.label(format!("{:.3}", snap.turn_weight_norm));
+                        ui.label(format!("{:.3}", effective_snap.turn_weight_norm));
                         ui.end_row();
                     });
             });
@@ -619,9 +837,9 @@ impl<'a> TabContext<'a> {
             ui.label(egui::RichText::new("Vision").strong());
             ui.add_space(4.0);
 
-            if snap.vision_color.len() >= (snap.vision_width * snap.vision_height * 4) as usize {
-                let vw = snap.vision_width as usize;
-                let vh = snap.vision_height as usize;
+            if effective_snap.vision_color.len() >= (effective_snap.vision_width * effective_snap.vision_height * 4) as usize {
+                let vw = effective_snap.vision_width as usize;
+                let vh = effective_snap.vision_height as usize;
                 let display_w = ui.available_width().min(320.0).max(80.0);
                 let cell_w = display_w / vw as f32;
                 let cell_h = cell_w; // square pixels
@@ -640,9 +858,9 @@ impl<'a> TabContext<'a> {
                 for row in 0..vh {
                     for col in 0..vw {
                         let idx = (row * vw + col) * 4;
-                        let r = (snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
-                        let g = (snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0) as u8;
-                        let b = (snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0) as u8;
+                        let r = (effective_snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
+                        let g = (effective_snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0) as u8;
+                        let b = (effective_snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0) as u8;
                         let pixel_rect = egui::Rect::from_min_size(
                             egui::pos2(
                                 rect.left() + col as f32 * cell_w,
@@ -697,7 +915,7 @@ impl<'a> TabContext<'a> {
             let p = ui.painter();
 
             // Draw biome texture as background
-            if let Some(ref tex) = world.biome_texture {
+            if let Some(ref tex) = effective_world.biome_texture {
                 p.image(
                     tex.id(),
                     map_rect,
@@ -708,7 +926,7 @@ impl<'a> TabContext<'a> {
                 p.rect_filled(map_rect, 2.0, egui::Color32::from_gray(30));
             }
 
-            let ws = world.world_size;
+            let ws = effective_world.world_size;
             let half = ws / 2.0;
 
             // Helper: world (x, z) → map pixel position
@@ -722,14 +940,14 @@ impl<'a> TabContext<'a> {
             };
 
             // Draw food items as small yellow-green dots
-            for fp in &world.food_positions {
+            for fp in &effective_world.food_positions {
                 let pos = to_map(fp[0], fp[1]);
                 p.circle_filled(pos, 2.0, egui::Color32::from_rgb(140, 200, 40));
             }
 
             // Draw all other agents as small dots
-            for other in all_agents {
-                if other.id == snap.id {
+            for other in effective_agents {
+                if other.id == effective_snap.id {
                     continue;
                 }
                 let acolor = if other.alive {
@@ -747,11 +965,11 @@ impl<'a> TabContext<'a> {
 
             // Draw selected agent as a larger dot with facing direction arrow
             {
-                let agent_pos = to_map(snap.position[0], snap.position[2]);
+                let agent_pos = to_map(effective_snap.position[0], effective_snap.position[2]);
                 let agent_color = egui::Color32::from_rgb(
-                    (snap.color[0] * 255.0) as u8,
-                    (snap.color[1] * 255.0) as u8,
-                    (snap.color[2] * 255.0) as u8,
+                    (effective_snap.color[0] * 255.0) as u8,
+                    (effective_snap.color[1] * 255.0) as u8,
+                    (effective_snap.color[2] * 255.0) as u8,
                 );
 
                 // Agent dot
@@ -760,8 +978,8 @@ impl<'a> TabContext<'a> {
 
                 // Facing direction arrow
                 let arrow_len = 12.0;
-                let dx = snap.yaw.sin() * arrow_len;
-                let dz = snap.yaw.cos() * arrow_len;
+                let dx = effective_snap.yaw.sin() * arrow_len;
+                let dz = effective_snap.yaw.cos() * arrow_len;
                 let arrow_end = egui::pos2(agent_pos.x + dx, agent_pos.y + dz);
                 p.line_segment(
                     [agent_pos, arrow_end],
@@ -828,10 +1046,10 @@ impl<'a> TabContext<'a> {
 
             let window = *chart_window;
             let series_data: [(&[f32], egui::Color32); 4] = [
-                (&snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
-                (&snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
-                (&snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
-                (&snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
+                (&effective_snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
+                (&effective_snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
+                (&effective_snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
+                (&effective_snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
             ];
             for &(full_data, color) in &series_data {
                 let start = full_data.len().saturating_sub(window);
@@ -856,15 +1074,15 @@ impl<'a> TabContext<'a> {
             ui.label(egui::RichText::new("Decision Stream").strong().size(14.0));
             ui.add_space(4.0);
 
-            if snap.decision_log.is_empty() {
+            if effective_snap.decision_log.is_empty() {
                 ui.label(
                     egui::RichText::new("No decisions recorded yet.")
                         .italics()
                         .color(egui::Color32::GRAY),
                 );
             } else {
-                let display_count = snap.decision_log.len().min(64);
-                let start = snap.decision_log.len() - display_count;
+                let display_count = effective_snap.decision_log.len().min(64);
+                let start = effective_snap.decision_log.len() - display_count;
 
                 // Column headers
                 ui.horizontal(|ui| {
@@ -886,7 +1104,7 @@ impl<'a> TabContext<'a> {
                     .max_height(300.0)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        for d in snap.decision_log[start..].iter().rev() {
+                        for d in effective_snap.decision_log[start..].iter().rev() {
                             let bg = if d.credit_magnitude > 0.05 {
                                 if d.raw_gradient > 0.0 {
                                     egui::Color32::from_rgba_premultiplied(30, 60, 30, 255)

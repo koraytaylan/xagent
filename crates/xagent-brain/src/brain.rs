@@ -115,10 +115,8 @@ impl Brain {
 
     /// Process one tick: sensory input → motor output.
     pub fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
-        // Extract raw features first (for the action selector), then encode.
-        let raw_features = self.encoder.extract_features(frame).to_vec();
         let encoded = self.encoder.encode(frame);
-        self.tick_inner(frame, encoded, None, &raw_features)
+        self.tick_inner(frame, encoded, None)
     }
 
     /// Process one tick using GPU-computed encode and recall results.
@@ -128,9 +126,8 @@ impl Brain {
         gpu_encoded: &[f32],
         gpu_similarities: &[f32],
     ) -> MotorCommand {
-        let raw_features = self.encoder.extract_features(frame).to_vec();
         let encoded = EncodedState::from_slice(gpu_encoded);
-        self.tick_inner(frame, encoded, Some(gpu_similarities), &raw_features)
+        self.tick_inner(frame, encoded, Some(gpu_similarities))
     }
 
     /// Shared implementation for both CPU and GPU tick paths.
@@ -139,7 +136,6 @@ impl Brain {
         frame: &SensoryFrame,
         encoded: EncodedState,
         gpu_similarities: Option<&[f32]>,
-        raw_features: &[f32],
     ) -> MotorCommand {
         self.tick_count += 1;
         self.memory.advance_tick();
@@ -214,8 +210,6 @@ impl Brain {
             homeo_state.raw_gradient,
             scalar_error,
             homeo_state.urgency,
-            &mut self.memory,
-            raw_features,
         );
 
         // 9. Record prediction for next tick's error computation
@@ -288,7 +282,6 @@ impl Brain {
     pub fn export_learned_state(&self) -> LearnedState {
         LearnedState {
             action_weights: self.action_selector.export_weights(),
-            global_action_values: self.action_selector.export_global_values(),
             predictor_weights: self.predictor.export_weights(),
             predictor_context_weight: self.predictor.export_context_weight(),
         }
@@ -301,14 +294,15 @@ impl Brain {
     /// The encoder is NOT imported because it's a deterministic projection —
     /// all brains with the same config already produce identical encodings.
     pub fn import_learned_state(&mut self, state: &LearnedState) {
-        self.action_selector.import_weights(&state.action_weights, &state.global_action_values);
+        self.action_selector.import_weights(&state.action_weights);
         self.predictor.import_weights(&state.predictor_weights, state.predictor_context_weight);
     }
 }
 
 /// Snapshot of a brain's learned weights for cross-generation inheritance.
 ///
-/// Captures the behavioral policy (action selector) and temporal model
+/// Captures the behavioral policy (action selector, now continuous motor
+/// weights: forward_weights + turn_weights + biases) and temporal model
 /// (predictor) that the agent discovered through within-lifetime learning.
 /// The encoder is NOT included because it's a fixed deterministic projection
 /// (seeded from representation_dim) — all brains with the same config
@@ -319,8 +313,8 @@ impl Brain {
 /// inherited policy is mostly ignored for the first ~500 ticks.
 #[derive(Clone, Debug)]
 pub struct LearnedState {
+    /// Combined continuous motor weights: [forward_weights..., turn_weights..., forward_bias, turn_bias].
     pub action_weights: Vec<f32>,
-    pub global_action_values: Vec<f32>,
     pub predictor_weights: Vec<f32>,
     pub predictor_context_weight: f32,
 }

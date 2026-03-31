@@ -12,7 +12,7 @@ const NON_VISUAL_FEATURES: usize = 9;
 const CHANNELS_PER_PIXEL: usize = 4;
 
 // (L2_REGULARIZATION_FACTOR and WEIGHT_CLAMP_RANGE removed:
-//  the encoder is now a fixed random projection — no adaptation.)
+//  the encoder uses Hebbian credit-driven adaptation via adapt_from_credit.)
 
 /// Compresses raw sensory input into a fixed-size internal representation.
 ///
@@ -22,18 +22,20 @@ const CHANNELS_PER_PIXEL: usize = 4;
 /// "green on the left → turn left" — something the old pooled-bin approach
 /// could never capture because it averaged away positional information.
 ///
-/// The encoder is a **fixed random projection** — weights are initialized
-/// deterministically from `representation_dim` as a seed and never adapted.
-/// This guarantees that all brains with the same config produce identical
-/// encodings, making action policy weights transferable across generations
-/// without needing to inherit encoder weights.
+/// Weights are initialized deterministically from `representation_dim` as a
+/// seed, ensuring all brains with the same config start from identical
+/// encodings. During the agent's lifetime, `adapt_from_credit()` refines
+/// the weights using the action selector's credit signal (Hebbian rule),
+/// amplifying the raw features that contribute to behaviourally relevant
+/// encoded dimensions. Inherited encoder weights are transferred via
+/// `import_weights()` / `weights_snapshot()`.
 pub struct SensoryEncoder {
     /// Dimensionality of the output representation.
     representation_dim: usize,
     /// Number of input features (visual pixels × channels + non-visual).
     feature_count: usize,
     /// Encoding weights: [representation_dim × feature_count], row-major.
-    /// Fixed after initialization — never adapted.
+    /// Initialized deterministically, then refined by `adapt_from_credit()`.
     weights: Vec<f32>,
     /// Per-feature bias terms (fixed at zero).
     biases: Vec<f32>,
@@ -161,15 +163,21 @@ impl SensoryEncoder {
         &self.biases
     }
 
-    /// Snapshot of encoder weights. Since the encoder is a fixed deterministic
-    /// projection, this is identical to `weights()` — included for API symmetry.
+    /// Snapshot of encoder weights for cross-generation inheritance.
     pub fn weights_snapshot(&self) -> Vec<f32> {
-        self.weights.to_vec()
+        self.weights.clone()
     }
 
-    /// No-op for the fixed encoder: all brains with the same representation_dim
-    /// already produce identical weights deterministically.
-    pub fn import_weights(&mut self, _weights: &[f32], _biases: &[f32]) {}
+    /// Import encoder weights and biases from a previous generation.
+    /// Silently skipped if dimensions don't match.
+    pub fn import_weights(&mut self, weights: &[f32], biases: &[f32]) {
+        if weights.len() == self.weights.len() {
+            self.weights.copy_from_slice(weights);
+        }
+        if biases.len() == self.biases.len() {
+            self.biases.copy_from_slice(biases);
+        }
+    }
 
     /// Number of input features.
     pub fn feature_count(&self) -> usize {
@@ -181,10 +189,34 @@ impl SensoryEncoder {
         self.representation_dim
     }
 
-    /// No-op: the encoder is a fixed random projection. Weights are
-    /// deterministic and never adapted, ensuring cross-generation
-    /// compatibility of action policy weights.
+    /// Legacy no-op: kept for backward compatibility.
+    /// The brain now calls `adapt_from_credit()` instead.
     pub fn adapt(&mut self, _error: f32, _learning_rate: f32) {}
+
+    /// Adapt encoder weights based on the action selector's credit signal.
+    ///
+    /// When the action selector learns "dimension i in encoded state correlates
+    /// with positive outcomes", the encoder amplifies the raw input features
+    /// that contribute to dimension i.
+    ///
+    /// Simple Hebbian rule: `delta_w[i,j] += lr * credit_signal[i] * input_feature[j]`
+    pub fn adapt_from_credit(&mut self, credit_signal: &[f32], learning_rate: f32) {
+        if !self.initialized || credit_signal.len() != self.representation_dim {
+            return;
+        }
+        let fc = self.feature_count;
+        for i in 0..self.representation_dim {
+            if credit_signal[i].abs() < 1e-6 {
+                continue;
+            }
+            let row_base = i * fc;
+            let scale = learning_rate * credit_signal[i] * 0.001; // small encoder LR
+            for j in 0..fc {
+                self.weights[row_base + j] += scale * self.feature_scratch[j];
+                self.weights[row_base + j] = self.weights[row_base + j].clamp(-2.0, 2.0);
+            }
+        }
+    }
 
     /// Extract raw per-pixel features from sensory data into the scratch buffer.
     ///
@@ -405,6 +437,60 @@ mod tests {
         let feats = enc.extract_features(&frame);
         // 4×3 pixels × 4 channels (RGBD) + 9 interoceptive = 57
         assert_eq!(feats.len(), 4 * 3 * 4 + 9);
+    }
+
+    #[test]
+    fn adapt_from_credit_modifies_weights() {
+        let mut enc = SensoryEncoder::new(8, 4);
+        // Force initialization by encoding a frame.
+        let _ = enc.encode(&make_frame(0.5, 0.5));
+        let weights_before: Vec<f32> = enc.weights.clone();
+
+        // Build a credit signal with non-zero values.
+        let credit: Vec<f32> = (0..8).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        enc.adapt_from_credit(&credit, 0.5);
+
+        assert_ne!(
+            enc.weights, weights_before,
+            "adapt_from_credit with non-zero signal should modify weights"
+        );
+    }
+
+    #[test]
+    fn adapt_from_credit_skips_zero_signal() {
+        let mut enc = SensoryEncoder::new(8, 4);
+        let _ = enc.encode(&make_frame(0.5, 0.5));
+        let weights_before: Vec<f32> = enc.weights.clone();
+
+        let credit = vec![0.0; 8];
+        enc.adapt_from_credit(&credit, 0.5);
+
+        assert_eq!(
+            enc.weights, weights_before,
+            "adapt_from_credit with zero signal should not modify weights"
+        );
+    }
+
+    #[test]
+    fn import_weights_restores_snapshot() {
+        let mut enc = SensoryEncoder::new(8, 4);
+        let _ = enc.encode(&make_frame(0.5, 0.5));
+
+        // Mutate weights via credit.
+        let credit: Vec<f32> = (0..8).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        enc.adapt_from_credit(&credit, 0.5);
+        let snapshot = enc.weights_snapshot();
+        let bias_snapshot: Vec<f32> = enc.biases().to_vec();
+
+        // Create a fresh encoder and import the snapshot.
+        let mut enc2 = SensoryEncoder::new(8, 4);
+        let _ = enc2.encode(&make_frame(0.5, 0.5));
+        enc2.import_weights(&snapshot, &bias_snapshot);
+
+        assert_eq!(
+            enc2.weights, enc.weights,
+            "import_weights should restore the snapshot"
+        );
     }
 
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {

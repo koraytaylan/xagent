@@ -82,6 +82,10 @@ pub struct ActionSelector {
     exploitative_actions: u64,
     /// Most recent encoded state snapshot for credit assignment context.
     current_state: Vec<f32>,
+    /// Per-dimension credit signal accumulated during the most recent
+    /// `assign_credit()` call. The encoder reads this to know which encoded
+    /// dimensions were behaviourally relevant.
+    cached_credit_signal: Vec<f32>,
 }
 
 impl ActionSelector {
@@ -102,6 +106,7 @@ impl ActionSelector {
             total_actions: 0,
             exploitative_actions: 0,
             current_state: vec![0.0; repr_dim],
+            cached_credit_signal: vec![0.0; repr_dim],
         }
     }
 
@@ -202,6 +207,13 @@ impl ActionSelector {
         }
     }
 
+    /// Per-dimension credit signal from the most recent `assign_credit()`.
+    /// The encoder uses this to know which encoded dimensions correlate with
+    /// positive (or negative) behavioural outcomes.
+    pub fn last_credit_signal(&self) -> &[f32] {
+        &self.cached_credit_signal
+    }
+
     /// Action entropy. With continuous output, this metric is less meaningful.
     /// Returns 0.0 for API compatibility.
     pub fn action_entropy(&self) -> f32 {
@@ -261,6 +273,11 @@ impl ActionSelector {
         let now = self.tick;
         let dim = self.repr_dim;
 
+        // Zero out cached credit signal for this round.
+        for v in &mut self.cached_credit_signal {
+            *v = 0.0;
+        }
+
         let n = self.history_len.min(ACTION_HISTORY_LEN);
         for i in 0..n {
             let rec = &self.action_ring[i];
@@ -286,14 +303,18 @@ impl ActionSelector {
 
             let credit = effective_improvement * temporal;
 
-            // Update policy weights using encoded state snapshot.
+            // Update policy weights using encoded state snapshot
+            // and accumulate per-dimension credit for the encoder.
             let s_offset = rec.state_offset;
             let fwd_out = rec.forward_output;
             let trn_out = rec.turn_output;
             for d in 0..dim {
-                let state_val = self.state_ring[s_offset + d];
-                self.forward_weights[d] += WEIGHT_LR * credit * fwd_out * state_val;
-                self.turn_weights[d] += WEIGHT_LR * credit * trn_out * state_val;
+                let feat = self.state_ring[s_offset + d];
+                self.forward_weights[d] += WEIGHT_LR * credit * fwd_out * feat;
+                self.turn_weights[d] += WEIGHT_LR * credit * trn_out * feat;
+                // Accumulate per-dimension credit for the encoder.
+                self.cached_credit_signal[d] += credit * fwd_out * feat;
+                self.cached_credit_signal[d] += credit * trn_out * feat;
             }
 
             // Update biases.

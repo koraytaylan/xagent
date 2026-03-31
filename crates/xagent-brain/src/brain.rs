@@ -146,12 +146,11 @@ impl Brain {
 
         // 2. Compute prediction error from previous tick's prediction
         let mut scalar_error = 0.0_f32;
+        let modulated_lr = self.config.learning_rate * (1.0 + homeo_state.gradient.abs());
 
         if let Some(prev_prediction) = self.predictor.last_prediction() {
             let prev_prediction = prev_prediction.clone();
             scalar_error = self.predictor.prediction_error(&prev_prediction, &encoded);
-
-            let modulated_lr = self.config.learning_rate * (1.0 + homeo_state.gradient.abs());
 
             // Learn: update memory reinforcements
             self.memory.learn(&encoded, scalar_error, modulated_lr);
@@ -212,6 +211,11 @@ impl Brain {
             homeo_state.urgency,
         );
 
+        // 8b. Credit-driven encoder adaptation: amplify raw features that
+        //     contributed to behaviourally relevant encoded dimensions.
+        let credit_signal = self.action_selector.last_credit_signal();
+        self.encoder.adapt_from_credit(credit_signal, modulated_lr);
+
         // 9. Record prediction for next tick's error computation
         self.predictor.record_prediction(prediction);
 
@@ -270,17 +274,20 @@ impl Brain {
     /// Export the brain's learned state for cross-generation inheritance.
     ///
     /// Within-lifetime learning discovers spatial associations (e.g. "green-left
-    /// → turn left") that are encoded in the encoder and action selector weights.
+    /// -> turn left") that are encoded in the encoder and action selector weights.
     /// Without inheritance, this knowledge is discarded every generation and must
-    /// be relearned from scratch — making evolution unable to build on prior
+    /// be relearned from scratch -- making evolution unable to build on prior
     /// progress. By transferring the learned state to the next generation's
     /// champion, learning accumulates across generations.
     ///
-    /// Includes encoder weights (the perceptual mapping) and action policy
-    /// weights (the behavioral associations). Both are needed because the
-    /// policy references specific encoder output patterns.
+    /// Includes encoder weights (credit-refined perceptual mapping), action
+    /// policy weights (behavioural associations), and predictor weights
+    /// (temporal model). All three are needed because the policy references
+    /// specific encoder output patterns.
     pub fn export_learned_state(&self) -> LearnedState {
         LearnedState {
+            encoder_weights: self.encoder.weights_snapshot(),
+            encoder_biases: self.encoder.biases().to_vec(),
             action_weights: self.action_selector.export_weights(),
             predictor_weights: self.predictor.export_weights(),
             predictor_context_weight: self.predictor.export_context_weight(),
@@ -291,9 +298,8 @@ impl Brain {
     ///
     /// Only works when dimensions match (same BrainConfig). If sizes mismatch,
     /// the import is silently skipped and the brain keeps its fresh weights.
-    /// The encoder is NOT imported because it's a deterministic projection —
-    /// all brains with the same config already produce identical encodings.
     pub fn import_learned_state(&mut self, state: &LearnedState) {
+        self.encoder.import_weights(&state.encoder_weights, &state.encoder_biases);
         self.action_selector.import_weights(&state.action_weights);
         self.predictor.import_weights(&state.predictor_weights, state.predictor_context_weight);
     }
@@ -301,18 +307,22 @@ impl Brain {
 
 /// Snapshot of a brain's learned weights for cross-generation inheritance.
 ///
-/// Captures the behavioral policy (action selector, now continuous motor
-/// weights: forward_weights + turn_weights + biases) and temporal model
-/// (predictor) that the agent discovered through within-lifetime learning.
-/// The encoder is NOT included because it's a fixed deterministic projection
-/// (seeded from representation_dim) — all brains with the same config
-/// already produce identical encodings, so action weights transfer directly.
+/// Captures the encoder (perceptual mapping refined by credit-driven Hebbian
+/// learning), the behavioral policy (action selector: forward_weights +
+/// turn_weights + biases), and temporal model (predictor). All three are
+/// needed because the policy references specific encoder output patterns:
+/// inheriting only the policy into a fresh encoder would be meaningless if
+/// the encoder outputs differ.
 ///
 /// Including the predictor is critical: without inherited predictions, the
-/// agent has high prediction error → high exploration rate (~80%) → the
+/// agent has high prediction error -> high exploration rate (~80%) -> the
 /// inherited policy is mostly ignored for the first ~500 ticks.
 #[derive(Clone, Debug)]
 pub struct LearnedState {
+    /// Encoder projection weights, refined by credit-driven Hebbian learning.
+    pub encoder_weights: Vec<f32>,
+    /// Encoder bias terms.
+    pub encoder_biases: Vec<f32>,
     /// Combined continuous motor weights: [forward_weights..., turn_weights..., forward_bias, turn_bias].
     pub action_weights: Vec<f32>,
     pub predictor_weights: Vec<f32>,
@@ -466,6 +476,7 @@ mod tests {
     fn learned_state_roundtrip_preserves_weights() {
         let mut brain = Brain::new(BrainConfig::default());
         // Run a few ticks so the brain has non-trivial learned state
+        // (encoder weights get refined by credit-driven adaptation).
         let frame = make_frame(0.8, 0.9);
         for _ in 0..20 {
             brain.tick(&frame);
@@ -473,17 +484,29 @@ mod tests {
 
         let state = brain.export_learned_state();
 
+        // Verify encoder weights are included in the exported state.
+        assert!(
+            !state.encoder_weights.is_empty(),
+            "Exported state must include encoder weights"
+        );
+        assert!(
+            !state.encoder_biases.is_empty(),
+            "Exported state must include encoder biases"
+        );
+
         // Create a fresh brain and import the learned state.
-        // Since the encoder is deterministic (same config = same weights),
-        // both brains encode identically. The action and predictor weights
-        // are imported directly.
         let mut brain2 = Brain::new(BrainConfig::default());
         brain2.import_learned_state(&state);
 
-        // Encodings must be exactly identical (deterministic encoder).
+        // After import, encoder weights and encodings should match.
+        assert_eq!(
+            brain.encoder.weights_snapshot(),
+            brain2.encoder.weights_snapshot(),
+            "Encoder weights should match after import"
+        );
         let enc1 = brain.encoder.encode(&frame);
         let enc2 = brain2.encoder.encode(&frame);
-        assert_eq!(enc1.data(), enc2.data(), "Deterministic encoder should produce identical output");
+        assert_eq!(enc1.data(), enc2.data(), "Encoder should produce identical output after import");
     }
 
     #[test]

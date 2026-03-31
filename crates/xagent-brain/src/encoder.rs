@@ -1,6 +1,7 @@
 //! Sensory encoder: compresses raw sensory frames into fixed-size internal representations.
 
 use rand::Rng;
+use rand::SeedableRng;
 use xagent_shared::SensoryFrame;
 
 /// Number of non-visual features: velocity_mag, facing(x,y,z), angular_vel,
@@ -10,9 +11,8 @@ const NON_VISUAL_FEATURES: usize = 9;
 /// Channels per pixel in the raw visual encoding: R, G, B, depth.
 const CHANNELS_PER_PIXEL: usize = 4;
 
-// --- Constants ---
-const WEIGHT_CLAMP_RANGE: f32 = 2.0;
-const L2_REGULARIZATION_FACTOR: f32 = 0.001;
+// (L2_REGULARIZATION_FACTOR and WEIGHT_CLAMP_RANGE removed:
+//  the encoder is now a fixed random projection — no adaptation.)
 
 /// Compresses raw sensory input into a fixed-size internal representation.
 ///
@@ -21,23 +21,26 @@ const L2_REGULARIZATION_FACTOR: f32 = 0.001;
 /// (row-major). This lets the brain learn directional associations like
 /// "green on the left → turn left" — something the old pooled-bin approach
 /// could never capture because it averaged away positional information.
+///
+/// The encoder is a **fixed random projection** — weights are initialized
+/// deterministically from `representation_dim` as a seed and never adapted.
+/// This guarantees that all brains with the same config produce identical
+/// encodings, making action policy weights transferable across generations
+/// without needing to inherit encoder weights.
 pub struct SensoryEncoder {
     /// Dimensionality of the output representation.
     representation_dim: usize,
     /// Number of input features (visual pixels × channels + non-visual).
     feature_count: usize,
     /// Encoding weights: [representation_dim × feature_count], row-major.
+    /// Fixed after initialization — never adapted.
     weights: Vec<f32>,
-    /// Per-feature bias terms.
+    /// Per-feature bias terms (fixed at zero).
     biases: Vec<f32>,
     /// Reusable scratch buffer for extracted features.
     feature_scratch: Vec<f32>,
     /// Reusable scratch buffer for encoded output.
     encode_scratch: Vec<f32>,
-    /// Accumulated weight scale factor for deferred L2 decay.
-    pending_scale: f32,
-    /// Number of adapt() calls since last materialization.
-    adapt_count: u32,
     /// Whether the weight matrix has been initialized (deferred to first encode).
     initialized: bool,
 }
@@ -92,9 +95,10 @@ impl SensoryEncoder {
     /// `encode()` call so the encoder can size itself to the actual frame
     /// dimensions without requiring them at construction time.
     ///
-    /// `representation_dim` controls the output vector size.
-    /// `_visual_encoding_size` is retained for config compatibility but no
-    /// longer used — the encoder derives its input size from the raw frame.
+    /// `representation_dim` controls the output vector size and seeds the
+    /// deterministic weight initialization. All brains with the same
+    /// `representation_dim` produce identical encoder weights, ensuring
+    /// action policy weights are compatible across generations.
     pub fn new(representation_dim: usize, _visual_encoding_size: usize) -> Self {
         Self {
             representation_dim,
@@ -103,20 +107,20 @@ impl SensoryEncoder {
             biases: vec![0.0; representation_dim],
             feature_scratch: Vec::new(),
             encode_scratch: vec![0.0; representation_dim],
-            pending_scale: 1.0,
-            adapt_count: 0,
             initialized: false,
         }
     }
 
     /// Initialize weights on first encode, when we know the actual frame size.
+    /// Uses `representation_dim` as the RNG seed so all brains with the same
+    /// config produce identical encodings — a deterministic random projection.
     fn lazy_init(&mut self, feature_count: usize) {
         self.feature_count = feature_count;
         let weight_count = feature_count * self.representation_dim;
 
-        // Xavier / Glorot-style initialization
+        // Xavier / Glorot-style initialization with DETERMINISTIC seed.
         let limit = (6.0 / (feature_count + self.representation_dim) as f32).sqrt();
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.representation_dim as u64);
         self.weights = (0..weight_count)
             .map(|_| rng.random_range(-limit..=limit))
             .collect();
@@ -129,14 +133,13 @@ impl SensoryEncoder {
     pub fn encode(&mut self, frame: &SensoryFrame) -> EncodedState {
         self.extract_features_into(frame);
 
-        let scale = self.pending_scale;
         for i in 0..self.representation_dim {
             let mut sum = self.biases[i];
             let row_base = i * self.feature_count;
             for j in 0..self.feature_count {
                 sum += self.feature_scratch[j] * self.weights[row_base + j];
             }
-            self.encode_scratch[i] = crate::fast_tanh(sum * scale);
+            self.encode_scratch[i] = crate::fast_tanh(sum);
         }
 
         EncodedState::from_slice(&self.encode_scratch[..self.representation_dim])
@@ -149,9 +152,7 @@ impl SensoryEncoder {
     }
 
     /// Encoder weights, row-major \[representation_dim × feature_count\].
-    /// Materializes any pending scale factor before returning.
-    pub fn weights(&mut self) -> &[f32] {
-        self.materialize_scale();
+    pub fn weights(&self) -> &[f32] {
         &self.weights
     }
 
@@ -160,30 +161,15 @@ impl SensoryEncoder {
         &self.biases
     }
 
-    /// Snapshot of encoder weights with pending scale materialized.
-    /// Used for cross-generation inheritance.
+    /// Snapshot of encoder weights. Since the encoder is a fixed deterministic
+    /// projection, this is identical to `weights()` — included for API symmetry.
     pub fn weights_snapshot(&self) -> Vec<f32> {
-        let mut w = self.weights.clone();
-        if (self.pending_scale - 1.0).abs() > 1e-10 {
-            for v in &mut w {
-                *v *= self.pending_scale;
-            }
-        }
-        w
+        self.weights.to_vec()
     }
 
-    /// Import inherited encoder weights from a previous generation.
-    /// Silently skipped if dimensions don't match.
-    pub fn import_weights(&mut self, weights: &[f32], biases: &[f32]) {
-        if weights.len() == self.weights.len() {
-            self.weights.copy_from_slice(weights);
-            self.pending_scale = 1.0;
-            self.adapt_count = 0;
-        }
-        if biases.len() == self.biases.len() {
-            self.biases.copy_from_slice(biases);
-        }
-    }
+    /// No-op for the fixed encoder: all brains with the same representation_dim
+    /// already produce identical weights deterministically.
+    pub fn import_weights(&mut self, _weights: &[f32], _biases: &[f32]) {}
 
     /// Number of input features.
     pub fn feature_count(&self) -> usize {
@@ -195,33 +181,10 @@ impl SensoryEncoder {
         self.representation_dim
     }
 
-    /// Adapt encoding weights using Hebbian-inspired L2 regularization.
-    ///
-    /// Instead of multiplying every weight each tick, we accumulate a scalar
-    /// scale factor and materialize it every 32 ticks. The encode() path
-    /// applies the pending scale on-the-fly during the dot product.
-    pub fn adapt(&mut self, _error: f32, learning_rate: f32) {
-        self.pending_scale *= 1.0 - (learning_rate * L2_REGULARIZATION_FACTOR);
-        self.adapt_count += 1;
-
-        // Materialize every 32 ticks to prevent floating-point underflow
-        if self.adapt_count >= 32 {
-            self.materialize_scale();
-        }
-    }
-
-    /// Apply the accumulated scale factor to all weights and reset.
-    fn materialize_scale(&mut self) {
-        if (self.pending_scale - 1.0).abs() > 1e-10 {
-            let s = self.pending_scale;
-            for w in &mut self.weights {
-                *w *= s;
-                *w = w.clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);
-            }
-            self.pending_scale = 1.0;
-        }
-        self.adapt_count = 0;
-    }
+    /// No-op: the encoder is a fixed random projection. Weights are
+    /// deterministic and never adapted, ensuring cross-generation
+    /// compatibility of action policy weights.
+    pub fn adapt(&mut self, _error: f32, _learning_rate: f32) {}
 
     /// Extract raw per-pixel features from sensory data into the scratch buffer.
     ///
@@ -372,15 +335,30 @@ mod tests {
     }
 
     #[test]
-    fn adaptation_modifies_weights() {
+    fn encoder_weights_are_fixed() {
+        // The encoder is a deterministic random projection — adapt() is a
+        // no-op. Weights must NOT change, ensuring cross-generation
+        // compatibility of inherited action policy weights.
         let mut enc = SensoryEncoder::new(8, 4);
         let _ = enc.encode(&make_frame(0.5, 0.5));
         let weights_before: Vec<f32> = enc.weights.clone();
-        // Call adapt enough times to trigger materialization
-        for _ in 0..32 {
+        for _ in 0..100 {
             enc.adapt(0.5, 0.1);
         }
-        assert_ne!(enc.weights, weights_before, "Weights should change after adapt");
+        assert_eq!(enc.weights, weights_before, "Encoder weights should be fixed");
+    }
+
+    #[test]
+    fn same_config_produces_identical_encoder() {
+        // Two brains with the same representation_dim must produce the
+        // same encoder weights — this is what makes action weight
+        // inheritance work across generations.
+        let mut enc1 = SensoryEncoder::new(16, 8);
+        let mut enc2 = SensoryEncoder::new(16, 8);
+        let frame = make_frame(0.5, 0.8);
+        let a = enc1.encode(&frame);
+        let b = enc2.encode(&frame);
+        assert_eq!(a.data(), b.data(), "Same config must produce identical encodings");
     }
 
     #[test]

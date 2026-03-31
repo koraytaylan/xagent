@@ -25,10 +25,9 @@ const ACTION_HISTORY_LEN: usize = 64;
 const CREDIT_DECAY_RATE: f32 = 0.04;
 /// Learning rate for policy weight updates (per credit event).
 const WEIGHT_LR: f32 = 0.02;
-/// L2 weight decay per tick (prevents weight explosion).
-/// Tuned so an agent living ~4000 ticks retains ~96% of learned weights,
-/// allowing death-avoidance learning to accumulate across multiple lives.
-const WEIGHT_DECAY: f32 = 0.00001;
+// WEIGHT_DECAY removed: MAX_WEIGHT_NORM already prevents explosion via
+// normalize_weights(). Decay on top of normalization was destroying
+// inherited cross-generation weights (39% loss per 50k-tick generation).
 /// Negative gradient amplifier — pain is a stronger teacher than pleasure.
 /// Biologically motivated: amygdala responds 2-3x more strongly to aversive stimuli.
 const PAIN_AMPLIFIER: f32 = 3.0;
@@ -339,10 +338,8 @@ impl ActionSelector {
         let now = self.tick;
         let dim = self.repr_dim;
 
-        // L2 weight decay (always applied, independent of gradient)
-        for w in &mut self.action_weights {
-            *w *= 1.0 - WEIGHT_DECAY;
-        }
+        // (Weight decay removed — MAX_WEIGHT_NORM caps prevent explosion
+        //  while preserving inherited cross-generation signal.)
 
         // Pre-compute current state norm for cosine similarity
         let current_norm_sq: f32 = self.current_state.iter().map(|v| v * v).sum();

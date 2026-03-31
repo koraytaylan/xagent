@@ -216,6 +216,24 @@ impl Predictor {
         self.context_weight = self.context_weight.clamp(CONTEXT_WEIGHT_MIN, CONTEXT_WEIGHT_MAX);
     }
 
+    /// Export predictor weights for cross-generation inheritance.
+    pub fn export_weights(&self) -> Vec<f32> {
+        self.weights.clone()
+    }
+
+    /// Export context weight.
+    pub fn export_context_weight(&self) -> f32 {
+        self.context_weight
+    }
+
+    /// Import inherited predictor weights. Silently skipped on dimension mismatch.
+    pub fn import_weights(&mut self, weights: &[f32], context_weight: f32) {
+        if weights.len() == self.weights.len() {
+            self.weights.copy_from_slice(weights);
+            self.context_weight = context_weight;
+        }
+    }
+
     /// Record scalar prediction error into the history ring buffer.
     pub fn record_error(&mut self, error: f32) {
         self.error_history[self.error_cursor] = error;

@@ -615,31 +615,9 @@ impl App {
     fn advance_generation(&mut self) {
         let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
 
-        // Capture the best agent's learned state BEFORE advancing.
-        // This is the knowledge (encoder mapping + action policy) that the
-        // agent discovered through within-lifetime learning. Without
-        // inheritance, this is thrown away every generation and must be
-        // relearned from scratch — making evolution unable to accumulate
-        // progress. The champion in the next generation inherits these
-        // weights so learning builds across generations.
-        let inherited_state = {
-            let mut best_idx = 0usize;
-            let mut best_fit = f32::NEG_INFINITY;
-            for a in &self.agents {
-                let fit = a.brain.telemetry().decision_quality;
-                // Prefer the agent with highest composite fitness proxy;
-                // fall back to the first alive agent.
-                let alive_bonus = if a.body.body.alive { 0.1 } else { 0.0 };
-                let score = fit + alive_bonus;
-                if score > best_fit {
-                    best_fit = score;
-                    best_idx = a.id as usize;
-                }
-            }
-            self.agents.get(best_idx).map(|a| a.brain.export_learned_state())
-        };
-
-        let result = {
+        // Evaluate fitness, then capture best agent's learned state using the
+        // actual composite fitness ranking (not the brain's internal metrics).
+        let (result, inherited_state) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -648,7 +626,12 @@ impl App {
             let fitness = gov.evaluate(&self.agents);
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
-            gov.advance(&fitness)
+
+            // fitness is sorted by descending composite_fitness — first entry is best
+            let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+            let state = self.agents.get(best_idx).map(|a| a.brain.export_learned_state());
+
+            (gov.advance(&fitness), state)
         };
 
         // Governor borrow released — safe to call self methods

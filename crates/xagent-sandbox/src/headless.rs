@@ -165,19 +165,12 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
         println!();
         let gen_elapsed = gen_start.elapsed();
 
-        // Capture best agent's learned state for next generation's champion.
-        inherited_state = agents
-            .iter()
-            .max_by(|a, b| {
-                let sa = a.brain.telemetry().decision_quality
-                    + if a.body.body.alive { 0.1 } else { 0.0 };
-                let sb = b.brain.telemetry().decision_quality
-                    + if b.body.body.alive { 0.1 } else { 0.0 };
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|a| a.brain.export_learned_state());
-
         let fitness = governor.evaluate(&agents);
+
+        // Capture best agent's learned state using actual composite fitness.
+        // fitness is sorted descending — first entry is the best performer.
+        let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+        inherited_state = agents.get(best_idx).map(|a| a.brain.export_learned_state());
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",

@@ -278,10 +278,10 @@ impl Brain {
     /// policy references specific encoder output patterns.
     pub fn export_learned_state(&self) -> LearnedState {
         LearnedState {
-            encoder_weights: self.encoder.weights_snapshot(),
-            encoder_biases: self.encoder.biases().to_vec(),
             action_weights: self.action_selector.export_weights(),
             global_action_values: self.action_selector.export_global_values(),
+            predictor_weights: self.predictor.export_weights(),
+            predictor_context_weight: self.predictor.export_context_weight(),
         }
     }
 
@@ -289,24 +289,31 @@ impl Brain {
     ///
     /// Only works when dimensions match (same BrainConfig). If sizes mismatch,
     /// the import is silently skipped and the brain keeps its fresh weights.
+    /// The encoder is NOT imported because it's a deterministic projection —
+    /// all brains with the same config already produce identical encodings.
     pub fn import_learned_state(&mut self, state: &LearnedState) {
-        self.encoder.import_weights(&state.encoder_weights, &state.encoder_biases);
         self.action_selector.import_weights(&state.action_weights, &state.global_action_values);
+        self.predictor.import_weights(&state.predictor_weights, state.predictor_context_weight);
     }
 }
 
 /// Snapshot of a brain's learned weights for cross-generation inheritance.
 ///
-/// Captures the perceptual mapping (encoder) and behavioral policy (action
-/// selector) that the agent discovered through within-lifetime learning.
-/// Transferred to the next generation's champion so evolution builds on
-/// accumulated knowledge rather than rediscovering it from scratch.
+/// Captures the behavioral policy (action selector) and temporal model
+/// (predictor) that the agent discovered through within-lifetime learning.
+/// The encoder is NOT included because it's a fixed deterministic projection
+/// (seeded from representation_dim) — all brains with the same config
+/// already produce identical encodings, so action weights transfer directly.
+///
+/// Including the predictor is critical: without inherited predictions, the
+/// agent has high prediction error → high exploration rate (~80%) → the
+/// inherited policy is mostly ignored for the first ~500 ticks.
 #[derive(Clone, Debug)]
 pub struct LearnedState {
-    pub encoder_weights: Vec<f32>,
-    pub encoder_biases: Vec<f32>,
     pub action_weights: Vec<f32>,
     pub global_action_values: Vec<f32>,
+    pub predictor_weights: Vec<f32>,
+    pub predictor_context_weight: f32,
 }
 
 #[cfg(test)]
@@ -463,21 +470,17 @@ mod tests {
 
         let state = brain.export_learned_state();
 
-        // Create a fresh brain and import the learned state
+        // Create a fresh brain and import the learned state.
+        // Since the encoder is deterministic (same config = same weights),
+        // both brains encode identically. The action and predictor weights
+        // are imported directly.
         let mut brain2 = Brain::new(BrainConfig::default());
         brain2.import_learned_state(&state);
 
-        // Both brains should produce nearly identical encodings for the same input.
-        // Tiny differences from pending_scale materialization are expected.
+        // Encodings must be exactly identical (deterministic encoder).
         let enc1 = brain.encoder.encode(&frame);
         let enc2 = brain2.encoder.encode(&frame);
-        let max_diff: f32 = enc1.data().iter().zip(enc2.data())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-4,
-            "Imported brain should produce near-identical encodings: max_diff={max_diff}"
-        );
+        assert_eq!(enc1.data(), enc2.data(), "Deterministic encoder should produce identical output");
     }
 
     #[test]

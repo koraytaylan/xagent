@@ -29,7 +29,7 @@ use xagent_sandbox::headless;
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, SortMode,
-    Tab, TabContext,
+    Tab, TabContext, WorldSnapshot,
 };
 
 use xagent_sandbox::world::WorldState;
@@ -309,6 +309,9 @@ struct App {
 
     // Sidebar sort mode
     sort_mode: SortMode,
+
+    // World snapshot for mini-map UI
+    world_snapshot: WorldSnapshot,
 }
 
 impl App {
@@ -426,6 +429,7 @@ impl App {
             gpu_batch_active: Vec::new(),
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             sort_mode: SortMode::Id,
+            world_snapshot: WorldSnapshot::default(),
         }
     }
 
@@ -1878,6 +1882,43 @@ impl ApplicationHandler for App {
                                 let mut evo_snap = std::mem::take(&mut self.evo_snapshot);
                                 let mut evo_action = EvolutionAction::None;
 
+                                // Build world snapshot for mini-map
+                                if let Some(world) = &self.world {
+                                    self.world_snapshot.food_positions = world.food_items.iter()
+                                        .filter(|f| !f.consumed)
+                                        .map(|f| [f.position.x, f.position.z])
+                                        .collect();
+                                    self.world_snapshot.world_size = world.config.world_size;
+                                }
+                                let mut world_snap = std::mem::take(&mut self.world_snapshot);
+                                // Pre-build biome image pixels if texture not yet created
+                                let mut biome_image = if world_snap.biome_texture.is_none() {
+                                    self.world.as_ref().map(|world| {
+                                        use xagent_sandbox::world::biome::BiomeType;
+                                        let res = 256usize;
+                                        let ws = world.config.world_size;
+                                        let half = ws / 2.0;
+                                        let cell = ws / res as f32;
+                                        let mut pixels = Vec::with_capacity(res * res);
+                                        for row in 0..res {
+                                            let z = -half + (row as f32 + 0.5) * cell;
+                                            for col in 0..res {
+                                                let x = -half + (col as f32 + 0.5) * cell;
+                                                let biome = world.biome_map.biome_at(x, z);
+                                                let c = match biome {
+                                                    BiomeType::FoodRich => egui::Color32::from_rgb(25, 70, 20),
+                                                    BiomeType::Barren => egui::Color32::from_rgb(60, 50, 30),
+                                                    BiomeType::Danger => egui::Color32::from_rgb(80, 25, 15),
+                                                };
+                                                pixels.push(c);
+                                            }
+                                        }
+                                        egui::ColorImage { size: [res, res], pixels }
+                                    })
+                                } else {
+                                    None
+                                };
+
                                 let console_lines: Vec<&str> = self.console_log.iter()
                                     .map(|s| s.as_str()).collect();
 
@@ -1896,6 +1937,13 @@ impl ApplicationHandler for App {
                                     &frame_ctx.view,
                                     screen,
                                     |ctx| {
+                                        // Build biome texture once (requires ctx)
+                                        if let Some(image) = biome_image.take() {
+                                            world_snap.biome_texture = Some(
+                                                ctx.load_texture("biome_map", image, egui::TextureOptions::NEAREST)
+                                            );
+                                        }
+
                                         // ── Top bar ──────────────────────────
                                         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                                             ui.horizontal(|ui| {
@@ -2157,6 +2205,7 @@ impl ApplicationHandler for App {
                                                     agents: &agent_snaps,
                                                     evolution: &mut evo_snap,
                                                     evolution_action: &mut evo_action,
+                                                    world: &world_snap,
                                                 };
                                                 egui_dock::DockArea::new(dock_state)
                                                     .style(egui_dock::Style::from_egui(ui.style().as_ref()))
@@ -2171,6 +2220,8 @@ impl ApplicationHandler for App {
 
                                 // Restore evolution snapshot (may have been mutated by UI)
                                 self.evo_snapshot = evo_snap;
+                                // Restore world snapshot (biome texture may have been created)
+                                self.world_snapshot = world_snap;
 
                                 // Defer evolution action to after the renderer borrow
                                 pending_evo_action = evo_action;

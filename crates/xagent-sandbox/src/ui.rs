@@ -174,6 +174,26 @@ impl Default for EvolutionSnapshot {
     }
 }
 
+/// Per-frame world state snapshot for the mini-map.
+pub struct WorldSnapshot {
+    /// World size in units (e.g., 200.0).
+    pub world_size: f32,
+    /// Positions of non-consumed food items (x, z pairs).
+    pub food_positions: Vec<[f32; 2]>,
+    /// Pre-rendered biome image as egui texture, built once on world creation.
+    pub biome_texture: Option<egui::TextureHandle>,
+}
+
+impl Default for WorldSnapshot {
+    fn default() -> Self {
+        Self {
+            world_size: 200.0,
+            food_positions: Vec::new(),
+            biome_texture: None,
+        }
+    }
+}
+
 /// Context passed to the TabViewer so it can render both viewport and agent detail tabs.
 pub struct TabContext<'a> {
     pub viewport_tex_id: egui::TextureId,
@@ -185,6 +205,7 @@ pub struct TabContext<'a> {
     pub agents: &'a [AgentSnapshot],
     pub evolution: &'a mut EvolutionSnapshot,
     pub evolution_action: &'a mut EvolutionAction,
+    pub world: &'a WorldSnapshot,
 }
 
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,

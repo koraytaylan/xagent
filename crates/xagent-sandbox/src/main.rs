@@ -428,7 +428,8 @@ impl App {
         }
     }
 
-    /// Spawn a new agent with the given BrainConfig at a random position.
+    /// Spawn a new agent with the given BrainConfig at a safe random position
+    /// (not in a danger biome).
     fn spawn_agent(&mut self, config: BrainConfig, generation: u32) {
         if self.agents.len() >= MAX_AGENTS {
             self.log_msg(format!("[SPAWN] Max agents ({}) reached", MAX_AGENTS));
@@ -436,21 +437,17 @@ impl App {
         }
         let Some(world) = &self.world else { return };
 
-        let mut rng = rand::rng();
-        let half = world.config.world_size / 2.0 - 5.0;
-        let x: f32 = rng.random_range(-half..half);
-        let z: f32 = rng.random_range(-half..half);
-        let y = world.terrain.height_at(x, z) + 1.0;
+        let pos = world.safe_spawn_position();
 
         let id = self.next_agent_id;
         self.next_agent_id += 1;
 
-        let mut agent = Agent::new(id, Vec3::new(x, y, z), config, self.tick);
+        let mut agent = Agent::new(id, pos, config, self.tick);
         agent.generation = generation;
 
         self.log_msg(format!(
             "[SPAWN] Agent {} (gen {}) at ({:.1}, {:.1})",
-            id, generation, x, z
+            id, generation, pos.x, pos.z
         ));
 
         self.agents.push(agent);
@@ -1360,25 +1357,21 @@ impl ApplicationHandler for App {
                                 } else if !agent.body.body.alive && agent.respawn_cooldown > 0 {
                                     agent.respawn_cooldown -= 1;
                                     if agent.respawn_cooldown == 0 {
-                                        let mut rng = rand::rng();
-                                        let half = world.config.world_size / 2.0 - 5.0;
-                                        let x: f32 = rng.random_range(-half..half);
-                                        let z: f32 = rng.random_range(-half..half);
-                                        let y = world.terrain.height_at(x, z) + 1.0;
-                                        agent.body = AgentBody::new(Vec3::new(x, y, z));
-                                        // Partial respawn: no "free heal" from dying
+                                        let pos = world.safe_spawn_position();
+                                        agent.body = AgentBody::new(pos);
                                         agent.body.body.internal.energy =
                                             agent.body.body.internal.max_energy * 0.5;
                                         agent.body.body.internal.integrity =
-                                            agent.body.body.internal.max_integrity * 0.7;
+                                            agent.body.body.internal.max_integrity;
                                         agent.life_start_tick = self.tick;
                                         agent.has_reproduced = false;
                                         agent.generation += 1;
                                         agent.reset_trail();
                                         agent.brain.trauma(0.5);
+                                        let p = agent.body.body.position;
                                         event_msgs.push(format!(
                                             "[RESPAWN] Agent {} at ({:.1}, {:.1})",
-                                            agent.id, x, z
+                                            agent.id, p.x, p.z
                                         ));
                                     }
                                 }

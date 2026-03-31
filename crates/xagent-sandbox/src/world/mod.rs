@@ -61,6 +61,26 @@ impl WorldState {
         entity::generate_food_mesh(&self.food_items)
     }
 
+    /// Pick a random position that is NOT in a danger biome.
+    /// Tries up to 50 candidates; falls back to the last one if all are danger
+    /// (extremely unlikely with typical biome distributions).
+    pub fn safe_spawn_position(&self) -> glam::Vec3 {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let half = self.config.world_size / 2.0 - 5.0;
+        let mut x = 0.0f32;
+        let mut z = 0.0f32;
+        for _ in 0..50 {
+            x = rng.random_range(-half..half);
+            z = rng.random_range(-half..half);
+            if self.biome_map.biome_at(x, z) != biome::BiomeType::Danger {
+                break;
+            }
+        }
+        let y = self.terrain.height_at(x, z) + 1.0;
+        glam::Vec3::new(x, y, z)
+    }
+
     /// Tick food respawn timers. Returns `true` if any food respawned.
     /// Uses incremental grid inserts instead of full rebuild.
     pub fn update(&mut self, dt: f32) -> bool {

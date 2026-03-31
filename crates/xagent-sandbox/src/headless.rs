@@ -79,12 +79,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
             .iter()
             .enumerate()
             .map(|(i, cfg)| {
-                let mut rng = rand::rng();
-                let half = world.config.world_size / 2.0 - 5.0;
-                let x: f32 = rng.random_range(-half..half);
-                let z: f32 = rng.random_range(-half..half);
-                let y = world.terrain.height_at(x, z) + 1.0;
-                Agent::new(i as u32, Vec3::new(x, y, z), cfg.clone(), 0)
+                let pos = world.safe_spawn_position();
+                Agent::new(i as u32, pos, cfg.clone(), 0)
             })
             .collect();
 
@@ -139,12 +135,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                     agent.total_ticks_alive += 1;
                     agent.record_heatmap(world.config.world_size);
                 } else {
-                    let mut rng = rand::rng();
-                    let half = world.config.world_size / 2.0 - 5.0;
-                    let x: f32 = rng.random_range(-half..half);
-                    let z: f32 = rng.random_range(-half..half);
-                    let y = world.terrain.height_at(x, z) + 1.0;
-                    agent.body = AgentBody::new(Vec3::new(x, y, z));
+                    let pos = world.safe_spawn_position();
+                    agent.body = AgentBody::new(pos);
+                    agent.body.body.internal.integrity =
+                        agent.body.body.internal.max_integrity;
                     agent.brain.death_signal();
                     agent.brain.trauma(0.5);
                     agent.death_count += 1;

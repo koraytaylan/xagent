@@ -109,16 +109,16 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
     }
 }
 
-/// Fixed-step ray marching for terrain and agent intersection.
+/// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
 /// Advances a ray from `origin` in direction `dir` in increments of `step` units,
-/// checking if the ray position drops below the terrain height or is within range
-/// of another agent at each step. Returns the hit color and distance traveled.
-/// Agents are rendered as bright magenta. If no hit within `max_dist`, returns
-/// sky color and max_dist.
+/// checking for food items, other agents, and terrain at each step. Returns the
+/// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///
-/// Rays pointing steeply upward (dir.y > 0.3) that start above terrain are
-/// unlikely to hit — they bail out after a few steps to save height lookups.
+/// Food items are rendered as bright yellow-green, distinct from biome colors.
+/// This makes food *physically visible* — the brain must still learn that this
+/// color correlates with positive gradient. Without food visibility, agents see
+/// uniform green inside food biomes and have zero directional signal for food.
 fn march_ray(
     origin: Vec3,
     dir: Vec3,
@@ -129,11 +129,13 @@ fn march_ray(
 ) -> ([f32; 4], f32) {
     let sky: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
     let agent_color: [f32; 4] = [0.9, 0.2, 0.6, 1.0];
-    // Squared detection radius (~1.5 units, matching agent cube half-diagonal)
+    // Bright yellow-green: visually distinct from biome green (0.15, 0.50, 0.10)
+    let food_color: [f32; 4] = [0.70, 0.95, 0.20, 1.0];
+    // Squared detection radii
     let agent_radius_sq: f32 = 1.5 * 1.5;
+    let food_radius_sq: f32 = 1.0 * 1.0; // food cubes are ~0.7 units
 
     // Early-out: upward-pointing rays above terrain are almost certainly sky.
-    // Check origin against terrain once; if above and ray goes up, skip marching.
     if dir.y > 0.3 {
         let origin_h = world.terrain.height_at(origin.x, origin.z);
         if origin.y > origin_h {
@@ -145,7 +147,19 @@ fn march_ray(
     while t < max_dist {
         let p = origin + dir * t;
 
-        // Check agent hits first (agents are in front of terrain they stand on)
+        // Check food items via spatial grid (O(1) per step)
+        for idx in world.food_grid.query_nearby(p.x, p.z) {
+            let food = &world.food_items[idx];
+            if food.consumed {
+                continue;
+            }
+            let diff = p - food.position;
+            if diff.length_squared() < food_radius_sq {
+                return (food_color, t);
+            }
+        }
+
+        // Check agent hits
         for other in others {
             if !other.alive {
                 continue;
@@ -156,6 +170,7 @@ fn march_ray(
             }
         }
 
+        // Check terrain hit
         let gh = world.terrain.height_at(p.x, p.z);
         if p.y <= gh {
             let c = match world.biome_map.biome_at(p.x, p.z) {

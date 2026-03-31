@@ -387,18 +387,43 @@ impl Governor {
         let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
 
+        // Use the population average (mean of all reduced group fitnesses) for both
+        // the success comparison and the stored bar.  The original approach used the
+        // best group's average, which suffers from "winner's curse": the max of N
+        // noisy estimates is systematically inflated, so the next generation almost
+        // never reproduces it.  The mean is unbiased and has much lower variance
+        // (σ/√N vs order-statistic inflation), giving a fair cross-generation bar.
+        let gen_avg = if reduced.is_empty() {
+            0.0
+        } else {
+            reduced.iter().map(|f| f.composite_fitness).sum::<f32>()
+                / reduced.len() as f32
+        };
+
         // Look up the spawn parent's fitness — this is the bar to beat
         let parent_fitness = self.spawn_parent_fitness();
 
         let island = &mut self.islands[self.active_island];
 
-        // Score this generation against its parent (not the all-time best)
-        if gen_fit >= parent_fitness {
-            // ★ Success — this generation improved on its parent
+        // Score this generation against its parent (not the all-time best).
+        // Both sides use the same metric (population average) so a generation
+        // can only succeed when its overall quality genuinely meets or exceeds
+        // the parent's.
+        if gen_avg >= parent_fitness {
+            // ★ Success — this generation's average meets or exceeds its parent's
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = ?2 WHERE id = ?1",
-                params![self.current_node_id, gen_fit as f64],
+                params![self.current_node_id, gen_avg as f64],
             );
+            // Update node config to the best performer's config so future
+            // champions (bred from this node) use a proven, tested config.
+            if let Some(best) = reduced.first() {
+                let best_json = serde_json::to_string(&best.config).unwrap_or_default();
+                let _ = self.db.execute(
+                    "UPDATE node SET config_json = ?1 WHERE id = ?2",
+                    params![best_json, self.current_node_id],
+                );
+            }
             island.spawn_parent_id = self.current_node_id;
             // Store elite configs from this successful generation
             island.elite_configs = reduced
@@ -409,23 +434,26 @@ impl Governor {
             island.attempts = 0;
             self.refresh_best_score();
             let global_best = self.best_score();
-            if gen_fit >= global_best {
-                messages.push(format!("[EVOLUTION] ★ New global best: {:.4}", gen_fit));
+            if gen_avg >= global_best {
+                messages.push(format!(
+                    "[EVOLUTION] ★ New global best: {:.4} (peak: {:.4})",
+                    gen_avg, gen_fit
+                ));
             } else {
                 messages.push(format!(
-                    "[EVOLUTION] ✓ Beat parent ({:.4} → {:.4}, global best: {:.4})",
-                    parent_fitness, gen_fit, global_best
+                    "[EVOLUTION] ✓ Beat parent ({:.4} → {:.4}, peak: {:.4})",
+                    parent_fitness, gen_avg, gen_fit
                 ));
             }
         } else {
             // ✗ Failure — didn't beat the parent
             let _ = self.db.execute(
                 "UPDATE node SET status = 'failed', best_fitness = ?2 WHERE id = ?1",
-                params![self.current_node_id, gen_fit as f64],
+                params![self.current_node_id, gen_avg as f64],
             );
             messages.push(format!(
                 "[EVOLUTION] ✗ Failed ({:.4} < parent {:.4})",
-                gen_fit, parent_fitness
+                gen_avg, parent_fitness
             ));
 
             // Check if this island has exhausted its patience at current spawn parent
@@ -591,7 +619,11 @@ impl Governor {
         let base_config = mutate_config_with_strength(&parent_config, effective_strength);
 
         self.generation += 1;
-        let config_json = serde_json::to_string(&base_config).unwrap_or_default();
+        // Store the champion config (parent_config) as the node's config.
+        // base_config is only used for mutation records; parent_config is the
+        // actual champion that will be evaluated, ensuring future spawn parents
+        // reference a tested config rather than an untested random mutant.
+        let config_json = serde_json::to_string(&parent_config).unwrap_or_default();
         let _ = self.db.execute(
             "INSERT INTO node (run_id, parent_id, generation, config_json, status)
              VALUES (?1, ?2, ?3, ?4, 'active')",
@@ -1726,5 +1758,131 @@ mod tests {
         }
         assert!(has_a_param, "crossover never picked from parent A");
         assert!(has_b_param, "crossover never picked from parent B");
+    }
+
+    // ─── gen_avg comparison tests ───────────────────────────────────
+
+    /// Helper: create multi-agent fitness with varying scores.
+    fn mock_multi_fitness(scores: &[(usize, f32)]) -> Vec<AgentFitness> {
+        scores
+            .iter()
+            .map(|&(idx, fit)| AgentFitness {
+                agent_index: idx,
+                config: BrainConfig::default(),
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
+                composite_fitness: fit,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gen_avg_determines_success_not_best_group() {
+        // With eval_repeats=1, gen_avg = mean of all agents.
+        // One high-scoring agent shouldn't carry a low-avg generation.
+        let mut gov = test_governor(5);
+
+        // Gen 0: avg = 0.3, succeeds (root = -1.0)
+        let gen0_fitness = mock_multi_fitness(&[
+            (0, 0.3), (1, 0.3), (2, 0.3), (3, 0.3),
+        ]);
+        gov.advance(&gen0_fitness);
+        // Root best_fitness is now the avg = 0.3
+        let root_bar: f64 = gov.db.query_row(
+            "SELECT best_fitness FROM node WHERE id = ?1",
+            params![gov.spawn_parent_id().unwrap()],
+            |row| row.get(0),
+        ).unwrap();
+        assert!((root_bar - 0.3).abs() < 0.01, "Bar should be gen_avg (0.3), got {root_bar}");
+
+        // Gen 1: best agent = 0.5 but avg = 0.25 → should FAIL (0.25 < 0.3)
+        let gen1_fitness = mock_multi_fitness(&[
+            (0, 0.5), (1, 0.1), (2, 0.2), (3, 0.2),
+        ]);
+        let gen1_id = gov.current_node_id.unwrap();
+        gov.advance(&gen1_fitness);
+        assert_eq!(
+            node_status(&gov, gen1_id), "failed",
+            "High best but low avg should fail"
+        );
+    }
+
+    #[test]
+    fn successful_node_config_updates_to_best_performer() {
+        let mut gov = test_governor(5);
+
+        // Create a distinctive "elite" config
+        let elite_config = BrainConfig { memory_capacity: 999, ..BrainConfig::default() };
+        let gen0_fitness = vec![
+            AgentFitness {
+                agent_index: 0,
+                config: elite_config.clone(),
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 50,
+                cells_explored: 100,
+                composite_fitness: 0.5,
+            },
+        ];
+
+        // Gen 0: succeeds — node config should update to the best performer
+        gov.advance(&gen0_fitness);
+        let root_id = gov.spawn_parent_id().unwrap();
+
+        let stored_json: String = gov.db.query_row(
+            "SELECT config_json FROM node WHERE id = ?1",
+            params![root_id],
+            |row| row.get(0),
+        ).unwrap();
+        let stored_config: BrainConfig = serde_json::from_str(&stored_json).unwrap();
+
+        assert_eq!(
+            stored_config.memory_capacity, 999,
+            "Successful node should store best performer's config, got mem={}",
+            stored_config.memory_capacity
+        );
+    }
+
+    #[test]
+    fn breed_respects_eval_repeats_grouping() {
+        // With eval_repeats=2, breed should produce pairs of identical configs.
+        let config = GovernorConfig {
+            population_size: 6,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 3,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 1,
+            migration_interval: 0,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Gen 0: succeed to enable breeding
+        gov.advance(&mock_fitness(0.5));
+
+        let configs = gov.breed_next_generation(&mock_fitness(0.1));
+        // 6 agents / 2 repeats = 3 unique configs, each repeated twice
+        assert_eq!(configs.len(), 6);
+
+        // Agents 0,1 should be identical; 2,3 identical; 4,5 identical
+        for pair_start in (0..6).step_by(2) {
+            assert_eq!(
+                configs[pair_start].memory_capacity,
+                configs[pair_start + 1].memory_capacity,
+                "Agents {} and {} should share config",
+                pair_start, pair_start + 1
+            );
+            assert!(
+                (configs[pair_start].learning_rate - configs[pair_start + 1].learning_rate).abs()
+                    < f32::EPSILON,
+                "Agents {} and {} should share config",
+                pair_start, pair_start + 1
+            );
+        }
     }
 }

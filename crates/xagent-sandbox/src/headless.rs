@@ -40,16 +40,24 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
         governor.config.patience,
     );
 
-    let mut current_configs: Vec<BrainConfig> =
-        (0..governor.config.population_size)
-            .map(|i| {
-                if i == 0 {
-                    seed_config.clone()
-                } else {
-                    mutate_config(&seed_config)
+    let mut current_configs: Vec<BrainConfig> = {
+        let repeats = governor.config.eval_repeats.max(1);
+        let unique_count = (governor.config.population_size / repeats).max(1);
+        let mut unique_configs = vec![seed_config.clone()];
+        for _ in 1..unique_count {
+            unique_configs.push(mutate_config(&seed_config));
+        }
+        let mut configs = Vec::with_capacity(governor.config.population_size);
+        for uc in &unique_configs {
+            for _ in 0..repeats {
+                if configs.len() >= governor.config.population_size {
+                    break;
                 }
-            })
-            .collect();
+                configs.push(uc.clone());
+            }
+        }
+        configs
+    };
 
     loop {
         if governor.evolution_complete() {

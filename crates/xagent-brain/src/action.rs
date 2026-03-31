@@ -68,12 +68,19 @@ const CREDIT_DEADZONE: f32 = 0.01;
 /// bounded enough that alternatives retain >1% softmax probability.
 const MAX_WEIGHT_NORM: f32 = 2.0;
 
-/// A record of one action taken: what action, when, and where in the
-/// state ring buffer its encoded state snapshot lives.
+/// A record of one action taken: what action, when, where in the
+/// state ring buffer its encoded state snapshot lives, and the
+/// homeostatic gradient at the moment the action was chosen.
 struct ActionRecord {
     action_idx: usize,
     tick: u64,
     state_offset: usize,
+    /// Homeostatic gradient at the time this action was taken.
+    /// Used for improvement-based credit: credit = (gradient_now - gradient_then).
+    /// This eliminates the temporal lag problem where correct actions (e.g. turning
+    /// away from danger) were punished because the gradient was still reflecting
+    /// *past* damage at the moment credit was assigned.
+    gradient_at_action: f32,
 }
 
 /// Selects motor commands via a learned linear policy over encoded states.
@@ -211,8 +218,10 @@ impl ActionSelector {
 
         let command = Self::action_to_command(action_idx, &mut rng);
 
-        // Record action + state snapshot in ring buffer
-        self.record_action(action_idx, current);
+        // Record action + state snapshot + current gradient in ring buffer.
+        // The gradient is stored so credit assignment can compare "gradient then"
+        // vs "gradient now" — rewarding actions that improved the situation.
+        self.record_action(action_idx, current, homeostatic_gradient);
         self.last_action_idx = action_idx;
 
         command
@@ -314,18 +323,6 @@ impl ActionSelector {
             *w *= 1.0 - WEIGHT_DECAY;
         }
 
-        // Gradient deadzone: skip credit for metabolic baseline noise.
-        if gradient.abs() < CREDIT_DEADZONE {
-            return;
-        }
-
-        // Negativity bias: amplify painful signals
-        let effective_gradient = if gradient < 0.0 {
-            gradient * PAIN_AMPLIFIER
-        } else {
-            gradient
-        };
-
         // Pre-compute current state norm for cosine similarity
         let current_norm_sq: f32 = self.current_state.iter().map(|v| v * v).sum();
         let current_norm = current_norm_sq.sqrt();
@@ -338,21 +335,42 @@ impl ActionSelector {
             let age = now.saturating_sub(rec.tick) as f32;
             let temporal = (-age * CREDIT_DECAY_RATE).exp();
 
-            // M2: Skip entries where temporal decay makes credit negligible
+            // Skip entries where temporal decay makes credit negligible
             if temporal < 0.01 {
                 continue;
             }
 
+            // ── Improvement-based credit ──────────────────────────────
+            // Instead of using the current absolute gradient (which lags
+            // behind the action by several ticks due to EMA smoothing),
+            // compute how much the gradient CHANGED since the action was
+            // taken: improvement = gradient_now - gradient_at_action.
+            //
+            // This correctly handles the hazard avoidance scenario:
+            //   - Walking INTO danger: gradient was 0, now -0.02 → Δ=-0.02 → punish ✓
+            //   - Turning AWAY:        gradient was -0.02, now -0.01 → Δ=+0.01 → reward ✓
+            //   - Moving to safety:    gradient was -0.01, now +0.01 → Δ=+0.02 → reward ✓
+            //
+            // The old approach used `gradient` directly, which was still
+            // deeply negative when the agent turned away, incorrectly
+            // punishing the very action that saved it.
+            let improvement = gradient - rec.gradient_at_action;
+
+            // Gradient deadzone on improvement to avoid noise
+            if improvement.abs() < CREDIT_DEADZONE {
+                continue;
+            }
+
+            // Negativity bias: amplify painful signals
+            let effective_improvement = if improvement < 0.0 {
+                improvement * PAIN_AMPLIFIER
+            } else {
+                improvement
+            };
+
             // State-conditioned credit: modulate by cosine similarity between
             // the current (event-triggering) state and the recorded state.
-            // This makes credit assignment context-dependent — only actions
-            // taken in SIMILAR states get reinforced/penalized.
-            //
-            // Why this matters: without state conditioning, a death signal
-            // penalizes "forward" in ALL states (danger, safe, food-rich).
-            // After many deaths, the agent learns "forward is always bad" and
-            // freezes. With state conditioning, only "forward in danger-like
-            // states" gets penalized — forward in safe states stays viable.
+            // Only actions taken in SIMILAR states get reinforced/penalized.
             let s_offset = rec.state_offset;
             let state_sim = if current_norm > 1e-6 {
                 let rec_norm_sq: f32 = self.state_ring[s_offset..s_offset + dim]
@@ -372,7 +390,7 @@ impl ActionSelector {
                 1.0
             };
 
-            let credit = effective_gradient * temporal * state_sim;
+            let credit = effective_improvement * temporal * state_sim;
 
             // Update policy weights: Δw[action] += lr * credit * state_snapshot
             let w_offset = rec.action_idx * dim;
@@ -396,10 +414,6 @@ impl ActionSelector {
         }
 
         // Synaptic homeostasis: cap each action's weight vector L2 norm.
-        // Prevents unbounded accumulation in either direction:
-        // - Positive: food circling can't lock in forever (weights plateau)
-        // - Negative: death signals can't paralyze (forward stays viable)
-        // Weight decay still runs every tick; this only clips after credit updates.
         self.normalize_weights();
     }
 
@@ -421,7 +435,7 @@ impl ActionSelector {
         }
     }
 
-    fn record_action(&mut self, action_idx: usize, state: &EncodedState) {
+    fn record_action(&mut self, action_idx: usize, state: &EncodedState, gradient: f32) {
         let dim = self.repr_dim;
         let s_offset = self.history_cursor * dim;
 
@@ -434,6 +448,7 @@ impl ActionSelector {
             action_idx,
             tick: self.tick,
             state_offset: s_offset,
+            gradient_at_action: gradient,
         };
         if self.action_ring.len() < ACTION_HISTORY_LEN {
             self.action_ring.push(rec);
@@ -601,8 +616,13 @@ mod tests {
         let pred = state.clone();
         let mut mem = PatternMemory::new(10, 4);
 
-        // Take many actions with positive gradient
-        for _ in 0..50 {
+        // Simulate a gradient TRANSITION: baseline → positive.
+        // With improvement-based credit, actions taken during baseline get
+        // rewarded when the gradient subsequently rises (things improved).
+        for _ in 0..25 {
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, &mut mem);
+        }
+        for _ in 0..25 {
             sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, &mut mem);
         }
 
@@ -612,7 +632,7 @@ mod tests {
             .iter()
             .cloned()
             .fold(f32::NEG_INFINITY, f32::max);
-        assert!(max_val > 0.0, "Positive gradient should increase values");
+        assert!(max_val > 0.0, "Positive gradient transition should increase values");
     }
 
     #[test]
@@ -659,12 +679,20 @@ mod tests {
         let state_b = make_state(&[0.0, 1.0, 0.0, 0.0]);
         let pred = make_state(&[0.0; 4]);
 
-        // Repeatedly: take actions in state A with positive gradient
-        for _ in 0..100 {
+        // Simulate gradient TRANSITION in state A: baseline → positive.
+        // Actions during baseline get rewarded when gradient rises.
+        for _ in 0..50 {
+            sel.select(&state_a, &pred, &[], 0.0, 0.1, 0.5, &mut mem);
+        }
+        for _ in 0..50 {
             sel.select(&state_a, &pred, &[], 1.0, 0.1, 0.5, &mut mem);
         }
-        // Take actions in state B with negative gradient
-        for _ in 0..100 {
+        // Simulate gradient TRANSITION in state B: baseline → negative.
+        // Actions during baseline get punished when gradient drops.
+        for _ in 0..50 {
+            sel.select(&state_b, &pred, &[], 0.0, 0.1, 0.5, &mut mem);
+        }
+        for _ in 0..50 {
             sel.select(&state_b, &pred, &[], -1.0, 0.1, 0.5, &mut mem);
         }
 
@@ -677,7 +705,7 @@ mod tests {
 
         assert!(
             max_a > max_b,
-            "State A (positive gradient) should have higher max preference than B (negative): A={max_a}, B={max_b}"
+            "State A (improving gradient) should have higher max preference than B (worsening): A={max_a}, B={max_b}"
         );
     }
 
@@ -690,8 +718,12 @@ mod tests {
         let danger_state = make_state(&[1.0, 0.0, 0.0, 0.0]);
         let safe_state = make_state(&[0.0, 1.0, 0.0, 0.0]);
 
-        // Train with negative gradient in danger state (simulating damage)
-        for _ in 0..50 {
+        // Simulate entering danger: gradient transitions from safe (0) to damage (-1).
+        // Actions taken during safe phase get punished when gradient worsens.
+        for _ in 0..25 {
+            sel.select(&danger_state, &safe_state, &[], 0.0, 0.1, 0.5, &mut mem);
+        }
+        for _ in 0..25 {
             sel.select(&danger_state, &safe_state, &[], -1.0, 0.1, 0.5, &mut mem);
         }
 
@@ -801,6 +833,40 @@ mod tests {
         assert!(
             avg_danger < avg_safe,
             "Death in danger state should penalize danger preferences more than safe: danger={avg_danger:.4}, safe={avg_safe:.4}"
+        );
+    }
+
+    #[test]
+    fn avoidance_action_gets_positive_credit_after_gradient_recovers() {
+        // Core scenario the improvement-based credit fixes:
+        // Agent takes damage (gradient drops), then turns away (gradient recovers).
+        // The turn should get POSITIVE credit, not negative.
+        let mut sel = ActionSelector::new(4);
+        let danger_state = make_state(&[1.0, 0.0, 0.0, 0.0]);
+        let pred = make_state(&[0.0; 4]);
+        let mut mem = PatternMemory::new(10, 4);
+
+        // Phase 1: take actions while gradient is worsening (entering danger)
+        for _ in 0..10 {
+            sel.select(&danger_state, &pred, &[], -0.5, 0.3, 0.5, &mut mem);
+        }
+
+        // Phase 2: gradient recovers (agent turned away, damage stopping)
+        for _ in 0..10 {
+            sel.select(&danger_state, &pred, &[], 0.0, 0.3, 0.2, &mut mem);
+        }
+
+        // The actions from phase 1 (taken at gradient -0.5) should have received
+        // POSITIVE improvement credit when gradient rose to 0.0 in phase 2:
+        // improvement = 0.0 - (-0.5) = +0.5 → reward.
+        // So at least some action weights in danger_state should be positive
+        // (the actions that were taken during the worsening phase got credited
+        // when things improved).
+        let prefs = sel.compute_state_preferences(&danger_state);
+        let max_pref = prefs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_pref > 0.0,
+            "Actions during danger should get positive credit when gradient recovers: max_pref={max_pref:.4}"
         );
     }
 }

@@ -580,13 +580,25 @@ impl App {
             self.brain_config.clone()
         };
         let pop_size = self.governor_config.population_size;
-        for i in 0..pop_size {
-            let cfg = if i == 0 {
-                seed.clone()
-            } else {
-                mutate_config(&seed)
-            };
-            self.spawn_agent(cfg, 0);
+        let repeats = self.governor_config.eval_repeats.max(1);
+        let unique_count = (pop_size / repeats).max(1);
+
+        // Build unique configs matching breed_next_generation structure
+        // so that reduce_fitness grouping (agent_index / eval_repeats)
+        // correctly averages same-config runs.
+        let mut unique_configs = vec![seed.clone()]; // slot 0: champion
+        for _ in 1..unique_count {
+            unique_configs.push(mutate_config(&seed));
+        }
+
+        // Repeat each config eval_repeats times
+        for uc in &unique_configs {
+            for _ in 0..repeats {
+                if self.agents.len() >= pop_size {
+                    break;
+                }
+                self.spawn_agent(uc.clone(), 0);
+            }
         }
     }
 

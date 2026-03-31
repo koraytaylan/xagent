@@ -7,25 +7,26 @@ use xagent_shared::SensoryFrame;
 /// energy, integrity, energy_delta, integrity_delta.
 const NON_VISUAL_FEATURES: usize = 9;
 
+/// Channels per pixel in the raw visual encoding: R, G, B, depth.
+const CHANNELS_PER_PIXEL: usize = 4;
+
 // --- Constants ---
 const WEIGHT_CLAMP_RANGE: f32 = 2.0;
 const L2_REGULARIZATION_FACTOR: f32 = 0.001;
 
 /// Compresses raw sensory input into a fixed-size internal representation.
 ///
-/// The encoder has limited capacity — it cannot represent everything in
-/// the sensory frame. What it chooses to encode determines what the brain
-/// "pays attention to". Encoding weights adapt based on prediction error:
-/// features that contributed most to the output receive proportionally
-/// larger gradient-like updates.
+/// Visual data is encoded per-pixel with full spatial structure preserved:
+/// each pixel contributes its own RGB + depth features in spatial order
+/// (row-major). This lets the brain learn directional associations like
+/// "green on the left → turn left" — something the old pooled-bin approach
+/// could never capture because it averaged away positional information.
 pub struct SensoryEncoder {
     /// Dimensionality of the output representation.
     representation_dim: usize,
-    /// Visual encoding resolution (downsampled).
-    visual_encoding_size: usize,
-    /// Number of input features (visual + non-visual).
+    /// Number of input features (visual pixels × channels + non-visual).
     feature_count: usize,
-    /// Encoding weights: [feature_count × representation_dim], row-major.
+    /// Encoding weights: [representation_dim × feature_count], row-major.
     weights: Vec<f32>,
     /// Per-feature bias terms.
     biases: Vec<f32>,
@@ -37,6 +38,8 @@ pub struct SensoryEncoder {
     pending_scale: f32,
     /// Number of adapt() calls since last materialization.
     adapt_count: u32,
+    /// Whether the weight matrix has been initialized (deferred to first encode).
+    initialized: bool,
 }
 
 /// Maximum representation dimensionality. Sized for stack allocation.
@@ -85,34 +88,41 @@ impl EncodedState {
 }
 
 impl SensoryEncoder {
-    /// Create a new encoder with Xavier/Glorot-initialized weights.
+    /// Create a new encoder. Weight initialization is deferred to the first
+    /// `encode()` call so the encoder can size itself to the actual frame
+    /// dimensions without requiring them at construction time.
     ///
     /// `representation_dim` controls the output vector size.
-    /// `visual_encoding_size` controls how many bins the visual field is pooled into.
-    pub fn new(representation_dim: usize, visual_encoding_size: usize) -> Self {
-        // 3 channels (RGB) per spatial bin + non-visual features
-        let feature_count = visual_encoding_size * 3 + NON_VISUAL_FEATURES;
-        let weight_count = feature_count * representation_dim;
-
-        // Xavier / Glorot-style initialization: uniform in [-limit, limit]
-        let limit = (6.0 / (feature_count + representation_dim) as f32).sqrt();
-        let mut rng = rand::rng();
-        let weights: Vec<f32> = (0..weight_count)
-            .map(|_| rng.random_range(-limit..=limit))
-            .collect();
-        let biases = vec![0.0; representation_dim];
-
+    /// `_visual_encoding_size` is retained for config compatibility but no
+    /// longer used — the encoder derives its input size from the raw frame.
+    pub fn new(representation_dim: usize, _visual_encoding_size: usize) -> Self {
         Self {
             representation_dim,
-            visual_encoding_size,
-            feature_count,
-            weights,
-            biases,
-            feature_scratch: vec![0.0; feature_count],
+            feature_count: 0,
+            weights: Vec::new(),
+            biases: vec![0.0; representation_dim],
+            feature_scratch: Vec::new(),
             encode_scratch: vec![0.0; representation_dim],
             pending_scale: 1.0,
             adapt_count: 0,
+            initialized: false,
         }
+    }
+
+    /// Initialize weights on first encode, when we know the actual frame size.
+    fn lazy_init(&mut self, feature_count: usize) {
+        self.feature_count = feature_count;
+        let weight_count = feature_count * self.representation_dim;
+
+        // Xavier / Glorot-style initialization
+        let limit = (6.0 / (feature_count + self.representation_dim) as f32).sqrt();
+        let mut rng = rand::rng();
+        self.weights = (0..weight_count)
+            .map(|_| rng.random_range(-limit..=limit))
+            .collect();
+        self.biases = vec![0.0; self.representation_dim];
+        self.feature_scratch = vec![0.0; feature_count];
+        self.initialized = true;
     }
 
     /// Encode a sensory frame into the internal representation.
@@ -150,7 +160,7 @@ impl SensoryEncoder {
         &self.biases
     }
 
-    /// Number of input features (visual bins × 3 + non-visual).
+    /// Number of input features.
     pub fn feature_count(&self) -> usize {
         self.feature_count
     }
@@ -188,46 +198,49 @@ impl SensoryEncoder {
         self.adapt_count = 0;
     }
 
-    /// Extract features from raw sensory data into the scratch buffer.
+    /// Extract raw per-pixel features from sensory data into the scratch buffer.
     ///
-    /// Visual data is pooled per-channel (R, G, B separately) so the encoder
-    /// can distinguish color — critical for telling danger (red) from food (green).
+    /// Each pixel contributes RGB + depth in spatial order (row-major),
+    /// preserving the directional layout of the agent's visual field.
+    /// The brain can learn spatial associations like "green-left → turn left"
+    /// because pixel position maps directly to viewing angle.
     fn extract_features_into(&mut self, frame: &SensoryFrame) {
+        let total_pixels = (frame.vision.width * frame.vision.height) as usize;
+        let needed = total_pixels * CHANNELS_PER_PIXEL + NON_VISUAL_FEATURES;
+
+        // Lazy-initialize on first call when we know the actual frame size
+        if !self.initialized {
+            self.lazy_init(needed);
+        }
+
         let mut cursor = 0;
 
-        let total_pixels = (frame.vision.width * frame.vision.height) as usize;
+        // Per-pixel RGB + depth, preserving full spatial structure
         if total_pixels > 0 && !frame.vision.color.is_empty() {
-            let bin_count = self.visual_encoding_size.max(1);
-
-            for bin in 0..bin_count {
-                let px_start = bin * total_pixels / bin_count;
-                let px_end = ((bin + 1) * total_pixels / bin_count).min(total_pixels);
-                let n = (px_end - px_start).max(1) as f32;
-
-                let mut r_sum = 0.0f32;
-                let mut g_sum = 0.0f32;
-                let mut b_sum = 0.0f32;
-
-                for px in px_start..px_end {
-                    let base = px * 4;
-                    if base + 2 < frame.vision.color.len() {
-                        r_sum += frame.vision.color[base];
-                        g_sum += frame.vision.color[base + 1];
-                        b_sum += frame.vision.color[base + 2];
-                        // Skip alpha (index+3) — carries no useful information
-                    }
+            for px in 0..total_pixels {
+                let base = px * 4;
+                if base + 2 < frame.vision.color.len() {
+                    self.feature_scratch[cursor] = frame.vision.color[base];     // R
+                    self.feature_scratch[cursor + 1] = frame.vision.color[base + 1]; // G
+                    self.feature_scratch[cursor + 2] = frame.vision.color[base + 2]; // B
+                } else {
+                    self.feature_scratch[cursor] = 0.0;
+                    self.feature_scratch[cursor + 1] = 0.0;
+                    self.feature_scratch[cursor + 2] = 0.0;
                 }
-
-                self.feature_scratch[cursor] = r_sum / n;
-                self.feature_scratch[cursor + 1] = g_sum / n;
-                self.feature_scratch[cursor + 2] = b_sum / n;
-                cursor += 3;
+                // Depth (normalized 0..1): how far away is the surface at this pixel
+                if px < frame.vision.depth.len() {
+                    self.feature_scratch[cursor + 3] = frame.vision.depth[px];
+                } else {
+                    self.feature_scratch[cursor + 3] = 1.0;
+                }
+                cursor += CHANNELS_PER_PIXEL;
             }
         } else {
-            for i in 0..(self.visual_encoding_size * 3) {
-                self.feature_scratch[cursor + i] = 0.0;
+            for _ in 0..(total_pixels * CHANNELS_PER_PIXEL) {
+                self.feature_scratch[cursor] = 0.0;
+                cursor += 1;
             }
-            cursor += self.visual_encoding_size * 3;
         }
 
         // Proprioceptive features
@@ -274,6 +287,42 @@ mod tests {
         }
     }
 
+    /// Build a frame where the LEFT half is one color and the RIGHT half is another.
+    /// This tests that the encoder preserves spatial structure.
+    fn make_spatial_frame(left_r: f32, left_g: f32, right_r: f32, right_g: f32) -> SensoryFrame {
+        let w = 4u32;
+        let h = 3u32;
+        let pixels = (w * h) as usize;
+        let mut color = vec![0.0f32; pixels * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let px = (row * w + col) as usize;
+                let base = px * 4;
+                if col < w / 2 {
+                    color[base] = left_r;
+                    color[base + 1] = left_g;
+                } else {
+                    color[base] = right_r;
+                    color[base + 1] = right_g;
+                }
+                color[base + 2] = 0.1; // B
+                color[base + 3] = 1.0; // A
+            }
+        }
+        SensoryFrame {
+            vision: VisualField { width: w, height: h, color, depth: vec![0.5; pixels] },
+            velocity: Vec3::ZERO,
+            facing: Vec3::Z,
+            angular_velocity: 0.0,
+            energy_signal: 0.5,
+            integrity_signal: 1.0,
+            energy_delta: 0.0,
+            integrity_delta: 0.0,
+            touch_contacts: vec![],
+            tick: 0,
+        }
+    }
+
     #[test]
     fn similar_inputs_produce_similar_encodings() {
         let mut enc = SensoryEncoder::new(16, 8);
@@ -300,8 +349,8 @@ mod tests {
     #[test]
     fn adaptation_modifies_weights() {
         let mut enc = SensoryEncoder::new(8, 4);
-        let weights_before: Vec<f32> = enc.weights.clone();
         let _ = enc.encode(&make_frame(0.5, 0.5));
+        let weights_before: Vec<f32> = enc.weights.clone();
         // Call adapt enough times to trigger materialization
         for _ in 0..32 {
             enc.adapt(0.5, 0.1);
@@ -328,6 +377,31 @@ mod tests {
         let a = enc.encode(&frame);
         let b = enc.encode(&frame);
         assert_eq!(a.data(), b.data(), "Same input should produce same output");
+    }
+
+    #[test]
+    fn spatial_structure_is_preserved() {
+        // Green-left / red-right produces a DIFFERENT encoding from
+        // red-left / green-right.  The old pooled encoder would have
+        // averaged them to the same global color → identical output.
+        let mut enc = SensoryEncoder::new(16, 8);
+        let food_left  = enc.encode(&make_spatial_frame(0.1, 0.8, 0.8, 0.1));
+        let food_right = enc.encode(&make_spatial_frame(0.8, 0.1, 0.1, 0.8));
+
+        let sim = cosine_sim(food_left.data(), food_right.data());
+        assert!(
+            sim < 0.95,
+            "Spatially mirrored scenes should produce distinct encodings: sim={sim}"
+        );
+    }
+
+    #[test]
+    fn feature_count_includes_depth_and_interoception() {
+        let mut enc = SensoryEncoder::new(8, 4);
+        let frame = make_frame(0.5, 0.5);
+        let feats = enc.extract_features(&frame);
+        // 4×3 pixels × 4 channels (RGBD) + 9 interoceptive = 57
+        assert_eq!(feats.len(), 4 * 3 * 4 + 9);
     }
 
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {

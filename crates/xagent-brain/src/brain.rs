@@ -88,12 +88,17 @@ impl Brain {
     /// Initializes all subsystems (encoder, memory, predictor, action selector,
     /// homeostasis, capacity manager) with parameters derived from the config.
     pub fn new(config: BrainConfig) -> Self {
-        let encoder = SensoryEncoder::new(config.representation_dim, config.visual_encoding_size);
+        let mut encoder = SensoryEncoder::new(config.representation_dim, config.visual_encoding_size);
         let memory = PatternMemory::new(config.memory_capacity, config.representation_dim);
         let predictor = Predictor::new(config.representation_dim);
         let action_selector = ActionSelector::new(config.representation_dim);
         let homeostasis = HomeostaticMonitor::new();
         let capacity = CapacityManager::new(config.processing_slots);
+
+        // Trigger encoder weight initialization with the standard 8×6 frame
+        // so feature_count() is available for GPU pipeline setup.
+        let blank = xagent_shared::SensoryFrame::new_blank(8, 6);
+        let _ = encoder.encode(&blank);
 
         Self {
             config,
@@ -391,5 +396,15 @@ mod tests {
         let t = brain.telemetry();
         assert!(!t.prediction_error.is_nan(), "Should not produce NaN with max inputs");
         assert!(!t.homeostatic_gradient.is_nan(), "Gradient should not be NaN");
+    }
+
+    #[test]
+    fn encoder_feature_count_available_after_construction() {
+        let brain = Brain::new(BrainConfig::default());
+        // feature_count must be > 0 immediately after construction
+        // (GPU pipeline reads it before the first tick).
+        let fc = brain.encoder.feature_count();
+        // 8×6 pixels × 4 channels (RGBD) + 9 interoceptive = 201
+        assert_eq!(fc, 8 * 6 * 4 + 9, "feature_count should reflect 8×6 RGBD + interoception");
     }
 }

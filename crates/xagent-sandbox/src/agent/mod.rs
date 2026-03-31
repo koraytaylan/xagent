@@ -129,8 +129,6 @@ pub struct Agent {
     pub exploration_rate_history: std::collections::VecDeque<f32>,
     pub energy_history: std::collections::VecDeque<f32>,
     pub integrity_history: std::collections::VecDeque<f32>,
-    /// Per-tick action weight snapshots for chart (each entry is [f32; 8]).
-    pub action_weight_history: std::collections::VecDeque<[f32; 8]>,
     /// Ring buffer of recent brain decisions for the decision stream UI.
     pub decision_log: std::collections::VecDeque<xagent_brain::DecisionSnapshot>,
     /// Pre-allocated sensory frame buffer, reused each tick to avoid heap churn.
@@ -162,7 +160,6 @@ impl Agent {
             exploration_rate_history: std::collections::VecDeque::with_capacity(128),
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
-            action_weight_history: std::collections::VecDeque::with_capacity(128),
             decision_log: std::collections::VecDeque::with_capacity(256),
             cached_frame: SensoryFrame::new_blank(8, 6),
         }
@@ -241,7 +238,6 @@ impl Agent {
         self.exploration_rate_history.clear();
         self.energy_history.clear();
         self.integrity_history.clear();
-        self.action_weight_history.clear();
         self.decision_log.clear();
     }
 }

@@ -15,6 +15,42 @@ pub enum Tab {
     AgentDetail(u32),
 }
 
+/// Sort modes for the agent list sidebar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SortMode {
+    Id,
+    Energy,
+    Integrity,
+    Deaths,
+    LongestLife,
+    PredictionError,
+    Fitness,
+}
+
+impl SortMode {
+    pub const ALL: [SortMode; 7] = [
+        SortMode::Id,
+        SortMode::Energy,
+        SortMode::Integrity,
+        SortMode::Deaths,
+        SortMode::LongestLife,
+        SortMode::PredictionError,
+        SortMode::Fitness,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::Id => "ID",
+            SortMode::Energy => "Energy",
+            SortMode::Integrity => "Integrity",
+            SortMode::Deaths => "Deaths",
+            SortMode::LongestLife => "Longest Life",
+            SortMode::PredictionError => "Pred. Error",
+            SortMode::Fitness => "Fitness",
+        }
+    }
+}
+
 /// Snapshot of a single agent's state, copied once per frame for the UI.
 pub struct AgentSnapshot {
     pub id: u32,
@@ -29,12 +65,30 @@ pub struct AgentSnapshot {
     pub longest_life: u64,
     pub exploration_rate: f32,
     pub prediction_error: f32,
-    pub action_weights: Vec<f32>,
+    /// Forward channel weight norm (policy strength).
+    pub forward_weight_norm: f32,
+    /// Turn channel weight norm (policy strength).
+    pub turn_weight_norm: f32,
     pub prediction_error_history: Vec<f32>,
     pub exploration_rate_history: Vec<f32>,
     pub energy_history: Vec<f32>,
     pub integrity_history: Vec<f32>,
-    pub action_weight_history: Vec<[f32; 8]>,
+    /// Recent decision snapshots for the brain inspector stream.
+    pub decision_log: Vec<xagent_brain::DecisionSnapshot>,
+    /// Homeostatic gradient (composite).
+    pub gradient: f32,
+    /// Urgency level.
+    pub urgency: f32,
+    /// Food consumed (cumulative).
+    pub food_consumed: u32,
+    /// Total ticks alive (cumulative).
+    pub total_ticks_alive: u64,
+    /// Current motor forward output.
+    pub motor_forward: f32,
+    /// Current motor turn output.
+    pub motor_turn: f32,
+    /// Current behavior phase label.
+    pub phase: &'static str,
 }
 
 /// The lifecycle state of the evolution system.
@@ -458,36 +512,16 @@ impl<'a> TabContext<'a> {
             cols[0].label(format!("Deaths: {}", snap.deaths));
             cols[0].label(format!("Longest life: {} ticks", snap.longest_life));
 
-            // Right column: brain info + action weights
+            // Right column: brain info + motor weights
             cols[1].label(egui::RichText::new("Brain").strong());
             cols[1].add_space(4.0);
             cols[1].label(format!("Exploration: {:.1}%", snap.exploration_rate * 100.0));
             cols[1].label(format!("Prediction error: {:.4}", snap.prediction_error));
-
-            cols[1].add_space(8.0);
-            cols[1].label(egui::RichText::new("Action Weights").strong());
             cols[1].add_space(4.0);
-
-            let action_names = [
-                "Forward", "Back", "Left", "Right",
-                "Turn L", "Turn R", "Consume", "Forage",
-            ];
-            let max_w = snap.action_weights.iter().copied()
-                .fold(0.0f32, f32::max).max(0.001);
-
-            egui::Grid::new("action_weights_grid")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(&mut cols[1], |ui| {
-                    for (i, w) in snap.action_weights.iter().enumerate() {
-                        let name = action_names.get(i).unwrap_or(&"?");
-                        ui.label(egui::RichText::new(*name).monospace().small());
-                        ui.add(egui::ProgressBar::new(w / max_w)
-                            .text(format!("{:.3}", w))
-                            .desired_width(120.0));
-                        ui.end_row();
-                    }
-                });
+            cols[1].label(format!("Fwd weight norm: {:.3}", snap.forward_weight_norm));
+            cols[1].label(format!("Turn weight norm: {:.3}", snap.turn_weight_norm));
+            cols[1].label(format!("Motor fwd: {:.3}  turn: {:.3}", snap.motor_forward, snap.motor_turn));
+            cols[1].label(format!("Phase: {}", snap.phase));
         });
 
         // ── Combined history chart ──────────────────────────────────
@@ -575,104 +609,7 @@ impl<'a> TabContext<'a> {
             }
         }
 
-        // ── Action Weights history chart ────────────────────────────
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Action Weight History").strong());
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("(same zoom as above)")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-        });
-        ui.add_space(4.0);
-
-        let action_names = [
-            "Forward", "Back", "Left", "Right",
-            "Turn L", "Turn R", "Consume", "Forage",
-        ];
-        let action_colors = [
-            egui::Color32::from_rgb(255, 100, 100),  // Forward - red
-            egui::Color32::from_rgb(100, 100, 255),  // Back - blue
-            egui::Color32::from_rgb(255, 200, 50),   // Left - yellow
-            egui::Color32::from_rgb(50, 220, 200),   // Right - cyan
-            egui::Color32::from_rgb(200, 100, 255),  // Turn L - purple
-            egui::Color32::from_rgb(255, 150, 50),   // Turn R - orange
-            egui::Color32::from_rgb(100, 255, 100),  // Consume - green
-            egui::Color32::from_rgb(255, 255, 255),  // Forage - white
-        ];
-
-        // Legend row
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..8 {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 4.0, action_colors[i]);
-                ui.label(egui::RichText::new(action_names[i]).small().color(egui::Color32::GRAY));
-                ui.add_space(4.0);
-            }
-        });
-        ui.add_space(2.0);
-
-        let aw_chart_height = 120.0;
-        let aw_avail_w = ui.available_width().max(60.0);
-        let (aw_rect, aw_resp) = ui.allocate_exact_size(
-            egui::vec2(aw_avail_w, aw_chart_height),
-            egui::Sense::hover(),
-        );
-
-        // Scroll-to-zoom (shared with vitals chart)
-        if aw_resp.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
-                let factor = if scroll > 0.0 { 0.8 } else { 1.25 };
-                let new_w = ((*chart_window as f32) * factor).round() as usize;
-                *chart_window = new_w.clamp(30, 10_000);
-            }
-        }
-
-        let aw_painter = ui.painter();
-
-        // Background + grid
-        aw_painter.rect_filled(aw_rect, 2.0, egui::Color32::from_gray(25));
-        for frac in [0.25, 0.5, 0.75] {
-            let y = aw_rect.bottom() - frac * aw_rect.height();
-            aw_painter.line_segment(
-                [egui::pos2(aw_rect.left(), y), egui::pos2(aw_rect.right(), y)],
-                egui::Stroke::new(0.5, egui::Color32::from_gray(50)),
-            );
-        }
-
-        // Compute visible window and auto-scale Y range
-        let aw_hist = &snap.action_weight_history;
-        let aw_start = aw_hist.len().saturating_sub(window);
-        let aw_slice = &aw_hist[aw_start..];
-
-        if aw_slice.len() >= 2 {
-            let mut vmin = f32::MAX;
-            let mut vmax = f32::MIN;
-            for snap_aw in aw_slice {
-                for &v in snap_aw {
-                    if v < vmin { vmin = v; }
-                    if v > vmax { vmax = v; }
-                }
-            }
-            let range = (vmax - vmin).max(0.001);
-            let n = aw_slice.len();
-
-            for action_idx in 0..8 {
-                let points: Vec<egui::Pos2> = aw_slice.iter().enumerate().map(|(i, aw)| {
-                    let x = aw_rect.left() + (i as f32 / (n - 1) as f32) * aw_rect.width();
-                    let t = (aw[action_idx] - vmin) / range;
-                    let y = aw_rect.bottom() - t * aw_rect.height();
-                    egui::pos2(x, y)
-                }).collect();
-                let stroke = egui::Stroke::new(1.5, action_colors[action_idx]);
-                for pair in points.windows(2) {
-                    aw_painter.line_segment([pair[0], pair[1]], stroke);
-                }
-            }
-        }
+        // (Action Weight History chart removed — will be replaced by brain inspector in Task 6)
     }
 
     fn render_evolution_tab(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) -> EvolutionAction {

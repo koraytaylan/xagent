@@ -196,16 +196,6 @@ fn record_agent_histories(agent: &mut Agent) {
         h.pop_front();
     }
     h.push_back(inf.clamp(0.0, 1.0));
-    let vals = agent.brain.action_selector.global_action_values();
-    let mut aw = [0.0f32; 8];
-    for (j, v) in vals.iter().enumerate().take(8) {
-        aw[j] = *v;
-    }
-    let h = &mut agent.action_weight_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(aw);
     if let Some(decision) = agent.brain.last_decision().cloned() {
         let h = &mut agent.decision_log;
         if h.len() >= 256 {
@@ -1819,10 +1809,6 @@ impl ApplicationHandler for App {
                                         let skip = d.len().saturating_sub(snap_window);
                                         d.iter().skip(skip).copied().collect()
                                     };
-                                    let tail_aw = |d: &std::collections::VecDeque<[f32; 8]>| -> Vec<[f32; 8]> {
-                                        let skip = d.len().saturating_sub(snap_window);
-                                        d.iter().skip(skip).copied().collect()
-                                    };
                                     AgentSnapshot {
                                         id: a.id,
                                         gen: a.generation,
@@ -1836,12 +1822,28 @@ impl ApplicationHandler for App {
                                         longest_life: a.longest_life,
                                         exploration_rate: a.brain.action_selector.exploration_rate(),
                                         prediction_error: telemetry.prediction_error,
-                                        action_weights: a.brain.action_selector.global_action_values().to_vec(),
+                                        forward_weight_norm: {
+                                            let w = a.brain.action_selector.export_weights();
+                                            let dim = a.brain.config.representation_dim;
+                                            w[..dim].iter().map(|x| x * x).sum::<f32>().sqrt()
+                                        },
+                                        turn_weight_norm: {
+                                            let w = a.brain.action_selector.export_weights();
+                                            let dim = a.brain.config.representation_dim;
+                                            w[dim..dim*2].iter().map(|x| x * x).sum::<f32>().sqrt()
+                                        },
                                         prediction_error_history: tail(&a.prediction_error_history),
                                         exploration_rate_history: tail(&a.exploration_rate_history),
                                         energy_history: tail(&a.energy_history),
                                         integrity_history: tail(&a.integrity_history),
-                                        action_weight_history: tail_aw(&a.action_weight_history),
+                                        decision_log: a.decision_log.iter().cloned().collect(),
+                                        gradient: telemetry.homeostatic_gradient,
+                                        urgency: telemetry.homeostatic_urgency,
+                                        food_consumed: a.food_consumed,
+                                        total_ticks_alive: a.total_ticks_alive,
+                                        motor_forward: a.cached_motor.forward,
+                                        motor_turn: a.cached_motor.turn,
+                                        phase: telemetry.behavior_phase(),
                                     }
                                 }).collect();
 

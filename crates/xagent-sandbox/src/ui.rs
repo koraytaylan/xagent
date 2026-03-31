@@ -470,7 +470,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                     egui::ScrollArea::vertical()
                         .id_salt(format!("agent_detail_scroll_{}", id))
                         .show(ui, |ui| {
-                            Self::render_agent_detail(ui, snap, self.chart_window);
+                            Self::render_agent_detail(ui, snap, self.chart_window, self.world, self.agents);
                         });
                 } else {
                     ui.label(format!("Agent {} no longer exists.", id));
@@ -485,7 +485,13 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
 }
 
 impl<'a> TabContext<'a> {
-    fn render_agent_detail(ui: &mut egui::Ui, snap: &AgentSnapshot, chart_window: &mut usize) {
+    fn render_agent_detail(
+        ui: &mut egui::Ui,
+        snap: &AgentSnapshot,
+        chart_window: &mut usize,
+        world: &WorldSnapshot,
+        all_agents: &[AgentSnapshot],
+    ) {
         let color = egui::Color32::from_rgb(
             (snap.color[0] * 255.0) as u8,
             (snap.color[1] * 255.0) as u8,
@@ -607,6 +613,164 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                     });
             });
+
+            // ── Agent Vision ──────────────────────────────────
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Vision").strong());
+            ui.add_space(4.0);
+
+            if snap.vision_color.len() >= (snap.vision_width * snap.vision_height * 4) as usize {
+                let vw = snap.vision_width as usize;
+                let vh = snap.vision_height as usize;
+                let display_w = ui.available_width().min(320.0).max(80.0);
+                let cell_w = display_w / vw as f32;
+                let cell_h = cell_w; // square pixels
+                let display_h = cell_h * vh as f32;
+
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(display_w, display_h),
+                    egui::Sense::hover(),
+                );
+                let p = ui.painter();
+
+                // Background
+                p.rect_filled(rect, 2.0, egui::Color32::from_gray(15));
+
+                // Paint each pixel as a colored rectangle
+                for row in 0..vh {
+                    for col in 0..vw {
+                        let idx = (row * vw + col) * 4;
+                        let r = (snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
+                        let g = (snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0) as u8;
+                        let b = (snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0) as u8;
+                        let pixel_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                rect.left() + col as f32 * cell_w,
+                                rect.top() + row as f32 * cell_h,
+                            ),
+                            egui::vec2(cell_w, cell_h),
+                        );
+                        p.rect_filled(pixel_rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                    }
+                }
+
+                // Grid lines (subtle)
+                for col in 0..=vw {
+                    let x = rect.left() + col as f32 * cell_w;
+                    p.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(0.5, egui::Color32::from_gray(40)),
+                    );
+                }
+                for row in 0..=vh {
+                    let y = rect.top() + row as f32 * cell_h;
+                    p.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(0.5, egui::Color32::from_gray(40)),
+                    );
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new("No vision data available.")
+                        .italics()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+
+            // ── Mini-Map ──────────────────────────────────────
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Map").strong());
+                ui.label(
+                    egui::RichText::new("(top-down)")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            });
+            ui.add_space(4.0);
+
+            let map_size = ui.available_width().min(300.0).max(100.0);
+            let (map_rect, _) = ui.allocate_exact_size(
+                egui::vec2(map_size, map_size),
+                egui::Sense::hover(),
+            );
+            let p = ui.painter();
+
+            // Draw biome texture as background
+            if let Some(ref tex) = world.biome_texture {
+                p.image(
+                    tex.id(),
+                    map_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                p.rect_filled(map_rect, 2.0, egui::Color32::from_gray(30));
+            }
+
+            let ws = world.world_size;
+            let half = ws / 2.0;
+
+            // Helper: world (x, z) → map pixel position
+            let to_map = |wx: f32, wz: f32| -> egui::Pos2 {
+                let nx = (wx + half) / ws;
+                let nz = (wz + half) / ws;
+                egui::pos2(
+                    map_rect.left() + nx * map_rect.width(),
+                    map_rect.top() + nz * map_rect.height(),
+                )
+            };
+
+            // Draw food items as small yellow-green dots
+            for fp in &world.food_positions {
+                let pos = to_map(fp[0], fp[1]);
+                p.circle_filled(pos, 2.0, egui::Color32::from_rgb(140, 200, 40));
+            }
+
+            // Draw all other agents as small dots
+            for other in all_agents {
+                if other.id == snap.id {
+                    continue;
+                }
+                let acolor = if other.alive {
+                    egui::Color32::from_rgb(
+                        (other.color[0] * 255.0) as u8,
+                        (other.color[1] * 255.0) as u8,
+                        (other.color[2] * 255.0) as u8,
+                    )
+                } else {
+                    egui::Color32::from_gray(80)
+                };
+                let pos = to_map(other.position[0], other.position[2]);
+                p.circle_filled(pos, 3.0, acolor);
+            }
+
+            // Draw selected agent as a larger dot with facing direction arrow
+            {
+                let agent_pos = to_map(snap.position[0], snap.position[2]);
+                let agent_color = egui::Color32::from_rgb(
+                    (snap.color[0] * 255.0) as u8,
+                    (snap.color[1] * 255.0) as u8,
+                    (snap.color[2] * 255.0) as u8,
+                );
+
+                // Agent dot
+                p.circle_filled(agent_pos, 5.0, agent_color);
+                p.circle_stroke(agent_pos, 5.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+
+                // Facing direction arrow
+                let arrow_len = 12.0;
+                let dx = snap.yaw.sin() * arrow_len;
+                let dz = snap.yaw.cos() * arrow_len;
+                let arrow_end = egui::pos2(agent_pos.x + dx, agent_pos.y + dz);
+                p.line_segment(
+                    [agent_pos, arrow_end],
+                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                );
+            }
+
+            // Map border
+            p.rect_stroke(map_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Inside);
 
             // -- History chart --
             ui.add_space(8.0);

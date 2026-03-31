@@ -263,6 +263,50 @@ impl Brain {
     pub fn death_signal(&mut self) {
         self.action_selector.death_signal();
     }
+
+    /// Export the brain's learned state for cross-generation inheritance.
+    ///
+    /// Within-lifetime learning discovers spatial associations (e.g. "green-left
+    /// → turn left") that are encoded in the encoder and action selector weights.
+    /// Without inheritance, this knowledge is discarded every generation and must
+    /// be relearned from scratch — making evolution unable to build on prior
+    /// progress. By transferring the learned state to the next generation's
+    /// champion, learning accumulates across generations.
+    ///
+    /// Includes encoder weights (the perceptual mapping) and action policy
+    /// weights (the behavioral associations). Both are needed because the
+    /// policy references specific encoder output patterns.
+    pub fn export_learned_state(&self) -> LearnedState {
+        LearnedState {
+            encoder_weights: self.encoder.weights_snapshot(),
+            encoder_biases: self.encoder.biases().to_vec(),
+            action_weights: self.action_selector.export_weights(),
+            global_action_values: self.action_selector.export_global_values(),
+        }
+    }
+
+    /// Import a learned state from a previous generation's best performer.
+    ///
+    /// Only works when dimensions match (same BrainConfig). If sizes mismatch,
+    /// the import is silently skipped and the brain keeps its fresh weights.
+    pub fn import_learned_state(&mut self, state: &LearnedState) {
+        self.encoder.import_weights(&state.encoder_weights, &state.encoder_biases);
+        self.action_selector.import_weights(&state.action_weights, &state.global_action_values);
+    }
+}
+
+/// Snapshot of a brain's learned weights for cross-generation inheritance.
+///
+/// Captures the perceptual mapping (encoder) and behavioral policy (action
+/// selector) that the agent discovered through within-lifetime learning.
+/// Transferred to the next generation's champion so evolution builds on
+/// accumulated knowledge rather than rediscovering it from scratch.
+#[derive(Clone, Debug)]
+pub struct LearnedState {
+    pub encoder_weights: Vec<f32>,
+    pub encoder_biases: Vec<f32>,
+    pub action_weights: Vec<f32>,
+    pub global_action_values: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -406,5 +450,55 @@ mod tests {
         let fc = brain.encoder.feature_count();
         // 8×6 pixels × 4 channels (RGBD) + 9 interoceptive = 201
         assert_eq!(fc, 8 * 6 * 4 + 9, "feature_count should reflect 8×6 RGBD + interoception");
+    }
+
+    #[test]
+    fn learned_state_roundtrip_preserves_weights() {
+        let mut brain = Brain::new(BrainConfig::default());
+        // Run a few ticks so the brain has non-trivial learned state
+        let frame = make_frame(0.8, 0.9);
+        for _ in 0..20 {
+            brain.tick(&frame);
+        }
+
+        let state = brain.export_learned_state();
+
+        // Create a fresh brain and import the learned state
+        let mut brain2 = Brain::new(BrainConfig::default());
+        brain2.import_learned_state(&state);
+
+        // Both brains should produce nearly identical encodings for the same input.
+        // Tiny differences from pending_scale materialization are expected.
+        let enc1 = brain.encoder.encode(&frame);
+        let enc2 = brain2.encoder.encode(&frame);
+        let max_diff: f32 = enc1.data().iter().zip(enc2.data())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "Imported brain should produce near-identical encodings: max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn learned_state_import_skips_on_dimension_mismatch() {
+        let mut brain_32 = Brain::new(BrainConfig { representation_dim: 32, ..BrainConfig::default() });
+        brain_32.tick(&make_frame(0.5, 0.5));
+        let state_32 = brain_32.export_learned_state();
+
+        // Create a brain with different dimensions
+        let mut brain_16 = Brain::new(BrainConfig { representation_dim: 16, ..BrainConfig::default() });
+        let frame = make_frame(0.5, 0.5);
+        brain_16.tick(&frame);
+        let enc_before = brain_16.encoder.encode(&frame);
+
+        // Import from mismatched dimensions — should be silently ignored
+        brain_16.import_learned_state(&state_32);
+        let enc_after = brain_16.encoder.encode(&frame);
+
+        assert_eq!(
+            enc_before.data(), enc_after.data(),
+            "Mismatched import should leave brain unchanged"
+        );
     }
 }

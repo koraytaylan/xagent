@@ -160,6 +160,31 @@ impl SensoryEncoder {
         &self.biases
     }
 
+    /// Snapshot of encoder weights with pending scale materialized.
+    /// Used for cross-generation inheritance.
+    pub fn weights_snapshot(&self) -> Vec<f32> {
+        let mut w = self.weights.clone();
+        if (self.pending_scale - 1.0).abs() > 1e-10 {
+            for v in &mut w {
+                *v *= self.pending_scale;
+            }
+        }
+        w
+    }
+
+    /// Import inherited encoder weights from a previous generation.
+    /// Silently skipped if dimensions don't match.
+    pub fn import_weights(&mut self, weights: &[f32], biases: &[f32]) {
+        if weights.len() == self.weights.len() {
+            self.weights.copy_from_slice(weights);
+            self.pending_scale = 1.0;
+            self.adapt_count = 0;
+        }
+        if biases.len() == self.biases.len() {
+            self.biases.copy_from_slice(biases);
+        }
+    }
+
     /// Number of input features.
     pub fn feature_count(&self) -> usize {
         self.feature_count

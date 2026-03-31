@@ -615,6 +615,30 @@ impl App {
     fn advance_generation(&mut self) {
         let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
 
+        // Capture the best agent's learned state BEFORE advancing.
+        // This is the knowledge (encoder mapping + action policy) that the
+        // agent discovered through within-lifetime learning. Without
+        // inheritance, this is thrown away every generation and must be
+        // relearned from scratch — making evolution unable to accumulate
+        // progress. The champion in the next generation inherits these
+        // weights so learning builds across generations.
+        let inherited_state = {
+            let mut best_idx = 0usize;
+            let mut best_fit = f32::NEG_INFINITY;
+            for a in &self.agents {
+                let fit = a.brain.telemetry().decision_quality;
+                // Prefer the agent with highest composite fitness proxy;
+                // fall back to the first alive agent.
+                let alive_bonus = if a.body.body.alive { 0.1 } else { 0.0 };
+                let score = fit + alive_bonus;
+                if score > best_fit {
+                    best_fit = score;
+                    best_idx = a.id as usize;
+                }
+            }
+            self.agents.get(best_idx).map(|a| a.brain.export_learned_state())
+        };
+
         let result = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
@@ -633,7 +657,15 @@ impl App {
                 for msg in messages {
                     self.log_msg(msg);
                 }
+                let repeats = self.governor_config.eval_repeats.max(1);
                 self.spawn_population_from_configs(&configs);
+                // Inherit learned weights into champion agents (first eval_repeats slots).
+                // Champions share the parent's BrainConfig, so dimensions always match.
+                if let Some(ref state) = inherited_state {
+                    for agent in self.agents.iter_mut().take(repeats) {
+                        agent.brain.import_learned_state(state);
+                    }
+                }
             }
             AdvanceResult::Finished { messages } => {
                 for msg in messages {

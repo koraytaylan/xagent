@@ -24,4 +24,4 @@ pub(crate) fn fast_tanh(x: f32) -> f32 {
     x * (27.0 + x2) / (27.0 + 9.0 * x2)
 }
 
-pub use brain::{Brain, BrainTelemetry};
+pub use brain::{Brain, BrainTelemetry, LearnedState};

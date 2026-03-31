@@ -11,6 +11,8 @@ use rand::Rng;
 use rayon::prelude::*;
 use xagent_shared::{BrainConfig, FullConfig};
 
+use xagent_brain::LearnedState;
+
 use crate::agent::{mutate_config, senses, Agent, AgentBody};
 use crate::governor::{AdvanceResult, Governor};
 use crate::world::WorldState;
@@ -59,6 +61,12 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
         configs
     };
 
+    // Learned state inherited from the previous generation's best performer.
+    // Champions (first eval_repeats agents) receive these weights so learning
+    // accumulates across generations instead of restarting from scratch.
+    let mut inherited_state: Option<LearnedState> = None;
+    let repeats = governor.config.eval_repeats.max(1);
+
     loop {
         if governor.evolution_complete() {
             println!("\n✓ Evolution complete after {} generations", governor.generation);
@@ -79,6 +87,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                 Agent::new(i as u32, Vec3::new(x, y, z), cfg.clone(), 0)
             })
             .collect();
+
+        // Inherit learned weights into champion agents
+        if let Some(ref state) = inherited_state {
+            for agent in agents.iter_mut().take(repeats) {
+                agent.brain.import_learned_state(state);
+            }
+        }
 
         governor.gen_tick = 0;
 
@@ -149,6 +164,18 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
 
         println!();
         let gen_elapsed = gen_start.elapsed();
+
+        // Capture best agent's learned state for next generation's champion.
+        inherited_state = agents
+            .iter()
+            .max_by(|a, b| {
+                let sa = a.brain.telemetry().decision_quality
+                    + if a.body.body.alive { 0.1 } else { 0.0 };
+                let sb = b.brain.telemetry().decision_quality
+                    + if b.body.body.alive { 0.1 } else { 0.0 };
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.brain.export_learned_state());
 
         let fitness = governor.evaluate(&agents);
         governor.log_generation(&fitness);

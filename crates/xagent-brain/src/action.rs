@@ -254,6 +254,27 @@ impl ActionSelector {
         self.assign_credit(DEATH_CREDIT, false);
     }
 
+    /// Export action policy weights for cross-generation inheritance.
+    pub fn export_weights(&self) -> Vec<f32> {
+        self.action_weights.clone()
+    }
+
+    /// Export global action biases for cross-generation inheritance.
+    pub fn export_global_values(&self) -> Vec<f32> {
+        self.global_action_values.clone()
+    }
+
+    /// Import inherited action weights from a previous generation.
+    /// Silently skipped if dimensions don't match (different BrainConfig).
+    pub fn import_weights(&mut self, weights: &[f32], global_values: &[f32]) {
+        if weights.len() == self.action_weights.len() {
+            self.action_weights.copy_from_slice(weights);
+        }
+        if global_values.len() == self.global_action_values.len() {
+            self.global_action_values.copy_from_slice(global_values);
+        }
+    }
+
     /// Compute entropy of action value distribution (for telemetry).
     pub fn action_entropy(&self) -> f32 {
         let max_val = self

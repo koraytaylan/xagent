@@ -86,6 +86,8 @@ pub struct ActionSelector {
     /// `assign_credit()` call. The encoder reads this to know which encoded
     /// dimensions were behaviourally relevant.
     cached_credit_signal: Vec<f32>,
+    /// Total |credit| applied during the most recent assign_credit() call.
+    last_credit_magnitude: f32,
 }
 
 impl ActionSelector {
@@ -107,6 +109,7 @@ impl ActionSelector {
             exploitative_actions: 0,
             current_state: vec![0.0; repr_dim],
             cached_credit_signal: vec![0.0; repr_dim],
+            last_credit_magnitude: 0.0,
         }
     }
 
@@ -220,6 +223,11 @@ impl ActionSelector {
         &self.cached_credit_signal
     }
 
+    /// Total |credit| magnitude from the most recent credit assignment.
+    pub fn last_credit_magnitude(&self) -> f32 {
+        self.last_credit_magnitude
+    }
+
     /// Action entropy. With continuous output, this metric is less meaningful.
     /// Returns 0.0 for API compatibility.
     pub fn action_entropy(&self) -> f32 {
@@ -283,6 +291,7 @@ impl ActionSelector {
         for v in &mut self.cached_credit_signal {
             *v = 0.0;
         }
+        self.last_credit_magnitude = 0.0;
 
         let n = self.history_len.min(ACTION_HISTORY_LEN);
         for i in 0..n {
@@ -308,6 +317,7 @@ impl ActionSelector {
             };
 
             let credit = effective_improvement * temporal;
+            self.last_credit_magnitude += credit.abs();
 
             // Update policy weights using encoded state snapshot
             // and accumulate per-dimension credit for the encoder.

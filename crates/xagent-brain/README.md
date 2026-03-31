@@ -787,6 +787,44 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 | `LEARNING` | 8–20% | Learning is working, composite score increasing |
 | `ADAPTED` | ≥ 20% | Brain has adapted to its environment |
 
+#### DecisionSnapshot
+
+A per-tick snapshot of the brain's decision state, captured at the end of `tick_inner()` and stored in `Brain::last_decision`. This enables the UI to show a real-time "decision stream" — a scrollable log of what the brain decided, why, and what happened.
+
+```rust
+pub struct DecisionSnapshot {
+    pub tick: u64,
+    pub motor_forward: f32,
+    pub motor_turn: f32,
+    pub exploration_rate: f32,
+    pub gradient: f32,          // composite homeostatic gradient
+    pub raw_gradient: f32,      // avg prediction error (raw)
+    pub urgency: f32,           // homeostatic urgency
+    pub prediction_error: f32,
+    pub patterns_recalled: usize,
+    pub credit_magnitude: f32,  // abs sum of credit assigned this tick
+    pub energy: f32,            // energy signal [0, 1]
+    pub integrity: f32,         // integrity signal [0, 1]
+    pub phase: &'static str,    // behavior phase label
+    pub alive: bool,
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `motor_forward` / `motor_turn` | The continuous motor outputs chosen this tick |
+| `exploration_rate` | Current exploration probability (higher = more random) |
+| `gradient` | Composite homeostatic gradient (positive = improving) |
+| `raw_gradient` | Rolling average prediction error |
+| `urgency` | Non-linear distress level (suppresses exploration) |
+| `prediction_error` | This tick's prediction error |
+| `patterns_recalled` | How many memory patterns were recalled this tick |
+| `credit_magnitude` | Total absolute credit assigned to actions this tick (higher = stronger learning signal) |
+| `energy` / `integrity` | Normalized physiological signals at decision time |
+| `phase` | Current behavior phase label (RANDOM/EXPLORING/LEARNING/ADAPTED) |
+
+The sandbox's agent detail tab renders this as a color-coded scrollable log, with credit magnitude highlighted in green (positive) or red (negative gradient) to show at a glance whether the agent's recent decisions are being reinforced or penalized.
+
 ---
 
 ## 5. Emergent Phenomena

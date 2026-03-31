@@ -66,6 +66,40 @@ impl BrainTelemetry {
     }
 }
 
+/// Per-tick snapshot of the brain's decision-making process.
+/// Captured after each tick for the decision stream UI.
+#[derive(Clone, Debug)]
+pub struct DecisionSnapshot {
+    /// Tick number when this decision was made.
+    pub tick: u64,
+    /// Motor output: forward thrust [-1, 1].
+    pub motor_forward: f32,
+    /// Motor output: turn rate [-1, 1].
+    pub motor_turn: f32,
+    /// Current exploration rate [0.1, 0.85].
+    pub exploration_rate: f32,
+    /// Homeostatic gradient (composite, smoothed).
+    pub gradient: f32,
+    /// Raw per-tick gradient (unsmoothed, used for credit).
+    pub raw_gradient: f32,
+    /// Urgency/distress level [0, 10].
+    pub urgency: f32,
+    /// Prediction error this tick.
+    pub prediction_error: f32,
+    /// Number of patterns recalled this tick.
+    pub patterns_recalled: usize,
+    /// Total credit magnitude applied this tick (sum of |credit| across all history entries).
+    pub credit_magnitude: f32,
+    /// Current energy level [0, 1].
+    pub energy: f32,
+    /// Current integrity level [0, 1].
+    pub integrity: f32,
+    /// Behavior phase label.
+    pub phase: &'static str,
+    /// Whether the agent is alive.
+    pub alive: bool,
+}
+
 /// The cognitive core. Receives sensory input, produces motor output.
 ///
 /// Each tick: encode → recall → predict → compare → learn → select action.
@@ -80,6 +114,8 @@ pub struct Brain {
     tick_count: u64,
     /// Latest telemetry snapshot.
     last_telemetry: BrainTelemetry,
+    /// Latest decision snapshot for external observation.
+    last_decision: Option<DecisionSnapshot>,
 }
 
 impl Brain {
@@ -110,6 +146,7 @@ impl Brain {
             capacity,
             tick_count: 0,
             last_telemetry: BrainTelemetry::default(),
+            last_decision: None,
         }
     }
 
@@ -243,12 +280,35 @@ impl Brain {
             decision_quality,
         };
 
+        // 12. Capture decision snapshot for UI stream
+        self.last_decision = Some(DecisionSnapshot {
+            tick: self.tick_count,
+            motor_forward: command.forward,
+            motor_turn: command.turn,
+            exploration_rate,
+            gradient: homeo_state.gradient,
+            raw_gradient: homeo_state.raw_gradient,
+            urgency: homeo_state.urgency,
+            prediction_error: scalar_error,
+            patterns_recalled: recalled.len(),
+            credit_magnitude: self.action_selector.last_credit_magnitude(),
+            energy: frame.energy_signal,
+            integrity: frame.integrity_signal,
+            phase: self.last_telemetry.behavior_phase(),
+            alive: true,
+        });
+
         command
     }
 
     /// Get the latest telemetry snapshot.
     pub fn telemetry(&self) -> &BrainTelemetry {
         &self.last_telemetry
+    }
+
+    /// Get the latest decision snapshot (for UI decision stream).
+    pub fn last_decision(&self) -> Option<&DecisionSnapshot> {
+        self.last_decision.as_ref()
     }
 
     /// Current tick count.

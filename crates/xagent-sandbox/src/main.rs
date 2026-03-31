@@ -312,6 +312,10 @@ struct App {
 
     // World snapshot for mini-map UI
     world_snapshot: WorldSnapshot,
+
+    // Replay recording
+    recording: Option<xagent_sandbox::replay::GenerationRecording>,
+    last_recording: Option<xagent_sandbox::replay::GenerationRecording>,
 }
 
 impl App {
@@ -430,6 +434,8 @@ impl App {
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             sort_mode: SortMode::Id,
             world_snapshot: WorldSnapshot::default(),
+            recording: None,
+            last_recording: None,
         }
     }
 
@@ -602,6 +608,23 @@ impl App {
                 self.spawn_agent(uc.clone(), 0);
             }
         }
+
+        // Start replay recording
+        if let Some(world) = &self.world {
+            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
+                .map(|a| (a.id, a.color))
+                .collect();
+            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+                .map(|f| [f.position.x, f.position.y, f.position.z])
+                .collect();
+            let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
+            self.recording = Some(xagent_sandbox::replay::GenerationRecording::new(
+                gen,
+                &agent_info,
+                &initial_food,
+                self.governor_config.tick_budget as usize,
+            ));
+        }
     }
 
     fn spawn_population_from_configs(&mut self, configs: &[BrainConfig]) {
@@ -611,10 +634,28 @@ impl App {
         for cfg in configs {
             self.spawn_agent(cfg.clone(), 0);
         }
+
+        // Start replay recording
+        if let Some(world) = &self.world {
+            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
+                .map(|a| (a.id, a.color))
+                .collect();
+            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+                .map(|f| [f.position.x, f.position.y, f.position.z])
+                .collect();
+            let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
+            self.recording = Some(xagent_sandbox::replay::GenerationRecording::new(
+                gen,
+                &agent_info,
+                &initial_food,
+                self.governor_config.tick_budget as usize,
+            ));
+        }
     }
 
     /// Evaluate the current generation, advance to the next (or finish).
     fn advance_generation(&mut self) {
+        self.last_recording = self.recording.take();
         let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
 
         // Evaluate fitness, then capture best agent's learned state using the
@@ -1281,9 +1322,17 @@ impl ApplicationHandler for App {
                                 let consumed = xagent_sandbox::physics::step(
                                     &mut agent.body, &motor, world, SIM_DT,
                                 );
-                                if consumed {
+                                if let Some(food_idx) = consumed {
                                     self.food_dirty = true;
                                     agent.food_consumed += 1;
+                                    if let Some(ref mut rec) = self.recording {
+                                        rec.record_food_event(xagent_sandbox::replay::FoodEvent {
+                                            tick: self.tick,
+                                            food_index: food_idx,
+                                            consumed: true,
+                                            new_position: None,
+                                        });
+                                    }
                                 }
                                 agent.total_ticks_alive += 1;
                                 agent.record_heatmap(world.config.world_size);
@@ -1338,8 +1387,53 @@ impl ApplicationHandler for App {
                             let respawned = world.update(SIM_DT);
                             if respawned {
                                 self.food_dirty = true;
+                                if let Some(ref mut rec) = self.recording {
+                                    for &idx in world.last_respawned_indices() {
+                                        let pos = world.food_items[idx].position;
+                                        rec.record_food_event(xagent_sandbox::replay::FoodEvent {
+                                            tick: self.tick,
+                                            food_index: idx,
+                                            consumed: false,
+                                            new_position: Some([pos.x, pos.y, pos.z]),
+                                        });
+                                    }
+                                }
                             }
                             self.heatmap_dirty = true;
+
+                            // ── Recording: capture tick data ──
+                            if let Some(ref mut rec) = self.recording {
+                                use xagent_sandbox::replay::{TickRecord, VISION_KEYFRAME_INTERVAL, GenerationRecording};
+                                let tick = self.tick;
+                                let is_keyframe = tick % VISION_KEYFRAME_INTERVAL == 0;
+
+                                let records: Vec<TickRecord> = self.agents.iter().map(|a| {
+                                    let t = a.brain.telemetry();
+                                    TickRecord {
+                                        position: [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z],
+                                        yaw: a.body.yaw,
+                                        alive: a.body.body.alive,
+                                        energy: a.body.body.internal.energy,
+                                        integrity: a.body.body.internal.integrity,
+                                        motor_forward: a.cached_motor.forward,
+                                        motor_turn: a.cached_motor.turn,
+                                        exploration_rate: a.brain.action_selector.exploration_rate(),
+                                        prediction_error: t.prediction_error,
+                                        gradient: t.homeostatic_gradient,
+                                        raw_gradient: t.avg_prediction_error,
+                                        urgency: t.homeostatic_urgency,
+                                        credit_magnitude: a.brain.action_selector.last_credit_magnitude(),
+                                        patterns_recalled: t.recall_budget as u16,
+                                        phase: GenerationRecording::phase_to_u8(t.behavior_phase()),
+                                        vision_color: if is_keyframe {
+                                            Some(a.cached_frame.vision.color.clone())
+                                        } else {
+                                            None
+                                        },
+                                    }
+                                }).collect();
+                                rec.record_tick(tick, &records);
+                            }
 
                             // Handle death/respawn
                             let mut event_msgs: Vec<String> = Vec::new();

@@ -34,15 +34,15 @@ fn sanitize_motor(motor: &MotorCommand) -> MotorCommand {
 }
 
 /// Advance one simulation tick: apply motor commands, gravity, collisions, energy.
-/// Returns `true` if the agent consumed food this tick.
+/// Returns `Some(food_index)` if the agent consumed food this tick, `None` otherwise.
 pub fn step(
     agent: &mut AgentBody,
     motor: &MotorCommand,
     world: &mut WorldState,
     dt: f32,
-) -> bool {
+) -> Option<usize> {
     if !agent.body.alive {
-        return false;
+        return None;
     }
 
     let motor = sanitize_motor(motor);
@@ -141,8 +141,8 @@ pub fn step(
 /// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.
 /// Uses the spatial grid for O(1) lookup instead of scanning all food items.
 /// Awards food_energy_value to the agent and marks the food as consumed
-/// with a 10-second respawn timer. Returns `true` if food was consumed.
-fn try_consume(agent: &mut AgentBody, world: &mut WorldState) -> bool {
+/// with a 10-second respawn timer. Returns `Some(food_index)` if food was consumed.
+fn try_consume(agent: &mut AgentBody, world: &mut WorldState) -> Option<usize> {
     let pos = agent.body.position;
     let mut best: Option<(usize, f32)> = None;
 
@@ -167,8 +167,8 @@ fn try_consume(agent: &mut AgentBody, world: &mut WorldState) -> bool {
         world.food_grid.remove(idx, fx, fz);
         agent.body.internal.energy = (agent.body.internal.energy + world.config.food_energy_value)
             .min(agent.body.internal.max_energy);
-        true
+        Some(idx)
     } else {
-        false
+        None
     }
 }

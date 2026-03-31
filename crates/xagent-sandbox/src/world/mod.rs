@@ -81,6 +81,11 @@ impl WorldState {
         glam::Vec3::new(x, y, z)
     }
 
+    /// Return a reference to the last respawned food indices (from the most recent update() call).
+    pub fn last_respawned_indices(&self) -> &[usize] {
+        &self.respawned_scratch
+    }
+
     /// Tick food respawn timers. Returns `true` if any food respawned.
     /// Uses incremental grid inserts instead of full rebuild.
     pub fn update(&mut self, dt: f32) -> bool {

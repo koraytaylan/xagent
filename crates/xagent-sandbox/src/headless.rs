@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use glam::Vec3;
 use log::info;
-use rand::Rng;
 use rayon::prelude::*;
 use xagent_shared::{BrainConfig, FullConfig};
 
@@ -136,7 +135,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                     let consumed = crate::physics::step(
                         &mut agent.body, &motor, &mut world, dt,
                     );
-                    if consumed {
+                    if consumed.is_some() {
                         agent.food_consumed += 1;
                     }
                     agent.total_ticks_alive += 1;

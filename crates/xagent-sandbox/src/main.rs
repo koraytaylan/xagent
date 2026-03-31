@@ -1848,6 +1848,15 @@ impl ApplicationHandler for App {
                                         motor_forward: a.cached_motor.forward,
                                         motor_turn: a.cached_motor.turn,
                                         phase: telemetry.behavior_phase(),
+                                        vision_color: a.cached_frame.vision.color.clone(),
+                                        vision_width: a.cached_frame.vision.width,
+                                        vision_height: a.cached_frame.vision.height,
+                                        position: [
+                                            a.body.body.position.x,
+                                            a.body.body.position.y,
+                                            a.body.body.position.z,
+                                        ],
+                                        yaw: a.body.yaw,
                                     }
                                 }).collect();
 

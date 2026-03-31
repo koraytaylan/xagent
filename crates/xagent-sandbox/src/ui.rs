@@ -89,6 +89,15 @@ pub struct AgentSnapshot {
     pub motor_turn: f32,
     /// Current behavior phase label.
     pub phase: &'static str,
+    /// Agent's 8x6 visual field as RGBA floats (192 values: width*height*4).
+    pub vision_color: Vec<f32>,
+    /// Visual field dimensions.
+    pub vision_width: u32,
+    pub vision_height: u32,
+    /// Agent position in world space.
+    pub position: [f32; 3],
+    /// Agent yaw (rotation around Y axis, radians).
+    pub yaw: f32,
 }
 
 /// The lifecycle state of the evolution system.

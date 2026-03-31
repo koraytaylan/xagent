@@ -28,8 +28,8 @@ use xagent_sandbox::gpu_compute::GpuBrainCompute;
 use xagent_sandbox::headless;
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
-    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, Tab,
-    TabContext,
+    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, SortMode,
+    Tab, TabContext,
 };
 
 use xagent_sandbox::world::WorldState;
@@ -306,6 +306,9 @@ struct App {
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
+
+    // Sidebar sort mode
+    sort_mode: SortMode,
 }
 
 impl App {
@@ -422,6 +425,7 @@ impl App {
             gpu_batch_patterns: Vec::new(),
             gpu_batch_active: Vec::new(),
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
+            sort_mode: SortMode::Id,
         }
     }
 
@@ -1872,6 +1876,7 @@ impl ApplicationHandler for App {
                                 let mut open_agent_tab: Option<u32> = None;
                                 let mut vp_hovered = false;
                                 let mut chart_win = self.chart_window;
+                                let mut sort_mode = self.sort_mode;
                                 let dock_state = &mut self.dock_state;
 
                                 egui.render(
@@ -1978,8 +1983,64 @@ impl ApplicationHandler for App {
                                                         .size(14.0),
                                                 );
                                                 ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("Sort:").small().color(egui::Color32::GRAY));
+                                                    egui::ComboBox::from_id_salt("agent_sort")
+                                                        .selected_text(sort_mode.label())
+                                                        .width(90.0)
+                                                        .show_ui(ui, |ui| {
+                                                            for mode in SortMode::ALL {
+                                                                ui.selectable_value(&mut sort_mode, mode, mode.label());
+                                                            }
+                                                        });
+                                                });
+                                                ui.add_space(2.0);
                                                 egui::ScrollArea::vertical().show(ui, |ui| {
-                                                    for (idx, snap) in agent_snaps.iter().enumerate() {
+                                                    let mut sorted_indices: Vec<usize> = (0..agent_snaps.len()).collect();
+                                                    match sort_mode {
+                                                        SortMode::Id => {} // already sorted by id
+                                                        SortMode::Energy => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                let ea = agent_snaps[a].energy / agent_snaps[a].max_energy.max(0.001);
+                                                                let eb = agent_snaps[b].energy / agent_snaps[b].max_energy.max(0.001);
+                                                                eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                                                            });
+                                                        }
+                                                        SortMode::Integrity => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                let ia = agent_snaps[a].integrity / agent_snaps[a].max_integrity.max(0.001);
+                                                                let ib = agent_snaps[b].integrity / agent_snaps[b].max_integrity.max(0.001);
+                                                                ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal)
+                                                            });
+                                                        }
+                                                        SortMode::Deaths => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                agent_snaps[a].deaths.cmp(&agent_snaps[b].deaths)
+                                                            });
+                                                        }
+                                                        SortMode::LongestLife => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                agent_snaps[b].longest_life.cmp(&agent_snaps[a].longest_life)
+                                                            });
+                                                        }
+                                                        SortMode::PredictionError => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                agent_snaps[a].prediction_error.partial_cmp(&agent_snaps[b].prediction_error)
+                                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                                            });
+                                                        }
+                                                        SortMode::Fitness => {
+                                                            sorted_indices.sort_by(|&a, &b| {
+                                                                let fa = agent_snaps[a].food_consumed as f64
+                                                                    + agent_snaps[a].total_ticks_alive as f64 * 0.001;
+                                                                let fb = agent_snaps[b].food_consumed as f64
+                                                                    + agent_snaps[b].total_ticks_alive as f64 * 0.001;
+                                                                fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+                                                            });
+                                                        }
+                                                    }
+                                                    for &idx in &sorted_indices {
+                                                        let snap = &agent_snaps[idx];
                                                         let is_selected = idx == selected_idx;
                                                         let color = egui::Color32::from_rgb(
                                                             (snap.color[0] * 255.0) as u8,
@@ -2041,46 +2102,26 @@ impl ApplicationHandler for App {
                                                                     ui.end_row();
                                                                 });
 
-                                                            // Combined 4-line mini chart (last 10k ticks, no legend)
-                                                            let chart_h = 28.0;
-                                                            let chart_w = ui.available_width().max(40.0);
-                                                            let (chart_rect, _) = ui.allocate_exact_size(
-                                                                egui::vec2(chart_w, chart_h),
-                                                                egui::Sense::hover(),
-                                                            );
-                                                            let p = ui.painter();
-                                                            p.rect_filled(chart_rect, 1.0, egui::Color32::from_gray(25));
-                                                            let sidebar_window = 10_000;
-                                                            let series: [(&[f32], egui::Color32); 4] = [
-                                                                (&snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
-                                                                (&snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
-                                                                (&snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
-                                                                (&snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
-                                                            ];
-                                                            for &(full_data, color) in &series {
-                                                                let start = full_data.len().saturating_sub(sidebar_window);
-                                                                let data = &full_data[start..];
-                                                                if data.len() < 2 { continue; }
-                                                                let n = data.len();
-                                                                let pts: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
-                                                                    let x = chart_rect.left() + (i as f32 / (n - 1) as f32) * chart_rect.width();
-                                                                    let y = chart_rect.bottom() - v.clamp(0.0, 1.0) * chart_rect.height();
-                                                                    egui::pos2(x, y)
-                                                                }).collect();
-                                                                let stroke = egui::Stroke::new(1.0, color);
-                                                                for pair in pts.windows(2) {
-                                                                    p.line_segment([pair[0], pair[1]], stroke);
-                                                                }
-                                                            }
-
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "Deaths: {} | Best: {}t",
-                                                                    snap.deaths, snap.longest_life
-                                                                ))
-                                                                .small()
-                                                                .color(egui::Color32::GRAY),
-                                                            );
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(snap.phase)
+                                                                        .small()
+                                                                        .color(match snap.phase {
+                                                                            "ADAPTED" => egui::Color32::from_rgb(80, 200, 80),
+                                                                            "LEARNING" => egui::Color32::from_rgb(200, 200, 80),
+                                                                            "EXPLORING" => egui::Color32::from_rgb(200, 140, 60),
+                                                                            _ => egui::Color32::from_rgb(150, 150, 150),
+                                                                        }),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "| D:{} F:{}",
+                                                                        snap.deaths, snap.food_consumed
+                                                                    ))
+                                                                    .small()
+                                                                    .color(egui::Color32::GRAY),
+                                                                );
+                                                            });
                                                         });
                                                         let resp = response.response.interact(egui::Sense::click());
                                                         if resp.clicked() {
@@ -2117,6 +2158,7 @@ impl ApplicationHandler for App {
 
                                 self.viewport_hovered = vp_hovered;
                                 self.chart_window = chart_win;
+                                self.sort_mode = sort_mode;
 
                                 // Restore evolution snapshot (may have been mutated by UI)
                                 self.evo_snapshot = evo_snap;

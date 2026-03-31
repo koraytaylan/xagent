@@ -24,7 +24,11 @@ const ACTION_HISTORY_LEN: usize = 64;
 /// Temporal credit decay: how fast older actions lose credit.
 const CREDIT_DECAY_RATE: f32 = 0.04;
 /// Learning rate for policy weight updates (per credit event).
-const WEIGHT_LR: f32 = 0.02;
+/// Tuned for improvement-based credit with raw (non-EMA) gradient:
+/// a food event produces raw_gradient ≈ 0.12, improvement ≈ 0.13,
+/// credit ≈ 0.07, yielding Δw ≈ 0.003/dim — enough for ~8 food events
+/// to build a detectable preference. MAX_WEIGHT_NORM prevents explosion.
+const WEIGHT_LR: f32 = 0.10;
 // WEIGHT_DECAY removed: MAX_WEIGHT_NORM already prevents explosion via
 // normalize_weights(). Decay on top of normalization was destroying
 // inherited cross-generation weights (39% loss per 50k-tick generation).

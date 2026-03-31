@@ -50,8 +50,16 @@ pub struct HomeostaticMonitor {
 /// Result of a homeostatic update, consumed by other brain modules.
 #[derive(Clone, Debug)]
 pub struct HomeostaticState {
-    /// Composite gradient (blended from all timescales).
+    /// Composite gradient (blended from all timescales). Used for urgency,
+    /// exploration rate, and modulated learning rate — contexts that benefit
+    /// from temporal smoothing.
     pub gradient: f32,
+    /// Raw per-tick gradient: energy_delta × 0.6 + integrity_delta × 0.4.
+    /// No EMA smoothing. Used for credit assignment because actions need
+    /// the *immediate* consequence signal, not a smoothed average. A food
+    /// event that changes energy by +0.2 produces raw_gradient = +0.12,
+    /// vs composite ≈ +0.04 (67% lost to EMA blending).
+    pub raw_gradient: f32,
     /// Fast-timescale gradient.
     pub gradient_fast: f32,
     /// Medium-timescale gradient.
@@ -124,6 +132,7 @@ impl HomeostaticMonitor {
 
         HomeostaticState {
             gradient,
+            raw_gradient,
             gradient_fast: self.gradient_fast,
             gradient_medium: self.gradient_medium,
             gradient_slow: self.gradient_slow,

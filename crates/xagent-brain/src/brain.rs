@@ -200,12 +200,16 @@ impl Brain {
         // 7. Decay old patterns
         self.memory.decay(self.config.decay_rate);
 
-        // 8. Select action based on predictions, homeostatic state, and prediction error
+        // 8. Select action based on predictions, homeostatic state, and prediction error.
+        // Credit assignment receives the RAW per-tick gradient (not EMA composite) so
+        // food/damage events produce a sharp, strong signal. The composite gradient is
+        // still used for exploration rate and modulated learning rate (its smoothing is
+        // appropriate there).
         let command = self.action_selector.select(
             &encoded,
             &prospection_prediction,
             &recalled,
-            homeo_state.gradient,
+            homeo_state.raw_gradient,
             scalar_error,
             homeo_state.urgency,
             &mut self.memory,

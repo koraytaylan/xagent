@@ -462,154 +462,348 @@ impl<'a> TabContext<'a> {
             (snap.color[2] * 255.0) as u8,
         );
 
+        // Header
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 7.0, color);
-            ui.heading(format!(
-                "Agent {} (Gen {})",
-                snap.id, snap.gen
-            ));
+            ui.heading(format!("Agent {} (Gen {})", snap.id, snap.gen));
             if !snap.alive {
-                ui.label(egui::RichText::new("💀 DEAD").color(egui::Color32::RED));
+                ui.label(egui::RichText::new("DEAD").color(egui::Color32::RED));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(snap.phase)
+                        .strong()
+                        .color(match snap.phase {
+                            "ADAPTED" => egui::Color32::from_rgb(80, 200, 80),
+                            "LEARNING" => egui::Color32::from_rgb(200, 200, 80),
+                            "EXPLORING" => egui::Color32::from_rgb(200, 140, 60),
+                            _ => egui::Color32::from_rgb(150, 150, 150),
+                        }),
+                );
+            });
         });
         ui.separator();
 
-        ui.columns(2, |cols| {
-            // Left column: vitals + statistics
-            cols[0].label(egui::RichText::new("Vitals").strong());
-            cols[0].add_space(4.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // -- Vitals + Motor --
+            ui.columns(2, |cols| {
+                // Left column: vitals + statistics
+                cols[0].label(egui::RichText::new("Vitals").strong());
+                cols[0].add_space(4.0);
 
-            let energy_frac = snap.energy / snap.max_energy.max(0.001);
-            let integrity_frac = snap.integrity / snap.max_integrity.max(0.001);
+                let energy_frac = snap.energy / snap.max_energy.max(0.001);
+                let integrity_frac = snap.integrity / snap.max_integrity.max(0.001);
 
-            egui::Grid::new("vitals_grid")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(&mut cols[0], |ui| {
-                    ui.label("Energy:");
-                    ui.add(egui::ProgressBar::new(energy_frac)
-                        .text(format!("{:.1}/{:.0}", snap.energy, snap.max_energy))
-                        .fill(if energy_frac > 0.5 {
+                egui::Grid::new("vitals_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(&mut cols[0], |ui| {
+                        ui.label("Energy:");
+                        ui.add(egui::ProgressBar::new(energy_frac)
+                            .text(format!("{:.1}/{:.0}", snap.energy, snap.max_energy))
+                            .fill(if energy_frac > 0.5 {
+                                egui::Color32::from_rgb(80, 200, 80)
+                            } else if energy_frac > 0.25 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgb(220, 60, 60)
+                            }));
+                        ui.end_row();
+
+                        ui.label("Integrity:");
+                        ui.add(egui::ProgressBar::new(integrity_frac)
+                            .text(format!("{:.1}/{:.0}", snap.integrity, snap.max_integrity))
+                            .fill(egui::Color32::from_rgb(100, 150, 255)));
+                        ui.end_row();
+                    });
+
+                cols[0].add_space(8.0);
+                cols[0].label(egui::RichText::new("Statistics").strong());
+                cols[0].add_space(4.0);
+                cols[0].label(format!("Deaths: {}", snap.deaths));
+                cols[0].label(format!("Food consumed: {}", snap.food_consumed));
+                cols[0].label(format!("Longest life: {} ticks", snap.longest_life));
+                cols[0].label(format!("Total alive: {} ticks", snap.total_ticks_alive));
+
+                // Right column: brain + motor
+                cols[1].label(egui::RichText::new("Brain").strong());
+                cols[1].add_space(4.0);
+                cols[1].label(format!("Exploration: {:.1}%", snap.exploration_rate * 100.0));
+                cols[1].label(format!("Pred. error: {:.4}", snap.prediction_error));
+                cols[1].label(format!("Gradient: {:+.4}", snap.gradient));
+                cols[1].label(format!("Urgency: {:.2}", snap.urgency));
+
+                cols[1].add_space(8.0);
+                cols[1].label(egui::RichText::new("Motor Output").strong());
+                cols[1].add_space(4.0);
+
+                egui::Grid::new("motor_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(&mut cols[1], |ui| {
+                        ui.label("Forward:");
+                        let fwd = snap.motor_forward;
+                        let fwd_color = if fwd >= 0.0 {
                             egui::Color32::from_rgb(80, 200, 80)
-                        } else if energy_frac > 0.25 {
-                            egui::Color32::YELLOW
                         } else {
                             egui::Color32::from_rgb(220, 60, 60)
-                        }));
-                    ui.end_row();
+                        };
+                        ui.add(egui::ProgressBar::new(fwd.abs())
+                            .text(format!("{:+.3}", fwd))
+                            .fill(fwd_color)
+                            .desired_width(120.0));
+                        ui.end_row();
 
-                    ui.label("Integrity:");
-                    ui.add(egui::ProgressBar::new(integrity_frac)
-                        .text(format!("{:.1}/{:.0}", snap.integrity, snap.max_integrity))
-                        .fill(egui::Color32::from_rgb(100, 150, 255)));
-                    ui.end_row();
-                });
+                        ui.label("Turn:");
+                        let trn = snap.motor_turn;
+                        let trn_color = if trn >= 0.0 {
+                            egui::Color32::from_rgb(100, 150, 255)
+                        } else {
+                            egui::Color32::from_rgb(200, 100, 255)
+                        };
+                        ui.add(egui::ProgressBar::new(trn.abs())
+                            .text(format!("{:+.3} {}", trn, if trn > 0.05 { "R" } else if trn < -0.05 { "L" } else { "" }))
+                            .fill(trn_color)
+                            .desired_width(120.0));
+                        ui.end_row();
 
-            cols[0].add_space(8.0);
-            cols[0].label(egui::RichText::new("Statistics").strong());
-            cols[0].add_space(4.0);
-            cols[0].label(format!("Deaths: {}", snap.deaths));
-            cols[0].label(format!("Longest life: {} ticks", snap.longest_life));
+                        ui.label("Fwd norm:");
+                        ui.label(format!("{:.3}", snap.forward_weight_norm));
+                        ui.end_row();
 
-            // Right column: brain info + motor weights
-            cols[1].label(egui::RichText::new("Brain").strong());
-            cols[1].add_space(4.0);
-            cols[1].label(format!("Exploration: {:.1}%", snap.exploration_rate * 100.0));
-            cols[1].label(format!("Prediction error: {:.4}", snap.prediction_error));
-            cols[1].add_space(4.0);
-            cols[1].label(format!("Fwd weight norm: {:.3}", snap.forward_weight_norm));
-            cols[1].label(format!("Turn weight norm: {:.3}", snap.turn_weight_norm));
-            cols[1].label(format!("Motor fwd: {:.3}  turn: {:.3}", snap.motor_forward, snap.motor_turn));
-            cols[1].label(format!("Phase: {}", snap.phase));
-        });
+                        ui.label("Turn norm:");
+                        ui.label(format!("{:.3}", snap.turn_weight_norm));
+                        ui.end_row();
+                    });
+            });
 
-        // ── Combined history chart ──────────────────────────────────
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("History").strong());
+            // -- History chart --
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(format!("Window: {} ticks  (scroll to zoom)", *chart_window))
-                    .small()
-                    .color(egui::Color32::GRAY),
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("History").strong());
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("Window: {} ticks  (scroll to zoom)", *chart_window))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            });
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                for (label, color) in [
+                    ("Energy", egui::Color32::from_rgb(80, 200, 80)),
+                    ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
+                    ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
+                    ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
+                ] {
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, color);
+                    ui.label(egui::RichText::new(label).small().color(egui::Color32::GRAY));
+                    ui.add_space(6.0);
+                }
+            });
+            ui.add_space(2.0);
+
+            let chart_height = 120.0;
+            let avail_w = ui.available_width().max(60.0);
+            let (rect, chart_resp) = ui.allocate_exact_size(
+                egui::vec2(avail_w, chart_height),
+                egui::Sense::hover(),
             );
-        });
-        ui.add_space(4.0);
 
-        // Legend
-        ui.horizontal(|ui| {
-            for (label, color) in [
-                ("Energy", egui::Color32::from_rgb(80, 200, 80)),
-                ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
-                ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
-                ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
-            ] {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 4.0, color);
-                ui.label(egui::RichText::new(label).small().color(egui::Color32::GRAY));
-                ui.add_space(6.0);
+            if chart_resp.hovered() {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = if scroll > 0.0 { 0.8 } else { 1.25 };
+                    let new_w = ((*chart_window as f32) * factor).round() as usize;
+                    *chart_window = new_w.clamp(30, 10_000);
+                }
+            }
+
+            let painter = ui.painter();
+            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(25));
+            for frac in [0.25, 0.5, 0.75] {
+                let y = rect.bottom() - frac * rect.height();
+                painter.line_segment(
+                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    egui::Stroke::new(0.5, egui::Color32::from_gray(50)),
+                );
+            }
+
+            let window = *chart_window;
+            let series_data: [(&[f32], egui::Color32); 4] = [
+                (&snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
+                (&snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
+                (&snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
+                (&snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
+            ];
+            for &(full_data, color) in &series_data {
+                let start = full_data.len().saturating_sub(window);
+                let data = &full_data[start..];
+                if data.len() < 2 {
+                    continue;
+                }
+                let n = data.len();
+                let points: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
+                    let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+                    let y = rect.bottom() - v.clamp(0.0, 1.0) * rect.height();
+                    egui::pos2(x, y)
+                }).collect();
+                let stroke = egui::Stroke::new(1.5, color);
+                for pair in points.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+            }
+
+            // -- Brain Decision Stream --
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Decision Stream").strong().size(14.0));
+            ui.add_space(4.0);
+
+            if snap.decision_log.is_empty() {
+                ui.label(
+                    egui::RichText::new("No decisions recorded yet.")
+                        .italics()
+                        .color(egui::Color32::GRAY),
+                );
+            } else {
+                let display_count = snap.decision_log.len().min(64);
+                let start = snap.decision_log.len() - display_count;
+
+                // Column headers
+                ui.horizontal(|ui| {
+                    let mono_gray = |text: &str| egui::RichText::new(text).small().strong().color(egui::Color32::from_gray(180)).monospace();
+                    ui.label(mono_gray("TICK"));
+                    ui.add_space(8.0);
+                    ui.label(mono_gray("MOTOR"));
+                    ui.add_space(20.0);
+                    ui.label(mono_gray("FEELING"));
+                    ui.add_space(16.0);
+                    ui.label(mono_gray("SIGNAL"));
+                    ui.add_space(16.0);
+                    ui.label(mono_gray("CONTEXT"));
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("decision_stream")
+                    .max_height(300.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for d in snap.decision_log[start..].iter().rev() {
+                            let bg = if d.credit_magnitude > 0.05 {
+                                if d.raw_gradient > 0.0 {
+                                    egui::Color32::from_rgba_premultiplied(30, 60, 30, 255)
+                                } else {
+                                    egui::Color32::from_rgba_premultiplied(60, 30, 30, 255)
+                                }
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+
+                            egui::Frame::NONE
+                                .fill(bg)
+                                .inner_margin(egui::Margin::symmetric(2, 1))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:>6}", d.tick))
+                                                .monospace()
+                                                .small()
+                                                .color(egui::Color32::from_gray(120)),
+                                        );
+
+                                        let fwd_char = if d.motor_forward > 0.3 { "^^" }
+                                            else if d.motor_forward > 0.05 { "^" }
+                                            else if d.motor_forward < -0.3 { "vv" }
+                                            else if d.motor_forward < -0.05 { "v" }
+                                            else { "--" };
+                                        let trn_char = if d.motor_turn > 0.3 { ">>" }
+                                            else if d.motor_turn > 0.05 { ">" }
+                                            else if d.motor_turn < -0.3 { "<<" }
+                                            else if d.motor_turn < -0.05 { "<" }
+                                            else { "--" };
+                                        ui.label(
+                                            egui::RichText::new(format!("{}{}", fwd_char, trn_char))
+                                                .monospace()
+                                                .small()
+                                                .color(egui::Color32::WHITE),
+                                        );
+
+                                        let grad_color = if d.raw_gradient > 0.01 {
+                                            egui::Color32::from_rgb(80, 200, 80)
+                                        } else if d.raw_gradient < -0.01 {
+                                            egui::Color32::from_rgb(220, 60, 60)
+                                        } else {
+                                            egui::Color32::from_gray(120)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("g:{:+.3}", d.raw_gradient))
+                                                .monospace()
+                                                .small()
+                                                .color(grad_color),
+                                        );
+
+                                        let urgency_color = if d.urgency > 5.0 {
+                                            egui::Color32::from_rgb(220, 60, 60)
+                                        } else if d.urgency > 2.0 {
+                                            egui::Color32::YELLOW
+                                        } else {
+                                            egui::Color32::from_gray(120)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("u:{:.1}", d.urgency))
+                                                .monospace()
+                                                .small()
+                                                .color(urgency_color),
+                                        );
+
+                                        if d.credit_magnitude > 0.01 {
+                                            let credit_color = if d.raw_gradient > 0.0 {
+                                                egui::Color32::from_rgb(80, 200, 80)
+                                            } else {
+                                                egui::Color32::from_rgb(220, 60, 60)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(format!("cr:{:.3}", d.credit_magnitude))
+                                                    .monospace()
+                                                    .small()
+                                                    .color(credit_color),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("cr:---")
+                                                    .monospace()
+                                                    .small()
+                                                    .color(egui::Color32::from_gray(60)),
+                                            );
+                                        }
+
+                                        ui.label(
+                                            egui::RichText::new(format!("pe:{:.3}", d.prediction_error))
+                                                .monospace()
+                                                .small()
+                                                .color(egui::Color32::from_rgb(200, 140, 60)),
+                                        );
+
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "ex:{:.0}% mem:{}",
+                                                d.exploration_rate * 100.0,
+                                                d.patterns_recalled
+                                            ))
+                                            .monospace()
+                                            .small()
+                                            .color(egui::Color32::from_rgb(180, 100, 220)),
+                                        );
+                                    });
+                                });
+                        }
+                    });
             }
         });
-        ui.add_space(2.0);
-
-        let chart_height = 120.0;
-        let avail_w = ui.available_width().max(60.0);
-        let (rect, chart_resp) = ui.allocate_exact_size(
-            egui::vec2(avail_w, chart_height),
-            egui::Sense::hover(),
-        );
-
-        // Scroll-to-zoom on chart area
-        if chart_resp.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
-                let factor = if scroll > 0.0 { 0.8 } else { 1.25 };
-                let new_w = ((*chart_window as f32) * factor).round() as usize;
-                *chart_window = new_w.clamp(30, 10_000);
-            }
-        }
-
-        let painter = ui.painter();
-
-        // Background + faint grid lines
-        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(25));
-        for frac in [0.25, 0.5, 0.75] {
-            let y = rect.bottom() - frac * rect.height();
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(0.5, egui::Color32::from_gray(50)),
-            );
-        }
-
-        // Slice each series to the visible window (most recent N samples)
-        let window = *chart_window;
-
-        let series_data: [(&[f32], egui::Color32); 4] = [
-            (&snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
-            (&snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
-            (&snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
-            (&snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
-        ];
-        for &(full_data, color) in &series_data {
-            let start = full_data.len().saturating_sub(window);
-            let data = &full_data[start..];
-            if data.len() < 2 {
-                continue;
-            }
-            let n = data.len();
-            let points: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
-                let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
-                let y = rect.bottom() - v.clamp(0.0, 1.0) * rect.height();
-                egui::pos2(x, y)
-            }).collect();
-            let stroke = egui::Stroke::new(1.5, color);
-            for pair in points.windows(2) {
-                painter.line_segment([pair[0], pair[1]], stroke);
-            }
-        }
-
-        // (Action Weight History chart removed — will be replaced by brain inspector in Task 6)
     }
 
     fn render_evolution_tab(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) -> EvolutionAction {

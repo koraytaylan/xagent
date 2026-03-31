@@ -130,6 +130,15 @@ impl HomeostaticMonitor {
         self.current_energy = energy_signal;
         self.current_integrity = integrity_signal;
 
+        // Amplify the raw gradient by urgency so the agent FEELS low energy
+        // as increasing pain. Without this, energy depletion (-0.006/tick) is
+        // below the credit deadzone (0.01) at ALL energy levels — the agent
+        // cannot feel hunger. With urgency scaling, depletion at 50% energy
+        // becomes -0.021 (above deadzone), creating a drive to seek food that
+        // intensifies as energy drops. This is the primitive pain signal:
+        // comfortable at 80%, hungry at 50%, desperate at 20%.
+        let raw_gradient = raw_gradient * (1.0 + self.urgency);
+
         HomeostaticState {
             gradient,
             raw_gradient,

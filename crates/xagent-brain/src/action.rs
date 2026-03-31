@@ -95,11 +95,7 @@ impl ActionSelector {
             repr_dim,
             forward_weights: vec![0.0; repr_dim],
             turn_weights: vec![0.0; repr_dim],
-            // Innate forward drive: newborn agents move forward by default.
-            // Learning adjusts this — danger reduces it, food reinforces it.
-            // Without this, zero-initialized weights + small exploration noise
-            // produces near-zero movement (agents stand still and starve).
-            forward_bias: 0.5,
+            forward_bias: 0.0,
             turn_bias: 0.0,
             action_ring: Vec::with_capacity(ACTION_HISTORY_LEN),
             state_ring: vec![0.0; ACTION_HISTORY_LEN * repr_dim],
@@ -139,11 +135,17 @@ impl ActionSelector {
         self.assign_credit(homeostatic_gradient);
 
         // 3. Adaptive exploration rate.
+        // Base 0.5 for continuous motor: additive noise of ±0.5 produces
+        // vigorous movement comparable to the old discrete system's random
+        // full-strength actions. Both forward and turn channels get real
+        // signal so credit assignment can learn both steering and thrust.
+        // As the policy learns (weights grow), it dominates the noise and
+        // behavior smoothly transitions from random to directed.
         let stability = recalled.len() as f32 / 16.0;
         let novelty_bonus = (prediction_error * 2.0).min(0.4);
         let urgency_penalty = (urgency * 0.4).min(0.5);
         self.exploration_rate =
-            (0.15 - stability * 0.1 + novelty_bonus - urgency_penalty).clamp(0.05, 0.85);
+            (0.5 - stability * 0.15 + novelty_bonus - urgency_penalty).clamp(0.10, 0.85);
 
         // 4. Compute raw motor outputs from encoded state.
         let mut fwd = self.forward_bias;

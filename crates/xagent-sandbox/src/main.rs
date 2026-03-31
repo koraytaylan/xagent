@@ -206,6 +206,13 @@ fn record_agent_histories(agent: &mut Agent) {
         h.pop_front();
     }
     h.push_back(aw);
+    if let Some(decision) = agent.brain.last_decision().cloned() {
+        let h = &mut agent.decision_log;
+        if h.len() >= 256 {
+            h.pop_front();
+        }
+        h.push_back(decision);
+    }
 }
 
 struct App {

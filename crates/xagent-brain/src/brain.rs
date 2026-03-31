@@ -115,21 +115,22 @@ impl Brain {
 
     /// Process one tick: sensory input → motor output.
     pub fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
+        // Extract raw features first (for the action selector), then encode.
+        let raw_features = self.encoder.extract_features(frame).to_vec();
         let encoded = self.encoder.encode(frame);
-        self.tick_inner(frame, encoded, None)
+        self.tick_inner(frame, encoded, None, &raw_features)
     }
 
     /// Process one tick using GPU-computed encode and recall results.
-    /// `gpu_encoded` is the GPU-computed encoded state (dim floats).
-    /// `gpu_similarities` is the GPU-computed similarity scores (memory_capacity floats).
     pub fn tick_gpu(
         &mut self,
         frame: &SensoryFrame,
         gpu_encoded: &[f32],
         gpu_similarities: &[f32],
     ) -> MotorCommand {
+        let raw_features = self.encoder.extract_features(frame).to_vec();
         let encoded = EncodedState::from_slice(gpu_encoded);
-        self.tick_inner(frame, encoded, Some(gpu_similarities))
+        self.tick_inner(frame, encoded, Some(gpu_similarities), &raw_features)
     }
 
     /// Shared implementation for both CPU and GPU tick paths.
@@ -138,6 +139,7 @@ impl Brain {
         frame: &SensoryFrame,
         encoded: EncodedState,
         gpu_similarities: Option<&[f32]>,
+        raw_features: &[f32],
     ) -> MotorCommand {
         self.tick_count += 1;
         self.memory.advance_tick();
@@ -213,6 +215,7 @@ impl Brain {
             scalar_error,
             homeo_state.urgency,
             &mut self.memory,
+            raw_features,
         );
 
         // 9. Record prediction for next tick's error computation

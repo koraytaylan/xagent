@@ -6,6 +6,7 @@ use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
 use xagent_brain::encoder::MAX_REPR_DIM;
+use xagent_brain::LearnedState;
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -272,6 +273,31 @@ pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> Brain
     }
 }
 
+/// Perturb inherited weights for neuroevolution.
+/// Mutates a random 10% of action weights by +/-strength, and 1% of encoder
+/// weights by +/-(strength * 0.1). This lets evolution explore behavioral
+/// variations that within-lifetime learning might miss.
+pub fn mutate_learned_state(state: &LearnedState, strength: f32) -> LearnedState {
+    let mut rng = rand::rng();
+    let mut result = state.clone();
+
+    // Perturb action weights (forward + turn + biases)
+    for w in result.action_weights.iter_mut() {
+        if rng.random::<f32>() < 0.1 {
+            *w += rng.random_range(-strength..strength);
+        }
+    }
+
+    // Perturb encoder weights more conservatively
+    for w in result.encoder_weights.iter_mut() {
+        if rng.random::<f32>() < 0.01 {
+            *w += rng.random_range(-strength * 0.1..strength * 0.1);
+        }
+    }
+
+    result
+}
+
 /// Uniform crossover: randomly pick each parameter from parent A or B.
 pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
     let mut rng = rand::rng();
@@ -400,4 +426,29 @@ pub fn generate_all_agents_mesh(agents: &[Agent]) -> Mesh {
     }
 
     Mesh { vertices, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutate_learned_state_perturbs_weights() {
+        let state = LearnedState {
+            encoder_weights: vec![1.0; 100],
+            encoder_biases: vec![0.0; 10],
+            action_weights: vec![0.5; 66],
+            predictor_weights: vec![0.0; 100],
+            predictor_context_weight: 0.2,
+        };
+        let mutated = mutate_learned_state(&state, 0.1);
+        // Action weights should differ (10% mutation rate)
+        assert_ne!(mutated.action_weights, state.action_weights);
+        // Predictor weights should be unchanged
+        assert_eq!(mutated.predictor_weights, state.predictor_weights);
+        // Predictor context weight should be unchanged
+        assert_eq!(mutated.predictor_context_weight, state.predictor_context_weight);
+        // Encoder biases should be unchanged
+        assert_eq!(mutated.encoder_biases, state.encoder_biases);
+    }
 }

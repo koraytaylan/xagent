@@ -30,6 +30,9 @@ pub enum AdvanceResult {
     Continue {
         configs: Vec<BrainConfig>,
         messages: Vec<String>,
+        /// Effective mutation strength for this generation (used to perturb
+        /// inherited weights in neuroevolution).
+        mutation_strength: f32,
     },
     /// Max generations reached — stop the simulation.
     Finished {
@@ -481,6 +484,16 @@ impl Governor {
             self.active_island = (self.active_island + 1) % self.islands.len();
         }
 
+        // Compute effective mutation strength for neuroevolution weight perturbation.
+        // This mirrors the adaptive strength calculation inside breed_next_generation().
+        let effective_strength = {
+            let attempts = self.islands[self.active_island].attempts;
+            let base = self.config.mutation_strength;
+            let max_strength = 0.5_f32;
+            let patience = self.config.patience.max(1) as f32;
+            base + (max_strength - base) * (attempts as f32 / patience).min(1.0)
+        };
+
         // Breed the next generation from the (now-rotated) island's spawn parent
         let configs = self.breed_next_generation(fitness);
 
@@ -535,7 +548,7 @@ impl Governor {
 
         self.persist_state();
 
-        AdvanceResult::Continue { configs, messages }
+        AdvanceResult::Continue { configs, messages, mutation_strength: effective_strength }
     }
 
     /// Backtrack one level when the island exhausts patience at its current

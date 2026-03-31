@@ -16,7 +16,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, SensoryFrame, WorldConfig};
 
 use xagent_sandbox::agent::{
-    mutate_config, senses, Agent, AgentBody, MAX_AGENTS,
+    mutate_config, mutate_learned_state, senses, Agent, AgentBody, MAX_AGENTS,
 };
 use xagent_sandbox::recording::MetricsLogger;
 use xagent_sandbox::renderer::camera::Camera;
@@ -633,23 +633,24 @@ impl App {
 
         // Governor borrow released — safe to call self methods
         match result {
-            AdvanceResult::Continue { configs, messages } => {
+            AdvanceResult::Continue { configs, messages, mutation_strength } => {
                 for msg in messages {
                     self.log_msg(msg);
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
                 self.spawn_population_from_configs(&configs);
-                // Inherit learned weights into champion agents (first eval_repeats slots).
-                // ALL agents inherit the action weights, not just champions.
-                // Action weights are 8×201 (raw features) — independent of
-                // repr_dim, so they're compatible with any BrainConfig.
-                // This gives mutants the same behavioral baseline as the
-                // champion, so evolution can test whether a mutant's brain
-                // architecture helps it improve BEYOND that baseline.
-                // Predictor weights are only inherited by matching-dim agents.
+                // Inherit learned weights: champions get exact weights,
+                // mutants get perturbed weights for neuroevolution.
                 if let Some(ref state) = inherited_state {
-                    for agent in self.agents.iter_mut() {
-                        agent.brain.import_learned_state(state);
+                    for (i, agent) in self.agents.iter_mut().enumerate() {
+                        if i < repeats {
+                            // Champion: exact inherited weights
+                            agent.brain.import_learned_state(state);
+                        } else {
+                            // Mutant: inherited weights + small perturbation
+                            let mutated = mutate_learned_state(state, mutation_strength);
+                            agent.brain.import_learned_state(&mutated);
+                        }
                     }
                 }
             }

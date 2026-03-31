@@ -13,7 +13,7 @@ use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::LearnedState;
 
-use crate::agent::{mutate_config, senses, Agent, AgentBody};
+use crate::agent::{mutate_config, mutate_learned_state, senses, Agent, AgentBody};
 use crate::governor::{AdvanceResult, Governor};
 use crate::world::WorldState;
 
@@ -65,6 +65,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
     // Champions (first eval_repeats agents) receive these weights so learning
     // accumulates across generations instead of restarting from scratch.
     let mut inherited_state: Option<LearnedState> = None;
+    let mut inherited_mutation_strength: f32 = 0.0;
     let repeats = governor.config.eval_repeats.max(1);
 
     loop {
@@ -84,12 +85,18 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
             })
             .collect();
 
-        // ALL agents inherit action weights (raw-feature policy is config-independent).
-        // This gives mutants the same behavioral baseline so evolution tests whether
-        // different brain architectures improve learning beyond the inherited policy.
+        // Inherit learned weights: champions get exact weights,
+        // mutants get perturbed weights for neuroevolution.
         if let Some(ref state) = inherited_state {
-            for agent in agents.iter_mut() {
-                agent.brain.import_learned_state(state);
+            for (i, agent) in agents.iter_mut().enumerate() {
+                if i < repeats {
+                    // Champion: exact inherited weights
+                    agent.brain.import_learned_state(state);
+                } else {
+                    // Mutant: inherited weights + small perturbation
+                    let mutated = mutate_learned_state(state, inherited_mutation_strength);
+                    agent.brain.import_learned_state(&mutated);
+                }
             }
         }
 
@@ -177,11 +184,12 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
         governor.update_wall_time(start_time.elapsed().as_secs_f64());
 
         match governor.advance(&fitness) {
-            AdvanceResult::Continue { configs, messages } => {
+            AdvanceResult::Continue { configs, messages, mutation_strength } => {
                 for msg in &messages {
                     println!("{}", msg);
                 }
                 current_configs = configs;
+                inherited_mutation_strength = mutation_strength;
             }
             AdvanceResult::Finished { messages } => {
                 for msg in &messages {

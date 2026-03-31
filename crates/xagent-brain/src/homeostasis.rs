@@ -77,6 +77,13 @@ impl HomeostaticMonitor {
         }
     }
 
+    /// Reset all EMAs to neutral. Called on death so the respawn's health
+    /// jump doesn't produce a false positive gradient that rewards the
+    /// actions from the previous life.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// Update with current interoceptive signals. Returns full homeostatic state.
     ///
     /// Positive gradient = internal state improving (good).

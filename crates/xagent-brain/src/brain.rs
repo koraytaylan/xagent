@@ -259,9 +259,11 @@ impl Brain {
 
     /// Signal that the agent has died. Sends a massive negative credit event
     /// to the action selector so it retroactively punishes the actions that
-    /// led to death. This is the brain's strongest learning signal.
+    /// led to death, then resets the homeostatic monitor so the respawn's
+    /// health jump doesn't produce a false positive gradient.
     pub fn death_signal(&mut self) {
         self.action_selector.death_signal();
+        self.homeostasis.reset();
     }
 
     /// Export the brain's learned state for cross-generation inheritance.

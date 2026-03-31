@@ -245,12 +245,21 @@ impl ActionSelector {
         }
     }
 
-    /// Send a one-time negative credit event when the agent dies.
-    /// Only updates state-dependent weights, NOT global biases — this prevents
-    /// the death signal from globally punishing whichever action the agent
-    /// happened to be using, which would cycle through and destroy all actions.
+    /// Send a one-time negative credit event when the agent dies, then
+    /// clear the action history so the old life's entries don't receive
+    /// the positive gradient spike from respawning.
+    ///
+    /// Without clearing, the respawn causes a gradient discontinuity
+    /// (health jumps from 0 to 50%+). assign_credit on the next tick
+    /// computes improvement = +0.15 - (-0.006) = +0.156 for old entries,
+    /// accumulating ~60% of the death penalty back as false REWARD.
+    /// The agent learns "approach danger → die → respawn → things improved!"
     pub fn death_signal(&mut self) {
         self.assign_credit(DEATH_CREDIT, false);
+        // Clear history: old life is fully credited. New life starts clean.
+        self.action_ring.clear();
+        self.history_len = 0;
+        self.history_cursor = 0;
     }
 
     /// Export action policy weights for cross-generation inheritance.

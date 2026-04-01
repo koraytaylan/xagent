@@ -1106,6 +1106,7 @@ mod tests {
             eval_repeats: 1,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
@@ -1415,6 +1416,7 @@ mod tests {
             eval_repeats: 1,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1463,6 +1465,7 @@ mod tests {
             eval_repeats: 1,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1576,6 +1579,7 @@ mod tests {
             eval_repeats: 2,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1645,6 +1649,7 @@ mod tests {
             eval_repeats: 2,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1698,6 +1703,7 @@ mod tests {
             eval_repeats: 1,
             num_islands: 3,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1727,6 +1733,7 @@ mod tests {
             eval_repeats: 1,
             num_islands: 3,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -1900,6 +1907,7 @@ mod tests {
             eval_repeats: 2,
             num_islands: 1,
             migration_interval: 0,
+            momentum_decay: 0.9,
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();

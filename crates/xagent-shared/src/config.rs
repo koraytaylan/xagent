@@ -144,6 +144,10 @@ pub struct GovernorConfig {
     /// Generations between best-config migration across islands.
     #[serde(default = "default_migration_interval")]
     pub migration_interval: u32,
+    /// Decay factor for per-island mutation momentum (0.0–1.0).
+    /// Higher = longer memory of winning mutation directions.
+    #[serde(default = "default_momentum_decay")]
+    pub momentum_decay: f32,
 }
 
 fn default_mutation_strength() -> f32 {
@@ -162,6 +166,10 @@ fn default_migration_interval() -> u32 {
     5
 }
 
+fn default_momentum_decay() -> f32 {
+    0.9
+}
+
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
@@ -174,6 +182,7 @@ impl Default for GovernorConfig {
             eval_repeats: 2,
             num_islands: 3,
             migration_interval: 5,
+            momentum_decay: 0.9,
         }
     }
 }

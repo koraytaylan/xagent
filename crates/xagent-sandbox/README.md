@@ -203,10 +203,11 @@ The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as 
 
 #### Layout
 
+- **Top bar** — App title, FPS, agent count, evolution state indicator, wall time and ticks/sec (when running/paused), pause/resume and reset buttons (right-aligned, when running/paused).
 - **Left sidebar** — Sort dropdown (by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, Fitness), agent list with colored dots, compact energy/integrity bars, phase label, death count, food consumed, and best life duration.
 - **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; the **Evolution** tab shows the evolution dashboard; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
-- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), **Agent Vision** display (8x6 upscaled color grid showing what the agent sees), **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
-- **Bottom console** — Scrollable log of death/spawn/respawn events.
+- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
+- **Bottom console** — Scrollable log of evolution events.
 
 #### Viewport Integration
 
@@ -541,7 +542,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — all runtime info is displayed on the HUD overlay.
+Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay.
 
 ---
 
@@ -925,8 +926,8 @@ Clicking an agent in the **sidebar** selects it; double-clicking opens a dedicat
 detail tab in the dock area. The selected agent is indicated by a yellow diamond
 marker floating above it in the 3D viewport. Its data drives:
 - **Sidebar**: colored dot, compact energy/integrity bars, phase label, death count, food consumed, best life. Sortable by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, or Fitness via dropdown.
-- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), **Agent Vision** (8x6 upscaled color grid), **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, 0.5x–8x speed, live/replay toggle).
-- **Bottom console**: scrollable log showing death/spawn/respawn events
+- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, 0.5x–8x speed, live/replay toggle).
+- **Bottom console**: scrollable log of evolution events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
 - CSV logging

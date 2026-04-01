@@ -124,7 +124,7 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ## 4. The Sandbox World
 
-The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides a docked tab layout: a sortable left sidebar with the agent list, a main area with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, decision stream, and replay playback controls), and a bottom console for event logs.
+The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides: a **top bar** (FPS, agent count, evolution state, wall time, ticks/sec, pause/resume/reset controls), a sortable **left sidebar** with the agent list, a **main dock area** with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, decision stream, and replay playback controls), and a **bottom console** for evolution event logs.
 
 ### Terrain & Biomes
 
@@ -240,6 +240,8 @@ cargo run --release -- --config experiment.json
 | Click agent in sidebar | Select / focus that agent |
 | Double-click agent in sidebar | Open an agent detail tab in the dock area |
 | Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| Pause / Resume button (top bar) | Pause or resume the simulation (visible during Running/Paused) |
+| Reset button (top bar) | Reset the evolution run (visible during Running/Paused) |
 | "Replay Gen N" button (detail tab) | Enter replay mode for the last completed generation |
 | Timeline scrubber (replay mode) | Scrub through recorded ticks |
 | Close detail tab | Click the × on the tab header |

@@ -246,6 +246,7 @@ impl Brain {
             homeo_state.raw_gradient,
             scalar_error,
             homeo_state.urgency,
+            0.0, // curiosity_bonus: wired in Task 5
         );
 
         // 8b. Credit-driven encoder adaptation: amplify raw features that

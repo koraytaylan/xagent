@@ -125,6 +125,7 @@ impl ActionSelector {
         homeostatic_gradient: f32,
         prediction_error: f32,
         urgency: f32,
+        curiosity_bonus: f32,
     ) -> MotorCommand {
         self.tick += 1;
         let mut rng = rand::rng();
@@ -148,7 +149,7 @@ impl ActionSelector {
         let novelty_bonus = (prediction_error * 2.0).min(0.4);
         let urgency_penalty = (urgency * 0.4).min(0.5);
         self.exploration_rate =
-            (0.5 - stability * 0.15 + novelty_bonus - urgency_penalty).clamp(0.10, 0.85);
+            (0.5 - stability * 0.15 + novelty_bonus + curiosity_bonus - urgency_penalty).clamp(0.10, 0.85);
 
         // 4. Compute raw motor outputs from encoded state.
         let mut fwd = self.forward_bias;
@@ -404,7 +405,7 @@ mod tests {
         let pred = make_state(&[0.5, 0.3, -0.1, 0.2]);
 
         for _ in 0..100 {
-            let cmd = sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            let cmd = sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
             assert!(
                 cmd.forward >= -1.0 && cmd.forward <= 1.0,
                 "forward {} out of bounds",
@@ -426,14 +427,14 @@ mod tests {
 
         // Phase 1: baseline gradient (0.0)
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
         }
 
         let fwd_before: f32 = sel.forward_weights.iter().sum();
 
         // Phase 2: positive gradient (+1.0) -- improvement from baseline
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
         }
 
         let fwd_after: f32 = sel.forward_weights.iter().sum();
@@ -459,12 +460,12 @@ mod tests {
 
         // Phase 1: baseline gradient (0.0)
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
         }
 
         // Phase 2: negative gradient (-1.0) -- worsening from baseline
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], -1.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], -1.0, 0.1, 0.0, 0.0);
         }
 
         // With negative gradient transition, recent motor commands should
@@ -487,7 +488,7 @@ mod tests {
         // Force high exploration rate by using high prediction error.
         let mut outputs = Vec::new();
         for _ in 0..50 {
-            let cmd = sel.select(&state, &pred, &[], 0.0, 0.9, 0.0);
+            let cmd = sel.select(&state, &pred, &[], 0.0, 0.9, 0.0, 0.0);
             outputs.push(cmd.forward);
         }
 
@@ -508,7 +509,7 @@ mod tests {
 
         // Build up history.
         for _ in 0..20 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
         }
         assert!(sel.history_len > 0, "Should have history after selecting");
 
@@ -529,10 +530,10 @@ mod tests {
 
         // Build some non-trivial weights.
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
         }
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
         }
 
         let exported = sel.export_weights();
@@ -570,10 +571,10 @@ mod tests {
 
         // Build a forward preference.
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
         }
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0);
+            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
         }
 
         // Now test: current state is neutral, prediction is the trained state.
@@ -587,7 +588,7 @@ mod tests {
         for _ in 0..20 {
             let mut sel_copy_n = ActionSelector::new(4);
             sel_copy_n.import_weights(&sel.export_weights());
-            let cmd = sel_copy_n.select(&neutral, &neutral, &[], 0.0, 0.01, 0.0);
+            let cmd = sel_copy_n.select(&neutral, &neutral, &[], 0.0, 0.01, 0.0, 0.0);
             fwd_neutral.push(cmd.forward);
         }
 
@@ -596,7 +597,7 @@ mod tests {
         for _ in 0..20 {
             let mut sel_copy_p = ActionSelector::new(4);
             sel_copy_p.import_weights(&sel.export_weights());
-            let cmd = sel_copy_p.select(&neutral, &dangerous_pred, &[], 0.0, 0.01, 0.0);
+            let cmd = sel_copy_p.select(&neutral, &dangerous_pred, &[], 0.0, 0.01, 0.0, 0.0);
             fwd_prospective.push(cmd.forward);
         }
 

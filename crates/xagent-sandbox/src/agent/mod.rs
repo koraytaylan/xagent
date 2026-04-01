@@ -274,6 +274,10 @@ pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> Brain
         learning_rate: perturb_f(&mut rng, parent.learning_rate),
         decay_rate: perturb_f(&mut rng, parent.decay_rate),
         distress_exponent: perturb_f(&mut rng, parent.distress_exponent).clamp(1.5, 5.0),
+        habituation_sensitivity: perturb_f(&mut rng, parent.habituation_sensitivity).clamp(5.0, 50.0),
+        max_curiosity_bonus: perturb_f(&mut rng, parent.max_curiosity_bonus).clamp(0.1, 1.0),
+        fatigue_recovery_sensitivity: perturb_f(&mut rng, parent.fatigue_recovery_sensitivity).clamp(2.0, 20.0),
+        fatigue_floor: perturb_f(&mut rng, parent.fatigue_floor).clamp(0.05, 0.4),
     }
 }
 
@@ -336,6 +340,26 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.distress_exponent
         } else {
             b.distress_exponent
+        },
+        habituation_sensitivity: if rng.random::<f32>() < 0.5 {
+            a.habituation_sensitivity
+        } else {
+            b.habituation_sensitivity
+        },
+        max_curiosity_bonus: if rng.random::<f32>() < 0.5 {
+            a.max_curiosity_bonus
+        } else {
+            b.max_curiosity_bonus
+        },
+        fatigue_recovery_sensitivity: if rng.random::<f32>() < 0.5 {
+            a.fatigue_recovery_sensitivity
+        } else {
+            b.fatigue_recovery_sensitivity
+        },
+        fatigue_floor: if rng.random::<f32>() < 0.5 {
+            a.fatigue_floor
+        } else {
+            b.fatigue_floor
         },
     }
 }

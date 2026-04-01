@@ -7,6 +7,14 @@ use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
 use xagent_brain::encoder::MAX_REPR_DIM;
+
+/// Upper bound for memory_capacity to prevent GPU buffer overflow.
+/// Large preset uses 512; 2048 gives ~4x evolutionary headroom.
+const MAX_MEMORY_CAPACITY: usize = 2048;
+
+/// Upper bound for processing_slots to keep recall cost bounded.
+/// Large preset uses 32; 128 gives ~4x evolutionary headroom.
+const MAX_PROCESSING_SLOTS: usize = 128;
 use xagent_brain::LearnedState;
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
@@ -261,8 +269,8 @@ pub fn mutate_config_with_strength(
     let mut rng = rand::rng();
 
     BrainConfig {
-        memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength),
-        processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength),
+        memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength).min(MAX_MEMORY_CAPACITY),
+        processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength).min(MAX_PROCESSING_SLOTS),
         visual_encoding_size: parent.visual_encoding_size,
         representation_dim: momentum.biased_perturb_u(&mut rng, parent.representation_dim, "representation_dim", strength).min(MAX_REPR_DIM),
         learning_rate: momentum.biased_perturb_f(&mut rng, parent.learning_rate, "learning_rate", strength),

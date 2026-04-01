@@ -323,16 +323,18 @@ impl GpuBrainCompute {
         let mem_active_size = n * c * 4;
         let similarities_size = n * c * 4;
 
-        // Guard: bail if any buffer exceeds the device's storage binding limit
+        // Guard: bail if any buffer exceeds the device's limits
         let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        let max_buf = device.limits().max_buffer_size as u64;
+        let limit = max_binding.min(max_buf);
         let largest = enc_weights_size
             .max(mem_patterns_size)
             .max(features_size);
-        if largest > max_binding {
+        if largest > limit {
             log::warn!(
                 "[GPU-COMPUTE] Largest buffer ({:.1} MB) exceeds device limit ({:.1} MB) — falling back to CPU",
                 largest as f64 / 1_048_576.0,
-                max_binding as f64 / 1_048_576.0,
+                limit as f64 / 1_048_576.0,
             );
             return None;
         }

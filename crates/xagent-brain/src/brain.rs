@@ -149,6 +149,8 @@ impl Brain {
         let _ = encoder.encode(&blank);
 
         let repr_dim = config.representation_dim;
+        let habituation_sensitivity = config.habituation_sensitivity;
+        let max_curiosity_bonus = config.max_curiosity_bonus;
 
         Self {
             config,
@@ -158,7 +160,7 @@ impl Brain {
             action_selector,
             homeostasis,
             capacity,
-            habituation: SensoryHabituation::new(repr_dim),
+            habituation: SensoryHabituation::new(repr_dim, habituation_sensitivity, max_curiosity_bonus),
             motor_fatigue: MotorFatigue::new(),
             tick_count: 0,
             last_telemetry: BrainTelemetry::default(),

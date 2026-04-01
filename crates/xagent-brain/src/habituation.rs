@@ -6,12 +6,8 @@
 
 /// EMA smoothing factor for variance tracking (~50-tick window).
 const HABITUATION_EMA_ALPHA: f32 = 0.02;
-/// Scales variance_ema into the [0, 1] attenuation range.
-const SENSITIVITY: f32 = 15.0;
 /// Minimum attenuation — never fully suppress a dimension.
 const ATTENUATION_FLOOR: f32 = 0.1;
-/// Maximum curiosity bonus (same scale as novelty_bonus in action selector).
-const MAX_CURIOSITY_BONUS: f32 = 0.4;
 
 /// Post-encoder filter that attenuates repetitive sensory input and produces
 /// a curiosity bonus that drives exploration during monotony.
@@ -22,11 +18,13 @@ pub struct SensoryHabituation {
     habituated: Vec<f32>,
     curiosity_bonus: f32,
     tick: u64,
+    sensitivity: f32,
+    max_curiosity_bonus: f32,
 }
 
 impl SensoryHabituation {
     /// Create a new habituation filter for the given representation dimension.
-    pub fn new(repr_dim: usize) -> Self {
+    pub fn new(repr_dim: usize, sensitivity: f32, max_curiosity_bonus: f32) -> Self {
         Self {
             prev_encoded: vec![0.0; repr_dim],
             variance_ema: vec![0.0; repr_dim],
@@ -34,6 +32,8 @@ impl SensoryHabituation {
             habituated: vec![0.0; repr_dim],
             curiosity_bonus: 0.0,
             tick: 0,
+            sensitivity,
+            max_curiosity_bonus,
         }
     }
 
@@ -47,7 +47,7 @@ impl SensoryHabituation {
             let delta = (encoded[i] - self.prev_encoded[i]).abs();
             self.variance_ema[i] =
                 (1.0 - HABITUATION_EMA_ALPHA) * self.variance_ema[i] + HABITUATION_EMA_ALPHA * delta;
-            self.attenuation[i] = (self.variance_ema[i] * SENSITIVITY).clamp(ATTENUATION_FLOOR, 1.0);
+            self.attenuation[i] = (self.variance_ema[i] * self.sensitivity).clamp(ATTENUATION_FLOOR, 1.0);
             self.habituated[i] = encoded[i] * self.attenuation[i];
             attenuation_sum += self.attenuation[i];
             self.prev_encoded[i] = encoded[i];
@@ -58,7 +58,7 @@ impl SensoryHabituation {
         } else {
             1.0
         };
-        self.curiosity_bonus = (1.0 - mean_attenuation) * MAX_CURIOSITY_BONUS;
+        self.curiosity_bonus = (1.0 - mean_attenuation) * self.max_curiosity_bonus;
     }
 
     /// The habituated (attenuated) encoded state.
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn constant_input_increases_habituation() {
-        let mut hab = SensoryHabituation::new(4);
+        let mut hab = SensoryHabituation::new(4, 20.0, 0.6);
         let state = vec![0.5, 0.3, -0.1, 0.2];
         for _ in 0..200 {
             hab.update(&state);
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn varying_input_keeps_attenuation_high() {
-        let mut hab = SensoryHabituation::new(4);
+        let mut hab = SensoryHabituation::new(4, 20.0, 0.6);
         for i in 0..200 {
             let v = (i as f32 * 0.1).sin();
             let state = vec![v, -v, v * 0.5, v * 0.3];
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn habituation_recovers_after_change() {
-        let mut hab = SensoryHabituation::new(4);
+        let mut hab = SensoryHabituation::new(4, 20.0, 0.6);
         let constant = vec![0.5, 0.3, -0.1, 0.2];
         for _ in 0..200 {
             hab.update(&constant);
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn habituated_state_is_attenuated() {
-        let mut hab = SensoryHabituation::new(4);
+        let mut hab = SensoryHabituation::new(4, 20.0, 0.6);
         let state = vec![1.0, 1.0, 1.0, 1.0];
         for _ in 0..200 {
             hab.update(&state);
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn attenuation_is_bounded() {
-        let mut hab = SensoryHabituation::new(4);
+        let mut hab = SensoryHabituation::new(4, 20.0, 0.6);
         for _ in 0..500 {
             hab.update(&[0.0, 0.0, 0.0, 0.0]);
         }
@@ -168,9 +168,9 @@ mod tests {
             );
         }
         assert!(
-            hab.curiosity_bonus() >= 0.0 && hab.curiosity_bonus() <= MAX_CURIOSITY_BONUS,
-            "Curiosity {} out of bounds [0, {}]",
-            hab.curiosity_bonus(), MAX_CURIOSITY_BONUS
+            hab.curiosity_bonus() >= 0.0 && hab.curiosity_bonus() <= 0.6,
+            "Curiosity {} out of bounds [0, 0.6]",
+            hab.curiosity_bonus()
         );
     }
 }

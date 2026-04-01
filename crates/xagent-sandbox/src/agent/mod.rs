@@ -1,5 +1,6 @@
 pub mod senses;
 
+use crate::momentum::MutationMomentum;
 use crate::renderer::Vertex;
 use crate::world::Mesh;
 use glam::Vec3;
@@ -247,37 +248,30 @@ impl Agent {
 
 /// Create a mutated BrainConfig from a parent config (±10% per param).
 pub fn mutate_config(parent: &BrainConfig) -> BrainConfig {
-    mutate_config_with_strength(parent, 0.1)
+    mutate_config_with_strength(parent, 0.1, &MutationMomentum::new(0.9))
 }
 
 /// Create a mutated BrainConfig with a configurable mutation strength.
 /// `strength` controls the perturbation range: e.g. 0.1 → ±10%, 0.3 → ±30%.
-pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> BrainConfig {
+pub fn mutate_config_with_strength(
+    parent: &BrainConfig,
+    strength: f32,
+    momentum: &MutationMomentum,
+) -> BrainConfig {
     let mut rng = rand::rng();
-    let lo = 1.0 - strength;
-    let hi = 1.0 + strength;
-
-    let perturb_f = |rng: &mut rand::rngs::ThreadRng, v: f32| -> f32 {
-        let factor: f32 = rng.random_range(lo..hi);
-        (v * factor).max(0.0001)
-    };
-    let perturb_u = |rng: &mut rand::rngs::ThreadRng, v: usize| -> usize {
-        let factor: f32 = rng.random_range(lo..hi);
-        ((v as f32 * factor).round() as usize).max(1)
-    };
 
     BrainConfig {
-        memory_capacity: perturb_u(&mut rng, parent.memory_capacity),
-        processing_slots: perturb_u(&mut rng, parent.processing_slots),
+        memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength),
+        processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength),
         visual_encoding_size: parent.visual_encoding_size,
-        representation_dim: perturb_u(&mut rng, parent.representation_dim).min(MAX_REPR_DIM),
-        learning_rate: perturb_f(&mut rng, parent.learning_rate),
-        decay_rate: perturb_f(&mut rng, parent.decay_rate),
-        distress_exponent: perturb_f(&mut rng, parent.distress_exponent).clamp(1.5, 5.0),
-        habituation_sensitivity: perturb_f(&mut rng, parent.habituation_sensitivity).clamp(5.0, 50.0),
-        max_curiosity_bonus: perturb_f(&mut rng, parent.max_curiosity_bonus).clamp(0.1, 1.0),
-        fatigue_recovery_sensitivity: perturb_f(&mut rng, parent.fatigue_recovery_sensitivity).clamp(2.0, 20.0),
-        fatigue_floor: perturb_f(&mut rng, parent.fatigue_floor).clamp(0.05, 0.4),
+        representation_dim: momentum.biased_perturb_u(&mut rng, parent.representation_dim, "representation_dim", strength).min(MAX_REPR_DIM),
+        learning_rate: momentum.biased_perturb_f(&mut rng, parent.learning_rate, "learning_rate", strength),
+        decay_rate: momentum.biased_perturb_f(&mut rng, parent.decay_rate, "decay_rate", strength),
+        distress_exponent: momentum.biased_perturb_f(&mut rng, parent.distress_exponent, "distress_exponent", strength).clamp(1.5, 5.0),
+        habituation_sensitivity: momentum.biased_perturb_f(&mut rng, parent.habituation_sensitivity, "habituation_sensitivity", strength).clamp(5.0, 50.0),
+        max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
+        fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
+        fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
     }
 }
 

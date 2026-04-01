@@ -10,6 +10,8 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
+use crate::momentum::MutationMomentum;
+
 use crate::agent::{crossover_config, mutate_config_with_strength, Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
@@ -83,6 +85,8 @@ pub struct Governor {
     cached_best_score: f32,
     /// Cached tree nodes (invalidated on advance).
     cached_tree_nodes: Option<Vec<TreeNode>>,
+    /// Per-island mutation momentum vectors.
+    pub momentums: Vec<MutationMomentum>,
 }
 
 impl Governor {
@@ -169,6 +173,9 @@ impl Governor {
                 attempts: 0,
             })
             .collect();
+        let momentums: Vec<MutationMomentum> = (0..num_islands)
+            .map(|_| MutationMomentum::new(config.momentum_decay))
+            .collect();
 
         Ok(Self {
             db,
@@ -181,6 +188,7 @@ impl Governor {
             active_island: 0,
             cached_best_score: -1.0,
             cached_tree_nodes: None,
+            momentums,
         })
     }
 
@@ -218,6 +226,9 @@ impl Governor {
                 attempts: 0,
             })
             .collect();
+        let momentums: Vec<MutationMomentum> = (0..num_islands)
+            .map(|_| MutationMomentum::new(config.momentum_decay))
+            .collect();
 
         let mut gov = Self {
             db,
@@ -230,6 +241,7 @@ impl Governor {
             active_island: 0,
             cached_best_score: -1.0,
             cached_tree_nodes: None,
+            momentums,
         };
         gov.refresh_best_score();
         Ok(gov)
@@ -629,7 +641,8 @@ impl Governor {
         let effective_strength =
             base + (max_strength - base) * (attempts as f32 / patience).min(1.0);
 
-        let base_config = mutate_config_with_strength(&parent_config, effective_strength);
+        let momentum = &self.momentums[self.active_island];
+        let base_config = mutate_config_with_strength(&parent_config, effective_strength, momentum);
 
         self.generation += 1;
         // Store the champion config (parent_config) as the node's config.
@@ -680,7 +693,7 @@ impl Governor {
             if unique_configs.len() >= unique_count {
                 break;
             }
-            unique_configs.push(mutate_config_with_strength(elite, effective_strength));
+            unique_configs.push(mutate_config_with_strength(elite, effective_strength, momentum));
         }
 
         // Crossover offspring from elite pairs
@@ -697,13 +710,13 @@ impl Governor {
                     &island.elite_configs[idx_a],
                     &island.elite_configs[idx_b],
                 );
-                unique_configs.push(mutate_config_with_strength(&child, effective_strength));
+                unique_configs.push(mutate_config_with_strength(&child, effective_strength, momentum));
             }
         }
 
         // Fill remaining unique slots from the spawn parent's config
         while unique_configs.len() < unique_count {
-            unique_configs.push(mutate_config_with_strength(&parent_config, effective_strength));
+            unique_configs.push(mutate_config_with_strength(&parent_config, effective_strength, momentum));
         }
 
         // Repeat each config eval_repeats times to fill pop_size slots

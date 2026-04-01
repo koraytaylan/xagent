@@ -1542,13 +1542,6 @@ impl<'a> TabContext<'a> {
 
         // ── Timing stats ────────────────────────────────────
         ui.horizontal(|ui| {
-            let hours = (evo.wall_time_secs / 3600.0) as u64;
-            let mins = ((evo.wall_time_secs % 3600.0) / 60.0) as u64;
-            let secs = (evo.wall_time_secs % 60.0) as u64;
-            ui.label(format!("⏱ {}h {:02}m {:02}s", hours, mins, secs));
-            ui.separator();
-            ui.label(format!("{:.0} ticks/sec", evo.ticks_per_sec));
-            ui.separator();
             ui.label(format!("Pop: {} | Elite: {} | Patience: {}",
                              evo.population_size, evo.elitism_count, evo.patience));
         });

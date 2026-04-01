@@ -1910,6 +1910,8 @@ impl ApplicationHandler for App {
                                 };
 
                                 let fps = self.fps;
+                                let wall_time_secs = self.evo_snapshot.wall_time_secs;
+                                let ticks_per_sec = self.evo_snapshot.ticks_per_sec;
                                 let render_3d = self.render_3d;
                                 let evo_state = self.evo_snapshot.state.clone();
                                 let viewport_tex_id = egui.viewport_texture_id;
@@ -2097,6 +2099,15 @@ impl ApplicationHandler for App {
                                                                 .color(egui::Color32::YELLOW),
                                                         );
                                                     }
+                                                }
+                                                if matches!(&evo_state, EvolutionState::Running | EvolutionState::Paused) {
+                                                    ui.separator();
+                                                    let hours = (wall_time_secs / 3600.0) as u64;
+                                                    let mins = ((wall_time_secs % 3600.0) / 60.0) as u64;
+                                                    let secs = (wall_time_secs % 60.0) as u64;
+                                                    ui.label(format!("{}h {:02}m {:02}s", hours, mins, secs));
+                                                    ui.separator();
+                                                    ui.label(format!("{:.0} ticks/s", ticks_per_sec));
                                                 }
                                                 if !render_3d {
                                                     ui.separator();

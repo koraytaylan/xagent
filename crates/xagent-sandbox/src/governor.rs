@@ -1051,6 +1051,31 @@ fn record_mutations(
             parent.decay_rate as f64,
             child.decay_rate as f64,
         ),
+        (
+            "distress_exponent",
+            parent.distress_exponent as f64,
+            child.distress_exponent as f64,
+        ),
+        (
+            "habituation_sensitivity",
+            parent.habituation_sensitivity as f64,
+            child.habituation_sensitivity as f64,
+        ),
+        (
+            "max_curiosity_bonus",
+            parent.max_curiosity_bonus as f64,
+            child.max_curiosity_bonus as f64,
+        ),
+        (
+            "fatigue_recovery_sensitivity",
+            parent.fatigue_recovery_sensitivity as f64,
+            child.fatigue_recovery_sensitivity as f64,
+        ),
+        (
+            "fatigue_floor",
+            parent.fatigue_floor as f64,
+            child.fatigue_floor as f64,
+        ),
     ];
 
     for (name, old_val, new_val) in params_to_check {
@@ -1739,6 +1764,7 @@ mod tests {
             learning_rate: 0.9,
             decay_rate: 0.9,
             distress_exponent: 2.0,
+            ..BrainConfig::default()
         };
         let b = BrainConfig {
             memory_capacity: 1,
@@ -1748,6 +1774,7 @@ mod tests {
             learning_rate: 0.001,
             decay_rate: 0.001,
             distress_exponent: 2.0,
+            ..BrainConfig::default()
         };
 
         // Run crossover many times — with probability 1-(0.5^5)^N the child

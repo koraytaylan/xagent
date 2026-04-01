@@ -430,7 +430,7 @@ impl App {
             governor: None,
             evo_snapshot,
             evo_wall_accumulated: 0.0,
-            evo_wall_segment_start: Some(Instant::now()),
+            evo_wall_segment_start: None,
             tps_tick_count: 0,
             tps_last_reset: Instant::now(),
             tps_display: 0.0,

@@ -1752,12 +1752,17 @@ impl<'a> TabContext<'a> {
             // Root node (gen 0): show all config values
             if let Some(cfg) = &node.config {
                 format!(
-                    " (mem={} slots={} repr={} lr={:.4} decay={:.4})",
+                    " (mem={} slots={} repr={} lr={:.4} decay={:.4} distress={:.2} hab={:.1} curiosity={:.2} fat_rec={:.1} fat_fl={:.2})",
                     cfg.memory_capacity,
                     cfg.processing_slots,
                     cfg.representation_dim,
                     cfg.learning_rate,
                     cfg.decay_rate,
+                    cfg.distress_exponent,
+                    cfg.habituation_sensitivity,
+                    cfg.max_curiosity_bonus,
+                    cfg.fatigue_recovery_sensitivity,
+                    cfg.fatigue_floor,
                 )
             } else {
                 String::new()

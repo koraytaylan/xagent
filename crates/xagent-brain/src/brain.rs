@@ -47,7 +47,7 @@ pub struct BrainTelemetry {
     pub mean_attenuation: f32,
     /// Curiosity bonus from sensory monotony.
     pub curiosity_bonus: f32,
-    /// Motor fatigue factor [0.2, 1.0]. Low = fatigued.
+    /// Motor fatigue factor [fatigue_floor, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,
     /// Recent motor output variance (higher = more diverse).
     pub motor_variance: f32,

@@ -15,6 +15,7 @@ pub mod homeostasis;
 pub mod memory;
 pub mod predictor;
 pub mod action;
+pub mod habituation;
 
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
 #[inline(always)]
@@ -25,3 +26,4 @@ pub(crate) fn fast_tanh(x: f32) -> f32 {
 }
 
 pub use brain::{Brain, BrainTelemetry, DecisionSnapshot, LearnedState};
+pub use habituation::SensoryHabituation;

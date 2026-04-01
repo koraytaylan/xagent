@@ -289,6 +289,9 @@ struct App {
     evo_snapshot: EvolutionSnapshot,
     evo_wall_accumulated: f64,
     evo_wall_segment_start: Option<Instant>,
+    tps_tick_count: u64,
+    tps_last_reset: Instant,
+    tps_display: f64,
     db_path: String,
     governor_config: GovernorConfig,
 
@@ -428,6 +431,9 @@ impl App {
             evo_snapshot,
             evo_wall_accumulated: 0.0,
             evo_wall_segment_start: Some(Instant::now()),
+            tps_tick_count: 0,
+            tps_last_reset: Instant::now(),
+            tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
             gpu_brain,
@@ -533,6 +539,9 @@ impl App {
                         self.evo_snapshot.migration_interval = gov_config.migration_interval;
                         self.evo_wall_accumulated = 0.0;
                         self.evo_wall_segment_start = Some(Instant::now());
+                        self.tps_tick_count = 0;
+                        self.tps_last_reset = Instant::now();
+                        self.tps_display = 0.0;
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Started new run".into());
@@ -555,6 +564,9 @@ impl App {
                         self.governor = Some(gov);
                         self.evo_wall_accumulated = 0.0;
                         self.evo_wall_segment_start = Some(Instant::now());
+                        self.tps_tick_count = 0;
+                        self.tps_last_reset = Instant::now();
+                        self.tps_display = 0.0;
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Resumed from database".into());
@@ -570,12 +582,15 @@ impl App {
                 if let Some(start) = self.evo_wall_segment_start.take() {
                     self.evo_wall_accumulated += start.elapsed().as_secs_f64();
                 }
+                self.tps_display = 0.0;
                 self.log_msg("[EVOLUTION] Paused".into());
             }
             EvolutionAction::Unpause => {
                 self.evo_snapshot.state = EvolutionState::Running;
                 self.paused = false;
                 self.evo_wall_segment_start = Some(Instant::now());
+                self.tps_tick_count = 0;
+                self.tps_last_reset = Instant::now();
                 self.log_msg("[EVOLUTION] Resumed".into());
             }
             EvolutionAction::Reset => {
@@ -1509,6 +1524,7 @@ impl ApplicationHandler for App {
                         }
 
                         self.tick += 1;
+                        self.tps_tick_count += 1;
 
                         // ── Governor tick tracking ──────────────
                         if let Some(gov) = &mut self.governor {
@@ -2003,10 +2019,13 @@ impl ApplicationHandler for App {
                                         .map(|s| s.elapsed().as_secs_f64())
                                         .unwrap_or(0.0);
                                 self.evo_snapshot.wall_time_secs = wall;
-                                if wall > 0.0 {
-                                    self.evo_snapshot.ticks_per_sec =
-                                        self.evo_snapshot.gen_tick as f64 / wall;
+                                let tps_elapsed = self.tps_last_reset.elapsed().as_secs_f64();
+                                if tps_elapsed >= 1.0 {
+                                    self.tps_display = self.tps_tick_count as f64 / tps_elapsed;
+                                    self.tps_tick_count = 0;
+                                    self.tps_last_reset = Instant::now();
                                 }
+                                self.evo_snapshot.ticks_per_sec = self.tps_display;
                                 // Move snapshot out so we can pass &mut to the closure
                                 let mut evo_snap = std::mem::take(&mut self.evo_snapshot);
                                 let mut evo_action = EvolutionAction::None;

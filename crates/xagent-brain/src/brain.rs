@@ -151,6 +151,8 @@ impl Brain {
         let repr_dim = config.representation_dim;
         let habituation_sensitivity = config.habituation_sensitivity;
         let max_curiosity_bonus = config.max_curiosity_bonus;
+        let fatigue_recovery_sensitivity = config.fatigue_recovery_sensitivity;
+        let fatigue_floor = config.fatigue_floor;
 
         Self {
             config,
@@ -161,7 +163,7 @@ impl Brain {
             homeostasis,
             capacity,
             habituation: SensoryHabituation::new(repr_dim, habituation_sensitivity, max_curiosity_bonus),
-            motor_fatigue: MotorFatigue::new(),
+            motor_fatigue: MotorFatigue::new(fatigue_recovery_sensitivity, fatigue_floor),
             tick_count: 0,
             last_telemetry: BrainTelemetry::default(),
             last_decision: None,

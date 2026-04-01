@@ -6,10 +6,6 @@
 
 /// Ring buffer size for tracking recent motor outputs.
 const FATIGUE_WINDOW: usize = 64;
-/// Scales variance into the [0, 1] fatigue factor range.
-const RECOVERY_SENSITIVITY: f32 = 5.0;
-/// Minimum fatigue factor — never fully paralyze (80% max dampening).
-const FATIGUE_FLOOR: f32 = 0.2;
 
 /// Tracks motor output variance and produces a fatigue dampening factor.
 pub struct MotorFatigue {
@@ -19,11 +15,13 @@ pub struct MotorFatigue {
     len: usize,
     fatigue_factor: f32,
     motor_variance: f32,
+    recovery_sensitivity: f32,
+    fatigue_floor: f32,
 }
 
 impl MotorFatigue {
     /// Create a new motor fatigue tracker.
-    pub fn new() -> Self {
+    pub fn new(recovery_sensitivity: f32, fatigue_floor: f32) -> Self {
         Self {
             forward_ring: vec![0.0; FATIGUE_WINDOW],
             turn_ring: vec![0.0; FATIGUE_WINDOW],
@@ -31,6 +29,8 @@ impl MotorFatigue {
             len: 0,
             fatigue_factor: 1.0,
             motor_variance: 0.0,
+            recovery_sensitivity,
+            fatigue_floor,
         }
     }
 
@@ -52,11 +52,11 @@ impl MotorFatigue {
         let turn_var = Self::variance(&self.turn_ring[..self.len]);
         self.motor_variance = fwd_var + turn_var;
 
-        self.fatigue_factor = (self.motor_variance * RECOVERY_SENSITIVITY)
-            .clamp(FATIGUE_FLOOR, 1.0);
+        self.fatigue_factor = (self.motor_variance * self.recovery_sensitivity)
+            .clamp(self.fatigue_floor, 1.0);
     }
 
-    /// Current fatigue factor [FATIGUE_FLOOR, 1.0]. Multiply motor output by this.
+    /// Current fatigue factor [fatigue_floor, 1.0]. Multiply motor output by this.
     pub fn fatigue_factor(&self) -> f32 {
         self.fatigue_factor
     }
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn constant_output_causes_fatigue() {
-        let mut mf = MotorFatigue::new();
+        let mut mf = MotorFatigue::new(8.0, 0.1);
         for _ in 0..FATIGUE_WINDOW {
             mf.update(0.5, 0.3);
         }
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn varied_output_prevents_fatigue() {
-        let mut mf = MotorFatigue::new();
+        let mut mf = MotorFatigue::new(8.0, 0.1);
         for i in 0..FATIGUE_WINDOW {
             let v = (i as f32 * 0.2).sin();
             mf.update(v, -v);
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn fatigue_recovers_when_output_diversifies() {
-        let mut mf = MotorFatigue::new();
+        let mut mf = MotorFatigue::new(8.0, 0.1);
         for _ in 0..FATIGUE_WINDOW {
             mf.update(0.5, 0.3);
         }
@@ -133,12 +133,12 @@ mod tests {
 
     #[test]
     fn fatigue_factor_is_bounded() {
-        let mut mf = MotorFatigue::new();
+        let mut mf = MotorFatigue::new(8.0, 0.1);
         for _ in 0..200 {
             mf.update(0.0, 0.0);
         }
         assert!(
-            mf.fatigue_factor() >= FATIGUE_FLOOR,
+            mf.fatigue_factor() >= 0.1,
             "Fatigue factor should not go below floor: {}",
             mf.fatigue_factor()
         );
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn initial_state_has_no_fatigue() {
-        let mf = MotorFatigue::new();
+        let mf = MotorFatigue::new(8.0, 0.1);
         assert_eq!(mf.fatigue_factor(), 1.0);
         assert_eq!(mf.motor_variance(), 0.0);
     }

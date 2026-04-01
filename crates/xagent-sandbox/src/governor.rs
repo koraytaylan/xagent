@@ -503,17 +503,22 @@ impl Governor {
         // ── Momentum update: learn from individual winners ──────────────
         // An individual "winner" is an offspring whose fitness >= spawn parent.
         // Even in a failed generation, strong individuals contribute directional data.
+        let had_winners;
         if let Some(ref pc) = parent_config_for_momentum {
             let winner_configs: Vec<BrainConfig> = reduced
                 .iter()
                 .filter(|f| f.composite_fitness >= parent_fitness)
                 .map(|f| f.config.clone())
                 .collect();
+            had_winners = !winner_configs.is_empty();
             self.momentums[self.active_island].update(pc, &winner_configs);
             self.momentums[self.active_island].decay_step();
+        } else {
+            had_winners = false;
         }
 
-        // Log momentum trends for insight
+        // Log momentum trends only when there were winners (avoids noise)
+        if had_winners {
         let top = self.momentums[self.active_island].top_params(3);
         if !top.is_empty() {
             let trends: Vec<String> = top.iter()
@@ -539,6 +544,7 @@ impl Governor {
             if !trends.is_empty() {
                 messages.push(format!("[EVOLUTION] Momentum trending: {}", trends.join(", ")));
             }
+        }
         }
 
         // Check completion after scoring but before breeding

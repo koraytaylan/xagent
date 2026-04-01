@@ -2188,7 +2188,9 @@ impl ApplicationHandler for App {
                                                     .stick_to_bottom(true)
                                                     .show(ui, |ui| {
                                                         for line in &console_lines {
-                                                            let color = if line.contains("best") || line.contains("Beat parent") {
+                                                            let color = if line.contains("ERROR") || line.contains("Failed to") {
+                                                                egui::Color32::from_rgb(255, 100, 100)
+                                                            } else if line.contains("best") || line.contains("Beat parent") {
                                                                 egui::Color32::from_rgb(80, 220, 80)
                                                             } else if line.contains("Failed") || line.contains("exhausted") || line.contains("backtracking") {
                                                                 egui::Color32::from_rgb(255, 140, 80)
@@ -2196,8 +2198,6 @@ impl ApplicationHandler for App {
                                                                 egui::Color32::from_rgb(100, 180, 255)
                                                             } else if line.contains("Momentum") {
                                                                 egui::Color32::from_rgb(180, 160, 255)
-                                                            } else if line.contains("ERROR") || line.contains("Failed to") {
-                                                                egui::Color32::from_rgb(255, 100, 100)
                                                             } else {
                                                                 egui::Color32::LIGHT_GRAY
                                                             };

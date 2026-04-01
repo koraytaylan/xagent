@@ -24,6 +24,13 @@ pub struct Camera {
 
     pub is_mouse_dragging: bool,
     pub last_mouse_pos: Option<(f64, f64)>,
+
+    // Orbit mode — camera orbits the selected agent
+    pub orbit_mode: bool,
+    pub orbit_target: Vec3,
+    pub orbit_distance: f32,
+    pub orbit_yaw: f32,
+    pub orbit_pitch: f32,
 }
 
 impl Camera {
@@ -48,6 +55,11 @@ impl Camera {
             move_down: false,
             is_mouse_dragging: false,
             last_mouse_pos: None,
+            orbit_mode: false,
+            orbit_target: Vec3::ZERO,
+            orbit_distance: 30.0,
+            orbit_yaw: 0.0,
+            orbit_pitch: -0.5,
         }
     }
 
@@ -125,6 +137,42 @@ impl Camera {
         self.position = Vec3::new(0.0, 300.0, 120.0);
         self.yaw = -std::f32::consts::FRAC_PI_2;
         self.pitch = -1.2;
+        self.orbit_mode = false;
+    }
+
+    /// Update camera to orbit around the target position.
+    pub fn update_orbit(&mut self, target: Vec3) {
+        self.orbit_target = target;
+        let x = self.orbit_distance * self.orbit_yaw.cos() * self.orbit_pitch.cos();
+        let y = self.orbit_distance * self.orbit_pitch.sin();
+        let z = self.orbit_distance * self.orbit_yaw.sin() * self.orbit_pitch.cos();
+        self.position = self.orbit_target + Vec3::new(x, y, z);
+
+        // Derive yaw/pitch from look direction so view_matrix() works correctly
+        let dir = (self.orbit_target - self.position).normalize();
+        self.yaw = dir.z.atan2(dir.x);
+        self.pitch = dir.y.asin();
+    }
+
+    /// Process mouse movement for orbit rotation.
+    pub fn process_orbit_mouse_move(&mut self, x: f64, y: f64) {
+        if !self.is_mouse_dragging {
+            self.last_mouse_pos = None;
+            return;
+        }
+        if let Some((last_x, last_y)) = self.last_mouse_pos {
+            let sensitivity = 0.005;
+            let dx = (x - last_x) as f32;
+            let dy = (y - last_y) as f32;
+            self.orbit_yaw += dx * sensitivity;
+            self.orbit_pitch = (self.orbit_pitch - dy * sensitivity).clamp(-1.4, -0.05);
+        }
+        self.last_mouse_pos = Some((x, y));
+    }
+
+    /// Scroll-wheel zoom for orbit mode.
+    pub fn process_orbit_scroll(&mut self, delta: f32) {
+        self.orbit_distance = (self.orbit_distance - delta * 2.0).clamp(5.0, 200.0);
     }
 
     /// Compute the view matrix (world-to-camera transform) using right-handed look-at.

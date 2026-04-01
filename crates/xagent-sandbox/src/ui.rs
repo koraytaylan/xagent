@@ -247,6 +247,7 @@ pub struct TabContext<'a> {
     pub world: &'a WorldSnapshot,
     pub replay: &'a mut ReplayState,
     pub recording: Option<&'a crate::replay::GenerationRecording>,
+    pub orbit_mode: &'a mut bool,
 }
 
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,
@@ -482,6 +483,16 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             Tab::Sandbox => {
+                // Toolbar
+                ui.horizontal(|ui| {
+                    let orbit_label = if *self.orbit_mode { "\u{1F3AF} Orbiting" } else { "\u{1F3AF} Orbit Agent" };
+                    if ui.selectable_label(*self.orbit_mode, orbit_label).clicked() {
+                        *self.orbit_mode = !*self.orbit_mode;
+                    }
+                });
+                ui.separator();
+
+                // Viewport
                 let avail = ui.available_size();
                 *self.desired_vp = (
                     (avail.x * self.ppp) as u32,

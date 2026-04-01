@@ -3,8 +3,10 @@ use xagent_shared::{BrainConfig, MotorCommand, SensoryFrame};
 use crate::action::ActionSelector;
 use crate::capacity::CapacityManager;
 use crate::encoder::{EncodedState, SensoryEncoder};
+use crate::habituation::SensoryHabituation;
 use crate::homeostasis::{HomeostaticMonitor, HomeostaticState};
 use crate::memory::PatternMemory;
+use crate::motor_fatigue::MotorFatigue;
 use crate::predictor::Predictor;
 
 /// Maximum lookahead steps for multi-step prediction rollout.
@@ -41,6 +43,14 @@ pub struct BrainTelemetry {
     pub exploitation_ratio: f32,
     /// Composite decision quality score [0.0, 1.0].
     pub decision_quality: f32,
+    /// Sensory habituation: mean attenuation across encoded dimensions [0.1, 1.0].
+    pub mean_attenuation: f32,
+    /// Curiosity bonus from sensory monotony [0.0, 0.4].
+    pub curiosity_bonus: f32,
+    /// Motor fatigue factor [0.2, 1.0]. Low = fatigued.
+    pub fatigue_factor: f32,
+    /// Recent motor output variance (higher = more diverse).
+    pub motor_variance: f32,
 }
 
 impl BrainTelemetry {
@@ -111,6 +121,8 @@ pub struct Brain {
     pub action_selector: ActionSelector,
     pub homeostasis: HomeostaticMonitor,
     pub capacity: CapacityManager,
+    pub habituation: SensoryHabituation,
+    pub motor_fatigue: MotorFatigue,
     tick_count: u64,
     /// Latest telemetry snapshot.
     last_telemetry: BrainTelemetry,
@@ -136,6 +148,8 @@ impl Brain {
         let blank = xagent_shared::SensoryFrame::new_blank(8, 6);
         let _ = encoder.encode(&blank);
 
+        let repr_dim = config.representation_dim;
+
         Self {
             config,
             encoder,
@@ -144,6 +158,8 @@ impl Brain {
             action_selector,
             homeostasis,
             capacity,
+            habituation: SensoryHabituation::new(repr_dim),
+            motor_fatigue: MotorFatigue::new(),
             tick_count: 0,
             last_telemetry: BrainTelemetry::default(),
             last_decision: None,
@@ -177,7 +193,11 @@ impl Brain {
         self.tick_count += 1;
         self.memory.advance_tick();
 
-        // 1. Compute homeostatic gradient from interoceptive signals
+        // 1a. Sensory habituation: attenuate encoded state + compute curiosity
+        self.habituation.update(encoded.data());
+        let habituated = EncodedState::from_slice(self.habituation.habituated_state());
+
+        // 1b. Compute homeostatic gradient from interoceptive signals
         let homeo_state: HomeostaticState =
             self.homeostasis.update(frame.energy_signal, frame.integrity_signal);
 
@@ -187,15 +207,15 @@ impl Brain {
 
         if let Some(prev_prediction) = self.predictor.last_prediction() {
             let prev_prediction = prev_prediction.clone();
-            scalar_error = self.predictor.prediction_error(&prev_prediction, &encoded);
+            scalar_error = self.predictor.prediction_error(&prev_prediction, &habituated);
 
             // Learn: update memory reinforcements
-            self.memory.learn(&encoded, scalar_error, modulated_lr);
+            self.memory.learn(&habituated, scalar_error, modulated_lr);
 
             // Compute error vector into scratch, then learn from it
             // We use the static version to avoid borrow conflict with learn()
             {
-                let error_vec = Predictor::prediction_error_vec(&prev_prediction, &encoded);
+                let error_vec = Predictor::prediction_error_vec(&prev_prediction, &habituated);
                 self.predictor.learn(&error_vec, prev_prediction.data(), modulated_lr);
             }
 
@@ -212,12 +232,12 @@ impl Brain {
         // 4. Recall relevant patterns with similarity scores (GPU or CPU path)
         let recalled = match gpu_similarities {
             Some(sims) => self.memory.recall_with_gpu_similarities(sims, recall_budget),
-            None => self.memory.recall(&encoded, recall_budget),
+            None => self.memory.recall(&habituated, recall_budget),
         };
         self.capacity.report_usage(recalled.len());
 
         // 5. Predict next state using pre-computed similarity scores
-        let prediction = self.predictor.predict_weighted(&encoded, &recalled);
+        let prediction = self.predictor.predict_weighted(&habituated, &recalled);
 
         // 5b. Multi-step rollout for prospective evaluation.
         let confidence = 1.0 - scalar_error.clamp(0.0, 1.0);
@@ -229,7 +249,7 @@ impl Brain {
         };
 
         // 6. Store current state as a pattern
-        self.memory.store(encoded.clone());
+        self.memory.store(habituated.clone());
 
         // 7. Decay old patterns
         self.memory.decay(self.config.decay_rate);
@@ -239,20 +259,31 @@ impl Brain {
         // food/damage events produce a sharp, strong signal. The composite gradient is
         // still used for exploration rate and modulated learning rate (its smoothing is
         // appropriate there).
+        let curiosity_bonus = self.habituation.curiosity_bonus();
         let command = self.action_selector.select(
-            &encoded,
+            &habituated,
             &prospection_prediction,
             &recalled,
             homeo_state.raw_gradient,
             scalar_error,
             homeo_state.urgency,
-            0.0, // curiosity_bonus: wired in Task 5
+            curiosity_bonus,
         );
 
         // 8b. Credit-driven encoder adaptation: amplify raw features that
         //     contributed to behaviourally relevant encoded dimensions.
         let credit_signal = self.action_selector.last_credit_signal();
         self.encoder.adapt_from_credit(credit_signal, modulated_lr);
+
+        // 8c. Motor fatigue: dampen output when action variance is low.
+        self.motor_fatigue.update(command.forward, command.turn);
+        let fatigue = self.motor_fatigue.fatigue_factor();
+        let command = MotorCommand {
+            forward: command.forward * fatigue,
+            turn: command.turn * fatigue,
+            strafe: command.strafe,
+            action: command.action,
+        };
 
         // 9. Record prediction for next tick's error computation
         self.predictor.record_prediction(prediction);
@@ -279,6 +310,10 @@ impl Brain {
             avg_prediction_error: self.predictor.recent_avg_error(32),
             exploitation_ratio,
             decision_quality,
+            mean_attenuation: self.habituation.mean_attenuation(),
+            curiosity_bonus,
+            fatigue_factor: self.motor_fatigue.fatigue_factor(),
+            motor_variance: self.motor_fatigue.motor_variance(),
         };
 
         // 12. Capture decision snapshot for UI stream

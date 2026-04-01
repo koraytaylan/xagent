@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod governor;
+pub mod momentum;
 pub mod gpu_compute;
 pub mod headless;
 pub mod overlay;

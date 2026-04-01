@@ -25,6 +25,22 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [1.5, 5.0]. Default 2.0.
     #[serde(default = "default_distress_exponent")]
     pub distress_exponent: f32,
+    /// Scales per-dimension variance into attenuation range. Higher = faster boredom.
+    /// Heritable: mutated during breeding, clamped to [5.0, 50.0]. Default 20.0.
+    #[serde(default = "default_habituation_sensitivity")]
+    pub habituation_sensitivity: f32,
+    /// Maximum curiosity bonus from sensory monotony. Higher = stronger exploration drive.
+    /// Heritable: mutated during breeding, clamped to [0.1, 1.0]. Default 0.6.
+    #[serde(default = "default_max_curiosity_bonus")]
+    pub max_curiosity_bonus: f32,
+    /// Scales motor variance into fatigue relief. Higher = easier recovery from fatigue.
+    /// Heritable: mutated during breeding, clamped to [2.0, 20.0]. Default 8.0.
+    #[serde(default = "default_fatigue_recovery_sensitivity")]
+    pub fatigue_recovery_sensitivity: f32,
+    /// Minimum motor output under fatigue. Lower = harsher dampening.
+    /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
+    #[serde(default = "default_fatigue_floor")]
+    pub fatigue_floor: f32,
 }
 
 /// Configuration for the world simulation.
@@ -53,6 +69,22 @@ pub struct WorldConfig {
 
 fn default_distress_exponent() -> f32 {
     2.0
+}
+
+fn default_habituation_sensitivity() -> f32 {
+    20.0
+}
+
+fn default_max_curiosity_bonus() -> f32 {
+    0.6
+}
+
+fn default_fatigue_recovery_sensitivity() -> f32 {
+    8.0
+}
+
+fn default_fatigue_floor() -> f32 {
+    0.1
 }
 
 fn default_seed() -> u64 {
@@ -156,6 +188,10 @@ impl Default for BrainConfig {
             learning_rate: 0.05,
             decay_rate: 0.001,
             distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 }
@@ -171,6 +207,10 @@ impl BrainConfig {
             learning_rate: 0.08,
             decay_rate: 0.002,
             distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 
@@ -184,6 +224,10 @@ impl BrainConfig {
             learning_rate: 0.03,
             decay_rate: 0.0005,
             distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 }

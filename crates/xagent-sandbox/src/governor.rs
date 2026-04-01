@@ -513,6 +513,34 @@ impl Governor {
             self.momentums[self.active_island].decay_step();
         }
 
+        // Log momentum trends for insight
+        let top = self.momentums[self.active_island].top_params(3);
+        if !top.is_empty() {
+            let trends: Vec<String> = top.iter()
+                .filter(|(_, val)| val.abs() > 0.001) // Only show meaningful trends
+                .map(|(name, val)| {
+                    let dir = if *val > 0.0 { "↑" } else { "↓" };
+                    let short = match *name {
+                        "memory_capacity" => "mem",
+                        "processing_slots" => "slots",
+                        "representation_dim" => "repr",
+                        "learning_rate" => "lr",
+                        "decay_rate" => "decay",
+                        "distress_exponent" => "distress",
+                        "habituation_sensitivity" => "hab",
+                        "max_curiosity_bonus" => "curiosity",
+                        "fatigue_recovery_sensitivity" => "fat_rec",
+                        "fatigue_floor" => "fat_fl",
+                        other => other,
+                    };
+                    format!("{}{}", short, dir)
+                })
+                .collect();
+            if !trends.is_empty() {
+                messages.push(format!("[EVOLUTION] Momentum trending: {}", trends.join(", ")));
+            }
+        }
+
         // Check completion after scoring but before breeding
         if self.evolution_complete() {
             self.refresh_best_score();

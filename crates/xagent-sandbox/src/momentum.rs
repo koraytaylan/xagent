@@ -82,6 +82,16 @@ impl MutationMomentum {
         ((value as f32 * biased_factor).round() as usize).max(1)
     }
 
+    /// Return the top N parameters by absolute momentum magnitude.
+    pub fn top_params(&self, n: usize) -> Vec<(&str, f32)> {
+        let mut entries: Vec<(&str, f32)> = self.momentum.iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        entries.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        entries.truncate(n);
+        entries
+    }
+
     /// Mutable access to the momentum map (for testing).
     #[cfg(test)]
     pub fn momentum_mut(&mut self) -> &mut HashMap<String, f32> {

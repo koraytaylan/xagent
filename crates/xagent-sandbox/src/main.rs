@@ -248,6 +248,7 @@ struct App {
     selected_agent_idx: usize,
     viewport_hovered: bool,
     chart_window: usize,
+    orbit_mode: bool,
 
     // CSV metrics logger
     logger: Option<MetricsLogger>,
@@ -412,6 +413,7 @@ impl App {
             selected_agent_idx: 0,
             viewport_hovered: false,
             chart_window: 120,
+            orbit_mode: false,
             logger,
             agent_instance_buffer: None,
             agent_instance_count: 0,
@@ -460,7 +462,6 @@ impl App {
     /// (not in a danger biome).
     fn spawn_agent(&mut self, config: BrainConfig, generation: u32) {
         if self.agents.len() >= MAX_AGENTS {
-            self.log_msg(format!("[SPAWN] Max agents ({}) reached", MAX_AGENTS));
             return;
         }
         let Some(world) = &self.world else { return };
@@ -472,11 +473,6 @@ impl App {
 
         let mut agent = Agent::new(id, pos, config, self.tick);
         agent.generation = generation;
-
-        self.log_msg(format!(
-            "[SPAWN] Agent {} (gen {}) at ({:.1}, {:.1})",
-            id, generation, pos.x, pos.z
-        ));
 
         self.agents.push(agent);
     }
@@ -1179,7 +1175,11 @@ impl ApplicationHandler for App {
                 if pointer_on_viewport || self.camera.is_mouse_dragging =>
             {
                 self.cursor_pos = (position.x, position.y);
-                self.camera.process_mouse_move(position.x, position.y);
+                if self.camera.orbit_mode {
+                    self.camera.process_orbit_mouse_move(position.x, position.y);
+                } else {
+                    self.camera.process_mouse_move(position.x, position.y);
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } if pointer_on_viewport => {
@@ -1187,7 +1187,11 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
                 };
-                self.camera.process_scroll(scroll);
+                if self.camera.orbit_mode {
+                    self.camera.process_orbit_scroll(scroll);
+                } else {
+                    self.camera.process_scroll(scroll);
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -1208,7 +1212,24 @@ impl ApplicationHandler for App {
                 }
 
                 // ── camera ─────────────────────────────────────────
-                self.camera.update(dt);
+                // Detect orbit toggle: initialize orbit parameters from current camera
+                if self.orbit_mode && !self.camera.orbit_mode {
+                    if let Some(agent) = self.agents.get(self.selected_agent_idx) {
+                        let diff = self.camera.position - agent.body.body.position;
+                        self.camera.orbit_distance = diff.length().clamp(5.0, 200.0);
+                        self.camera.orbit_yaw = diff.z.atan2(diff.x);
+                        self.camera.orbit_pitch = (diff.y / diff.length()).asin().clamp(-1.4, -0.05);
+                    }
+                }
+                self.camera.orbit_mode = self.orbit_mode;
+                if self.camera.orbit_mode {
+                    if let Some(agent) = self.agents.get(self.selected_agent_idx) {
+                        let target = agent.body.body.position;
+                        self.camera.update_orbit(target);
+                    }
+                } else {
+                    self.camera.update(dt);
+                }
 
                 // ── simulation ticks (fixed timestep) ──────────
                 if !self.paused {
@@ -1475,23 +1496,13 @@ impl ApplicationHandler for App {
                             }
 
                             // Handle death/respawn
-                            let mut event_msgs: Vec<String> = Vec::new();
                             for agent in &mut self.agents {
                                 if !agent.body.body.alive && agent.respawn_cooldown == 0 {
                                     let life_ticks = agent.age(self.tick);
                                     agent.longest_life = agent.longest_life.max(life_ticks);
                                     agent.death_count += 1;
-                                    let cause = if agent.body.body.internal.energy <= 0.0 {
-                                        "energy depletion"
-                                    } else {
-                                        "integrity failure"
-                                    };
                                     // Death signal: retroactively punish actions that led here
                                     agent.brain.death_signal();
-                                    event_msgs.push(format!(
-                                        "[DEATH] Agent {} died ({}), lived {} ticks",
-                                        agent.id, cause, life_ticks
-                                    ));
                                     agent.respawn_cooldown = RESPAWN_COOLDOWN_FRAMES;
                                 } else if !agent.body.body.alive && agent.respawn_cooldown > 0 {
                                     agent.respawn_cooldown -= 1;
@@ -1507,18 +1518,7 @@ impl ApplicationHandler for App {
                                         agent.generation += 1;
                                         agent.reset_trail();
                                         agent.brain.trauma(0.5);
-                                        let p = agent.body.body.position;
-                                        event_msgs.push(format!(
-                                            "[RESPAWN] Agent {} at ({:.1}, {:.1})",
-                                            agent.id, p.x, p.z
-                                        ));
                                     }
-                                }
-                            }
-                            for msg in event_msgs {
-                                self.console_log.push_back(msg);
-                                if self.console_log.len() > 200 {
-                                    self.console_log.pop_front();
                                 }
                             }
                         }
@@ -2078,6 +2078,7 @@ impl ApplicationHandler for App {
                                 let dock_state = &mut self.dock_state;
                                 let replay_state = &mut self.replay_state;
                                 let last_recording = self.last_recording.as_ref();
+                                let orbit_mode = &mut self.orbit_mode;
 
                                 egui.render(
                                     window,
@@ -2187,10 +2188,16 @@ impl ApplicationHandler for App {
                                                     .stick_to_bottom(true)
                                                     .show(ui, |ui| {
                                                         for line in &console_lines {
-                                                            let color = if line.contains("[DEATH]") {
+                                                            let color = if line.contains("best") || line.contains("Beat parent") {
+                                                                egui::Color32::from_rgb(80, 220, 80)
+                                                            } else if line.contains("Failed") || line.contains("exhausted") || line.contains("backtracking") {
+                                                                egui::Color32::from_rgb(255, 140, 80)
+                                                            } else if line.contains("Migration") {
+                                                                egui::Color32::from_rgb(100, 180, 255)
+                                                            } else if line.contains("Momentum") {
+                                                                egui::Color32::from_rgb(180, 160, 255)
+                                                            } else if line.contains("ERROR") || line.contains("Failed to") {
                                                                 egui::Color32::from_rgb(255, 100, 100)
-                                                            } else if line.contains("[SPAWN]") || line.contains("[RESPAWN]") {
-                                                                egui::Color32::from_rgb(100, 255, 100)
                                                             } else {
                                                                 egui::Color32::LIGHT_GRAY
                                                             };
@@ -2383,6 +2390,7 @@ impl ApplicationHandler for App {
                                                     world: &world_snap,
                                                     replay: replay_state,
                                                     recording: last_recording,
+                                                    orbit_mode,
                                                 };
                                                 egui_dock::DockArea::new(dock_state)
                                                     .style(egui_dock::Style::from_egui(ui.style().as_ref()))

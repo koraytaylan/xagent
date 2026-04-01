@@ -98,6 +98,16 @@ pub struct AgentSnapshot {
     pub position: [f32; 3],
     /// Agent yaw (rotation around Y axis, radians).
     pub yaw: f32,
+    /// Sensory habituation: mean attenuation [0.1, 1.0].
+    pub mean_attenuation: f32,
+    /// Curiosity bonus from sensory monotony [0.0, 0.4].
+    pub curiosity_bonus: f32,
+    /// Motor fatigue factor [0.2, 1.0].
+    pub fatigue_factor: f32,
+    /// Motor output variance.
+    pub motor_variance: f32,
+    /// Fatigue factor history for the chart.
+    pub fatigue_history: Vec<f32>,
 }
 
 /// The lifecycle state of the evolution system.

@@ -22,6 +22,14 @@ pub struct TickRecord {
     pub credit_magnitude: f32,
     pub patterns_recalled: u16,
     pub phase: u8, // 0=RANDOM, 1=EXPLORING, 2=LEARNING, 3=ADAPTED
+    /// Sensory habituation: mean attenuation [0.1, 1.0].
+    pub mean_attenuation: f32,
+    /// Curiosity bonus from sensory monotony [0.0, 0.4].
+    pub curiosity_bonus: f32,
+    /// Motor fatigue factor [0.2, 1.0].
+    pub fatigue_factor: f32,
+    /// Motor output variance.
+    pub motor_variance: f32,
     /// Vision color data (8*6*4 = 192 f32 values). Only stored at keyframes
     /// (every VISION_KEYFRAME_INTERVAL ticks) to save memory.
     pub vision_color: Option<Vec<f32>>,

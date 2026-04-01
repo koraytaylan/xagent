@@ -807,6 +807,48 @@ impl<'a> TabContext<'a> {
                 cols[1].label(format!("Pred. error: {:.4}", effective_snap.prediction_error));
                 cols[1].label(format!("Gradient: {:+.4}", effective_snap.gradient));
                 cols[1].label(format!("Urgency: {:.2}", effective_snap.urgency));
+                cols[1].add_space(4.0);
+                cols[1].label(
+                    egui::RichText::new(format!(
+                        "Habituation: {:.0}%",
+                        effective_snap.mean_attenuation * 100.0
+                    ))
+                    .color(if effective_snap.mean_attenuation < 0.4 {
+                        egui::Color32::from_rgb(220, 100, 60)
+                    } else {
+                        egui::Color32::GRAY
+                    }),
+                );
+                cols[1].label(
+                    egui::RichText::new(format!(
+                        "Curiosity: {:.3}",
+                        effective_snap.curiosity_bonus
+                    ))
+                    .color(if effective_snap.curiosity_bonus > 0.2 {
+                        egui::Color32::from_rgb(80, 200, 80)
+                    } else {
+                        egui::Color32::GRAY
+                    }),
+                );
+                cols[1].label(
+                    egui::RichText::new(format!(
+                        "Fatigue: {:.0}%",
+                        effective_snap.fatigue_factor * 100.0
+                    ))
+                    .color(if effective_snap.fatigue_factor < 0.5 {
+                        egui::Color32::from_rgb(220, 100, 60)
+                    } else {
+                        egui::Color32::GRAY
+                    }),
+                );
+                cols[1].label(
+                    egui::RichText::new(format!(
+                        "Motor var: {:.4}",
+                        effective_snap.motor_variance
+                    ))
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
 
                 cols[1].add_space(8.0);
                 cols[1].label(egui::RichText::new("Motor Output").strong());
@@ -1031,6 +1073,7 @@ impl<'a> TabContext<'a> {
                     ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
                     ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
                     ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
+                    ("Fatigue", egui::Color32::from_rgb(220, 120, 60)),
                 ] {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
@@ -1067,11 +1110,12 @@ impl<'a> TabContext<'a> {
             }
 
             let window = *chart_window;
-            let series_data: [(&[f32], egui::Color32); 4] = [
+            let series_data: [(&[f32], egui::Color32); 5] = [
                 (&effective_snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
                 (&effective_snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
                 (&effective_snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
                 (&effective_snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
+                (&effective_snap.fatigue_history, egui::Color32::from_rgb(220, 120, 60)),
             ];
             for &(full_data, color) in &series_data {
                 let start = full_data.len().saturating_sub(window);

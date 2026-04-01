@@ -1848,13 +1848,6 @@ impl ApplicationHandler for App {
                             scale: info_scale,
                             color: info_color,
                         });
-                        text_items.push(TextItem {
-                            text: format!("Tick: {}  Speed: {}x", self.tick, self.speed_multiplier),
-                            x: -0.98,
-                            y: info_y - 0.07,
-                            scale: info_scale,
-                            color: info_color,
-                        });
                     }
 
                     if let Some(renderer) = &mut self.renderer {
@@ -1916,8 +1909,6 @@ impl ApplicationHandler for App {
                                     pixels_per_point: window.scale_factor() as f32,
                                 };
 
-                                let tick = self.tick;
-                                let speed = self.speed_multiplier;
                                 let fps = self.fps;
                                 let render_3d = self.render_3d;
                                 let evo_state = self.evo_snapshot.state.clone();
@@ -2076,10 +2067,6 @@ impl ApplicationHandler for App {
                                                         .strong()
                                                         .color(egui::Color32::from_rgb(120, 200, 255)),
                                                 );
-                                                ui.separator();
-                                                ui.label(format!("Tick: {}", tick));
-                                                ui.separator();
-                                                ui.label(format!("Speed: {}x", speed));
                                                 ui.separator();
                                                 ui.label(format!("FPS: {:.0}", fps));
                                                 ui.separator();

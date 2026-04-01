@@ -2312,35 +2312,6 @@ impl ApplicationHandler for App {
                                                                     snap.id, snap.gen, status
                                                                 ));
                                                             });
-                                                            // Compact vitals: E/I bars + combined history chart
-                                                            let energy_frac = snap.energy / snap.max_energy.max(0.001);
-                                                            let integrity_frac = snap.integrity / snap.max_integrity.max(0.001);
-                                                            let bar_h = 4.0;
-
-                                                            egui::Grid::new(format!("sidebar_vitals_{}", snap.id))
-                                                                .num_columns(2)
-                                                                .spacing([4.0, 1.0])
-                                                                .show(ui, |ui| {
-                                                                    ui.label(egui::RichText::new("E").small().color(egui::Color32::GRAY));
-                                                                    let e_color = if energy_frac > 0.5 {
-                                                                        egui::Color32::from_rgb(80, 200, 80)
-                                                                    } else if energy_frac > 0.25 {
-                                                                        egui::Color32::YELLOW
-                                                                    } else {
-                                                                        egui::Color32::from_rgb(220, 60, 60)
-                                                                    };
-                                                                    ui.add(egui::ProgressBar::new(energy_frac)
-                                                                        .fill(e_color)
-                                                                        .desired_height(bar_h));
-                                                                    ui.end_row();
-
-                                                                    ui.label(egui::RichText::new("I").small().color(egui::Color32::GRAY));
-                                                                    ui.add(egui::ProgressBar::new(integrity_frac)
-                                                                        .fill(egui::Color32::from_rgb(100, 150, 255))
-                                                                        .desired_height(bar_h));
-                                                                    ui.end_row();
-                                                                });
-
                                                             ui.horizontal(|ui| {
                                                                 ui.label(
                                                                     egui::RichText::new(snap.phase)

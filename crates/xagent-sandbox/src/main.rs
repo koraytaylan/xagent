@@ -287,7 +287,8 @@ struct App {
     // Evolution governor (created on Start/Resume, not on App init)
     governor: Option<Governor>,
     evo_snapshot: EvolutionSnapshot,
-    evo_wall_start: Instant,
+    evo_wall_accumulated: f64,
+    evo_wall_segment_start: Option<Instant>,
     db_path: String,
     governor_config: GovernorConfig,
 
@@ -425,7 +426,8 @@ impl App {
             console_log: VecDeque::new(),
             governor: None,
             evo_snapshot,
-            evo_wall_start: Instant::now(),
+            evo_wall_accumulated: 0.0,
+            evo_wall_segment_start: Some(Instant::now()),
             db_path: db_path.to_string(),
             governor_config,
             gpu_brain,
@@ -529,7 +531,8 @@ impl App {
                         self.evo_snapshot.eval_repeats = gov_config.eval_repeats;
                         self.evo_snapshot.num_islands = gov_config.num_islands;
                         self.evo_snapshot.migration_interval = gov_config.migration_interval;
-                        self.evo_wall_start = Instant::now();
+                        self.evo_wall_accumulated = 0.0;
+                        self.evo_wall_segment_start = Some(Instant::now());
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Started new run".into());
@@ -550,7 +553,8 @@ impl App {
                             self.brain_config = c.clone();
                         }
                         self.governor = Some(gov);
-                        self.evo_wall_start = Instant::now();
+                        self.evo_wall_accumulated = 0.0;
+                        self.evo_wall_segment_start = Some(Instant::now());
                         self.paused = false;
                         self.spawn_evolution_population();
                         self.log_msg("[EVOLUTION] Resumed from database".into());
@@ -563,11 +567,15 @@ impl App {
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
+                if let Some(start) = self.evo_wall_segment_start.take() {
+                    self.evo_wall_accumulated += start.elapsed().as_secs_f64();
+                }
                 self.log_msg("[EVOLUTION] Paused".into());
             }
             EvolutionAction::Unpause => {
                 self.evo_snapshot.state = EvolutionState::Running;
                 self.paused = false;
+                self.evo_wall_segment_start = Some(Instant::now());
                 self.log_msg("[EVOLUTION] Resumed".into());
             }
             EvolutionAction::Reset => {
@@ -665,7 +673,10 @@ impl App {
     /// Evaluate the current generation, advance to the next (or finish).
     fn advance_generation(&mut self) {
         self.last_recording = self.recording.take();
-        let wall_secs = self.evo_wall_start.elapsed().as_secs_f64();
+        let wall_secs = self.evo_wall_accumulated
+            + self.evo_wall_segment_start
+                .map(|s| s.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
 
         // Evaluate fitness, then capture best agent's learned state using the
         // actual composite fitness ranking (not the brain's internal metrics).
@@ -1987,7 +1998,10 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
                                     self.evo_snapshot.fitness_history = gov.fitness_history();
                                 }
-                                let wall = self.evo_wall_start.elapsed().as_secs_f64();
+                                let wall = self.evo_wall_accumulated
+                                    + self.evo_wall_segment_start
+                                        .map(|s| s.elapsed().as_secs_f64())
+                                        .unwrap_or(0.0);
                                 self.evo_snapshot.wall_time_secs = wall;
                                 if wall > 0.0 {
                                     self.evo_snapshot.ticks_per_sec =

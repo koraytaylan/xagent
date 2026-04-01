@@ -128,7 +128,7 @@ impl Brain {
         let memory = PatternMemory::new(config.memory_capacity, config.representation_dim);
         let predictor = Predictor::new(config.representation_dim);
         let action_selector = ActionSelector::new(config.representation_dim);
-        let homeostasis = HomeostaticMonitor::new();
+        let homeostasis = HomeostaticMonitor::new(config.distress_exponent);
         let capacity = CapacityManager::new(config.processing_slots);
 
         // Trigger encoder weight initialization with the standard 8×6 frame

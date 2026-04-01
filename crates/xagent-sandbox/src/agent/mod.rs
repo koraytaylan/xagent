@@ -270,6 +270,7 @@ pub fn mutate_config_with_strength(parent: &BrainConfig, strength: f32) -> Brain
         representation_dim: perturb_u(&mut rng, parent.representation_dim).min(MAX_REPR_DIM),
         learning_rate: perturb_f(&mut rng, parent.learning_rate),
         decay_rate: perturb_f(&mut rng, parent.decay_rate),
+        distress_exponent: perturb_f(&mut rng, parent.distress_exponent).clamp(1.5, 5.0),
     }
 }
 
@@ -327,6 +328,11 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.decay_rate
         } else {
             b.decay_rate
+        },
+        distress_exponent: if rng.random::<f32>() < 0.5 {
+            a.distress_exponent
+        } else {
+            b.distress_exponent
         },
     }
 }

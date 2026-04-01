@@ -21,6 +21,9 @@ pub struct BrainConfig {
     pub learning_rate: f32,
     /// Decay rate for unreinforced patterns per tick.
     pub decay_rate: f32,
+    /// Exponent for the homeostatic distress curve. Higher = calm longer, panic harder.
+    /// Heritable: mutated during breeding, clamped to [1.5, 5.0]. Default 2.0.
+    pub distress_exponent: f32,
 }
 
 /// Configuration for the world simulation.
@@ -147,6 +150,7 @@ impl Default for BrainConfig {
             representation_dim: 32,
             learning_rate: 0.05,
             decay_rate: 0.001,
+            distress_exponent: 2.0,
         }
     }
 }
@@ -161,6 +165,7 @@ impl BrainConfig {
             representation_dim: 16,
             learning_rate: 0.08,
             decay_rate: 0.002,
+            distress_exponent: 2.0,
         }
     }
 
@@ -173,6 +178,7 @@ impl BrainConfig {
             representation_dim: 64,
             learning_rate: 0.03,
             decay_rate: 0.0005,
+            distress_exponent: 2.0,
         }
     }
 }

@@ -24,6 +24,8 @@ const MAX_DISTRESS: f32 = 10.0;
 /// away from stability. This gradient is the ONLY evaluative signal
 /// in the entire brain — it modulates learning rates and action preferences.
 pub struct HomeostaticMonitor {
+    /// Exponent for distress curve (heritable, default 2.0).
+    distress_exponent: f32,
     /// Previous energy signal.
     prev_energy: f32,
     /// Previous integrity signal.
@@ -72,8 +74,9 @@ pub struct HomeostaticState {
 
 impl HomeostaticMonitor {
     /// Create a new monitor assuming full health (energy=1.0, integrity=1.0).
-    pub fn new() -> Self {
+    pub fn new(distress_exponent: f32) -> Self {
         Self {
+            distress_exponent,
             prev_energy: 1.0,
             prev_integrity: 1.0,
             gradient_fast: 0.0,
@@ -89,7 +92,8 @@ impl HomeostaticMonitor {
     /// jump doesn't produce a false positive gradient that rewards the
     /// actions from the previous life.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        let exp = self.distress_exponent;
+        *self = Self::new(exp);
     }
 
     /// Update with current interoceptive signals. Returns full homeostatic state.
@@ -113,8 +117,8 @@ impl HomeostaticMonitor {
         self.gradient_slow = self.gradient_slow * (1.0 - SLOW_EMA_ALPHA) + raw_gradient * SLOW_EMA_ALPHA;
 
         // --- Non-linear urgency ---
-        let energy_distress = Self::distress_curve(energy_signal);
-        let integrity_distress = Self::distress_curve(integrity_signal);
+        let energy_distress = self.distress_curve(energy_signal);
+        let integrity_distress = self.distress_curve(integrity_signal);
         self.urgency = (energy_distress + integrity_distress) * 0.5;
 
         // --- Composite gradient ---
@@ -163,9 +167,9 @@ impl HomeostaticMonitor {
 
     /// Non-linear distress: maps a [0, 1] health level to [0, MAX_DISTRESS].
     /// distress(1.0) = 0, distress(0.5) = 2.5, distress(0.1) = 8.1, distress(0.01) ≈ 9.8.
-    fn distress_curve(level: f32) -> f32 {
+    fn distress_curve(&self, level: f32) -> f32 {
         let clamped = level.clamp(0.01, 1.0);
-        let distress = (1.0 - clamped).powi(2) * DISTRESS_SCALE;
+        let distress = (1.0 - clamped).powf(self.distress_exponent) * DISTRESS_SCALE;
         distress.min(MAX_DISTRESS)
     }
 }
@@ -176,7 +180,7 @@ mod tests {
 
     #[test]
     fn stable_signals_produce_near_zero_gradient() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         // Feed the same (healthy) signals repeatedly
         for _ in 0..20 {
             let state = hm.update(0.8, 0.9);
@@ -191,7 +195,7 @@ mod tests {
 
     #[test]
     fn improving_signals_give_positive_gradient() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         // Start at a moderate level (not too far from initial 1.0 to avoid big negative spike)
         let mut energy = 0.5;
         let mut integrity = 0.5;
@@ -213,7 +217,7 @@ mod tests {
 
     #[test]
     fn worsening_signals_give_negative_gradient() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         hm.update(0.9, 0.9);
         // Steadily worsen
         for i in 1..=10 {
@@ -231,9 +235,9 @@ mod tests {
 
     #[test]
     fn urgency_increases_at_critical_levels() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         let state_healthy = hm.update(0.9, 0.9);
-        let mut hm2 = HomeostaticMonitor::new();
+        let mut hm2 = HomeostaticMonitor::new(2.0);
         let state_critical = hm2.update(0.1, 0.1);
 
         assert!(
@@ -246,7 +250,7 @@ mod tests {
 
     #[test]
     fn multi_timescale_gradients_converge_differently() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         // Single positive step
         hm.update(0.5, 0.5);
         let state = hm.update(0.6, 0.6);
@@ -262,9 +266,10 @@ mod tests {
 
     #[test]
     fn distress_curve_is_bounded() {
+        let hm = HomeostaticMonitor::new(2.0);
         for i in 0..=100 {
             let level = i as f32 / 100.0;
-            let d = HomeostaticMonitor::distress_curve(level);
+            let d = hm.distress_curve(level);
             assert!(
                 d >= 0.0 && d <= MAX_DISTRESS,
                 "distress({level}) = {d} out of bounds [0, {MAX_DISTRESS}]"
@@ -274,7 +279,7 @@ mod tests {
 
     #[test]
     fn gradient_responds_to_energy_drop() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         hm.update(1.0, 1.0);
         let state = hm.update(0.5, 1.0);
         assert!(
@@ -286,7 +291,7 @@ mod tests {
 
     #[test]
     fn gradient_responds_to_energy_gain() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         hm.update(0.5, 1.0);
         let state = hm.update(1.0, 1.0);
         assert!(
@@ -298,9 +303,9 @@ mod tests {
 
     #[test]
     fn urgency_increases_at_low_levels() {
-        let mut hm1 = HomeostaticMonitor::new();
+        let mut hm1 = HomeostaticMonitor::new(2.0);
         let state_low = hm1.update(0.1, 0.5);
-        let mut hm2 = HomeostaticMonitor::new();
+        let mut hm2 = HomeostaticMonitor::new(2.0);
         let state_high = hm2.update(0.9, 0.5);
         assert!(
             state_low.urgency > state_high.urgency * 2.0,
@@ -312,7 +317,7 @@ mod tests {
 
     #[test]
     fn multi_timescale_gradients_fast_reacts_quicker() {
-        let mut hm = HomeostaticMonitor::new();
+        let mut hm = HomeostaticMonitor::new(2.0);
         // Feed stable signal then a sudden drop
         for _ in 0..50 {
             hm.update(0.8, 0.8);

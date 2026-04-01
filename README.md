@@ -76,12 +76,14 @@ Sandbox                          Brain
 Each tick, the brain executes a single loop:
 
 ```
-encode → recall → predict → compare → learn → act
+encode → habituate → recall → predict → compare → learn → act → fatigue
 ```
 
 ### Step-by-Step
 
 1. **Encode** — The `SensoryEncoder` compresses the raw `SensoryFrame` into a fixed-size numerical vector (`EncodedState`). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque `Vec<f32>`, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+
+1a. **Habituate** — `SensoryHabituation` attenuates encoded dimensions that haven't changed recently (boredom). Produces a curiosity bonus that boosts exploration when sensory input is monotonous. The raw encoding is preserved for telemetry; the habituated state flows to all downstream components.
 
 2. **Recall** — `PatternMemory` retrieves the most similar past experiences within a capacity budget set by the `CapacityManager`. The budget adapts: high prediction error → more recall slots to gather context.
 
@@ -95,14 +97,16 @@ encode → recall → predict → compare → learn → act
    - **Encoder weights** receive L2 regularization to stay bounded
    - **Learning rate** is modulated by homeostatic gradient magnitude
 
-6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%).
+6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%), boosted by the curiosity bonus from habituation.
+
+6a. **Fatigue** — `MotorFatigue` tracks recent motor output variance. Repetitive commands (low variance) dampen motor output, forcing the agent to break out of loops. Recovery is immediate when output diversifies.
 
 ### Homeostatic Feedback
 
 The `HomeostaticMonitor` tracks energy and integrity signals across three timescales (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) using exponential moving averages. It produces:
 
 - **Gradient** — positive = improving, negative = worsening. Modulates learning rate and action credit.
-- **Urgency** — non-linear distress curve. Near-critical levels suppress exploration.
+- **Urgency** — non-linear distress curve (configurable exponent, default quadratic). Near-critical levels suppress exploration.
 
 This is the **only** evaluative signal. There is no reward function.
 
@@ -247,11 +251,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 ### Brain Presets
 
-| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` |
-|--------|---:|---:|---:|---:|---:|---:|
-| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 |
-| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 |
-| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 |
+| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
+|--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
 
 **Parameter effects:**
 
@@ -263,6 +267,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `representation_dim` | Internal representation vector length. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
+| `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
+| `habituation_sensitivity` | How fast boredom builds (default 20.0). Higher → faster sensory attenuation. Heritable. |
+| `max_curiosity_bonus` | Exploration boost ceiling from monotony (default 0.6). Higher → stronger curiosity drive. Heritable. |
+| `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
+| `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
 
 ### World Presets
 
@@ -284,7 +293,12 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "visual_encoding_size": 64,
     "representation_dim": 32,
     "learning_rate": 0.05,
-    "decay_rate": 0.001
+    "decay_rate": 0.001,
+    "distress_exponent": 2.0,
+    "habituation_sensitivity": 20.0,
+    "max_curiosity_bonus": 0.6,
+    "fatigue_recovery_sensitivity": 8.0,
+    "fatigue_floor": 0.1
   },
   "world": {
     "world_size": 256.0,
@@ -332,6 +346,9 @@ These metrics are visible in the **sidebar** (compact vitals, phase label, sorta
 | `memory_utilization` | Climbing toward capacity | Staying near 0 |
 | `homeostatic_gradient` | Trending positive | Consistently negative |
 | `exploration_rate` | Gradually decreasing | Stuck at max |
+| `mean_attenuation` | Near 1.0 (diverse input) | Near 0.1 (habituated, monotonous) |
+| `curiosity_bonus` | Low (varied sensory experience) | High (boredom driving exploration) |
+| `fatigue_factor` | Near 1.0 (diverse motor output) | Near floor (repetitive, dampened) |
 
 ### CSV Log Files
 

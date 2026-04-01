@@ -256,6 +256,11 @@ pub struct BrainConfig {
     pub representation_dim: usize,
     pub learning_rate: f32,
     pub decay_rate: f32,
+    pub distress_exponent: f32,
+    pub habituation_sensitivity: f32,
+    pub max_curiosity_bonus: f32,
+    pub fatigue_recovery_sensitivity: f32,
+    pub fatigue_floor: f32,
 }
 ```
 
@@ -269,6 +274,11 @@ Brain capacity parameters. These are not implementation details — they are the
 | `representation_dim` | 32 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
 | `learning_rate` | 0.05 | Base learning rate for association updates. Higher rates mean faster adaptation but more instability (catastrophic forgetting). Lower rates mean more stable memory but slower learning. |
 | `decay_rate` | 0.001 | Decay rate for unreinforced patterns per tick. Patterns that aren't recalled or reinforced gradually lose strength. Higher decay means more aggressive forgetting — the brain only retains frequently-used patterns. |
+| `distress_exponent` | 2.0 | Exponent for the homeostatic distress curve. Higher values mean the agent stays calm longer but panics harder at critical levels. Heritable: mutated during breeding, clamped to [1.5, 5.0]. |
+| `habituation_sensitivity` | 20.0 | How fast sensory habituation (boredom) builds. Scales per-dimension variance into attenuation. Higher values cause faster boredom. Heritable: clamped to [5.0, 50.0]. |
+| `max_curiosity_bonus` | 0.6 | Maximum exploration boost from sensory monotony. Added to the exploration rate formula when the agent is habituated. Heritable: clamped to [0.1, 1.0]. |
+| `fatigue_recovery_sensitivity` | 8.0 | How easily motor fatigue lifts when output diversifies. Higher values mean faster recovery. Heritable: clamped to [2.0, 20.0]. |
+| `fatigue_floor` | 0.1 | Minimum motor output under fatigue. Lower values allow harsher dampening of repetitive motor commands. Heritable: clamped to [0.05, 0.4]. |
 
 **Presets**:
 

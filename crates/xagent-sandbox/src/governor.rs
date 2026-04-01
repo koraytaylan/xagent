@@ -129,6 +129,20 @@ impl Governor {
             .unwrap_or(-1.0) as f32
     }
 
+    /// Get the spawn parent's BrainConfig for the active island.
+    fn spawn_parent_config(&self) -> Option<BrainConfig> {
+        let spawn_id = self.islands.get(self.active_island)?.spawn_parent_id?;
+        let json: String = self
+            .db
+            .query_row(
+                "SELECT config_json FROM node WHERE id = ?1",
+                params![spawn_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
     /// Create a new governor, initializing the database schema and inserting
     /// a new run record. `db_path` is the SQLite file path.
     pub fn new(
@@ -198,12 +212,13 @@ impl Governor {
         let db = Connection::open(db_path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
-        let (run_id, governor_json, spawn_parent_id): (i64, String, Option<i64>) =
+        let (run_id, governor_json, spawn_parent_id, momentum_json): (i64, String, Option<i64>, String) =
             db.query_row(
-                "SELECT id, governor_config, spawn_parent_id
+                "SELECT id, governor_config, spawn_parent_id,
+                        COALESCE(momentum_json, '[]')
                  FROM run ORDER BY id DESC LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
 
         let config: GovernorConfig =
@@ -226,9 +241,13 @@ impl Governor {
                 attempts: 0,
             })
             .collect();
-        let momentums: Vec<MutationMomentum> = (0..num_islands)
-            .map(|_| MutationMomentum::new(config.momentum_decay))
-            .collect();
+        let mut momentums: Vec<MutationMomentum> =
+            serde_json::from_str(&momentum_json).unwrap_or_default();
+        // Ensure we have one momentum per island (handles old DBs or island count changes)
+        while momentums.len() < num_islands {
+            momentums.push(MutationMomentum::new(config.momentum_decay));
+        }
+        momentums.truncate(num_islands);
 
         let mut gov = Self {
             db,
@@ -415,8 +434,11 @@ impl Governor {
                 / reduced.len() as f32
         };
 
-        // Look up the spawn parent's fitness — this is the bar to beat
+        // Look up the spawn parent's fitness and config — this is the bar to beat.
+        // Capture both before the success/failure branch so they refer to the same node
+        // (backtracking changes spawn_parent_id, which would cause a mismatch).
         let parent_fitness = self.spawn_parent_fitness();
+        let parent_config_for_momentum = self.spawn_parent_config();
 
         let island = &mut self.islands[self.active_island];
 
@@ -476,6 +498,19 @@ impl Governor {
             if should_backtrack {
                 self.backtrack_island(&mut messages);
             }
+        }
+
+        // ── Momentum update: learn from individual winners ──────────────
+        // An individual "winner" is an offspring whose fitness >= spawn parent.
+        // Even in a failed generation, strong individuals contribute directional data.
+        if let Some(ref pc) = parent_config_for_momentum {
+            let winner_configs: Vec<BrainConfig> = reduced
+                .iter()
+                .filter(|f| f.composite_fitness >= parent_fitness)
+                .map(|f| f.config.clone())
+                .collect();
+            self.momentums[self.active_island].update(pc, &winner_configs);
+            self.momentums[self.active_island].decay_step();
         }
 
         // Check completion after scoring but before breeding
@@ -733,14 +768,14 @@ impl Governor {
         configs
     }
 
-    /// Persist best_score and spawn_parent_id for resume.
+    /// Persist best_score, spawn_parent_id, and momentum for resume.
     fn persist_state(&self) {
         let best_score = self.best_score();
-        // Pick the active island's spawn parent for resume
         let spawn_parent = self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id);
+        let momentum_json = serde_json::to_string(&self.momentums).unwrap_or_else(|_| "[]".into());
         let _ = self.db.execute(
-            "UPDATE run SET best_score = ?1, spawn_parent_id = ?2 WHERE id = ?3",
-            params![best_score as f64, spawn_parent, self.run_id],
+            "UPDATE run SET best_score = ?1, spawn_parent_id = ?2, momentum_json = ?3 WHERE id = ?4",
+            params![best_score as f64, spawn_parent, momentum_json, self.run_id],
         );
     }
 
@@ -1027,7 +1062,14 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             parent_fitness REAL,
             result_fitness REAL
         );",
-    )
+    )?;
+
+    // Backwards-compatible migration: add momentum_json if missing
+    let _ = db.execute_batch(
+        "ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';"
+    );
+
+    Ok(())
 }
 
 /// Compare two BrainConfigs and record which parameters changed.
@@ -1531,6 +1573,9 @@ mod tests {
         gov.advance(&elite_fitness);
         assert!(!gov.islands[gov.active_island].elite_configs.is_empty());
 
+        // Reset momentum so it doesn't bias the elitism check below
+        gov.momentums[gov.active_island] = crate::momentum::MutationMomentum::new(0.9);
+
         // breed_next_generation uses stored elite_configs from the successful gen
         let configs = gov.breed_next_generation(&mock_fitness(0.01));
         assert_eq!(configs.len(), 5);
@@ -1947,5 +1992,68 @@ mod tests {
                 pair_start, pair_start + 1
             );
         }
+    }
+
+    #[test]
+    fn momentum_persists_across_resume() {
+        use std::fs;
+
+        let db_path = "/tmp/xagent_test_momentum_persist.db";
+        let _ = fs::remove_file(db_path);
+
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 2,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+
+        // Create governor, inject momentum, advance (which persists)
+        {
+            let mut gov = Governor::new(db_path, config.clone(), &brain, "{}").unwrap();
+            gov.momentums[0].momentum_mut().insert("learning_rate".into(), 0.05);
+            gov.momentums[1].momentum_mut().insert("decay_rate".into(), -0.03);
+            gov.advance(&mock_fitness(0.1)); // triggers persist_state
+        }
+
+        // Resume and verify momentum survived
+        {
+            let gov = Governor::resume(db_path).unwrap();
+            assert_eq!(gov.momentums.len(), 2);
+            // Momentum was persisted after advance, which calls decay_step.
+            // The injected values were also blended with winner data during advance.
+            // Key assertion: momentum vectors exist and were deserialized (not empty defaults).
+            let has_data = gov.momentums[0].get("learning_rate") != 0.0
+                || gov.momentums[1].get("decay_rate") != 0.0;
+            assert!(has_data, "momentum should have been persisted and restored");
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn governor_initializes_momentum_per_island() {
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 3,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+        assert_eq!(gov.momentums.len(), 3);
     }
 }

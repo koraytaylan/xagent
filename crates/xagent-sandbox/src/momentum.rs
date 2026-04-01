@@ -82,6 +82,12 @@ impl MutationMomentum {
         ((value as f32 * biased_factor).round() as usize).max(1)
     }
 
+    /// Mutable access to the momentum map (for testing).
+    #[cfg(test)]
+    pub fn momentum_mut(&mut self) -> &mut HashMap<String, f32> {
+        &mut self.momentum
+    }
+
     /// Update momentum from a set of winning offspring.
     ///
     /// For each BrainConfig parameter, computes the average delta between parent

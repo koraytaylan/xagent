@@ -4,6 +4,7 @@
 //! toward directions that previously improved fitness. Momentum decays each
 //! generation so stale signals fade naturally.
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use xagent_shared::BrainConfig;
@@ -44,6 +45,41 @@ impl MutationMomentum {
         }
         // Remove near-zero entries to keep the map clean
         self.momentum.retain(|_, v| v.abs() > 1e-8);
+    }
+
+    /// Biased perturbation for f32 parameters.
+    ///
+    /// Combines a random multiplicative factor (same as the old `perturb_f`)
+    /// with an additive momentum nudge that shifts the center of perturbation.
+    pub fn biased_perturb_f(
+        &self,
+        rng: &mut impl Rng,
+        value: f32,
+        param: &str,
+        strength: f32,
+    ) -> f32 {
+        let lo = 1.0 - strength;
+        let hi = 1.0 + strength;
+        let random_factor: f32 = rng.random_range(lo..hi);
+        let nudge = self.get(param);
+        let biased_factor = random_factor + nudge;
+        (value * biased_factor).max(0.0001)
+    }
+
+    /// Biased perturbation for usize parameters.
+    pub fn biased_perturb_u(
+        &self,
+        rng: &mut impl Rng,
+        value: usize,
+        param: &str,
+        strength: f32,
+    ) -> usize {
+        let lo = 1.0 - strength;
+        let hi = 1.0 + strength;
+        let random_factor: f32 = rng.random_range(lo..hi);
+        let nudge = self.get(param);
+        let biased_factor = random_factor + nudge;
+        ((value as f32 * biased_factor).round() as usize).max(1)
     }
 
     /// Update momentum from a set of winning offspring.
@@ -270,5 +306,65 @@ mod tests {
         // momentum = 0.9 * 0.0 + 0.1 * 0.03 = 0.003
         let val = m.get("learning_rate");
         assert!((val - 0.003).abs() < 1e-5);
+    }
+
+    #[test]
+    fn biased_perturb_f_no_momentum_stays_in_range() {
+        let m = MutationMomentum::new(0.9); // empty momentum
+        let mut rng = rand::rng();
+
+        let value = 1.0;
+        for _ in 0..100 {
+            let result = m.biased_perturb_f(&mut rng, value, "learning_rate", 0.1);
+            assert!(result >= 0.0001);
+            // Without momentum, factor is in [0.9, 1.1], so result in [0.9, 1.1]
+            assert!(result >= 0.89 && result <= 1.11,
+                "result {} out of expected range", result);
+        }
+    }
+
+    #[test]
+    fn biased_perturb_f_with_momentum_shifts_distribution() {
+        let mut m = MutationMomentum::new(0.9);
+        m.momentum.insert("learning_rate".into(), 0.1);
+
+        let mut rng = rand::rng();
+        let value = 1.0;
+
+        let mut sum = 0.0;
+        let n = 1000;
+        for _ in 0..n {
+            sum += m.biased_perturb_f(&mut rng, value, "learning_rate", 0.1);
+        }
+        let avg = sum / n as f32;
+
+        // Average should be above 1.0 (biased upward by momentum)
+        assert!(avg > 1.0, "avg {} should be > 1.0 with positive momentum", avg);
+    }
+
+    #[test]
+    fn biased_perturb_u_no_momentum_stays_reasonable() {
+        let m = MutationMomentum::new(0.9);
+        let mut rng = rand::rng();
+
+        let value: usize = 100;
+        for _ in 0..100 {
+            let result = m.biased_perturb_u(&mut rng, value, "memory_capacity", 0.1);
+            assert!(result >= 1);
+            assert!(result >= 85 && result <= 115,
+                "result {} out of expected range", result);
+        }
+    }
+
+    #[test]
+    fn biased_perturb_f_respects_min_clamp() {
+        let mut m = MutationMomentum::new(0.9);
+        m.momentum.insert("fatigue_floor".into(), -10.0);
+
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let result = m.biased_perturb_f(&mut rng, 0.001, "fatigue_floor", 0.5);
+            assert!(result >= 0.0001, "result {} below min clamp", result);
+        }
     }
 }

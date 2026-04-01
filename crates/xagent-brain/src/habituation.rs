@@ -66,7 +66,7 @@ impl SensoryHabituation {
         &self.habituated
     }
 
-    /// Current curiosity bonus [0.0, MAX_CURIOSITY_BONUS].
+    /// Current curiosity bonus, capped by the configured maximum.
     pub fn curiosity_bonus(&self) -> f32 {
         self.curiosity_bonus
     }

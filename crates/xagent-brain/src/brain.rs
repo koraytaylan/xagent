@@ -45,7 +45,7 @@ pub struct BrainTelemetry {
     pub decision_quality: f32,
     /// Sensory habituation: mean attenuation across encoded dimensions [0.1, 1.0].
     pub mean_attenuation: f32,
-    /// Curiosity bonus from sensory monotony [0.0, 0.4].
+    /// Curiosity bonus from sensory monotony.
     pub curiosity_bonus: f32,
     /// Motor fatigue factor [0.2, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,

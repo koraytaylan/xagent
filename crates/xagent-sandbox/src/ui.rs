@@ -100,9 +100,9 @@ pub struct AgentSnapshot {
     pub yaw: f32,
     /// Sensory habituation: mean attenuation [0.1, 1.0].
     pub mean_attenuation: f32,
-    /// Curiosity bonus from sensory monotony [0.0, 0.4].
+    /// Curiosity bonus from sensory monotony.
     pub curiosity_bonus: f32,
-    /// Motor fatigue factor [0.2, 1.0].
+    /// Motor fatigue factor [fatigue_floor, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,
     /// Motor output variance.
     pub motor_variance: f32,

@@ -1429,7 +1429,7 @@ impl ApplicationHandler for App {
                                         exploration_rate: a.brain.action_selector.exploration_rate(),
                                         prediction_error: t.prediction_error,
                                         gradient: t.homeostatic_gradient,
-                                        raw_gradient: t.avg_prediction_error,
+                                        raw_gradient: t.avg_prediction_error, // TODO: BrainTelemetry lacks raw_gradient; this maps the wrong field
                                         urgency: t.homeostatic_urgency,
                                         credit_magnitude: a.brain.action_selector.last_credit_magnitude(),
                                         patterns_recalled: t.recall_budget as u16,

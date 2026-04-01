@@ -43,6 +43,11 @@ impl MotorFatigue {
             self.len += 1;
         }
 
+        // Need at least 2 samples for meaningful variance; keep factor at 1.0 during warmup.
+        if self.len < 2 {
+            return;
+        }
+
         let fwd_var = Self::variance(&self.forward_ring[..self.len]);
         let turn_var = Self::variance(&self.turn_ring[..self.len]);
         self.motor_variance = fwd_var + turn_var;

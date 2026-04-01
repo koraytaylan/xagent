@@ -23,6 +23,7 @@ pub struct BrainConfig {
     pub decay_rate: f32,
     /// Exponent for the homeostatic distress curve. Higher = calm longer, panic harder.
     /// Heritable: mutated during breeding, clamped to [1.5, 5.0]. Default 2.0.
+    #[serde(default = "default_distress_exponent")]
     pub distress_exponent: f32,
 }
 
@@ -48,6 +49,10 @@ pub struct WorldConfig {
     /// Random seed for world generation.
     #[serde(default = "default_seed")]
     pub seed: u64,
+}
+
+fn default_distress_exponent() -> f32 {
+    2.0
 }
 
 fn default_seed() -> u64 {

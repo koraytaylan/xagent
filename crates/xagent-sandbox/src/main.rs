@@ -196,6 +196,11 @@ fn record_agent_histories(agent: &mut Agent) {
         h.pop_front();
     }
     h.push_back(inf.clamp(0.0, 1.0));
+    let h = &mut agent.fatigue_history;
+    if h.len() >= cap {
+        h.pop_front();
+    }
+    h.push_back(agent.brain.telemetry().fatigue_factor);
     if let Some(decision) = agent.brain.last_decision().cloned() {
         let h = &mut agent.decision_log;
         if h.len() >= 256 {
@@ -1429,6 +1434,10 @@ impl ApplicationHandler for App {
                                         credit_magnitude: a.brain.action_selector.last_credit_magnitude(),
                                         patterns_recalled: t.recall_budget as u16,
                                         phase: GenerationRecording::phase_to_u8(t.behavior_phase()),
+                                        mean_attenuation: t.mean_attenuation,
+                                        curiosity_bonus: t.curiosity_bonus,
+                                        fatigue_factor: t.fatigue_factor,
+                                        motor_variance: t.motor_variance,
                                         vision_color: if is_keyframe {
                                             Some(a.cached_frame.vision.color.clone())
                                         } else {
@@ -1969,6 +1978,11 @@ impl ApplicationHandler for App {
                                             a.body.body.position.z,
                                         ],
                                         yaw: a.body.yaw,
+                                        mean_attenuation: telemetry.mean_attenuation,
+                                        curiosity_bonus: telemetry.curiosity_bonus,
+                                        fatigue_factor: telemetry.fatigue_factor,
+                                        motor_variance: telemetry.motor_variance,
+                                        fatigue_history: tail(&a.fatigue_history),
                                     }
                                 }).collect();
 

@@ -1738,6 +1738,7 @@ mod tests {
             representation_dim: 500,
             learning_rate: 0.9,
             decay_rate: 0.9,
+            distress_exponent: 2.0,
         };
         let b = BrainConfig {
             memory_capacity: 1,
@@ -1746,6 +1747,7 @@ mod tests {
             representation_dim: 1,
             learning_rate: 0.001,
             decay_rate: 0.001,
+            distress_exponent: 2.0,
         };
 
         // Run crossover many times — with probability 1-(0.5^5)^N the child

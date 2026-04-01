@@ -664,6 +664,11 @@ impl<'a> TabContext<'a> {
                         vision_height: 6,
                         position: record.position,
                         yaw: record.yaw,
+                        mean_attenuation: record.mean_attenuation,
+                        curiosity_bonus: record.curiosity_bonus,
+                        fatigue_factor: record.fatigue_factor,
+                        motor_variance: record.motor_variance,
+                        fatigue_history: Vec::new(),
                     };
                     &replay_snap
                 } else {
@@ -736,6 +741,11 @@ impl<'a> TabContext<'a> {
                             vision_height: 6,
                             position: r.position,
                             yaw: r.yaw,
+                            mean_attenuation: r.mean_attenuation,
+                            curiosity_bonus: r.curiosity_bonus,
+                            fatigue_factor: r.fatigue_factor,
+                            motor_variance: r.motor_variance,
+                            fatigue_history: Vec::new(),
                         }
                     }).collect::<Vec<_>>();
                     &replay_agents[..]

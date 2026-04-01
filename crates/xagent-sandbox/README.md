@@ -916,8 +916,7 @@ death/respawn.
 - When enabled: agent must survive 5000 ticks continuously.
 - **Once per life**: `has_reproduced` flag prevents repeated spawning.
 - **Population cap**: `MAX_AGENTS = 100`.
-- **Mutation**: Each `BrainConfig` parameter is independently perturbed ±10%.
-  `visual_encoding_size` is preserved (must match the sensory pipeline).
+- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `visual_encoding_size` is preserved (must match the sensory pipeline).
 - **Generation tracking**: Generation increments on each death/respawn, tracking how many lives the agent has lived.
 
 ### Telemetry Focus

@@ -166,6 +166,7 @@ Each agent is assigned a **static palette color** at spawn. The same color is us
 - Up to 100 concurrent agents (raised from 20)
 - **Food respawn**: 10-second timer, relocates to a new random food-rich position — prevents camping, forces foraging
 - **Reproduction**: currently disabled to focus on individual learning rather than evolution
+- **Directed mutations**: Per-parameter momentum vectors (one per island) bias mutations toward directions that previously improved fitness. Momentum decays each generation (configurable via `momentum_decay`) so stale signals fade. This provides directional bias, emergent correlated mutations, and selective mutation focus — all without hardcoded parameter relationships.
 
 See the sandbox crate source for full implementation details.
 

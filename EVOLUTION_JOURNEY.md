@@ -136,6 +136,16 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 **Lesson:** Don't spawn agents in immediately fatal situations. Organisms don't gestate in lethal environments.
 
+### 14. Mutations Were Random Walks
+
+**Symptom:** Evolution progressed slowly. Each mutation was a coin flip — no learning from what worked before.
+
+**Root cause:** `mutate_config_with_strength` applied uniform random perturbation (±strength%) to every parameter independently. The mutation tracking data (`mutation_log` table) was collected but never used. Evolution was a random walk filtered by selection, with no directional intelligence.
+
+**Fix:** Per-parameter momentum vectors (one set per island). After each generation, offspring that beat their parent contribute their mutation deltas to an exponentially-decaying momentum. Future perturbations are biased toward winning directions. This provides: (A) directional bias — parameters trend toward values that improve fitness, (B) emergent correlated mutations — parameters that consistently move together develop aligned momentum, (C) selective focus — parameters with strong signal get larger perturbations while stagnant ones stay near random noise.
+
+**Lesson:** Evolution with memory is faster than evolution without. The same principle that makes gradient descent faster than random search applies to neuroevolution — you don't need exact gradients, just a noisy directional signal accumulated over time.
+
 ---
 
 ## The Disconnect (Current State)

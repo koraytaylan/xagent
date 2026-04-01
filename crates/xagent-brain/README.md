@@ -25,8 +25,10 @@ The brain receives a `SensoryFrame` and emits a `MotorCommand` (movement + discr
    - [4.3 Prediction Engine](#43-prediction-engine-predictorrs)
    - [4.4 Action Selector](#44-action-selector-actionrs)
    - [4.5 Homeostatic Monitor](#45-homeostatic-monitor-homeostasisrs)
-   - [4.6 Capacity Manager](#46-capacity-manager-capacityrs)
-   - [4.7 Brain Orchestrator](#47-brain-orchestrator-brainrs)
+   - [4.6 Sensory Habituation](#46-sensory-habituation-habituationrs)
+   - [4.7 Motor Fatigue](#47-motor-fatigue-fatiguers)
+   - [4.8 Capacity Manager](#48-capacity-manager-capacityrs)
+   - [4.9 Brain Orchestrator](#49-brain-orchestrator-brainrs)
 5. [Emergent Phenomena](#5-emergent-phenomena)
 6. [Configuration (BrainConfig)](#6-configuration-brainconfig)
 7. [Testing](#7-testing)
@@ -155,26 +157,33 @@ All components are orchestrated by `Brain::tick()`, which runs once per simulati
   Legend:
   ────▶  Data flow (per tick)
   ◀────  Budget / modulation signal
+
+  Note: Between Encoder and downstream consumers (Memory, Predictor, ActionSelector),
+  SensoryHabituation attenuates the encoded state and produces a curiosity_bonus.
+  After ActionSelector produces a MotorCommand, MotorFatigue dampens the output
+  based on recent motor variance.
 ```
 
-### Tick Execution Order (12 steps)
+### Tick Execution Order (14 steps)
 
 ```
- 1. Encode sensory input           → EncodedState (opaque Vec<f32>)
- 2. Update homeostasis             → HomeostaticState (gradient, urgency)
- 3. Compute prediction error       → scalar_error, error_vec
-    ├─ Learn: memory reinforcement
-    ├─ Learn: predictor weights (gradient descent)
-    └─ Learn: encoder weights (L2 regularization)
- 4. Allocate recall budget         → (recall_budget, surprise_budget)
- 5. Recall similar patterns        → Vec<EncodedState>
- 6. Predict next state             → prediction
- 7. Store current pattern in memory
- 8. Decay old patterns
- 9. Select action                  → MotorCommand
-10. Record prediction for next tick
-11. Compute behavior quality metrics
-12. Update telemetry snapshot
+ 1.  Encode sensory input           → EncodedState (opaque Vec<f32>)
+ 1a. Apply sensory habituation      → habituated state, curiosity_bonus
+ 2.  Update homeostasis             → HomeostaticState (gradient, urgency)
+ 3.  Compute prediction error       → scalar_error, error_vec
+     ├─ Learn: memory reinforcement
+     ├─ Learn: predictor weights (gradient descent)
+     └─ Learn: encoder weights (L2 regularization)
+ 4.  Allocate recall budget         → (recall_budget, surprise_budget)
+ 5.  Recall similar patterns        → Vec<EncodedState>
+ 6.  Predict next state             → prediction
+ 7.  Store current pattern in memory
+ 8.  Decay old patterns
+ 9.  Select action (using habituated state and curiosity_bonus) → MotorCommand
+ 9a. Apply motor fatigue            → dampened MotorCommand
+10.  Record prediction for next tick
+11.  Compute behavior quality metrics
+12.  Update telemetry snapshot
 ```
 
 ---
@@ -501,15 +510,16 @@ The exploration rate is computed dynamically each tick:
 let stability = recalled.len() as f32 / 16.0;
 let novelty_bonus = (prediction_error * 2.0).min(0.4);
 let urgency_penalty = (urgency * 0.4).min(0.5);
-exploration_rate = (0.4 - stability * 0.2 + novelty_bonus - urgency_penalty)
+exploration_rate = (0.5 - stability * 0.15 + novelty_bonus + curiosity_bonus - urgency_penalty)
     .clamp(0.10, 0.85);
 ```
 
-- **Base rate is 0.4** (was 0.8) — agent exploits ~60% of the time by default
-- **More recalled patterns** (stable environment) → less exploration
+- **Base rate is 0.5** — agent exploits ~50% of the time by default
+- **More recalled patterns** (stable environment) → less exploration (stability weight 0.15)
 - **Higher prediction error** (novel situation) → more exploration
+- **Higher curiosity bonus** (sensory monotony) → more exploration
 - **Higher urgency** (danger) → less exploration (exploit known-good actions)
-- **Exploration floor is 10%** (was 5%) — even at maximum urgency, agents explore at least 10% of the time, preventing total exploitation lock-in
+- **Exploration floor is 10%** — even at maximum urgency, agents explore at least 10% of the time, preventing total exploitation lock-in
 
 #### Uniform Random Exploration
 
@@ -613,13 +623,15 @@ The urgency amplifier means the gradient signal is stronger when the agent is in
 Urgency is computed from a non-linear distress function that maps health levels [0, 1] to distress [0, 10]:
 
 ```rust
-fn distress_curve(level: f32) -> f32 {
+fn distress_curve(level: f32, exponent: f32) -> f32 {
     let clamped = level.clamp(0.01, 1.0);
-    (1.0 - clamped).powi(2) * DISTRESS_SCALE  // DISTRESS_SCALE = 10.0
+    (1.0 - clamped).powf(exponent) * DISTRESS_SCALE  // DISTRESS_SCALE = 10.0
 }
 ```
 
-Example values:
+The exponent is configurable via `BrainConfig::distress_exponent` (default 2.0, range [1.5, 5.0], heritable). Lower exponents make the agent react sooner to moderate drops; higher exponents keep the agent calm longer but produce sharper panic at critical levels.
+
+Example values (with default exponent 2.0):
 | Level | Distress | Interpretation |
 |-------|----------|----------------|
 | 1.0 | 0.0 | Perfect health, no urgency |
@@ -629,7 +641,7 @@ Example values:
 | 0.1 | 8.1 | Critical |
 | 0.01 | 9.8 | Near death |
 
-The quadratic shape means urgency increases slowly at first (the agent is tolerant of mild drops) but accelerates rapidly as levels approach zero.
+The shape means urgency increases slowly at first (the agent is tolerant of mild drops) but accelerates rapidly as levels approach zero. The exponent controls the steepness of this curve.
 
 Final urgency is the average distress of energy and integrity:
 ```rust
@@ -662,7 +674,57 @@ The `HomeostaticState` struct returned from `update()` contains:
 
 ---
 
-### 4.6 Capacity Manager (`capacity.rs`)
+### 4.6 Sensory Habituation (`habituation.rs`)
+
+**What it does**: A post-encoder filter that attenuates repetitive sensory dimensions and produces a `curiosity_bonus` that feeds into the exploration rate. When the encoded state stops changing, habituation grows and curiosity rises, pushing the agent to break out of monotonous loops.
+
+**How it works**:
+
+For each dimension of the encoded state, an exponential moving average (EMA) tracks the magnitude of change between ticks. Dimensions with low change magnitude are attenuated (dampened toward zero), producing a **habituated state** that downstream consumers (Memory, Predictor, ActionSelector) use instead of the raw encoded state.
+
+1. **Per-dimension change EMA**: `change_ema[i] = alpha * |current[i] - prev[i]| + (1 - alpha) * change_ema[i]`
+2. **Attenuation**: `attenuation[i] = max(ATTENUATION_FLOOR, change_ema[i] / sensitivity)`
+3. **Habituated state**: `habituated[i] = encoded[i] * attenuation[i]`
+4. **Curiosity bonus**: `curiosity_bonus = (1.0 - mean_attenuation) * max_curiosity_bonus`
+
+When all dimensions are changing rapidly, mean attenuation is high and curiosity bonus is near zero. When the agent is stuck in a loop seeing the same thing, attenuation drops and curiosity bonus rises, increasing exploration.
+
+**Key constants**:
+
+| Constant / Parameter | Value | Configurable? |
+|----------------------|-------|---------------|
+| `HABITUATION_EMA_ALPHA` | 0.15 | No (hardcoded) |
+| `ATTENUATION_FLOOR` | 0.05 | No (hardcoded) |
+| `habituation_sensitivity` | 20.0 (default) | Yes (`BrainConfig`) |
+| `max_curiosity_bonus` | 0.6 (default) | Yes (`BrainConfig`) |
+
+---
+
+### 4.7 Motor Fatigue (`fatigue.rs`)
+
+**What it does**: Tracks a ring buffer of recent motor outputs and dampens the MotorCommand when motor variance is low. This prevents the agent from mechanically repeating the same motor pattern indefinitely. Recovery is immediate -- as soon as the agent produces varied output, fatigue lifts.
+
+**How it works**:
+
+A fixed-size ring buffer stores recent `(forward, turn)` pairs. The variance of each component is computed over the window. Low variance means repetitive output, which triggers fatigue dampening:
+
+1. **Motor variance**: `variance = var(forward_history) + var(turn_history)`
+2. **Fatigue factor**: `factor = max(fatigue_floor, 1.0 - exp(-variance * recovery_sensitivity))`
+3. **Dampened output**: `motor.forward *= factor; motor.turn *= factor;`
+
+When variance is high (diverse motor output), the fatigue factor is near 1.0 and output is unaffected. When variance is near zero (repetitive output), the factor drops toward `fatigue_floor`, weakening the command and giving other action candidates a chance to win on subsequent ticks.
+
+**Key constants / parameters**:
+
+| Constant / Parameter | Value | Configurable? |
+|----------------------|-------|---------------|
+| `FATIGUE_WINDOW` | 32 | No (hardcoded) |
+| `fatigue_recovery_sensitivity` | 8.0 (default) | Yes (`BrainConfig`) |
+| `fatigue_floor` | 0.1 (default) | Yes (`BrainConfig`) |
+
+---
+
+### 4.8 Capacity Manager (`capacity.rs`)
 
 **What it does**: Manages the brain's per-tick processing budget, dynamically allocating recall slots and reserving capacity for surprise (novel patterns).
 
@@ -715,7 +777,7 @@ The `CognitiveLoad` struct tracks:
 
 ---
 
-### 4.7 Brain Orchestrator (`brain.rs`)
+### 4.9 Brain Orchestrator (`brain.rs`)
 
 **What it does**: Owns all components, orchestrates the tick loop, and produces telemetry.
 
@@ -723,7 +785,7 @@ The `CognitiveLoad` struct tracks:
 
 #### The tick() Method
 
-The 12-step orchestration documented in the [Data Flow Diagram](#3-data-flow-diagram) section. Key design choice: learning happens *before* recall and prediction, using the *previous* tick's prediction error. This means the brain is always learning from one tick ago, which avoids circular dependencies.
+The 14-step orchestration documented in the [Data Flow Diagram](#3-data-flow-diagram) section. Key design choice: learning happens *before* recall and prediction, using the *previous* tick's prediction error. This means the brain is always learning from one tick ago, which avoids circular dependencies.
 
 #### The trauma() Method
 
@@ -835,7 +897,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 |------------|---------------|------------------------|
 | **Attention** | Capacity constraints force selective recall; encoder bottleneck compresses information | Encoder, Capacity Manager |
 | **Fear / Avoidance** | Negative homeostatic gradient from damage → pain amplifier (3×) makes damage signal loud → credit assignment blames recent actions via state snapshots → policy weights learn to avoid danger-associated sensory features → **prospective evaluation** applies these learned associations to the predicted future, so the agent anticipates danger before entering it | Memory, Action Selector, Predictor, Homeostasis |
-| **Curiosity** | High prediction error in safe (low urgency) situations → exploration rate increases → agent approaches novelty | Predictor, Action Selector, Capacity Manager |
+| **Curiosity** | High prediction error in safe (low urgency) situations → exploration rate increases; additionally, sensory habituation produces a curiosity_bonus when input is monotonous, further boosting exploration even when prediction error is low | Predictor, Action Selector, Capacity Manager, Sensory Habituation |
 | **Habit Formation** | Repeated successful actions build strong context-action values → exploitation ratio increases → behavior becomes automatic | Memory, Action Selector |
 | **Startle / Surprise** | Sudden prediction error spike → surprise budget increases → recall budget shifts → exploration spikes | Predictor, Capacity Manager, Action Selector |
 | **Adaptation** | Prediction error decreases over time in stable environments → exploration drops → behavior stabilizes | Predictor, Action Selector |
@@ -844,6 +906,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 | **Chunking** | Co-occurring patterns get associated → recalling one activates the chain → complex sequences are treated as units | Memory (associations) |
 | **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | Homeostasis (multi-timescale) |
 | **Contextual Memory** | Linear policy weights map encoded state features to action preferences — different percepts trigger different behaviors | Action Selector, Encoder |
+| **Boredom / Loop Breaking** | Monotonous sensory input → sensory habituation attenuates repetitive dimensions → curiosity_bonus rises → exploration increases; simultaneously, low motor variance → motor fatigue dampens output → agent's repeated action weakens, giving other actions a chance | Sensory Habituation, Motor Fatigue, Action Selector |
 | **Cognitive Overload** | Novel, rapidly changing environments exhaust recall budget → brain can't keep up → behavior degrades | Capacity Manager, Memory |
 
 ---
@@ -852,12 +915,17 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 
 ```rust
 pub struct BrainConfig {
-    pub memory_capacity: usize,       // Maximum stored patterns
-    pub processing_slots: usize,      // Max recall operations per tick
-    pub visual_encoding_size: usize,  // Visual downsampling resolution
-    pub representation_dim: usize,    // Internal representation vector length
-    pub learning_rate: f32,           // Base learning rate
-    pub decay_rate: f32,              // Pattern decay per tick
+    pub memory_capacity: usize,            // Maximum stored patterns
+    pub processing_slots: usize,           // Max recall operations per tick
+    pub visual_encoding_size: usize,       // Visual downsampling resolution
+    pub representation_dim: usize,         // Internal representation vector length
+    pub learning_rate: f32,                // Base learning rate
+    pub decay_rate: f32,                   // Pattern decay per tick
+    pub distress_exponent: f32,            // Distress curve exponent (default 2.0)
+    pub habituation_sensitivity: f32,      // Boredom speed (default 20.0)
+    pub max_curiosity_bonus: f32,          // Max exploration from monotony (default 0.6)
+    pub fatigue_recovery_sensitivity: f32, // Fatigue relief speed (default 8.0)
+    pub fatigue_floor: f32,                // Min motor output under fatigue (default 0.1)
 }
 ```
 
@@ -871,14 +939,19 @@ pub struct BrainConfig {
 | `representation_dim` | Compressed representation, fast but loses information | Rich representation, captures more nuance but harder to learn |
 | `learning_rate` | Slow adaptation, stable but takes longer to respond to change | Fast adaptation, responsive but risks oscillation |
 | `decay_rate` | Long memory retention, accumulates patterns, can fill memory with stale data | Aggressive forgetting, only keeps very recent/frequent patterns |
+| `distress_exponent` | Reacts sooner to moderate health drops, more cautious overall | Stays calm longer, but panics harder at critical levels |
+| `habituation_sensitivity` | Slow to bore, tolerates repetitive input longer | Bores quickly, curiosity bonus rises fast in monotonous situations |
+| `max_curiosity_bonus` | Weak exploration boost from monotony, loops persist longer | Strong exploration boost from monotony, breaks loops aggressively |
+| `fatigue_recovery_sensitivity` | Slow fatigue recovery, motor dampening lingers after variance returns | Fast fatigue recovery, dampening lifts immediately with diverse output |
+| `fatigue_floor` | Motor output can be nearly zeroed by fatigue, strong loop-breaking | Motor output stays substantial even under full fatigue, gentler loop-breaking |
 
 ### Presets
 
-| Preset | Capacity | Slots | Visual | Repr Dim | LR | Decay | Character |
-|--------|----------|-------|--------|----------|------|-------|-----------|
-| `tiny()` | 24 | 8 | 32 | 16 | 0.08 | 0.002 | Reactive, impulsive, forgetful. Interesting for observing constraint effects — limited memory forces rapid turnover and strong habits form fast. |
-| `default()` | 128 | 16 | 64 | 32 | 0.05 | 0.001 | Balanced. Enough memory for medium-term learning and multiple survival skills, enough processing for reasonable context. Good starting point. |
-| `large()` | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | Thoughtful, slow to adapt but forms rich memories. Large representation space captures more environmental nuance. Needs more ticks to show emergent behavior. |
+| Preset | Capacity | Slots | Visual | Repr Dim | LR | Decay | Distress Exp | Hab. Sens. | Max Curiosity | Fatigue Recov. | Fatigue Floor | Character |
+|--------|----------|-------|--------|----------|------|-------|-------------|-----------|---------------|---------------|--------------|-----------|
+| `tiny()` | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 25.0 | 0.6 | 10.0 | 0.15 | Reactive, impulsive, forgetful. Bores fast, breaks loops quickly. |
+| `default()` | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 | Balanced. Good starting point for all anti-loop parameters. |
+| `large()` | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.5 | 15.0 | 0.4 | 6.0 | 0.1 | Thoughtful, patient. Slower to bore, calmer under moderate stress. |
 
 ### Tuning Guide
 
@@ -888,7 +961,8 @@ pub struct BrainConfig {
 | Agent gets stuck doing one thing | Learning rate too high (overfit to first success), or decay too low (stale patterns dominate) | Decrease `learning_rate`, increase `decay_rate`, or decrease `memory_capacity` |
 | Agent ignores visual changes | `visual_encoding_size` too small, or `representation_dim` too small to capture visual information | Increase `visual_encoding_size` and `representation_dim` together |
 | Agent seems "blind" to threats | Homeostatic gradient is too slow to react (this is in homeostasis constants, not config) | Increase `learning_rate` so credit assignment is stronger |
-| Agent panics too early | Urgency distress curve kicks in at moderate levels | Not tunable via BrainConfig — would require adjusting `DISTRESS_SCALE` in homeostasis.rs |
+| Agent panics too early | Urgency distress curve kicks in at moderate levels | Increase `distress_exponent` (e.g., 3.0–4.0) — agent stays calmer longer but panics harder at critical levels |
+| Agent stuck in loops | Repetitive sensory input and motor output without breaking free | Increase `habituation_sensitivity` and `max_curiosity_bonus`, decrease `fatigue_floor` |
 | Memory fills up too fast | `decay_rate` too low or `memory_capacity` too small | Increase `decay_rate` or increase `memory_capacity` |
 
 ---

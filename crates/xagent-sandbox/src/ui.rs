@@ -1748,9 +1748,24 @@ impl<'a> TabContext<'a> {
             .map(|f| format!("{:.4}", f))
             .unwrap_or_else(|| "—".into());
 
-        let mutation_str = if node.mutations.is_empty() {
+        let detail_str = if node.parent_id.is_none() {
+            // Root node (gen 0): show all config values
+            if let Some(cfg) = &node.config {
+                format!(
+                    " (mem={} slots={} repr={} lr={:.4} decay={:.4})",
+                    cfg.memory_capacity,
+                    cfg.processing_slots,
+                    cfg.representation_dim,
+                    cfg.learning_rate,
+                    cfg.decay_rate,
+                )
+            } else {
+                String::new()
+            }
+        } else if node.mutations.is_empty() {
             String::new()
         } else if let Some(config) = &node.config {
+            // Child nodes: show only changed parameters with direction and value
             let parts: Vec<String> = node
                 .mutations
                 .iter()
@@ -1762,12 +1777,18 @@ impl<'a> TabContext<'a> {
                         "representation_dim" => format!("repr{}{}", arrow, config.representation_dim),
                         "learning_rate" => format!("lr{}{:.4}", arrow, config.learning_rate),
                         "decay_rate" => format!("decay{}{:.4}", arrow, config.decay_rate),
+                        "distress_exponent" => format!("distress{}{:.2}", arrow, config.distress_exponent),
+                        "habituation_sensitivity" => format!("hab{}{:.1}", arrow, config.habituation_sensitivity),
+                        "max_curiosity_bonus" => format!("curiosity{}{:.2}", arrow, config.max_curiosity_bonus),
+                        "fatigue_recovery_sensitivity" => format!("fatigue_rec{}{:.1}", arrow, config.fatigue_recovery_sensitivity),
+                        "fatigue_floor" => format!("fatigue_fl{}{:.2}", arrow, config.fatigue_floor),
                         other => format!("{}{}", other, arrow),
                     }
                 })
                 .collect();
             format!(" ({})", parts.join(" "))
         } else {
+            // Fallback: no config available, just show directions
             let parts: Vec<String> = node
                 .mutations
                 .iter()
@@ -1778,6 +1799,11 @@ impl<'a> TabContext<'a> {
                         "representation_dim" => "repr",
                         "learning_rate" => "lr",
                         "decay_rate" => "decay",
+                        "distress_exponent" => "distress",
+                        "habituation_sensitivity" => "hab",
+                        "max_curiosity_bonus" => "curiosity",
+                        "fatigue_recovery_sensitivity" => "fatigue_rec",
+                        "fatigue_floor" => "fatigue_fl",
                         other => other,
                     };
                     format!("{}{}", short, if *d > 0.0 { "↑" } else { "↓" })
@@ -1797,7 +1823,7 @@ impl<'a> TabContext<'a> {
 
         format!(
             "{}Gen {} fit={}{}{}",
-            current_marker, node.generation, fitness_str, mutation_str, status_icon,
+            current_marker, node.generation, fitness_str, detail_str, status_icon,
         )
     }
 }

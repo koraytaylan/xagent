@@ -2105,6 +2105,26 @@ impl ApplicationHandler for App {
                                                             .color(egui::Color32::from_rgb(255, 160, 50)),
                                                     );
                                                 }
+                                                // ── Right-aligned controls ──
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    if matches!(&evo_state, EvolutionState::Running | EvolutionState::Paused) {
+                                                        if ui.add(egui::Button::new(
+                                                            egui::RichText::new("🗑 Reset")
+                                                                .color(egui::Color32::from_rgb(220, 80, 80)),
+                                                        )).clicked() {
+                                                            evo_action = EvolutionAction::Reset;
+                                                        }
+                                                        if matches!(&evo_state, EvolutionState::Running) {
+                                                            if ui.button("⏸ Pause").clicked() {
+                                                                evo_action = EvolutionAction::Pause;
+                                                            }
+                                                        } else {
+                                                            if ui.button("▶ Resume").clicked() {
+                                                                evo_action = EvolutionAction::Unpause;
+                                                            }
+                                                        }
+                                                    }
+                                                });
                                             });
                                         });
 

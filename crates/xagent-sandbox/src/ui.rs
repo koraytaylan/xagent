@@ -1334,7 +1334,7 @@ impl<'a> TabContext<'a> {
 
             EvolutionState::Running | EvolutionState::Paused => {
                 let is_running = evo.state == EvolutionState::Running;
-                Self::render_running_dashboard(ui, evo, is_running, &mut action);
+                Self::render_running_dashboard(ui, evo, is_running);
             }
         }
 
@@ -1519,29 +1519,9 @@ impl<'a> TabContext<'a> {
         ui: &mut egui::Ui,
         evo: &EvolutionSnapshot,
         is_running: bool,
-        action: &mut EvolutionAction,
     ) {
-        // ── Header + controls ───────────────────────────────
-        ui.horizontal(|ui| {
-            ui.heading(format!("Generation {}", evo.generation));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(
-                    egui::RichText::new("🗑 Reset")
-                        .color(egui::Color32::from_rgb(220, 80, 80)),
-                )).clicked() {
-                    *action = EvolutionAction::Reset;
-                }
-                if is_running {
-                    if ui.button("⏸ Pause").clicked() {
-                        *action = EvolutionAction::Pause;
-                    }
-                } else {
-                    if ui.button("▶ Resume").clicked() {
-                        *action = EvolutionAction::Unpause;
-                    }
-                }
-            });
-        });
+        // ── Header ──────────────────────────────────────────
+        ui.heading(format!("Generation {}", evo.generation));
         ui.add_space(4.0);
 
         // ── Progress bar ────────────────────────────────────

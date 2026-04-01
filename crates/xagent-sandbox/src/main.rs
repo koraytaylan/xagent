@@ -1163,14 +1163,14 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } if pointer_on_viewport => {
-                if button == MouseButton::Left {
+                if button == MouseButton::Right {
                     self.camera.is_mouse_dragging = state == ElementState::Pressed;
                     if state == ElementState::Released {
                         self.camera.last_mouse_pos = None;
                     }
                 }
-                // Right-click to select nearest agent
-                if button == MouseButton::Right && state == ElementState::Released {
+                // Left-click to select nearest agent
+                if button == MouseButton::Left && state == ElementState::Released {
                     self.pick_agent_at_cursor();
                 }
             }

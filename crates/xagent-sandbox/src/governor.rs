@@ -884,7 +884,7 @@ impl Governor {
     fn tree_nodes_from_db(&self) -> Vec<TreeNode> {
         let mut stmt = match self.db.prepare(
             "SELECT id, parent_id, generation, best_fitness, avg_fitness,
-                    config_json, status
+                    config_json, status, island_id
              FROM node WHERE run_id = ?1 ORDER BY id",
         ) {
             Ok(s) => s,
@@ -902,6 +902,7 @@ impl Governor {
                     best_fitness: row.get::<_, Option<f64>>(3)?.map(|v| v as f32),
                     avg_fitness: row.get::<_, Option<f64>>(4)?.map(|v| v as f32),
                     status: row.get(6)?,
+                    island_id: row.get(7)?,
                     config,
                     mutations: Vec::new(),
                 })
@@ -965,11 +966,40 @@ impl Governor {
             Ok((
                 row.get::<_, u32>(0)?,
                 row.get::<_, f32>(1)?,
-                row.get::<_, f32>(2)?,
+                row.get::<_, Option<f32>>(2)?.unwrap_or(0.0),
             ))
         })
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
+    }
+
+    /// Per-island fitness history: island_id → Vec<(generation, best_fitness, avg_fitness)>.
+    /// Nodes without an island_id (e.g., root) are excluded.
+    pub fn fitness_history_by_island(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
+        let mut stmt = match self.db.prepare(
+            "SELECT island_id, generation, best_fitness, avg_fitness FROM node
+             WHERE run_id = ?1 AND best_fitness IS NOT NULL AND island_id IS NOT NULL
+             ORDER BY island_id, generation ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        let mut map: std::collections::HashMap<i64, Vec<(u32, f32, f32)>> =
+            std::collections::HashMap::new();
+        if let Ok(rows) = stmt.query_map(params![self.run_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, f32>(2)?,
+                row.get::<_, Option<f32>>(3)?.unwrap_or(0.0),
+            ))
+        }) {
+            for r in rows.flatten() {
+                let (island_id, gen, best, avg) = r;
+                map.entry(island_id).or_default().push((gen, best, avg));
+            }
+        }
+        map
     }
 }
 
@@ -1039,6 +1069,7 @@ pub struct TreeNode {
     pub best_fitness: Option<f32>,
     pub avg_fitness: Option<f32>,
     pub status: String,
+    pub island_id: Option<i64>,
     /// Per-node config (deserialized for display)
     pub config: Option<BrainConfig>,
     /// Summary of mutations from parent: e.g. "learning_rate↑ decay_rate↓"
@@ -2148,5 +2179,47 @@ mod tests {
         assert!(ids.contains(&0), "should have island 0");
         assert!(ids.contains(&1), "should have island 1");
         assert!(ids.contains(&2), "should have island 2");
+    }
+
+    #[test]
+    fn fitness_history_by_island_returns_per_island_data() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 2,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Root (island_id=NULL, gen 0): fitness 0.1 — not counted per-island
+        gov.advance(&mock_fitness(0.1));
+        // Island 1, gen 1: fitness 0.2
+        gov.advance(&mock_fitness(0.2));
+        // Island 0, gen 2: fitness 0.3
+        gov.advance(&mock_fitness(0.3));
+        // Island 1, gen 3: fitness 0.4
+        gov.advance(&mock_fitness(0.4));
+        // Island 0, gen 4: fitness 0.5
+        gov.advance(&mock_fitness(0.5));
+
+        let history = gov.fitness_history_by_island();
+        assert!(history.contains_key(&0), "should have island 0");
+        assert!(history.contains_key(&1), "should have island 1");
+
+        let island_0 = &history[&0];
+        let island_1 = &history[&1];
+
+        // Island 0: gens 2 and 4 evaluated (2 entries)
+        // Island 1: gens 1 and 3 evaluated (2 entries)
+        // Root (gen 0) excluded — has no island_id
+        assert_eq!(island_0.len(), 2, "island 0 should have 2 data points");
+        assert_eq!(island_1.len(), 2, "island 1 should have 2 data points");
     }
 }

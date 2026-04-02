@@ -2028,6 +2028,9 @@ impl ApplicationHandler for App {
                                 self.evo_snapshot.ticks_per_sec = self.tps_display;
                                 // Move snapshot out so we can pass &mut to the closure
                                 let mut evo_snap = std::mem::take(&mut self.evo_snapshot);
+                                let gen_tick = evo_snap.gen_tick;
+                                let tick_budget = evo_snap.tick_budget;
+                                let evo_generation = evo_snap.generation;
                                 let mut evo_action = EvolutionAction::None;
 
                                 // Build world snapshot for mini-map
@@ -2142,6 +2145,17 @@ impl ApplicationHandler for App {
                                                     ui.label(format!("{}h {:02}m {:02}s", hours, mins, secs));
                                                     ui.separator();
                                                     ui.label(format!("{:.0} ticks/s", ticks_per_sec));
+                                                }
+                                                // Generation progress bar (compact, in toolbar)
+                                                if matches!(&evo_state, EvolutionState::Running | EvolutionState::Paused) && tick_budget > 0 {
+                                                    ui.separator();
+                                                    let progress = gen_tick as f32 / tick_budget as f32;
+                                                    ui.add(
+                                                        egui::ProgressBar::new(progress)
+                                                            .text(format!("Gen {} — {:.0}%", evo_generation, progress * 100.0))
+                                                            .desired_width(160.0)
+                                                            .animate(matches!(&evo_state, EvolutionState::Running)),
+                                                    );
                                                 }
                                                 if !render_3d {
                                                     ui.separator();

@@ -1892,7 +1892,7 @@ impl<'a> TabContext<'a> {
 
         // Sort children: active/successful first, then exhausted, then failed
         for children in children_map.values_mut() {
-            children.sort_by_key(|node| {
+            children.sort_unstable_by_key(|node| {
                 match node.status.as_str() {
                     "active" => 0,
                     "successful" => 1,

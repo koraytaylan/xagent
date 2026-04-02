@@ -1532,16 +1532,19 @@ impl<'a> TabContext<'a> {
         ui: &mut egui::Ui,
         evo: &mut EvolutionSnapshot,
     ) {
+        // ── Fitness chart at top of tab (always visible) ────────
+        if !evo.fitness_history.is_empty() {
+            Self::render_fitness_chart(ui, &evo.fitness_history);
+        }
+
         let tree_has_nodes = !evo.tree_nodes.is_empty();
 
         if tree_has_nodes {
-            // Clone tree data for rendering (tree_nodes needed by both panes;
-            // original stays on evo so selected_node_id writes persist).
             let tree_nodes = evo.tree_nodes.clone();
             let current_node_id = evo.current_node_id;
 
             ui.columns(2, |columns| {
-                // Left pane: tree (writes evo.selected_node_id on click)
+                // Left pane: tree
                 columns[0].group(|ui| {
                     ui.set_min_width(ui.available_width());
                     ui.set_max_width(ui.available_width());
@@ -1560,13 +1563,11 @@ impl<'a> TabContext<'a> {
                         });
                 });
 
-                // Read selected_node_id AFTER tree renders (no one-frame lag)
                 let selected_node_id = evo.selected_node_id;
                 let generation = evo.generation;
                 let current_config = &evo.current_config;
-                let fitness_history = &evo.fitness_history;
 
-                // Right pane: detail / overview
+                // Right pane: detail / overview (no chart — it's at the top now)
                 columns[1].group(|ui| {
                     ui.set_min_height(300.0);
                     egui::ScrollArea::vertical()
@@ -1607,10 +1608,6 @@ impl<'a> TabContext<'a> {
                                 });
                                 ui.add_space(4.0);
                             }
-
-                            if !fitness_history.is_empty() {
-                                Self::render_fitness_chart(ui, fitness_history);
-                            }
                         });
                 });
             });
@@ -1644,9 +1641,6 @@ impl<'a> TabContext<'a> {
                         });
                 });
                 ui.add_space(4.0);
-            }
-            if !evo.fitness_history.is_empty() {
-                Self::render_fitness_chart(ui, &evo.fitness_history);
             }
         }
     }

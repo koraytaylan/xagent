@@ -96,7 +96,7 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray(pos, ray, world, max_dist, step, others);
+            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Others(others));
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -109,31 +109,36 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
     }
 }
 
+/// Discriminated union for the two agent-list representations.
+/// Avoids duplicating the ray-march loop.
+enum AgentSlice<'a> {
+    Others(&'a [OtherAgent]),
+    Positions { all: &'a [(Vec3, bool)], self_index: usize },
+}
+
 /// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
 /// Advances a ray from `origin` in direction `dir` in increments of `step` units,
 /// checking for food items, other agents, and terrain at each step. Returns the
 /// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///
-/// Food items are rendered as bright yellow-green, distinct from biome colors.
+/// Food items are rendered as bright lime-green, distinct from biome colors.
 /// This makes food *physically visible* — the brain must still learn that this
-/// color correlates with positive gradient. Without food visibility, agents see
-/// uniform green inside food biomes and have zero directional signal for food.
-fn march_ray(
+/// color correlates with positive gradient. Without food visibility, agents have
+/// zero directional signal for food.
+fn march_ray_unified(
     origin: Vec3,
     dir: Vec3,
     world: &WorldState,
     max_dist: f32,
     step: f32,
-    others: &[OtherAgent],
+    agents: AgentSlice,
 ) -> ([f32; 4], f32) {
     let sky: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
     let agent_color: [f32; 4] = [0.9, 0.2, 0.6, 1.0];
-    // Bright yellow-green: visually distinct from biome green (0.15, 0.50, 0.10)
     let food_color: [f32; 4] = [0.70, 0.95, 0.20, 1.0];
-    // Squared detection radii
     let agent_radius_sq: f32 = 1.5 * 1.5;
-    let food_radius_sq: f32 = 1.0 * 1.0; // food cubes are ~0.7 units
+    let food_radius_sq: f32 = 1.0 * 1.0;
 
     // Early-out: upward-pointing rays above terrain are almost certainly sky.
     if dir.y > 0.3 {
@@ -159,14 +164,29 @@ fn march_ray(
             }
         }
 
-        // Check agent hits
-        for other in others {
-            if !other.alive {
-                continue;
+        // Check agent hits — dispatch on slice variant
+        match &agents {
+            AgentSlice::Others(others) => {
+                for other in *others {
+                    if !other.alive {
+                        continue;
+                    }
+                    let diff = p - other.position;
+                    if diff.length_squared() < agent_radius_sq {
+                        return (agent_color, t);
+                    }
+                }
             }
-            let diff = p - other.position;
-            if diff.length_squared() < agent_radius_sq {
-                return (agent_color, t);
+            AgentSlice::Positions { all, self_index } => {
+                for (j, (other_pos, alive)) in all.iter().enumerate() {
+                    if j == *self_index || !alive {
+                        continue;
+                    }
+                    let diff = p - *other_pos;
+                    if diff.length_squared() < agent_radius_sq {
+                        return (agent_color, t);
+                    }
+                }
             }
         }
 
@@ -300,7 +320,7 @@ fn sample_vision_positions(
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray_positions(pos, ray, world, max_dist, step, all_positions, self_index);
+            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Positions { all: all_positions, self_index });
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -311,55 +331,6 @@ fn sample_vision_positions(
             vf.depth[idx] = depth / max_dist;
         }
     }
-}
-
-/// Ray marching using shared positions slice (skips self_index).
-fn march_ray_positions(
-    origin: Vec3,
-    dir: Vec3,
-    world: &WorldState,
-    max_dist: f32,
-    step: f32,
-    all_positions: &[(Vec3, bool)],
-    self_index: usize,
-) -> ([f32; 4], f32) {
-    let sky: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
-    let agent_color: [f32; 4] = [0.9, 0.2, 0.6, 1.0];
-    let agent_radius_sq: f32 = 1.5 * 1.5;
-
-    if dir.y > 0.3 {
-        let origin_h = world.terrain.height_at(origin.x, origin.z);
-        if origin.y > origin_h {
-            return (sky, max_dist);
-        }
-    }
-
-    let mut t = 0.0_f32;
-    while t < max_dist {
-        let p = origin + dir * t;
-
-        for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
-            if j == self_index || !alive {
-                continue;
-            }
-            let diff = p - *other_pos;
-            if diff.length_squared() < agent_radius_sq {
-                return (agent_color, t);
-            }
-        }
-
-        let gh = world.terrain.height_at(p.x, p.z);
-        if p.y <= gh {
-            let c = match world.biome_map.biome_at(p.x, p.z) {
-                BiomeType::FoodRich => [0.15, 0.50, 0.10, 1.0],
-                BiomeType::Barren => [0.50, 0.40, 0.20, 1.0],
-                BiomeType::Danger => [0.60, 0.20, 0.10, 1.0],
-            };
-            return (c, t);
-        }
-        t += step;
-    }
-    (sky, max_dist)
 }
 
 /// Touch detection using shared positions slice.

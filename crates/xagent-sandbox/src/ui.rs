@@ -154,6 +154,8 @@ pub struct EvolutionSnapshot {
     pub current_config: Option<xagent_shared::BrainConfig>,
     pub fitness_history: std::collections::HashMap<i64, Vec<(u32, f32, f32)>>, // island_id → (generation, best, avg)
     pub selected_node_id: Option<i64>,
+    /// Fraction of available width for the tree pane (0.0–1.0). Persisted across frames.
+    pub tree_pane_fraction: f32,
     // Editable fields for Idle state (pre-start configuration)
     pub edit_brain: xagent_shared::BrainConfig,
     pub edit_governor: xagent_shared::GovernorConfig,
@@ -180,6 +182,7 @@ impl Default for EvolutionSnapshot {
             current_config: None,
             fitness_history: std::collections::HashMap::new(),
             selected_node_id: None,
+            tree_pane_fraction: 0.4,
             edit_brain: xagent_shared::BrainConfig::default(),
             edit_governor: xagent_shared::GovernorConfig::default(),
         }
@@ -1543,32 +1546,49 @@ impl<'a> TabContext<'a> {
             let tree_nodes = evo.tree_nodes.clone();
             let current_node_id = evo.current_node_id;
 
-            ui.columns(2, |columns| {
+            let avail = ui.available_size();
+            let tree_width = (avail.x * evo.tree_pane_fraction).clamp(100.0, avail.x - 100.0);
+
+            ui.horizontal(|ui| {
                 // Left pane: tree
-                columns[0].group(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.set_max_width(ui.available_width());
-                    ui.set_min_height(300.0);
-                    egui::ScrollArea::both()
-                        .id_salt("evo_tree_scroll")
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
-                            ui.add_space(4.0);
-                            Self::render_tree(
-                                ui,
-                                &tree_nodes,
-                                current_node_id,
-                                &mut evo.selected_node_id,
-                            );
-                        });
+                ui.allocate_ui(egui::vec2(tree_width, avail.y), |ui| {
+                    ui.group(|ui| {
+                        ui.set_min_height(300.0);
+                        egui::ScrollArea::both()
+                            .id_salt("evo_tree_scroll")
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
+                                ui.add_space(4.0);
+                                Self::render_tree(
+                                    ui,
+                                    &tree_nodes,
+                                    current_node_id,
+                                    &mut evo.selected_node_id,
+                                );
+                            });
+                    });
                 });
+
+                // Draggable separator
+                let sep_resp = ui.separator();
+                let sep_rect = sep_resp.rect;
+                let drag_rect = sep_rect.expand2(egui::vec2(4.0, 0.0));
+                let sep_id = ui.id().with("evo_pane_sep");
+                let sep_sense = ui.interact(drag_rect, sep_id, egui::Sense::drag());
+                if sep_sense.dragged() {
+                    let delta = sep_sense.drag_delta().x;
+                    evo.tree_pane_fraction = ((tree_width + delta) / avail.x).clamp(0.15, 0.85);
+                }
+                if sep_sense.hovered() || sep_sense.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
 
                 let selected_node_id = evo.selected_node_id;
                 let generation = evo.generation;
                 let current_config = &evo.current_config;
 
-                // Right pane: detail / overview (no chart — it's at the top now)
-                columns[1].group(|ui| {
+                // Right pane: detail / overview
+                ui.group(|ui| {
                     ui.set_min_height(300.0);
                     egui::ScrollArea::vertical()
                         .id_salt("evo_detail_scroll")

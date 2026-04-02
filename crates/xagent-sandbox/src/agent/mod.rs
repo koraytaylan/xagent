@@ -272,7 +272,7 @@ pub fn mutate_config_with_strength(
         memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength).min(MAX_MEMORY_CAPACITY),
         processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength).min(MAX_PROCESSING_SLOTS),
         visual_encoding_size: parent.visual_encoding_size,
-        representation_dim: momentum.biased_perturb_u(&mut rng, parent.representation_dim, "representation_dim", strength).min(MAX_REPR_DIM),
+        representation_dim: parent.representation_dim,
         learning_rate: momentum.biased_perturb_f(&mut rng, parent.learning_rate, "learning_rate", strength),
         decay_rate: momentum.biased_perturb_f(&mut rng, parent.decay_rate, "decay_rate", strength),
         distress_exponent: momentum.biased_perturb_f(&mut rng, parent.distress_exponent, "distress_exponent", strength).clamp(1.5, 5.0),
@@ -323,11 +323,7 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             b.processing_slots
         },
         visual_encoding_size: a.visual_encoding_size,
-        representation_dim: (if rng.random::<f32>() < 0.5 {
-            a.representation_dim
-        } else {
-            b.representation_dim
-        }).min(MAX_REPR_DIM),
+        representation_dim: a.representation_dim,
         learning_rate: if rng.random::<f32>() < 0.5 {
             a.learning_rate
         } else {

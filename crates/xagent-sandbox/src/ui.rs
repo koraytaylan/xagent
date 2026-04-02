@@ -1592,14 +1592,22 @@ impl<'a> TabContext<'a> {
                 // Right pane: detail / overview
                 ui.group(|ui| {
                     ui.set_min_height(300.0);
+                    // Heading above scroll area
+                    if let Some(sel_id) = selected_node_id {
+                        let heading_text = tree_nodes.iter()
+                            .find(|n| n.id == sel_id)
+                            .map(|n| format!("Generation {}", n.generation))
+                            .unwrap_or_else(|| format!("Generation {}", generation));
+                        ui.heading(heading_text);
+                    } else {
+                        ui.heading(format!("Generation {}", generation));
+                    }
+                    ui.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt("evo_detail_scroll")
                         .show(ui, |ui| {
                             if let Some(sel_id) = selected_node_id {
                                 Self::render_node_detail(ui, &tree_nodes, sel_id);
-                            } else {
-                                ui.heading(format!("Generation {}", generation));
-                                ui.add_space(4.0);
                             }
 
                             if let Some(cfg) = current_config {
@@ -1766,9 +1774,6 @@ impl<'a> TabContext<'a> {
                 return;
             }
         };
-
-        ui.heading(format!("Generation {}", node.generation));
-        ui.add_space(4.0);
 
         egui::Grid::new("node_detail_grid")
             .num_columns(2)

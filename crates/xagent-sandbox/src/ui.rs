@@ -1347,8 +1347,7 @@ impl<'a> TabContext<'a> {
             }
 
             EvolutionState::Running | EvolutionState::Paused => {
-                let is_running = state == EvolutionState::Running;
-                Self::render_running_dashboard(ui, evo, is_running);
+                Self::render_running_dashboard(ui, evo);
             }
         }
 
@@ -1532,7 +1531,6 @@ impl<'a> TabContext<'a> {
     fn render_running_dashboard(
         ui: &mut egui::Ui,
         evo: &mut EvolutionSnapshot,
-        _is_running: bool,
     ) {
         let tree_has_nodes = !evo.tree_nodes.is_empty();
 

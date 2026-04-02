@@ -515,14 +515,10 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                 *self.viewport_hovered = resp.hovered() || resp.dragged();
             }
             Tab::Evolution => {
-                egui::ScrollArea::vertical()
-                    .id_salt("evolution_tab_scroll")
-                    .show(ui, |ui| {
-                        let action = Self::render_evolution_tab(ui, self.evolution);
-                        if action != EvolutionAction::None {
-                            *self.evolution_action = action;
-                        }
-                    });
+                let action = Self::render_evolution_tab(ui, self.evolution);
+                if action != EvolutionAction::None {
+                    *self.evolution_action = action;
+                }
             }
             Tab::AgentDetail(id) => {
                 if let Some(snap) = self.agents.iter().find(|a| a.id == *id) {

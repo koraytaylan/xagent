@@ -547,6 +547,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn touch_contacts_appear_in_features() {
+        use xagent_shared::TouchContact;
+
+        let mut enc = SensoryEncoder::new(8, 4);
+        let mut frame = make_frame(0.5, 0.5);
+
+        // Add touch contacts
+        frame.touch_contacts = vec![
+            TouchContact {
+                direction: Vec3::new(1.0, 0.0, 0.0),
+                intensity: 0.8,
+                surface_tag: 1,
+            },
+            TouchContact {
+                direction: Vec3::new(0.0, 0.0, -1.0),
+                intensity: 0.3,
+                surface_tag: 2,
+            },
+        ];
+
+        let feats = enc.extract_features(&frame);
+
+        // Non-visual features start after visual pixels
+        // 4×3 pixels × 4 channels = 48, then 9 proprioceptive/interoceptive, then touch
+        let touch_start = 4 * 3 * 4 + 9;
+
+        // First touch slot should be the strongest contact (intensity 0.8)
+        assert!((feats[touch_start] - 1.0).abs() < 1e-6, "direction.x of strongest contact");
+        assert!((feats[touch_start + 1] - 0.0).abs() < 1e-6, "direction.z of strongest contact");
+        assert!((feats[touch_start + 2] - 0.8).abs() < 1e-6, "intensity of strongest contact");
+        assert!((feats[touch_start + 3] - 0.25).abs() < 1e-6, "surface_tag/4.0 of strongest contact (tag 1)");
+
+        // Second touch slot should be the weaker contact (intensity 0.3)
+        let slot2 = touch_start + 4;
+        assert!((feats[slot2] - 0.0).abs() < 1e-6, "direction.x of second contact");
+        assert!((feats[slot2 + 1] - (-1.0)).abs() < 1e-6, "direction.z of second contact");
+        assert!((feats[slot2 + 2] - 0.3).abs() < 1e-6, "intensity of second contact");
+        assert!((feats[slot2 + 3] - 0.5).abs() < 1e-6, "surface_tag/4.0 of second contact (tag 2)");
+
+        // Third and fourth slots should be zero-padded
+        let slot3 = touch_start + 8;
+        for i in 0..4 {
+            assert!((feats[slot3 + i]).abs() < 1e-6, "slot 3 feature {} should be zero-padded", i);
+        }
+        let slot4 = touch_start + 12;
+        for i in 0..4 {
+            assert!((feats[slot4 + i]).abs() < 1e-6, "slot 4 feature {} should be zero-padded", i);
+        }
+    }
+
+    #[test]
+    fn touch_contacts_sorted_by_intensity() {
+        use xagent_shared::TouchContact;
+
+        let mut enc = SensoryEncoder::new(8, 4);
+        let mut frame = make_frame(0.5, 0.5);
+
+        // Add contacts in non-sorted order (weakest first)
+        frame.touch_contacts = vec![
+            TouchContact {
+                direction: Vec3::new(0.0, 0.0, 1.0),
+                intensity: 0.1,
+                surface_tag: 3,
+            },
+            TouchContact {
+                direction: Vec3::new(1.0, 0.0, 0.0),
+                intensity: 0.9,
+                surface_tag: 1,
+            },
+            TouchContact {
+                direction: Vec3::new(-1.0, 0.0, 0.0),
+                intensity: 0.5,
+                surface_tag: 4,
+            },
+        ];
+
+        let feats = enc.extract_features(&frame);
+        let touch_start = 4 * 3 * 4 + 9;
+
+        // Slot 0: strongest (0.9, tag 1)
+        assert!((feats[touch_start + 2] - 0.9).abs() < 1e-6, "slot 0 should have intensity 0.9");
+        assert!((feats[touch_start + 3] - 0.25).abs() < 1e-6, "slot 0 should have tag 1 (0.25)");
+
+        // Slot 1: second strongest (0.5, tag 4)
+        let slot1 = touch_start + 4;
+        assert!((feats[slot1 + 2] - 0.5).abs() < 1e-6, "slot 1 should have intensity 0.5");
+        assert!((feats[slot1 + 3] - 1.0).abs() < 1e-6, "slot 1 should have tag 4 (1.0)");
+
+        // Slot 2: weakest (0.1, tag 3)
+        let slot2 = touch_start + 8;
+        assert!((feats[slot2 + 2] - 0.1).abs() < 1e-6, "slot 2 should have intensity 0.1");
+        assert!((feats[slot2 + 3] - 0.75).abs() < 1e-6, "slot 2 should have tag 3 (0.75)");
+    }
+
+    #[test]
+    fn no_touch_contacts_produces_zero_features() {
+        let mut enc = SensoryEncoder::new(8, 4);
+        let frame = make_frame(0.5, 0.5); // no touch contacts
+
+        let feats = enc.extract_features(&frame);
+        let touch_start = 4 * 3 * 4 + 9;
+
+        // All 16 touch features should be zero
+        for i in 0..16 {
+            assert!(
+                feats[touch_start + i].abs() < 1e-6,
+                "touch feature {} should be zero with no contacts, got {}",
+                i,
+                feats[touch_start + i]
+            );
+        }
+    }
+
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
         let ma: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();

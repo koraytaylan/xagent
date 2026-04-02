@@ -212,6 +212,9 @@ impl Governor {
         let db = Connection::open(db_path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
+        // Run migrations for any new columns (idempotent — silently ignores duplicates)
+        let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
+
         let (run_id, governor_json, spawn_parent_id, momentum_json): (i64, String, Option<i64>, String) =
             db.query_row(
                 "SELECT id, governor_config, spawn_parent_id,

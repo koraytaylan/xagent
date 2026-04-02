@@ -1890,6 +1890,19 @@ impl<'a> TabContext<'a> {
             }
         }
 
+        // Sort children: active/successful first, then exhausted, then failed
+        for children in children_map.values_mut() {
+            children.sort_by_key(|node| {
+                match node.status.as_str() {
+                    "active" => 0,
+                    "successful" => 1,
+                    "exhausted" => 2,
+                    "failed" => 3,
+                    _ => 4,
+                }
+            });
+        }
+
         if let Some(roots) = children_map.get(&None) {
             for root in roots {
                 Self::render_tree_node(ui, root, &children_map, &expanded_ids, current_id, selected_node_id);

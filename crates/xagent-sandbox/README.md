@@ -209,6 +209,15 @@ The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as 
 - **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
 - **Bottom console** — Scrollable log of evolution events.
 
+#### Evolution Tab
+
+The Evolution tab is a two-column layout (rendered via `ui.columns(2, ...)`):
+
+- **Left pane — Generation tree** (file explorer style): each node is a generation entry. Clicking a node selects it and populates the right panel with its details (status, island ID, fitness, mutations applied, full `BrainConfig`). Dead-end branches (failed/exhausted generations) are **collapsed by default** but can be manually expanded for post-mortem inspection.
+- **Right panel — Generation detail**: shows the selected node's fields when a tree node is clicked; otherwise shows aggregate stats for the current run.
+- **Fitness chart**: one colored line per island (up to 8 distinct colors), so each island's evolutionary trajectory is independently visible. Data comes from `fitness_history_by_island()`, which groups `EvolutionSnapshot.fitness_history` (`HashMap<i64, Vec<(u32, f32, f32)>>`) by island ID.
+- **Generation progress bar**: rendered in `TopBottomPanel::top("top_bar")` — always visible regardless of which tab is active. Displays ticks elapsed vs. tick budget for the current generation.
+
 #### Viewport Integration
 
 The 3D scene is rendered to an **offscreen wgpu texture**, which is then displayed as an `egui::Image` inside the Sandbox tab. Camera drag and scroll events are forwarded to the 3D camera only when the pointer is hovering over the viewport pane (tracked via `viewport_hovered`). This prevents UI interactions in the sidebar or detail tabs from moving the camera.

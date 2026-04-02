@@ -166,6 +166,28 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 **Lesson:** An untested data path is a broken data path. The sensing side was correct; the encoding side never consumed it. Integration tests that verify end-to-end data flow (sensor → encoder → feature vector) catch this class of bug.
 
+### Issue #17: Evolution Tab UI Overhaul
+
+**What changed:** Five improvements to the evolution tab:
+1. Fitness chart now shows per-island lines with distinct colors. Each island's evolutionary trajectory is visible independently.
+2. Evolution tree is now a left-side pane (file explorer style). Clicking a generation node displays its details (fitness, mutations, config) in the main panel.
+3. Dead branches (failed/exhausted) are collapsed by default but can be manually expanded to inspect what happened.
+4. Generation progress bar moved to the top toolbar for persistent visibility.
+5. Removed the "Pop | Elite | Patience" status line (redundant information).
+
+**Root cause:** The previous single-line fitness chart made it impossible to distinguish island performance. The tree was embedded in a vertical scroll with no way to inspect node details. Dead branches were permanently locked, preventing post-mortem analysis.
+
+**Technical details:**
+- Added `island_id INTEGER` column to the `node` table with backwards-compatible migration
+- `breed_next_generation` now stores `active_island` on each new node
+- New `fitness_history_by_island()` query groups data by island
+- `EvolutionSnapshot.fitness_history` changed from `Vec<(u32, f32, f32)>` to `HashMap<i64, Vec<(u32, f32, f32)>>`
+- `TreeNode` gained `island_id: Option<i64>` field
+- Tree nodes are now clickable (`egui::Sense::click()`) with a `selected_node_id` state
+- `render_running_dashboard` uses `ui.columns(2, ...)` for the horizontal split layout
+- Force-collapse (`header.open(Some(false))`) removed from dead-end branches
+- Progress bar renders in `TopBottomPanel::top("top_bar")` using captured `gen_tick`/`tick_budget`
+
 ---
 
 ## The Disconnect (Current State)

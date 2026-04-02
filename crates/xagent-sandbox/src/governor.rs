@@ -952,27 +952,6 @@ impl Governor {
         serde_json::from_str(&json).ok()
     }
 
-    /// Fitness history: (generation, best_fitness, avg_fitness) for all evaluated nodes.
-    pub fn fitness_history(&self) -> Vec<(u32, f32, f32)> {
-        let mut stmt = match self.db.prepare(
-            "SELECT generation, best_fitness, avg_fitness FROM node
-             WHERE run_id = ?1 AND best_fitness IS NOT NULL
-             ORDER BY generation ASC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map(params![self.run_id], |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, f32>(1)?,
-                row.get::<_, Option<f32>>(2)?.unwrap_or(0.0),
-            ))
-        })
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
-    }
-
     /// Per-island fitness history: island_id → Vec<(generation, best_fitness, avg_fitness)>.
     /// Nodes without an island_id (e.g., root) are excluded.
     pub fn fitness_history_by_island(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {

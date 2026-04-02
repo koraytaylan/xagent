@@ -152,7 +152,8 @@ pub struct EvolutionSnapshot {
     pub tree_nodes: Vec<crate::governor::TreeNode>,
     pub current_node_id: Option<i64>,
     pub current_config: Option<xagent_shared::BrainConfig>,
-    pub fitness_history: Vec<(u32, f32, f32)>, // (generation, best, avg)
+    pub fitness_history: std::collections::HashMap<i64, Vec<(u32, f32, f32)>>, // island_id → (generation, best, avg)
+    pub selected_node_id: Option<i64>,
     // Editable fields for Idle state (pre-start configuration)
     pub edit_brain: xagent_shared::BrainConfig,
     pub edit_governor: xagent_shared::GovernorConfig,
@@ -177,7 +178,8 @@ impl Default for EvolutionSnapshot {
             tree_nodes: Vec::new(),
             current_node_id: None,
             current_config: None,
-            fitness_history: Vec::new(),
+            fitness_history: std::collections::HashMap::new(),
+            selected_node_id: None,
             edit_brain: xagent_shared::BrainConfig::default(),
             edit_governor: xagent_shared::GovernorConfig::default(),
         }
@@ -1602,9 +1604,9 @@ impl<'a> TabContext<'a> {
     }
 
     fn render_fitness_chart(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
-        ui.collapsing("📈 Fitness Over Generations", |ui| {
+        ui.collapsing("Fitness Over Generations", |ui| {
             let avail = ui.available_width().max(200.0);
-            let chart_height = 120.0;
+            let chart_height = 150.0;
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(avail, chart_height),
                 egui::Sense::hover(),
@@ -1612,56 +1614,76 @@ impl<'a> TabContext<'a> {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
 
-            let max_fit = evo
-                .fitness_history
-                .iter()
-                .map(|(_, b, _)| *b)
-                .fold(0.0f32, f32::max)
-                .max(0.01);
+            if evo.fitness_history.is_empty() {
+                return;
+            }
 
-            let n = evo.fitness_history.len();
-            if n >= 2 {
-                let best_pts: Vec<egui::Pos2> = evo
-                    .fitness_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, best, _))| {
-                        egui::pos2(
-                            rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
-                            rect.bottom() - (best / max_fit) * rect.height(),
-                        )
-                    })
-                    .collect();
-                for pair in best_pts.windows(2) {
-                    painter.line_segment(
-                        [pair[0], pair[1]],
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(50, 200, 80)),
-                    );
+            // Per-island colors (up to 8 islands, wraps)
+            let island_colors = [
+                egui::Color32::from_rgb(50, 200, 80),   // green
+                egui::Color32::from_rgb(80, 140, 255),   // blue
+                egui::Color32::from_rgb(255, 140, 50),    // orange
+                egui::Color32::from_rgb(200, 80, 200),    // purple
+                egui::Color32::from_rgb(255, 220, 50),    // yellow
+                egui::Color32::from_rgb(50, 220, 220),    // cyan
+                egui::Color32::from_rgb(255, 80, 80),     // red
+                egui::Color32::from_rgb(180, 180, 180),   // grey
+            ];
+
+            // Find global max fitness and generation range across all islands
+            let mut global_max_fit: f32 = 0.01;
+            let mut global_min_gen: u32 = u32::MAX;
+            let mut global_max_gen: u32 = 0;
+            for points in evo.fitness_history.values() {
+                for &(gen, best, _) in points {
+                    global_max_fit = global_max_fit.max(best);
+                    global_min_gen = global_min_gen.min(gen);
+                    global_max_gen = global_max_gen.max(gen);
                 }
+            }
 
-                let avg_pts: Vec<egui::Pos2> = evo
-                    .fitness_history
+            if global_min_gen == u32::MAX {
+                return; // all vecs were empty — nothing to draw
+            }
+
+            let gen_range = (global_max_gen - global_min_gen).max(1) as f32;
+
+            // Sort island keys for deterministic rendering
+            let mut island_keys: Vec<i64> = evo.fitness_history.keys().copied().collect();
+            island_keys.sort();
+
+            // Draw best-fitness line per island
+            for &island_id in &island_keys {
+                let points = &evo.fitness_history[&island_id];
+                if points.len() < 2 {
+                    continue;
+                }
+                let color = island_colors[island_id as usize % island_colors.len()];
+
+                let pts: Vec<egui::Pos2> = points
                     .iter()
-                    .enumerate()
-                    .map(|(i, (_, _, avg))| {
+                    .map(|&(gen, best, _)| {
                         egui::pos2(
-                            rect.left() + (i as f32 / (n - 1) as f32) * rect.width(),
-                            rect.bottom() - (avg / max_fit) * rect.height(),
+                            rect.left() + ((gen - global_min_gen) as f32 / gen_range) * rect.width(),
+                            rect.bottom() - (best / global_max_fit) * rect.height(),
                         )
                     })
                     .collect();
-                for pair in avg_pts.windows(2) {
+                for pair in pts.windows(2) {
                     painter.line_segment(
                         [pair[0], pair[1]],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 180, 50)),
+                        egui::Stroke::new(2.0, color),
                     );
                 }
             }
 
+            // Legend
             ui.horizontal(|ui| {
-                ui.colored_label(egui::Color32::from_rgb(50, 200, 80), "● Best");
-                ui.colored_label(egui::Color32::from_rgb(200, 180, 50), "● Avg");
-                ui.label(format!("Max: {:.4}", max_fit));
+                for &island_id in &island_keys {
+                    let color = island_colors[island_id as usize % island_colors.len()];
+                    ui.colored_label(color, format!("Island {}", island_id));
+                }
+                ui.label(format!("Max: {:.4}", global_max_fit));
             });
         });
         ui.add_space(4.0);

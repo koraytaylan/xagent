@@ -1546,12 +1546,12 @@ impl<'a> TabContext<'a> {
             let tree_nodes = evo.tree_nodes.clone();
             let current_node_id = evo.current_node_id;
 
-            let avail = ui.available_size();
-            let tree_width = (avail.x * evo.tree_pane_fraction).clamp(100.0, avail.x - 100.0);
+            let avail_width = ui.available_width();
+            let tree_width = (avail_width * evo.tree_pane_fraction).clamp(100.0, avail_width - 100.0);
 
             ui.horizontal(|ui| {
                 // Left pane: tree
-                ui.allocate_ui(egui::vec2(tree_width, avail.y), |ui| {
+                ui.allocate_ui(egui::vec2(tree_width, 0.0), |ui| {
                     ui.group(|ui| {
                         ui.set_min_height(300.0);
                         egui::ScrollArea::both()
@@ -1577,7 +1577,7 @@ impl<'a> TabContext<'a> {
                 let sep_sense = ui.interact(drag_rect, sep_id, egui::Sense::drag());
                 if sep_sense.dragged() {
                     let delta = sep_sense.drag_delta().x;
-                    evo.tree_pane_fraction = ((tree_width + delta) / avail.x).clamp(0.15, 0.85);
+                    evo.tree_pane_fraction = ((tree_width + delta) / avail_width).clamp(0.15, 0.85);
                 }
                 if sep_sense.hovered() || sep_sense.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);

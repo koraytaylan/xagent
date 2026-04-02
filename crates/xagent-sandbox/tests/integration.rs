@@ -499,3 +499,15 @@ fn touch_contacts_populated_near_food() {
         "Agent within 3 units of food should have a TOUCH_FOOD contact (tag=1)"
     );
 }
+
+// ── UI Snapshot Tests ─────────────────────────────────────────────────
+
+#[test]
+fn evolution_snapshot_default_tree_pane_fraction() {
+    let snap = xagent_sandbox::ui::EvolutionSnapshot::default();
+    assert!(
+        (snap.tree_pane_fraction - 0.25).abs() < f32::EPSILON,
+        "tree_pane_fraction should default to 0.25, got {}",
+        snap.tree_pane_fraction,
+    );
+}

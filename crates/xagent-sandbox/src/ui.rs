@@ -184,7 +184,7 @@ impl Default for EvolutionSnapshot {
             current_config: None,
             fitness_history: std::collections::HashMap::new(),
             selected_node_id: None,
-            tree_pane_fraction: 0.4,
+            tree_pane_fraction: 0.25,
             edit_brain: xagent_shared::BrainConfig::default(),
             edit_governor: xagent_shared::GovernorConfig::default(),
         }
@@ -1544,100 +1544,131 @@ impl<'a> TabContext<'a> {
             let tree_nodes = evo.tree_nodes.clone();
             let current_node_id = evo.current_node_id;
 
-            let avail_width = ui.available_width();
-            let tree_width = (avail_width * evo.tree_pane_fraction).clamp(100.0, avail_width - 100.0);
+            let selected_node_id = evo.selected_node_id;
+            let generation = evo.generation;
+            let current_config = &evo.current_config;
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                // Left pane: tree
-                ui.allocate_ui(egui::vec2(tree_width, 0.0), |ui| {
-                    ui.group(|ui| {
-                        ui.set_min_height(300.0);
-                        ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
-                        ui.add_space(4.0);
-                        egui::ScrollArea::both()
-                            .id_salt("evo_tree_scroll")
-                            .show(ui, |ui| {
-                                Self::render_tree(
-                                    ui,
-                                    &tree_nodes,
-                                    current_node_id,
-                                    &mut evo.selected_node_id,
-                                );
-                            });
+            // Reserve the full remaining rect for the two-pane layout
+            let pane_rect = ui.available_rect_before_wrap();
+            let gap = 4.0;
+            let sep_x = pane_rect.left() + pane_rect.width() * evo.tree_pane_fraction;
+
+            // Draggable separator
+            let sep_interact_rect = egui::Rect::from_x_y_ranges(
+                (sep_x - gap)..=(sep_x + gap),
+                pane_rect.y_range(),
+            );
+            let sep_id = ui.id().with("evo_pane_sep");
+            let sep_sense = ui.interact(sep_interact_rect, sep_id, egui::Sense::drag());
+            if sep_sense.dragged() {
+                let new_x = sep_x + sep_sense.drag_delta().x;
+                evo.tree_pane_fraction =
+                    ((new_x - pane_rect.left()) / pane_rect.width()).clamp(0.15, 0.85);
+            }
+            if sep_sense.hovered() || sep_sense.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            ui.painter().vline(
+                sep_x,
+                pane_rect.y_range(),
+                ui.visuals().widgets.noninteractive.bg_stroke,
+            );
+
+            // Left pane: tree
+            let left_rect = egui::Rect::from_x_y_ranges(
+                pane_rect.left()..=(sep_x - gap),
+                pane_rect.y_range(),
+            );
+            let vertical = egui::Layout::top_down(egui::Align::LEFT);
+            let mut left_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(vertical),
+            );
+            left_ui.group(|ui| {
+                ui.set_min_size(egui::vec2(left_rect.width() - 8.0, left_rect.height() - 8.0));
+                ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
+                ui.add_space(4.0);
+                let scroll_width = ui.available_width();
+                egui::ScrollArea::both()
+                    .id_salt("evo_tree_scroll")
+                    .min_scrolled_width(scroll_width)
+                    .show(ui, |ui| {
+                        ui.set_min_width(scroll_width);
+                        Self::render_tree(
+                            ui,
+                            &tree_nodes,
+                            current_node_id,
+                            &mut evo.selected_node_id,
+                        );
                     });
-                });
-
-                // Draggable separator
-                let sep_resp = ui.separator();
-                let sep_rect = sep_resp.rect;
-                let drag_rect = sep_rect.expand2(egui::vec2(3.0, 0.0));
-                let sep_id = ui.id().with("evo_pane_sep");
-                let sep_sense = ui.interact(drag_rect, sep_id, egui::Sense::drag());
-                if sep_sense.dragged() {
-                    let delta = sep_sense.drag_delta().x;
-                    evo.tree_pane_fraction = ((tree_width + delta) / avail_width).clamp(0.15, 0.85);
-                }
-                if sep_sense.hovered() || sep_sense.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-
-                let selected_node_id = evo.selected_node_id;
-                let generation = evo.generation;
-                let current_config = &evo.current_config;
-
-                // Right pane: detail / overview
-                ui.group(|ui| {
-                    ui.set_min_height(300.0);
-                    // Heading above scroll area
-                    if let Some(sel_id) = selected_node_id {
-                        let heading_text = tree_nodes.iter()
-                            .find(|n| n.id == sel_id)
-                            .map(|n| format!("Generation {}", n.generation))
-                            .unwrap_or_else(|| format!("Generation {}", generation));
-                        ui.heading(heading_text);
-                    } else {
-                        ui.heading(format!("Generation {}", generation));
-                    }
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("evo_detail_scroll")
-                        .show(ui, |ui| {
-                            if let Some(sel_id) = selected_node_id {
-                                Self::render_node_detail(ui, &tree_nodes, sel_id);
-                            }
-
-                            if let Some(cfg) = current_config {
-                                ui.collapsing("Best Config", |ui| {
-                                    egui::Grid::new("config_grid")
-                                        .num_columns(2)
-                                        .spacing([20.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.label("memory_capacity");
-                                            ui.monospace(format!("{}", cfg.memory_capacity));
-                                            ui.end_row();
-                                            ui.label("processing_slots");
-                                            ui.monospace(format!("{}", cfg.processing_slots));
-                                            ui.end_row();
-                                            ui.label("visual_encoding_size");
-                                            ui.monospace(format!("{}", cfg.visual_encoding_size));
-                                            ui.end_row();
-                                            ui.label("representation_dim");
-                                            ui.monospace(format!("{}", cfg.representation_dim));
-                                            ui.end_row();
-                                            ui.label("learning_rate");
-                                            ui.monospace(format!("{:.5}", cfg.learning_rate));
-                                            ui.end_row();
-                                            ui.label("decay_rate");
-                                            ui.monospace(format!("{:.5}", cfg.decay_rate));
-                                            ui.end_row();
-                                        });
-                                });
-                                ui.add_space(4.0);
-                            }
-                        });
-                });
             });
+
+            // Right pane: detail / overview
+            let right_rect = egui::Rect::from_x_y_ranges(
+                (sep_x + gap)..=pane_rect.right(),
+                pane_rect.y_range(),
+            );
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(right_rect)
+                    .layout(vertical),
+            );
+            right_ui.group(|ui| {
+                ui.set_min_size(egui::vec2(right_rect.width() - 8.0, right_rect.height() - 8.0));
+                if let Some(sel_id) = selected_node_id {
+                    let heading_text = tree_nodes.iter()
+                        .find(|n| n.id == sel_id)
+                        .map(|n| format!("Generation {}", n.generation))
+                        .unwrap_or_else(|| format!("Generation {}", generation));
+                    ui.heading(heading_text);
+                } else {
+                    ui.heading(format!("Generation {}", generation));
+                }
+                ui.add_space(4.0);
+                let scroll_width = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .id_salt("evo_detail_scroll")
+                    .min_scrolled_width(scroll_width)
+                    .show(ui, |ui| {
+                        ui.set_min_width(scroll_width);
+                        if let Some(sel_id) = selected_node_id {
+                            Self::render_node_detail(ui, &tree_nodes, sel_id);
+                        }
+
+                        if let Some(cfg) = current_config {
+                            ui.collapsing("Best Config", |ui| {
+                                egui::Grid::new("config_grid")
+                                    .num_columns(2)
+                                    .spacing([20.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label("memory_capacity");
+                                        ui.monospace(format!("{}", cfg.memory_capacity));
+                                        ui.end_row();
+                                        ui.label("processing_slots");
+                                        ui.monospace(format!("{}", cfg.processing_slots));
+                                        ui.end_row();
+                                        ui.label("visual_encoding_size");
+                                        ui.monospace(format!("{}", cfg.visual_encoding_size));
+                                        ui.end_row();
+                                        ui.label("representation_dim");
+                                        ui.monospace(format!("{}", cfg.representation_dim));
+                                        ui.end_row();
+                                        ui.label("learning_rate");
+                                        ui.monospace(format!("{:.5}", cfg.learning_rate));
+                                        ui.end_row();
+                                        ui.label("decay_rate");
+                                        ui.monospace(format!("{:.5}", cfg.decay_rate));
+                                        ui.end_row();
+                                    });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+            });
+
+            // Tell the parent layout we consumed the full rect
+            ui.advance_cursor_after_rect(pane_rect);
         } else {
             ui.heading(format!("Generation {}", evo.generation));
             ui.add_space(4.0);

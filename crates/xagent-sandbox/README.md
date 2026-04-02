@@ -211,11 +211,11 @@ The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as 
 
 #### Evolution Tab
 
-The Evolution tab is a two-column layout (rendered via `ui.columns(2, ...)`):
+The Evolution tab uses a top/bottom split layout:
 
-- **Left pane — Generation tree** (file explorer style): each node is a generation entry. Clicking a node selects it and populates the right panel with its details (status, island ID, fitness, mutations applied, full `BrainConfig`). Dead-end branches (failed/exhausted generations) are **collapsed by default** but can be manually expanded for post-mortem inspection.
-- **Right panel — Generation detail**: shows the selected node's fields when a tree node is clicked; otherwise shows aggregate stats for the current run.
-- **Fitness chart**: one colored line per island (up to 8 distinct colors), so each island's evolutionary trajectory is independently visible. Data comes from `fitness_history_by_island()`, which groups `EvolutionSnapshot.fitness_history` (`HashMap<i64, Vec<(u32, f32, f32)>>`) by island ID.
+- **Top — Fitness chart**: one colored line per island (up to 8 distinct colors), so each island's evolutionary trajectory is independently visible. Data comes from `fitness_history_by_island()`, which groups `EvolutionSnapshot.fitness_history` (`HashMap<i64, Vec<(u32, f32, f32)>>`) by island ID.
+- **Left pane — Generation tree** (25% width, resizable): file explorer style, each node is a generation entry. Clicking a node selects it and populates the right panel with its details (status, island ID, fitness, mutations applied, full `BrainConfig`). Dead-end branches (failed/exhausted generations) are collapsed by default but can be manually expanded for post-mortem inspection. A draggable vertical separator between the panes allows resizing.
+- **Right pane — Generation detail** (75% width, resizable): shows the selected node's fields when a tree node is clicked; otherwise shows aggregate stats for the current run. Both panes fill the remaining vertical space below the fitness chart.
 - **Generation progress bar**: rendered in `TopBottomPanel::top("top_bar")` — always visible regardless of which tab is active. Displays ticks elapsed vs. tick budget for the current generation.
 
 #### Viewport Integration

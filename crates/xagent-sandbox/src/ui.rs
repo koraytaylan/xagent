@@ -1548,6 +1548,7 @@ impl<'a> TabContext<'a> {
             let tree_width = (avail_width * evo.tree_pane_fraction).clamp(100.0, avail_width - 100.0);
 
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
                 // Left pane: tree
                 ui.allocate_ui(egui::vec2(tree_width, 0.0), |ui| {
                     ui.group(|ui| {
@@ -1570,7 +1571,7 @@ impl<'a> TabContext<'a> {
                 // Draggable separator
                 let sep_resp = ui.separator();
                 let sep_rect = sep_resp.rect;
-                let drag_rect = sep_rect.expand2(egui::vec2(4.0, 0.0));
+                let drag_rect = sep_rect.expand2(egui::vec2(3.0, 0.0));
                 let sep_id = ui.id().with("evo_pane_sep");
                 let sep_sense = ui.interact(drag_rect, sep_id, egui::Sense::drag());
                 if sep_sense.dragged() {

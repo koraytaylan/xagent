@@ -968,11 +968,11 @@ impl Governor {
     }
 
     /// Per-island fitness history: island_id → Vec<(generation, best_fitness, avg_fitness)>.
-    /// Nodes without an island_id (e.g., root) are excluded.
+    /// Nodes without an island_id (pre-migration data) are grouped under key -1.
     pub fn fitness_history_by_island(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
         let mut stmt = match self.db.prepare(
             "SELECT island_id, generation, best_fitness, avg_fitness FROM node
-             WHERE run_id = ?1 AND best_fitness IS NOT NULL AND island_id IS NOT NULL
+             WHERE run_id = ?1 AND best_fitness IS NOT NULL
              ORDER BY island_id, generation ASC",
         ) {
             Ok(s) => s,
@@ -982,15 +982,16 @@ impl Governor {
             std::collections::HashMap::new();
         if let Ok(rows) = stmt.query_map(params![self.run_id], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(0)?,
                 row.get::<_, u32>(1)?,
                 row.get::<_, f32>(2)?,
                 row.get::<_, Option<f32>>(3)?.unwrap_or(0.0),
             ))
         }) {
             for r in rows.flatten() {
-                let (island_id, gen, best, avg) = r;
-                map.entry(island_id).or_default().push((gen, best, avg));
+                let (island_id_opt, gen, best, avg) = r;
+                let key = island_id_opt.unwrap_or(-1);
+                map.entry(key).or_default().push((gen, best, avg));
             }
         }
         map

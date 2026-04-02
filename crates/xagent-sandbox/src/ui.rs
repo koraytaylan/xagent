@@ -1671,7 +1671,8 @@ impl<'a> TabContext<'a> {
         ui: &mut egui::Ui,
         fitness_history: &std::collections::HashMap<i64, Vec<(u32, f32, f32)>>,
     ) {
-        ui.collapsing("Fitness Over Generations", |ui| {
+        {
+            let ui = &mut *ui;
             let avail = ui.available_width().max(200.0);
             let chart_height = 150.0;
             let (rect, _) = ui.allocate_exact_size(
@@ -1753,7 +1754,7 @@ impl<'a> TabContext<'a> {
                 }
                 ui.label(format!("Max: {:.4}", global_max_fit));
             });
-        });
+        }
         ui.add_space(4.0);
     }
 

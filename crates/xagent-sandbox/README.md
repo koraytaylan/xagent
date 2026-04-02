@@ -417,15 +417,18 @@ in the direction determined by the pixel's grid position within the FOV. The ray
 marches in 1.0-unit steps until it hits terrain (point below the heightmap surface),
 another agent, or reaches max distance.
 
-**Hit color** is determined by what the ray strikes:
+**Hit color** is determined by what the ray strikes first (checked in this order):
 
-| Target | RGBA |
-|---|---|
-| FoodRich terrain | `[0.15, 0.50, 0.10, 1.0]` |
-| Barren terrain | `[0.50, 0.40, 0.20, 1.0]` |
-| Danger terrain | `[0.60, 0.20, 0.10, 1.0]` |
-| Other agent | `[0.90, 0.20, 0.60, 1.0]` (magenta) |
-| Sky (miss) | `[0.53, 0.81, 0.92, 1.0]` (early-out) |
+| Target | RGBA | Priority |
+|---|---|---|
+| Food item | `[0.70, 0.95, 0.20, 1.0]` (lime green) | 1st — spatial grid lookup |
+| Other agent | `[0.90, 0.20, 0.60, 1.0]` (magenta) | 2nd |
+| FoodRich terrain | `[0.15, 0.50, 0.10, 1.0]` | 3rd |
+| Barren terrain | `[0.50, 0.40, 0.20, 1.0]` | 3rd |
+| Danger terrain | `[0.60, 0.20, 0.10, 1.0]` | 3rd |
+| Sky (miss) | `[0.53, 0.81, 0.92, 1.0]` (early-out) | fallback |
+
+A single unified `march_ray_unified` function handles all targets via an `AgentSlice` enum dispatch, ensuring both the `extract_senses` and `extract_senses_with_positions` paths see food identically.
 
 Depth is normalized to `[0, 1]` by dividing by `max_dist` (50.0).
 
@@ -613,9 +616,9 @@ When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) an
 2. `mutate_config()` perturbs the parent's `BrainConfig`:
    - Floats (`learning_rate`, `decay_rate`): multiplied by uniform random in [0.9, 1.1],
      clamped to ≥ 0.0001.
-   - Integers (`memory_capacity`, `processing_slots`, `representation_dim`):
+   - Integers (`memory_capacity`, `processing_slots`):
      multiplied by [0.9, 1.1], rounded, clamped to ≥ 1.
-   - `visual_encoding_size` is **not mutated** (must match shared sensory pipeline).
+   - `visual_encoding_size` and `representation_dim` are **not mutated** (visual_encoding_size must match the sensory pipeline; representation_dim is locked to prevent weight inheritance breakage across generations).
 3. Child spawns near parent (±5 units offset), generation = parent generation + 1.
 4. Child gets a fresh brain with the mutated config.
 
@@ -832,11 +835,11 @@ Each frame, when the window requests a redraw:
 ```
 ┌────────────────────────┐
 │  WorldState            │     ┌───────────────────────┐
-│  ├─ terrain (heights)  │────►│ sample_vision()       │
+│  ├─ terrain (heights)  │────►│ march_ray_unified()   │
 │  ├─ biome_map          │     │  8×6 grid, 90° FOV    │──► vision.color [192 floats]
 │  └─ food_items         │     │  50.0 max depth       │──► vision.depth [48 floats]
 │                        │     │  1.0 ray step         │
-│                        │     │  detects agents too   │
+│                        │     │  food + agents + terrain│
 │                        │     └───────────────────────┘
 │                        │
 │  AgentBody             │     ┌───────────────────────┐
@@ -861,14 +864,14 @@ Each frame, when the window requests a redraw:
 
 ### What the Brain "Sees" vs What the Renderer Shows
 
-The brain receives an **8 × 6 biome-colored depth image** from simplified raycasting.
+The brain receives an **8 × 6 colored depth image** from simplified raycasting.
 The renderer shows the actual **textured terrain mesh** with height-blended vertex
 colors. These are related but not identical:
 
-- The brain's vision uses flat biome colors (3 terrain options + agent magenta + sky).
-- The renderer shows smooth height-based color gradients per biome.
-- The brain **can see other agents** in its visual field (rendered as magenta
-  `[0.9, 0.2, 0.6, 1.0]`), as well as detecting them via touch contacts.
+- The brain's vision uses flat biome colors (3 terrain options + food lime-green + agent magenta + sky).
+- The renderer shows smooth height-based color gradients per biome with 3D food/agent cubes.
+- The brain **can see food items** (lime green `[0.70, 0.95, 0.20, 1.0]`) and **other agents** (magenta `[0.9, 0.2, 0.6, 1.0]`) in its visual field.
+- The brain also receives **touch contacts** — the top 4 contacts by intensity are encoded into 16 features (direction, intensity, surface tag).
 
 ### Touch Contact Generation
 
@@ -917,7 +920,7 @@ death/respawn.
 - When enabled: agent must survive 5000 ticks continuously.
 - **Once per life**: `has_reproduced` flag prevents repeated spawning.
 - **Population cap**: `MAX_AGENTS = 100`.
-- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `visual_encoding_size` is preserved (must match the sensory pipeline).
+- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `visual_encoding_size` and `representation_dim` are preserved (visual_encoding_size must match the sensory pipeline; representation_dim is locked to prevent weight inheritance breakage across generations).
 - **Generation tracking**: Generation increments on each death/respawn, tracking how many lives the agent has lived.
 
 ### Telemetry Focus
@@ -1082,7 +1085,7 @@ optimization at this scale.
 
 | Limitation | Detail |
 |---|---|
-| Simplified vision | Agents see biome-colored raycasts, not the actual rendered scene. No agent/food visibility in visual field. |
+| Simplified vision | Agents see biome-colored raycasts, not the actual rendered scene. Food items and other agents are visible as distinct colors (lime green and magenta respectively). |
 | No audio channel | No sound-based sensory input — agents are effectively deaf. |
 | Flat-ish terrain | Multi-octave noise produces rolling hills (±6.5 units) but no caves, overhangs, or vertical features. |
 | No object manipulation | Agents cannot carry, build, or reshape the world. Push action has no physics effect. |

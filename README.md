@@ -142,8 +142,8 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 
 - Physical simulation: gravity, locomotion, collision with terrain
 - Internal state: energy (depletes over time and with movement) and integrity (damaged by hazards, regenerates when energy > 50%)
-- Sensory apparatus: 8×6 raycast vision (ray step 1.0), touch contacts (food, terrain edges, hazards, other agents), proprioception, interoception
-- **Agent vision**: ray marching detects terrain, food, and other agents (rendered as magenta `[0.9, 0.2, 0.6, 1.0]` in the visual field)
+- Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (food, terrain edges, hazards, other agents — top 4 encoded into brain), proprioception, interoception
+- **Agent vision**: ray marching detects terrain (biome-colored), food items (lime green `[0.70, 0.95, 0.20, 1.0]`), and other agents (magenta `[0.9, 0.2, 0.6, 1.0]`) in the visual field
 - **Agent-agent collision**: physical collision resolution pushes overlapping agents apart (2-unit minimum separation)
 - Death occurs when energy or integrity reaches zero → respawn with optional brain persistence
 
@@ -267,7 +267,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `memory_capacity` | Max stored patterns. Smaller → faster forgetting, stronger capacity pressure. |
 | `processing_slots` | Max recall operations per tick. Smaller → narrower attention. |
 | `visual_encoding_size` | Resolution of visual encoding (average-pooled bins). Smaller → coarser visual perception. |
-| `representation_dim` | Internal representation vector length. Smaller → more compression, more abstraction. |
+| `representation_dim` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |

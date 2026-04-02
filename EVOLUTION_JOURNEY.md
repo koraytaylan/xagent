@@ -50,15 +50,15 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 **Lesson:** Life boundaries are discontinuities. The history from one life must not leak credit into the next.
 
-### 5. Agent Couldn't See Food
+### 5. Agent Couldn't See Food (The Duplication Bug)
 
-**Symptom:** 600+ generations, no food-seeking behavior.
+**Symptom:** 600+ generations, no food-seeking behavior. Agents acted completely randomly after 10+ hours of evolution. Flat fitness graph.
 
-**Root cause:** Ray marching checked terrain biome colors and other agents, but never food items. Inside a green biome, every direction looked identical. Zero directional signal.
+**Root cause:** Two separate ray-march functions existed: `march_ray` (checked food, agents, terrain) and `march_ray_positions` (checked agents and terrain only — no food). Both `main.rs` and `headless.rs` used `extract_senses_with_positions`, which called the broken function. Agents were completely blind to food during all actual simulation runs. Credit assignment reinforced noise because there was no distinguishable visual state before eating food.
 
-**Fix:** Added food item detection to ray marching via spatial grid lookup.
+**Fix:** Unified both functions into `march_ray_unified` with an `AgentSlice` enum that dispatches agent-hit checks. Food detection (via spatial grid lookup, lime green `[0.70, 0.95, 0.20]`) is now in the single code path. Added integration tests that verify both extraction paths see food.
 
-**Lesson:** Before optimizing a learning algorithm, verify the agent has access to the information it needs to learn from.
+**Lesson:** Code duplication is a bug factory. When two functions do the same thing, they will eventually diverge. The fix isn't adding the missing code to both — it's eliminating the duplication. Also: before optimizing a learning algorithm, verify the agent has access to the information it needs to learn from.
 
 ### 6. Encoder Destroyed Spatial Information
 
@@ -145,6 +145,26 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 **Fix:** Per-parameter momentum vectors (one set per island). After each generation, offspring that beat their parent contribute their mutation deltas to an exponentially-decaying momentum. Future perturbations are biased toward winning directions. This provides: (A) directional bias — parameters trend toward values that improve fitness, (B) emergent correlated mutations — parameters that consistently move together develop aligned momentum, (C) selective focus — parameters with strong signal get larger perturbations while stagnant ones stay near random noise.
 
 **Lesson:** Evolution with memory is faster than evolution without. The same principle that makes gradient descent faster than random search applies to neuroevolution — you don't need exact gradients, just a noisy directional signal accumulated over time.
+
+### 15. `representation_dim` Mutation Destroyed Weight Inheritance
+
+**Symptom:** Offspring frequently started from random initialization despite weight inheritance code being present.
+
+**Root cause:** `representation_dim` was evolvable via both mutation and crossover. When a child's `representation_dim` differed from the parent's, all three weight imports — encoder (`repr_dim × feature_count`), action selector (`repr_dim × 2 + 2`), and predictor (`repr_dim × repr_dim`) — were silently skipped because the dimension check in `import_weights` failed. The child started from a fresh random brain every time this happened.
+
+**Fix:** Locked `representation_dim` — removed it from both `mutate_config_with_strength` and `crossover_config`. The field remains in `BrainConfig` for population-level configuration but never changes across generations.
+
+**Lesson:** Silent failures are the worst kind. The `import_weights` guard that skips mismatched dimensions is correct safety behavior, but the upstream code that freely mutated the dimension was silently defeating the entire inheritance mechanism. When a safety guard fires, it should log — or better, the condition should be prevented upstream.
+
+### 16. Touch Contacts Computed But Never Encoded
+
+**Symptom:** Agents had no tactile sense despite touch infrastructure being fully wired on the sensing side.
+
+**Root cause:** `detect_touch()` and `detect_touch_positions()` populated `frame.touch_contacts` every tick (food proximity, terrain edges, hazard zones, other agents). But `extract_features_into()` in the encoder never read `touch_contacts` — the feature vector contained only visual and proprioceptive/interoceptive features (9 non-visual features). Touch data was computed and discarded.
+
+**Fix:** Encoder now encodes the top 4 touch contacts (by intensity) into 16 additional features: direction.x, direction.z, intensity, and normalized surface_tag for each. `NON_VISUAL_FEATURES` increased from 9 to 25.
+
+**Lesson:** An untested data path is a broken data path. The sensing side was correct; the encoding side never consumed it. Integration tests that verify end-to-end data flow (sensor → encoder → feature vector) catch this class of bug.
 
 ---
 

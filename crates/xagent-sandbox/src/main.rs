@@ -378,6 +378,7 @@ impl App {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
                     evo_snapshot.current_node_id = gov.current_node_id;
                     evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                    evo_snapshot.best_fitness = gov.best_score();
                 }
                 println!(
                     "[GOVERNOR] Found previous session at generation {} in {}",
@@ -2013,6 +2014,7 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
                                     self.evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                                    self.evo_snapshot.best_fitness = gov.best_score();
                                 }
                                 let wall = self.evo_wall_accumulated
                                     + self.evo_wall_segment_start
@@ -2031,6 +2033,7 @@ impl ApplicationHandler for App {
                                 let gen_tick = evo_snap.gen_tick;
                                 let tick_budget = evo_snap.tick_budget;
                                 let evo_generation = evo_snap.generation;
+                                let best_fitness = evo_snap.best_fitness;
                                 let mut evo_action = EvolutionAction::None;
 
                                 // Build world snapshot for mini-map
@@ -2145,6 +2148,13 @@ impl ApplicationHandler for App {
                                                     ui.label(format!("{}h {:02}m {:02}s", hours, mins, secs));
                                                     ui.separator();
                                                     ui.label(format!("{:.0} ticks/s", ticks_per_sec));
+                                                }
+                                                if matches!(&evo_state, EvolutionState::Running | EvolutionState::Paused) && best_fitness >= 0.0 {
+                                                    ui.separator();
+                                                    ui.label(
+                                                        egui::RichText::new(format!("Best: {:.4}", best_fitness))
+                                                            .color(egui::Color32::from_rgb(50, 200, 80)),
+                                                    );
                                                 }
                                                 // Generation progress bar (compact, in toolbar)
                                                 if matches!(&evo_state, EvolutionState::Running | EvolutionState::Paused) && tick_budget > 0 {

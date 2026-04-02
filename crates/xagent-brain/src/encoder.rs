@@ -5,8 +5,17 @@ use rand::SeedableRng;
 use xagent_shared::SensoryFrame;
 
 /// Number of non-visual features: velocity_mag, facing(x,y,z), angular_vel,
-/// energy, integrity, energy_delta, integrity_delta.
-const NON_VISUAL_FEATURES: usize = 9;
+/// energy, integrity, energy_delta, integrity_delta (9 proprioceptive/interoceptive)
+/// + 4 touch contacts × 4 features each (direction.x, direction.z, intensity,
+/// normalized surface_tag) = 25 total.
+const NON_VISUAL_FEATURES: usize = 25;
+
+/// Maximum number of touch contacts encoded into the feature vector.
+/// The strongest contacts by intensity are selected; remaining slots are zero-padded.
+const MAX_TOUCH_CONTACTS: usize = 4;
+
+/// Features per touch contact: direction.x, direction.z, intensity, surface_tag/4.0.
+const TOUCH_FEATURES_PER_CONTACT: usize = 4;
 
 /// Channels per pixel in the raw visual encoding: R, G, B, depth.
 const CHANNELS_PER_PIXEL: usize = 4;
@@ -275,6 +284,51 @@ impl SensoryEncoder {
         self.feature_scratch[cursor + 6] = frame.integrity_signal;
         self.feature_scratch[cursor + 7] = frame.energy_delta;
         self.feature_scratch[cursor + 8] = frame.integrity_delta;
+
+        // Touch contacts: top MAX_TOUCH_CONTACTS by intensity, 4 features each.
+        // The brain receives direction, proximity, and an opaque surface tag —
+        // it must learn what each tag value correlates with through experience.
+        let touch_start = cursor + 9;
+        let mut contact_count = frame.touch_contacts.len().min(MAX_TOUCH_CONTACTS);
+
+        if contact_count > 0 {
+            // Find the top contacts by intensity without allocating.
+            // We use a simple selection: for each slot, find the strongest
+            // unused contact. With MAX_TOUCH_CONTACTS=4, this is 4×N comparisons
+            // which is fine for typical contact counts (<10).
+            let mut used = [false; 64]; // more than enough for any realistic contact count
+            for slot in 0..contact_count {
+                let mut best_idx = usize::MAX;
+                let mut best_intensity = -1.0_f32;
+                for (ci, contact) in frame.touch_contacts.iter().enumerate() {
+                    if ci < used.len() && !used[ci] && contact.intensity > best_intensity {
+                        best_intensity = contact.intensity;
+                        best_idx = ci;
+                    }
+                }
+                if best_idx == usize::MAX {
+                    // Fewer usable contacts than expected
+                    contact_count = slot;
+                    break;
+                }
+                used[best_idx] = true;
+                let c = &frame.touch_contacts[best_idx];
+                let base = touch_start + slot * TOUCH_FEATURES_PER_CONTACT;
+                self.feature_scratch[base] = c.direction.x;
+                self.feature_scratch[base + 1] = c.direction.z;
+                self.feature_scratch[base + 2] = c.intensity;
+                self.feature_scratch[base + 3] = c.surface_tag as f32 / 4.0;
+            }
+        }
+
+        // Zero-pad remaining touch slots
+        for slot in contact_count..MAX_TOUCH_CONTACTS {
+            let base = touch_start + slot * TOUCH_FEATURES_PER_CONTACT;
+            self.feature_scratch[base] = 0.0;
+            self.feature_scratch[base + 1] = 0.0;
+            self.feature_scratch[base + 2] = 0.0;
+            self.feature_scratch[base + 3] = 0.0;
+        }
     }
 }
 
@@ -435,8 +489,8 @@ mod tests {
         let mut enc = SensoryEncoder::new(8, 4);
         let frame = make_frame(0.5, 0.5);
         let feats = enc.extract_features(&frame);
-        // 4×3 pixels × 4 channels (RGBD) + 9 interoceptive = 57
-        assert_eq!(feats.len(), 4 * 3 * 4 + 9);
+        // 4×3 pixels × 4 channels (RGBD) + 25 non-visual (9 proprioceptive/interoceptive + 16 touch) = 73
+        assert_eq!(feats.len(), 4 * 3 * 4 + NON_VISUAL_FEATURES);
     }
 
     #[test]

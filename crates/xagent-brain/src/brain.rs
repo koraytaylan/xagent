@@ -568,8 +568,8 @@ mod tests {
         // feature_count must be > 0 immediately after construction
         // (GPU pipeline reads it before the first tick).
         let fc = brain.encoder.feature_count();
-        // 8×6 pixels × 4 channels (RGBD) + 9 interoceptive = 201
-        assert_eq!(fc, 8 * 6 * 4 + 9, "feature_count should reflect 8×6 RGBD + interoception");
+        // 8×6 pixels × 4 channels (RGBD) + 25 non-visual (9 proprioceptive/interoceptive + 16 touch) = 217
+        assert_eq!(fc, 8 * 6 * 4 + 25, "feature_count should reflect 8×6 RGBD + non-visual features");
     }
 
     #[test]

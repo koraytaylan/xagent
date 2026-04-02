@@ -227,13 +227,25 @@ impl Governor {
         let config: GovernorConfig =
             serde_json::from_str(&governor_json).unwrap_or_default();
 
-        let (node_id, generation): (i64, u32) = db.query_row(
-            "SELECT id, generation FROM node
-             WHERE run_id = ?1 AND status = 'active'
-             ORDER BY generation DESC LIMIT 1",
-            params![run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        // Prefer an active node; fall back to the most recent node of any status
+        // (covers the case where the app was stopped after evaluation but before breeding).
+        let (node_id, generation): (i64, u32) = db
+            .query_row(
+                "SELECT id, generation FROM node
+                 WHERE run_id = ?1 AND status = 'active'
+                 ORDER BY generation DESC LIMIT 1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .or_else(|_| {
+                db.query_row(
+                    "SELECT id, generation FROM node
+                     WHERE run_id = ?1
+                     ORDER BY generation DESC LIMIT 1",
+                    params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })?;
 
         // Reconstruct all islands from the persisted best state
         let num_islands = config.num_islands.max(1);

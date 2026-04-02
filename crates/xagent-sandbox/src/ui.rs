@@ -1556,11 +1556,11 @@ impl<'a> TabContext<'a> {
                 ui.allocate_ui(egui::vec2(tree_width, 0.0), |ui| {
                     ui.group(|ui| {
                         ui.set_min_height(300.0);
+                        ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
+                        ui.add_space(4.0);
                         egui::ScrollArea::both()
                             .id_salt("evo_tree_scroll")
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
-                                ui.add_space(4.0);
                                 Self::render_tree(
                                     ui,
                                     &tree_nodes,

@@ -6,7 +6,6 @@ use crate::world::Mesh;
 use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
-use xagent_brain::encoder::MAX_REPR_DIM;
 
 /// Upper bound for memory_capacity to prevent GPU buffer overflow.
 /// Large preset uses 512; 2048 gives ~4x evolutionary headroom.

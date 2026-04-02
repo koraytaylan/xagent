@@ -1974,45 +1974,8 @@ impl<'a> TabContext<'a> {
             .map(|f| format!("{:.4}", f))
             .unwrap_or_else(|| "—".into());
 
-        // Short mutation summary: just arrows, no values (details in the detail panel)
-        let mutation_str = if !node.mutations.is_empty() {
-            let parts: Vec<String> = node
-                .mutations
-                .iter()
-                .map(|(p, d)| {
-                    let short = match p.as_str() {
-                        "memory_capacity" => "mem",
-                        "processing_slots" => "slots",
-                        "representation_dim" => "repr",
-                        "learning_rate" => "lr",
-                        "decay_rate" => "decay",
-                        "distress_exponent" => "distress",
-                        "habituation_sensitivity" => "hab",
-                        "max_curiosity_bonus" => "curiosity",
-                        "fatigue_recovery_sensitivity" => "fat_rec",
-                        "fatigue_floor" => "fat_fl",
-                        other => other,
-                    };
-                    format!("{}{}", short, if *d > 0.0 { "↑" } else { "↓" })
-                })
-                .collect();
-            format!(" ({})", parts.join(" "))
-        } else {
-            String::new()
-        };
-
-        let status_icon = match node.status.as_str() {
-            "failed" => " [X]",
-            "exhausted" => " [--]",
-            "successful" => " [OK]",
-            _ => "",
-        };
-
         let current_marker = if is_current { ">> " } else { "" };
 
-        format!(
-            "{}Gen {} fit={}{}{}",
-            current_marker, node.generation, fitness_str, mutation_str, status_icon,
-        )
+        format!("{}Gen {} {}", current_marker, node.generation, fitness_str)
     }
 }

@@ -2201,4 +2201,77 @@ mod tests {
         assert_eq!(island_0.len(), 2, "island 0 should have 2 data points");
         assert_eq!(island_1.len(), 2, "island 1 should have 2 data points");
     }
+
+    #[test]
+    fn fitness_history_by_island_tracks_failed_branches() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 2,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 2,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Gen 0 (island 0): success (root, no island_id — excluded from per-island map)
+        gov.advance(&mock_fitness(0.5));
+        // Gen 1 (island 1): success
+        gov.advance(&mock_fitness(0.5));
+        // Gen 2 (island 0): fail — fitness drops
+        gov.advance(&mock_fitness(0.1));
+        // Gen 3 (island 1): fail
+        gov.advance(&mock_fitness(0.1));
+        // Gen 4 (island 0): fail again — second data point for island 0
+        gov.advance(&mock_fitness(0.1));
+
+        let history = gov.fitness_history_by_island();
+        // Both islands should have data points even for failed generations
+        assert!(history.contains_key(&0));
+        assert!(history.contains_key(&1));
+        // Each island should have at least 2 data points
+        assert!(history[&0].len() >= 2);
+        assert!(history[&1].len() >= 2);
+    }
+
+    #[test]
+    fn tree_nodes_include_island_id() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 2,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        let root_id = gov.current_node_id.unwrap();
+
+        // Advance twice (one per island)
+        gov.advance(&mock_fitness(0.1));
+        gov.advance(&mock_fitness(0.2));
+
+        let nodes = gov.tree_nodes();
+        // Root should have island_id = None
+        let root_node = nodes.iter().find(|n| n.id == root_id).unwrap();
+        assert_eq!(root_node.island_id, None);
+
+        // Non-root nodes should have island_id set
+        let non_root: Vec<&TreeNode> = nodes.iter().filter(|n| n.id != root_id).collect();
+        assert!(!non_root.is_empty());
+        for node in non_root {
+            assert!(node.island_id.is_some(), "node {} should have island_id", node.id);
+        }
+    }
 }

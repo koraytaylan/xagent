@@ -720,9 +720,9 @@ impl Governor {
         // reference a tested config rather than an untested random mutant.
         let config_json = serde_json::to_string(&parent_config).unwrap_or_default();
         let _ = self.db.execute(
-            "INSERT INTO node (run_id, parent_id, generation, config_json, status)
-             VALUES (?1, ?2, ?3, ?4, 'active')",
-            params![self.run_id, Some(spawn_parent), self.generation, config_json],
+            "INSERT INTO node (run_id, parent_id, generation, config_json, status, island_id)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            params![self.run_id, Some(spawn_parent), self.generation, config_json, self.active_island as i64],
         );
         let new_node_id = self.db.last_insert_rowid();
         self.current_node_id = Some(new_node_id);
@@ -1073,6 +1073,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             mutation_direction REAL,
             status TEXT DEFAULT 'active',
             spawn_attempts INTEGER DEFAULT 0,
+            island_id INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -1101,6 +1102,11 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add momentum_json if missing
     let _ = db.execute_batch(
         "ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';"
+    );
+
+    // Backwards-compatible migration: add island_id if missing
+    let _ = db.execute_batch(
+        "ALTER TABLE node ADD COLUMN island_id INTEGER;"
     );
 
     Ok(())
@@ -2089,5 +2095,58 @@ mod tests {
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
         assert_eq!(gov.momentums.len(), 3);
+    }
+
+    #[test]
+    fn breed_stores_island_id_on_node() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 3,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+        let root_id = gov.current_node_id.unwrap();
+
+        // Root node should have island_id NULL (created before islands assigned)
+        let root_island: Option<i64> = gov.db
+            .query_row("SELECT island_id FROM node WHERE id = ?1", params![root_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(root_island, None);
+
+        // Advance 3 times — one generation per island (round-robin: 0, 1, 2)
+        gov.advance(&mock_fitness(0.1)); // island 0 evaluates gen 0, breeds gen 1 for island 1
+        gov.advance(&mock_fitness(0.1)); // island 1 evaluates gen 1, breeds gen 2 for island 2
+        gov.advance(&mock_fitness(0.1)); // island 2 evaluates gen 2, breeds gen 3 for island 0
+
+        // Check that bred nodes have island_id set
+        let mut stmt = gov.db.prepare(
+            "SELECT id, island_id FROM node WHERE run_id = ?1 AND id != ?2 ORDER BY id"
+        ).unwrap();
+        let rows: Vec<(i64, Option<i64>)> = stmt.query_map(
+            params![gov.run_id, root_id],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap().flatten().collect();
+
+        // Each bred node should have a non-null island_id
+        assert!(!rows.is_empty());
+        for (node_id, island_id) in &rows {
+            assert!(island_id.is_some(), "node {} should have island_id set", node_id);
+        }
+
+        // Three advances over 3 islands: should see each of 0, 1, 2 represented
+        let ids: Vec<i64> = rows.iter()
+            .map(|(_, island_id)| island_id.unwrap())
+            .collect();
+        assert!(ids.contains(&0), "should have island 0");
+        assert!(ids.contains(&1), "should have island 1");
+        assert!(ids.contains(&2), "should have island 2");
     }
 }

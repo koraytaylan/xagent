@@ -1300,7 +1300,8 @@ impl<'a> TabContext<'a> {
     fn render_evolution_tab(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) -> EvolutionAction {
         let mut action = EvolutionAction::None;
 
-        match &evo.state {
+        let state = evo.state.clone();
+        match state {
             EvolutionState::Idle => {
                 ui.heading("🧬 New Evolution Run");
                 ui.add_space(8.0);
@@ -1346,7 +1347,7 @@ impl<'a> TabContext<'a> {
             }
 
             EvolutionState::Running | EvolutionState::Paused => {
-                let is_running = evo.state == EvolutionState::Running;
+                let is_running = state == EvolutionState::Running;
                 Self::render_running_dashboard(ui, evo, is_running);
             }
         }
@@ -1456,7 +1457,7 @@ impl<'a> TabContext<'a> {
         });
     }
 
-    fn render_config_summary(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
+    fn render_config_summary(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
         if let Some(cfg) = &evo.current_config {
             ui.collapsing("🧠 Brain Config", |ui| {
                 egui::Grid::new("brain_summary_grid")
@@ -1518,92 +1519,142 @@ impl<'a> TabContext<'a> {
         });
 
         if !evo.fitness_history.is_empty() {
-            Self::render_fitness_chart(ui, evo);
+            Self::render_fitness_chart(ui, &evo.fitness_history);
         }
 
         if !evo.tree_nodes.is_empty() {
-            ui.collapsing("🌳 Evolution Tree", |ui| {
-                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id);
+            ui.collapsing("Evolution Tree", |ui| {
+                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id, &mut evo.selected_node_id);
             });
         }
     }
 
     fn render_running_dashboard(
         ui: &mut egui::Ui,
-        evo: &EvolutionSnapshot,
-        is_running: bool,
+        evo: &mut EvolutionSnapshot,
+        _is_running: bool,
     ) {
-        // ── Header ──────────────────────────────────────────
-        ui.heading(format!("Generation {}", evo.generation));
-        ui.add_space(4.0);
+        let tree_has_nodes = !evo.tree_nodes.is_empty();
 
-        // ── Progress bar ────────────────────────────────────
-        let progress = if evo.tick_budget > 0 {
-            evo.gen_tick as f32 / evo.tick_budget as f32
+        if tree_has_nodes {
+            // Clone tree data for rendering (tree_nodes needed by both panes;
+            // original stays on evo so selected_node_id writes persist).
+            let tree_nodes = evo.tree_nodes.clone();
+            let current_node_id = evo.current_node_id;
+
+            ui.columns(2, |columns| {
+                // Left pane: tree (writes evo.selected_node_id on click)
+                columns[0].group(|ui| {
+                    ui.set_min_height(300.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("evo_tree_scroll")
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
+                            ui.add_space(4.0);
+                            Self::render_tree(
+                                ui,
+                                &tree_nodes,
+                                current_node_id,
+                                &mut evo.selected_node_id,
+                            );
+                        });
+                });
+
+                // Read selected_node_id AFTER tree renders (no one-frame lag)
+                let selected_node_id = evo.selected_node_id;
+                let generation = evo.generation;
+                let current_config = &evo.current_config;
+                let fitness_history = &evo.fitness_history;
+
+                // Right pane: detail / overview
+                columns[1].group(|ui| {
+                    ui.set_min_height(300.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("evo_detail_scroll")
+                        .show(ui, |ui| {
+                            if let Some(sel_id) = selected_node_id {
+                                Self::render_node_detail(ui, &tree_nodes, sel_id);
+                            } else {
+                                ui.heading(format!("Generation {}", generation));
+                                ui.add_space(4.0);
+                            }
+
+                            if let Some(cfg) = current_config {
+                                ui.collapsing("Best Config", |ui| {
+                                    egui::Grid::new("config_grid")
+                                        .num_columns(2)
+                                        .spacing([20.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label("memory_capacity");
+                                            ui.monospace(format!("{}", cfg.memory_capacity));
+                                            ui.end_row();
+                                            ui.label("processing_slots");
+                                            ui.monospace(format!("{}", cfg.processing_slots));
+                                            ui.end_row();
+                                            ui.label("visual_encoding_size");
+                                            ui.monospace(format!("{}", cfg.visual_encoding_size));
+                                            ui.end_row();
+                                            ui.label("representation_dim");
+                                            ui.monospace(format!("{}", cfg.representation_dim));
+                                            ui.end_row();
+                                            ui.label("learning_rate");
+                                            ui.monospace(format!("{:.5}", cfg.learning_rate));
+                                            ui.end_row();
+                                            ui.label("decay_rate");
+                                            ui.monospace(format!("{:.5}", cfg.decay_rate));
+                                            ui.end_row();
+                                        });
+                                });
+                                ui.add_space(4.0);
+                            }
+
+                            if !fitness_history.is_empty() {
+                                Self::render_fitness_chart(ui, fitness_history);
+                            }
+                        });
+                });
+            });
         } else {
-            0.0
-        };
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .text(format!(
-                    "{} / {} ticks ({:.0}%)",
-                    evo.gen_tick, evo.tick_budget, progress * 100.0,
-                ))
-                .animate(is_running),
-        );
-        ui.add_space(8.0);
-
-        // ── Timing stats ────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label(format!("Pop: {} | Elite: {} | Patience: {}",
-                             evo.population_size, evo.elitism_count, evo.patience));
-        });
-        ui.separator();
-
-        // ── Current best config ─────────────────────────────
-        if let Some(cfg) = &evo.current_config {
-            ui.collapsing("🧬 Best Config", |ui| {
-                egui::Grid::new("config_grid")
-                    .num_columns(2)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("memory_capacity");
-                        ui.monospace(format!("{}", cfg.memory_capacity));
-                        ui.end_row();
-                        ui.label("processing_slots");
-                        ui.monospace(format!("{}", cfg.processing_slots));
-                        ui.end_row();
-                        ui.label("visual_encoding_size");
-                        ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
-                        ui.label("representation_dim");
-                        ui.monospace(format!("{}", cfg.representation_dim));
-                        ui.end_row();
-                        ui.label("learning_rate");
-                        ui.monospace(format!("{:.5}", cfg.learning_rate));
-                        ui.end_row();
-                        ui.label("decay_rate");
-                        ui.monospace(format!("{:.5}", cfg.decay_rate));
-                        ui.end_row();
-                    });
-            });
+            ui.heading(format!("Generation {}", evo.generation));
             ui.add_space(4.0);
-        }
-
-        // ── Fitness chart ───────────────────────────────────
-        if !evo.fitness_history.is_empty() {
-            Self::render_fitness_chart(ui, evo);
-        }
-
-        // ── Evolution tree ──────────────────────────────────
-        if !evo.tree_nodes.is_empty() {
-            ui.collapsing("🌳 Evolution Tree", |ui| {
-                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id);
-            });
+            if let Some(cfg) = &evo.current_config {
+                ui.collapsing("Best Config", |ui| {
+                    egui::Grid::new("config_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("memory_capacity");
+                            ui.monospace(format!("{}", cfg.memory_capacity));
+                            ui.end_row();
+                            ui.label("processing_slots");
+                            ui.monospace(format!("{}", cfg.processing_slots));
+                            ui.end_row();
+                            ui.label("visual_encoding_size");
+                            ui.monospace(format!("{}", cfg.visual_encoding_size));
+                            ui.end_row();
+                            ui.label("representation_dim");
+                            ui.monospace(format!("{}", cfg.representation_dim));
+                            ui.end_row();
+                            ui.label("learning_rate");
+                            ui.monospace(format!("{:.5}", cfg.learning_rate));
+                            ui.end_row();
+                            ui.label("decay_rate");
+                            ui.monospace(format!("{:.5}", cfg.decay_rate));
+                            ui.end_row();
+                        });
+                });
+                ui.add_space(4.0);
+            }
+            if !evo.fitness_history.is_empty() {
+                Self::render_fitness_chart(ui, &evo.fitness_history);
+            }
         }
     }
 
-    fn render_fitness_chart(ui: &mut egui::Ui, evo: &EvolutionSnapshot) {
+    fn render_fitness_chart(
+        ui: &mut egui::Ui,
+        fitness_history: &std::collections::HashMap<i64, Vec<(u32, f32, f32)>>,
+    ) {
         ui.collapsing("Fitness Over Generations", |ui| {
             let avail = ui.available_width().max(200.0);
             let chart_height = 150.0;
@@ -1614,7 +1665,7 @@ impl<'a> TabContext<'a> {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
 
-            if evo.fitness_history.is_empty() {
+            if fitness_history.is_empty() {
                 return;
             }
 
@@ -1634,7 +1685,7 @@ impl<'a> TabContext<'a> {
             let mut global_max_fit: f32 = 0.01;
             let mut global_min_gen: u32 = u32::MAX;
             let mut global_max_gen: u32 = 0;
-            for points in evo.fitness_history.values() {
+            for points in fitness_history.values() {
                 for &(gen, best, _) in points {
                     global_max_fit = global_max_fit.max(best);
                     global_min_gen = global_min_gen.min(gen);
@@ -1649,12 +1700,12 @@ impl<'a> TabContext<'a> {
             let gen_range = (global_max_gen - global_min_gen).max(1) as f32;
 
             // Sort island keys for deterministic rendering
-            let mut island_keys: Vec<i64> = evo.fitness_history.keys().copied().collect();
+            let mut island_keys: Vec<i64> = fitness_history.keys().copied().collect();
             island_keys.sort();
 
             // Draw best-fitness line per island
             for &island_id in &island_keys {
-                let points = &evo.fitness_history[&island_id];
+                let points = &fitness_history[&island_id];
                 if points.len() < 2 {
                     continue;
                 }
@@ -1689,23 +1740,128 @@ impl<'a> TabContext<'a> {
         ui.add_space(4.0);
     }
 
+    fn render_node_detail(ui: &mut egui::Ui, nodes: &[crate::governor::TreeNode], node_id: i64) {
+        let node = match nodes.iter().find(|n| n.id == node_id) {
+            Some(n) => n,
+            None => {
+                ui.label("Node not found.");
+                return;
+            }
+        };
+
+        ui.heading(format!("Generation {}", node.generation));
+        ui.add_space(4.0);
+
+        egui::Grid::new("node_detail_grid")
+            .num_columns(2)
+            .spacing([20.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Status");
+                let status_color = match node.status.as_str() {
+                    "failed" => egui::Color32::from_rgb(180, 60, 60),
+                    "exhausted" => egui::Color32::GRAY,
+                    "successful" => egui::Color32::from_rgb(100, 200, 100),
+                    "active" => egui::Color32::from_rgb(80, 220, 120),
+                    _ => egui::Color32::from_gray(180),
+                };
+                ui.colored_label(status_color, &node.status);
+                ui.end_row();
+
+                if let Some(island) = node.island_id {
+                    ui.label("Island");
+                    ui.monospace(format!("{}", island));
+                    ui.end_row();
+                }
+
+                if let Some(fit) = node.best_fitness {
+                    ui.label("Best Fitness");
+                    ui.monospace(format!("{:.6}", fit));
+                    ui.end_row();
+                }
+                if let Some(avg) = node.avg_fitness {
+                    ui.label("Avg Fitness");
+                    ui.monospace(format!("{:.6}", avg));
+                    ui.end_row();
+                }
+            });
+
+        if !node.mutations.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Mutations").strong());
+            egui::Grid::new("node_mutations_grid")
+                .num_columns(2)
+                .spacing([20.0, 4.0])
+                .show(ui, |ui| {
+                    for (param, dir) in &node.mutations {
+                        let arrow = if *dir > 0.0 { "+" } else { "-" };
+                        ui.label(param);
+                        ui.monospace(format!("{}{:.4}", arrow, dir.abs()));
+                        ui.end_row();
+                    }
+                });
+        }
+
+        if let Some(cfg) = &node.config {
+            ui.add_space(8.0);
+            ui.collapsing("Config", |ui| {
+                egui::Grid::new("node_config_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("memory_capacity");
+                        ui.monospace(format!("{}", cfg.memory_capacity));
+                        ui.end_row();
+                        ui.label("processing_slots");
+                        ui.monospace(format!("{}", cfg.processing_slots));
+                        ui.end_row();
+                        ui.label("visual_encoding_size");
+                        ui.monospace(format!("{}", cfg.visual_encoding_size));
+                        ui.end_row();
+                        ui.label("representation_dim");
+                        ui.monospace(format!("{}", cfg.representation_dim));
+                        ui.end_row();
+                        ui.label("learning_rate");
+                        ui.monospace(format!("{:.5}", cfg.learning_rate));
+                        ui.end_row();
+                        ui.label("decay_rate");
+                        ui.monospace(format!("{:.5}", cfg.decay_rate));
+                        ui.end_row();
+                        ui.label("distress_exponent");
+                        ui.monospace(format!("{:.2}", cfg.distress_exponent));
+                        ui.end_row();
+                        ui.label("habituation_sensitivity");
+                        ui.monospace(format!("{:.1}", cfg.habituation_sensitivity));
+                        ui.end_row();
+                        ui.label("max_curiosity_bonus");
+                        ui.monospace(format!("{:.2}", cfg.max_curiosity_bonus));
+                        ui.end_row();
+                        ui.label("fatigue_recovery_sensitivity");
+                        ui.monospace(format!("{:.1}", cfg.fatigue_recovery_sensitivity));
+                        ui.end_row();
+                        ui.label("fatigue_floor");
+                        ui.monospace(format!("{:.2}", cfg.fatigue_floor));
+                        ui.end_row();
+                    });
+            });
+        }
+    }
+
     fn render_tree(
         ui: &mut egui::Ui,
         nodes: &[crate::governor::TreeNode],
         current_id: Option<i64>,
+        selected_node_id: &mut Option<i64>,
     ) {
         if nodes.is_empty() {
             return;
         }
 
-        // Build children map: parent_id → list of child nodes
         let mut children_map: std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>> =
             std::collections::HashMap::new();
         for node in nodes {
             children_map.entry(node.parent_id).or_default().push(node);
         }
 
-        // Find path from current node to root for default expansion
         let mut expanded_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         if let Some(current) = current_id {
             let node_map: std::collections::HashMap<i64, &crate::governor::TreeNode> =
@@ -1717,10 +1873,9 @@ impl<'a> TabContext<'a> {
             }
         }
 
-        // Render from root nodes (parent_id = None)
         if let Some(roots) = children_map.get(&None) {
             for root in roots {
-                Self::render_tree_node(ui, root, &children_map, &expanded_ids, current_id);
+                Self::render_tree_node(ui, root, &children_map, &expanded_ids, current_id, selected_node_id);
             }
         }
     }
@@ -1731,46 +1886,53 @@ impl<'a> TabContext<'a> {
         children_map: &std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>>,
         expanded_ids: &std::collections::HashSet<i64>,
         current_id: Option<i64>,
+        selected_node_id: &mut Option<i64>,
     ) {
         let has_children = children_map.get(&Some(node.id)).map_or(false, |c| !c.is_empty());
         let is_current = Some(node.id) == current_id;
         let is_on_path = expanded_ids.contains(&node.id);
+        let is_selected = *selected_node_id == Some(node.id);
 
         let label = Self::format_tree_label(node, is_current);
-        let color = match node.status.as_str() {
+        let mut color = match node.status.as_str() {
             "failed" => egui::Color32::from_rgb(180, 60, 60),
             "exhausted" => egui::Color32::GRAY,
             "successful" => egui::Color32::from_rgb(100, 200, 100),
             _ if is_current => egui::Color32::from_rgb(80, 220, 120),
             _ => egui::Color32::from_gray(180),
         };
-
-        let is_dead_end = matches!(node.status.as_str(), "failed" | "exhausted");
+        if is_selected {
+            color = egui::Color32::from_rgb(120, 200, 255);
+        }
 
         if has_children {
-            let mut header = egui::CollapsingHeader::new(
+            let header = egui::CollapsingHeader::new(
                 egui::RichText::new(&label).color(color).monospace().size(11.0),
             )
             .id_salt(node.id)
             .default_open(is_on_path);
 
-            // Force-collapse dead-end branches not on the active path
-            if is_dead_end && !is_on_path {
-                header = header.open(Some(false));
-            }
-
-            header.show(ui, |ui| {
+            let resp = header.show(ui, |ui| {
                 if let Some(children) = children_map.get(&Some(node.id)) {
                     for child in children {
-                        Self::render_tree_node(ui, child, children_map, expanded_ids, current_id);
+                        Self::render_tree_node(ui, child, children_map, expanded_ids, current_id, selected_node_id);
                     }
                 }
             });
+            if resp.header_response.clicked() {
+                *selected_node_id = Some(node.id);
+            }
         } else {
-            // Leaf node — label with small indent to align with collapsible siblings
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
-                ui.label(egui::RichText::new(&label).color(color).monospace().size(11.0));
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&label).color(color).monospace().size(11.0),
+                    ).sense(egui::Sense::click()),
+                );
+                if resp.clicked() {
+                    *selected_node_id = Some(node.id);
+                }
             });
         }
     }

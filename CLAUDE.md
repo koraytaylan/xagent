@@ -2,7 +2,7 @@
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 46 unit + 17 integration tests
+- `cargo test -p xagent-sandbox` — runs 46 lib unit + 8 bin unit + 18 integration tests (72 total)
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence

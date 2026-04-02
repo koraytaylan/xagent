@@ -554,7 +554,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay.
+Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 50k×`) turns yellow when above 1×.
 
 ---
 
@@ -582,9 +582,12 @@ about_to_wait()     → Request continuous redraw
 | `3` | 5 | 5x |
 | `4` | 10 | 10x |
 | `5` | 100 | 100x |
-| `6` | 1000 | 1000x |
+| `6` | 1000 | 1k× |
+| `7` | 5000 | 5k× |
+| `8` | 10000 | 10k× |
+| `9` | 50000 | 50k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 2000).
+Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 100,000) in fast mode.
 
 ##### Brain Tick Decimation
 
@@ -752,6 +755,9 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | `4` | Speed 10x (10 ticks/frame) |
 | `5` | Speed 100x (100 ticks/frame) |
 | `6` | Speed 1000x (1000 ticks/frame) |
+| `7` | Speed 5000x (5000 ticks/frame) |
+| `8` | Speed 10000x (10000 ticks/frame) |
+| `9` | Speed 50000x (50000 ticks/frame) |
 | Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |
@@ -1082,9 +1088,9 @@ optimization at this scale.
 
 - **>20 agents**: The inter-agent perception cost becomes O(N²) and brain ticks
   multiply. The hard cap prevents this.
-- **High ticks_per_frame (1000x)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
+- **High ticks_per_frame (1000x+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
   ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
-  cap scales with speed (`speed × 2`, capped at 2000).
+  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 100,000 in fast mode).
 - **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means
   searching 32 patterns per tick, each compared against a 64-dim vector.
 

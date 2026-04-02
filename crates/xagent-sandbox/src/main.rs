@@ -1117,6 +1117,18 @@ impl ApplicationHandler for App {
                         self.speed_multiplier = 1000;
                         println!("[SIM] Speed: 1000x ({} ticks/sec)", SIM_RATE as u32 * 1000);
                     }
+                    PhysicalKey::Code(KeyCode::Digit7) if pressed => {
+                        self.speed_multiplier = 5000;
+                        println!("[SIM] Speed: 5000x ({} ticks/sec)", SIM_RATE as u32 * 5000);
+                    }
+                    PhysicalKey::Code(KeyCode::Digit8) if pressed => {
+                        self.speed_multiplier = 10000;
+                        println!("[SIM] Speed: 10000x ({} ticks/sec)", SIM_RATE as u32 * 10000);
+                    }
+                    PhysicalKey::Code(KeyCode::Digit9) if pressed => {
+                        self.speed_multiplier = 50000;
+                        println!("[SIM] Speed: 50000x ({} ticks/sec)", SIM_RATE as u32 * 50000);
+                    }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
                         self.heatmap_dirty = true;
@@ -1235,18 +1247,12 @@ impl ApplicationHandler for App {
                 // ── simulation ticks (fixed timestep) ──────────
                 if !self.paused {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
-                    // Cap per-frame ticks proportional to speed, with a reasonable ceiling
-                    let max_ticks = if self.render_3d {
-                        (self.speed_multiplier * 2).min(2000)
-                    } else {
-                        (self.speed_multiplier * 10).min(10000)
-                    };
+                    let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
                     let mut ticks_run = 0u32;
 
                     // Brain decimation: at high speed, run brain every Nth tick
                     // to keep CPU load manageable. Physics still runs every tick.
-                    // sqrt scaling: 1x→1, 10x→3, 100x→10, 1000x→31
-                    let brain_stride = ((self.speed_multiplier as f32).sqrt() as u64).max(1);
+                    let brain_stride = brain_stride(self.speed_multiplier);
 
                     // Pre-allocate buffers outside the tick loop to avoid
                     // repeated heap allocations (12 agents × 10 ticks = 120/frame).
@@ -1941,6 +1947,7 @@ impl ApplicationHandler for App {
                                 let wall_time_secs = self.evo_snapshot.wall_time_secs;
                                 let ticks_per_sec = self.evo_snapshot.ticks_per_sec;
                                 let render_3d = self.render_3d;
+                                let speed_multiplier = self.speed_multiplier;
                                 let evo_state = self.evo_snapshot.state.clone();
                                 let viewport_tex_id = egui.viewport_texture_id;
                                 let ppp = window.scale_factor() as f32;
@@ -2146,6 +2153,16 @@ impl ApplicationHandler for App {
                                                     let mins = ((wall_time_secs % 3600.0) / 60.0) as u64;
                                                     let secs = (wall_time_secs % 60.0) as u64;
                                                     ui.label(format!("{}h {:02}m {:02}s", hours, mins, secs));
+                                                    ui.separator();
+                                                    let speed_label = speed_label(speed_multiplier);
+                                                    ui.label(
+                                                        egui::RichText::new(format!("⏩ {}", speed_label))
+                                                            .color(if speed_multiplier > 1 {
+                                                                egui::Color32::from_rgb(255, 200, 50)
+                                                            } else {
+                                                                egui::Color32::GRAY
+                                                            }),
+                                                    );
                                                     ui.separator();
                                                     ui.label(format!("{:.0} ticks/s", ticks_per_sec));
                                                 }
@@ -2542,5 +2559,125 @@ fn main() {
             cli.gpu_brain,
         );
         event_loop.run_app(&mut app).expect("Event loop error");
+    }
+}
+
+// ── Pure helpers (extracted for testability) ─────────────────────────────
+
+/// Map speed multiplier to a compact display label.
+fn speed_label(multiplier: u32) -> &'static str {
+    match multiplier {
+        1 => "1×",
+        2 => "2×",
+        5 => "5×",
+        10 => "10×",
+        100 => "100×",
+        1_000 => "1k×",
+        5_000 => "5k×",
+        10_000 => "10k×",
+        50_000 => "50k×",
+        _ => "?×",
+    }
+}
+
+/// Cap per-frame ticks proportional to speed, with a reasonable ceiling.
+/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 100,000).
+fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
+    if render_3d {
+        (speed_multiplier * 2).min(4000)
+    } else {
+        (speed_multiplier * 10).min(100_000)
+    }
+}
+
+/// Brain tick decimation stride — sqrt scaling so physics still runs every tick
+/// but brain evaluations are reduced at high speed. 1x→1, 10x→3, 100x→10, 1000x→31.
+fn brain_stride(speed_multiplier: u32) -> u64 {
+    ((speed_multiplier as f32).sqrt() as u64).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── speed_label ──────────────────────────────────────────────────
+
+    #[test]
+    fn speed_label_all_known_levels() {
+        assert_eq!(speed_label(1), "1×");
+        assert_eq!(speed_label(2), "2×");
+        assert_eq!(speed_label(5), "5×");
+        assert_eq!(speed_label(10), "10×");
+        assert_eq!(speed_label(100), "100×");
+        assert_eq!(speed_label(1_000), "1k×");
+        assert_eq!(speed_label(5_000), "5k×");
+        assert_eq!(speed_label(10_000), "10k×");
+        assert_eq!(speed_label(50_000), "50k×");
+    }
+
+    #[test]
+    fn speed_label_unknown_returns_fallback() {
+        assert_eq!(speed_label(42), "?×");
+        assert_eq!(speed_label(0), "?×");
+        assert_eq!(speed_label(999), "?×");
+    }
+
+    // ── max_ticks_per_frame ──────────────────────────────────────────
+
+    #[test]
+    fn max_ticks_3d_scales_linearly_then_caps() {
+        assert_eq!(max_ticks_per_frame(1, true), 2);
+        assert_eq!(max_ticks_per_frame(10, true), 20);
+        assert_eq!(max_ticks_per_frame(1000, true), 2000);
+        assert_eq!(max_ticks_per_frame(5000, true), 4000); // capped
+        assert_eq!(max_ticks_per_frame(50_000, true), 4000); // capped
+    }
+
+    #[test]
+    fn max_ticks_fast_mode_scales_then_caps() {
+        assert_eq!(max_ticks_per_frame(1, false), 10);
+        assert_eq!(max_ticks_per_frame(100, false), 1000);
+        assert_eq!(max_ticks_per_frame(1000, false), 10_000);
+        assert_eq!(max_ticks_per_frame(10_000, false), 100_000); // at cap
+        assert_eq!(max_ticks_per_frame(50_000, false), 100_000); // capped
+    }
+
+    // ── brain_stride ─────────────────────────────────────────────────
+
+    #[test]
+    fn brain_stride_sqrt_scaling() {
+        assert_eq!(brain_stride(1), 1);
+        assert_eq!(brain_stride(10), 3); // sqrt(10)=3.16 → 3
+        assert_eq!(brain_stride(100), 10);
+        assert_eq!(brain_stride(1000), 31); // sqrt(1000)=31.6 → 31
+        assert_eq!(brain_stride(10_000), 100);
+        assert_eq!(brain_stride(50_000), 223); // sqrt(50000)=223.6 → 223
+    }
+
+    #[test]
+    fn brain_stride_never_zero() {
+        // Even at speed 0 (shouldn't happen), stride must be ≥ 1
+        assert!(brain_stride(0) >= 1);
+    }
+
+    // ── key-to-multiplier mapping ────────────────────────────────────
+
+    #[test]
+    fn all_speed_levels_have_labels() {
+        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 5_000, 10_000, 50_000];
+        for &m in levels {
+            assert_ne!(speed_label(m), "?×", "missing label for multiplier {}", m);
+        }
+    }
+
+    #[test]
+    fn fast_mode_always_ge_3d_mode() {
+        for speed in [1, 2, 5, 10, 100, 1000, 5000, 10_000, 50_000] {
+            assert!(
+                max_ticks_per_frame(speed, false) >= max_ticks_per_frame(speed, true),
+                "fast mode should allow >= 3D ticks at speed {}",
+                speed,
+            );
+        }
     }
 }

@@ -1248,10 +1248,6 @@ impl ApplicationHandler for App {
                     let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
                     let mut ticks_run = 0u32;
 
-                    // Brain decimation: at high speed, run brain every Nth tick
-                    // to keep CPU load manageable. Physics still runs every tick.
-                    let brain_stride = brain_stride(self.speed_multiplier);
-
                     // Pre-allocate buffers outside the tick loop to avoid
                     // repeated heap allocations (12 agents × 10 ticks = 120/frame).
                     let mut all_positions: Vec<(Vec3, bool)> =
@@ -1269,13 +1265,12 @@ impl ApplicationHandler for App {
 
                     // ── Adaptive GPU/CPU decision ──
                     // GPU dispatches once per frame → 1 brain tick per frame.
-                    // CPU rayon runs brain_stride-decimated ticks inside the loop.
-                    // Use GPU only when expected brain ticks ≤ 2 per frame so
+                    // CPU runs brain every tick inside the loop.
+                    // Use GPU only when expected ticks ≤ 2 per frame so
                     // agents get equivalent cognitive throughput either way.
                     let expected_ticks = (self.sim_accumulator / SIM_DT)
                         .min(max_ticks as f32) as u64;
-                    let expected_brain_ticks = expected_ticks / brain_stride;
-                    let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
+                    let use_gpu = self.gpu_compute.is_some() && expected_ticks <= 2;
 
                     // ── GPU COLLECT: always drain in-flight results ──
                     // try_collect_into() unmaps staging buffers even if we don't
@@ -1332,44 +1327,33 @@ impl ApplicationHandler for App {
                             // ── Phase 2: Brain ticks (CPU rayon) ──
                             // When GPU is active this frame, agents use
                             // cached_motor from the per-frame collect above.
-                            // Otherwise, CPU rayon runs brain with stride.
+                            // Otherwise, CPU runs brain every tick.
                             if !use_gpu {
                                 let tick = self.tick;
-                                let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
-                                    a.body.body.alive && (tick + i as u64) % brain_stride == 0
-                                });
+                                let world_ref: &WorldState = &*world;
+                                let all_pos = &all_positions;
 
-                                if any_brain {
-                                    let world_ref: &WorldState = &*world;
-                                    let all_pos = &all_positions;
+                                self.agents
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .for_each(|(i, agent)| {
+                                        if !agent.body.body.alive {
+                                            return;
+                                        }
 
-                                    self.agents
-                                        .par_iter_mut()
-                                        .enumerate()
-                                        .for_each(|(i, agent)| {
-                                            if !agent.body.body.alive {
-                                                return;
-                                            }
-                                            let run_brain =
-                                                (tick + i as u64) % brain_stride == 0;
-                                            if !run_brain {
-                                                return;
-                                            }
+                                        senses::extract_senses_with_positions(
+                                            &agent.body,
+                                            world_ref,
+                                            tick,
+                                            all_pos,
+                                            i,
+                                            &mut agent.cached_frame,
+                                        );
 
-                                            senses::extract_senses_with_positions(
-                                                &agent.body,
-                                                world_ref,
-                                                tick,
-                                                all_pos,
-                                                i,
-                                                &mut agent.cached_frame,
-                                            );
-
-                                            agent.cached_motor =
-                                                agent.brain.tick(&agent.cached_frame);
-                                            record_agent_histories(agent);
-                                        });
-                                }
+                                        agent.cached_motor =
+                                            agent.brain.tick(&agent.cached_frame);
+                                        record_agent_histories(agent);
+                                    });
                             }
 
                             // ── Phase 3: Physics + stats (sequential, mutates world) ──
@@ -1399,9 +1383,7 @@ impl ApplicationHandler for App {
                                 agent.record_heatmap(world.config.world_size);
                                 agent.record_trail();
 
-                                let run_brain =
-                                    (self.tick + i as u64) % brain_stride == 0;
-                                if run_brain && i == self.selected_agent_idx {
+                                if i == self.selected_agent_idx {
                                     let life_ticks = agent.age(self.tick);
                                     log_tick_to_csv(
                                         &mut self.logger,
@@ -2596,12 +2578,6 @@ fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
     }
 }
 
-/// Brain tick decimation stride — sqrt scaling so physics still runs every tick
-/// but brain evaluations are reduced at high speed. 1x→1, 10x→3, 100x→10, 1000x→31.
-fn brain_stride(speed_multiplier: u32) -> u64 {
-    ((speed_multiplier as f32).sqrt() as u64).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,25 +2623,6 @@ mod tests {
         assert_eq!(max_ticks_per_frame(10_000, false), 100_000);
         assert_eq!(max_ticks_per_frame(100_000, false), 1_000_000); // at cap
         assert_eq!(max_ticks_per_frame(1_000_000, false), 1_000_000); // capped
-    }
-
-    // ── brain_stride ─────────────────────────────────────────────────
-
-    #[test]
-    fn brain_stride_sqrt_scaling() {
-        assert_eq!(brain_stride(1), 1);
-        assert_eq!(brain_stride(10), 3); // sqrt(10)=3.16 → 3
-        assert_eq!(brain_stride(100), 10);
-        assert_eq!(brain_stride(1000), 31); // sqrt(1000)=31.6 → 31
-        assert_eq!(brain_stride(10_000), 100);
-        assert_eq!(brain_stride(100_000), 316); // sqrt(100000)=316.2 → 316
-        assert_eq!(brain_stride(1_000_000), 1000); // sqrt(1000000)=1000
-    }
-
-    #[test]
-    fn brain_stride_never_zero() {
-        // Even at speed 0 (shouldn't happen), stride must be ≥ 1
-        assert!(brain_stride(0) >= 1);
     }
 
     // ── key-to-multiplier mapping ────────────────────────────────────

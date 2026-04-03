@@ -60,15 +60,21 @@ jobs:
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          cd "target/${TARGET}/release"
+          tar czf "../../../${BINARY_NAME}-${VERSION}-${TARGET}.tar.gz" "$BINARY_NAME"
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" -DestinationPath "${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${env:TARGET}/release/${env:BINARY_NAME}.exe" -DestinationPath "${env:BINARY_NAME}-${env:VERSION}-${env:TARGET}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -100,11 +106,13 @@ jobs:
           args: --latest --strip header
 
       - name: Merge to main
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout main
-          git merge --no-ff ${{ github.ref_name }} -m "release: ${{ github.ref_name }}"
+          git merge --no-ff "$TAG" -m "release: $TAG"
           git push origin main
 
       - name: Create GitHub Release

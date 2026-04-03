@@ -587,7 +587,7 @@ about_to_wait()     → Request continuous redraw
 | `8` | 100000 | 100k× |
 | `9` | 1000000 | 1000k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 100,000) in fast mode.
+Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 1,000,000) in fast mode.
 
 ##### Brain Tick Decimation
 
@@ -1094,7 +1094,7 @@ optimization at this scale.
   multiply. The hard cap prevents this.
 - **High ticks_per_frame (1000x+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
   ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
-  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 100,000 in fast mode).
+  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 1,000,000 in fast mode).
 - **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means
   searching 32 patterns per tick, each compared against a 64-dim vector.
 

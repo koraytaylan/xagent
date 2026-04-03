@@ -463,6 +463,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_for_new_life_clears_fatigue_history() {
+        let mut agent = Agent::new(0, Vec3::ZERO, BrainConfig::default(), 0);
+        // Simulate accumulated fatigue history from a previous life.
+        for i in 0..50 {
+            agent.fatigue_history.push_back(1.0 - i as f32 * 0.01);
+        }
+        assert!(!agent.fatigue_history.is_empty());
+
+        agent.reset_for_new_life(Vec3::new(5.0, 0.0, 5.0), 1000);
+
+        assert!(
+            agent.fatigue_history.is_empty(),
+            "reset_for_new_life must clear fatigue_history"
+        );
+    }
+
+    #[test]
     fn mutate_learned_state_perturbs_weights() {
         let state = LearnedState {
             encoder_weights: vec![1.0; 100],

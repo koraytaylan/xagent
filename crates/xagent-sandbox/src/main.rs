@@ -1522,6 +1522,7 @@ impl ApplicationHandler for App {
                                         agent.has_reproduced = false;
                                         agent.generation += 1;
                                         agent.reset_trail();
+                                        agent.fatigue_history.clear();
                                         agent.brain.trauma(0.5);
                                     }
                                 }

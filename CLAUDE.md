@@ -19,6 +19,13 @@
 - `allocate_ui` inside `ui.horizontal` inherits horizontal layout — children stack sideways. Use `ui.new_child(UiBuilder::new().max_rect(rect).layout(top_down))` for manual rect-based pane layouts instead.
 - `CollapsingHeader` toggles on any header click. For arrow-only toggle, use `CollapsingState::show_header` — it renders the native arrow (toggle on arrow only) and takes a closure for custom header content.
 
+## CI/CD
+- `.github/workflows/ci.yml` — check + test on Linux, triggers on push/PR to `develop`
+- `.github/workflows/release.yml` — tag-triggered (`v*`) release: test → build 4 targets → changelog → merge to `main` → GitHub Release
+- `cliff.toml` — git-cliff config for conventional commit changelog generation
+- `rust-toolchain.toml` — pins Rust stable channel for CI and local dev
+- Release flow: tag on `develop` (`git tag v0.x.0 && git push origin v0.x.0`) triggers the full pipeline
+
 ## Code Style
 - Specs: `docs/superpowers/specs/`, Plans: `docs/superpowers/plans/`
 - Commit prefixes: `feat:`, `fix:`, `perf:`

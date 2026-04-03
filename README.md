@@ -401,6 +401,12 @@ Each run produces a timestamped CSV file (e.g., `xagent_log_2026-03-23_21-06-03.
 xagent/
 ├── Cargo.toml                  # Workspace manifest
 ├── README.md                   # This file
+├── rust-toolchain.toml         # Pins Rust stable for CI + local dev
+├── cliff.toml                  # git-cliff changelog config
+├── .github/
+│   └── workflows/
+│       ├── ci.yml              # Check + test on push/PR to develop
+│       └── release.yml         # Tag-triggered release pipeline
 ├── crates/
 │   ├── xagent-shared/          # Interface contract
 │   │   └── src/

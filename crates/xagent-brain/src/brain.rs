@@ -369,6 +369,7 @@ impl Brain {
     pub fn death_signal(&mut self) {
         self.action_selector.death_signal();
         self.homeostasis.reset();
+        self.motor_fatigue.reset();
     }
 
     /// Export the brain's learned state for cross-generation inheritance.
@@ -628,6 +629,63 @@ mod tests {
         assert_eq!(
             enc_before.data(), enc_after.data(),
             "Mismatched import should leave brain unchanged"
+        );
+    }
+
+    #[test]
+    fn death_signal_resets_motor_fatigue() {
+        let mut brain = Brain::new(BrainConfig::default());
+
+        // Simulate the dying agent's constant (0,0) motor output that
+        // saturates the fatigue ring buffer during cooldown ticks.
+        for _ in 0..100 {
+            brain.motor_fatigue.update(0.0, 0.0);
+        }
+        assert!(
+            brain.motor_fatigue.fatigue_factor() < 0.3,
+            "Should be fatigued after constant zero output: {}",
+            brain.motor_fatigue.fatigue_factor()
+        );
+
+        brain.death_signal();
+
+        assert_eq!(
+            brain.motor_fatigue.fatigue_factor(), 1.0,
+            "death_signal must reset fatigue factor to 1.0"
+        );
+        assert_eq!(
+            brain.motor_fatigue.motor_variance(), 0.0,
+            "death_signal must clear motor variance"
+        );
+    }
+
+    #[test]
+    fn respawned_brain_is_not_stuck_at_max_fatigue() {
+        let mut brain = Brain::new(BrainConfig::default());
+        let frame = make_frame(0.8, 0.9);
+
+        // Simulate pre-death: buffer fills with constant output (the bug scenario).
+        for _ in 0..100 {
+            brain.motor_fatigue.update(0.0, 0.0);
+        }
+        let pre_death_fatigue = brain.motor_fatigue.fatigue_factor();
+        assert!(pre_death_fatigue < 0.3, "Pre-death fatigue should be near floor");
+
+        // Agent dies and respawns.
+        brain.death_signal();
+
+        // First tick of new life should produce output unclamped by old fatigue.
+        let cmd = brain.tick(&frame);
+        assert!(
+            brain.telemetry().fatigue_factor > pre_death_fatigue,
+            "First tick after respawn must not carry over pre-death fatigue ({} vs {})",
+            brain.telemetry().fatigue_factor,
+            pre_death_fatigue
+        );
+        // Motor output should not be zeroed by residual fatigue.
+        assert!(
+            cmd.forward.abs() > 0.0 || cmd.turn.abs() > 0.0,
+            "Respawned agent must be able to produce non-zero motor output"
         );
     }
 }

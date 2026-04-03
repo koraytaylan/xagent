@@ -56,6 +56,16 @@ impl MotorFatigue {
             .clamp(self.fatigue_floor, 1.0);
     }
 
+    /// Reset fatigue state for a fresh life (called on death/respawn).
+    pub fn reset(&mut self) {
+        self.forward_ring.fill(0.0);
+        self.turn_ring.fill(0.0);
+        self.cursor = 0;
+        self.len = 0;
+        self.fatigue_factor = 1.0;
+        self.motor_variance = 0.0;
+    }
+
     /// Current fatigue factor [fatigue_floor, 1.0]. Multiply motor output by this.
     pub fn fatigue_factor(&self) -> f32 {
         self.fatigue_factor
@@ -158,5 +168,17 @@ mod tests {
         let mf = MotorFatigue::new(8.0, 0.1);
         assert_eq!(mf.fatigue_factor(), 1.0);
         assert_eq!(mf.motor_variance(), 0.0);
+    }
+
+    #[test]
+    fn reset_clears_fatigue_after_constant_output() {
+        let mut mf = MotorFatigue::new(8.0, 0.1);
+        for _ in 0..FATIGUE_WINDOW {
+            mf.update(0.5, 0.3);
+        }
+        assert!(mf.fatigue_factor() < 0.3, "Should be fatigued before reset");
+        mf.reset();
+        assert_eq!(mf.fatigue_factor(), 1.0, "Reset should restore fatigue factor to 1.0");
+        assert_eq!(mf.motor_variance(), 0.0, "Reset should clear motor variance");
     }
 }

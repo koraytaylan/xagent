@@ -575,7 +575,7 @@ about_to_wait()     → Request continuous redraw
 
 #### Simulation Speed Controls
 
-| Key | `ticks_per_frame` | Label |
+| Key | `speed_multiplier` | Label |
 |---|---|---|
 | `1` | 1 | 1x |
 | `2` | 2 | 2x |
@@ -725,15 +725,15 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | Key | Action |
 |---|---|
 | `P` or `Space` | Toggle pause / resume |
-| `1` | Speed 1x (1 tick/frame) |
-| `2` | Speed 2x (2 ticks/frame) |
-| `3` | Speed 5x (5 ticks/frame) |
-| `4` | Speed 10x (10 ticks/frame) |
-| `5` | Speed 100x (100 ticks/frame) |
-| `6` | Speed 1000x (1000 ticks/frame) |
-| `7` | Speed 10000x (10000 ticks/frame) |
-| `8` | Speed 100000x (100000 ticks/frame) |
-| `9` | Speed 1000000x (1000000 ticks/frame) |
+| `1` | Speed 1× (multiplier 1) |
+| `2` | Speed 2× (multiplier 2) |
+| `3` | Speed 5× (multiplier 5) |
+| `4` | Speed 10× (multiplier 10) |
+| `5` | Speed 100× (multiplier 100) |
+| `6` | Speed 1k× (multiplier 1,000) |
+| `7` | Speed 10k× (multiplier 10,000) |
+| `8` | Speed 100k× (multiplier 100,000) |
+| `9` | Speed 1000k× (multiplier 1,000,000) |
 | Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |
@@ -1059,7 +1059,7 @@ optimization at this scale.
 
 - **>20 agents**: The inter-agent perception cost becomes O(N²) and brain ticks
   multiply. The hard cap prevents this.
-- **High ticks_per_frame (1000x+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
+- **High speed_multiplier (1000×+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
   ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
   cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 1,000,000 in fast mode).
 - **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means

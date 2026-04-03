@@ -1383,6 +1383,12 @@ impl ApplicationHandler for App {
                                 let consumed = xagent_sandbox::physics::step(
                                     &mut agent.body, &motor, world, SIM_DT,
                                 );
+                                // Metabolic cost: brain capacity drains energy
+                                let brain_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
+                                    agent.brain.config.memory_capacity,
+                                    agent.brain.config.processing_slots,
+                                );
+                                agent.body.body.internal.energy -= brain_drain;
                                 if let Some(food_idx) = consumed {
                                     self.food_dirty = true;
                                     agent.food_consumed += 1;

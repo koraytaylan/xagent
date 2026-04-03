@@ -18,6 +18,20 @@ const TURN_SPEED: f32 = 3.0;
 /// Half the agent's collision height in world units. The agent's feet are at
 /// `ground_height + AGENT_HALF_HEIGHT`, making the full agent 2 units tall.
 const AGENT_HALF_HEIGHT: f32 = 1.0;
+
+/// Metabolic cost per tick for maintaining brain capacity.
+/// Larger memory and processing capacity drain more energy — the
+/// biological cost of a bigger brain.
+const METABOLIC_BASE_COST: f32 = 0.0001;
+const METABOLIC_MEMORY_COST: f32 = 0.00003;
+const METABOLIC_PROCESSING_COST: f32 = 0.0001;
+
+pub fn metabolic_drain_per_tick(memory_capacity: usize, processing_slots: usize) -> f32 {
+    METABOLIC_BASE_COST
+        + memory_capacity as f32 * METABOLIC_MEMORY_COST
+        + processing_slots as f32 * METABOLIC_PROCESSING_COST
+}
+
 /// Maximum distance (in world units) at which an agent can consume a food item.
 /// Slightly larger than the agent's body (2-unit cube) to provide a forgiving
 /// interaction radius without requiring pixel-perfect alignment.

@@ -51,6 +51,22 @@ pub struct Pattern {
     pub successor: Option<usize>,
     /// Generation counter — incremented each time this slot is written.
     pub generation: u64,
+    /// Motor forward output active when this pattern was stored.
+    pub motor_forward: f32,
+    /// Motor turn output active when this pattern was stored.
+    pub motor_turn: f32,
+    /// Homeostatic gradient at storage time (positive = good outcome).
+    pub outcome_valence: f32,
+}
+
+/// A pattern recalled from memory, including its motor context.
+#[derive(Clone, Debug)]
+pub struct RecalledPattern {
+    pub state: EncodedState,
+    pub similarity: f32,
+    pub motor_forward: f32,
+    pub motor_turn: f32,
+    pub outcome_valence: f32,
 }
 
 /// Fixed-capacity memory bank for temporal patterns.
@@ -116,7 +132,7 @@ impl PatternMemory {
     }
 
     /// Store a new pattern. Overwrites the weakest existing pattern if full.
-    pub fn store(&mut self, state: EncodedState) {
+    pub fn store(&mut self, state: EncodedState, motor_forward: f32, motor_turn: f32, outcome_valence: f32) {
         self.next_generation += 1;
 
         let prev_idx = self.last_stored_idx;
@@ -145,6 +161,9 @@ impl PatternMemory {
             predecessor: prev_idx,
             successor: None,
             generation: self.next_generation,
+            motor_forward,
+            motor_turn,
+            outcome_valence,
         });
 
         // Wire temporal sequence: prev → new
@@ -180,12 +199,12 @@ impl PatternMemory {
     }
 
     /// Recall the top-N most similar patterns, within budget.
-    /// Returns (encoded_state, similarity_score) pairs.
+    /// Returns RecalledPattern values with state, similarity, and motor context.
     pub fn recall(
         &mut self,
         query: &EncodedState,
         budget: usize,
-    ) -> Vec<(EncodedState, f32)> {
+    ) -> Vec<RecalledPattern> {
         let query_norm = compute_norm(query.data());
         self.scored_scratch.clear();
         for (i, p) in self.patterns.iter().enumerate() {
@@ -209,9 +228,13 @@ impl PatternMemory {
         self.scored_scratch
             .iter()
             .filter_map(|&(idx, sim)| {
-                self.patterns[idx]
-                    .as_ref()
-                    .map(|p| (p.state.clone(), sim))
+                self.patterns[idx].as_ref().map(|p| RecalledPattern {
+                    state: p.state.clone(),
+                    similarity: sim,
+                    motor_forward: p.motor_forward,
+                    motor_turn: p.motor_turn,
+                    outcome_valence: p.outcome_valence,
+                })
             })
             .collect()
     }
@@ -520,7 +543,7 @@ impl PatternMemory {
         &mut self,
         scores: &[f32],
         budget: usize,
-    ) -> Vec<(EncodedState, f32)> {
+    ) -> Vec<RecalledPattern> {
         self.scored_scratch.clear();
         for (i, &sim) in scores.iter().enumerate().take(self.capacity) {
             if sim > -1.5 {
@@ -541,9 +564,13 @@ impl PatternMemory {
         self.scored_scratch
             .iter()
             .filter_map(|&(idx, sim)| {
-                self.patterns[idx]
-                    .as_ref()
-                    .map(|p| (p.state.clone(), sim))
+                self.patterns[idx].as_ref().map(|p| RecalledPattern {
+                    state: p.state.clone(),
+                    similarity: sim,
+                    motor_forward: p.motor_forward,
+                    motor_turn: p.motor_turn,
+                    outcome_valence: p.outcome_valence,
+                })
             })
             .collect()
     }
@@ -560,19 +587,19 @@ mod tests {
     #[test]
     fn store_and_recall() {
         let mut mem = PatternMemory::new(10, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]));
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]));
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
 
         let results = mem.recall(&make_state(&[0.9, 0.1, 0.0, 0.0]), 1);
         assert_eq!(results.len(), 1);
         // Should recall the pattern most similar to query
-        assert!(results[0].0.data()[0] > 0.5, "Should recall the [1,0,0,0] pattern");
+        assert!(results[0].state.data()[0] > 0.5, "Should recall the [1,0,0,0] pattern");
     }
 
     #[test]
     fn decay_removes_weak_patterns() {
         let mut mem = PatternMemory::new(10, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]));
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
         assert_eq!(mem.active_count(), 1);
 
         // Decay many times — smart decay is slower, so we need more iterations
@@ -586,8 +613,8 @@ mod tests {
     #[test]
     fn frequently_accessed_patterns_decay_slower() {
         let mut mem = PatternMemory::new(10, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]));
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]));
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
 
         // Access pattern 0 many times
         for _ in 0..20 {
@@ -608,9 +635,9 @@ mod tests {
     #[test]
     fn temporal_sequence_tracking() {
         let mut mem = PatternMemory::new(10, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0])); // idx 0
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0])); // idx 1
-        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0])); // idx 2
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 0
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 1
+        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0]), 0.0, 0.0, 0.0); // idx 2
 
         // Check successor chain: 0 → 1 → 2
         let p0 = mem.get(0).unwrap();
@@ -627,9 +654,9 @@ mod tests {
     #[test]
     fn association_chain_retrieval() {
         let mut mem = PatternMemory::new(10, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0])); // idx 0
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0])); // idx 1
-        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0])); // idx 2
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 0
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 1
+        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0]), 0.0, 0.0, 0.0); // idx 2
 
         let assoc = mem.retrieve_associated(0, 5);
         assert!(!assoc.is_empty(), "Should find associated patterns");
@@ -638,13 +665,13 @@ mod tests {
     #[test]
     fn capacity_limit_overwrites_weakest() {
         let mut mem = PatternMemory::new(3, 4);
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]));
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]));
-        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0]));
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0);
+        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0]), 0.0, 0.0, 0.0);
         assert_eq!(mem.active_count(), 3);
 
         // A 4th store should overwrite the weakest
-        mem.store(make_state(&[0.0, 0.0, 0.0, 1.0]));
+        mem.store(make_state(&[0.0, 0.0, 0.0, 1.0]), 0.0, 0.0, 0.0);
         assert_eq!(mem.active_count(), 3);
     }
 
@@ -653,9 +680,9 @@ mod tests {
         let mut mem = PatternMemory::new(3, 4);
 
         // Fill memory with 3 patterns
-        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0])); // idx 0
-        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0])); // idx 1
-        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0])); // idx 2
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 0
+        mem.store(make_state(&[0.0, 1.0, 0.0, 0.0]), 0.0, 0.0, 0.0); // idx 1
+        mem.store(make_state(&[0.0, 0.0, 1.0, 0.0]), 0.0, 0.0, 0.0); // idx 2
 
         // Verify pattern 1 has association to pattern 0 (backward temporal link)
         let gen0_before = mem.get(0).unwrap().generation;
@@ -664,7 +691,7 @@ mod tests {
         assert!(has_link_to_0, "Pattern 1 should have association to pattern 0");
 
         // Overwrite pattern 0 (all equal reinforcement, so first/weakest is chosen)
-        mem.store(make_state(&[0.9, 0.9, 0.9, 0.9]));
+        mem.store(make_state(&[0.9, 0.9, 0.9, 0.9]), 0.0, 0.0, 0.0);
 
         // Generation should have changed
         let gen0_after = mem.get(0).unwrap().generation;
@@ -691,8 +718,8 @@ mod tests {
         let mut mem = PatternMemory::new(10, 4);
 
         // Store two similar patterns
-        mem.store(make_state(&[0.9, 0.1, 0.0, 0.0]));
-        mem.store(make_state(&[0.1, 0.9, 0.0, 0.0]));
+        mem.store(make_state(&[0.9, 0.1, 0.0, 0.0]), 0.0, 0.0, 0.0);
+        mem.store(make_state(&[0.1, 0.9, 0.0, 0.0]), 0.0, 0.0, 0.0);
 
         // Get initial association strength (from temporal linking)
         let initial_strength = mem.get(0).unwrap()
@@ -725,8 +752,8 @@ mod tests {
         let mut mem = PatternMemory::new(10, dim);
         let s1 = EncodedState::from_slice(&vec![1.0; dim]);
         let s2 = EncodedState::from_slice(&vec![0.5; dim]);
-        mem.store(s1);
-        mem.store(s2);
+        mem.store(s1, 0.0, 0.0, 0.0);
+        mem.store(s2, 0.0, 0.0, 0.0);
         assert_eq!(mem.active_count(), 2);
 
         let before: f32 = mem
@@ -757,11 +784,26 @@ mod tests {
         let dim = 4;
         let mut mem = PatternMemory::new(10, dim);
         let s = EncodedState::from_slice(&vec![1.0; dim]);
-        mem.store(s);
+        mem.store(s, 0.0, 0.0, 0.0);
         assert_eq!(mem.active_count(), 1);
 
         // Apply 100% trauma — should wipe everything
         mem.trauma(1.0);
         assert_eq!(mem.active_count(), 0);
+    }
+
+    #[test]
+    fn pattern_stores_motor_context() {
+        let mut mem = PatternMemory::new(10, 4);
+        mem.store(
+            make_state(&[1.0, 0.0, 0.0, 0.0]),
+            0.8,   // motor_forward
+            -0.3,  // motor_turn
+            0.05,  // outcome_valence
+        );
+        let p = mem.get(0).unwrap();
+        assert!((p.motor_forward - 0.8).abs() < 1e-6);
+        assert!((p.motor_turn - (-0.3)).abs() < 1e-6);
+        assert!((p.outcome_valence - 0.05).abs() < 1e-6);
     }
 }

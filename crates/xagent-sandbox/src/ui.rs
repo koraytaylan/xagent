@@ -1970,30 +1970,47 @@ impl<'a> TabContext<'a> {
         }
 
         if has_children {
-            let header = egui::CollapsingHeader::new(
-                egui::RichText::new(&label).color(color).monospace().size(11.0),
-            )
-            .id_salt(node.id)
-            .default_open(is_on_path);
+            let id = ui.make_persistent_id(node.id);
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                is_on_path,
+            );
 
-            let resp = header.show(ui, |ui| {
+            let mut label_clicked = false;
+            let header_resp = state.show_header(ui, |ui| {
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&label).color(color).monospace().size(11.0),
+                    ).selectable(false).sense(egui::Sense::click()),
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                label_clicked = resp.clicked();
+            });
+            if label_clicked {
+                *selected_node_id = Some(node.id);
+            }
+
+            header_resp.body(|ui| {
                 if let Some(children) = children_map.get(&Some(node.id)) {
                     for child in children {
                         Self::render_tree_node(ui, child, children_map, expanded_ids, current_id, selected_node_id);
                     }
                 }
             });
-            if resp.header_response.clicked() {
-                *selected_node_id = Some(node.id);
-            }
         } else {
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
                 let resp = ui.add(
                     egui::Label::new(
                         egui::RichText::new(&label).color(color).monospace().size(11.0),
-                    ).sense(egui::Sense::click()),
+                    ).selectable(false).sense(egui::Sense::click()),
                 );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
                 if resp.clicked() {
                     *selected_node_id = Some(node.id);
                 }

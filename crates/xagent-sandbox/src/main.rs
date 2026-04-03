@@ -1246,6 +1246,14 @@ impl ApplicationHandler for App {
                 if !self.paused {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
+
+                    // Clamp accumulator so backlog never exceeds one frame's
+                    // worth of ticks. At extreme speed multipliers the
+                    // increment above can far exceed what the tick loop can
+                    // drain under its time budget, so cap it early to avoid
+                    // f32 precision loss and unbounded growth.
+                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
+
                     let mut ticks_run = 0u32;
 
                     // Pre-allocate buffers outside the tick loop to avoid
@@ -1632,11 +1640,6 @@ impl ApplicationHandler for App {
                             );
                         }
                     }
-
-                    // Clamp accumulator: allow up to max_ticks worth of
-                    // carry-over so the time budget can spread ticks across
-                    // multiple frames, but never accumulate more than that.
-                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
 
                     // Mark HUD dirty if any ticks ran this frame
                     if ticks_run > 0 {

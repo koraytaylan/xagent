@@ -1116,16 +1116,16 @@ impl ApplicationHandler for App {
                         println!("[SIM] Speed: 1000x ({} ticks/sec)", SIM_RATE as u32 * 1000);
                     }
                     PhysicalKey::Code(KeyCode::Digit7) if pressed => {
-                        self.speed_multiplier = 5000;
-                        println!("[SIM] Speed: 5000x ({} ticks/sec)", SIM_RATE as u32 * 5000);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit8) if pressed => {
                         self.speed_multiplier = 10000;
                         println!("[SIM] Speed: 10000x ({} ticks/sec)", SIM_RATE as u32 * 10000);
                     }
+                    PhysicalKey::Code(KeyCode::Digit8) if pressed => {
+                        self.speed_multiplier = 100000;
+                        println!("[SIM] Speed: 100000x ({} ticks/sec)", SIM_RATE as u32 * 100000);
+                    }
                     PhysicalKey::Code(KeyCode::Digit9) if pressed => {
-                        self.speed_multiplier = 50000;
-                        println!("[SIM] Speed: 50000x ({} ticks/sec)", SIM_RATE as u32 * 50000);
+                        self.speed_multiplier = 1000000;
+                        println!("[SIM] Speed: 1000000x ({} ticks/sec)", SIM_RATE as u32 * 1000000);
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
@@ -2579,20 +2579,20 @@ fn speed_label(multiplier: u32) -> &'static str {
         10 => "10×",
         100 => "100×",
         1_000 => "1k×",
-        5_000 => "5k×",
         10_000 => "10k×",
-        50_000 => "50k×",
+        100_000 => "100k×",
+        1_000_000 => "1000k×",
         _ => "?×",
     }
 }
 
 /// Cap per-frame ticks proportional to speed, with a reasonable ceiling.
-/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 100,000).
+/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 1,000,000).
 fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
     if render_3d {
         (speed_multiplier * 2).min(4000)
     } else {
-        (speed_multiplier * 10).min(100_000)
+        (speed_multiplier * 10).min(1_000_000)
     }
 }
 
@@ -2616,9 +2616,9 @@ mod tests {
         assert_eq!(speed_label(10), "10×");
         assert_eq!(speed_label(100), "100×");
         assert_eq!(speed_label(1_000), "1k×");
-        assert_eq!(speed_label(5_000), "5k×");
         assert_eq!(speed_label(10_000), "10k×");
-        assert_eq!(speed_label(50_000), "50k×");
+        assert_eq!(speed_label(100_000), "100k×");
+        assert_eq!(speed_label(1_000_000), "1000k×");
     }
 
     #[test]
@@ -2636,7 +2636,7 @@ mod tests {
         assert_eq!(max_ticks_per_frame(10, true), 20);
         assert_eq!(max_ticks_per_frame(1000, true), 2000);
         assert_eq!(max_ticks_per_frame(5000, true), 4000); // capped
-        assert_eq!(max_ticks_per_frame(50_000, true), 4000); // capped
+        assert_eq!(max_ticks_per_frame(1_000_000, true), 4000); // capped
     }
 
     #[test]
@@ -2644,8 +2644,9 @@ mod tests {
         assert_eq!(max_ticks_per_frame(1, false), 10);
         assert_eq!(max_ticks_per_frame(100, false), 1000);
         assert_eq!(max_ticks_per_frame(1000, false), 10_000);
-        assert_eq!(max_ticks_per_frame(10_000, false), 100_000); // at cap
-        assert_eq!(max_ticks_per_frame(50_000, false), 100_000); // capped
+        assert_eq!(max_ticks_per_frame(10_000, false), 100_000);
+        assert_eq!(max_ticks_per_frame(100_000, false), 1_000_000); // at cap
+        assert_eq!(max_ticks_per_frame(1_000_000, false), 1_000_000); // capped
     }
 
     // ── brain_stride ─────────────────────────────────────────────────
@@ -2657,7 +2658,8 @@ mod tests {
         assert_eq!(brain_stride(100), 10);
         assert_eq!(brain_stride(1000), 31); // sqrt(1000)=31.6 → 31
         assert_eq!(brain_stride(10_000), 100);
-        assert_eq!(brain_stride(50_000), 223); // sqrt(50000)=223.6 → 223
+        assert_eq!(brain_stride(100_000), 316); // sqrt(100000)=316.2 → 316
+        assert_eq!(brain_stride(1_000_000), 1000); // sqrt(1000000)=1000
     }
 
     #[test]
@@ -2670,7 +2672,7 @@ mod tests {
 
     #[test]
     fn all_speed_levels_have_labels() {
-        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 5_000, 10_000, 50_000];
+        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
         for &m in levels {
             assert_ne!(speed_label(m), "?×", "missing label for multiplier {}", m);
         }
@@ -2678,7 +2680,7 @@ mod tests {
 
     #[test]
     fn fast_mode_always_ge_3d_mode() {
-        for speed in [1, 2, 5, 10, 100, 1000, 5000, 10_000, 50_000] {
+        for speed in [1, 2, 5, 10, 100, 1000, 10_000, 100_000, 1_000_000] {
             assert!(
                 max_ticks_per_frame(speed, false) >= max_ticks_per_frame(speed, true),
                 "fast mode should allow >= 3D ticks at speed {}",

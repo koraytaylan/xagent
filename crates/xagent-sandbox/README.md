@@ -554,7 +554,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 50k×`) turns yellow when above 1×.
+Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 1000k×`) turns yellow when above 1×.
 
 ---
 
@@ -583,9 +583,9 @@ about_to_wait()     → Request continuous redraw
 | `4` | 10 | 10x |
 | `5` | 100 | 100x |
 | `6` | 1000 | 1k× |
-| `7` | 5000 | 5k× |
-| `8` | 10000 | 10k× |
-| `9` | 50000 | 50k× |
+| `7` | 10000 | 10k× |
+| `8` | 100000 | 100k× |
+| `9` | 1000000 | 1000k× |
 
 Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 100,000) in fast mode.
 
@@ -755,9 +755,9 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | `4` | Speed 10x (10 ticks/frame) |
 | `5` | Speed 100x (100 ticks/frame) |
 | `6` | Speed 1000x (1000 ticks/frame) |
-| `7` | Speed 5000x (5000 ticks/frame) |
-| `8` | Speed 10000x (10000 ticks/frame) |
-| `9` | Speed 50000x (50000 ticks/frame) |
+| `7` | Speed 10000x (10000 ticks/frame) |
+| `8` | Speed 100000x (100000 ticks/frame) |
+| `9` | Speed 1000000x (1000000 ticks/frame) |
 | Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |

@@ -305,7 +305,7 @@ impl PatternMemory {
 
     /// Learn from prediction error: reinforce patterns similar to current state
     /// and strengthen co-occurrence associations between recently active patterns.
-    pub fn learn(&mut self, current: &EncodedState, error: f32, learning_rate: f32) {
+    pub fn learn(&mut self, current: &EncodedState, error: f32, learning_rate: f32, gradient: f32) {
         let current_norm = compute_norm(current.data());
         // Collect similarity scores first to avoid borrow conflicts
         let sims: Vec<(usize, f32)> = self
@@ -324,6 +324,9 @@ impl PatternMemory {
             if let Some(ref mut pat) = self.patterns[i] {
                 pat.reinforcement += sim * learning_rate * (1.0 - error);
                 pat.reinforcement = pat.reinforcement.clamp(0.0, MAX_REINFORCEMENT);
+                // Retroactive valence update: nudge toward current gradient
+                let valence_lr = learning_rate * 0.3;
+                pat.outcome_valence += sim * valence_lr * (gradient - pat.outcome_valence);
             }
         }
 
@@ -731,7 +734,7 @@ mod tests {
         // A state similar to both — learn repeatedly
         let current = make_state(&[0.5, 0.5, 0.0, 0.0]);
         for _ in 0..20 {
-            mem.learn(&current, 0.1, 0.1);
+            mem.learn(&current, 0.1, 0.1, 0.0);
         }
 
         // Check that the association strengthened
@@ -790,6 +793,26 @@ mod tests {
         // Apply 100% trauma — should wipe everything
         mem.trauma(1.0);
         assert_eq!(mem.active_count(), 0);
+    }
+
+    #[test]
+    fn learn_updates_outcome_valence() {
+        let mut mem = PatternMemory::new(10, 4);
+        // Store a pattern with neutral valence
+        mem.store(make_state(&[1.0, 0.0, 0.0, 0.0]), 0.5, 0.0, 0.0);
+
+        // Learn with a positive gradient near the stored pattern
+        let current = make_state(&[0.9, 0.1, 0.0, 0.0]);
+        for _ in 0..20 {
+            mem.learn(&current, 0.1, 0.1, 0.5);
+        }
+
+        let p = mem.get(0).unwrap();
+        assert!(
+            p.outcome_valence > 0.1,
+            "Valence should become positive after positive gradient: got {}",
+            p.outcome_valence
+        );
     }
 
     #[test]

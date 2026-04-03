@@ -500,12 +500,12 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ### Test Coverage Summary
 
-**58 tests total** across the workspace:
+**98 tests total** across the workspace:
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 44 | Encoder similarity/determinism, memory store/recall/decay/associations/temporal sequences, predictor convergence/gradient descent, homeostasis multi-timescale gradients/urgency/distress curves, action selector exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence) |
-| **xagent-sandbox** | 14 | Physics (movement, rotation, gravity, NaN sanitization), agent lifecycle (energy depletion, death, food consumption), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy) |
+| **xagent-brain** | 79 | Encoder similarity/determinism/adaptation, memory store/recall/decay/associations/temporal sequences/motor context/valence updates, predictor convergence/gradient descent/rollout dynamics, homeostasis multi-timescale gradients/urgency/distress curves, action selector memory-informed blending/exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence, motor context storage) |
+| **xagent-sandbox** | 19 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain), agent lifecycle (energy depletion, death, food consumption), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy), evolution (config mutation/crossover, fitness evaluation) |
 
 ---
 

@@ -241,23 +241,23 @@ All components are orchestrated by `Brain::tick()`, which runs once per simulati
 
 ### 4.2 Pattern Memory (`memory.rs`)
 
-**What it does**: Stores encoded states as `Pattern` objects in a fixed-capacity bank. Patterns can be recalled by similarity, associated with each other through co-occurrence, linked temporally (predecessor/successor), and decay over time unless reinforced.
+**What it does**: Stores encoded states as `Pattern` objects in a fixed-capacity bank. Each pattern captures not just the sensory state but also the motor command that was active and the homeostatic outcome (valence) at storage time — forming situation-action-outcome triplets. Patterns can be recalled by similarity, associated with each other through co-occurrence, linked temporally (predecessor/successor), and decay over time unless reinforced.
 
-**Why it exists**: This is the agent's experience store — analogous to episodic memory. It allows the agent to recognize familiar situations, anticipate what comes next (via temporal links), and build associations between co-occurring experiences. The fixed capacity means old, unused memories are eventually overwritten by new ones, implementing a form of forgetting.
+**Why it exists**: This is the agent's episodic motor memory — it allows the agent to recognize familiar situations, recall what actions worked (or failed) in similar states, anticipate what comes next (via temporal links), and build associations between co-occurring experiences. The motor context enables memory-informed action selection: recalled patterns directly suggest actions based on past outcomes. The fixed capacity means old, unused memories are eventually overwritten by new ones, implementing a form of forgetting.
 
 **How it works**:
 
 #### Storage
 
-When `store()` is called:
+When `store()` is called with the encoded state, motor command (forward, turn), and homeostatic gradient (outcome valence):
 1. A slot is found — either an empty one, or the one with the lowest reinforcement (weakest memory gets overwritten).
 2. If overwriting, temporal links pointing to the old pattern are cleaned up (`unlink_temporal`).
-3. The new pattern is created with `reinforcement=1.0`, `activation_count=1`, and the current tick.
+3. The new pattern is created with `reinforcement=1.0`, `activation_count=1`, the current tick, and the motor/valence context.
 4. Temporal links are established: the previous pattern's `successor` points here, and this pattern's `predecessor` points back. Both forward (0.5 strength) and backward (0.3 strength) associations are created.
 
 #### Recall by Similarity
 
-`recall()` computes cosine similarity between the query and all stored patterns, sorts by similarity, and returns the top-N (capped by `budget`). Each recalled pattern gets its `last_accessed` tick updated and `activation_count` incremented.
+`recall()` computes cosine similarity between the query and all stored patterns, sorts by similarity, and returns the top-N (capped by `budget`) as `RecalledPattern` structs. Each `RecalledPattern` contains the encoded state, similarity score, stored motor command (forward, turn), and outcome valence — providing the action selector with situation-action-outcome context. Each recalled pattern gets its `last_accessed` tick updated and `activation_count` incremented.
 
 ```rust
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -268,8 +268,6 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     (dot / (mag_a * mag_b)).clamp(-1.0, 1.0)
 }
 ```
-
-There is also `recall_weighted()` which returns `(EncodedState, similarity_score)` pairs for use by the predictor's context-weighted blending.
 
 #### Association Links with Generation Validation
 
@@ -319,9 +317,10 @@ With a severity of 0.2 (used on agent death), the weakest memories are wiped whi
 
 #### Learning
 
-`learn()` does two things:
+`learn()` does three things:
 1. **Reinforcement**: Patterns similar to the current state (cosine similarity > 0.3) are reinforced proportional to `similarity × learning_rate × (1 - error)`. Low prediction error strengthens matching patterns more.
-2. **Co-occurrence association**: Patterns that are *both* highly similar to the current state (similarity > 0.5) are associated with each other via bidirectional links with strength `learning_rate × 0.1`.
+2. **Retroactive valence update**: Similar patterns have their `outcome_valence` nudged toward the current homeostatic gradient via an EMA: `valence += sim × (learning_rate × 0.3) × (gradient - valence)`. This lets the agent update its assessment of past situations — "I thought this was bad, but it led to food" — creating a running evaluation that informs future action selection.
+3. **Co-occurrence association**: Patterns that are *both* highly similar to the current state (similarity > 0.5) are associated with each other via bidirectional links with strength `learning_rate × 0.1`.
 
 **Key constants**:
 
@@ -502,24 +501,46 @@ global_bias[a] = global_bias[a] × 0.995 + accumulated_credit[a] × 0.08
 
 The last 64 actions are tracked with zero per-tick heap allocation (pre-allocated ring buffer for state snapshots). The most recent action gets full credit; an action from 30 ticks ago gets `exp(-30 × 0.04) ≈ 30%` of the credit.
 
+#### Memory-Informed Motor Blending
+
+After the reactive policy computes raw motor output and prospective evaluation adjusts it, recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
+
+```
+mem_fwd = Σ (similarity × valence × stored_forward) / Σ |similarity × valence|
+mem_trn = Σ (similarity × valence × stored_turn)   / Σ |similarity × valence|
+mix = memory_strength × 0.4   // memory contributes up to 40% of motor signal
+fwd = fwd × (1 - mix) + mem_fwd × mix
+```
+
+- **Positive valence**: "do what I did before" — reinforces the recalled motor command
+- **Negative valence**: "do the opposite" — the sign flip steers away from past mistakes
+- **Low similarity**: contributes little (similarity weights the influence)
+- **Memory strength** scales with the average |similarity × valence| across recalled patterns, clamped to [0, 1]
+
+This creates a direct pathway from memory to action — agents with larger memory accumulate a richer library of situation-action-outcome triplets that directly guide behavior.
+
 #### Adaptive Exploration Rate
 
-The exploration rate is computed dynamically each tick:
+The exploration rate is computed dynamically each tick, based on **policy confidence** rather than recall count:
 
 ```rust
-let stability = recalled.len() as f32 / 16.0;
+let raw_signal = fwd.abs() + trn.abs();  // combined motor output magnitude
+let policy_confidence = (raw_signal / 2.0).clamp(0.0, 1.0);
 let novelty_bonus = (prediction_error * 2.0).min(0.4);
 let urgency_penalty = (urgency * 0.4).min(0.5);
-exploration_rate = (0.5 - stability * 0.15 + novelty_bonus + curiosity_bonus - urgency_penalty)
+exploration_rate = (0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity_bonus - urgency_penalty)
     .clamp(0.10, 0.85);
 ```
 
 - **Base rate is 0.5** — agent exploits ~50% of the time by default
-- **More recalled patterns** (stable environment) → less exploration (stability weight 0.15)
+- **Strong policy signal** (trained weights + memory advice) → less exploration
+- **Untrained agent** (weights ≈ 0, no memory) → high exploration (exploration IS the strategy)
 - **Higher prediction error** (novel situation) → more exploration
 - **Higher curiosity bonus** (sensory monotony) → more exploration
 - **Higher urgency** (danger) → less exploration (exploit known-good actions)
-- **Exploration floor is 10%** — even at maximum urgency, agents explore at least 10% of the time, preventing total exploitation lock-in
+- **Exploration floor is 10%** — even at maximum urgency, agents explore at least 10% of the time
+
+Previously, exploration was inversely proportional to the number of recalled patterns (`stability = recalled.len() / 16.0`). This created perverse evolutionary pressure: agents with larger memory recalled more patterns, explored less, and followed untrained policy weights — effectively paralyzing themselves. The policy-confidence approach decouples exploration from memory capacity, allowing evolution to find the optimal brain size without exploration penalties.
 
 #### Uniform Random Exploration
 

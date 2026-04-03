@@ -975,9 +975,10 @@ impl ApplicationHandler for App {
         let max_idx = (heatmap_res * heatmap_res * 6) as u64;
         self.heatmap_gpu = Some(GpuMesh::new_dynamic(&renderer.device, max_verts, max_idx));
 
-        // Trail overlay: linear ribbon, up to MAX_TRAIL_POINTS control points.
+        // Trail overlay: combined ribbons for ALL agents.
         // Each segment = 4 verts, 6 indices.
-        let max_trail_segs = xagent_sandbox::agent::MAX_TRAIL_POINTS as u64;
+        let max_trail_segs =
+            xagent_sandbox::agent::MAX_TRAIL_POINTS as u64 * MAX_AGENTS as u64;
         self.trail_gpu = Some(GpuMesh::new_dynamic(
             &renderer.device,
             max_trail_segs * 4,
@@ -1711,25 +1712,32 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // ── rebuild trail overlay for selected agent (only when changed) ──
+                // ── rebuild trail overlay for ALL agents (when any trail changed) ──
                 if let (Some(renderer), Some(trail_gpu)) =
                     (&self.renderer, &mut self.trail_gpu)
                 {
-                    if let Some(agent) = self.agents.get_mut(self.selected_agent_idx) {
-                        if agent.trail_dirty {
-                            if agent.trail.len() > 1 && agent.body.body.alive {
-                                let mesh = overlay::build_trail_mesh(
-                                    &agent.trail,
-                                    &agent.color,
-                                );
-                                trail_gpu.update_from_mesh(&renderer.queue, &mesh);
-                            } else {
-                                trail_gpu.num_indices = 0;
-                            }
-                            agent.trail_dirty = false;
+                    let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
+                    if any_dirty {
+                        let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
+                            .agents
+                            .iter()
+                            .map(|a| {
+                                (
+                                    a.trail.as_slice(),
+                                    &a.color as &[f32; 3],
+                                    a.body.body.alive,
+                                )
+                            })
+                            .collect();
+                        let mesh = overlay::build_all_trails_mesh(&agent_data);
+                        if mesh.indices.is_empty() {
+                            trail_gpu.num_indices = 0;
+                        } else {
+                            trail_gpu.update_from_mesh(&renderer.queue, &mesh);
                         }
-                    } else {
-                        trail_gpu.num_indices = 0;
+                        for a in &mut self.agents {
+                            a.trail_dirty = false;
+                        }
                     }
                 }
 

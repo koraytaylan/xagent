@@ -779,7 +779,7 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | Indicator | Description |
 |---|---|
 | Yellow diamond | Floating marker above the currently selected agent |
-| Colored ribbon trail | Linear ribbon of selected agent's full life path (distance-sampled, up to 4000 points, dirty-flag rebuild) |
+| Colored ribbon trails | Linear ribbons for all alive agents simultaneously, each in their own palette color (distance-sampled, up to 4000 points per agent, dirty-flag rebuild) |
 | Palette-colored agent | Each agent has a unique static color matching its sidebar dot |
 | Heatmap overlay (`H`) | Blue→yellow→red cells showing where the selected agent spent time |
 
@@ -921,9 +921,9 @@ as an octahedron shape, making the selected agent easy to spot even in crowded s
 
 Each agent records its position using distance-based sampling — a new control point
 is stored whenever the agent moves ≥ 3 units from the last sample (up to 4000 points
-per life). The selected agent's trail is rendered as a **linear ribbon** using the
-agent's own color. The mesh is only rebuilt when the trail data changes (dirty flag),
-keeping CPU cost negligible even at high time multipliers.
+per life). All alive agents' trails are rendered simultaneously as **linear ribbons**,
+each in the agent's own palette color. Meshes are only rebuilt when trail data changes
+(dirty flag), keeping CPU cost negligible even at high time multipliers.
 
 The trail covers the agent's **entire current life** (birth to present). Only the
 oldest 20% fades slightly; the rest is uniformly visible. The trail resets on

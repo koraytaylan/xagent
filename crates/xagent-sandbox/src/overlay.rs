@@ -130,6 +130,85 @@ pub fn build_trail_mesh(
     Mesh { vertices, indices }
 }
 
+/// Build a combined ribbon trail for every agent in the simulation.
+/// Each agent's trail is coloured with its own colour.  Returns an empty mesh
+/// if no agent has ≥2 trail points.
+pub fn build_all_trails_mesh(
+    agents: &[(&[[f32; 3]], &[f32; 3], bool)], // (trail, color, alive)
+) -> Mesh {
+    // First pass: count total segments across all agents.
+    let total_segments: usize = agents
+        .iter()
+        .filter(|(trail, _, alive)| *alive && trail.len() > 1)
+        .map(|(trail, _, _)| trail.len() - 1)
+        .sum();
+
+    if total_segments == 0 {
+        return Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+    }
+
+    let mut vertices = Vec::with_capacity(total_segments * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity(total_segments * 6);
+
+    let ribbon_half_width: f32 = 0.3;
+    let y_offset: f32 = 0.3;
+
+    for &(trail, agent_color, alive) in agents {
+        if !alive || trail.len() < 2 {
+            continue;
+        }
+
+        let num_segments = trail.len() - 1;
+        for i in 0..num_segments {
+            let a = trail[i];
+            let b = trail[i + 1];
+
+            let progress = i as f32 / num_segments as f32;
+            let brightness = if progress < 0.2 {
+                0.3 + (progress / 0.2) * 0.4
+            } else {
+                0.7
+            };
+            let color = [
+                agent_color[0] * brightness,
+                agent_color[1] * brightness,
+                agent_color[2] * brightness,
+            ];
+
+            let dx = b[0] - a[0];
+            let dz = b[2] - a[2];
+            let len = (dx * dx + dz * dz).sqrt().max(0.001);
+            let px = -dz / len * ribbon_half_width;
+            let pz = dx / len * ribbon_half_width;
+
+            let base = vertices.len() as u32;
+            vertices.push(Vertex {
+                position: [a[0] + px, a[1] + y_offset, a[2] + pz],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [a[0] - px, a[1] + y_offset, a[2] - pz],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [b[0] - px, b[1] + y_offset, b[2] - pz],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [b[0] + px, b[1] + y_offset, b[2] + pz],
+                color,
+            });
+
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        }
+    }
+
+    Mesh { vertices, indices }
+}
+
 /// Build a small diamond marker hovering above the given position.
 pub fn build_marker_mesh(position: glam::Vec3) -> Mesh {
     let cx = position.x;
@@ -172,4 +251,128 @@ pub fn build_marker_mesh(position: glam::Vec3) -> Mesh {
     }
 
     Mesh { vertices, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn white() -> [f32; 3] {
+        [1.0, 1.0, 1.0]
+    }
+
+    // ── build_trail_mesh ─────────────────────────────────────────────
+
+    #[test]
+    fn trail_mesh_empty_on_zero_points() {
+        let m = build_trail_mesh(&[], &white());
+        assert!(m.vertices.is_empty());
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn trail_mesh_empty_on_single_point() {
+        let m = build_trail_mesh(&[[0.0, 0.0, 0.0]], &white());
+        assert!(m.vertices.is_empty());
+    }
+
+    #[test]
+    fn trail_mesh_one_segment() {
+        let pts = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let m = build_trail_mesh(&pts, &white());
+        assert_eq!(m.vertices.len(), 4);
+        assert_eq!(m.indices.len(), 6);
+    }
+
+    #[test]
+    fn trail_mesh_three_points_two_segments() {
+        let pts = [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let m = build_trail_mesh(&pts, &white());
+        assert_eq!(m.vertices.len(), 8);
+        assert_eq!(m.indices.len(), 12);
+    }
+
+    #[test]
+    fn trail_mesh_applies_agent_color() {
+        let pts = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let red = [1.0, 0.0, 0.0];
+        let m = build_trail_mesh(&pts, &red);
+        // Single segment → oldest 20% fade region → brightness ≈ 0.3
+        assert!(m.vertices[0].color[0] > 0.0); // red channel present
+        assert_eq!(m.vertices[0].color[1], 0.0); // green zero
+        assert_eq!(m.vertices[0].color[2], 0.0); // blue zero
+    }
+
+    // ── build_all_trails_mesh ────────────────────────────────────────
+
+    #[test]
+    fn all_trails_empty_when_no_agents() {
+        let m = build_all_trails_mesh(&[]);
+        assert!(m.vertices.is_empty());
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn all_trails_skips_dead_agents() {
+        let trail = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let c = white();
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
+            vec![(trail.as_slice(), &c, false)];
+        let m = build_all_trails_mesh(&agents);
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn all_trails_skips_short_trails() {
+        let trail = vec![[0.0, 0.0, 0.0]]; // only 1 point
+        let c = white();
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
+            vec![(trail.as_slice(), &c, true)];
+        let m = build_all_trails_mesh(&agents);
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn all_trails_combines_two_agents() {
+        let t1 = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]; // 1 segment
+        let t2 = vec![[0.0, 0.0, 5.0], [5.0, 0.0, 5.0], [10.0, 0.0, 5.0]]; // 2 segments
+        let red = [1.0, 0.0, 0.0];
+        let blue = [0.0, 0.0, 1.0];
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
+            vec![(t1.as_slice(), &red, true), (t2.as_slice(), &blue, true)];
+        let m = build_all_trails_mesh(&agents);
+        // 3 segments total → 12 verts, 18 indices
+        assert_eq!(m.vertices.len(), 12);
+        assert_eq!(m.indices.len(), 18);
+    }
+
+    #[test]
+    fn all_trails_mixed_alive_and_dead() {
+        let t1 = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let t2 = vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0]];
+        let c = white();
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> = vec![
+            (t1.as_slice(), &c, true),  // alive → included
+            (t2.as_slice(), &c, false), // dead → skipped
+        ];
+        let m = build_all_trails_mesh(&agents);
+        assert_eq!(m.vertices.len(), 4); // only agent 1
+        assert_eq!(m.indices.len(), 6);
+    }
+
+    #[test]
+    fn all_trails_uses_each_agents_color() {
+        let t1 = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let t2 = vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0]];
+        let red = [1.0, 0.0, 0.0];
+        let blue = [0.0, 0.0, 1.0];
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
+            vec![(t1.as_slice(), &red, true), (t2.as_slice(), &blue, true)];
+        let m = build_all_trails_mesh(&agents);
+        // First 4 verts belong to agent 1 (red), next 4 to agent 2 (blue)
+        assert!(m.vertices[0].color[0] > 0.0); // red channel
+        assert_eq!(m.vertices[0].color[2], 0.0); // no blue
+        assert_eq!(m.vertices[4].color[0], 0.0); // no red
+        assert!(m.vertices[4].color[2] > 0.0); // blue channel
+    }
 }

@@ -161,6 +161,10 @@ Suicide prevention is emergent: death is maximally unpredictable (massive predic
 
 Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.25, 0.25, 0.25]`. This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
 
+### Agent Trails
+
+All alive agents render their movement history simultaneously as **linear ribbon trails**, each in the agent's own palette color. Positions are distance-sampled (new point every ≥ 3 units moved, up to 4000 points per life). Trail meshes are rebuilt only when data changes (dirty flag), keeping overhead negligible at high speed multipliers. Trails reset on death/respawn.
+
 ### Multi-Agent & Food Scarcity
 
 - Up to 100 concurrent agents (raised from 20)
@@ -230,7 +234,6 @@ cargo run --release -- --config experiment.json
 | `R` | Toggle brain persistence on death (persist / reset) |
 | `N` | Spawn new agent (default config) |
 | `M` | Spawn mutated agent (±10% parameter variation) |
-| `Esc` | Print session summary and exit |
 
 ### egui UI Interaction
 

@@ -996,7 +996,7 @@ Several optimizations keep the simulation fast at scale:
 cargo test -p xagent-sandbox
 ```
 
-### Test Inventory (14 tests)
+### Test Inventory (18 tests)
 
 | Test | Category | Verifies |
 |---|---|---|
@@ -1014,6 +1014,10 @@ cargo test -p xagent-sandbox
 | `terrain_rejects_one_subdivision` | World | `#[should_panic]` — 1 subdivision is rejected |
 | `sensory_frame_has_correct_dimensions` | Senses | Visual field is 8×6, buffers correctly sized |
 | `interoception_matches_body_state` | Senses | Energy/integrity signals match InternalState |
+| `orbit_camera_positioned_above_target` | Camera | Orbit places camera above target (positive Y offset) |
+| `orbit_pitch_clamps_above_horizon` | Camera | Orbit pitch stays within (0.05, 1.4) range |
+| `orbit_scroll_zoom_out_has_no_upper_bound` | Camera | Orbit zoom-out has no upper distance cap |
+| `orbit_scroll_zoom_in_clamps_at_minimum` | Camera | Orbit zoom-in floors at 5.0 distance |
 
 ---
 

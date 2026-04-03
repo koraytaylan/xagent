@@ -59,7 +59,7 @@ impl Camera {
             orbit_target: Vec3::ZERO,
             orbit_distance: 30.0,
             orbit_yaw: 0.0,
-            orbit_pitch: -0.5,
+            orbit_pitch: 0.5,
         }
     }
 
@@ -165,14 +165,14 @@ impl Camera {
             let dx = (x - last_x) as f32;
             let dy = (y - last_y) as f32;
             self.orbit_yaw += dx * sensitivity;
-            self.orbit_pitch = (self.orbit_pitch - dy * sensitivity).clamp(-1.4, -0.05);
+            self.orbit_pitch = (self.orbit_pitch - dy * sensitivity).clamp(0.05, 1.4);
         }
         self.last_mouse_pos = Some((x, y));
     }
 
     /// Scroll-wheel zoom for orbit mode.
     pub fn process_orbit_scroll(&mut self, delta: f32) {
-        self.orbit_distance = (self.orbit_distance - delta * 2.0).clamp(5.0, 200.0);
+        self.orbit_distance = (self.orbit_distance - delta * 2.0).max(5.0);
     }
 
     /// Compute the view matrix (world-to-camera transform) using right-handed look-at.
@@ -188,5 +188,83 @@ impl Camera {
     /// Combined view-projection matrix for transforming world positions to clip space.
     pub fn view_projection_matrix(&self) -> Mat4 {
         self.projection_matrix() * self.view_matrix()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orbit_camera_positioned_above_target() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+        let target = Vec3::new(10.0, 0.0, 10.0);
+        cam.update_orbit(target);
+
+        // Camera Y should be above target Y (positive orbit_pitch → positive Y offset)
+        assert!(
+            cam.position.y > target.y,
+            "camera should be above target: cam.y={} target.y={}",
+            cam.position.y,
+            target.y
+        );
+    }
+
+    #[test]
+    fn orbit_pitch_clamps_above_horizon() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+        cam.is_mouse_dragging = true;
+        cam.last_mouse_pos = Some((100.0, 100.0));
+
+        // Drag mouse far downward — tries to push pitch below 0.05
+        cam.process_orbit_mouse_move(100.0, 100_000.0);
+        assert!(
+            cam.orbit_pitch >= 0.05,
+            "orbit_pitch should not go below 0.05: {}",
+            cam.orbit_pitch
+        );
+
+        // Drag mouse far upward — tries to push pitch above 1.4
+        cam.last_mouse_pos = Some((100.0, 100.0));
+        cam.process_orbit_mouse_move(100.0, -100_000.0);
+        assert!(
+            cam.orbit_pitch <= 1.4,
+            "orbit_pitch should not exceed 1.4: {}",
+            cam.orbit_pitch
+        );
+    }
+
+    #[test]
+    fn orbit_scroll_zoom_out_has_no_upper_bound() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+
+        // Scroll out aggressively (negative delta = zoom out)
+        for _ in 0..1000 {
+            cam.process_orbit_scroll(-10.0);
+        }
+        assert!(
+            cam.orbit_distance > 200.0,
+            "orbit_distance should exceed old 200 cap: {}",
+            cam.orbit_distance
+        );
+    }
+
+    #[test]
+    fn orbit_scroll_zoom_in_clamps_at_minimum() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+
+        // Scroll in aggressively (positive delta = zoom in)
+        for _ in 0..1000 {
+            cam.process_orbit_scroll(10.0);
+        }
+        assert!(
+            cam.orbit_distance >= 5.0,
+            "orbit_distance should not go below 5.0: {}",
+            cam.orbit_distance
+        );
     }
 }

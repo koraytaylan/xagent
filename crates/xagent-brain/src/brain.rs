@@ -300,10 +300,10 @@ impl Brain {
             action: command.action,
         };
 
-        // 9. Record prediction for next tick's error computation
+        // 10. Record prediction for next tick's error computation
         self.predictor.record_prediction(prediction);
 
-        // 10. Compute behavior quality metrics
+        // 11. Compute behavior quality metrics
         let exploitation_ratio = self.action_selector.exploitation_ratio();
         let exploration_rate = self.action_selector.exploration_rate();
         let decision_quality = (1.0 - scalar_error.clamp(0.0, 1.0))
@@ -311,7 +311,7 @@ impl Brain {
             * (1.0 + homeo_state.gradient).clamp(0.0, 2.0)
             / 2.0;
 
-        // 11. Update telemetry
+        // 12. Update telemetry
         self.last_telemetry = BrainTelemetry {
             tick: self.tick_count,
             prediction_error: scalar_error,
@@ -331,7 +331,7 @@ impl Brain {
             motor_variance: self.motor_fatigue.motor_variance(),
         };
 
-        // 12. Capture decision snapshot for UI stream
+        // 13. Capture decision snapshot for UI stream
         self.last_decision = Some(DecisionSnapshot {
             tick: self.tick_count,
             motor_forward: command.forward,

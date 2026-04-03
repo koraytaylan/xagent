@@ -763,7 +763,7 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | `N` | Spawn a new agent (default config) |
 | `M` | Spawn a new agent (mutated config) |
 | `H` | Toggle heatmap overlay for selected agent |
-| `Escape` | Print session summary and quit |
+
 
 ### egui UI Interaction
 

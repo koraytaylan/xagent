@@ -1017,7 +1017,7 @@ impl ApplicationHandler for App {
         self.last_frame = Instant::now();
 
         println!(
-            "[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D | ESC = quit"
+            "[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D"
         );
         println!(
             "[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry"
@@ -1079,10 +1079,7 @@ impl ApplicationHandler for App {
                     }
 
                     // ── simulation controls ─────────────────────────
-                    PhysicalKey::Code(KeyCode::Escape) if pressed => {
-                        self.print_session_summary();
-                        event_loop.exit();
-                    }
+
                     PhysicalKey::Code(KeyCode::KeyP | KeyCode::Space) if pressed => {
                         match self.evo_snapshot.state {
                             EvolutionState::Running => {

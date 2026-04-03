@@ -21,6 +21,26 @@ pub struct BrainConfig {
     pub learning_rate: f32,
     /// Decay rate for unreinforced patterns per tick.
     pub decay_rate: f32,
+    /// Exponent for the homeostatic distress curve. Higher = calm longer, panic harder.
+    /// Heritable: mutated during breeding, clamped to [1.5, 5.0]. Default 2.0.
+    #[serde(default = "default_distress_exponent")]
+    pub distress_exponent: f32,
+    /// Scales per-dimension variance into attenuation range. Higher = faster boredom.
+    /// Heritable: mutated during breeding, clamped to [5.0, 50.0]. Default 20.0.
+    #[serde(default = "default_habituation_sensitivity")]
+    pub habituation_sensitivity: f32,
+    /// Maximum curiosity bonus from sensory monotony. Higher = stronger exploration drive.
+    /// Heritable: mutated during breeding, clamped to [0.1, 1.0]. Default 0.6.
+    #[serde(default = "default_max_curiosity_bonus")]
+    pub max_curiosity_bonus: f32,
+    /// Scales motor variance into fatigue relief. Higher = easier recovery from fatigue.
+    /// Heritable: mutated during breeding, clamped to [2.0, 20.0]. Default 8.0.
+    #[serde(default = "default_fatigue_recovery_sensitivity")]
+    pub fatigue_recovery_sensitivity: f32,
+    /// Minimum motor output under fatigue. Lower = harsher dampening.
+    /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
+    #[serde(default = "default_fatigue_floor")]
+    pub fatigue_floor: f32,
 }
 
 /// Configuration for the world simulation.
@@ -45,6 +65,26 @@ pub struct WorldConfig {
     /// Random seed for world generation.
     #[serde(default = "default_seed")]
     pub seed: u64,
+}
+
+fn default_distress_exponent() -> f32 {
+    2.0
+}
+
+fn default_habituation_sensitivity() -> f32 {
+    20.0
+}
+
+fn default_max_curiosity_bonus() -> f32 {
+    0.6
+}
+
+fn default_fatigue_recovery_sensitivity() -> f32 {
+    8.0
+}
+
+fn default_fatigue_floor() -> f32 {
+    0.1
 }
 
 fn default_seed() -> u64 {
@@ -75,6 +115,76 @@ pub struct FullConfig {
     pub brain: BrainConfig,
     #[serde(default)]
     pub world: WorldConfig,
+    #[serde(default)]
+    pub governor: GovernorConfig,
+}
+
+/// Configuration for the evolution governor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernorConfig {
+    /// Number of agents per generation.
+    pub population_size: usize,
+    /// Simulation ticks per generation before evaluation.
+    pub tick_budget: u64,
+    /// Number of top agents whose configs survive to the next generation.
+    pub elitism_count: usize,
+    /// Maximum number of generations to run (0 = unlimited).
+    pub max_generations: u64,
+    /// Consecutive generations of fitness regression before backtracking.
+    pub patience: u32,
+    /// Base mutation strength (0.1 = ±10%). Scales up with failed attempts.
+    #[serde(default = "default_mutation_strength")]
+    pub mutation_strength: f32,
+    /// How many times each unique config is evaluated per generation (noise reduction).
+    #[serde(default = "default_eval_repeats")]
+    pub eval_repeats: usize,
+    /// Number of independent evolutionary lineages (island model).
+    #[serde(default = "default_num_islands")]
+    pub num_islands: usize,
+    /// Generations between best-config migration across islands.
+    #[serde(default = "default_migration_interval")]
+    pub migration_interval: u32,
+    /// Decay factor for per-island mutation momentum (0.0–1.0).
+    /// Higher = longer memory of winning mutation directions.
+    #[serde(default = "default_momentum_decay")]
+    pub momentum_decay: f32,
+}
+
+fn default_mutation_strength() -> f32 {
+    0.1
+}
+
+fn default_eval_repeats() -> usize {
+    2
+}
+
+fn default_num_islands() -> usize {
+    3
+}
+
+fn default_migration_interval() -> u32 {
+    5
+}
+
+fn default_momentum_decay() -> f32 {
+    0.9
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            population_size: 10,
+            tick_budget: 50_000,
+            elitism_count: 3,
+            max_generations: 0,
+            patience: 5,
+            mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 3,
+            migration_interval: 5,
+            momentum_decay: 0.9,
+        }
+    }
 }
 
 impl Default for BrainConfig {
@@ -86,6 +196,11 @@ impl Default for BrainConfig {
             representation_dim: 32,
             learning_rate: 0.05,
             decay_rate: 0.001,
+            distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 }
@@ -100,6 +215,11 @@ impl BrainConfig {
             representation_dim: 16,
             learning_rate: 0.08,
             decay_rate: 0.002,
+            distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 
@@ -112,6 +232,11 @@ impl BrainConfig {
             representation_dim: 64,
             learning_rate: 0.03,
             decay_rate: 0.0005,
+            distress_exponent: 2.0,
+            habituation_sensitivity: 20.0,
+            max_curiosity_bonus: 0.6,
+            fatigue_recovery_sensitivity: 8.0,
+            fatigue_floor: 0.1,
         }
     }
 }

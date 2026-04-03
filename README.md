@@ -44,7 +44,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, `WorldConfig`, and the `CognitiveArchitecture` trait. No logic — just types. |
 | **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
-| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, HUD, CSV logging, and the main event loop. |
+| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, CSV logging, and the main event loop. |
 
 ### Communication Flow
 
@@ -76,12 +76,14 @@ Sandbox                          Brain
 Each tick, the brain executes a single loop:
 
 ```
-encode → recall → predict → compare → learn → act
+encode → habituate → recall → predict → compare → learn → act → fatigue
 ```
 
 ### Step-by-Step
 
 1. **Encode** — The `SensoryEncoder` compresses the raw `SensoryFrame` into a fixed-size numerical vector (`EncodedState`). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque `Vec<f32>`, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+
+1a. **Habituate** — `SensoryHabituation` attenuates encoded dimensions that haven't changed recently (boredom). Produces a curiosity bonus that boosts exploration when sensory input is monotonous. The raw encoding is preserved for telemetry; the habituated state flows to all downstream components.
 
 2. **Recall** — `PatternMemory` retrieves the most similar past experiences within a capacity budget set by the `CapacityManager`. The budget adapts: high prediction error → more recall slots to gather context.
 
@@ -95,14 +97,16 @@ encode → recall → predict → compare → learn → act
    - **Encoder weights** receive L2 regularization to stay bounded
    - **Learning rate** is modulated by homeostatic gradient magnitude
 
-6. **Act** — The `ActionSelector` chooses a motor command via a learned linear policy — a weight matrix mapping encoded state to action preferences. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration uses uniform random action selection (10–85% of ticks, adaptive).
+6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%), boosted by the curiosity bonus from habituation.
+
+6a. **Fatigue** — `MotorFatigue` tracks recent motor output variance. Repetitive commands (low variance) dampen motor output, forcing the agent to break out of loops. Recovery is immediate when output diversifies.
 
 ### Homeostatic Feedback
 
 The `HomeostaticMonitor` tracks energy and integrity signals across three timescales (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) using exponential moving averages. It produces:
 
 - **Gradient** — positive = improving, negative = worsening. Modulates learning rate and action credit.
-- **Urgency** — non-linear distress curve. Near-critical levels suppress exploration.
+- **Urgency** — non-linear distress curve (configurable exponent, default quadratic). Near-critical levels suppress exploration.
 
 This is the **only** evaluative signal. There is no reward function.
 
@@ -120,7 +124,7 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ## 4. The Sandbox World
 
-The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend).
+The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides: a **top bar** (FPS, agent count, evolution state, wall time, ticks/sec, pause/resume/reset controls), a sortable **left sidebar** with the agent list, a **main dock area** with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, decision stream, and replay playback controls), and a **bottom console** for evolution event logs.
 
 ### Terrain & Biomes
 
@@ -138,8 +142,8 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 
 - Physical simulation: gravity, locomotion, collision with terrain
 - Internal state: energy (depletes over time and with movement) and integrity (damaged by hazards, regenerates when energy > 50%)
-- Sensory apparatus: 8×6 raycast vision (ray step 1.0), touch contacts (food, terrain edges, hazards, other agents), proprioception, interoception
-- **Agent vision**: ray marching detects terrain, food, and other agents (rendered as magenta `[0.9, 0.2, 0.6, 1.0]` in the visual field)
+- Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (food, terrain edges, hazards, other agents — top 4 encoded into brain), proprioception, interoception
+- **Agent vision**: ray marching detects terrain (biome-colored), food items (lime green `[0.70, 0.95, 0.20, 1.0]`), and other agents (magenta `[0.9, 0.2, 0.6, 1.0]`) in the visual field
 - **Agent-agent collision**: physical collision resolution pushes overlapping agents apart (2-unit minimum separation)
 - Death occurs when energy or integrity reaches zero → respawn with optional brain persistence
 
@@ -153,25 +157,20 @@ When brain persistence is enabled (default), three guardrails prevent suicide lo
 
 Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), and the brain's core drive is minimizing prediction error.
 
-### Behavioral Significance Coloring
+### Agent Palette Colors
 
-Agent color is computed dynamically based on behavioral significance:
+Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.25, 0.25, 0.25]`. This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
 
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-```
+### Agent Trails
 
-- **Gray** `[0.55, 0.55, 0.55]` when significance ≈ 0 (random/uninformed behavior)
-- **Bright red** `[0.95, 0.15, 0.10]` when significance → 1 (informed, learned behavior)
-- **Dead agents** render as dark gray `[0.25, 0.25, 0.25]`
-
-This replaces the old static 8-color palette — agent color now reflects cognitive state.
+All alive agents render their movement history simultaneously as **linear ribbon trails**, each in the agent's own palette color. Positions are distance-sampled (new point every ≥ 3 units moved, up to 4000 points per life). Trail meshes are rebuilt only when data changes (dirty flag), keeping overhead negligible at high speed multipliers. Trails reset on death/respawn.
 
 ### Multi-Agent & Food Scarcity
 
 - Up to 100 concurrent agents (raised from 20)
 - **Food respawn**: 10-second timer, relocates to a new random food-rich position — prevents camping, forces foraging
 - **Reproduction**: currently disabled to focus on individual learning rather than evolution
+- **Directed mutations**: Per-parameter momentum vectors (one per island) bias mutations toward directions that previously improved fitness. Momentum decays each generation (configurable via `momentum_decay`) so stale signals fade. This provides directional bias, emergent correlated mutations, and selective mutation focus — all without hardcoded parameter relationships.
 
 See the sandbox crate source for full implementation details.
 
@@ -216,13 +215,15 @@ cargo run --release -- --config experiment.json
 
 ## 6. Controls Reference
 
+### Keyboard & Mouse
+
 | Key | Action |
 |-----|--------|
 | `W` / `A` / `S` / `D` | Move camera forward / left / backward / right |
 | `E` | Move camera up |
 | `Shift` | Move camera down |
-| Mouse drag | Rotate camera (yaw/pitch) |
-| Scroll wheel | Zoom camera in/out |
+| Mouse drag (on viewport) | Rotate camera (yaw/pitch) |
+| Scroll wheel (on viewport) | Zoom camera in/out |
 | `P` / `Space` | Pause / resume simulation |
 | `1` | Speed 1× (1 tick/frame) |
 | `2` | Speed 2× (2 ticks/frame) |
@@ -230,12 +231,25 @@ cargo run --release -- --config experiment.json
 | `4` | Speed 10× (10 ticks/frame) |
 | `5` | Speed 100× (100 ticks/frame) |
 | `6` | Speed 1000× (1000 ticks/frame) |
-| Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist / reset) |
 | `N` | Spawn new agent (default config) |
 | `M` | Spawn mutated agent (±10% parameter variation) |
-| `Tab` | Cycle telemetry display to next agent |
-| `Esc` | Print session summary and exit |
+
+### egui UI Interaction
+
+| Action | Effect |
+|--------|--------|
+| Sort dropdown (sidebar top) | Sort agent list by ID, Energy, Integrity, Deaths, etc. |
+| Click agent in sidebar | Select / focus that agent |
+| Double-click agent in sidebar | Open an agent detail tab in the dock area |
+| Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| Pause / Resume button (top bar) | Pause or resume the simulation (visible during Running/Paused) |
+| Reset button (top bar) | Reset the evolution run (visible during Running/Paused) |
+| "Replay Gen N" button (detail tab) | Enter replay mode for the last completed generation |
+| Timeline scrubber (replay mode) | Scrub through recorded ticks |
+| Close detail tab | Click the × on the tab header |
+
+Camera controls (drag, scroll) are routed to the 3D viewport only when the pointer is hovering over it; interacting with the sidebar or detail tabs does not move the camera.
 
 ---
 
@@ -243,11 +257,11 @@ cargo run --release -- --config experiment.json
 
 ### Brain Presets
 
-| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` |
-|--------|---:|---:|---:|---:|---:|---:|
-| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 |
-| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 |
-| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 |
+| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
+|--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
 
 **Parameter effects:**
 
@@ -256,9 +270,14 @@ cargo run --release -- --config experiment.json
 | `memory_capacity` | Max stored patterns. Smaller → faster forgetting, stronger capacity pressure. |
 | `processing_slots` | Max recall operations per tick. Smaller → narrower attention. |
 | `visual_encoding_size` | Resolution of visual encoding (average-pooled bins). Smaller → coarser visual perception. |
-| `representation_dim` | Internal representation vector length. Smaller → more compression, more abstraction. |
+| `representation_dim` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
+| `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
+| `habituation_sensitivity` | How fast boredom builds (default 20.0). Higher → faster sensory attenuation. Heritable. |
+| `max_curiosity_bonus` | Exploration boost ceiling from monotony (default 0.6). Higher → stronger curiosity drive. Heritable. |
+| `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
+| `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
 
 ### World Presets
 
@@ -280,7 +299,12 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "visual_encoding_size": 64,
     "representation_dim": 32,
     "learning_rate": 0.05,
-    "decay_rate": 0.001
+    "decay_rate": 0.001,
+    "distress_exponent": 2.0,
+    "habituation_sensitivity": 20.0,
+    "max_curiosity_bonus": 0.6,
+    "fatigue_recovery_sensitivity": 8.0,
+    "fatigue_floor": 0.1
   },
   "world": {
     "world_size": 256.0,
@@ -319,6 +343,8 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 
 ### Key Metrics to Watch
 
+These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning). The CSV log files also record all metrics per tick. Completed generations can be replayed via the built-in replay system.
+
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
 | `prediction_error` (avg) | Decreasing over time | Stuck high or oscillating |
@@ -326,6 +352,9 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 | `memory_utilization` | Climbing toward capacity | Staying near 0 |
 | `homeostatic_gradient` | Trending positive | Consistently negative |
 | `exploration_rate` | Gradually decreasing | Stuck at max |
+| `mean_attenuation` | Near 1.0 (diverse input) | Near 0.1 (habituated, monotonous) |
+| `curiosity_bonus` | Low (varied sensory experience) | High (boredom driving exploration) |
+| `fatigue_factor` | Near 1.0 (diverse motor output) | Near floor (repetitive, dampened) |
 
 ### CSV Log Files
 
@@ -372,6 +401,12 @@ Each run produces a timestamped CSV file (e.g., `xagent_log_2026-03-23_21-06-03.
 xagent/
 ├── Cargo.toml                  # Workspace manifest
 ├── README.md                   # This file
+├── rust-toolchain.toml         # Pins Rust stable for CI + local dev
+├── cliff.toml                  # git-cliff changelog config
+├── .github/
+│   └── workflows/
+│       ├── ci.yml              # Check + test on push/PR to develop
+│       └── release.yml         # Tag-triggered release pipeline
 ├── crates/
 │   ├── xagent-shared/          # Interface contract
 │   │   └── src/
@@ -386,7 +421,7 @@ xagent/
 │   │   ├── README.md           # Deep dive into brain internals
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports
-│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry
+│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry + DecisionSnapshot
 │   │       ├── encoder.rs      # SensoryEncoder (feature extraction + projection)
 │   │       ├── memory.rs       # PatternMemory (store, recall, associate, decay)
 │   │       ├── predictor.rs    # Predictor (state prediction + gradient descent)
@@ -413,6 +448,8 @@ xagent/
 │       │   │   ├── camera.rs   # Free-fly camera with mouse look
 │       │   │   ├── hud.rs      # HUD bar overlay (energy, integrity, etc.)
 │       │   │   └── font.rs     # Bitmap font atlas + text rendering
+│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot, WorldSnapshot, ReplayState)
+│       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
 │       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
 │           └── integration.rs  # 14 integration tests

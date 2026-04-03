@@ -1,11 +1,21 @@
 pub mod senses;
 
+use crate::momentum::MutationMomentum;
 use crate::renderer::Vertex;
 use crate::world::Mesh;
 use glam::Vec3;
 use rand::Rng;
 use xagent_brain::Brain;
-use xagent_shared::{BodyState, BrainConfig, InternalState};
+
+/// Upper bound for memory_capacity to prevent GPU buffer overflow.
+/// Large preset uses 512; 2048 gives ~4x evolutionary headroom.
+const MAX_MEMORY_CAPACITY: usize = 2048;
+
+/// Upper bound for processing_slots to keep recall cost bounded.
+/// Large preset uses 32; 128 gives ~4x evolutionary headroom.
+const MAX_PROCESSING_SLOTS: usize = 128;
+use xagent_brain::LearnedState;
+use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
 /// `HEATMAP_RES × HEATMAP_RES` grid. Each cell tracks how many ticks
@@ -108,9 +118,12 @@ pub struct Agent {
     pub life_start_tick: u64,
     pub longest_life: u64,
     pub respawn_cooldown: u32,
-    pub persist_brain: bool,
     /// Whether this agent has already reproduced in its current life.
     pub has_reproduced: bool,
+    /// Total food items consumed across all lives (cumulative for evolution scoring).
+    pub food_consumed: u32,
+    /// Total ticks spent alive across all lives (cumulative for evolution scoring).
+    pub total_ticks_alive: u64,
     /// Position visit counts for heatmap visualization.
     pub heatmap: Vec<u32>,
     /// Distance-sampled control points for trail visualization (current life only).
@@ -119,6 +132,16 @@ pub struct Agent {
     pub trail_dirty: bool,
     /// Cached motor command for ticks where the brain is decimated.
     pub cached_motor: xagent_shared::MotorCommand,
+    /// Rolling history for sidebar sparklines (capped length).
+    pub prediction_error_history: std::collections::VecDeque<f32>,
+    pub exploration_rate_history: std::collections::VecDeque<f32>,
+    pub energy_history: std::collections::VecDeque<f32>,
+    pub integrity_history: std::collections::VecDeque<f32>,
+    pub fatigue_history: std::collections::VecDeque<f32>,
+    /// Ring buffer of recent brain decisions for the decision stream UI.
+    pub decision_log: std::collections::VecDeque<xagent_brain::DecisionSnapshot>,
+    /// Pre-allocated sensory frame buffer, reused each tick to avoid heap churn.
+    pub cached_frame: SensoryFrame,
 }
 
 impl Agent {
@@ -135,12 +158,20 @@ impl Agent {
             life_start_tick: tick,
             longest_life: 0,
             respawn_cooldown: 0,
-            persist_brain: true,
             has_reproduced: false,
+            food_consumed: 0,
+            total_ticks_alive: 0,
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],
             trail: Vec::with_capacity(256),
             trail_dirty: false,
             cached_motor: xagent_shared::MotorCommand::default(),
+            prediction_error_history: std::collections::VecDeque::with_capacity(128),
+            exploration_rate_history: std::collections::VecDeque::with_capacity(128),
+            energy_history: std::collections::VecDeque::with_capacity(128),
+            integrity_history: std::collections::VecDeque::with_capacity(128),
+            fatigue_history: std::collections::VecDeque::with_capacity(128),
+            decision_log: std::collections::VecDeque::with_capacity(256),
+            cached_frame: SensoryFrame::new_blank(8, 6),
         }
     }
 
@@ -191,33 +222,163 @@ impl Agent {
         self.trail.clear();
         self.trail_dirty = true;
     }
+
+    /// Number of unique heatmap cells visited (non-zero entries).
+    pub fn unique_cells_explored(&self) -> u32 {
+        self.heatmap.iter().filter(|&&c| c > 0).count() as u32
+    }
+
+    /// Reset per-generation stats for evolution. Keeps BrainConfig (the "genome")
+    /// but zeroes cumulative fitness counters and resets the body/brain.
+    pub fn reset_for_new_life(&mut self, position: Vec3, tick: u64) {
+        self.body = AgentBody::new(position);
+        self.brain = Brain::new(self.brain.config.clone());
+        self.death_count = 0;
+        self.generation = 0;
+        self.life_start_tick = tick;
+        self.longest_life = 0;
+        self.respawn_cooldown = 0;
+        self.has_reproduced = false;
+        self.food_consumed = 0;
+        self.total_ticks_alive = 0;
+        self.heatmap.fill(0);
+        self.trail.clear();
+        self.trail_dirty = true;
+        self.prediction_error_history.clear();
+        self.exploration_rate_history.clear();
+        self.energy_history.clear();
+        self.integrity_history.clear();
+        self.fatigue_history.clear();
+        self.decision_log.clear();
+    }
 }
 
 /// Create a mutated BrainConfig from a parent config (±10% per param).
 pub fn mutate_config(parent: &BrainConfig) -> BrainConfig {
+    mutate_config_with_strength(parent, 0.1, &MutationMomentum::new(0.9))
+}
+
+/// Create a mutated BrainConfig with a configurable mutation strength.
+/// `strength` controls the perturbation range: e.g. 0.1 → ±10%, 0.3 → ±30%.
+pub fn mutate_config_with_strength(
+    parent: &BrainConfig,
+    strength: f32,
+    momentum: &MutationMomentum,
+) -> BrainConfig {
     let mut rng = rand::rng();
 
-    let perturb_f = |rng: &mut rand::rngs::ThreadRng, v: f32| -> f32 {
-        let factor: f32 = rng.random_range(0.9..1.1);
-        (v * factor).max(0.0001)
-    };
-    let perturb_u = |rng: &mut rand::rngs::ThreadRng, v: usize| -> usize {
-        let factor: f32 = rng.random_range(0.9..1.1);
-        ((v as f32 * factor).round() as usize).max(1)
-    };
-
     BrainConfig {
-        memory_capacity: perturb_u(&mut rng, parent.memory_capacity),
-        processing_slots: perturb_u(&mut rng, parent.processing_slots),
+        memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength).min(MAX_MEMORY_CAPACITY),
+        processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength).min(MAX_PROCESSING_SLOTS),
         visual_encoding_size: parent.visual_encoding_size,
-        representation_dim: perturb_u(&mut rng, parent.representation_dim),
-        learning_rate: perturb_f(&mut rng, parent.learning_rate),
-        decay_rate: perturb_f(&mut rng, parent.decay_rate),
+        representation_dim: parent.representation_dim,
+        learning_rate: momentum.biased_perturb_f(&mut rng, parent.learning_rate, "learning_rate", strength),
+        decay_rate: momentum.biased_perturb_f(&mut rng, parent.decay_rate, "decay_rate", strength),
+        distress_exponent: momentum.biased_perturb_f(&mut rng, parent.distress_exponent, "distress_exponent", strength).clamp(1.5, 5.0),
+        habituation_sensitivity: momentum.biased_perturb_f(&mut rng, parent.habituation_sensitivity, "habituation_sensitivity", strength).clamp(5.0, 50.0),
+        max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
+        fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
+        fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
+    }
+}
+
+/// Perturb inherited weights for neuroevolution.
+/// Mutates a random 10% of action weights by +/-strength, and 1% of encoder
+/// weights by +/-(strength * 0.1). This lets evolution explore behavioral
+/// variations that within-lifetime learning might miss.
+pub fn mutate_learned_state(state: &LearnedState, strength: f32) -> LearnedState {
+    let mut rng = rand::rng();
+    let mut result = state.clone();
+
+    // Perturb action weights (forward + turn + biases)
+    for w in result.action_weights.iter_mut() {
+        if rng.random::<f32>() < 0.1 {
+            *w += rng.random_range(-strength..strength);
+        }
+    }
+
+    // Perturb encoder weights more conservatively
+    for w in result.encoder_weights.iter_mut() {
+        if rng.random::<f32>() < 0.01 {
+            *w += rng.random_range(-strength * 0.1..strength * 0.1);
+        }
+    }
+
+    result
+}
+
+/// Uniform crossover: randomly pick each parameter from parent A or B.
+pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
+    let mut rng = rand::rng();
+    BrainConfig {
+        memory_capacity: if rng.random::<f32>() < 0.5 {
+            a.memory_capacity
+        } else {
+            b.memory_capacity
+        },
+        processing_slots: if rng.random::<f32>() < 0.5 {
+            a.processing_slots
+        } else {
+            b.processing_slots
+        },
+        visual_encoding_size: a.visual_encoding_size,
+        representation_dim: a.representation_dim,
+        learning_rate: if rng.random::<f32>() < 0.5 {
+            a.learning_rate
+        } else {
+            b.learning_rate
+        },
+        decay_rate: if rng.random::<f32>() < 0.5 {
+            a.decay_rate
+        } else {
+            b.decay_rate
+        },
+        distress_exponent: if rng.random::<f32>() < 0.5 {
+            a.distress_exponent
+        } else {
+            b.distress_exponent
+        },
+        habituation_sensitivity: if rng.random::<f32>() < 0.5 {
+            a.habituation_sensitivity
+        } else {
+            b.habituation_sensitivity
+        },
+        max_curiosity_bonus: if rng.random::<f32>() < 0.5 {
+            a.max_curiosity_bonus
+        } else {
+            b.max_curiosity_bonus
+        },
+        fatigue_recovery_sensitivity: if rng.random::<f32>() < 0.5 {
+            a.fatigue_recovery_sensitivity
+        } else {
+            b.fatigue_recovery_sensitivity
+        },
+        fatigue_floor: if rng.random::<f32>() < 0.5 {
+            a.fatigue_floor
+        } else {
+            b.fatigue_floor
+        },
+    }
+}
+
+/// Convert a single sRGB channel value to linear space.
+/// This ensures colors rendered through an sRGB framebuffer match egui's sRGB display.
+pub fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 
 /// Generate a cube mesh at the given position with the given color.
+/// Color is expected in sRGB space and is converted to linear for the GPU pipeline.
 pub fn generate_agent_mesh(position: Vec3, size: f32, color: [f32; 3]) -> Mesh {
+    let linear = [
+        srgb_to_linear(color[0]),
+        srgb_to_linear(color[1]),
+        srgb_to_linear(color[2]),
+    ];
     let h = size / 2.0;
     let p = position;
 
@@ -234,12 +395,12 @@ pub fn generate_agent_mesh(position: Vec3, size: f32, color: [f32; 3]) -> Mesh {
     ];
 
     let face_colors: [[f32; 3]; 6] = [
-        color,
-        [color[0] * 0.9, color[1] * 0.9, color[2] * 0.9],
-        [color[0] * 0.8, color[1] * 0.8, color[2] * 0.8],
-        [color[0] * 0.7, color[1] * 0.7, color[2] * 0.7],
-        [color[0] * 0.85, color[1] * 0.85, color[2] * 0.85],
-        [color[0] * 0.75, color[1] * 0.75, color[2] * 0.75],
+        linear,
+        [linear[0] * 0.9, linear[1] * 0.9, linear[2] * 0.9],
+        [linear[0] * 0.8, linear[1] * 0.8, linear[2] * 0.8],
+        [linear[0] * 0.7, linear[1] * 0.7, linear[2] * 0.7],
+        [linear[0] * 0.85, linear[1] * 0.85, linear[2] * 0.85],
+        [linear[0] * 0.75, linear[1] * 0.75, linear[2] * 0.75],
     ];
 
     #[rustfmt::skip]
@@ -295,4 +456,46 @@ pub fn generate_all_agents_mesh(agents: &[Agent]) -> Mesh {
     }
 
     Mesh { vertices, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_for_new_life_clears_fatigue_history() {
+        let mut agent = Agent::new(0, Vec3::ZERO, BrainConfig::default(), 0);
+        // Simulate accumulated fatigue history from a previous life.
+        for i in 0..50 {
+            agent.fatigue_history.push_back(1.0 - i as f32 * 0.01);
+        }
+        assert!(!agent.fatigue_history.is_empty());
+
+        agent.reset_for_new_life(Vec3::new(5.0, 0.0, 5.0), 1000);
+
+        assert!(
+            agent.fatigue_history.is_empty(),
+            "reset_for_new_life must clear fatigue_history"
+        );
+    }
+
+    #[test]
+    fn mutate_learned_state_perturbs_weights() {
+        let state = LearnedState {
+            encoder_weights: vec![1.0; 100],
+            encoder_biases: vec![0.0; 10],
+            action_weights: vec![0.5; 66],
+            predictor_weights: vec![0.0; 100],
+            predictor_context_weight: 0.2,
+        };
+        let mutated = mutate_learned_state(&state, 0.1);
+        // Action weights should differ (10% mutation rate)
+        assert_ne!(mutated.action_weights, state.action_weights);
+        // Predictor weights should be unchanged
+        assert_eq!(mutated.predictor_weights, state.predictor_weights);
+        // Predictor context weight should be unchanged
+        assert_eq!(mutated.predictor_context_weight, state.predictor_context_weight);
+        // Encoder biases should be unchanged
+        assert_eq!(mutated.encoder_biases, state.encoder_biases);
+    }
 }

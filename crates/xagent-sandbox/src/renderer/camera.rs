@@ -24,18 +24,25 @@ pub struct Camera {
 
     pub is_mouse_dragging: bool,
     pub last_mouse_pos: Option<(f64, f64)>,
+
+    // Orbit mode — camera orbits the selected agent
+    pub orbit_mode: bool,
+    pub orbit_target: Vec3,
+    pub orbit_distance: f32,
+    pub orbit_yaw: f32,
+    pub orbit_pitch: f32,
 }
 
 impl Camera {
-    /// Create a camera at position (0, 10, 20) looking roughly toward the world origin.
+    /// Create a camera positioned for a bird's-eye overview of the entire sandbox.
     ///
-    /// Initial yaw is -π/2 (facing -Z) with a slight downward pitch (-0.3 rad ≈ -17°)
-    /// to give a good overview of the terrain below.
+    /// With a 256×256 world and 45° vertical FOV, height ~300 captures the full area.
+    /// Pitch of -1.2 rad (≈ -69°) gives a steep overhead view with depth cues.
     pub fn new(aspect: f32) -> Self {
         Self {
-            position: Vec3::new(0.0, 10.0, 20.0),
+            position: Vec3::new(0.0, 300.0, 120.0),
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: -0.3,
+            pitch: -1.2,
             aspect,
             fov_y: 45.0_f32.to_radians(),
             z_near: 0.1,
@@ -48,6 +55,11 @@ impl Camera {
             move_down: false,
             is_mouse_dragging: false,
             last_mouse_pos: None,
+            orbit_mode: false,
+            orbit_target: Vec3::ZERO,
+            orbit_distance: 30.0,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.5,
         }
     }
 
@@ -122,9 +134,45 @@ impl Camera {
 
     /// Reset camera to the default overview position above the world origin.
     pub fn reset(&mut self) {
-        self.position = Vec3::new(0.0, 10.0, 20.0);
+        self.position = Vec3::new(0.0, 300.0, 120.0);
         self.yaw = -std::f32::consts::FRAC_PI_2;
-        self.pitch = -0.3;
+        self.pitch = -1.2;
+        self.orbit_mode = false;
+    }
+
+    /// Update camera to orbit around the target position.
+    pub fn update_orbit(&mut self, target: Vec3) {
+        self.orbit_target = target;
+        let x = self.orbit_distance * self.orbit_yaw.cos() * self.orbit_pitch.cos();
+        let y = self.orbit_distance * self.orbit_pitch.sin();
+        let z = self.orbit_distance * self.orbit_yaw.sin() * self.orbit_pitch.cos();
+        self.position = self.orbit_target + Vec3::new(x, y, z);
+
+        // Derive yaw/pitch from look direction so view_matrix() works correctly
+        let dir = (self.orbit_target - self.position).normalize();
+        self.yaw = dir.z.atan2(dir.x);
+        self.pitch = dir.y.asin();
+    }
+
+    /// Process mouse movement for orbit rotation.
+    pub fn process_orbit_mouse_move(&mut self, x: f64, y: f64) {
+        if !self.is_mouse_dragging {
+            self.last_mouse_pos = None;
+            return;
+        }
+        if let Some((last_x, last_y)) = self.last_mouse_pos {
+            let sensitivity = 0.005;
+            let dx = (x - last_x) as f32;
+            let dy = (y - last_y) as f32;
+            self.orbit_yaw += dx * sensitivity;
+            self.orbit_pitch = (self.orbit_pitch - dy * sensitivity).clamp(0.05, 1.4);
+        }
+        self.last_mouse_pos = Some((x, y));
+    }
+
+    /// Scroll-wheel zoom for orbit mode.
+    pub fn process_orbit_scroll(&mut self, delta: f32) {
+        self.orbit_distance = (self.orbit_distance - delta * 2.0).max(5.0);
     }
 
     /// Compute the view matrix (world-to-camera transform) using right-handed look-at.
@@ -140,5 +188,83 @@ impl Camera {
     /// Combined view-projection matrix for transforming world positions to clip space.
     pub fn view_projection_matrix(&self) -> Mat4 {
         self.projection_matrix() * self.view_matrix()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orbit_camera_positioned_above_target() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+        let target = Vec3::new(10.0, 0.0, 10.0);
+        cam.update_orbit(target);
+
+        // Camera Y should be above target Y (positive orbit_pitch → positive Y offset)
+        assert!(
+            cam.position.y > target.y,
+            "camera should be above target: cam.y={} target.y={}",
+            cam.position.y,
+            target.y
+        );
+    }
+
+    #[test]
+    fn orbit_pitch_clamps_above_horizon() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+        cam.is_mouse_dragging = true;
+        cam.last_mouse_pos = Some((100.0, 100.0));
+
+        // Drag mouse far downward — tries to push pitch below 0.05
+        cam.process_orbit_mouse_move(100.0, 100_000.0);
+        assert!(
+            cam.orbit_pitch >= 0.05,
+            "orbit_pitch should not go below 0.05: {}",
+            cam.orbit_pitch
+        );
+
+        // Drag mouse far upward — tries to push pitch above 1.4
+        cam.last_mouse_pos = Some((100.0, 100.0));
+        cam.process_orbit_mouse_move(100.0, -100_000.0);
+        assert!(
+            cam.orbit_pitch <= 1.4,
+            "orbit_pitch should not exceed 1.4: {}",
+            cam.orbit_pitch
+        );
+    }
+
+    #[test]
+    fn orbit_scroll_zoom_out_has_no_upper_bound() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+
+        // Scroll out aggressively (negative delta = zoom out)
+        for _ in 0..1000 {
+            cam.process_orbit_scroll(-10.0);
+        }
+        assert!(
+            cam.orbit_distance > 200.0,
+            "orbit_distance should exceed old 200 cap: {}",
+            cam.orbit_distance
+        );
+    }
+
+    #[test]
+    fn orbit_scroll_zoom_in_clamps_at_minimum() {
+        let mut cam = Camera::new(1.0);
+        cam.orbit_mode = true;
+
+        // Scroll in aggressively (positive delta = zoom in)
+        for _ in 0..1000 {
+            cam.process_orbit_scroll(10.0);
+        }
+        assert!(
+            cam.orbit_distance >= 5.0,
+            "orbit_distance should not go below 5.0: {}",
+            cam.orbit_distance
+        );
     }
 }

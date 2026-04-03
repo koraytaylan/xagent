@@ -321,7 +321,8 @@ fn sensory_frame_has_correct_dimensions() {
     let spawn_y = world.terrain.height_at(0.0, 0.0) + 2.0;
     let agent = agent_at(Vec3::new(0.0, spawn_y, 0.0));
 
-    let frame = xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0);
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     assert_eq!(frame.vision.width, 8, "Visual field width should be 8");
     assert_eq!(frame.vision.height, 6, "Visual field height should be 6");
@@ -347,7 +348,8 @@ fn interoception_matches_body_state() {
     agent.body.internal.energy = 75.0;
     agent.body.internal.integrity = 60.0;
 
-    let frame = xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0);
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     let expected_energy = agent.body.internal.energy_signal();
     let expected_integrity = agent.body.internal.integrity_signal();
@@ -363,5 +365,149 @@ fn interoception_matches_body_state() {
         "integrity_signal should match InternalState.integrity_signal(): {} vs {}",
         frame.integrity_signal,
         expected_integrity
+    );
+}
+
+#[test]
+fn vision_detects_food_items() {
+    let world = test_world();
+
+    // Find an unconsumed food item
+    let food = match world.food_items.iter().find(|f| !f.consumed) {
+        Some(f) => f,
+        None => return, // no food in default world (unlikely)
+    };
+
+    // Place agent looking directly at the food, close enough to see it
+    let to_food = (food.position - Vec3::new(food.position.x - 10.0, food.position.y, food.position.z)).normalize();
+    let agent_pos = food.position - to_food * 10.0;
+    let spawn_y = world.terrain.height_at(agent_pos.x, agent_pos.z) + 2.0;
+    let mut agent = agent_at(Vec3::new(agent_pos.x, spawn_y, agent_pos.z));
+    // Face toward the food
+    agent.body.facing = to_food;
+
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
+
+    // Check if any pixel in the vision field has the food color (lime green: R≈0.70, G≈0.95)
+    let food_green_threshold_g = 0.90;
+    let food_green_threshold_r = 0.60;
+    let mut found_food_pixel = false;
+    let pixels = (frame.vision.width * frame.vision.height) as usize;
+    for px in 0..pixels {
+        let base = px * 4;
+        let r = frame.vision.color[base];
+        let g = frame.vision.color[base + 1];
+        if r > food_green_threshold_r && g > food_green_threshold_g {
+            found_food_pixel = true;
+            break;
+        }
+    }
+
+    // We can't guarantee the food is in the FOV (depends on world layout),
+    // so this test checks the mechanism works rather than guaranteeing a hit.
+    // Place agent very close and facing directly at food for a reliable check.
+    let close_pos = food.position - Vec3::new(3.0, 0.0, 0.0);
+    let close_y = world.terrain.height_at(close_pos.x, close_pos.z) + 2.0;
+    let mut close_agent = agent_at(Vec3::new(close_pos.x, close_y, close_pos.z));
+    close_agent.body.facing = Vec3::X; // face toward food (food is +X from agent)
+
+    let mut close_frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&close_agent, &world, 0, &mut close_frame);
+
+    let mut close_found = false;
+    for px in 0..pixels {
+        let base = px * 4;
+        let r = close_frame.vision.color[base];
+        let g = close_frame.vision.color[base + 1];
+        if r > food_green_threshold_r && g > food_green_threshold_g {
+            close_found = true;
+            break;
+        }
+    }
+
+    assert!(
+        found_food_pixel || close_found,
+        "At least one vision approach should detect food as lime-green pixels"
+    );
+}
+
+#[test]
+fn vision_with_positions_detects_food_items() {
+    let world = test_world();
+
+    // Find an unconsumed food item
+    let food = match world.food_items.iter().find(|f| !f.consumed) {
+        Some(f) => f,
+        None => return,
+    };
+
+    // Place agent close to food, facing it
+    let close_pos = food.position - Vec3::new(3.0, 0.0, 0.0);
+    let close_y = world.terrain.height_at(close_pos.x, close_pos.z) + 2.0;
+    let mut agent = agent_at(Vec3::new(close_pos.x, close_y, close_pos.z));
+    agent.body.facing = Vec3::X;
+
+    // Use the positions-based extraction (the path used during evolution)
+    let all_positions: Vec<(Vec3, bool)> = vec![(agent.body.position, true)];
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses_with_positions(
+        &agent, &world, 0, &all_positions, 0, &mut frame,
+    );
+
+    let food_green_threshold_g = 0.90;
+    let food_green_threshold_r = 0.60;
+    let pixels = (frame.vision.width * frame.vision.height) as usize;
+    let mut found_food = false;
+    for px in 0..pixels {
+        let base = px * 4;
+        let r = frame.vision.color[base];
+        let g = frame.vision.color[base + 1];
+        if r > food_green_threshold_r && g > food_green_threshold_g {
+            found_food = true;
+            break;
+        }
+    }
+
+    assert!(
+        found_food,
+        "extract_senses_with_positions should detect food as lime-green pixels (the critical evolution bug)"
+    );
+}
+
+#[test]
+fn touch_contacts_populated_near_food() {
+    let world = test_world();
+
+    // Find an unconsumed food item
+    let food = match world.food_items.iter().find(|f| !f.consumed) {
+        Some(f) => f,
+        None => return,
+    };
+
+    // Place agent within touch range of food (< 3.0 units)
+    let agent_pos = Vec3::new(food.position.x + 1.0, food.position.y, food.position.z);
+    let spawn_y = world.terrain.height_at(agent_pos.x, agent_pos.z) + 2.0;
+    let agent = agent_at(Vec3::new(agent_pos.x, spawn_y, agent_pos.z));
+
+    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
+
+    let has_food_touch = frame.touch_contacts.iter().any(|c| c.surface_tag == 1 && c.intensity > 0.0);
+    assert!(
+        has_food_touch,
+        "Agent within 3 units of food should have a TOUCH_FOOD contact (tag=1)"
+    );
+}
+
+// ── UI Snapshot Tests ─────────────────────────────────────────────────
+
+#[test]
+fn evolution_snapshot_default_tree_pane_fraction() {
+    let snap = xagent_sandbox::ui::EvolutionSnapshot::default();
+    assert!(
+        (snap.tree_pane_fraction - 0.25).abs() < f32::EPSILON,
+        "tree_pane_fraction should default to 0.25, got {}",
+        snap.tree_pane_fraction,
     );
 }

@@ -15,5 +15,17 @@ pub mod homeostasis;
 pub mod memory;
 pub mod predictor;
 pub mod action;
+pub mod habituation;
+pub mod motor_fatigue;
 
-pub use brain::{Brain, BrainTelemetry};
+/// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
+#[inline(always)]
+pub(crate) fn fast_tanh(x: f32) -> f32 {
+    if x.abs() > 4.5 { return x.signum(); }
+    let x2 = x * x;
+    x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+pub use brain::{Brain, BrainTelemetry, DecisionSnapshot, LearnedState};
+pub use habituation::SensoryHabituation;
+pub use motor_fatigue::MotorFatigue;

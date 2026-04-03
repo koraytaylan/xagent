@@ -5,7 +5,14 @@
 //! simulation loop that connects agents to their environment.
 
 pub mod agent;
+pub mod governor;
+pub mod momentum;
+pub mod gpu_compute;
+pub mod headless;
+pub mod overlay;
 pub mod physics;
 pub mod recording;
 pub mod renderer;
+pub mod replay;
+pub mod ui;
 pub mod world;

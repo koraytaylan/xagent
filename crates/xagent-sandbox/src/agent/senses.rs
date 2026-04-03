@@ -19,40 +19,65 @@ pub struct OtherAgent {
 }
 
 /// Produce a full sensory frame from current agent & world state.
-pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64) -> SensoryFrame {
-    extract_senses_with_others(agent, world, tick, &[])
+/// Writes into `frame` to avoid heap allocation (reuses existing buffers).
+pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64, frame: &mut SensoryFrame) {
+    extract_senses_with_others(agent, world, tick, &[], frame)
+}
+
+/// Produce a sensory frame with awareness of other agents given as a
+/// shared positions slice. Skips agent at `self_index` automatically.
+pub fn extract_senses_with_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    tick: u64,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    frame: &mut SensoryFrame,
+) {
+    sample_vision_positions(agent, world, all_positions, self_index, &mut frame.vision);
+    frame.velocity = agent.body.velocity;
+    frame.facing = agent.body.facing;
+    frame.angular_velocity = agent.angular_velocity;
+    frame.energy_signal = agent.body.internal.energy_signal();
+    frame.integrity_signal = agent.body.internal.integrity_signal();
+    frame.energy_delta = agent.energy_delta();
+    frame.integrity_delta = agent.integrity_delta();
+    frame.touch_contacts.clear();
+    detect_touch_positions(agent, world, all_positions, self_index, &mut frame.touch_contacts);
+    frame.tick = tick;
 }
 
 /// Produce a sensory frame with awareness of other agents.
+/// Writes into `frame` to avoid heap allocation (reuses existing buffers).
 pub fn extract_senses_with_others(
     agent: &AgentBody,
     world: &WorldState,
     tick: u64,
     others: &[OtherAgent],
-) -> SensoryFrame {
-    SensoryFrame {
-        vision: sample_vision(agent, world, others),
-        velocity: agent.body.velocity,
-        facing: agent.body.facing,
-        angular_velocity: agent.angular_velocity,
-        energy_signal: agent.body.internal.energy_signal(),
-        integrity_signal: agent.body.internal.integrity_signal(),
-        energy_delta: agent.energy_delta(),
-        integrity_delta: agent.integrity_delta(),
-        touch_contacts: detect_touch_with_others(agent, world, others),
-        tick,
-    }
+    frame: &mut SensoryFrame,
+) {
+    sample_vision(agent, world, others, &mut frame.vision);
+    frame.velocity = agent.body.velocity;
+    frame.facing = agent.body.facing;
+    frame.angular_velocity = agent.angular_velocity;
+    frame.energy_signal = agent.body.internal.energy_signal();
+    frame.integrity_signal = agent.body.internal.integrity_signal();
+    frame.energy_delta = agent.energy_delta();
+    frame.integrity_delta = agent.integrity_delta();
+    frame.touch_contacts.clear();
+    detect_touch_with_others(agent, world, others, &mut frame.touch_contacts);
+    frame.tick = tick;
 }
 
 // ── vision ──────────────────────────────────────────────────────────────
 
 /// Low-resolution raycast sampling of terrain colors in front of the agent.
 /// Resolution is 8×6 (48 rays) with step size 1.0 for efficient marching.
-/// Also detects other agents along each ray.
-fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent]) -> VisualField {
-    let w = 8_u32;
-    let h = 6_u32;
-    let mut vf = VisualField::new(w, h);
+/// Also detects other agents along each ray. Writes into existing `vf` buffer.
+fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], vf: &mut VisualField) {
+    let w = vf.width;
+    let h = vf.height;
+    vf.clear();
 
     let half_fov = (90.0_f32 / 2.0).to_radians();
     let tan_hf = half_fov.tan();
@@ -71,7 +96,7 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent]) -
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray(pos, ray, world, max_dist, step, others);
+            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Others(others));
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -82,34 +107,40 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent]) -
             vf.depth[idx] = depth / max_dist;
         }
     }
-    vf
 }
 
-/// Fixed-step ray marching for terrain and agent intersection.
+/// Discriminated union for the two agent-list representations.
+/// Avoids duplicating the ray-march loop.
+enum AgentSlice<'a> {
+    Others(&'a [OtherAgent]),
+    Positions { all: &'a [(Vec3, bool)], self_index: usize },
+}
+
+/// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
 /// Advances a ray from `origin` in direction `dir` in increments of `step` units,
-/// checking if the ray position drops below the terrain height or is within range
-/// of another agent at each step. Returns the hit color and distance traveled.
-/// Agents are rendered as bright magenta. If no hit within `max_dist`, returns
-/// sky color and max_dist.
+/// checking for food items, other agents, and terrain at each step. Returns the
+/// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///
-/// Rays pointing steeply upward (dir.y > 0.3) that start above terrain are
-/// unlikely to hit — they bail out after a few steps to save height lookups.
-fn march_ray(
+/// Food items are rendered as bright lime-green, distinct from biome colors.
+/// This makes food *physically visible* — the brain must still learn that this
+/// color correlates with positive gradient. Without food visibility, agents have
+/// zero directional signal for food.
+fn march_ray_unified(
     origin: Vec3,
     dir: Vec3,
     world: &WorldState,
     max_dist: f32,
     step: f32,
-    others: &[OtherAgent],
+    agents: AgentSlice,
 ) -> ([f32; 4], f32) {
     let sky: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
     let agent_color: [f32; 4] = [0.9, 0.2, 0.6, 1.0];
-    // Squared detection radius (~1.5 units, matching agent cube half-diagonal)
+    let food_color: [f32; 4] = [0.70, 0.95, 0.20, 1.0];
     let agent_radius_sq: f32 = 1.5 * 1.5;
+    let food_radius_sq: f32 = 1.0 * 1.0;
 
     // Early-out: upward-pointing rays above terrain are almost certainly sky.
-    // Check origin against terrain once; if above and ray goes up, skip marching.
     if dir.y > 0.3 {
         let origin_h = world.terrain.height_at(origin.x, origin.z);
         if origin.y > origin_h {
@@ -121,17 +152,45 @@ fn march_ray(
     while t < max_dist {
         let p = origin + dir * t;
 
-        // Check agent hits first (agents are in front of terrain they stand on)
-        for other in others {
-            if !other.alive {
+        // Check food items via spatial grid (O(1) per step)
+        for idx in world.food_grid.query_nearby(p.x, p.z) {
+            let food = &world.food_items[idx];
+            if food.consumed {
                 continue;
             }
-            let diff = p - other.position;
-            if diff.length_squared() < agent_radius_sq {
-                return (agent_color, t);
+            let diff = p - food.position;
+            if diff.length_squared() < food_radius_sq {
+                return (food_color, t);
             }
         }
 
+        // Check agent hits — dispatch on slice variant
+        match &agents {
+            AgentSlice::Others(others) => {
+                for other in *others {
+                    if !other.alive {
+                        continue;
+                    }
+                    let diff = p - other.position;
+                    if diff.length_squared() < agent_radius_sq {
+                        return (agent_color, t);
+                    }
+                }
+            }
+            AgentSlice::Positions { all, self_index } => {
+                for (j, (other_pos, alive)) in all.iter().enumerate() {
+                    if j == *self_index || !alive {
+                        continue;
+                    }
+                    let diff = p - *other_pos;
+                    if diff.length_squared() < agent_radius_sq {
+                        return (agent_color, t);
+                    }
+                }
+            }
+        }
+
+        // Check terrain hit
         let gh = world.terrain.height_at(p.x, p.z);
         if p.y <= gh {
             let c = match world.biome_map.biome_at(p.x, p.z) {
@@ -150,13 +209,14 @@ fn march_ray(
 
 /// Detect all touch contacts including other agents.
 /// Agent-to-agent touch range is 5.0 units with intensity inversely proportional
-/// to distance.
+/// to distance. Appends to the provided contacts buffer.
 fn detect_touch_with_others(
     agent: &AgentBody,
     world: &WorldState,
     others: &[OtherAgent],
-) -> Vec<TouchContact> {
-    let mut contacts = detect_touch(agent, world);
+    contacts: &mut Vec<TouchContact>,
+) {
+    detect_touch(agent, world, contacts);
 
     // Other agents as touch contacts
     let agent_touch_range = 5.0;
@@ -175,19 +235,18 @@ fn detect_touch_with_others(
             });
         }
     }
-
-    contacts
 }
 
 /// Detect touch contacts from environmental features (food, terrain edges, hazards).
+/// Uses the spatial grid for O(1) food proximity lookup.
 /// Touch range for food is 3.0 units, terrain edge detection starts at 3.0 units
 /// from world boundary. Hazard zones produce a constant downward contact.
-fn detect_touch(agent: &AgentBody, world: &WorldState) -> Vec<TouchContact> {
-    let mut contacts = Vec::new();
+fn detect_touch(agent: &AgentBody, world: &WorldState, contacts: &mut Vec<TouchContact>) {
     let pos = agent.body.position;
 
-    // Nearby food
-    for food in &world.food_items {
+    // Nearby food via spatial grid
+    for idx in world.food_grid.query_nearby(pos.x, pos.z) {
+        let food = &world.food_items[idx];
         if food.consumed {
             continue;
         }
@@ -228,6 +287,76 @@ fn detect_touch(agent: &AgentBody, world: &WorldState) -> Vec<TouchContact> {
             surface_tag: TOUCH_HAZARD,
         });
     }
+}
 
-    contacts
+// ── position-slice variants (C2: avoid Vec<OtherAgent> allocation) ──────
+
+/// Vision sampling using a shared positions slice.
+fn sample_vision_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    vf: &mut VisualField,
+) {
+    let w = vf.width;
+    let h = vf.height;
+    vf.clear();
+
+    let half_fov = (90.0_f32 / 2.0).to_radians();
+    let tan_hf = half_fov.tan();
+
+    let pos = agent.body.position;
+    let fwd = agent.body.facing;
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x).normalize_or_zero();
+
+    let max_dist: f32 = 50.0;
+    let step: f32 = 1.0;
+
+    for row in 0..h {
+        for col in 0..w {
+            let u = (col as f32 / (w - 1) as f32) * 2.0 - 1.0;
+            let v = (row as f32 / (h - 1) as f32) * 2.0 - 1.0;
+
+            let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
+
+            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Positions { all: all_positions, self_index });
+
+            let idx = (row * w + col) as usize;
+            let ci = idx * 4;
+            vf.color[ci] = color[0];
+            vf.color[ci + 1] = color[1];
+            vf.color[ci + 2] = color[2];
+            vf.color[ci + 3] = color[3];
+            vf.depth[idx] = depth / max_dist;
+        }
+    }
+}
+
+/// Touch detection using shared positions slice.
+fn detect_touch_positions(
+    agent: &AgentBody,
+    world: &WorldState,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    contacts: &mut Vec<TouchContact>,
+) {
+    detect_touch(agent, world, contacts);
+
+    let agent_touch_range = 5.0;
+    let pos = agent.body.position;
+    for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
+        if j == self_index || !*alive {
+            continue;
+        }
+        let diff = *other_pos - pos;
+        let dist = diff.length();
+        if dist < agent_touch_range && dist > 0.01 {
+            contacts.push(TouchContact {
+                direction: diff.normalize_or_zero(),
+                intensity: 1.0 - (dist / agent_touch_range),
+                surface_tag: TOUCH_AGENT,
+            });
+        }
+    }
 }

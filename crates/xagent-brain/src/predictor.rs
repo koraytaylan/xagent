@@ -17,13 +17,7 @@ const CONTEXT_WEIGHT_LR: f32 = 0.01;
 const CONTEXT_WEIGHT_MIN: f32 = 0.05;
 const CONTEXT_WEIGHT_MAX: f32 = 0.5;
 
-/// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
-#[inline(always)]
-fn fast_tanh(x: f32) -> f32 {
-    if x.abs() > 4.5 { return x.signum(); }
-    let x2 = x * x;
-    x * (27.0 + x2) / (27.0 + 9.0 * x2)
-}
+use crate::fast_tanh;
 
 /// Predicts the next encoded state given the current state and recalled patterns.
 ///
@@ -42,7 +36,9 @@ pub struct Predictor {
     /// Last prediction made (for computing error on next tick).
     last_prediction: Option<EncodedState>,
     /// Cached input to the last predict() call, needed for weight updates.
-    last_input: Option<Vec<f32>>,
+    last_input: Vec<f32>,
+    /// Whether last_input has valid data.
+    has_last_input: bool,
     /// Ring buffer of recent scalar prediction errors.
     error_history: Vec<f32>,
     /// Write cursor into error_history.
@@ -51,6 +47,10 @@ pub struct Predictor {
     error_count: u64,
     /// Reusable scratch buffer for prediction output.
     scratch: Vec<f32>,
+    /// Reusable scratch buffer for error vector.
+    error_scratch: Vec<f32>,
+    /// Reusable scratch buffer for predict_pure output.
+    pure_scratch: Vec<f32>,
 }
 
 impl Predictor {
@@ -79,11 +79,14 @@ impl Predictor {
             weights,
             context_weight: 0.2,
             last_prediction: None,
-            last_input: None,
+            last_input: vec![0.0; dim],
+            has_last_input: false,
             error_history: vec![0.0; ERROR_HISTORY_LEN],
             error_cursor: 0,
             error_count: 0,
             scratch: vec![0.0; dim],
+            error_scratch: vec![0.0; dim],
+            pure_scratch: vec![0.0; dim],
         }
     }
 
@@ -100,10 +103,12 @@ impl Predictor {
         }
 
         // Apply prediction weights to current state
+        // Weights stored row-major [dim × dim] for contiguous inner-loop access
         for i in 0..self.dim {
             let mut sum = 0.0;
+            let row_base = i * self.dim;
             for j in 0..self.dim {
-                sum += current.data[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[row_base + j];
             }
             self.scratch[i] = sum;
         }
@@ -115,23 +120,23 @@ impl Predictor {
                 for (state, sim) in recalled {
                     let w = self.context_weight * sim.max(0.0) / total_sim;
                     for i in 0..self.dim {
-                        self.scratch[i] += state.data[i] * w;
+                        self.scratch[i] += state.data()[i] * w;
                     }
                 }
             }
         }
 
         // Cache the effective input for weight updates
-        self.last_input = Some(current.data.clone());
+        let copy_len = self.dim.min(current.len());
+        self.last_input[..copy_len].copy_from_slice(&current.data()[..copy_len]);
+        self.has_last_input = true;
 
         // Normalize with fast tanh approximation
         for val in self.scratch.iter_mut() {
             *val = fast_tanh(*val);
         }
 
-        EncodedState {
-            data: self.scratch.clone(),
-        }
+        EncodedState::from_slice(&self.scratch[..self.dim])
     }
 
     /// Convenience: predict with unweighted recalled states (uniform weight).
@@ -139,19 +144,30 @@ impl Predictor {
         let weighted: Vec<(EncodedState, f32)> = recalled
             .iter()
             .map(|s| {
-                let sim = PatternMemory::cosine_similarity(&current.data, &s.data).max(0.0);
+                let sim = PatternMemory::cosine_similarity(current.data(), s.data()).max(0.0);
                 (s.clone(), sim)
             })
             .collect();
         self.predict_weighted(current, &weighted)
     }
 
-    /// Compute per-dimension error vector: predicted − actual.
+    /// Compute per-dimension error vector into internal scratch buffer.
+    /// Returns a slice reference to avoid allocation.
+    pub fn prediction_error_vec_into(&mut self, predicted: &EncodedState, actual: &EncodedState) -> &[f32] {
+        for (i, (p, a)) in predicted.data().iter().zip(actual.data().iter()).enumerate() {
+            if i < self.error_scratch.len() {
+                self.error_scratch[i] = p - a;
+            }
+        }
+        &self.error_scratch[..self.dim.min(predicted.len()).min(actual.len())]
+    }
+
+    /// Compute per-dimension error vector: predicted − actual (allocating version for tests).
     pub fn prediction_error_vec(predicted: &EncodedState, actual: &EncodedState) -> Vec<f32> {
         predicted
-            .data
+            .data()
             .iter()
-            .zip(actual.data.iter())
+            .zip(actual.data().iter())
             .map(|(p, a)| p - a)
             .collect()
     }
@@ -159,9 +175,9 @@ impl Predictor {
     /// Compute scalar prediction error (RMSE).
     pub fn prediction_error(&self, predicted: &EncodedState, actual: &EncodedState) -> f32 {
         let mse: f32 = predicted
-            .data
+            .data()
             .iter()
-            .zip(actual.data.iter())
+            .zip(actual.data().iter())
             .map(|(p, a)| (p - a).powi(2))
             .sum::<f32>()
             / self.dim as f32;
@@ -174,20 +190,20 @@ impl Predictor {
     /// adjust weights to reduce future prediction error. Applies the tanh
     /// derivative and gradient clipping for stability.
     pub fn learn(&mut self, error_vec: &[f32], predicted: &[f32], learning_rate: f32) {
-        let input = match &self.last_input {
-            Some(inp) => inp.clone(),
-            None => return,
-        };
+        if !self.has_last_input {
+            return;
+        }
         let dim = self.dim;
 
         for i in 0..dim {
             let err_i = error_vec.get(i).copied().unwrap_or(0.0);
             let pred_i = predicted.get(i).copied().unwrap_or(0.0);
             // tanh'(x) = 1 - tanh(x)²
-            let tanh_deriv = 1.0 - pred_i.powi(2);
+            let tanh_deriv = 1.0 - pred_i * pred_i;
+            let row_base = i * dim;
             for j in 0..dim {
-                let grad = (err_i * tanh_deriv * input[j]).clamp(-GRADIENT_CLAMP, GRADIENT_CLAMP);
-                let idx = j * dim + i;
+                let grad = (err_i * tanh_deriv * self.last_input[j]).clamp(-GRADIENT_CLAMP, GRADIENT_CLAMP);
+                let idx = row_base + j;
                 self.weights[idx] -= learning_rate * grad;
                 self.weights[idx] = self.weights[idx].clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);
             }
@@ -198,6 +214,24 @@ impl Predictor {
         // If error is high, increase context weight; if low, decrease it
         self.context_weight += learning_rate * CONTEXT_WEIGHT_LR * (error_mag - 0.5);
         self.context_weight = self.context_weight.clamp(CONTEXT_WEIGHT_MIN, CONTEXT_WEIGHT_MAX);
+    }
+
+    /// Export predictor weights for cross-generation inheritance.
+    pub fn export_weights(&self) -> Vec<f32> {
+        self.weights.clone()
+    }
+
+    /// Export context weight.
+    pub fn export_context_weight(&self) -> f32 {
+        self.context_weight
+    }
+
+    /// Import inherited predictor weights. Silently skipped on dimension mismatch.
+    pub fn import_weights(&mut self, weights: &[f32], context_weight: f32) {
+        if weights.len() == self.weights.len() {
+            self.weights.copy_from_slice(weights);
+            self.context_weight = context_weight;
+        }
     }
 
     /// Record scalar prediction error into the history ring buffer.
@@ -232,24 +266,27 @@ impl Predictor {
         self.last_prediction = Some(prediction);
     }
 
-    /// Retrieve last prediction.
-    pub fn last_prediction(&self) -> Option<EncodedState> {
-        self.last_prediction.clone()
+    /// Retrieve last prediction as a reference.
+    pub fn last_prediction(&self) -> Option<&EncodedState> {
+        self.last_prediction.as_ref()
     }
 
     /// Pure (stateless) prediction: applies the weight matrix + tanh without
     /// modifying any internal state. Used for multi-step rollout where we
     /// iteratively simulate the agent's trajectory without affecting learning.
-    pub fn predict_pure(&self, current: &EncodedState) -> EncodedState {
-        let mut output = vec![0.0f32; self.dim];
+    pub fn predict_pure(&mut self, current: &EncodedState) -> EncodedState {
+        for v in self.pure_scratch.iter_mut() {
+            *v = 0.0;
+        }
         for i in 0..self.dim {
             let mut sum = 0.0;
+            let row_base = i * self.dim;
             for j in 0..self.dim {
-                sum += current.data[j] * self.weights[j * self.dim + i];
+                sum += current.data()[j] * self.weights[row_base + j];
             }
-            output[i] = fast_tanh(sum);
+            self.pure_scratch[i] = fast_tanh(sum);
         }
-        EncodedState { data: output }
+        EncodedState::from_slice(&self.pure_scratch[..self.dim])
     }
 
     /// Multi-step rollout: iteratively predict N steps into the future.
@@ -262,7 +299,7 @@ impl Predictor {
     ///
     /// No context patterns are used during rollout — the agent is simulating
     /// a hypothetical solo trajectory, not recalling memories.
-    pub fn rollout(&self, initial: &EncodedState, steps: usize) -> EncodedState {
+    pub fn rollout(&mut self, initial: &EncodedState, steps: usize) -> EncodedState {
         let mut state = initial.clone();
         for _ in 0..steps {
             state = self.predict_pure(&state);
@@ -276,9 +313,7 @@ mod tests {
     use super::*;
 
     fn make_state(vals: &[f32]) -> EncodedState {
-        EncodedState {
-            data: vals.to_vec(),
-        }
+        EncodedState::from_slice(vals)
     }
 
     #[test]
@@ -302,7 +337,7 @@ mod tests {
             let predicted = pred.predict(&state_a, &[]);
             let error = pred.prediction_error(&predicted, &state_b);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
             pred.record_error(error);
             errors.push(error);
         }
@@ -331,9 +366,9 @@ mod tests {
 
         // Predictions should differ when context is provided
         let diff: f32 = pred_no_ctx
-            .data
+            .data()
             .iter()
-            .zip(pred_with_ctx.data.iter())
+            .zip(pred_with_ctx.data().iter())
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(diff > 0.001, "Context should influence prediction, diff={diff}");
@@ -378,7 +413,7 @@ mod tests {
             let predicted = pred.predict(&state_a, &[]);
             let error = pred.prediction_error(&predicted, &state_b);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
             last_error = error;
         }
 
@@ -398,7 +433,7 @@ mod tests {
         let mutable_result = pred.predict(&state, &[]);
         let pure_result = pred.predict_pure(&state);
 
-        for (a, b) in mutable_result.data.iter().zip(pure_result.data.iter()) {
+        for (a, b) in mutable_result.data().iter().zip(pure_result.data().iter()) {
             assert!(
                 (a - b).abs() < 1e-5,
                 "predict_pure should match predict (no context): {a} vs {b}"
@@ -409,11 +444,9 @@ mod tests {
     #[test]
     fn predict_pure_does_not_mutate_state() {
         let dim = 4;
-        let pred = Predictor::new(dim);
+        let mut pred = Predictor::new(dim);
         let state = make_state(&[0.5, 0.3, -0.1, 0.2]);
 
-        // predict_pure takes &self, so this test is mostly a compile-time check
-        // that it doesn't require &mut self
         let _r1 = pred.predict_pure(&state);
         let _r2 = pred.predict_pure(&state);
         assert_eq!(pred.error_count(), 0, "predict_pure should not modify predictor state");
@@ -422,13 +455,13 @@ mod tests {
     #[test]
     fn rollout_converges_to_fixed_point() {
         let dim = 4;
-        let pred = Predictor::new(dim);
+        let mut pred = Predictor::new(dim);
         let state = make_state(&[0.5, 0.3, -0.1, 0.2]);
 
         // With near-identity weights (0.9 diagonal), rollout contracts toward zero
         let far = pred.rollout(&state, 100);
-        let magnitude: f32 = far.data.iter().map(|x| x.abs()).sum();
-        let initial_magnitude: f32 = state.data.iter().map(|x| x.abs()).sum();
+        let magnitude: f32 = far.data().iter().map(|x| x.abs()).sum();
+        let initial_magnitude: f32 = state.data().iter().map(|x| x.abs()).sum();
 
         assert!(
             magnitude < initial_magnitude,
@@ -447,7 +480,7 @@ mod tests {
         for _ in 0..200 {
             let predicted = pred.predict(&state_a, &[]);
             let error_vec = Predictor::prediction_error_vec(&predicted, &state_b);
-            pred.learn(&error_vec, &predicted.data, 0.05);
+            pred.learn(&error_vec, predicted.data(), 0.05);
         }
 
         // 1-step rollout from A should be close to B
@@ -460,7 +493,7 @@ mod tests {
 
         // Multi-step rollout should continue the trajectory (not crash/NaN)
         let far = pred.rollout(&state_a, 30);
-        for val in &far.data {
+        for val in far.data() {
             assert!(!val.is_nan(), "Rollout should not produce NaN");
             assert!(val.abs() <= 1.0, "Rollout values should stay in tanh range");
         }

@@ -68,6 +68,24 @@ pub struct SensoryFrame {
     pub tick: u64,
 }
 
+impl SensoryFrame {
+    /// Create a blank sensory frame with pre-allocated vision buffers.
+    pub fn new_blank(vision_w: u32, vision_h: u32) -> Self {
+        Self {
+            vision: VisualField::new(vision_w, vision_h),
+            velocity: Vec3::ZERO,
+            facing: Vec3::Z,
+            angular_velocity: 0.0,
+            energy_signal: 0.0,
+            integrity_signal: 0.0,
+            energy_delta: 0.0,
+            integrity_delta: 0.0,
+            touch_contacts: Vec::with_capacity(8),
+            tick: 0,
+        }
+    }
+}
+
 impl VisualField {
     /// Create a blank visual field with the given resolution.
     /// Colors initialize to black (0.0), depths to far plane (1.0).
@@ -79,5 +97,11 @@ impl VisualField {
             color: vec![0.0; pixel_count * 4],
             depth: vec![1.0; pixel_count],
         }
+    }
+
+    /// Reset to blank state without reallocating. Colors → black, depths → far.
+    pub fn clear(&mut self) {
+        self.color.fill(0.0);
+        self.depth.fill(1.0);
     }
 }

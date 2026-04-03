@@ -14,8 +14,10 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | Agent lifecycle (spawn, death, respawn, reproduction) | `agent/mod.rs` + `main.rs` |
 | Multi-agent management | `main.rs` |
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
+| egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
 | CSV telemetry recording | `recording.rs` |
+| Per-generation replay recording & playback | `replay.rs` |
 | Event loop & orchestration | `main.rs` |
 
 ---
@@ -30,12 +32,15 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ recording  │  │
 │  │          │  │          │  │          │  │          │  │            │  │
 │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │recording.rs│  │
-│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
+│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │ replay.rs  │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
 │       │             │             │             │              │          │
-│       │     ┌───────┴──────┐      │             │              │          │
+│  ┌────┴─────┐                                                            │
+│  │  ui.rs   │  egui integration (EguiIntegration, TabViewer, dock)       │
+│  └──────────┘                                                            │
+│       │             │             │             │              │          │
 │       │     │ WorldState   │◄─────┤             │              │          │
 │       │     │  .terrain    │      │ step()      │              │          │
 │       │     │  .biome_map  │      │  reads &    │              │          │
@@ -57,11 +62,13 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │     a. extract_senses() → SensoryFrame            │         │          │
 │  │     b. brain.tick(frame) → MotorCommand            │         │          │
 │  │     c. physics::step(agent, motor, world)         │         │          │
-│  │     d. death/respawn/reproduction checks          │         │          │
-│  │  3. Rebuild meshes (agents, food)                 │         │          │
-│  │  4. Build HUD bars                                │         │          │
-│  │  5. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  6. Log telemetry to CSV                          │                    │
+│  │     d. Record tick data + food events to replay   │         │          │
+│  │     e. death/respawn/reproduction checks          │         │          │
+│  │  3. Advance replay playback (if active)           │         │          │
+│  │  4. Rebuild meshes (agents, food)                 │         │          │
+│  │  5. Build HUD bars                                │         │          │
+│  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
+│  │  7. Log telemetry to CSV                          │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -134,6 +141,8 @@ Free-fly camera with 6-DOF movement:
 
 #### HUD Overlay (`renderer/hud.rs`)
 
+> **Note:** The legacy HUD pipeline still exists and renders status bars as a wgpu overlay. However, the primary UI is now the **egui** layer (see `ui.rs` below), which provides the sidebar, docked agent detail tabs, and bottom console. The HUD bars remain as a fallback rendering path.
+
 `HudBar` represents a single status bar in NDC space (−1..1):
 
 ```rust
@@ -175,6 +184,43 @@ Fully procedural — no external font files.
 - `TextVertex` has `position [f32; 3]`, `uv [f32; 2]`, `color [f32; 4]` (36 bytes).
 - Text is rendered by emitting one textured quad (4 verts, 6 indices) per character.
 - The text pipeline uses `ALPHA_BLENDING` and `FilterMode::Nearest`.
+
+### 3.1b egui UI Layer (`ui.rs`)
+
+The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as an overlay on top of the wgpu 3D scene.
+
+#### Key Types
+
+| Type | Role |
+|---|---|
+| `EguiIntegration` | Owns the egui context, winit integration state, wgpu renderer, and the offscreen texture that embeds the 3D viewport inside an egui panel. |
+| `Tab` | Enum — `Sandbox` (3D viewport, always open), `Evolution` (evolution dashboard), or `AgentDetail(u32)` (per-agent detail view). |
+| `SortMode` | Enum — 7 sorting options for the sidebar agent list: Id, Energy, Integrity, Deaths, LongestLife, PredictionError, Fitness. |
+| `AgentSnapshot` | Per-frame copy of an agent's vitals, brain metrics, motor output, decision log, vision data, position, and history buffers — decouples the UI from the simulation's mutable state. |
+| `WorldSnapshot` | Per-frame world state for the mini-map: world size, food positions, and a cached 256x256 biome texture. |
+| `ReplayState` | Playback state for the replay system: active flag, current tick, playing/paused, speed multiplier, total ticks, selected agent index. |
+| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, agent snapshots, world snapshot, replay state, and last generation recording. |
+
+#### Layout
+
+- **Top bar** — App title, FPS, agent count, evolution state indicator, wall time and ticks/sec (when running/paused), pause/resume and reset buttons (right-aligned, when running/paused).
+- **Left sidebar** — Sort dropdown (by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, Fitness), agent list with colored dots, compact energy/integrity bars, phase label, death count, food consumed, and best life duration.
+- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; the **Evolution** tab shows the evolution dashboard; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
+- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
+- **Bottom console** — Scrollable log of evolution events.
+
+#### Evolution Tab
+
+The Evolution tab uses a top/bottom split layout:
+
+- **Top — Fitness chart**: one colored line per island (up to 8 distinct colors), so each island's evolutionary trajectory is independently visible. Data comes from `fitness_history_by_island()`, which groups `EvolutionSnapshot.fitness_history` (`HashMap<i64, Vec<(u32, f32, f32)>>`) by island ID.
+- **Left pane — Generation tree** (25% width, resizable): file explorer style, each node is a generation entry. Clicking a node selects it and populates the right panel with its details (status, island ID, fitness, mutations applied, full `BrainConfig`). Dead-end branches (failed/exhausted generations) are collapsed by default but can be manually expanded for post-mortem inspection. A draggable vertical separator between the panes allows resizing.
+- **Right pane — Generation detail** (75% width, resizable): shows the selected node's fields when a tree node is clicked; otherwise shows aggregate stats for the current run. Both panes fill the remaining vertical space below the fitness chart.
+- **Generation progress bar**: rendered in `TopBottomPanel::top("top_bar")` — always visible regardless of which tab is active. Displays ticks elapsed vs. tick budget for the current generation.
+
+#### Viewport Integration
+
+The 3D scene is rendered to an **offscreen wgpu texture**, which is then displayed as an `egui::Image` inside the Sandbox tab. Camera drag and scroll events are forwarded to the 3D camera only when the pointer is hovering over the viewport pane (tracked via `viewport_hovered`). This prevents UI interactions in the sidebar or detail tabs from moving the camera.
 
 ---
 
@@ -299,7 +345,9 @@ pub struct FoodItem {
 14. **Biome effects** — in `Danger`: `integrity -= hazard_damage_rate`.
 15. **Integrity regen** — if `energy_signal > 0.5` and not full, `integrity += regen_rate`.
 16. **Auto-consume food** — find nearest non-consumed food within 2.5 units regardless
-    of action. Consume it: `energy += food_energy_value` (capped at max).
+    of action. Consume it: `energy += food_energy_value` (capped at max). Returns
+    `Some(food_index)` with the consumed item's index (used by the replay recording
+    system to track food events), or `None` if no food was consumed.
 17. **Death check** — if `energy ≤ 0` or `integrity ≤ 0`, set `alive = false`.
 
 #### Agent-Agent Collision
@@ -333,7 +381,7 @@ pub struct Agent {
     pub id: u32,
     pub body: AgentBody,
     pub brain: Brain,
-    pub color: [f32; 3],       // dynamic behavioral significance color
+    pub color: [f32; 3],       // static palette color (matches sidebar)
     pub birth_tick: u64,
     pub death_count: u32,
     pub generation: u32,       // life iteration (incremented on each death/respawn)
@@ -343,20 +391,13 @@ pub struct Agent {
     pub persist_brain: bool,   // if true, brain survives death
     pub has_reproduced: bool,  // once per life
     pub cached_motor: MotorCommand, // cached motor command for brain-decimated ticks
+    pub decision_log: VecDeque<DecisionSnapshot>, // last 256 brain decisions (ring buffer)
+    pub food_consumed: u32,    // cumulative food consumed
+    pub total_ticks_alive: u64, // cumulative ticks alive across all lives
 }
 ```
 
-**Behavioral significance coloring** — Agent color is computed dynamically each frame based on a composite behavioral significance score:
-
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-```
-
-- **Gray** `[0.55, 0.55, 0.55]` when significance ≈ 0 (random/uninformed behavior)
-- **Bright red** `[0.95, 0.15, 0.10]` when significance → 1 (informed, learned behavior)
-- Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
-
-This replaces the old static 8-color palette (`AGENT_COLORS`). Color now communicates cognitive state: you can see at a glance which agents have learned and which are still exploring randomly.
+**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
 
 **Agent mesh** — 2.0-unit cube with 6-face shading (each face darkened by factors
 1.0, 0.9, 0.8, 0.7, 0.85, 0.75). Combined into a single vertex buffer for all agents.
@@ -385,15 +426,18 @@ in the direction determined by the pixel's grid position within the FOV. The ray
 marches in 1.0-unit steps until it hits terrain (point below the heightmap surface),
 another agent, or reaches max distance.
 
-**Hit color** is determined by what the ray strikes:
+**Hit color** is determined by what the ray strikes first (checked in this order):
 
-| Target | RGBA |
-|---|---|
-| FoodRich terrain | `[0.15, 0.50, 0.10, 1.0]` |
-| Barren terrain | `[0.50, 0.40, 0.20, 1.0]` |
-| Danger terrain | `[0.60, 0.20, 0.10, 1.0]` |
-| Other agent | `[0.90, 0.20, 0.60, 1.0]` (magenta) |
-| Sky (miss) | `[0.53, 0.81, 0.92, 1.0]` (early-out) |
+| Target | RGBA | Priority |
+|---|---|---|
+| Food item | `[0.70, 0.95, 0.20, 1.0]` (lime green) | 1st — spatial grid lookup |
+| Other agent | `[0.90, 0.20, 0.60, 1.0]` (magenta) | 2nd |
+| FoodRich terrain | `[0.15, 0.50, 0.10, 1.0]` | 3rd |
+| Barren terrain | `[0.50, 0.40, 0.20, 1.0]` | 3rd |
+| Danger terrain | `[0.60, 0.20, 0.10, 1.0]` | 3rd |
+| Sky (miss) | `[0.53, 0.81, 0.92, 1.0]` (early-out) | fallback |
+
+A single unified `march_ray_unified` function handles all targets via an `AgentSlice` enum dispatch, ensuring both the `extract_senses` and `extract_senses_with_positions` paths see food identically.
 
 Depth is normalized to `[0, 1]` by dividing by `max_dist` (50.0).
 
@@ -440,7 +484,7 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Recording & Telemetry (`recording.rs`)
+### 3.5 Recording, Telemetry & Replay (`recording.rs`, `replay.rs`)
 
 #### CSV Format
 
@@ -464,6 +508,38 @@ generation
 - **Flushed every 100 ticks** for crash safety.
 - Final flush on session exit (`print_session_summary()`).
 
+#### Per-Generation Replay Recording (`replay.rs`)
+
+The replay system captures per-tick agent state during evolution runs, enabling
+post-hoc playback of any completed generation.
+
+**Data Structures:**
+
+| Struct | Purpose |
+|--------|---------|
+| `TickRecord` | Per-tick per-agent snapshot: position, yaw, alive, energy, integrity, motor output, exploration rate, prediction error, gradient, urgency, credit magnitude, patterns recalled, phase, and optional vision keyframe |
+| `FoodEvent` | Sparse food state change: tick, food index, consumed flag, new position (on respawn) |
+| `GenerationRecording` | Complete generation recording: agent info, flat-array tick records (`tick * agent_count + agent_idx`), sparse food events, initial food positions |
+
+**Storage Strategy:**
+- Tick records are stored in a flat `Vec<TickRecord>` indexed as `tick * agent_count + agent_idx`
+- Vision data (192 floats per agent) is only stored at keyframes (every 30 ticks) to save memory
+- Food events are sparse — only recorded when food is consumed or respawns
+- Initial food positions are stored once for reconstruction via `food_at_tick()`
+
+**Integration Points:**
+- Recording starts when a new generation spawns (`spawn_evolution_population` / `spawn_population_from_configs`)
+- Per-tick data is captured after physics and collision resolution
+- Food consumption events are captured when `physics::step()` returns `Some(food_index)`
+- Food respawn events are captured from `WorldState::last_respawned_indices()`
+- When a generation completes, the recording moves to `last_recording` for playback
+
+**Playback:**
+- The agent detail tab shows a "Replay Gen N" button when a recording is available
+- Timeline scrubber, play/pause, and speed controls (0.5x–8x)
+- Builds temporary `AgentSnapshot` and `WorldSnapshot` from recorded data at the current tick
+- Food positions are reconstructed by replaying food events up to the current tick
+
 #### Console Telemetry
 
 Printed every 100 ticks for the selected agent:
@@ -478,7 +554,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — all runtime info is displayed on the HUD overlay.
+Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 50k×`) turns yellow when above 1×.
 
 ---
 
@@ -506,9 +582,12 @@ about_to_wait()     → Request continuous redraw
 | `3` | 5 | 5x |
 | `4` | 10 | 10x |
 | `5` | 100 | 100x |
-| `6` | 1000 | 1000x |
+| `6` | 1000 | 1k× |
+| `7` | 5000 | 5k× |
+| `8` | 10000 | 10k× |
+| `9` | 50000 | 50k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 2000).
+Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 100,000) in fast mode.
 
 ##### Brain Tick Decimation
 
@@ -549,9 +628,9 @@ When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) an
 2. `mutate_config()` perturbs the parent's `BrainConfig`:
    - Floats (`learning_rate`, `decay_rate`): multiplied by uniform random in [0.9, 1.1],
      clamped to ≥ 0.0001.
-   - Integers (`memory_capacity`, `processing_slots`, `representation_dim`):
+   - Integers (`memory_capacity`, `processing_slots`):
      multiplied by [0.9, 1.1], rounded, clamped to ≥ 1.
-   - `visual_encoding_size` is **not mutated** (must match shared sensory pipeline).
+   - `visual_encoding_size` and `representation_dim` are **not mutated** (visual_encoding_size must match the sensory pipeline; representation_dim is locked to prevent weight inheritance breakage across generations).
 3. Child spawns near parent (±5 units offset), generation = parent generation + 1.
 4. Child gets a fresh brain with the mutated config.
 
@@ -676,22 +755,32 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | `4` | Speed 10x (10 ticks/frame) |
 | `5` | Speed 100x (100 ticks/frame) |
 | `6` | Speed 1000x (1000 ticks/frame) |
+| `7` | Speed 5000x (5000 ticks/frame) |
+| `8` | Speed 10000x (10000 ticks/frame) |
+| `9` | Speed 50000x (50000 ticks/frame) |
 | Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |
 | `M` | Spawn a new agent (mutated config) |
-| `Tab` | Cycle telemetry focus to next agent |
 | `H` | Toggle heatmap overlay for selected agent |
-| `Escape` | Print session summary and quit |
+
+
+### egui UI Interaction
+
+| Action | Effect |
+|---|---|
+| Click agent in sidebar | Select / focus that agent |
+| Double-click agent in sidebar | Open an agent detail tab |
+| Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
+| Close detail tab | Click the × on the tab header |
 
 ### Visual Cues
 
 | Indicator | Description |
 |---|---|
 | Yellow diamond | Floating marker above the currently selected agent |
-| Colored ribbon trail | Linear ribbon of selected agent's full life path (distance-sampled, up to 4000 points, dirty-flag rebuild) |
-| Gray agent | Random/uninformed behavior (low significance score) |
-| Red-tinted agent | Increasingly adapted (significance³ curve, hard to reach) |
+| Colored ribbon trails | Linear ribbons for all alive agents simultaneously, each in their own palette color (distance-sampled, up to 4000 points per agent, dirty-flag rebuild) |
+| Palette-colored agent | Each agent has a unique static color matching its sidebar dot |
 | Heatmap overlay (`H`) | Blue→yellow→red cells showing where the selected agent spent time |
 
 ---
@@ -761,11 +850,11 @@ Each frame, when the window requests a redraw:
 ```
 ┌────────────────────────┐
 │  WorldState            │     ┌───────────────────────┐
-│  ├─ terrain (heights)  │────►│ sample_vision()       │
+│  ├─ terrain (heights)  │────►│ march_ray_unified()   │
 │  ├─ biome_map          │     │  8×6 grid, 90° FOV    │──► vision.color [192 floats]
 │  └─ food_items         │     │  50.0 max depth       │──► vision.depth [48 floats]
 │                        │     │  1.0 ray step         │
-│                        │     │  detects agents too   │
+│                        │     │  food + agents + terrain│
 │                        │     └───────────────────────┘
 │                        │
 │  AgentBody             │     ┌───────────────────────┐
@@ -790,14 +879,14 @@ Each frame, when the window requests a redraw:
 
 ### What the Brain "Sees" vs What the Renderer Shows
 
-The brain receives an **8 × 6 biome-colored depth image** from simplified raycasting.
+The brain receives an **8 × 6 colored depth image** from simplified raycasting.
 The renderer shows the actual **textured terrain mesh** with height-blended vertex
 colors. These are related but not identical:
 
-- The brain's vision uses flat biome colors (3 terrain options + agent magenta + sky).
-- The renderer shows smooth height-based color gradients per biome.
-- The brain **can see other agents** in its visual field (rendered as magenta
-  `[0.9, 0.2, 0.6, 1.0]`), as well as detecting them via touch contacts.
+- The brain's vision uses flat biome colors (3 terrain options + food lime-green + agent magenta + sky).
+- The renderer shows smooth height-based color gradients per biome with 3D food/agent cubes.
+- The brain **can see food items** (lime green `[0.70, 0.95, 0.20, 1.0]`) and **other agents** (magenta `[0.9, 0.2, 0.6, 1.0]`) in its visual field.
+- The brain also receives **touch contacts** — the top 4 contacts by intensity are encoded into 16 features (direction, intensity, surface tag).
 
 ### Touch Contact Generation
 
@@ -818,28 +907,13 @@ Agents are stored in a `Vec<Agent>`. The main loop iterates by index so it can
 build the "other agents" list for inter-agent perception while maintaining mutable
 access to the current agent.
 
-### Behavioral Significance Coloring
+### Agent Palette Colors
 
-Agent color is no longer a static palette. Instead, each agent's color is computed
-dynamically from a composite behavioral significance score:
-
-```
-significance = exploitation_ratio × (1 − prediction_error) × memory_utilization
-color_t = significance³   (cubic curve — agents must truly adapt to turn red)
-```
-
-The cubic power curve ensures agents don't appear red prematurely. A raw score of
-0.3 (moderately informed) only produces a color shift of 0.027 — barely visible.
-Only genuinely adapted agents (score > 0.7) get a noticeably red tint.
-
-The color interpolates from gray to bright red:
-- **significance ≈ 0**: `[0.55, 0.55, 0.55]` (gray — random/uninformed)
-- **significance → 1**: `[0.95, 0.15, 0.10]` (bright red — informed, learned)
-- **Dead agents**: `[0.25, 0.25, 0.25]` (dark gray)
+Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
 
 ### Selection Marker
 
-The currently focused agent (via right-click or Tab) is highlighted with a bright
+The currently focused agent (selected via the sidebar or right-click) is highlighted with a bright
 yellow diamond marker floating above it. The diamond has 8 triangular faces arranged
 as an octahedron shape, making the selected agent easy to spot even in crowded scenes.
 
@@ -847,9 +921,9 @@ as an octahedron shape, making the selected agent easy to spot even in crowded s
 
 Each agent records its position using distance-based sampling — a new control point
 is stored whenever the agent moves ≥ 3 units from the last sample (up to 4000 points
-per life). The selected agent's trail is rendered as a **linear ribbon** using the
-agent's own color. The mesh is only rebuilt when the trail data changes (dirty flag),
-keeping CPU cost negligible even at high time multipliers.
+per life). All alive agents' trails are rendered simultaneously as **linear ribbons**,
+each in the agent's own palette color. Meshes are only rebuilt when trail data changes
+(dirty flag), keeping CPU cost negligible even at high time multipliers.
 
 The trail covers the agent's **entire current life** (birth to present). Only the
 oldest 20% fades slightly; the rest is uniformly visible. The trail resets on
@@ -861,18 +935,17 @@ death/respawn.
 - When enabled: agent must survive 5000 ticks continuously.
 - **Once per life**: `has_reproduced` flag prevents repeated spawning.
 - **Population cap**: `MAX_AGENTS = 100`.
-- **Mutation**: Each `BrainConfig` parameter is independently perturbed ±10%.
-  `visual_encoding_size` is preserved (must match the sensory pipeline).
+- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `visual_encoding_size` and `representation_dim` are preserved (visual_encoding_size must match the sensory pipeline; representation_dim is locked to prevent weight inheritance breakage across generations).
 - **Generation tracking**: Generation increments on each death/respawn, tracking how many lives the agent has lived.
 
 ### Telemetry Focus
 
-`Tab` cycles `selected_agent_idx` through the agent list. Right-click selects the
-nearest agent via screen-space projection. The selected agent is indicated by a
-yellow diamond marker floating above it. Its data drives:
-- HUD bars (energy, integrity, prediction error, exploration rate)
-- Agent info text: "Agent N | Gen N | Deaths: N", "Phase: X | Quality: N%", "Tick: N  Speed: Nx"
-- "Agents: alive/total" counter at top-right below the FPS counter
+Clicking an agent in the **sidebar** selects it; double-clicking opens a dedicated
+detail tab in the dock area. The selected agent is indicated by a yellow diamond
+marker floating above it in the 3D viewport. Its data drives:
+- **Sidebar**: colored dot, compact energy/integrity bars, phase label, death count, food consumed, best life. Sortable by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, or Fitness via dropdown.
+- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, 0.5x–8x speed, live/replay toggle).
+- **Bottom console**: scrollable log of evolution events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
 - CSV logging
@@ -923,7 +996,7 @@ Several optimizations keep the simulation fast at scale:
 cargo test -p xagent-sandbox
 ```
 
-### Test Inventory (14 tests)
+### Test Inventory (18 tests)
 
 | Test | Category | Verifies |
 |---|---|---|
@@ -941,6 +1014,10 @@ cargo test -p xagent-sandbox
 | `terrain_rejects_one_subdivision` | World | `#[should_panic]` — 1 subdivision is rejected |
 | `sensory_frame_has_correct_dimensions` | Senses | Visual field is 8×6, buffers correctly sized |
 | `interoception_matches_body_state` | Senses | Energy/integrity signals match InternalState |
+| `orbit_camera_positioned_above_target` | Camera | Orbit places camera above target (positive Y offset) |
+| `orbit_pitch_clamps_above_horizon` | Camera | Orbit pitch stays within (0.05, 1.4) range |
+| `orbit_scroll_zoom_out_has_no_upper_bound` | Camera | Orbit zoom-out has no upper distance cap |
+| `orbit_scroll_zoom_in_clamps_at_minimum` | Camera | Orbit zoom-in floors at 5.0 distance |
 
 ---
 
@@ -1015,9 +1092,9 @@ optimization at this scale.
 
 - **>20 agents**: The inter-agent perception cost becomes O(N²) and brain ticks
   multiply. The hard cap prevents this.
-- **High ticks_per_frame (1000x)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
+- **High ticks_per_frame (1000x+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
   ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
-  cap scales with speed (`speed × 2`, capped at 2000).
+  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 100,000 in fast mode).
 - **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means
   searching 32 patterns per tick, each compared against a 64-dim vector.
 
@@ -1027,7 +1104,7 @@ optimization at this scale.
 
 | Limitation | Detail |
 |---|---|
-| Simplified vision | Agents see biome-colored raycasts, not the actual rendered scene. No agent/food visibility in visual field. |
+| Simplified vision | Agents see biome-colored raycasts, not the actual rendered scene. Food items and other agents are visible as distinct colors (lime green and magenta respectively). |
 | No audio channel | No sound-based sensory input — agents are effectively deaf. |
 | Flat-ish terrain | Multi-octave noise produces rolling hills (±6.5 units) but no caves, overhangs, or vertical features. |
 | No object manipulation | Agents cannot carry, build, or reshape the world. Push action has no physics effect. |

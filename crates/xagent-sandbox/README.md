@@ -770,7 +770,9 @@ Each frame, when the window requests a redraw:
 
 2. Update camera position from held keys (WASD/E/Shift)
 
-3. If not paused, for each tick (1–1000 per frame based on speed, capped at speed × 2 up to 2000):
+3. If not paused, run as many simulation ticks as the current speed/mode allows,
+   bounded by the per-frame tick time budget and `max_ticks_per_frame`
+   (currently up to 4000 in 3D mode and up to 1,000,000 in fast mode):
    a. Collect all agent positions into a snapshot (Vec<(Vec3, bool)>)
 
    b. For each living agent i:

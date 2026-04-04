@@ -1274,11 +1274,11 @@ impl ApplicationHandler for App {
                     // ── Adaptive GPU/CPU decision ──
                     // GPU dispatches once per frame → 1 brain tick per frame.
                     // CPU runs brain every tick inside the loop.
-                    // Use GPU only when expected ticks ≤ 2 per frame so
+                    // Use GPU only when expected ticks ≤ 1 per frame so
                     // agents get equivalent cognitive throughput either way.
                     let expected_ticks = (self.sim_accumulator / SIM_DT)
                         .min(max_ticks as f32) as u64;
-                    let use_gpu = self.gpu_compute.is_some() && expected_ticks <= 2;
+                    let use_gpu = self.gpu_compute.is_some() && expected_ticks <= 1;
 
                     // ── GPU COLLECT: always drain in-flight results ──
                     // try_collect_into() unmaps staging buffers even if we don't

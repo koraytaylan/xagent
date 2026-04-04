@@ -1389,6 +1389,10 @@ impl ApplicationHandler for App {
                                     agent.brain.config.processing_slots,
                                 );
                                 agent.body.body.internal.energy -= brain_drain;
+                                if agent.body.body.internal.energy <= 0.0 {
+                                    agent.body.body.internal.energy = 0.0;
+                                    agent.body.body.alive = false;
+                                }
                                 if let Some(food_idx) = consumed {
                                     self.food_dirty = true;
                                     agent.food_consumed += 1;

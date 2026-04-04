@@ -141,6 +141,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                         agent.brain.config.processing_slots,
                     );
                     agent.body.body.internal.energy -= brain_drain;
+                    if agent.body.body.internal.energy <= 0.0 {
+                        agent.body.body.internal.energy = 0.0;
+                        agent.body.body.alive = false;
+                    }
                     if consumed.is_some() {
                         agent.food_consumed += 1;
                     }

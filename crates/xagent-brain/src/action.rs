@@ -121,7 +121,7 @@ impl ActionSelector {
         &mut self,
         current: &EncodedState,
         prediction: &EncodedState,
-        recalled: &[(EncodedState, f32)],
+        recalled: &[crate::memory::RecalledPattern],
         homeostatic_gradient: f32,
         prediction_error: f32,
         urgency: f32,
@@ -138,18 +138,9 @@ impl ActionSelector {
         // 2. Temporal credit assignment.
         self.assign_credit(homeostatic_gradient);
 
-        // 3. Adaptive exploration rate.
-        // Base 0.5 for continuous motor: additive noise of ±0.5 produces
-        // vigorous movement comparable to the old discrete system's random
-        // full-strength actions. Both forward and turn channels get real
-        // signal so credit assignment can learn both steering and thrust.
-        // As the policy learns (weights grow), it dominates the noise and
-        // behavior smoothly transitions from random to directed.
-        let stability = recalled.len() as f32 / 16.0;
+        // 3. Exploration rate variables (computed after motor output, see step 7).
         let novelty_bonus = (prediction_error * 2.0).min(0.4);
         let urgency_penalty = (urgency * 0.4).min(0.5);
-        self.exploration_rate =
-            (0.5 - stability * 0.15 + novelty_bonus + curiosity_bonus - urgency_penalty).clamp(0.10, 0.85);
 
         // 4. Compute raw motor outputs from encoded state.
         let mut fwd = self.forward_bias;
@@ -174,11 +165,38 @@ impl ActionSelector {
             trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn);
         }
 
-        // 6. Clean output through tanh squashing.
+        // 6. Memory-informed motor blending: recalled patterns suggest
+        //    actions based on past outcomes in similar states.
+        let mut mem_fwd = 0.0_f32;
+        let mut mem_trn = 0.0_f32;
+        let mut total_weight = 0.0_f32;
+        for rp in recalled {
+            let w = rp.similarity * rp.outcome_valence;
+            mem_fwd += w * rp.motor_forward;
+            mem_trn += w * rp.motor_turn;
+            total_weight += w.abs();
+        }
+        if total_weight > 1e-6 {
+            mem_fwd /= total_weight;
+            mem_trn /= total_weight;
+            let memory_strength = (total_weight / recalled.len().max(1) as f32).clamp(0.0, 1.0);
+            let mix = memory_strength * 0.4;
+            fwd = fwd * (1.0 - mix) + mem_fwd * mix;
+            trn = trn * (1.0 - mix) + mem_trn * mix;
+        }
+
+        // 7. Adaptive exploration rate: based on policy confidence, not recall count.
+        let raw_signal = fwd.abs() + trn.abs();
+        let policy_confidence = (raw_signal / 2.0).clamp(0.0, 1.0);
+        self.exploration_rate =
+            (0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity_bonus - urgency_penalty)
+                .clamp(0.10, 0.85);
+
+        // 8. Clean output through tanh squashing.
         let fwd_clean = crate::fast_tanh(fwd);
         let trn_clean = crate::fast_tanh(trn);
 
-        // 7. Add exploration noise.
+        // 9. Add exploration noise.
         let fwd_noisy =
             (fwd_clean + rng.random_range(-1.0..1.0) * self.exploration_rate).clamp(-1.0, 1.0);
         let trn_noisy =
@@ -190,7 +208,7 @@ impl ActionSelector {
             self.exploitative_actions += 1;
         }
 
-        // 8. Record actual motor output (including noise) + state snapshot + gradient in ring buffer.
+        // 10. Record actual motor output (including noise) + state snapshot + gradient in ring buffer.
         // We record the noisy output because that's what the agent actually did --
         // credit should reinforce the executed action, including exploratory noise.
         self.record_motor(fwd_noisy, trn_noisy, homeostatic_gradient);
@@ -393,9 +411,46 @@ impl ActionSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::RecalledPattern;
 
     fn make_state(vals: &[f32]) -> EncodedState {
         EncodedState::from_slice(vals)
+    }
+
+    #[test]
+    fn recalled_positive_valence_biases_motor_output() {
+        let dim = 4;
+        let mut sel = ActionSelector::new(dim);
+
+        // Create a recalled pattern with strong positive valence and forward thrust
+        let recalled = vec![RecalledPattern {
+            state: crate::encoder::EncodedState::from_slice(&[1.0, 0.0, 0.0, 0.0]),
+            similarity: 0.9,
+            motor_forward: 0.8,
+            motor_turn: -0.5,
+            outcome_valence: 0.5,
+        }];
+
+        let state = crate::encoder::EncodedState::from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        let prediction = crate::encoder::EncodedState::from_slice(&[1.0, 0.0, 0.0, 0.0]);
+
+        // Run many times and average to cancel out noise
+        let mut total_fwd = 0.0;
+        let n = 200;
+        for _ in 0..n {
+            let cmd = sel.select(&state, &prediction, &recalled, 0.0, 0.0, 0.0, 0.0);
+            total_fwd += cmd.forward;
+        }
+        let avg_fwd = total_fwd / n as f32;
+
+        // With positive valence recalled pattern suggesting 0.8 forward,
+        // average should be biased positive (untrained policy weights = 0,
+        // so without memory the average would be ~0 from symmetric noise)
+        assert!(
+            avg_fwd > 0.05,
+            "Memory with positive valence should bias forward output positive: avg={}",
+            avg_fwd,
+        );
     }
 
     #[test]
@@ -405,7 +460,7 @@ mod tests {
         let pred = make_state(&[0.5, 0.3, -0.1, 0.2]);
 
         for _ in 0..100 {
-            let cmd = sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            let cmd = sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
             assert!(
                 cmd.forward >= -1.0 && cmd.forward <= 1.0,
                 "forward {} out of bounds",
@@ -427,14 +482,14 @@ mod tests {
 
         // Phase 1: baseline gradient (0.0)
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
         }
 
         let fwd_before: f32 = sel.forward_weights.iter().sum();
 
         // Phase 2: positive gradient (+1.0) -- improvement from baseline
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 1.0, 0.1, 0.0, 0.0);
         }
 
         let fwd_after: f32 = sel.forward_weights.iter().sum();
@@ -460,12 +515,12 @@ mod tests {
 
         // Phase 1: baseline gradient (0.0)
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
         }
 
         // Phase 2: negative gradient (-1.0) -- worsening from baseline
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], -1.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], -1.0, 0.1, 0.0, 0.0);
         }
 
         // With negative gradient transition, recent motor commands should
@@ -488,7 +543,7 @@ mod tests {
         // Force high exploration rate by using high prediction error.
         let mut outputs = Vec::new();
         for _ in 0..50 {
-            let cmd = sel.select(&state, &pred, &[], 0.0, 0.9, 0.0, 0.0);
+            let cmd = sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.9, 0.0, 0.0);
             outputs.push(cmd.forward);
         }
 
@@ -509,7 +564,7 @@ mod tests {
 
         // Build up history.
         for _ in 0..20 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
         }
         assert!(sel.history_len > 0, "Should have history after selecting");
 
@@ -530,10 +585,10 @@ mod tests {
 
         // Build some non-trivial weights.
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
         }
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 1.0, 0.1, 0.0, 0.0);
         }
 
         let exported = sel.export_weights();
@@ -571,10 +626,10 @@ mod tests {
 
         // Build a forward preference.
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 0.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.1, 0.0, 0.0);
         }
         for _ in 0..30 {
-            sel.select(&state, &pred, &[], 1.0, 0.1, 0.0, 0.0);
+            sel.select(&state, &pred, &[] as &[RecalledPattern], 1.0, 0.1, 0.0, 0.0);
         }
 
         // Now test: current state is neutral, prediction is the trained state.
@@ -588,7 +643,7 @@ mod tests {
         for _ in 0..20 {
             let mut sel_copy_n = ActionSelector::new(4);
             sel_copy_n.import_weights(&sel.export_weights());
-            let cmd = sel_copy_n.select(&neutral, &neutral, &[], 0.0, 0.01, 0.0, 0.0);
+            let cmd = sel_copy_n.select(&neutral, &neutral, &[] as &[RecalledPattern], 0.0, 0.01, 0.0, 0.0);
             fwd_neutral.push(cmd.forward);
         }
 
@@ -597,7 +652,7 @@ mod tests {
         for _ in 0..20 {
             let mut sel_copy_p = ActionSelector::new(4);
             sel_copy_p.import_weights(&sel.export_weights());
-            let cmd = sel_copy_p.select(&neutral, &dangerous_pred, &[], 0.0, 0.01, 0.0, 0.0);
+            let cmd = sel_copy_p.select(&neutral, &dangerous_pred, &[] as &[RecalledPattern], 0.0, 0.01, 0.0, 0.0);
             fwd_prospective.push(cmd.forward);
         }
 

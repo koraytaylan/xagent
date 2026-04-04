@@ -500,6 +500,32 @@ fn touch_contacts_populated_near_food() {
     );
 }
 
+// ── Metabolic Tests ────────────────────────────────────────────────────
+
+#[test]
+fn metabolic_cost_drains_energy_proportional_to_capacity() {
+    use xagent_shared::BrainConfig;
+
+    // Two configs: tiny brain vs large brain
+    let small = BrainConfig { memory_capacity: 1, processing_slots: 1, ..BrainConfig::default() };
+    let large = BrainConfig { memory_capacity: 512, processing_slots: 32, ..BrainConfig::default() };
+
+    let small_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
+        small.memory_capacity,
+        small.processing_slots,
+    );
+    let large_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
+        large.memory_capacity,
+        large.processing_slots,
+    );
+
+    assert!(small_drain > 0.0, "Even small brains have baseline cost");
+    assert!(
+        large_drain > small_drain * 10.0,
+        "Large brain should cost significantly more: small={small_drain}, large={large_drain}",
+    );
+}
+
 // ── UI Snapshot Tests ─────────────────────────────────────────────────
 
 #[test]

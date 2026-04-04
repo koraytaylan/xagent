@@ -28,4 +28,5 @@ pub(crate) fn fast_tanh(x: f32) -> f32 {
 
 pub use brain::{Brain, BrainTelemetry, DecisionSnapshot, LearnedState};
 pub use habituation::SensoryHabituation;
+pub use memory::RecalledPattern;
 pub use motor_fatigue::MotorFatigue;

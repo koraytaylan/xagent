@@ -135,6 +135,16 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                     let consumed = crate::physics::step(
                         &mut agent.body, &motor, &mut world, dt,
                     );
+                    // Metabolic cost: brain capacity drains energy
+                    let brain_drain = crate::physics::metabolic_drain_per_tick(
+                        agent.brain.config.memory_capacity,
+                        agent.brain.config.processing_slots,
+                    );
+                    agent.body.body.internal.energy -= brain_drain;
+                    if agent.body.body.internal.energy <= 0.0 {
+                        agent.body.body.internal.energy = 0.0;
+                        agent.body.body.alive = false;
+                    }
                     if consumed.is_some() {
                         agent.food_consumed += 1;
                     }

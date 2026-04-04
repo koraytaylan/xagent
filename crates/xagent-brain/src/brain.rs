@@ -214,7 +214,7 @@ impl Brain {
             scalar_error = self.predictor.prediction_error(&prev_prediction, &habituated);
 
             // Learn: update memory reinforcements
-            self.memory.learn(&habituated, scalar_error, modulated_lr);
+            self.memory.learn(&habituated, scalar_error, modulated_lr, homeo_state.raw_gradient);
 
             // Compute error vector into scratch, then learn from it
             // We use the static version to avoid borrow conflict with learn()
@@ -240,8 +240,12 @@ impl Brain {
         };
         self.capacity.report_usage(recalled.len());
 
-        // 5. Predict next state using pre-computed similarity scores
-        let prediction = self.predictor.predict_weighted(&habituated, &recalled);
+        // 5. Predict next state using recalled patterns
+        let recalled_for_predictor: Vec<(EncodedState, f32)> = recalled
+            .iter()
+            .map(|rp| (rp.state.clone(), rp.similarity))
+            .collect();
+        let prediction = self.predictor.predict_weighted(&habituated, &recalled_for_predictor);
 
         // 5b. Multi-step rollout for prospective evaluation.
         let confidence = 1.0 - scalar_error.clamp(0.0, 1.0);
@@ -252,13 +256,7 @@ impl Brain {
             prediction.clone()
         };
 
-        // 6. Store current state as a pattern
-        self.memory.store(habituated.clone());
-
-        // 7. Decay old patterns
-        self.memory.decay(self.config.decay_rate);
-
-        // 8. Select action based on predictions, homeostatic state, and prediction error.
+        // 6. Select action based on predictions, homeostatic state, and prediction error.
         // Credit assignment receives the RAW per-tick gradient (not EMA composite) so
         // food/damage events produce a sharp, strong signal. The composite gradient is
         // still used for exploration rate and modulated learning rate (its smoothing is
@@ -274,12 +272,25 @@ impl Brain {
             curiosity_bonus,
         );
 
-        // 8b. Credit-driven encoder adaptation: amplify raw features that
+        // 6b. Credit-driven encoder adaptation: amplify raw features that
         //     contributed to behaviourally relevant encoded dimensions.
         let credit_signal = self.action_selector.last_credit_signal();
         self.encoder.adapt_from_credit(credit_signal, modulated_lr);
 
-        // 8c. Motor fatigue: dampen output when action variance is low.
+        // 7. Store current state as pattern with motor context.
+        // Uses pre-fatigue motor output (the intended action) and
+        // current homeostatic gradient as outcome signal.
+        self.memory.store(
+            habituated.clone(),
+            command.forward,
+            command.turn,
+            homeo_state.raw_gradient,
+        );
+
+        // 8. Decay old patterns.
+        self.memory.decay(self.config.decay_rate);
+
+        // 9. Motor fatigue: dampen output when action variance is low.
         self.motor_fatigue.update(command.forward, command.turn);
         let fatigue = self.motor_fatigue.fatigue_factor();
         let command = MotorCommand {
@@ -289,10 +300,10 @@ impl Brain {
             action: command.action,
         };
 
-        // 9. Record prediction for next tick's error computation
+        // 10. Record prediction for next tick's error computation
         self.predictor.record_prediction(prediction);
 
-        // 10. Compute behavior quality metrics
+        // 11. Compute behavior quality metrics
         let exploitation_ratio = self.action_selector.exploitation_ratio();
         let exploration_rate = self.action_selector.exploration_rate();
         let decision_quality = (1.0 - scalar_error.clamp(0.0, 1.0))
@@ -300,7 +311,7 @@ impl Brain {
             * (1.0 + homeo_state.gradient).clamp(0.0, 2.0)
             / 2.0;
 
-        // 11. Update telemetry
+        // 12. Update telemetry
         self.last_telemetry = BrainTelemetry {
             tick: self.tick_count,
             prediction_error: scalar_error,
@@ -320,7 +331,7 @@ impl Brain {
             motor_variance: self.motor_fatigue.motor_variance(),
         };
 
-        // 12. Capture decision snapshot for UI stream
+        // 13. Capture decision snapshot for UI stream
         self.last_decision = Some(DecisionSnapshot {
             tick: self.tick_count,
             motor_forward: command.forward,
@@ -686,6 +697,30 @@ mod tests {
         assert!(
             cmd.forward.abs() > 0.0 || cmd.turn.abs() > 0.0,
             "Respawned agent must be able to produce non-zero motor output"
+        );
+    }
+
+    #[test]
+    fn tick_stores_motor_context_in_memory() {
+        let config = BrainConfig::default();
+        let mut brain = Brain::new(config);
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        // Tick a few times to build up state
+        for _ in 0..10 {
+            brain.tick(&frame);
+        }
+
+        // Memory should have patterns with motor fields set
+        // (not all zeros, since exploration noise produces non-zero motors)
+        let has_nonzero_motor = (0..brain.memory.active_count()).any(|i| {
+            brain.memory.get(i).map_or(false, |p| {
+                p.motor_forward.abs() > 1e-6 || p.motor_turn.abs() > 1e-6
+            })
+        });
+        assert!(
+            has_nonzero_motor,
+            "At least one pattern should have non-zero motor context after ticking"
         );
     }
 }

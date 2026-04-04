@@ -44,8 +44,9 @@
 //!
 //! For 10 agents the GPU dispatch overhead (~50-100μs) dominates the actual
 //! compute time. GPU becomes advantageous above ~50 agents. GPU is auto-detected
-//! at startup via `ComputeBackend::probe()`; the caller uses an adaptive scheduler that automatically falls
-//! back to CPU rayon when the speed multiplier would cause GPU mode to deliver
+//! at startup via `ComputeBackend::probe()`; the caller uses an adaptive
+//! scheduler that automatically falls back to CPU rayon when the speed
+//! multiplier would cause GPU mode to deliver
 //! fewer brain ticks than the CPU path (roughly above 10-16× speed).
 
 use std::sync::atomic::{AtomicU64, Ordering};

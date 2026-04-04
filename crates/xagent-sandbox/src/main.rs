@@ -2579,7 +2579,6 @@ fn main() {
     print_config(&config);
 
     let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
-    println!("[xagent] Compute backend: {}", backend.name());
     let has_gpu = backend.has_gpu();
 
     if cli.no_render {

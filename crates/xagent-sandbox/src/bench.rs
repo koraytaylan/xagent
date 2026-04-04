@@ -75,30 +75,64 @@ pub fn run_bench(
             });
         }
 
-        // Phase 3: sequential physics + metabolic drain + death/respawn
-        for i in 0..agents.len() {
-            let agent = &mut agents[i];
-            if agent.body.body.alive {
-                let motor = agent.cached_motor.clone();
-                let _ = crate::physics::step(&mut agent.body, &motor, &mut world, dt);
+        // Phase 3: parallel physics via step_pure + deferred food consumption + respawns
+        //
+        // step_pure takes &WorldState (immutable) so all agents can be
+        // physics-stepped in parallel. Food consumption and respawns
+        // require mutable world access, so they happen sequentially after.
 
-                let brain_drain = crate::physics::metabolic_drain_per_tick(
-                    agent.brain.config.memory_capacity,
-                    agent.brain.config.processing_slots,
-                );
-                agent.body.body.internal.energy -= brain_drain;
-                if agent.body.body.internal.energy <= 0.0 {
-                    agent.body.body.internal.energy = 0.0;
-                    agent.body.body.alive = false;
+        // 3a: parallel physics (rayon)
+        let results: Vec<(Option<usize>, bool)> = {
+            let world_ref: &WorldState = &world;
+            agents
+                .par_iter_mut()
+                .map(|agent| {
+                    if !agent.body.body.alive {
+                        return (None, false);
+                    }
+                    let motor = agent.cached_motor.clone();
+                    let (consumed, died) =
+                        crate::physics::step_pure(&mut agent.body, &motor, world_ref, dt);
+
+                    let brain_drain = crate::physics::metabolic_drain_per_tick(
+                        agent.brain.config.memory_capacity,
+                        agent.brain.config.processing_slots,
+                    );
+                    agent.body.body.internal.energy -= brain_drain;
+                    if agent.body.body.internal.energy <= 0.0 {
+                        agent.body.body.internal.energy = 0.0;
+                        agent.body.body.alive = false;
+                        return (consumed, true);
+                    }
+
+                    (consumed, died)
+                })
+                .collect()
+        };
+
+        // 3b: deferred food consumption (sequential — mutates world)
+        for (consumed, _) in &results {
+            if let Some(idx) = consumed {
+                let food = &mut world.food_items[*idx];
+                if !food.consumed {
+                    let fx = food.position.x;
+                    let fz = food.position.z;
+                    food.consumed = true;
+                    food.respawn_timer = 10.0;
+                    world.food_grid.remove(*idx, fx, fz);
                 }
-            } else {
-                // Respawn dead agents to maintain population pressure
+            }
+        }
+
+        // 3c: respawn dead agents (sequential — needs mutable world for safe_spawn_position)
+        for (i, (_, died)) in results.iter().enumerate() {
+            if *died || !agents[i].body.body.alive {
                 let pos = world.safe_spawn_position();
-                agent.body = AgentBody::new(pos);
-                agent.body.body.internal.integrity =
-                    agent.body.body.internal.max_integrity;
-                agent.brain.death_signal();
-                agent.brain.trauma(0.5);
+                agents[i].body = AgentBody::new(pos);
+                agents[i].body.body.internal.integrity =
+                    agents[i].body.body.internal.max_integrity;
+                agents[i].brain.death_signal();
+                agents[i].brain.trauma(0.5);
             }
         }
 

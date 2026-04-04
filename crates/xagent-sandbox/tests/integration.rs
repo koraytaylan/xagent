@@ -615,3 +615,57 @@ fn agent_grid_rebuild_reuses_allocation() {
     let near_new: Vec<usize> = grid.query_nearby(200.0, 200.0).collect();
     assert!(near_new.contains(&0), "New agent 0 should be at (200,200)");
 }
+
+// ── step_pure Parity Tests ──────────────────────────────────────────
+
+#[test]
+fn step_pure_matches_step_for_movement() {
+    let world_a = test_world();
+    let world_b = test_world();
+
+    let spawn_y = world_a.terrain.height_at(0.0, 0.0) + 2.0;
+    let pos = Vec3::new(0.0, spawn_y, 0.0);
+    let mut agent_a = agent_at(pos);
+    let mut agent_b = agent_at(pos);
+
+    let motor = MotorCommand {
+        forward: 0.8,
+        strafe: -0.3,
+        turn: 0.5,
+        action: None,
+    };
+    let dt = 1.0 / 30.0;
+
+    // Run step() on agent_a (with mutable world — no food nearby so no mutation)
+    let mut world_a_mut = world_a;
+    physics::step(&mut agent_a, &motor, &mut world_a_mut, dt);
+
+    // Run step_pure() on agent_b (with immutable world)
+    let (_consumed, _died) = physics::step_pure(&mut agent_b, &motor, &world_b, dt);
+
+    // Positions must match within f32 epsilon
+    let eps = 1e-6;
+    assert!(
+        (agent_a.body.position - agent_b.body.position).length() < eps,
+        "Positions diverge: step={:?} vs step_pure={:?}",
+        agent_a.body.position,
+        agent_b.body.position,
+    );
+    assert!(
+        (agent_a.body.velocity - agent_b.body.velocity).length() < eps,
+        "Velocities diverge: step={:?} vs step_pure={:?}",
+        agent_a.body.velocity,
+        agent_b.body.velocity,
+    );
+    assert!(
+        (agent_a.body.internal.energy - agent_b.body.internal.energy).abs() < eps,
+        "Energy diverges: step={} vs step_pure={}",
+        agent_a.body.internal.energy,
+        agent_b.body.internal.energy,
+    );
+    assert_eq!(
+        agent_a.body.alive,
+        agent_b.body.alive,
+        "Alive state diverges",
+    );
+}

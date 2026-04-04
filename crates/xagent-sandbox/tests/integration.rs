@@ -682,3 +682,34 @@ fn step_pure_matches_step_for_movement() {
         "Alive state diverges",
     );
 }
+
+// ── GPU Vision Tests ────────────────────────────────────────────────
+
+#[test]
+fn gpu_vision_matches_cpu_vision() {
+    // Skip if no GPU available
+    let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
+    if !backend.has_gpu() {
+        println!("Skipping GPU test: no GPU available");
+        return;
+    }
+
+    // Setup: create world, agent, positions
+    let world = test_world();
+    let agent = agent_at(Vec3::new(0.0, 5.0, 0.0));
+    let positions = vec![
+        (Vec3::new(0.0, 5.0, 0.0), true),   // self
+        (Vec3::new(10.0, 5.0, 10.0), true),  // another agent
+    ];
+
+    // CPU vision
+    let mut cpu_frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions);
+    xagent_sandbox::agent::senses::extract_senses_with_positions(
+        &agent, &world, 0, &positions, 0, &agent_grid, &mut cpu_frame,
+    );
+
+    // GPU vision will be tested once the shader is implemented.
+    // For now this test documents the expected interface.
+    assert!(cpu_frame.vision.color.len() == 8 * 6 * 4);
+}

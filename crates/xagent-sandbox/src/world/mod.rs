@@ -77,6 +77,10 @@ impl WorldState {
     ///
     /// Uses the world's seeded RNG so results are deterministic for a given
     /// `WorldConfig::seed`.
+    ///
+    /// NOTE: Takes `&self` but acquires an internal `Mutex` lock on the RNG.
+    /// Concurrent callers will serialize on this lock. If respawn is ever
+    /// parallelized, this becomes a contention point.
     pub fn safe_spawn_position(&self) -> glam::Vec3 {
         use rand::Rng;
         let mut rng = self.spawn_rng.lock().expect("spawn_rng mutex poisoned");

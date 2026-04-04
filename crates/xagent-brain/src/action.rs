@@ -119,6 +119,16 @@ impl ActionSelector {
         }
     }
 
+    /// Reseed the exploration RNG with a unique per-agent value.
+    /// This ensures agents with the same `repr_dim` produce different
+    /// exploration noise sequences, preserving behavioral diversity.
+    pub fn reseed(&mut self, seed: u64) {
+        use rand::SeedableRng;
+        self.rng = rand::rngs::SmallRng::seed_from_u64(
+            (self.repr_dim as u64).wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(seed),
+        );
+    }
+
     /// Select a continuous motor command.
     ///
     /// Produces forward/turn values in [-1, 1] from the encoded state using

@@ -170,6 +170,13 @@ impl Brain {
         }
     }
 
+    /// Reseed the action selector's exploration RNG so that agents with the
+    /// same `BrainConfig` produce different exploration noise sequences.
+    /// Call with a unique per-agent value (e.g. agent id) right after construction.
+    pub fn reseed_exploration(&mut self, seed: u64) {
+        self.action_selector.reseed(seed);
+    }
+
     /// Process one tick: sensory input → motor output.
     pub fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
         let encoded = self.encoder.encode(frame);

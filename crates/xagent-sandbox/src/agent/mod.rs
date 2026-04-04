@@ -147,10 +147,12 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with a fresh brain, assigned color, and zero death count.
     pub fn new(id: u32, position: Vec3, config: BrainConfig, tick: u64) -> Self {
+        let mut brain = Brain::new(config);
+        brain.reseed_exploration(id as u64);
         Self {
             id,
             body: AgentBody::new(position),
-            brain: Brain::new(config),
+            brain,
             color: agent_color(id as usize),
             birth_tick: tick,
             death_count: 0,
@@ -233,6 +235,7 @@ impl Agent {
     pub fn reset_for_new_life(&mut self, position: Vec3, tick: u64) {
         self.body = AgentBody::new(position);
         self.brain = Brain::new(self.brain.config.clone());
+        self.brain.reseed_exploration(self.id as u64);
         self.death_count = 0;
         self.generation = 0;
         self.life_start_tick = tick;

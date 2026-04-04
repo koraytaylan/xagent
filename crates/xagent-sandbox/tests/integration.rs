@@ -689,22 +689,28 @@ fn step_pure_matches_step_for_movement() {
 fn deterministic_bench_produces_same_state_twice() {
     use xagent_shared::{BrainConfig, WorldConfig};
 
+    // Pin rayon to 1 thread to eliminate any scheduling non-determinism.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+
     let config_b = BrainConfig::default();
     let config_w = WorldConfig::default();
 
     // Run bench twice with same parameters (CPU path only for determinism)
-    let r1 = xagent_sandbox::bench::run_bench_cpu(config_b.clone(), config_w.clone(), 5, 500);
-    let r2 = xagent_sandbox::bench::run_bench_cpu(config_b, config_w, 5, 500);
+    let (r1, r2) = pool.install(|| {
+        let r1 = xagent_sandbox::bench::run_bench_cpu(config_b.clone(), config_w.clone(), 5, 500);
+        let r2 = xagent_sandbox::bench::run_bench_cpu(config_b, config_w, 5, 500);
+        (r1, r2)
+    });
 
     // Both should complete with same tick count
     assert_eq!(r1.total_ticks, r2.total_ticks);
     assert_eq!(r1.agent_count, r2.agent_count);
 
-    // Compare final positions
-    for (p1, p2) in r1.final_positions.iter().zip(r2.final_positions.iter()) {
-        assert!((p1[0] - p2[0]).abs() < 1e-4, "x diverged: {} vs {}", p1[0], p2[0]);
-        assert!((p1[1] - p2[1]).abs() < 1e-4, "y diverged: {} vs {}", p1[1], p2[1]);
-        assert!((p1[2] - p2[2]).abs() < 1e-4, "z diverged: {} vs {}", p1[2], p2[2]);
+    // Exact equality: seeded RNG + single-threaded rayon = bitwise deterministic
+    for (i, (p1, p2)) in r1.final_positions.iter().zip(r2.final_positions.iter()).enumerate() {
+        assert_eq!(p1[0], p2[0], "agent {} x diverged: {} vs {}", i, p1[0], p2[0]);
+        assert_eq!(p1[1], p2[1], "agent {} y diverged: {} vs {}", i, p1[1], p2[1]);
+        assert_eq!(p1[2], p2[2], "agent {} z diverged: {} vs {}", i, p1[2], p2[2]);
     }
 }
 

@@ -758,7 +758,7 @@ struct VisionParams {
     num_agents_total: u32,
     agent_radius_sq: f32, // 2.25
     food_radius_sq: f32,  // 1.0
-    _pad: u32,
+    biome_res: u32,      // biome grid resolution (e.g. 256)
 }
 
 @group(0) @binding(0) var<uniform> params: VisionParams;
@@ -794,12 +794,11 @@ fn terrain_height(x: f32, z: f32) -> f32 {
 }
 
 fn biome_color(x: f32, z: f32) -> vec4<f32> {
-    let half = params.terrain_size / 2.0;
-    let step = params.terrain_size / f32(params.terrain_vps - 1u);
-    let vps = params.terrain_vps;
-    let ix = min(u32(floor(clamp((x + half) / step, 0.0, f32(vps - 1u)))), vps - 2u);
-    let iz = min(u32(floor(clamp((z + half) / step, 0.0, f32(vps - 1u)))), vps - 2u);
-    let biome = biome_types[iz * (vps - 1u) + ix]; // biome grid is subdivisions x subdivisions
+    let half = params.world_size / 2.0;
+    let inv_cell = f32(params.biome_res) / params.world_size;
+    let col = min(u32(floor((x + half) * inv_cell)), params.biome_res - 1u);
+    let row = min(u32(floor((z + half) * inv_cell)), params.biome_res - 1u);
+    let biome = biome_types[row * params.biome_res + col];
     if biome == 0u { // FoodRich
         return vec4(0.15, 0.50, 0.10, 1.0);
     } else if biome == 1u { // Barren
@@ -938,7 +937,7 @@ pub struct VisionParams {
     pub num_agents_total: u32,
     pub agent_radius_sq: f32,
     pub food_radius_sq: f32,
-    pub _pad: u32,
+    pub biome_res: u32,
 }
 
 // ── GpuVisionCompute ─────────────────────────────────────────────────
@@ -965,9 +964,11 @@ pub struct GpuVisionCompute {
     vision_staging: wgpu::Buffer,
     num_agents: u32,
     num_rays: u32,
+    has_in_flight: bool,
     // Invariant terrain parameters (set at construction, never change)
     terrain_vps: u32,
     terrain_size_val: f32,
+    biome_res: u32,
 }
 
 impl GpuVisionCompute {
@@ -983,6 +984,7 @@ impl GpuVisionCompute {
         biome_types: &[u32],
         terrain_vps: u32,
         terrain_size: f32,
+        biome_res: u32,
         num_food: usize,
         num_agents_total: usize,
     ) -> Self {
@@ -1027,7 +1029,7 @@ impl GpuVisionCompute {
             num_agents_total: num_agents_total as u32,
             agent_radius_sq: 2.25,
             food_radius_sq: 1.0,
-            _pad: 0,
+            biome_res,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vision-params"),
@@ -1082,8 +1084,10 @@ impl GpuVisionCompute {
             vision_staging,
             num_agents,
             num_rays,
+            has_in_flight: false,
             terrain_vps,
             terrain_size_val: terrain_size,
+            biome_res,
         }
     }
 
@@ -1115,7 +1119,7 @@ impl GpuVisionCompute {
             num_agents_total,
             agent_radius_sq: 2.25,
             food_radius_sq: 1.0,
-            _pad: 0,
+            biome_res: self.biome_res,
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -1165,7 +1169,12 @@ impl GpuVisionCompute {
         // Request async map
         self.vision_staging
             .slice(..vision_size)
-            .map_async(wgpu::MapMode::Read, |_| {});
+            .map_async(wgpu::MapMode::Read, |result| {
+                if let Err(e) = result {
+                    log::error!("[GPU-VISION] map_async failed: {}", e);
+                }
+            });
+        self.has_in_flight = true;
     }
 
     /// Read back vision output. Blocks until the GPU is done.
@@ -1173,6 +1182,9 @@ impl GpuVisionCompute {
     /// Returns 5 floats per ray per agent: `[r, g, b, a, depth]`.
     /// Total length = num_agents * num_rays * 5.
     pub fn try_collect(&mut self) -> Option<Vec<f32>> {
+        if !self.has_in_flight {
+            return None;
+        }
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
 
         let vision_len = (self.num_agents as usize) * (self.num_rays as usize) * 5;
@@ -1183,6 +1195,7 @@ impl GpuVisionCompute {
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         self.vision_staging.unmap();
+        self.has_in_flight = false;
 
         Some(result)
     }

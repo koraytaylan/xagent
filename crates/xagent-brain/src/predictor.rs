@@ -6,6 +6,7 @@
 
 use crate::encoder::EncodedState;
 use crate::memory::PatternMemory;
+use rand::SeedableRng;
 
 /// Size of the prediction error history ring buffer.
 const ERROR_HISTORY_LEN: usize = 128;
@@ -59,9 +60,10 @@ impl Predictor {
     /// Weights start as 0.9 on the diagonal (predicting the next state ≈ current state)
     /// with small random off-diagonal noise to break symmetry.
     pub fn new(dim: usize) -> Self {
-        // Near-identity with small off-diagonal noise
+        // Near-identity with small off-diagonal noise.
+        // Seeded from dim for deterministic initialization.
         let mut weights = vec![0.0; dim * dim];
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(dim as u64);
         use rand::Rng;
         for i in 0..dim {
             for j in 0..dim {

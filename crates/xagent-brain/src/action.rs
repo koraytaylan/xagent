@@ -12,7 +12,7 @@
 //! that moment get reinforced for the active motor channels.
 
 use crate::encoder::EncodedState;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use xagent_shared::MotorCommand;
 
 /// How many recent motor commands to keep for credit assignment.
@@ -88,10 +88,15 @@ pub struct ActionSelector {
     cached_credit_signal: Vec<f32>,
     /// Total |credit| applied during the most recent assign_credit() call.
     last_credit_magnitude: f32,
+    /// Seeded RNG for exploration noise — deterministic per agent.
+    rng: rand::rngs::SmallRng,
 }
 
 impl ActionSelector {
     /// Create a new action selector for continuous motor output.
+    ///
+    /// Uses a fixed seed for the exploration RNG so that agents with the
+    /// same `repr_dim` produce deterministic outputs across identical runs.
     pub fn new(repr_dim: usize) -> Self {
         Self {
             repr_dim,
@@ -110,6 +115,7 @@ impl ActionSelector {
             current_state: vec![0.0; repr_dim],
             cached_credit_signal: vec![0.0; repr_dim],
             last_credit_magnitude: 0.0,
+            rng: rand::rngs::SmallRng::seed_from_u64(repr_dim as u64),
         }
     }
 
@@ -128,7 +134,10 @@ impl ActionSelector {
         curiosity_bonus: f32,
     ) -> MotorCommand {
         self.tick += 1;
-        let mut rng = rand::rng();
+        // Pre-generate exploration noise so the RNG borrow doesn't overlap with
+        // the mutable self borrow in assign_credit().
+        let noise_fwd: f32 = self.rng.random_range(-1.0..1.0);
+        let noise_trn: f32 = self.rng.random_range(-1.0..1.0);
         let dim = self.repr_dim;
 
         // 1. Snapshot current encoded state for credit assignment.
@@ -196,11 +205,11 @@ impl ActionSelector {
         let fwd_clean = crate::fast_tanh(fwd);
         let trn_clean = crate::fast_tanh(trn);
 
-        // 9. Add exploration noise.
+        // 9. Add exploration noise (using pre-generated noise values).
         let fwd_noisy =
-            (fwd_clean + rng.random_range(-1.0..1.0) * self.exploration_rate).clamp(-1.0, 1.0);
+            (fwd_clean + noise_fwd * self.exploration_rate).clamp(-1.0, 1.0);
         let trn_noisy =
-            (trn_clean + rng.random_range(-1.0..1.0) * self.exploration_rate).clamp(-1.0, 1.0);
+            (trn_clean + noise_trn * self.exploration_rate).clamp(-1.0, 1.0);
 
         // Track exploitation.
         self.total_actions += 1;

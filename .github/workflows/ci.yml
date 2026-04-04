@@ -25,3 +25,6 @@ jobs:
 
       - name: Cargo test
         run: cargo test -p xagent-sandbox
+
+      - name: Benchmark (informational)
+        run: cargo run --release -p xagent-sandbox -- --bench 2>&1 | tee bench-output.txt

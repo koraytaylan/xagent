@@ -30,10 +30,23 @@ impl FoodItem {
     }
 }
 
-/// Scatter food items across food-rich biomes.
+/// Scatter food items across food-rich biomes using the thread-local RNG.
+///
+/// Prefer [`spawn_food_seeded`] for deterministic world generation.
 pub fn spawn_food(terrain: &TerrainData, biome_map: &BiomeMap, density: f32) -> Vec<FoodItem> {
+    spawn_food_seeded(terrain, biome_map, density, rand::rng())
+}
+
+/// Scatter food items across food-rich biomes using a caller-supplied RNG.
+///
+/// Passing a seeded `SmallRng` produces deterministic worlds for a given seed.
+pub fn spawn_food_seeded(
+    terrain: &TerrainData,
+    biome_map: &BiomeMap,
+    density: f32,
+    mut rng: impl Rng,
+) -> Vec<FoodItem> {
     let half = terrain.size / 2.0;
-    let mut rng = rand::rng();
     let mut items = Vec::new();
 
     let step = 4.0; // sample grid spacing
@@ -83,15 +96,18 @@ pub fn generate_food_mesh(items: &[FoodItem]) -> Mesh {
 /// relocates to a new random position in a food-rich biome, forcing agents
 /// to forage rather than camp a single spot.
 /// Tick food respawn timers. Returns indices of food items that respawned.
+///
+/// The `rng` parameter should be the world's seeded RNG for deterministic
+/// food respawn positions.
 pub fn update_food(
     items: &mut [FoodItem],
     dt: f32,
     terrain: &TerrainData,
     biome_map: &BiomeMap,
     respawned_indices: &mut Vec<usize>,
+    rng: &mut impl Rng,
 ) {
     respawned_indices.clear();
-    let mut rng = rand::rng();
     let half = terrain.size / 2.0;
 
     for (i, item) in items.iter_mut().enumerate() {

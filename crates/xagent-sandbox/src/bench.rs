@@ -23,6 +23,8 @@ pub struct BenchResult {
     pub agent_count: usize,
     pub elapsed_secs: f64,
     pub ticks_per_sec: f64,
+    /// Final agent positions for determinism validation.
+    pub final_positions: Vec<[f32; 3]>,
 }
 
 /// Run a headless benchmark: `total_ticks` simulation ticks with
@@ -62,7 +64,7 @@ pub fn run_bench(
 /// 2. Brain ticks via rayon (senses + brain.tick)
 /// 3. Sequential physics (step + metabolic drain + death/respawn)
 /// 4. Collision resolution (O(n^2) pairwise)
-fn run_bench_cpu(
+pub fn run_bench_cpu(
     brain: BrainConfig,
     world_config: WorldConfig,
     agent_count: usize,
@@ -121,11 +123,17 @@ fn run_bench_cpu(
     let elapsed_secs = elapsed.as_secs_f64();
     let ticks_per_sec = total_ticks as f64 / elapsed_secs;
 
+    let final_positions: Vec<[f32; 3]> = agents
+        .iter()
+        .map(|a| [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z])
+        .collect();
+
     BenchResult {
         total_ticks,
         agent_count,
         elapsed_secs,
         ticks_per_sec,
+        final_positions,
     }
 }
 
@@ -275,11 +283,17 @@ fn run_bench_gpu(
     let elapsed_secs = elapsed.as_secs_f64();
     let ticks_per_sec = total_ticks as f64 / elapsed_secs;
 
+    let final_positions: Vec<[f32; 3]> = agents
+        .iter()
+        .map(|a| [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z])
+        .collect();
+
     BenchResult {
         total_ticks,
         agent_count,
         elapsed_secs,
         ticks_per_sec,
+        final_positions,
     }
 }
 

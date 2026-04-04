@@ -45,20 +45,23 @@ pub fn run_bench(
         })
         .collect();
 
+    let mut all_positions: Vec<(Vec3, bool)> = Vec::with_capacity(agent_count);
     let start = Instant::now();
 
     for tick in 0..total_ticks {
-        // Phase 1: snapshot positions
-        let positions: Vec<(Vec3, bool)> = agents
-            .iter()
-            .map(|a| (a.body.body.position, a.body.body.alive))
-            .collect();
+        // Phase 1: snapshot positions (in-place)
+        if all_positions.len() != agents.len() {
+            all_positions.resize(agents.len(), (Vec3::ZERO, false));
+        }
+        for (i, agent) in agents.iter().enumerate() {
+            all_positions[i] = (agent.body.body.position, agent.body.body.alive);
+        }
 
         // Phase 2: brain ticks (rayon parallel)
-        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions);
+        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions);
         {
             let world_ref: &WorldState = &world;
-            let pos = &positions;
+            let pos = &all_positions;
             agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
                 if !agent.body.body.alive {
                     return;

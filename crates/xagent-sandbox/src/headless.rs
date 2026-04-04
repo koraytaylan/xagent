@@ -104,12 +104,15 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
         // Run generation
         let gen_start = Instant::now();
         let mut tick: u64 = 0;
+        let mut positions: Vec<(Vec3, bool)> = Vec::with_capacity(agents.len());
 
         while !governor.generation_complete() {
-            let positions: Vec<(Vec3, bool)> = agents
-                .iter()
-                .map(|a| (a.body.body.position, a.body.body.alive))
-                .collect();
+            if positions.len() != agents.len() {
+                positions.resize(agents.len(), (Vec3::ZERO, false));
+            }
+            for (i, a) in agents.iter().enumerate() {
+                positions[i] = (a.body.body.position, a.body.body.alive);
+            }
 
             // Brain ticks (CPU rayon)
             let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions);
@@ -151,7 +154,6 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                         agent.food_consumed += 1;
                     }
                     agent.total_ticks_alive += 1;
-                    agent.record_heatmap(world.config.world_size);
                 } else {
                     let pos = world.safe_spawn_position();
                     agent.body = AgentBody::new(pos);

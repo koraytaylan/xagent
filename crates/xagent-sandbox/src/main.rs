@@ -1304,7 +1304,9 @@ impl ApplicationHandler for App {
                                             let sim = &sim_out[i * gpu_cap..i * gpu_cap + a_cap];
                                             agent.cached_motor =
                                                 agent.brain.tick_gpu(frame, enc, sim);
-                                            record_agent_histories(agent);
+                                            if self.speed_multiplier <= 1 {
+                                                record_agent_histories(agent);
+                                            }
                                         }
                                     }
                                 }
@@ -1328,13 +1330,13 @@ impl ApplicationHandler for App {
                         }
 
                         if let Some(world) = &mut self.world {
-                            // ── Phase 1: Snapshot positions (sequential) ──
-                            all_positions.clear();
-                            all_positions.extend(
-                                self.agents
-                                    .iter()
-                                    .map(|a| (a.body.body.position, a.body.body.alive)),
-                            );
+                            // ── Phase 1: Snapshot positions (sequential, in-place) ──
+                            if all_positions.len() != self.agents.len() {
+                                all_positions.resize(self.agents.len(), (Vec3::ZERO, false));
+                            }
+                            for (i, agent) in self.agents.iter().enumerate() {
+                                all_positions[i] = (agent.body.body.position, agent.body.body.alive);
+                            }
 
                             // ── Phase 2: Brain ticks (CPU rayon) ──
                             // When GPU is active this frame, agents use
@@ -1342,6 +1344,7 @@ impl ApplicationHandler for App {
                             // Otherwise, CPU runs brain every tick.
                             if !use_gpu {
                                 let tick = self.tick;
+                                let speed = self.speed_multiplier;
                                 let world_ref: &WorldState = &*world;
                                 let all_pos = &all_positions;
                                 let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos);
@@ -1366,7 +1369,9 @@ impl ApplicationHandler for App {
 
                                         agent.cached_motor =
                                             agent.brain.tick(&agent.cached_frame);
-                                        record_agent_histories(agent);
+                                        if speed <= 1 {
+                                            record_agent_histories(agent);
+                                        }
                                     });
                             }
 
@@ -1404,8 +1409,10 @@ impl ApplicationHandler for App {
                                     }
                                 }
                                 agent.total_ticks_alive += 1;
-                                agent.record_heatmap(world.config.world_size);
-                                agent.record_trail();
+                                if self.speed_multiplier <= 1 {
+                                    agent.record_heatmap(world.config.world_size);
+                                    agent.record_trail();
+                                }
 
                                 if i == self.selected_agent_idx {
                                     let life_ticks = agent.age(self.tick);

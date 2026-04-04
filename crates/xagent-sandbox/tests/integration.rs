@@ -616,6 +616,19 @@ fn agent_grid_rebuild_reuses_allocation() {
     assert!(near_new.contains(&0), "New agent 0 should be at (200,200)");
 }
 
+// ── ComputeBackend Tests ────────────────────────────────────────────
+
+#[test]
+fn compute_backend_probe_returns_a_tier() {
+    let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
+    // Should return at least CpuOptimized (rayon is always available)
+    assert!(matches!(
+        backend,
+        xagent_sandbox::compute_backend::ComputeBackend::CpuOptimized
+        | xagent_sandbox::compute_backend::ComputeBackend::GpuAccelerated { .. }
+    ));
+}
+
 // ── step_pure Parity Tests ──────────────────────────────────────────
 
 #[test]

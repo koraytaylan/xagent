@@ -87,10 +87,6 @@ struct Cli {
     #[arg(long)]
     dump_tree: bool,
 
-    /// Use GPU compute for brain encode + recall (experimental)
-    #[arg(long)]
-    gpu_brain: bool,
-
     /// Run headless benchmark (no UI, no DB) and print ticks/sec
     #[arg(long)]
     bench: bool,
@@ -301,7 +297,7 @@ struct App {
     governor_config: GovernorConfig,
 
     // GPU brain compute (encode + recall offload)
-    gpu_brain: bool,
+    has_gpu: bool,
     gpu_compute: Option<xagent_sandbox::gpu_compute::GpuBrainCompute>,
 
     // Per-frame GPU pipeline state: stores previous frame's sensory data
@@ -342,7 +338,7 @@ impl App {
         governor_config: GovernorConfig,
         enable_logging: bool,
         db_path: &str,
-        gpu_brain: bool,
+        has_gpu: bool,
     ) -> Self {
         let logger = if enable_logging {
             match MetricsLogger::new() {
@@ -443,7 +439,7 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            gpu_brain,
+            has_gpu,
             gpu_compute: None,
             gpu_prev_frames: Vec::new(),
             gpu_prev_agent_dims: Vec::new(),
@@ -485,7 +481,7 @@ impl App {
     /// Ensure GPU compute pipeline matches current agent configuration.
     /// Creates or recreates the pipeline if dimensions changed.
     fn ensure_gpu_compute(&mut self) {
-        if !self.gpu_brain || self.agents.is_empty() {
+        if !self.has_gpu || self.agents.is_empty() {
             return;
         }
         let n = self.agents.len() as u32;
@@ -510,7 +506,7 @@ impl App {
             }
             None => {
                 self.log_msg("[GPU] No GPU available, falling back to CPU".into());
-                self.gpu_brain = false;
+                self.has_gpu = false;
             }
         }
     }
@@ -1265,7 +1261,7 @@ impl ApplicationHandler for App {
                     let mut all_positions: Vec<(Vec3, bool)> =
                         Vec::with_capacity(self.agents.len());
 
-                    // Lazily initialize GPU compute if --gpu-brain was requested
+                    // Lazily initialize GPU compute if GPU was detected at startup
                     self.ensure_gpu_compute();
 
                     let gpu_n = self.agents.len();
@@ -2582,8 +2578,12 @@ fn main() {
 
     print_config(&config);
 
+    let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
+    println!("[xagent] Compute backend: {}", backend.name());
+    let has_gpu = backend.has_gpu();
+
     if cli.no_render {
-        headless::run_headless(config, &cli.db, cli.resume, cli.gpu_brain);
+        headless::run_headless(config, &cli.db, cli.resume, has_gpu);
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let mut app = App::new(
@@ -2592,7 +2592,7 @@ fn main() {
             config.governor,
             cli.log,
             &cli.db,
-            cli.gpu_brain,
+            has_gpu,
         );
         event_loop.run_app(&mut app).expect("Event loop error");
     }

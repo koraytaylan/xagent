@@ -18,7 +18,7 @@ use crate::world::WorldState;
 
 /// Run the headless evolution loop: no window, no rendering, max speed.
 /// Creates a Governor, runs generations until complete or interrupted.
-pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain: bool) {
+pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: bool) {
     info!("Running headless evolution");
     let dt = 1.0 / config.world.tick_rate;
     let world_json = serde_json::to_string(&config.world).unwrap_or_default();

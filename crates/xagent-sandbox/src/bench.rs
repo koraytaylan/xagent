@@ -75,7 +75,7 @@ pub fn run_bench(
             let agent = &mut agents[i];
             if agent.body.body.alive {
                 let motor = agent.cached_motor.clone();
-                crate::physics::step(&mut agent.body, &motor, &mut world, dt);
+                let _ = crate::physics::step(&mut agent.body, &motor, &mut world, dt);
 
                 let brain_drain = crate::physics::metabolic_drain_per_tick(
                     agent.brain.config.memory_capacity,
@@ -93,6 +93,7 @@ pub fn run_bench(
                 agent.body.body.internal.integrity =
                     agent.body.body.internal.max_integrity;
                 agent.brain.death_signal();
+                agent.brain.trauma(0.5);
             }
         }
 

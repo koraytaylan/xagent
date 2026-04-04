@@ -390,7 +390,7 @@ pub struct Agent {
     pub respawn_cooldown: u32, // frames to wait before respawning
     pub persist_brain: bool,   // if true, brain survives death
     pub has_reproduced: bool,  // once per life
-    pub cached_motor: MotorCommand, // cached motor command for brain-decimated ticks
+    pub cached_motor: MotorCommand, // latest motor command from brain
     pub decision_log: VecDeque<DecisionSnapshot>, // last 256 brain decisions (ring buffer)
     pub food_consumed: u32,    // cumulative food consumed
     pub total_ticks_alive: u64, // cumulative ticks alive across all lives
@@ -554,7 +554,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 50k×`) turns yellow when above 1×.
+Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 1000k×`) turns yellow when above 1×.
 
 ---
 
@@ -575,7 +575,7 @@ about_to_wait()     → Request continuous redraw
 
 #### Simulation Speed Controls
 
-| Key | `ticks_per_frame` | Label |
+| Key | `speed_multiplier` | Label |
 |---|---|---|
 | `1` | 1 | 1x |
 | `2` | 2 | 2x |
@@ -583,35 +583,11 @@ about_to_wait()     → Request continuous redraw
 | `4` | 10 | 10x |
 | `5` | 100 | 100x |
 | `6` | 1000 | 1k× |
-| `7` | 5000 | 5k× |
-| `8` | 10000 | 10k× |
-| `9` | 50000 | 50k× |
+| `7` | 10000 | 10k× |
+| `8` | 100000 | 100k× |
+| `9` | 1000000 | 1000k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 100,000) in fast mode.
-
-##### Brain Tick Decimation
-
-At high speed multipliers the brain is the bottleneck, but full-fidelity brain
-evaluation on every tick isn't needed when the simulation is fast-forwarding.
-**Brain tick decimation** reduces brain calls while keeping physics accurate:
-
-- The brain only runs every `brain_stride` ticks, where
-  `brain_stride = sqrt(speed_multiplier)` (floored, minimum 1).
-- Physics (`physics::step`) still runs **every** tick, so positions and
-  collisions stay accurate.
-- When the brain is skipped, the last `MotorCommand` is reused from
-  `agent.cached_motor`.
-- Brain ticks are **staggered** across agents:
-  `(tick + agent_index) % brain_stride == 0` determines whether an agent's
-  brain fires on a given tick. This spreads CPU load evenly across frames
-  instead of spiking on a single tick.
-
-| Speed | `brain_stride` | Brain calls / tick |
-|---|---|---|
-| 1× | 1 | every tick (no change) |
-| 10× | 3 | ~1 in 3 |
-| 100× | 10 | ~1 in 10 |
-| 1000× | 31 | ~1 in 31 (~31× fewer brain calls) |
+Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 1,000,000) in fast mode.
 
 #### Agent Spawning
 
@@ -749,15 +725,15 @@ cargo run -p xagent-sandbox -- --config my_config.json
 | Key | Action |
 |---|---|
 | `P` or `Space` | Toggle pause / resume |
-| `1` | Speed 1x (1 tick/frame) |
-| `2` | Speed 2x (2 ticks/frame) |
-| `3` | Speed 5x (5 ticks/frame) |
-| `4` | Speed 10x (10 ticks/frame) |
-| `5` | Speed 100x (100 ticks/frame) |
-| `6` | Speed 1000x (1000 ticks/frame) |
-| `7` | Speed 5000x (5000 ticks/frame) |
-| `8` | Speed 10000x (10000 ticks/frame) |
-| `9` | Speed 50000x (50000 ticks/frame) |
+| `1` | Speed 1× (multiplier 1) |
+| `2` | Speed 2× (multiplier 2) |
+| `3` | Speed 5× (multiplier 5) |
+| `4` | Speed 10× (multiplier 10) |
+| `5` | Speed 100× (multiplier 100) |
+| `6` | Speed 1k× (multiplier 1,000) |
+| `7` | Speed 10k× (multiplier 10,000) |
+| `8` | Speed 100k× (multiplier 100,000) |
+| `9` | Speed 1000k× (multiplier 1,000,000) |
 | Right-click | Select/focus nearest agent (0.05 NDC pick threshold) |
 | `R` | Toggle brain persistence on death (persist ↔ reset) |
 | `N` | Spawn a new agent (default config) |
@@ -794,23 +770,19 @@ Each frame, when the window requests a redraw:
 
 2. Update camera position from held keys (WASD/E/Shift)
 
-3. If not paused, for each tick (1–1000 per frame based on speed, capped at speed × 2 up to 2000):
+3. If not paused, run as many simulation ticks as the current speed/mode allows,
+   bounded by the per-frame tick time budget and `max_ticks_per_frame`
+   (currently up to 4000 in 3D mode and up to 1,000,000 in fast mode):
    a. Collect all agent positions into a snapshot (Vec<(Vec3, bool)>)
 
-   b. Compute brain_stride = floor(sqrt(speed_multiplier)), min 1
-
-   c. For each living agent i:
-      ├─ Build OtherAgent list (all agents except i)
-      ├─ If (tick + i) % brain_stride == 0:        ← brain fires this tick
-      │   ├─ extract_senses_with_others(agent.body, world, tick, others)
-      │   │   → produces SensoryFrame
-      │   ├─ brain.tick(&frame)
-      │   │   → produces MotorCommand
-      │   └─ agent.cached_motor = motor             ← cache for skipped ticks
-      ├─ Else:
-      │   └─ motor = agent.cached_motor              ← reuse last command
+   b. For each living agent i:
+      ├─ extract_senses_with_positions(agent.body, world, tick, positions, i)
+      │   → produces SensoryFrame
+      ├─ brain.tick(&frame)
+      │   → produces MotorCommand
+      ├─ agent.cached_motor = motor
       ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
-      │   → updates position, velocity, energy, integrity, alive (every tick)
+      │   → updates position, velocity, energy, integrity, alive
       └─ If selected agent: log to CSV, accumulate prediction error
 
    d. world.update(dt) — decrement food respawn timers, relocate respawned food
@@ -981,9 +953,6 @@ Several optimizations keep the simulation fast at scale:
 - **Sky ray early-out**: rays that miss terrain exit immediately
 - **Reused `others_buf`**: pre-allocated buffer for inter-agent data, reused each sim loop tick
 - **Agent-agent collision**: O(n²) pairwise check using simple squared-distance math
-- **Brain tick decimation**: at high speed multipliers, brain evaluations are reduced
-  by a factor of `sqrt(speed_multiplier)` while physics still runs every tick.
-  Staggered across agents so CPU load is spread evenly (see *Simulation Speed Controls*).
 - **MAX_AGENTS**: raised from 20 → 100
 
 ---
@@ -1092,9 +1061,9 @@ optimization at this scale.
 
 - **>20 agents**: The inter-agent perception cost becomes O(N²) and brain ticks
   multiply. The hard cap prevents this.
-- **High ticks_per_frame (1000x+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
+- **High speed_multiplier (1000×+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
   ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
-  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 100,000 in fast mode).
+  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 1,000,000 in fast mode).
 - **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means
   searching 32 patterns per tick, each compared against a 64-dim vector.
 

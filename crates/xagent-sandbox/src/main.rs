@@ -1116,16 +1116,16 @@ impl ApplicationHandler for App {
                         println!("[SIM] Speed: 1000x ({} ticks/sec)", SIM_RATE as u32 * 1000);
                     }
                     PhysicalKey::Code(KeyCode::Digit7) if pressed => {
-                        self.speed_multiplier = 5000;
-                        println!("[SIM] Speed: 5000x ({} ticks/sec)", SIM_RATE as u32 * 5000);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit8) if pressed => {
                         self.speed_multiplier = 10000;
                         println!("[SIM] Speed: 10000x ({} ticks/sec)", SIM_RATE as u32 * 10000);
                     }
+                    PhysicalKey::Code(KeyCode::Digit8) if pressed => {
+                        self.speed_multiplier = 100000;
+                        println!("[SIM] Speed: 100000x ({} ticks/sec)", SIM_RATE as u32 * 100000);
+                    }
                     PhysicalKey::Code(KeyCode::Digit9) if pressed => {
-                        self.speed_multiplier = 50000;
-                        println!("[SIM] Speed: 50000x ({} ticks/sec)", SIM_RATE as u32 * 50000);
+                        self.speed_multiplier = 1000000;
+                        println!("[SIM] Speed: 1000000x ({} ticks/sec)", SIM_RATE as u32 * 1000000);
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
@@ -1246,11 +1246,15 @@ impl ApplicationHandler for App {
                 if !self.paused {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
-                    let mut ticks_run = 0u32;
 
-                    // Brain decimation: at high speed, run brain every Nth tick
-                    // to keep CPU load manageable. Physics still runs every tick.
-                    let brain_stride = brain_stride(self.speed_multiplier);
+                    // Clamp accumulator so backlog never exceeds one frame's
+                    // worth of ticks. At extreme speed multipliers the
+                    // increment above can far exceed what the tick loop can
+                    // drain under its time budget, so cap it early to avoid
+                    // f32 precision loss and unbounded growth.
+                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
+
+                    let mut ticks_run = 0u32;
 
                     // Pre-allocate buffers outside the tick loop to avoid
                     // repeated heap allocations (12 agents × 10 ticks = 120/frame).
@@ -1269,13 +1273,12 @@ impl ApplicationHandler for App {
 
                     // ── Adaptive GPU/CPU decision ──
                     // GPU dispatches once per frame → 1 brain tick per frame.
-                    // CPU rayon runs brain_stride-decimated ticks inside the loop.
-                    // Use GPU only when expected brain ticks ≤ 2 per frame so
+                    // CPU runs brain every tick inside the loop.
+                    // Use GPU only when expected ticks ≤ 1 per frame so
                     // agents get equivalent cognitive throughput either way.
                     let expected_ticks = (self.sim_accumulator / SIM_DT)
                         .min(max_ticks as f32) as u64;
-                    let expected_brain_ticks = expected_ticks / brain_stride;
-                    let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
+                    let use_gpu = self.gpu_compute.is_some() && expected_ticks <= 1;
 
                     // ── GPU COLLECT: always drain in-flight results ──
                     // try_collect_into() unmaps staging buffers even if we don't
@@ -1332,44 +1335,33 @@ impl ApplicationHandler for App {
                             // ── Phase 2: Brain ticks (CPU rayon) ──
                             // When GPU is active this frame, agents use
                             // cached_motor from the per-frame collect above.
-                            // Otherwise, CPU rayon runs brain with stride.
+                            // Otherwise, CPU runs brain every tick.
                             if !use_gpu {
                                 let tick = self.tick;
-                                let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
-                                    a.body.body.alive && (tick + i as u64) % brain_stride == 0
-                                });
+                                let world_ref: &WorldState = &*world;
+                                let all_pos = &all_positions;
 
-                                if any_brain {
-                                    let world_ref: &WorldState = &*world;
-                                    let all_pos = &all_positions;
+                                self.agents
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .for_each(|(i, agent)| {
+                                        if !agent.body.body.alive {
+                                            return;
+                                        }
 
-                                    self.agents
-                                        .par_iter_mut()
-                                        .enumerate()
-                                        .for_each(|(i, agent)| {
-                                            if !agent.body.body.alive {
-                                                return;
-                                            }
-                                            let run_brain =
-                                                (tick + i as u64) % brain_stride == 0;
-                                            if !run_brain {
-                                                return;
-                                            }
+                                        senses::extract_senses_with_positions(
+                                            &agent.body,
+                                            world_ref,
+                                            tick,
+                                            all_pos,
+                                            i,
+                                            &mut agent.cached_frame,
+                                        );
 
-                                            senses::extract_senses_with_positions(
-                                                &agent.body,
-                                                world_ref,
-                                                tick,
-                                                all_pos,
-                                                i,
-                                                &mut agent.cached_frame,
-                                            );
-
-                                            agent.cached_motor =
-                                                agent.brain.tick(&agent.cached_frame);
-                                            record_agent_histories(agent);
-                                        });
-                                }
+                                        agent.cached_motor =
+                                            agent.brain.tick(&agent.cached_frame);
+                                        record_agent_histories(agent);
+                                    });
                             }
 
                             // ── Phase 3: Physics + stats (sequential, mutates world) ──
@@ -1409,9 +1401,7 @@ impl ApplicationHandler for App {
                                 agent.record_heatmap(world.config.world_size);
                                 agent.record_trail();
 
-                                let run_brain =
-                                    (self.tick + i as u64) % brain_stride == 0;
-                                if run_brain && i == self.selected_agent_idx {
+                                if i == self.selected_agent_idx {
                                     let life_ticks = agent.age(self.tick);
                                     log_tick_to_csv(
                                         &mut self.logger,
@@ -1660,11 +1650,6 @@ impl ApplicationHandler for App {
                             );
                         }
                     }
-
-                    // Clamp accumulator: allow up to max_ticks worth of
-                    // carry-over so the time budget can spread ticks across
-                    // multiple frames, but never accumulate more than that.
-                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
 
                     // Mark HUD dirty if any ticks ran this frame
                     if ticks_run > 0 {
@@ -2589,27 +2574,21 @@ fn speed_label(multiplier: u32) -> &'static str {
         10 => "10×",
         100 => "100×",
         1_000 => "1k×",
-        5_000 => "5k×",
         10_000 => "10k×",
-        50_000 => "50k×",
+        100_000 => "100k×",
+        1_000_000 => "1000k×",
         _ => "?×",
     }
 }
 
 /// Cap per-frame ticks proportional to speed, with a reasonable ceiling.
-/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 100,000).
+/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 1,000,000).
 fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
     if render_3d {
         (speed_multiplier * 2).min(4000)
     } else {
-        (speed_multiplier * 10).min(100_000)
+        (speed_multiplier * 10).min(1_000_000)
     }
-}
-
-/// Brain tick decimation stride — sqrt scaling so physics still runs every tick
-/// but brain evaluations are reduced at high speed. 1x→1, 10x→3, 100x→10, 1000x→31.
-fn brain_stride(speed_multiplier: u32) -> u64 {
-    ((speed_multiplier as f32).sqrt() as u64).max(1)
 }
 
 #[cfg(test)]
@@ -2626,9 +2605,9 @@ mod tests {
         assert_eq!(speed_label(10), "10×");
         assert_eq!(speed_label(100), "100×");
         assert_eq!(speed_label(1_000), "1k×");
-        assert_eq!(speed_label(5_000), "5k×");
         assert_eq!(speed_label(10_000), "10k×");
-        assert_eq!(speed_label(50_000), "50k×");
+        assert_eq!(speed_label(100_000), "100k×");
+        assert_eq!(speed_label(1_000_000), "1000k×");
     }
 
     #[test]
@@ -2646,7 +2625,7 @@ mod tests {
         assert_eq!(max_ticks_per_frame(10, true), 20);
         assert_eq!(max_ticks_per_frame(1000, true), 2000);
         assert_eq!(max_ticks_per_frame(5000, true), 4000); // capped
-        assert_eq!(max_ticks_per_frame(50_000, true), 4000); // capped
+        assert_eq!(max_ticks_per_frame(1_000_000, true), 4000); // capped
     }
 
     #[test]
@@ -2654,33 +2633,16 @@ mod tests {
         assert_eq!(max_ticks_per_frame(1, false), 10);
         assert_eq!(max_ticks_per_frame(100, false), 1000);
         assert_eq!(max_ticks_per_frame(1000, false), 10_000);
-        assert_eq!(max_ticks_per_frame(10_000, false), 100_000); // at cap
-        assert_eq!(max_ticks_per_frame(50_000, false), 100_000); // capped
-    }
-
-    // ── brain_stride ─────────────────────────────────────────────────
-
-    #[test]
-    fn brain_stride_sqrt_scaling() {
-        assert_eq!(brain_stride(1), 1);
-        assert_eq!(brain_stride(10), 3); // sqrt(10)=3.16 → 3
-        assert_eq!(brain_stride(100), 10);
-        assert_eq!(brain_stride(1000), 31); // sqrt(1000)=31.6 → 31
-        assert_eq!(brain_stride(10_000), 100);
-        assert_eq!(brain_stride(50_000), 223); // sqrt(50000)=223.6 → 223
-    }
-
-    #[test]
-    fn brain_stride_never_zero() {
-        // Even at speed 0 (shouldn't happen), stride must be ≥ 1
-        assert!(brain_stride(0) >= 1);
+        assert_eq!(max_ticks_per_frame(10_000, false), 100_000);
+        assert_eq!(max_ticks_per_frame(100_000, false), 1_000_000); // at cap
+        assert_eq!(max_ticks_per_frame(1_000_000, false), 1_000_000); // capped
     }
 
     // ── key-to-multiplier mapping ────────────────────────────────────
 
     #[test]
     fn all_speed_levels_have_labels() {
-        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 5_000, 10_000, 50_000];
+        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
         for &m in levels {
             assert_ne!(speed_label(m), "?×", "missing label for multiplier {}", m);
         }
@@ -2688,7 +2650,7 @@ mod tests {
 
     #[test]
     fn fast_mode_always_ge_3d_mode() {
-        for speed in [1, 2, 5, 10, 100, 1000, 5000, 10_000, 50_000] {
+        for speed in [1, 2, 5, 10, 100, 1000, 10_000, 100_000, 1_000_000] {
             assert!(
                 max_ticks_per_frame(speed, false) >= max_ticks_per_frame(speed, true),
                 "fast mode should allow >= 3D ticks at speed {}",

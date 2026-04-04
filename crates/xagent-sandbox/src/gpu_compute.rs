@@ -1352,7 +1352,7 @@ impl GpuVisionCompute {
     ///
     /// Returns 5 floats per ray per agent: `[r, g, b, a, depth]`.
     /// Total length = num_agents * num_rays * 5.
-    pub fn try_collect(&mut self) -> Option<Vec<f32>> {
+    pub fn collect_blocking(&mut self) -> Option<Vec<f32>> {
         if !self.has_in_flight {
             return None;
         }
@@ -1544,7 +1544,7 @@ impl GpuUnifiedPipeline {
 
     /// Collect vision + brain results. Blocks until both are complete.
     pub fn collect_blocking(&mut self) -> Option<UnifiedResult> {
-        let vision = self.vision.try_collect()?;
+        let vision = self.vision.collect_blocking()?;
         let mut encoded = Vec::new();
         let mut similarities = Vec::new();
         if !self.brain.collect_blocking_into(&mut encoded, &mut similarities) {

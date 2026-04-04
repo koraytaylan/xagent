@@ -42,11 +42,18 @@ impl ComputeBackend {
 
         let adapter_name = adapter.get_info().name.clone();
 
+        // Request the adapter's actual storage buffer limit so shared
+        // device works with GpuBrainCompute (which needs large buffers).
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("xagent-compute"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,

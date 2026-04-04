@@ -180,6 +180,10 @@ fn run_bench_gpu(
 
     let mut all_positions: Vec<(Vec3, bool)> = Vec::with_capacity(agent_count);
     let num_rays = 48usize;
+    // Pre-allocate GPU data buffers outside the loop to avoid per-tick allocation
+    let mut agent_poses: Vec<(Vec3, f32)> = Vec::with_capacity(agent_count);
+    let mut food_positions: Vec<f32> = Vec::with_capacity(world.food_items.len() * 4);
+    let mut agent_positions: Vec<f32> = Vec::with_capacity(agent_count * 4);
     let start = Instant::now();
 
     for tick in 0..total_ticks {
@@ -192,40 +196,34 @@ fn run_bench_gpu(
         }
 
         // Phase 2a: compute ray params on CPU
-        let agent_poses: Vec<(Vec3, f32)> = agents
-            .iter()
-            .map(|a| (a.body.body.position, a.body.yaw))
-            .collect();
+        agent_poses.clear();
+        agent_poses.extend(agents.iter().map(|a| (a.body.body.position, a.body.yaw)));
         let (ray_origins, ray_dirs) = crate::gpu_compute::compute_ray_params(&agent_poses);
 
         // Phase 2b: pack food positions [x, y, z, consumed_as_f32]
-        let food_positions: Vec<f32> = world
-            .food_items
-            .iter()
-            .flat_map(|f| {
-                [
-                    f.position.x,
-                    f.position.y,
-                    f.position.z,
-                    if f.consumed { 1.0 } else { 0.0 },
-                ]
-            })
-            .collect();
+        food_positions.clear();
+        for f in &world.food_items {
+            food_positions.push(f.position.x);
+            food_positions.push(f.position.y);
+            food_positions.push(f.position.z);
+            food_positions.push(if f.consumed { 1.0 } else { 0.0 });
+        }
 
         // Pack agent positions [x, y, z, alive_as_f32]
-        let agent_positions: Vec<f32> = all_positions
-            .iter()
-            .flat_map(|(pos, alive)| {
-                [pos.x, pos.y, pos.z, if *alive { 1.0 } else { 0.0 }]
-            })
-            .collect();
+        agent_positions.clear();
+        for (pos, alive) in &all_positions {
+            agent_positions.push(pos.x);
+            agent_positions.push(pos.y);
+            agent_positions.push(pos.z);
+            agent_positions.push(if *alive { 1.0 } else { 0.0 });
+        }
 
         // Phase 2c: submit vision to GPU
         gpu_vision.submit(&food_positions, &agent_positions, &ray_origins, &ray_dirs);
 
         // Phase 2d: collect vision results (blocking)
         let vision_data = gpu_vision
-            .try_collect()
+            .collect_blocking()
             .expect("[bench] GPU vision collect failed");
 
         // Phase 2e+2f: build frames from GPU vision + CPU touch, then brain.tick

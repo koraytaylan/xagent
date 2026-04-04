@@ -90,6 +90,10 @@ struct Cli {
     /// Use GPU compute for brain encode + recall (experimental)
     #[arg(long)]
     gpu_brain: bool,
+
+    /// Run headless benchmark (no UI, no DB) and print ticks/sec
+    #[arg(long)]
+    bench: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -2537,6 +2541,26 @@ fn main() {
         let json = serde_json::to_string_pretty(&config)
             .expect("Failed to serialize config");
         println!("{}", json);
+        return;
+    }
+
+    if cli.bench {
+        let agent_count = config.governor.population_size;
+        let total_ticks = config.governor.tick_budget;
+        println!(
+            "Benchmark: {} agents, {} ticks",
+            agent_count, total_ticks,
+        );
+        let result = xagent_sandbox::bench::run_bench(
+            config.brain,
+            config.world,
+            agent_count,
+            total_ticks,
+        );
+        println!(
+            "Completed {} ticks in {:.2}s ({:.0} ticks/sec)",
+            result.total_ticks, result.elapsed_secs, result.ticks_per_sec,
+        );
         return;
     }
 

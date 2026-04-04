@@ -1,7 +1,8 @@
 use glam::Vec3;
-use xagent_shared::{MotorAction, MotorCommand, WorldConfig};
+use xagent_shared::{BrainConfig, MotorAction, MotorCommand, WorldConfig};
 
 use xagent_sandbox::agent::AgentBody;
+use xagent_sandbox::bench;
 use xagent_sandbox::physics;
 use xagent_sandbox::world::biome::BiomeType;
 use xagent_sandbox::world::terrain::TerrainData;
@@ -535,5 +536,26 @@ fn evolution_snapshot_default_tree_pane_fraction() {
         (snap.tree_pane_fraction - 0.25).abs() < f32::EPSILON,
         "tree_pane_fraction should default to 0.25, got {}",
         snap.tree_pane_fraction,
+    );
+}
+
+// ── Bench Tests ──────────────────────────────────────────────────────
+
+#[test]
+fn bench_runner_completes_and_reports_ticks_per_sec() {
+    let brain = BrainConfig::default();
+    let world = WorldConfig::default();
+    let agent_count = 4;
+    let total_ticks = 100;
+
+    let result = bench::run_bench(brain, world, agent_count, total_ticks);
+
+    assert_eq!(result.total_ticks, total_ticks, "total_ticks should match requested");
+    assert_eq!(result.agent_count, agent_count, "agent_count should match requested");
+    assert!(result.elapsed_secs > 0.0, "elapsed_secs should be positive");
+    assert!(result.ticks_per_sec > 0.0, "ticks_per_sec should be positive");
+    assert!(
+        (result.ticks_per_sec - (total_ticks as f64 / result.elapsed_secs)).abs() < 1e-6,
+        "ticks_per_sec should equal total_ticks / elapsed_secs"
     );
 }

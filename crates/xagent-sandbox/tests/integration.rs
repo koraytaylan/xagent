@@ -451,9 +451,10 @@ fn vision_with_positions_detects_food_items() {
 
     // Use the positions-based extraction (the path used during evolution)
     let all_positions: Vec<(Vec3, bool)> = vec![(agent.body.position, true)];
+    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&all_positions);
     let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
-        &agent, &world, 0, &all_positions, 0, &mut frame,
+        &agent, &world, 0, &all_positions, 0, &agent_grid, &mut frame,
     );
 
     let food_green_threshold_g = 0.90;
@@ -558,4 +559,59 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
         (result.ticks_per_sec - (total_ticks as f64 / result.elapsed_secs)).abs() < 1e-6,
         "ticks_per_sec should equal total_ticks / elapsed_secs"
     );
+}
+
+// ── AgentGrid Tests ─────────────────────────────────────────────────
+
+#[test]
+fn agent_grid_query_returns_nearby_agents() {
+    use xagent_sandbox::world::spatial::AgentGrid;
+
+    let positions: Vec<(Vec3, bool)> = vec![
+        (Vec3::new(0.0, 0.0, 0.0), true),   // 0: at origin
+        (Vec3::new(1.0, 0.0, 1.0), true),    // 1: nearby origin (same cell)
+        (Vec3::new(100.0, 0.0, 100.0), true), // 2: far away
+        (Vec3::new(2.0, 0.0, 2.0), false),   // 3: dead, near origin
+    ];
+
+    let grid = AgentGrid::from_positions(&positions);
+
+    // Query near origin — should find agents 0 and 1 but not 2 (far) or 3 (dead)
+    let nearby: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
+    assert!(nearby.contains(&0), "Should find agent 0 near origin");
+    assert!(nearby.contains(&1), "Should find agent 1 near origin");
+    assert!(!nearby.contains(&2), "Should NOT find distant agent 2");
+    assert!(!nearby.contains(&3), "Should NOT find dead agent 3");
+
+    // Query near the far agent — should find only agent 2
+    let far_nearby: Vec<usize> = grid.query_nearby(100.0, 100.0).collect();
+    assert!(far_nearby.contains(&2), "Should find agent 2 near (100,100)");
+    assert!(!far_nearby.contains(&0), "Should NOT find agent 0 near (100,100)");
+
+    // Query in empty area — should return nothing
+    let empty: Vec<usize> = grid.query_nearby(-500.0, -500.0).collect();
+    assert!(empty.is_empty(), "Should find no agents in empty area");
+}
+
+#[test]
+fn agent_grid_rebuild_reuses_allocation() {
+    use xagent_sandbox::world::spatial::AgentGrid;
+
+    let positions_a: Vec<(Vec3, bool)> = vec![
+        (Vec3::new(0.0, 0.0, 0.0), true),
+        (Vec3::new(50.0, 0.0, 50.0), true),
+    ];
+    let mut grid = AgentGrid::from_positions(&positions_a);
+
+    // After rebuild with different positions, old indices should be gone
+    let positions_b: Vec<(Vec3, bool)> = vec![
+        (Vec3::new(200.0, 0.0, 200.0), true),
+    ];
+    grid.rebuild(&positions_b);
+
+    let near_origin: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
+    assert!(near_origin.is_empty(), "Old agent at origin should be gone after rebuild");
+
+    let near_new: Vec<usize> = grid.query_nearby(200.0, 200.0).collect();
+    assert!(near_new.contains(&0), "New agent 0 should be at (200,200)");
 }

@@ -55,6 +55,7 @@ pub fn run_bench(
             .collect();
 
         // Phase 2: brain ticks (rayon parallel)
+        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions);
         {
             let world_ref: &WorldState = &world;
             let pos = &positions;
@@ -64,6 +65,7 @@ pub fn run_bench(
                 }
                 senses::extract_senses_with_positions(
                     &agent.body, world_ref, tick, pos, i,
+                    &agent_grid,
                     &mut agent.cached_frame,
                 );
                 agent.cached_motor = agent.brain.tick(&agent.cached_frame);

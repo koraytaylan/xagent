@@ -112,6 +112,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                 .collect();
 
             // Brain ticks (CPU rayon)
+            let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions);
             {
                 let world_ref: &WorldState = &world;
                 let pos = &positions;
@@ -121,6 +122,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _gpu_brain:
                     }
                     senses::extract_senses_with_positions(
                         &agent.body, world_ref, tick, pos, i,
+                        &agent_grid,
                         &mut agent.cached_frame,
                     );
                     agent.cached_motor = agent.brain.tick(&agent.cached_frame);

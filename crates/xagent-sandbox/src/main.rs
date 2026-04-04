@@ -1344,6 +1344,7 @@ impl ApplicationHandler for App {
                                 let tick = self.tick;
                                 let world_ref: &WorldState = &*world;
                                 let all_pos = &all_positions;
+                                let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos);
 
                                 self.agents
                                     .par_iter_mut()
@@ -1359,6 +1360,7 @@ impl ApplicationHandler for App {
                                             tick,
                                             all_pos,
                                             i,
+                                            &agent_grid,
                                             &mut agent.cached_frame,
                                         );
 
@@ -1564,6 +1566,7 @@ impl ApplicationHandler for App {
                             let world_ref: &WorldState = world;
                             let all_pos = &all_positions;
                             let tick = self.tick;
+                            let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos);
 
                             // Parallel sensory extraction for ALL alive agents
                             struct AgentGpuSlice {
@@ -1587,6 +1590,7 @@ impl ApplicationHandler for App {
                                         }
                                         senses::extract_senses_with_positions(
                                             &agent.body, world_ref, tick, all_pos, i,
+                                            &agent_grid,
                                             &mut agent.cached_frame,
                                         );
                                         let feats = agent.brain.encoder

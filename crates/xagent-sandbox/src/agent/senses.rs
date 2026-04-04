@@ -26,15 +26,17 @@ pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64, frame: &
 
 /// Produce a sensory frame with awareness of other agents given as a
 /// shared positions slice. Skips agent at `self_index` automatically.
+/// Uses the spatial `AgentGrid` for O(1) proximity queries in vision and touch.
 pub fn extract_senses_with_positions(
     agent: &AgentBody,
     world: &WorldState,
     tick: u64,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     frame: &mut SensoryFrame,
 ) {
-    sample_vision_positions(agent, world, all_positions, self_index, &mut frame.vision);
+    sample_vision_positions(agent, world, all_positions, self_index, agent_grid, &mut frame.vision);
     frame.velocity = agent.body.velocity;
     frame.facing = agent.body.facing;
     frame.angular_velocity = agent.angular_velocity;
@@ -43,7 +45,7 @@ pub fn extract_senses_with_positions(
     frame.energy_delta = agent.energy_delta();
     frame.integrity_delta = agent.integrity_delta();
     frame.touch_contacts.clear();
-    detect_touch_positions(agent, world, all_positions, self_index, &mut frame.touch_contacts);
+    detect_touch_positions(agent, world, all_positions, self_index, agent_grid, &mut frame.touch_contacts);
     frame.tick = tick;
 }
 
@@ -109,11 +111,11 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
     }
 }
 
-/// Discriminated union for the two agent-list representations.
+/// Discriminated union for the agent-list representations.
 /// Avoids duplicating the ray-march loop.
 enum AgentSlice<'a> {
     Others(&'a [OtherAgent]),
-    Positions { all: &'a [(Vec3, bool)], self_index: usize },
+    Grid { grid: &'a crate::world::spatial::AgentGrid, all: &'a [(Vec3, bool)], self_index: usize },
 }
 
 /// Fixed-step ray marching for terrain, food, and agent intersection.
@@ -177,12 +179,16 @@ fn march_ray_unified(
                     }
                 }
             }
-            AgentSlice::Positions { all, self_index } => {
-                for (j, (other_pos, alive)) in all.iter().enumerate() {
-                    if j == *self_index || !alive {
+            AgentSlice::Grid { grid, all, self_index } => {
+                for j in grid.query_nearby(p.x, p.z) {
+                    if j == *self_index {
                         continue;
                     }
-                    let diff = p - *other_pos;
+                    let (other_pos, alive) = all[j];
+                    if !alive {
+                        continue;
+                    }
+                    let diff = p - other_pos;
                     if diff.length_squared() < agent_radius_sq {
                         return (agent_color, t);
                     }
@@ -291,12 +297,13 @@ fn detect_touch(agent: &AgentBody, world: &WorldState, contacts: &mut Vec<TouchC
 
 // ── position-slice variants (C2: avoid Vec<OtherAgent> allocation) ──────
 
-/// Vision sampling using a shared positions slice.
+/// Vision sampling using a shared positions slice and spatial agent grid.
 fn sample_vision_positions(
     agent: &AgentBody,
     world: &WorldState,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     vf: &mut VisualField,
 ) {
     let w = vf.width;
@@ -320,7 +327,7 @@ fn sample_vision_positions(
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Positions { all: all_positions, self_index });
+            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Grid { grid: agent_grid, all: all_positions, self_index });
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -333,23 +340,28 @@ fn sample_vision_positions(
     }
 }
 
-/// Touch detection using shared positions slice.
+/// Touch detection using shared positions slice and spatial agent grid.
 fn detect_touch_positions(
     agent: &AgentBody,
     world: &WorldState,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     contacts: &mut Vec<TouchContact>,
 ) {
     detect_touch(agent, world, contacts);
 
     let agent_touch_range = 5.0;
     let pos = agent.body.position;
-    for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
-        if j == self_index || !*alive {
+    for j in agent_grid.query_nearby(pos.x, pos.z) {
+        if j == self_index {
             continue;
         }
-        let diff = *other_pos - pos;
+        let (other_pos, alive) = all_positions[j];
+        if !alive {
+            continue;
+        }
+        let diff = other_pos - pos;
         let dist = diff.length();
         if dist < agent_touch_range && dist > 0.01 {
             contacts.push(TouchContact {

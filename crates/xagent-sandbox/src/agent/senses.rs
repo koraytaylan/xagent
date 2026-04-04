@@ -49,6 +49,31 @@ pub fn extract_senses_with_positions(
     frame.tick = tick;
 }
 
+/// Fill non-vision parts of a sensory frame (proprioception, interoception, touch).
+///
+/// Used by the GPU bench path: vision is filled from GPU output, then this
+/// function fills the remaining fields from CPU-accessible agent state.
+pub fn fill_frame_non_vision(
+    agent: &AgentBody,
+    world: &WorldState,
+    tick: u64,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
+    frame: &mut SensoryFrame,
+) {
+    frame.velocity = agent.body.velocity;
+    frame.facing = agent.body.facing;
+    frame.angular_velocity = agent.angular_velocity;
+    frame.energy_signal = agent.body.internal.energy_signal();
+    frame.integrity_signal = agent.body.internal.integrity_signal();
+    frame.energy_delta = agent.energy_delta();
+    frame.integrity_delta = agent.integrity_delta();
+    frame.touch_contacts.clear();
+    detect_touch_positions(agent, world, all_positions, self_index, agent_grid, &mut frame.touch_contacts);
+    frame.tick = tick;
+}
+
 /// Produce a sensory frame with awareness of other agents.
 /// Writes into `frame` to avoid heap allocation (reuses existing buffers).
 pub fn extract_senses_with_others(

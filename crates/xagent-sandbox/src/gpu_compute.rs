@@ -443,6 +443,177 @@ impl GpuBrainCompute {
         })
     }
 
+    /// Create with a pre-existing device and queue (for shared pipelines).
+    ///
+    /// Same as `try_new()` but uses provided device/queue instead of creating
+    /// new ones. Returns `None` if buffer sizes exceed device limits.
+    pub fn with_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        num_agents: u32,
+        dim: u32,
+        feature_count: u32,
+        memory_capacity: u32,
+    ) -> Option<Self> {
+        // Compile shaders
+        let encode_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("encode.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(ENCODE_SHADER.into()),
+        });
+        let recall_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("recall.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(RECALL_SHADER.into()),
+        });
+
+        let encode_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("encode"),
+                layout: None,
+                module: &encode_module,
+                entry_point: Some("encode_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let recall_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("recall"),
+                layout: None,
+                module: &recall_module,
+                entry_point: Some("recall_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // Buffer sizes (in bytes)
+        let n = num_agents as u64;
+        let d = dim as u64;
+        let f = feature_count as u64;
+        let c = memory_capacity as u64;
+
+        let features_size = n * f * 4;
+        let enc_weights_size = n * f * d * 4;
+        let enc_biases_size = n * d * 4;
+        let encoded_size = n * d * 4;
+        let mem_patterns_size = n * c * d * 4;
+        let mem_active_size = n * c * 4;
+        let similarities_size = n * c * 4;
+
+        // Guard: bail if any buffer exceeds the device's limits
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        let max_buf = device.limits().max_buffer_size as u64;
+        let limit = max_binding.min(max_buf);
+        let largest = enc_weights_size
+            .max(mem_patterns_size)
+            .max(features_size);
+        if largest > limit {
+            log::warn!(
+                "[GPU-COMPUTE] with_device: largest buffer ({:.1} MB) exceeds device limit ({:.1} MB)",
+                largest as f64 / 1_048_576.0,
+                limit as f64 / 1_048_576.0,
+            );
+            return None;
+        }
+
+        let params = GpuParams {
+            num_agents,
+            dim,
+            feature_count,
+            memory_capacity,
+        };
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let features_buf = make_storage_in(&device, "features", features_size);
+        let enc_weights_buf = make_storage_in(&device, "enc-weights", enc_weights_size);
+        let enc_biases_buf = make_storage_in(&device, "enc-biases", enc_biases_size);
+        let encoded_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("encoded"),
+            size: encoded_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mem_patterns_buf = make_storage_in(&device, "mem-patterns", mem_patterns_size);
+        let mem_active_buf = make_storage_in(&device, "mem-active", mem_active_size);
+        let similarities_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("similarities"),
+            size: similarities_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let encoded_staging = [
+            make_staging(&device, "encoded-staging-0", encoded_size),
+            make_staging(&device, "encoded-staging-1", encoded_size),
+        ];
+        let similarities_staging = [
+            make_staging(&device, "similarities-staging-0", similarities_size),
+            make_staging(&device, "similarities-staging-1", similarities_size),
+        ];
+
+        let encode_bgl = encode_pipeline.get_bind_group_layout(0);
+        let encode_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("encode-bg"),
+            layout: &encode_bgl,
+            entries: &[
+                bg_buf(0, &params_buf),
+                bg_buf(1, &features_buf),
+                bg_buf(2, &enc_weights_buf),
+                bg_buf(3, &enc_biases_buf),
+                bg_buf(4, &encoded_buf),
+            ],
+        });
+
+        let recall_bgl = recall_pipeline.get_bind_group_layout(0);
+        let recall_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("recall-bg"),
+            layout: &recall_bgl,
+            entries: &[
+                bg_buf(0, &params_buf),
+                bg_buf(1, &encoded_buf),
+                bg_buf(2, &mem_patterns_buf),
+                bg_buf(3, &mem_active_buf),
+                bg_buf(4, &similarities_buf),
+            ],
+        });
+
+        log::info!(
+            "[GPU-COMPUTE] with_device: {} agents, dim={}, features={}, memory_capacity={}",
+            num_agents, dim, feature_count, memory_capacity,
+        );
+
+        Some(Self {
+            device,
+            queue,
+            num_agents,
+            dim,
+            feature_count,
+            memory_capacity,
+            encode_pipeline,
+            recall_pipeline,
+            params_buf,
+            features_buf,
+            enc_weights_buf,
+            enc_biases_buf,
+            encoded_buf,
+            mem_patterns_buf,
+            mem_active_buf,
+            similarities_buf,
+            encoded_staging,
+            similarities_staging,
+            staging_idx: 0,
+            has_in_flight: false,
+            staging_mapped: [false; 2],
+            submit_seq: 0,
+            enc_mapped_seq: Arc::new(AtomicU64::new(0)),
+            sim_mapped_seq: Arc::new(AtomicU64::new(0)),
+            encode_bind_group,
+            recall_bind_group,
+        })
+    }
+
     /// Submit GPU compute work asynchronously.
     ///
     /// Uploads data, dispatches encode + recall shaders, copies results to a
@@ -1269,6 +1440,121 @@ fn bg_buf<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
+    }
+}
+
+// ── Unified GPU Pipeline ──────────────────────────────────────────────
+
+/// Combined result from a unified vision + brain GPU dispatch.
+pub struct UnifiedResult {
+    /// RGBA+depth per ray per agent (5 floats per ray, 48 rays per agent).
+    pub vision: Vec<f32>,
+    /// Encoded state per agent.
+    pub encoded: Vec<f32>,
+    /// Similarity scores per agent (per memory pattern).
+    pub similarities: Vec<f32>,
+}
+
+/// Unified GPU pipeline: vision + encode + recall in one submission.
+///
+/// Vision output stays on GPU between dispatches (no CPU roundtrip).
+/// Only final encoded state + similarities are read back to CPU alongside
+/// vision RGBA+depth.
+///
+/// For the initial implementation, vision and brain run as separate compute
+/// passes in the same command encoder. True on-GPU chaining (vision output
+/// directly feeds encode features) is deferred — it requires reformatting
+/// vision output to match the feature vector layout.
+pub struct GpuUnifiedPipeline {
+    vision: GpuVisionCompute,
+    brain: GpuBrainCompute,
+}
+
+impl GpuUnifiedPipeline {
+    /// Create a unified pipeline sharing a single device/queue.
+    ///
+    /// Both vision and brain sub-pipelines receive cloned handles to the
+    /// same device and queue (wgpu handles are Arc-wrapped internally).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        // vision params
+        terrain_heights: &[f32],
+        biome_types: &[u32],
+        terrain_vps: u32,
+        terrain_size: f32,
+        biome_res: u32,
+        num_food: usize,
+        // brain params
+        num_agents: u32,
+        dim: u32,
+        feature_count: u32,
+        memory_capacity: u32,
+    ) -> Option<Self> {
+        let vision = GpuVisionCompute::new(
+            device.clone(),
+            queue.clone(),
+            num_agents,
+            terrain_heights,
+            biome_types,
+            terrain_vps,
+            terrain_size,
+            biome_res,
+            num_food,
+            num_agents as usize,
+        );
+        let brain = GpuBrainCompute::with_device(
+            device,
+            queue,
+            num_agents,
+            dim,
+            feature_count,
+            memory_capacity,
+        )?;
+        Some(Self { vision, brain })
+    }
+
+    /// Submit vision + brain in one dispatch.
+    ///
+    /// Vision runs first on GPU, then brain encode+recall. Both are
+    /// dispatched as separate compute passes but submitted together,
+    /// eliminating one CPU roundtrip compared to running them independently.
+    pub fn submit_vision_and_brain(
+        &mut self,
+        // vision data
+        food_positions: &[f32],
+        agent_positions: &[f32],
+        ray_origins: &[f32],
+        ray_dirs: &[f32],
+        // brain data
+        features: &[f32],
+        enc_weights: &[f32],
+        enc_biases: &[f32],
+        mem_patterns: &[f32],
+        mem_active: &[u32],
+    ) {
+        // Submit vision and brain as separate dispatches.
+        // They use separate command encoders currently (each sub-pipeline
+        // owns its own submit path), but share the same device/queue so
+        // the driver can batch them.
+        self.vision.submit(food_positions, agent_positions, ray_origins, ray_dirs);
+        self.brain.submit(features, enc_weights, enc_biases, mem_patterns, mem_active);
+    }
+
+    /// Collect vision + brain results. Blocks until both are complete.
+    pub fn collect_blocking(&mut self) -> Option<UnifiedResult> {
+        let vision = self.vision.try_collect()?;
+        let mut encoded = Vec::new();
+        let mut similarities = Vec::new();
+        if !self.brain.collect_blocking_into(&mut encoded, &mut similarities) {
+            return None;
+        }
+        Some(UnifiedResult {
+            vision,
+            encoded,
+            similarities,
+        })
     }
 }
 

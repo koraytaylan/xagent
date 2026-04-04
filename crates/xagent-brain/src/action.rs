@@ -687,4 +687,34 @@ mod tests {
              neutral_avg={avg_neutral:.4}, prospective_avg={avg_prospective:.4}"
         );
     }
+
+    #[test]
+    fn reseed_produces_different_exploration_noise() {
+        let dim = 4;
+        let state = make_state(&[1.0, 0.0, 0.0, 0.0]);
+        let pred = state.clone();
+
+        let mut sel_a = ActionSelector::new(dim);
+        sel_a.reseed(0);
+
+        let mut sel_b = ActionSelector::new(dim);
+        sel_b.reseed(1);
+
+        // Collect several motor outputs from each
+        let mut outputs_a = Vec::new();
+        let mut outputs_b = Vec::new();
+        for _ in 0..20 {
+            let cmd_a = sel_a.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.0, 0.0, 0.0);
+            let cmd_b = sel_b.select(&state, &pred, &[] as &[RecalledPattern], 0.0, 0.0, 0.0, 0.0);
+            outputs_a.push(cmd_a.forward);
+            outputs_b.push(cmd_b.forward);
+        }
+
+        // At least one output must differ — different seeds must produce different noise
+        let any_differ = outputs_a.iter().zip(&outputs_b).any(|(a, b)| a != b);
+        assert!(
+            any_differ,
+            "Agents with different reseed values must produce different exploration noise"
+        );
+    }
 }

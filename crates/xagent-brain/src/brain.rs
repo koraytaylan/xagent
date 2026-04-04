@@ -730,4 +730,31 @@ mod tests {
             "At least one pattern should have non-zero motor context after ticking"
         );
     }
+
+    #[test]
+    fn reseed_exploration_produces_different_motor_output() {
+        let config = BrainConfig::default();
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        let mut brain_a = Brain::new(config.clone());
+        brain_a.reseed_exploration(0);
+
+        let mut brain_b = Brain::new(config);
+        brain_b.reseed_exploration(1);
+
+        let mut outputs_a = Vec::new();
+        let mut outputs_b = Vec::new();
+        for _ in 0..20 {
+            let cmd_a = brain_a.tick(&frame);
+            let cmd_b = brain_b.tick(&frame);
+            outputs_a.push(cmd_a.forward);
+            outputs_b.push(cmd_b.forward);
+        }
+
+        let any_differ = outputs_a.iter().zip(&outputs_b).any(|(a, b)| a != b);
+        assert!(
+            any_differ,
+            "Brains with different exploration seeds must produce different motor outputs"
+        );
+    }
 }

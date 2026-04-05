@@ -51,6 +51,8 @@ pub struct GpuBrain {
     encode_bind_group: wgpu::BindGroup,
     habituate_homeo_pipeline: wgpu::ComputePipeline,
     habituate_homeo_bind_group: wgpu::BindGroup,
+    recall_score_pipeline: wgpu::ComputePipeline,
+    recall_score_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -258,6 +260,18 @@ impl GpuBrain {
             ],
         });
 
+        let rs_source = format!("{}\n{}", constants, include_str!("shaders/recall_score.wgsl"));
+        let recall_score_pipeline = Self::create_pipeline(&device, "recall_score", &rs_source);
+        let recall_score_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("recall_score_bg"),
+            layout: &recall_score_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pattern_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: similarities_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -287,6 +301,8 @@ impl GpuBrain {
             encode_bind_group,
             habituate_homeo_pipeline,
             habituate_homeo_bind_group,
+            recall_score_pipeline,
+            recall_score_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -450,6 +466,24 @@ impl GpuBrain {
             });
             pass.set_pipeline(&self.habituate_homeo_pipeline);
             pass.set_bind_group(0, &self.habituate_homeo_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Dispatch recall_score pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_recall_score(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_recall_score"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("recall_score"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.recall_score_pipeline);
+            pass.set_bind_group(0, &self.recall_score_bind_group, &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -630,5 +664,42 @@ mod tests {
 
         // Constant input should drive attenuation down toward floor (0.1)
         assert!(mean_atten < 0.5, "Constant input should reduce attenuation, got mean={}", mean_atten);
+    }
+
+    #[test]
+    fn recall_score_computes_cosine_similarity() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+
+        // Write a known pattern to slot 0 that matches a known query
+        let mut state = brain.read_agent_state(0);
+
+        // Set pattern slot 0 as active with a known state
+        state.patterns[O_PAT_ACTIVE] = 1.0;  // slot 0 active
+        state.patterns[O_ACTIVE_COUNT] = 1.0;
+
+        // Pattern state: all 1.0 (norm = sqrt(32))
+        for d in 0..DIM {
+            state.patterns[O_PAT_STATES + d] = 1.0;
+        }
+        state.patterns[O_PAT_NORMS] = (DIM as f32).sqrt(); // pre-cached norm
+
+        brain.write_agent_state(0, &state);
+
+        // Upload habituated data directly: all 1.0 (same direction as pattern)
+        let hab_data: Vec<f32> = vec![1.0; DIM];
+        brain.queue.write_buffer(&brain.habituated_buf, 0, bytemuck::cast_slice(&hab_data));
+
+        brain.run_recall_score();
+
+        // Read similarities
+        let mut sims = vec![0.0_f32; MEMORY_CAP];
+        brain.read_buffer_range(&brain.similarities_buf, 0, (MEMORY_CAP * 4) as u64, &mut sims);
+
+        // Slot 0 should have similarity ≈ 1.0 (identical direction)
+        assert!((sims[0] - 1.0).abs() < 0.01, "slot 0 sim should be ~1.0, got {}", sims[0]);
+
+        // Slot 1 should be -2.0 (inactive)
+        assert!((sims[1] - (-2.0)).abs() < 0.01, "slot 1 should be -2.0, got {}", sims[1]);
     }
 }

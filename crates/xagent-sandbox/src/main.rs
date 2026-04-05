@@ -1349,6 +1349,7 @@ impl ApplicationHandler for App {
                                                     );
                                                     death_brain_signals.push(self.agents[idx as usize].brain_idx);
                                                     self.agents[idx as usize].death_count += 1;
+                                                    self.agents[idx as usize].reset_trail();
                                                 }
                                             }
                                         }
@@ -1357,10 +1358,17 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Submit any remaining ticks in the current batch
+                            // Submit remaining ticks + async state readback in one submit
+                            {
+                                let enc = encoder.get_or_insert_with(|| {
+                                    gpu_brain.device().create_command_encoder(&Default::default())
+                                });
+                                gpu_phys.submit_state_readback(enc);
+                            }
                             if let Some(enc) = encoder.take() {
                                 gpu_brain.queue().submit(std::iter::once(enc.finish()));
                             }
+                            gpu_phys.map_state_readback(gpu_brain.device());
 
                             self.food_dirty = true;
                         }
@@ -1375,40 +1383,48 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // ── End-of-frame: single GPU readback for rendering/UI ──
+                    // ── Collect async state readback from previous frame (non-blocking) ──
                     if ticks_run > 0 {
-                        if let (Some(ref gpu_phys), Some(ref gpu_brain)) =
-                            (&self.gpu_physics, &self.gpu_brain)
+                        if let (Some(ref mut gpu_phys), Some(ref gpu_brain)) =
+                            (&mut self.gpu_physics, &self.gpu_brain)
                         {
-                            let state = gpu_phys.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
-                            for i in 0..self.agents.len() {
-                                let base = i * PHYS_STRIDE;
-                                let a = &mut self.agents[i];
-                                a.body.body.position = Vec3::new(state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
-                                a.body.body.alive = state[base + P_ALIVE] > 0.5;
-                                a.body.yaw = state[base + P_YAW];
-                                a.body.body.internal.energy = state[base + P_ENERGY];
-                                a.body.body.internal.integrity = state[base + P_INTEGRITY];
-                                a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
-                                a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
-                                a.body.body.velocity = Vec3::new(state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
-                                a.food_consumed = state[base + P_FOOD_COUNT] as u32;
-                                a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
-                                a.body.body.facing = Vec3::new(state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
+                            // Poll once — if previous frame's readback is ready, update agents
+                            if gpu_phys.try_collect_state(gpu_brain.device()) {
+                                let state = gpu_phys.cached_state();
+                                for i in 0..self.agents.len() {
+                                    let base = i * PHYS_STRIDE;
+                                    if base + P_FACING_Z >= state.len() { break; }
+                                    let a = &mut self.agents[i];
+                                    a.body.body.position = Vec3::new(state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
+                                    a.body.body.alive = state[base + P_ALIVE] > 0.5;
+                                    a.body.yaw = state[base + P_YAW];
+                                    a.body.body.internal.energy = state[base + P_ENERGY];
+                                    a.body.body.internal.integrity = state[base + P_INTEGRITY];
+                                    a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
+                                    a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
+                                    a.body.body.velocity = Vec3::new(state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
+                                    a.food_consumed = state[base + P_FOOD_COUNT] as u32;
+                                    a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+                                    a.body.body.facing = Vec3::new(state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
+                                }
                             }
                         }
 
-                        // Per-agent bookkeeping (only at 1x speed)
+                        // Heatmap + trail: always record (needed for fitness exploration metric)
+                        if let Some(world) = &self.world {
+                            for agent in &mut self.agents {
+                                if agent.body.body.alive {
+                                    agent.record_heatmap(world.config.world_size);
+                                    agent.record_trail();
+                                }
+                            }
+                        }
+
+                        // Sparkline histories + CSV logging: only at 1x speed
                         if self.speed_multiplier <= 1 {
                             if let Some(world) = &self.world {
                                 for agent in &mut self.agents {
                                     record_agent_histories(agent);
-                                }
-                                for agent in &mut self.agents {
-                                    if agent.body.body.alive {
-                                        agent.record_heatmap(world.config.world_size);
-                                        agent.record_trail();
-                                    }
                                 }
                                 if self.selected_agent_idx < self.agents.len() {
                                     let agent = &self.agents[self.selected_agent_idx];

@@ -174,6 +174,24 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             tick += 1;
             governor.tick();
 
+            // Periodic heatmap update: read back positions every 100 ticks
+            // to track exploration cells for fitness evaluation.
+            if tick % 100 == 0 {
+                let state = gpu_physics.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
+                for i in 0..agents.len() {
+                    let base = i * xagent_brain::buffers::PHYS_STRIDE;
+                    let alive = state[base + xagent_brain::buffers::P_ALIVE] > 0.5;
+                    if alive {
+                        agents[i].body.body.position = glam::Vec3::new(
+                            state[base + xagent_brain::buffers::P_POS_X],
+                            state[base + xagent_brain::buffers::P_POS_Y],
+                            state[base + xagent_brain::buffers::P_POS_Z],
+                        );
+                        agents[i].record_heatmap(config.world.world_size);
+                    }
+                }
+            }
+
             if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
                 let pct = (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
                 print!("\rGen {} [{:>3}%]", governor.generation, pct);

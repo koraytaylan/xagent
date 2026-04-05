@@ -583,6 +583,44 @@ fn gpu_tick_loop_runs_without_crash() {
     assert!(result.ticks_per_sec > 0.0);
 }
 
+// ── Trail + Heatmap Tests ───────────────────────────────────────────
+
+#[test]
+fn reset_trail_clears_trail_and_marks_dirty() {
+    use xagent_sandbox::agent::Agent;
+    let world = test_world();
+    let pos = world.safe_spawn_position();
+    let mut agent = Agent::new(0, pos, 0, BrainConfig::default(), 0);
+
+    // Record a few trail points by moving the agent far enough apart
+    agent.body.body.position = Vec3::new(0.0, 0.0, 0.0);
+    agent.record_trail();
+    agent.body.body.position = Vec3::new(10.0, 0.0, 10.0);
+    agent.record_trail();
+    assert!(agent.trail.len() >= 2, "trail should have points");
+
+    // Clear dirty from initial recording
+    agent.trail_dirty = false;
+
+    // Reset trail (as should happen on death)
+    agent.reset_trail();
+    assert!(agent.trail.is_empty(), "trail should be empty after reset");
+    assert!(agent.trail_dirty, "trail_dirty should be set after reset");
+}
+
+#[test]
+fn record_heatmap_populates_cells() {
+    use xagent_sandbox::agent::Agent;
+    let world = test_world();
+    let pos = world.safe_spawn_position();
+    let mut agent = Agent::new(0, pos, 0, BrainConfig::default(), 0);
+
+    agent.body.body.position = Vec3::new(10.0, 0.0, 10.0);
+    agent.record_heatmap(world.config.world_size);
+
+    assert!(agent.unique_cells_explored() >= 1, "should have explored at least 1 cell");
+}
+
 // ── FoodGrid Tests ──────────────────────────────────────────────────
 
 #[test]

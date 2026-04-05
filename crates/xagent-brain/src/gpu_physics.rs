@@ -49,6 +49,14 @@ pub struct GpuPhysics {
     pub(crate) death_submit_seq: u64,
     pub(crate) death_mapped_seq: Arc<AtomicU64>,
 
+    // ── Async state readback (double-buffered) ──
+    pub(crate) state_staging: [wgpu::Buffer; 2],
+    pub(crate) state_staging_idx: usize,
+    pub(crate) state_submit_seq: u64,
+    pub(crate) state_mapped_seq: Arc<AtomicU64>,
+    /// Cached state from last completed readback.
+    pub(crate) state_cache: Vec<f32>,
+
     // ── Compute pipelines + bind groups ──
     pub(crate) physics_pipeline: wgpu::ComputePipeline,
     pub(crate) physics_bind_group: wgpu::BindGroup,
@@ -168,6 +176,23 @@ impl GpuPhysics {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("death_staging_1"),
                 size: death_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        // ── Async state readback staging (double-buffered) ──
+        let state_size = (n * PHYS_STRIDE * 4) as u64;
+        let state_staging = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("state_staging_0"),
+                size: state_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("state_staging_1"),
+                size: state_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -345,6 +370,11 @@ impl GpuPhysics {
             death_staging_mapped: [false, false],
             death_submit_seq: 0,
             death_mapped_seq: Arc::new(AtomicU64::new(0)),
+            state_staging,
+            state_staging_idx: 0,
+            state_submit_seq: 0,
+            state_mapped_seq: Arc::new(AtomicU64::new(0)),
+            state_cache: vec![0.0; n * PHYS_STRIDE],
             physics_pipeline,
             physics_bind_group,
             food_grid_build_pipeline,
@@ -608,6 +638,62 @@ impl GpuPhysics {
 
         let offset = (index as usize * PHYS_STRIDE * 4) as u64;
         queue.write_buffer(&self.agent_phys_buf, offset, bytemuck::cast_slice(&data));
+    }
+
+    /// Initiate async readback of full agent physics state.
+    /// Call once per frame after the last queue.submit(). The copy runs on GPU;
+    /// collect results next frame with `try_collect_state()`.
+    pub fn submit_state_readback(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let widx = self.state_staging_idx;
+        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[widx], 0, buf_size);
+        self.state_staging_idx = 1 - self.state_staging_idx;
+        self.state_submit_seq += 1;
+    }
+
+    /// Finalize the async state readback: map the staging buffer after submit.
+    /// Must be called AFTER the encoder containing submit_state_readback is submitted.
+    pub fn map_state_readback(&mut self, device: &wgpu::Device) {
+        let read_idx = 1 - self.state_staging_idx; // the one we just copied into
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let seq = self.state_submit_seq;
+        let flag = self.state_mapped_seq.clone();
+        self.state_staging[read_idx].slice(..buf_size).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
+                if result.is_ok() {
+                    flag.store(seq, Ordering::Release);
+                }
+            },
+        );
+        device.poll(wgpu::Maintain::Poll);
+    }
+
+    /// Try to collect async state readback (non-blocking). Updates internal cache.
+    /// Returns true if new data was collected.
+    pub fn try_collect_state(&mut self, device: &wgpu::Device) -> bool {
+        device.poll(wgpu::Maintain::Poll);
+        if self.state_mapped_seq.load(Ordering::Acquire) < self.state_submit_seq {
+            return false;
+        }
+        let read_idx = 1 - self.state_staging_idx;
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let slice = self.state_staging[read_idx].slice(..buf_size);
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        self.state_cache.clear();
+        self.state_cache.extend_from_slice(floats);
+        drop(data);
+        self.state_staging[read_idx].unmap();
+        true
+    }
+
+    /// Get the cached state from the last successful async readback.
+    pub fn cached_state(&self) -> &[f32] {
+        &self.state_cache
     }
 
     /// Read back full agent physics state. Returns data for all agents as flat f32 slice.

@@ -1,36 +1,41 @@
 // ── Phase: Vision ──────────────────────────────────────────────────────────
-// Serialized 48-ray march + proprioception/interoception/touch fill.
-// Single thread per agent — loops over all rays instead of parallel workgroup.
-// Buffers, constants, and helpers come from common.wgsl (concatenated before this).
+// Split into two sub-phases:
+//   phase_vision_rays  — cooperative ray march across ALL 256 threads
+//   phase_vision_senses — per-agent proprioception / interoception / touch
 
-fn phase_vision(tid: u32) {
-    let base = tid * PHYS_STRIDE;
-    if (agent_phys[base + P_ALIVE] < 0.5) { return; }
+// ── Sub-phase A: Cooperative ray march ────────────────────────────────────
+// All 256 threads share the total ray workload (agent_count × 48 rays).
+// Each thread handles ceil(total_rays/256) rays via strided loop.
 
+fn phase_vision_rays(tid: u32) {
     let agent_count = wc_u32(WC_AGENT_COUNT);
-    if tid >= agent_count { return; }
-
-    let s_base = tid * SENSORY_STRIDE;
-
-    // Read agent state
-    let pos = vec3<f32>(
-        agent_phys[base + P_POS_X],
-        agent_phys[base + P_POS_Y],
-        agent_phys[base + P_POS_Z],
-    );
-    let facing = vec3<f32>(
-        agent_phys[base + P_FACING_X],
-        agent_phys[base + P_FACING_Y],
-        agent_phys[base + P_FACING_Z],
-    );
+    let total_rays = agent_count * VISION_RAYS;
 
     let grid_width  = wc_u32(WC_GRID_WIDTH);
     let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
 
-    // ── Serialized ray loop ────────────────────────────────────────────────
-    for (var ray_idx = 0u; ray_idx < VISION_RAYS; ray_idx++) {
+    for (var r = tid; r < total_rays; r += 256u) {
+        let agent_id = r / VISION_RAYS;
+        let ray_idx  = r % VISION_RAYS;
 
-        // ── Ray direction computation ──────────────────────────────────
+        let base = agent_id * PHYS_STRIDE;
+        if (agent_phys[base + P_ALIVE] < 0.5) { continue; }
+
+        let s_base = agent_id * SENSORY_STRIDE;
+
+        // Read agent state
+        let pos = vec3<f32>(
+            agent_phys[base + P_POS_X],
+            agent_phys[base + P_POS_Y],
+            agent_phys[base + P_POS_Z],
+        );
+        let facing = vec3<f32>(
+            agent_phys[base + P_FACING_X],
+            agent_phys[base + P_FACING_Y],
+            agent_phys[base + P_FACING_Z],
+        );
+
+        // ── Ray direction ─────────────────────────────────────────────
         let col = ray_idx % VISION_W;
         let row = ray_idx / VISION_W;
         let u = (f32(col) / f32(VISION_W - 1u)) * 2.0 - 1.0;
@@ -39,7 +44,7 @@ fn phase_vision(tid: u32) {
         let right = vec3<f32>(facing.z, 0.0, -facing.x);
         let ray_dir = normalize(facing + right * u * tan_hf + vec3<f32>(0.0, -v * tan_hf, 0.0));
 
-        // ── Ray march ──────────────────────────────────────────────────
+        // ── Ray march ─────────────────────────────────────────────────
         var hit_color = vec4<f32>(0.53, 0.81, 0.92, 1.0); // sky default
         var hit_depth = VISION_MAX_DIST;
         var hit = false;
@@ -50,7 +55,7 @@ fn phase_vision(tid: u32) {
             let t = f32(step + 1u) * VISION_STEP_SIZE;
             let ray_pos = pos + ray_dir * t;
 
-            // ── Check food grid ────────────────────────────────────
+            // ── Check food grid ───────────────────────────────────
             let food_cx = cell_coord(ray_pos.x) + grid_offset;
             let food_cz = cell_coord(ray_pos.z) + grid_offset;
 
@@ -71,7 +76,7 @@ fn phase_vision(tid: u32) {
 
                     for (var s: u32 = 0u; s < count; s++) {
                         let fidx = u32(atomicLoad(&food_grid[cell_base + 1u + s]));
-                        if atomicLoad(&food_flags[fidx]) != 0u { continue; } // consumed
+                        if atomicLoad(&food_flags[fidx]) != 0u { continue; }
 
                         let fbase = fidx * FOOD_STATE_STRIDE;
                         let fx = food_state[fbase + F_POS_X];
@@ -94,7 +99,7 @@ fn phase_vision(tid: u32) {
             }
             if hit { break; }
 
-            // ── Check agent grid ───────────────────────────────────
+            // ── Check agent grid ──────────────────────────────────
             let ag_cx = cell_coord(ray_pos.x) + grid_offset;
             let ag_cz = cell_coord(ray_pos.z) + grid_offset;
 
@@ -115,7 +120,7 @@ fn phase_vision(tid: u32) {
 
                     for (var s: u32 = 0u; s < count; s++) {
                         let other = u32(atomicLoad(&agent_grid[cell_base + 1u + s]));
-                        if other == tid { continue; }
+                        if other == agent_id { continue; }
 
                         let ob = other * PHYS_STRIDE;
                         if agent_phys[ob + P_ALIVE] < 0.5 { continue; }
@@ -140,19 +145,16 @@ fn phase_vision(tid: u32) {
             }
             if hit { break; }
 
-            // ── Check terrain ──────────────────────────────────────
+            // ── Check terrain ─────────────────────────────────────
             let ground_h = sample_height(ray_pos.x, ray_pos.z);
 
             if ray_pos.y <= ground_h {
                 let biome_type = sample_biome(ray_pos.x, ray_pos.z);
                 if biome_type == 0u {
-                    // FoodRich
                     hit_color = vec4<f32>(0.15, 0.5, 0.1, 1.0);
                 } else if biome_type == 1u {
-                    // Barren
                     hit_color = vec4<f32>(0.5, 0.4, 0.2, 1.0);
                 } else {
-                    // Danger
                     hit_color = vec4<f32>(0.6, 0.2, 0.1, 1.0);
                 }
                 hit_depth = t;
@@ -160,13 +162,12 @@ fn phase_vision(tid: u32) {
                 break;
             }
 
-            // Early-out for upward rays clearly above terrain
             if ray_dir.y > 0.3 && ray_pos.y > ground_h + 5.0 {
-                break; // sky
+                break;
             }
         }
 
-        // ── Write vision results for this ray ──────────────────────────
+        // ── Write vision results ──────────────────────────────────────
         let ci = s_base + ray_idx * 4u;
         sensory_buf[ci]      = hit_color.x;
         sensory_buf[ci + 1u] = hit_color.y;
@@ -174,8 +175,27 @@ fn phase_vision(tid: u32) {
         sensory_buf[ci + 3u] = hit_color.w;
         sensory_buf[s_base + VISION_COLOR_COUNT + ray_idx] = hit_depth / VISION_MAX_DIST;
     }
+}
 
-    // ── Non-visual sensory data (runs unconditionally per agent) ───────────
+// ── Sub-phase B: Per-agent non-visual senses ──────────────────────────────
+
+fn phase_vision_senses(tid: u32) {
+    let base = tid * PHYS_STRIDE;
+    if (agent_phys[base + P_ALIVE] < 0.5) { return; }
+
+    let agent_count = wc_u32(WC_AGENT_COUNT);
+    if tid >= agent_count { return; }
+
+    let s_base = tid * SENSORY_STRIDE;
+    let grid_width  = wc_u32(WC_GRID_WIDTH);
+    let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
+
+    let pos = vec3<f32>(
+        agent_phys[base + P_POS_X],
+        agent_phys[base + P_POS_Y],
+        agent_phys[base + P_POS_Z],
+    );
+
     let nv_base = s_base + VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
     var off = nv_base;
 
@@ -217,19 +237,18 @@ fn phase_vision(tid: u32) {
     sensory_buf[off] = integrity - prev_integrity;
     off += 1u;
 
-    // ── Touch contacts (4 slots x 4 features = 16 floats) ─────────────────
+    // ── Touch contacts (4 slots x 4 features = 16 floats) ────────────────
     var touch_count: u32 = 0u;
     let touch_base = off;
 
-    // Zero all touch slots first
     for (var i: u32 = 0u; i < MAX_TOUCH_CONTACTS * 4u; i++) {
         sensory_buf[touch_base + i] = 0.0;
     }
 
-    // Query food_grid for nearby food within TOUCH_FOOD_RANGE
     let self_cx = cell_coord(pos.x) + grid_offset;
     let self_cz = cell_coord(pos.z) + grid_offset;
 
+    // Food touch
     for (var di: i32 = -1; di <= 1; di++) {
         for (var dj: i32 = -1; dj <= 1; dj++) {
             if touch_count >= MAX_TOUCH_CONTACTS { break; }
@@ -257,10 +276,10 @@ fn phase_vision(tid: u32) {
                 if dist < TOUCH_FOOD_RANGE {
                     let slot = touch_base + touch_count * 4u;
                     let inv_dist = 1.0 / max(dist, 1e-6);
-                    sensory_buf[slot]      = fdx * inv_dist;       // dir_x
-                    sensory_buf[slot + 1u] = fdz * inv_dist;       // dir_z
-                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_FOOD_RANGE; // intensity
-                    sensory_buf[slot + 3u] = f32(TOUCH_FOOD) / 4.0; // surface_tag
+                    sensory_buf[slot]      = fdx * inv_dist;
+                    sensory_buf[slot + 1u] = fdz * inv_dist;
+                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_FOOD_RANGE;
+                    sensory_buf[slot + 3u] = f32(TOUCH_FOOD) / 4.0;
                     touch_count += 1u;
                 }
             }
@@ -268,7 +287,7 @@ fn phase_vision(tid: u32) {
         if touch_count >= MAX_TOUCH_CONTACTS { break; }
     }
 
-    // Query agent_grid for nearby agents within TOUCH_AGENT_RANGE
+    // Agent touch
     for (var di: i32 = -1; di <= 1; di++) {
         for (var dj: i32 = -1; dj <= 1; dj++) {
             if touch_count >= MAX_TOUCH_CONTACTS { break; }
@@ -298,10 +317,10 @@ fn phase_vision(tid: u32) {
                 if dist < TOUCH_AGENT_RANGE {
                     let slot = touch_base + touch_count * 4u;
                     let inv_dist = 1.0 / max(dist, 1e-6);
-                    sensory_buf[slot]      = adx * inv_dist;       // dir_x
-                    sensory_buf[slot + 1u] = adz * inv_dist;       // dir_z
-                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_AGENT_RANGE; // intensity
-                    sensory_buf[slot + 3u] = f32(TOUCH_AGENT) / 4.0; // surface_tag
+                    sensory_buf[slot]      = adx * inv_dist;
+                    sensory_buf[slot + 1u] = adz * inv_dist;
+                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_AGENT_RANGE;
+                    sensory_buf[slot + 3u] = f32(TOUCH_AGENT) / 4.0;
                     touch_count += 1u;
                 }
             }

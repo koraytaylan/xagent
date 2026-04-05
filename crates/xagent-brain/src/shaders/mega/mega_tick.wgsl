@@ -40,9 +40,13 @@ fn mega_tick(@builtin(local_invocation_id) lid: vec3u) {
             storageBarrier(); workgroupBarrier();
         }
 
-        if (tick % 4u == 0u && tid < agent_count) {
-            phase_vision(tid);
-            phase_brain(tid);
+        if (tick % 4u == 0u) {
+            phase_vision_rays(tid);   // cooperative — all 256 threads share rays
+            storageBarrier(); workgroupBarrier();
+            if (tid < agent_count) {
+                phase_vision_senses(tid); // per-agent proprioception/touch
+                phase_brain(tid);
+            }
         }
         storageBarrier(); workgroupBarrier();
     }

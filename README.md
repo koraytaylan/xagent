@@ -73,33 +73,29 @@ Sandbox                          Brain
 
 ## 3. The Cognitive Architecture
 
-Each tick, the brain executes a single loop:
+Each tick, all agent brains execute simultaneously on GPU via 7 compute shader passes:
 
 ```
-encode → habituate → recall → predict → compare → learn → act → fatigue
+feature_extract → encode → habituate_homeo → recall_score → recall_topk → predict_and_act → learn_and_store
 ```
 
 ### Step-by-Step
 
-1. **Encode** — The `SensoryEncoder` compresses the raw `SensoryFrame` into a fixed-size numerical vector (`EncodedState`). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque `Vec<f32>`, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
-1a. **Habituate** — `SensoryHabituation` attenuates encoded dimensions that haven't changed recently (boredom). Produces a curiosity bonus that boosts exploration when sensory input is monotonous. The raw encoding is preserved for telemetry; the habituated state flows to all downstream components.
+1. **Feature Extract** — Extracts 217 features from the packed sensory input (192 RGBA vision + 48 depth + 27 non-visual). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
 
-2. **Recall** — `PatternMemory` retrieves the most similar past experiences within a capacity budget set by the `CapacityManager`. The budget adapts: high prediction error → more recall slots to gather context.
+2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 32-dimensional encoded state. This fixed-size representation is the common currency of all downstream passes.
 
-3. **Predict** — The `Predictor` generates an expected next state by applying a learned linear transform to the current encoding, blended with recalled context patterns weighted by similarity.
+3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
 
-4. **Compare** — The prediction from the *previous* tick is compared against the *current* encoding. The RMSE between them is the **prediction error** — the universal learning signal.
+4. **Recall Score** — Computes cosine similarity between the habituated state and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
 
-5. **Learn** — Prediction error drives all adaptation:
-   - **Predictor weights** update via online gradient descent
-   - **Memory reinforcement** strengthens patterns that co-occur with low error
-   - **Encoder weights** receive L2 regularization to stay bounded
-   - **Learning rate** is modulated by homeostatic gradient magnitude
+5. **Recall Top-K** — Selects the 16 most similar patterns from the score vector and updates their recall metadata (timestamps, access counts).
 
-6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%), boosted by the curiosity bonus from habituation.
+6. **Predict & Act** — Computes prediction error from the previous tick's prediction against the current encoded state. Performs credit assignment over recent action history weighted by homeostatic gradient. Evaluates the linear policy with prospection blending (predicted-future state + top-recalled-memory blend), applies exploration noise (adaptive rate 10–85%) and motor fatigue dampening (repetitive commands are attenuated, forcing loop-breaking).
 
-6a. **Fatigue** — `MotorFatigue` tracks recent motor output variance. Repetitive commands (low variance) dampen motor output, forcing the agent to break out of loops. Recovery is immediate when output diversifies.
+7. **Learn & Store** — Predictor gradient descent step, encoder Hebbian weight adaptation, memory reinforcement for patterns co-occurring with low error, pattern storage to the weakest slot, and per-pattern decay.
 
 ### Homeostatic Feedback
 
@@ -417,17 +413,20 @@ xagent/
 │   │       ├── sensory.rs      # SensoryFrame, VisualField, TouchContact
 │   │       └── traits.rs       # CognitiveArchitecture trait
 │   │
-│   ├── xagent-brain/           # Cognitive architecture
+│   ├── xagent-brain/           # GPU-resident cognitive architecture
 │   │   ├── README.md           # Deep dive into brain internals
 │   │   └── src/
-│   │       ├── lib.rs          # Re-exports
-│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry + DecisionSnapshot
-│   │       ├── encoder.rs      # SensoryEncoder (feature extraction + projection)
-│   │       ├── memory.rs       # PatternMemory (store, recall, associate, decay)
-│   │       ├── predictor.rs    # Predictor (state prediction + gradient descent)
-│   │       ├── action.rs       # ActionSelector (linear policy, credit assignment)
-│   │       ├── homeostasis.rs  # HomeostaticMonitor (multi-timescale gradients)
-│   │       └── capacity.rs     # CapacityManager (adaptive recall budgets)
+│   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry
+│   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
+│   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
+│   │       └── shaders/
+│   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
+│   │           ├── encode.wgsl           # Pass 2: features × weights → 32-dim encoded
+│   │           ├── habituate_homeo.wgsl  # Pass 3: habituation EMA + homeostasis
+│   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
+│   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
+│   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
+│   │           └── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/
@@ -500,12 +499,12 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ### Test Coverage Summary
 
-**181 tests total** across the workspace:
+**118 tests total** across the workspace:
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 81 | Encoder similarity/determinism/adaptation, memory store/recall/decay/associations/temporal sequences/motor context/valence updates, predictor convergence/gradient descent/rollout dynamics, homeostasis multi-timescale gradients/urgency/distress curves, action selector memory-informed blending/exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence, motor context storage) |
-| **xagent-sandbox** | 100 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
+| **xagent-brain** | 21 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling |
+| **xagent-sandbox** | 97 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
 
 ---
 

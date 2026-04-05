@@ -2,13 +2,16 @@
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 61 lib unit + 8 bin unit + 18 integration tests (87 total)
+- `cargo test -p xagent-sandbox` — runs 59 lib unit + 6 bin unit + 32 integration tests (97 total)
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence
 - `crates/xagent-sandbox/src/ui.rs` — egui 0.31 immediate-mode UI, `EvolutionSnapshot` bridges governor↔UI
 - `crates/xagent-sandbox/src/main.rs` — app loop, pipes governor data to snapshot before paint closure
 - DB migrations are idempotent: `let _ = db.execute_batch("ALTER TABLE ... ADD COLUMN ...");`
+- `crates/xagent-brain/src/gpu_brain.rs` — GPU-resident brain, 7-pass WGSL compute pipeline, state read/write, resize
+- `crates/xagent-brain/src/buffers.rs` — GPU buffer layout constants, sensory packing, AgentBrainState
+- `crates/xagent-brain/src/shaders/*.wgsl` — 7 WGSL compute shaders (feature_extract, encode, habituate_homeo, recall_score, recall_topk, predict_and_act, learn_and_store)
 
 ## egui Gotchas
 - `ui.available_size().y` is INFINITY inside `ScrollArea::vertical()` — use `available_width()` and let content drive height

@@ -179,8 +179,6 @@ fn print_config(config: &FullConfig) {
     println!("──────────────────────────────────────────────────");
 }
 
-const RESPAWN_COOLDOWN_FRAMES: u32 = 60;
-
 /// Base simulation rate in Hz. The simulation runs at this rate (scaled by
 /// speed multiplier) regardless of rendering frame rate.
 const SIM_RATE: f32 = 60.0;

@@ -565,6 +565,24 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
     );
 }
 
+// ── GPU Tick Loop Tests ─────────────────────────────────────────────
+
+#[test]
+fn gpu_tick_loop_runs_without_crash() {
+    if !xagent_brain::GpuBrain::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world = WorldConfig { seed: 42, ..Default::default() };
+    let result = bench::run_bench(brain, world, 10, 100);
+
+    assert_eq!(result.total_ticks, 100);
+    assert_eq!(result.agent_count, 10);
+    assert!(result.ticks_per_sec > 0.0);
+}
+
 // ── FoodGrid Tests ──────────────────────────────────────────────────
 
 #[test]

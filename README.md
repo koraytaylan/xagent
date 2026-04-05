@@ -452,7 +452,7 @@ xagent/
 │       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
 │       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
-│           └── integration.rs  # 14 integration tests
+│           └── integration.rs  # 32 integration tests
 └── xagent_log_*.csv            # Generated metric logs (gitignored)
 ```
 
@@ -500,12 +500,12 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ### Test Coverage Summary
 
-**98 tests total** across the workspace:
+**181 tests total** across the workspace:
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 79 | Encoder similarity/determinism/adaptation, memory store/recall/decay/associations/temporal sequences/motor context/valence updates, predictor convergence/gradient descent/rollout dynamics, homeostasis multi-timescale gradients/urgency/distress curves, action selector memory-informed blending/exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence, motor context storage) |
-| **xagent-sandbox** | 19 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain), agent lifecycle (energy depletion, death, food consumption), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy), evolution (config mutation/crossover, fitness evaluation) |
+| **xagent-brain** | 81 | Encoder similarity/determinism/adaptation, memory store/recall/decay/associations/temporal sequences/motor context/valence updates, predictor convergence/gradient descent/rollout dynamics, homeostasis multi-timescale gradients/urgency/distress curves, action selector memory-informed blending/exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence, motor context storage) |
+| **xagent-sandbox** | 100 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
 
 ---
 

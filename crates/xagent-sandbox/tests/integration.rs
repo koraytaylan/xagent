@@ -549,7 +549,7 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
     let agent_count = 4;
     let total_ticks = 100;
 
-    let result = bench::run_bench(brain, world, agent_count, total_ticks);
+    let result = bench::run_bench_cpu(brain, world, agent_count, total_ticks);
 
     assert_eq!(result.total_ticks, total_ticks, "total_ticks should match requested");
     assert_eq!(result.agent_count, agent_count, "agent_count should match requested");

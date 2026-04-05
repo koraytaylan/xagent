@@ -331,7 +331,8 @@ fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32
     };
 
     // 3b: deferred food consumption (sequential -- mutates world)
-    for (consumed, _) in &results {
+    // Deduplicate: only the first agent claiming a food index gets the energy.
+    for (i, (consumed, _)) in results.iter().enumerate() {
         if let Some(idx) = consumed {
             let food = &mut world.food_items[*idx];
             if !food.consumed {
@@ -340,7 +341,12 @@ fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32
                 food.consumed = true;
                 food.respawn_timer = 10.0;
                 world.food_grid.remove(*idx, fx, fz);
+                // Award energy only to the winning consumer
+                agents[i].body.body.internal.energy =
+                    (agents[i].body.body.internal.energy + world.config.food_energy_value)
+                        .min(agents[i].body.body.internal.max_energy);
             }
+            // else: another agent already claimed this food — no energy
         }
     }
 

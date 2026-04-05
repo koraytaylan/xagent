@@ -90,6 +90,14 @@ struct Cli {
     /// Run headless benchmark (no UI, no DB) and print ticks/sec
     #[arg(long)]
     bench: bool,
+
+    /// Number of ticks for --bench mode (default: 10000)
+    #[arg(long, default_value_t = 10_000)]
+    bench_ticks: u64,
+
+    /// Number of agents for --bench mode (default: 10)
+    #[arg(long, default_value_t = 10)]
+    bench_agents: usize,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -1272,10 +1280,14 @@ impl ApplicationHandler for App {
                     };
 
                     // ── Adaptive GPU/CPU decision ──
-                    // Use GPU if available. The GPU pipeline handles
-                    // vision + encode + recall per frame; CPU rayon handles
-                    // brain ticks inside the simulation loop.
-                    let use_gpu = self.gpu_compute.is_some();
+                    // The GPU pipeline produces one brain result per frame,
+                    // while the CPU path runs brain ticks inside the
+                    // simulation loop. To preserve the contract that each
+                    // simulation tick gets a corresponding brain update,
+                    // only use the GPU path when at most one tick will run.
+                    let expected_ticks = (self.sim_accumulator / SIM_DT)
+                        .min(max_ticks as f32) as u64;
+                    let use_gpu = self.gpu_compute.is_some() && expected_ticks <= 1;
 
                     // ── GPU COLLECT: always drain in-flight results ──
                     // try_collect_into() unmaps staging buffers even if we don't
@@ -2549,8 +2561,8 @@ fn main() {
     }
 
     if cli.bench {
-        let agent_count = config.governor.population_size;
-        let total_ticks = config.governor.tick_budget;
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
         println!(
             "Benchmark: {} agents, {} ticks",
             agent_count, total_ticks,

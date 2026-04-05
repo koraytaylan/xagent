@@ -267,8 +267,10 @@ pub fn step_pure(
 }
 
 /// Read-only food detection: finds the nearest unconsumed food within range
-/// and applies the energy gain, but does NOT mutate the world.
-fn try_detect_food(agent: &mut AgentBody, world: &WorldState) -> Option<usize> {
+/// but does NOT apply energy gain or mutate the world. The caller must
+/// deduplicate claims (multiple agents may detect the same food) and apply
+/// the energy gain to the winning consumer in the sequential phase.
+fn try_detect_food(agent: &AgentBody, world: &WorldState) -> Option<usize> {
     let pos = agent.body.position;
     let mut best: Option<(usize, f32)> = None;
 
@@ -285,14 +287,7 @@ fn try_detect_food(agent: &mut AgentBody, world: &WorldState) -> Option<usize> {
         }
     }
 
-    if let Some((idx, _)) = best {
-        // Apply energy gain to agent (same as try_consume)
-        agent.body.internal.energy = (agent.body.internal.energy + world.config.food_energy_value)
-            .min(agent.body.internal.max_energy);
-        Some(idx)
-    } else {
-        None
-    }
+    best.map(|(idx, _)| idx)
 }
 
 /// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.

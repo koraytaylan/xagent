@@ -1455,16 +1455,16 @@ pub struct UnifiedResult {
     pub similarities: Vec<f32>,
 }
 
-/// Unified GPU pipeline: vision + encode + recall in one submission.
+/// Coordinated GPU pipeline for vision + encode + recall on a shared device/queue.
 ///
-/// Vision output stays on GPU between dispatches (no CPU roundtrip).
-/// Only final encoded state + similarities are read back to CPU alongside
-/// vision RGBA+depth.
+/// Provides a single high-level API that runs the existing vision and brain
+/// GPU pipelines together. In the current implementation, those stages are
+/// submitted separately via the underlying `vision` and `brain` compute
+/// paths rather than being recorded into one command encoder.
 ///
-/// For the initial implementation, vision and brain run as separate compute
-/// passes in the same command encoder. True on-GPU chaining (vision output
-/// directly feeds encode features) is deferred — it requires reformatting
-/// vision output to match the feature vector layout.
+/// True on-GPU chaining (vision output directly feeding encode features)
+/// is deferred — it requires reformatting vision output to match the
+/// feature vector layout.
 pub struct GpuUnifiedPipeline {
     vision: GpuVisionCompute,
     brain: GpuBrainCompute,

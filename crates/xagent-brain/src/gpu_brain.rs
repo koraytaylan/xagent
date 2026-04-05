@@ -369,6 +369,12 @@ impl GpuBrain {
         self.agent_count
     }
 
+    /// Resize for a new population size. Reallocates all buffers.
+    /// Called between generations when population_size changes.
+    pub fn resize(&mut self, agent_count: u32) {
+        *self = Self::new(agent_count, &self.config.clone());
+    }
+
     /// Upload packed sensory data to GPU.
     pub fn upload_sensory(&mut self, frames: &[SensoryFrame]) {
         assert_eq!(frames.len(), self.agent_count as usize);
@@ -1084,5 +1090,34 @@ mod tests {
         let state = brain.read_agent_state(0);
         let active = state.patterns[O_ACTIVE_COUNT];
         assert!(active > 0.0, "memory should have stored patterns after 200 ticks, got active_count={}", active);
+    }
+
+    #[test]
+    fn resize_changes_agent_count() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(10, &config);
+        assert_eq!(brain.agent_count(), 10);
+        brain.resize(20);
+        assert_eq!(brain.agent_count(), 20);
+    }
+
+    #[test]
+    fn agents_produce_varied_motor_output() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(10, &config);
+        let frames: Vec<SensoryFrame> = (0..10)
+            .map(|_| SensoryFrame::new_blank(8, 6))
+            .collect();
+
+        let mut all_same = true;
+        for _ in 0..50 {
+            let commands = brain.tick(&frames);
+            let first = commands[0].forward;
+            if commands.iter().any(|c| (c.forward - first).abs() > 0.01) {
+                all_same = false;
+                break;
+            }
+        }
+        assert!(!all_same, "different agents should produce varied motor output");
     }
 }

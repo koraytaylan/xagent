@@ -48,7 +48,6 @@ pub struct GpuPhysics {
     pub(crate) death_staging_mapped: [bool; 2],
     pub(crate) death_submit_seq: u64,
     pub(crate) death_mapped_seq: Arc<AtomicU64>,
-    pub(crate) death_has_in_flight: bool,
 
     // ── Compute pipelines + bind groups ──
     pub(crate) physics_pipeline: wgpu::ComputePipeline,
@@ -346,7 +345,6 @@ impl GpuPhysics {
             death_staging_mapped: [false, false],
             death_submit_seq: 0,
             death_mapped_seq: Arc::new(AtomicU64::new(0)),
-            death_has_in_flight: false,
             physics_pipeline,
             physics_bind_group,
             food_grid_build_pipeline,

@@ -101,10 +101,6 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     bench_agents: usize,
 
-    /// Force CPU-only bench (skip GPU even if available)
-    #[arg(long)]
-    bench_cpu: bool,
-
     /// Override world size for --bench mode (default: from preset)
     #[arg(long)]
     world_size: Option<f32>,
@@ -2344,22 +2340,12 @@ fn main() {
             "Benchmark: {} agents, {} ticks",
             agent_count, total_ticks,
         );
-        let result = if cli.bench_cpu {
-            println!("[bench] Forced CPU mode");
-            xagent_sandbox::bench::run_bench_cpu(
-                config.brain,
-                config.world,
-                agent_count,
-                total_ticks,
-            )
-        } else {
-            xagent_sandbox::bench::run_bench(
-                config.brain,
-                config.world,
-                agent_count,
-                total_ticks,
-            )
-        };
+        let result = xagent_sandbox::bench::run_bench(
+            config.brain,
+            config.world,
+            agent_count,
+            total_ticks,
+        );
         println!(
             "Completed {} ticks in {:.2}s ({:.0} ticks/sec)",
             result.total_ticks, result.elapsed_secs, result.ticks_per_sec,

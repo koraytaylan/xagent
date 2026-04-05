@@ -6,10 +6,8 @@
 
 pub mod agent;
 pub mod bench;
-pub mod compute_backend;
 pub mod governor;
 pub mod momentum;
-pub mod gpu_compute;
 pub mod headless;
 pub mod overlay;
 pub mod physics;

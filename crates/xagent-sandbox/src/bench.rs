@@ -42,17 +42,6 @@ pub fn run_bench(
     run_bench_inner(brain, world_config, agent_count, total_ticks)
 }
 
-/// CPU-only benchmark path (still uses GpuBrain, kept for CLI compat).
-pub fn run_bench_cpu(
-    brain: BrainConfig,
-    world_config: WorldConfig,
-    agent_count: usize,
-    total_ticks: u64,
-) -> BenchResult {
-    println!("[bench] Using GpuPhysics + GpuBrain/CPU-compat ({} agents)", agent_count);
-    run_bench_inner(brain, world_config, agent_count, total_ticks)
-}
-
 fn run_bench_inner(
     brain: BrainConfig,
     world_config: WorldConfig,
@@ -129,7 +118,19 @@ fn run_bench_inner(
     let elapsed_secs = elapsed.as_secs_f64();
     let ticks_per_sec = total_ticks as f64 / elapsed_secs;
 
-    let final_positions: Vec<[f32; 3]> = vec![[0.0; 3]; agent_count];
+    // Read back final agent positions from GPU for determinism validation
+    gpu_brain.device().poll(wgpu::Maintain::Wait);
+    let state = gpu_physics.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
+    let final_positions: Vec<[f32; 3]> = (0..agent_count)
+        .map(|i| {
+            let base = i * xagent_brain::buffers::PHYS_STRIDE;
+            [
+                state[base + xagent_brain::buffers::P_POS_X],
+                state[base + xagent_brain::buffers::P_POS_Y],
+                state[base + xagent_brain::buffers::P_POS_Z],
+            ]
+        })
+        .collect();
 
     BenchResult {
         total_ticks,

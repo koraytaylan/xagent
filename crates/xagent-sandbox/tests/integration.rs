@@ -553,7 +553,7 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
     let agent_count = 4;
     let total_ticks = 100;
 
-    let result = bench::run_bench_cpu(brain, world, agent_count, total_ticks);
+    let result = bench::run_bench(brain, world, agent_count, total_ticks);
 
     assert_eq!(result.total_ticks, total_ticks, "total_ticks should match requested");
     assert_eq!(result.agent_count, agent_count, "agent_count should match requested");
@@ -734,19 +734,6 @@ fn agent_grid_rebuild_reuses_allocation() {
     assert!(near_new.contains(&0), "New agent 0 should be at (200,200)");
 }
 
-// ── ComputeBackend Tests ────────────────────────────────────────────
-
-#[test]
-fn compute_backend_probe_returns_a_tier() {
-    let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
-    // Should return at least CpuOptimized (rayon is always available)
-    assert!(matches!(
-        backend,
-        xagent_sandbox::compute_backend::ComputeBackend::CpuOptimized
-        | xagent_sandbox::compute_backend::ComputeBackend::GpuAccelerated { .. }
-    ));
-}
-
 // ── step_pure Parity Tests ──────────────────────────────────────────
 
 #[test]
@@ -924,8 +911,8 @@ fn deterministic_bench_produces_same_state_twice() {
 
     // Run bench twice with same parameters
     let (r1, r2) = pool.install(|| {
-        let r1 = xagent_sandbox::bench::run_bench_cpu(config_b.clone(), config_w.clone(), 5, 500);
-        let r2 = xagent_sandbox::bench::run_bench_cpu(config_b, config_w, 5, 500);
+        let r1 = xagent_sandbox::bench::run_bench(config_b.clone(), config_w.clone(), 5, 500);
+        let r2 = xagent_sandbox::bench::run_bench(config_b, config_w, 5, 500);
         (r1, r2)
     });
 

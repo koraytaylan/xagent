@@ -498,4 +498,60 @@ mod tests {
         assert!(new_z > 0.0, "agent should move forward in Z: got {}", new_z);
         assert!(floats[P_ALIVE] > 0.5, "agent should still be alive");
     }
+
+    #[test]
+    fn food_detect_awards_energy_on_claim() {
+        if !GpuBrain::is_available() { return; }
+        let brain_config = xagent_shared::BrainConfig::default();
+        let world_config = xagent_shared::WorldConfig::default();
+        let brain = GpuBrain::new(1, &brain_config);
+        let phys = GpuPhysics::new(&brain, 1, 1, &world_config);
+
+        let heights = vec![0.0f32; 129 * 129];
+        let biomes = vec![0u32; 256 * 256];
+        phys.upload_world(brain.queue(), &heights, &biomes,
+            &[(0.0, 1.0, 0.0)], &[false], &[0.0]);
+        phys.upload_agents(brain.queue(), &[(glam::Vec3::new(0.0, 1.0, 0.0), 50.0, 100.0, 128, 16)]);
+        phys.upload_world_config(brain.queue(), &world_config, 1, 1, 0);
+
+        // Build food grid, then detect
+        let mut encoder = brain.device().create_command_encoder(&Default::default());
+        encoder.clear_buffer(&phys.food_grid_buf, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.food_grid_build_pipeline);
+            pass.set_bind_group(0, &phys.food_grid_build_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.food_detect_pipeline);
+            pass.set_bind_group(0, &phys.food_detect_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        brain.queue().submit(std::iter::once(encoder.finish()));
+
+        // Read back agent energy
+        let readback = brain.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (PHYS_STRIDE * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc2 = brain.device().create_command_encoder(&Default::default());
+        enc2.copy_buffer_to_buffer(&phys.agent_phys_buf, 0, &readback, 0, (PHYS_STRIDE * 4) as u64);
+        brain.queue().submit(std::iter::once(enc2.finish()));
+        brain.device().poll(wgpu::Maintain::Wait);
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        brain.device().poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        let energy = floats[P_ENERGY];
+        assert!(energy > 60.0, "energy should have increased from food: got {}", energy);
+    }
 }

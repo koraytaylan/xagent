@@ -53,6 +53,8 @@ pub struct GpuBrain {
     habituate_homeo_bind_group: wgpu::BindGroup,
     recall_score_pipeline: wgpu::ComputePipeline,
     recall_score_bind_group: wgpu::BindGroup,
+    recall_topk_pipeline: wgpu::ComputePipeline,
+    recall_topk_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -272,6 +274,19 @@ impl GpuBrain {
             ],
         });
 
+        let rt_source = format!("{}\n{}", constants, include_str!("shaders/recall_topk.wgsl"));
+        let recall_topk_pipeline = Self::create_pipeline(&device, "recall_topk", &rt_source);
+        let recall_topk_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("recall_topk_bg"),
+            layout: &recall_topk_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: similarities_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pattern_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: recall_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: brain_state_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -303,6 +318,8 @@ impl GpuBrain {
             habituate_homeo_bind_group,
             recall_score_pipeline,
             recall_score_bind_group,
+            recall_topk_pipeline,
+            recall_topk_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -484,6 +501,24 @@ impl GpuBrain {
             });
             pass.set_pipeline(&self.recall_score_pipeline);
             pass.set_bind_group(0, &self.recall_score_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Dispatch recall_topk pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_recall_topk(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_recall_topk"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("recall_topk"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.recall_topk_pipeline);
+            pass.set_bind_group(0, &self.recall_topk_bind_group, &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -701,5 +736,38 @@ mod tests {
 
         // Slot 1 should be -2.0 (inactive)
         assert!((sims[1] - (-2.0)).abs() < 0.01, "slot 1 should be -2.0, got {}", sims[1]);
+    }
+
+    #[test]
+    fn recall_topk_selects_best_patterns() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+
+        // Write similarities directly: slot 5 = 0.9, slot 10 = 0.7, rest = -2.0
+        let mut sims = vec![-2.0_f32; MEMORY_CAP];
+        sims[5] = 0.9;
+        sims[10] = 0.7;
+        brain.queue.write_buffer(&brain.similarities_buf, 0, bytemuck::cast_slice(&sims));
+
+        // Mark slots 5 and 10 as active in patterns (needed for metadata update)
+        let mut state = brain.read_agent_state(0);
+        state.patterns[O_PAT_ACTIVE + 5] = 1.0;
+        state.patterns[O_PAT_ACTIVE + 10] = 1.0;
+        state.patterns[O_ACTIVE_COUNT] = 2.0;
+        brain.write_agent_state(0, &state);
+
+        brain.run_recall_topk();
+
+        // Read recall buffer
+        let mut recall = vec![0.0_f32; RECALL_IDX_STRIDE];
+        brain.read_buffer_range(&brain.recall_buf, 0, (RECALL_IDX_STRIDE * 4) as u64, &mut recall);
+
+        // Count should be 2
+        let count = recall[RECALL_K] as u32;
+        assert_eq!(count, 2, "should recall 2 patterns, got {}", count);
+
+        // First should be slot 5 (highest sim), second slot 10
+        assert_eq!(recall[0] as u32, 5, "first recalled should be slot 5");
+        assert_eq!(recall[1] as u32, 10, "second recalled should be slot 10");
     }
 }

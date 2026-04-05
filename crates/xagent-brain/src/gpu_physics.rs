@@ -612,6 +612,31 @@ impl GpuPhysics {
         queue.write_buffer(&self.agent_phys_buf, offset, bytemuck::cast_slice(&data));
     }
 
+    /// Read back full agent physics state. Returns data for all agents as flat f32 slice.
+    /// Call once per frame in windowed mode for rendering/UI.
+    pub fn read_full_state_blocking(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("state_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &staging, 0, buf_size);
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::Maintain::Wait);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        bytemuck::cast_slice::<u8, f32>(&data).to_vec()
+    }
+
     /// Blocking readback of agent stats for fitness evaluation. Call at generation end.
     pub fn read_agent_stats(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<(u32, u64)> {
         let n = self.agent_count as usize;

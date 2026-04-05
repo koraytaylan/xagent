@@ -9,6 +9,7 @@
 //! homeostatic pressure.
 
 pub mod brain;
+pub mod buffers;
 pub mod capacity;
 pub mod encoder;
 pub mod homeostasis;

@@ -8,3 +8,6 @@ xagent-shared = { path = "../xagent-shared" }
 glam = { workspace = true }
 rand = { workspace = true }
 log = { workspace = true }
+wgpu = "24"
+bytemuck = { workspace = true }
+pollster = "0.4"

@@ -159,6 +159,7 @@ pub const WC_WORLD_HALF_BOUND: usize = 16;
 pub const WC_BIOME_GRID_RES: usize = 17;
 pub const WC_GRID_WIDTH: usize = 18;
 pub const WC_GRID_OFFSET: usize = 19;
+pub const WC_TICKS_TO_RUN: usize = 20;
 pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
@@ -494,6 +495,7 @@ pub fn build_world_config(
     food_count: usize,
     agent_count: usize,
     tick: u64,
+    ticks_to_run: u32,
 ) -> Vec<f32> {
     let gw = grid_width(config.world_size);
     let go = gw / 2;
@@ -519,6 +521,7 @@ pub fn build_world_config(
     wc[WC_BIOME_GRID_RES] = 256.0;
     wc[WC_GRID_WIDTH] = gw as f32;
     wc[WC_GRID_OFFSET] = go as f32;
+    wc[WC_TICKS_TO_RUN] = ticks_to_run as f32;
     wc
 }
 

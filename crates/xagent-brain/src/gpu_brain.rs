@@ -474,6 +474,116 @@ impl GpuBrain {
         self.write_agent_state(index, &state);
     }
 
+    /// Upload sensory frames, run full brain tick (7 passes), return motor commands.
+    pub fn tick(&mut self, frames: &[SensoryFrame]) -> Vec<MotorCommand> {
+        self.submit(frames);
+        self.collect()
+    }
+
+    /// Non-blocking submit: upload sensory data, dispatch all 7 passes.
+    pub fn submit(&mut self, frames: &[SensoryFrame]) {
+        self.upload_sensory(frames);
+
+        let widx = self.staging_idx;
+        if self.staging_mapped[widx] {
+            self.motor_staging[widx].unmap();
+            self.staging_mapped[widx] = false;
+        }
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brain_tick"),
+        });
+
+        // Pass 1: feature_extract
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.feature_extract_pipeline);
+            pass.set_bind_group(0, &self.feature_extract_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 2: encode
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.encode_pipeline);
+            pass.set_bind_group(0, &self.encode_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 3: habituate_homeo
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.habituate_homeo_pipeline);
+            pass.set_bind_group(0, &self.habituate_homeo_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 4: recall_score
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.recall_score_pipeline);
+            pass.set_bind_group(0, &self.recall_score_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 5: recall_topk
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.recall_topk_pipeline);
+            pass.set_bind_group(0, &self.recall_topk_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 6: predict_and_act
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.predict_act_pipeline);
+            pass.set_bind_group(0, &self.predict_act_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // Pass 7: learn_and_store
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.learn_store_pipeline);
+            pass.set_bind_group(0, &self.learn_store_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+
+        // Copy motor output from decision_buf to staging buffer.
+        // Motor is at offset DIM+DIM (=64 f32) within each agent's DECISION_STRIDE block,
+        // so the data is not contiguous across agents. Issue N copy commands to gather it.
+        let n = self.agent_count as usize;
+        for i in 0..n {
+            let src_offset = ((i * DECISION_STRIDE + DIM + DIM) * 4) as u64;
+            let dst_offset = (i * 4 * 4) as u64; // 4 f32 * 4 bytes per agent
+            encoder.copy_buffer_to_buffer(
+                &self.decision_buf,
+                src_offset,
+                &self.motor_staging[widx],
+                dst_offset,
+                16, // 4 f32 * 4 bytes
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map the staging buffer for reading
+        let motor_size = (n * 4 * 4) as u64;
+        let seq = self.submit_seq + 1;
+        self.submit_seq = seq;
+        let flag = self.mapped_seq.clone();
+        self.motor_staging[widx]
+            .slice(..motor_size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    flag.store(seq, Ordering::Release);
+                }
+            });
+        self.staging_mapped[widx] = true;
+        self.staging_idx = 1 - self.staging_idx;
+        self.has_in_flight = true;
+    }
+
+    /// Blocking collect: wait for GPU and return motor commands.
+    pub fn collect(&mut self) -> Vec<MotorCommand> {
+        self.read_motor_output()
+    }
+
     /// Dispatch feature extraction pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_feature_extract(&mut self) {
@@ -916,5 +1026,63 @@ mod tests {
         // Verify a pattern slot is active
         let stored_idx = after.patterns[O_LAST_STORED_IDX] as usize;
         assert_eq!(after.patterns[O_PAT_ACTIVE + stored_idx], 1.0, "stored slot should be active");
+    }
+
+    #[test]
+    fn tick_produces_valid_motor_commands() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(4, &config);
+        let frames: Vec<SensoryFrame> = (0..4)
+            .map(|_| SensoryFrame::new_blank(8, 6))
+            .collect();
+
+        for _ in 0..100 {
+            let commands = brain.tick(&frames);
+            assert_eq!(commands.len(), 4);
+            for cmd in &commands {
+                assert!(cmd.forward.is_finite(), "forward must be finite");
+                assert!(cmd.turn.is_finite(), "turn must be finite");
+                assert!(cmd.forward >= -1.0 && cmd.forward <= 1.0, "forward in range: {}", cmd.forward);
+                assert!(cmd.turn >= -1.0 && cmd.turn <= 1.0, "turn in range: {}", cmd.turn);
+            }
+        }
+    }
+
+    #[test]
+    fn learning_changes_weights() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        let before = brain.read_agent_state(0);
+
+        for _ in 0..50 {
+            brain.tick(&[frame.clone()]);
+        }
+
+        let after = brain.read_agent_state(0);
+
+        // Predictor weights should shift due to gradient descent on prediction error
+        let weight_delta: f32 = before.brain_state[O_PRED_WEIGHTS..O_PRED_WEIGHTS + 100]
+            .iter()
+            .zip(&after.brain_state[O_PRED_WEIGHTS..O_PRED_WEIGHTS + 100])
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(weight_delta > 0.0, "predictor weights should change after learning");
+    }
+
+    #[test]
+    fn memory_fills_over_time() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        for _ in 0..200 {
+            brain.tick(&[frame.clone()]);
+        }
+
+        let state = brain.read_agent_state(0);
+        let active = state.patterns[O_ACTIVE_COUNT];
+        assert!(active > 0.0, "memory should have stored patterns after 200 ticks, got active_count={}", active);
     }
 }

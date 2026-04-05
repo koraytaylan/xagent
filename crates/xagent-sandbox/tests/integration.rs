@@ -451,7 +451,7 @@ fn vision_with_positions_detects_food_items() {
 
     // Use the positions-based extraction (the path used during evolution)
     let all_positions: Vec<(Vec3, bool)> = vec![(agent.body.position, true)];
-    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&all_positions);
+    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
     let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
         &agent, &world, 0, &all_positions, 0, &agent_grid, &mut frame,
@@ -574,7 +574,7 @@ fn agent_grid_query_returns_nearby_agents() {
         (Vec3::new(2.0, 0.0, 2.0), false),   // 3: dead, near origin
     ];
 
-    let grid = AgentGrid::from_positions(&positions);
+    let grid = AgentGrid::from_positions(&positions, 256.0);
 
     // Query near origin — should find agents 0 and 1 but not 2 (far) or 3 (dead)
     let nearby: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
@@ -601,7 +601,7 @@ fn agent_grid_rebuild_reuses_allocation() {
         (Vec3::new(0.0, 0.0, 0.0), true),
         (Vec3::new(50.0, 0.0, 50.0), true),
     ];
-    let mut grid = AgentGrid::from_positions(&positions_a);
+    let mut grid = AgentGrid::from_positions(&positions_a, 512.0);
 
     // After rebuild with different positions, old indices should be gone
     let positions_b: Vec<(Vec3, bool)> = vec![
@@ -840,7 +840,7 @@ fn gpu_vision_matches_cpu_vision() {
 
     // CPU vision
     let mut cpu_frame = xagent_shared::SensoryFrame::new_blank(8, 6);
-    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions);
+    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions, 256.0);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
         &agent, &world, 0, &positions, 0, &agent_grid, &mut cpu_frame,
     );

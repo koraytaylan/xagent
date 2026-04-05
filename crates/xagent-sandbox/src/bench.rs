@@ -41,17 +41,22 @@ pub fn run_bench(
 ) -> BenchResult {
     let backend = crate::compute_backend::ComputeBackend::probe();
 
+    // GPU vision is synchronous (blocking collect per tick), so CPU is
+    // faster for small agent counts where CPU rayon saturates the cores.
+    // Only use GPU when the per-agent vision cost outweighs the roundtrip.
+    const GPU_AGENT_THRESHOLD: usize = 50;
+
     match backend {
         crate::compute_backend::ComputeBackend::GpuAccelerated {
             device,
             queue,
             adapter_name,
-        } => {
-            println!("[bench] Using GPU: {}", adapter_name);
+        } if agent_count >= GPU_AGENT_THRESHOLD => {
+            println!("[bench] Using GPU: {} ({} agents)", adapter_name, agent_count);
             run_bench_gpu(device, queue, brain, world_config, agent_count, total_ticks)
         }
-        crate::compute_backend::ComputeBackend::CpuOptimized => {
-            println!("[bench] Using CPU (no GPU detected)");
+        _ => {
+            println!("[bench] Using CPU ({} agents)", agent_count);
             run_bench_cpu(brain, world_config, agent_count, total_ticks)
         }
     }
@@ -93,7 +98,7 @@ pub fn run_bench_cpu(
         }
 
         // Phase 2: brain ticks (rayon parallel)
-        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions);
+        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
         {
             let world_ref: &WorldState = &world;
             let pos = &all_positions;
@@ -235,7 +240,7 @@ fn run_bench_gpu(
             .expect("[bench] GPU vision collect failed");
 
         // Phase 2e+2f: build frames from GPU vision + CPU touch, then brain.tick
-        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions);
+        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
         {
             let world_ref: &WorldState = &world;
             let pos = &all_positions;

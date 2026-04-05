@@ -47,7 +47,7 @@ impl WorldState {
         let biome_map = BiomeMap::new(biome_seed, config.world_size);
         let food_rng = rand::rngs::SmallRng::seed_from_u64(food_seed);
         let food_items = entity::spawn_food_seeded(&terrain, &biome_map, config.food_density, food_rng);
-        let food_grid = FoodGrid::from_items(&food_items);
+        let food_grid = FoodGrid::from_items(&food_items, config.world_size);
         let spawn_rng = Mutex::new(rand::rngs::SmallRng::seed_from_u64(spawn_seed));
 
         Self {

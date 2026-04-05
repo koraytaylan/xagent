@@ -115,7 +115,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             }
 
             // Brain ticks (CPU rayon)
-            let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions);
+            let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions, world.config.world_size);
             {
                 let world_ref: &WorldState = &world;
                 let pos = &positions;

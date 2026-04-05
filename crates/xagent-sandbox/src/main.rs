@@ -98,6 +98,10 @@ struct Cli {
     /// Number of agents for --bench mode (default: 10)
     #[arg(long, default_value_t = 10)]
     bench_agents: usize,
+
+    /// Force CPU-only bench (skip GPU even if available)
+    #[arg(long)]
+    bench_cpu: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -1320,17 +1324,21 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // ── Frame time budget: never block UI longer than this ──
-                    const TICK_BUDGET_MS: u128 = 12;
+                    // ── Frame time budget ──
+                    // At low speed (≤10×) cap at 12ms to maintain smooth 60fps UI.
+                    // At high speed (>10×) the user is fast-forwarding: allow up
+                    // to 15ms and check less frequently so throughput isn't
+                    // throttled by Instant::now() syscalls.
+                    let tick_budget_ms: u128 = if self.speed_multiplier > 10 { 15 } else { 12 };
+                    let budget_check_interval: u32 = if self.speed_multiplier > 100 { 64 } else { 16 };
                     let tick_start = Instant::now();
 
                     while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
                         self.sim_accumulator -= SIM_DT;
                         ticks_run += 1;
 
-                        // Yield to UI every 16 ticks to maintain responsiveness
-                        if ticks_run % 16 == 0
-                            && tick_start.elapsed().as_millis() >= TICK_BUDGET_MS
+                        if ticks_run % budget_check_interval == 0
+                            && tick_start.elapsed().as_millis() >= tick_budget_ms
                         {
                             break;
                         }
@@ -1344,23 +1352,23 @@ impl ApplicationHandler for App {
                                 all_positions[i] = (agent.body.body.position, agent.body.body.alive);
                             }
 
-                            // ── Phase 2: Brain ticks (CPU rayon) ──
-                            // When GPU is active this frame, agents use
-                            // cached_motor from the per-frame collect above.
-                            // Otherwise, CPU runs brain every tick.
+                            // ── Phase 2+3: Brain + Physics (merged) ──
                             if !use_gpu {
+                                // CPU path: brain + physics in one parallel pass.
+                                // step_pure takes &WorldState (immutable), so food
+                                // consumption is deferred to the sequential phase.
                                 let tick = self.tick;
                                 let speed = self.speed_multiplier;
                                 let world_ref: &WorldState = &*world;
                                 let all_pos = &all_positions;
-                                let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos);
+                                let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos, self.world_config.world_size);
 
-                                self.agents
+                                let results: Vec<(Option<usize>, bool)> = self.agents
                                     .par_iter_mut()
                                     .enumerate()
-                                    .for_each(|(i, agent)| {
+                                    .map(|(i, agent)| {
                                         if !agent.body.body.alive {
-                                            return;
+                                            return (None, false);
                                         }
 
                                         senses::extract_senses_with_positions(
@@ -1378,61 +1386,133 @@ impl ApplicationHandler for App {
                                         if speed <= 1 {
                                             record_agent_histories(agent);
                                         }
-                                    });
-                            }
 
-                            // ── Phase 3: Physics + stats (sequential, mutates world) ──
-                            for i in 0..self.agents.len() {
-                                let agent = &mut self.agents[i];
-                                if !agent.body.body.alive {
-                                    continue;
-                                }
+                                        let motor = agent.cached_motor.clone();
+                                        let (consumed, died) =
+                                            xagent_sandbox::physics::step_pure(
+                                                &mut agent.body, &motor, world_ref, SIM_DT,
+                                            );
 
-                                let motor = agent.cached_motor.clone();
-                                let consumed = xagent_sandbox::physics::step(
-                                    &mut agent.body, &motor, world, SIM_DT,
-                                );
-                                // Metabolic cost: brain capacity drains energy
-                                let brain_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
-                                    agent.brain.config.memory_capacity,
-                                    agent.brain.config.processing_slots,
-                                );
-                                agent.body.body.internal.energy -= brain_drain;
-                                if agent.body.body.internal.energy <= 0.0 {
-                                    agent.body.body.internal.energy = 0.0;
-                                    agent.body.body.alive = false;
-                                }
-                                if let Some(food_idx) = consumed {
-                                    self.food_dirty = true;
-                                    agent.food_consumed += 1;
-                                    if let Some(ref mut rec) = self.recording {
-                                        rec.record_food_event(xagent_sandbox::replay::FoodEvent {
-                                            tick: self.tick,
-                                            food_index: food_idx,
-                                            consumed: true,
-                                            new_position: None,
-                                        });
+                                        let brain_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
+                                            agent.brain.config.memory_capacity,
+                                            agent.brain.config.processing_slots,
+                                        );
+                                        agent.body.body.internal.energy -= brain_drain;
+                                        if agent.body.body.internal.energy <= 0.0 {
+                                            agent.body.body.internal.energy = 0.0;
+                                            agent.body.body.alive = false;
+                                            return (consumed, true);
+                                        }
+
+                                        agent.total_ticks_alive += 1;
+                                        (consumed, died)
+                                    })
+                                    .collect();
+
+                                // Deferred food consumption (sequential — mutates world)
+                                for (i, (consumed, _)) in results.iter().enumerate() {
+                                    if let Some(idx) = consumed {
+                                        let food = &mut world.food_items[*idx];
+                                        if !food.consumed {
+                                            let fx = food.position.x;
+                                            let fz = food.position.z;
+                                            food.consumed = true;
+                                            food.respawn_timer = 10.0;
+                                            world.food_grid.remove(*idx, fx, fz);
+                                            self.agents[i].body.body.internal.energy =
+                                                (self.agents[i].body.body.internal.energy
+                                                    + world.config.food_energy_value)
+                                                    .min(self.agents[i].body.body.internal.max_energy);
+                                            self.food_dirty = true;
+                                            self.agents[i].food_consumed += 1;
+                                            if let Some(ref mut rec) = self.recording {
+                                                rec.record_food_event(xagent_sandbox::replay::FoodEvent {
+                                                    tick: self.tick,
+                                                    food_index: *idx,
+                                                    consumed: true,
+                                                    new_position: None,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
-                                agent.total_ticks_alive += 1;
+
+                                // Per-agent bookkeeping (sequential, only at 1x speed)
                                 if self.speed_multiplier <= 1 {
+                                    for agent in &mut self.agents {
+                                        if agent.body.body.alive {
+                                            agent.record_heatmap(world.config.world_size);
+                                            agent.record_trail();
+                                        }
+                                    }
+                                    if self.selected_agent_idx < self.agents.len() {
+                                        let agent = &self.agents[self.selected_agent_idx];
+                                        let life_ticks = agent.age(self.tick);
+                                        let motor = agent.cached_motor.clone();
+                                        log_tick_to_csv(
+                                            &mut self.logger,
+                                            agent,
+                                            world,
+                                            &motor,
+                                            life_ticks,
+                                        );
+                                        self.total_prediction_error +=
+                                            agent.brain.telemetry().prediction_error
+                                                as f64;
+                                        self.error_count += 1;
+                                    }
+                                }
+                            } else {
+                                // GPU path (speed=1 only): sequential physics
+                                for i in 0..self.agents.len() {
+                                    let agent = &mut self.agents[i];
+                                    if !agent.body.body.alive {
+                                        continue;
+                                    }
+
+                                    let motor = agent.cached_motor.clone();
+                                    let consumed = xagent_sandbox::physics::step(
+                                        &mut agent.body, &motor, world, SIM_DT,
+                                    );
+                                    let brain_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
+                                        agent.brain.config.memory_capacity,
+                                        agent.brain.config.processing_slots,
+                                    );
+                                    agent.body.body.internal.energy -= brain_drain;
+                                    if agent.body.body.internal.energy <= 0.0 {
+                                        agent.body.body.internal.energy = 0.0;
+                                        agent.body.body.alive = false;
+                                    }
+                                    if let Some(food_idx) = consumed {
+                                        self.food_dirty = true;
+                                        agent.food_consumed += 1;
+                                        if let Some(ref mut rec) = self.recording {
+                                            rec.record_food_event(xagent_sandbox::replay::FoodEvent {
+                                                tick: self.tick,
+                                                food_index: food_idx,
+                                                consumed: true,
+                                                new_position: None,
+                                            });
+                                        }
+                                    }
+                                    agent.total_ticks_alive += 1;
                                     agent.record_heatmap(world.config.world_size);
                                     agent.record_trail();
-                                }
 
-                                if i == self.selected_agent_idx {
-                                    let life_ticks = agent.age(self.tick);
-                                    log_tick_to_csv(
-                                        &mut self.logger,
-                                        agent,
-                                        world,
-                                        &motor,
-                                        life_ticks,
-                                    );
-                                    self.total_prediction_error +=
-                                        agent.brain.telemetry().prediction_error
-                                            as f64;
-                                    self.error_count += 1;
+                                    if i == self.selected_agent_idx {
+                                        let life_ticks = agent.age(self.tick);
+                                        log_tick_to_csv(
+                                            &mut self.logger,
+                                            agent,
+                                            world,
+                                            &motor,
+                                            life_ticks,
+                                        );
+                                        self.total_prediction_error +=
+                                            agent.brain.telemetry().prediction_error
+                                                as f64;
+                                        self.error_count += 1;
+                                    }
                                 }
                             }
 
@@ -1579,7 +1659,7 @@ impl ApplicationHandler for App {
                             let world_ref: &WorldState = world;
                             let all_pos = &all_positions;
                             let tick = self.tick;
-                            let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos);
+                            let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos, self.world_config.world_size);
 
                             // Parallel sensory extraction for ALL alive agents
                             struct AgentGpuSlice {
@@ -2568,12 +2648,22 @@ fn main() {
             "Benchmark: {} agents, {} ticks",
             agent_count, total_ticks,
         );
-        let result = xagent_sandbox::bench::run_bench(
-            config.brain,
-            config.world,
-            agent_count,
-            total_ticks,
-        );
+        let result = if cli.bench_cpu {
+            println!("[bench] Forced CPU mode");
+            xagent_sandbox::bench::run_bench_cpu(
+                config.brain,
+                config.world,
+                agent_count,
+                total_ticks,
+            )
+        } else {
+            xagent_sandbox::bench::run_bench(
+                config.brain,
+                config.world,
+                agent_count,
+                total_ticks,
+            )
+        };
         println!(
             "Completed {} ticks in {:.2}s ({:.0} ticks/sec)",
             result.total_ticks, result.elapsed_secs, result.ticks_per_sec,

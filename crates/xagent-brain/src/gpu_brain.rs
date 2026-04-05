@@ -55,6 +55,8 @@ pub struct GpuBrain {
     recall_score_bind_group: wgpu::BindGroup,
     recall_topk_pipeline: wgpu::ComputePipeline,
     recall_topk_bind_group: wgpu::BindGroup,
+    predict_act_pipeline: wgpu::ComputePipeline,
+    predict_act_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -287,6 +289,22 @@ impl GpuBrain {
             ],
         });
 
+        let pa_source = format!("{}\n{}", constants, include_str!("shaders/predict_and_act.wgsl"));
+        let predict_act_pipeline = Self::create_pipeline(&device, "predict_and_act", &pa_source);
+        let predict_act_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("predict_act_bg"),
+            layout: &predict_act_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: brain_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pattern_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: recall_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: homeo_out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: history_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: decision_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -320,6 +338,8 @@ impl GpuBrain {
             recall_score_bind_group,
             recall_topk_pipeline,
             recall_topk_bind_group,
+            predict_act_pipeline,
+            predict_act_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -519,6 +539,24 @@ impl GpuBrain {
             });
             pass.set_pipeline(&self.recall_topk_pipeline);
             pass.set_bind_group(0, &self.recall_topk_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Dispatch predict_and_act pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_predict_and_act(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_predict_and_act"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("predict_and_act"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.predict_act_pipeline);
+            pass.set_bind_group(0, &self.predict_act_bind_group, &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -769,5 +807,49 @@ mod tests {
         // First should be slot 5 (highest sim), second slot 10
         assert_eq!(recall[0] as u32, 5, "first recalled should be slot 5");
         assert_eq!(recall[1] as u32, 10, "second recalled should be slot 10");
+    }
+
+    #[test]
+    fn predict_and_act_produces_valid_motor() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(2, &config);
+        let frames: Vec<SensoryFrame> = (0..2)
+            .map(|_| SensoryFrame::new_blank(8, 6))
+            .collect();
+
+        // Run full pipeline up to predict_and_act
+        brain.upload_sensory(&frames);
+        brain.run_feature_extract();
+        brain.run_encode();
+        brain.run_habituate_homeo();
+        brain.run_recall_score();
+        brain.run_recall_topk();
+        brain.run_predict_and_act();
+
+        // Read decision buffer
+        let total = 2 * DECISION_STRIDE;
+        let mut dec = vec![0.0_f32; total];
+        brain.read_buffer_range(&brain.decision_buf, 0, (total * 4) as u64, &mut dec);
+
+        // Motor output should be finite and in [-1, 1]
+        for agent in 0..2 {
+            let base = agent * DECISION_STRIDE;
+            let fwd = dec[base + DIM + DIM];
+            let trn = dec[base + DIM + DIM + 1];
+            assert!(fwd.is_finite(), "agent {} forward not finite: {}", agent, fwd);
+            assert!(trn.is_finite(), "agent {} turn not finite: {}", agent, trn);
+            assert!(
+                fwd >= -1.0 && fwd <= 1.0,
+                "agent {} forward out of range: {}",
+                agent,
+                fwd
+            );
+            assert!(
+                trn >= -1.0 && trn <= 1.0,
+                "agent {} turn out of range: {}",
+                agent,
+                trn
+            );
+        }
     }
 }

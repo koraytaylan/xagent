@@ -930,6 +930,10 @@ struct VisionParams {
     agent_radius_sq: f32, // 2.25
     food_radius_sq: f32,  // 1.0
     biome_res: u32,      // biome grid resolution (e.g. 256)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: VisionParams;
@@ -967,8 +971,12 @@ fn terrain_height(x: f32, z: f32) -> f32 {
 fn biome_color(x: f32, z: f32) -> vec4<f32> {
     let half = params.world_size / 2.0;
     let inv_cell = f32(params.biome_res) / params.world_size;
-    let col = min(u32(floor((x + half) * inv_cell)), params.biome_res - 1u);
-    let row = min(u32(floor((z + half) * inv_cell)), params.biome_res - 1u);
+    // Clamp in float space before u32 conversion to avoid negative→u32 issues
+    // when rays extend beyond world bounds (x/z < -half).
+    let gx = clamp((x + half) * inv_cell, 0.0, f32(params.biome_res - 1u));
+    let gz = clamp((z + half) * inv_cell, 0.0, f32(params.biome_res - 1u));
+    let col = u32(floor(gx));
+    let row = u32(floor(gz));
     let biome = biome_types[row * params.biome_res + col];
     if biome == 0u { // FoodRich
         return vec4(0.15, 0.50, 0.10, 1.0);
@@ -1109,6 +1117,10 @@ pub struct VisionParams {
     pub agent_radius_sq: f32,
     pub food_radius_sq: f32,
     pub biome_res: u32,
+    // 12 fields × 4 bytes = 48 bytes (already 16-byte aligned).
+    // Explicit padding to 64 bytes for future-proofing against
+    // stricter WGSL uniform alignment requirements on some drivers.
+    pub _padding: [u32; 4],
 }
 
 // ── GpuVisionCompute ─────────────────────────────────────────────────
@@ -1207,6 +1219,7 @@ impl GpuVisionCompute {
             agent_radius_sq: 2.25,
             food_radius_sq: 1.0,
             biome_res,
+            _padding: [0; 4],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vision-params"),
@@ -1337,6 +1350,7 @@ impl GpuVisionCompute {
             agent_radius_sq: 2.25,
             food_radius_sq: 1.0,
             biome_res: self.biome_res,
+            _padding: [0; 4],
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 

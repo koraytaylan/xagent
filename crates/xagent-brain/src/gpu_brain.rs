@@ -47,6 +47,8 @@ pub struct GpuBrain {
     // ── Compute pipelines ──
     feature_extract_pipeline: wgpu::ComputePipeline,
     feature_extract_bind_group: wgpu::BindGroup,
+    encode_pipeline: wgpu::ComputePipeline,
+    encode_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -227,6 +229,18 @@ impl GpuBrain {
             ],
         });
 
+        let enc_source = format!("{}\n{}", constants, include_str!("shaders/encode.wgsl"));
+        let encode_pipeline = Self::create_pipeline(&device, "encode", &enc_source);
+        let encode_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("encode_bg"),
+            layout: &encode_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: features_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: brain_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: encoded_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -252,6 +266,8 @@ impl GpuBrain {
             has_in_flight: false,
             feature_extract_pipeline,
             feature_extract_bind_group,
+            encode_pipeline,
+            encode_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -384,6 +400,24 @@ impl GpuBrain {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Dispatch encode pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_encode(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_encode"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("encode"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.encode_pipeline);
+            pass.set_bind_group(0, &self.encode_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
     pub(crate) fn read_buffer_range(&self, buffer: &wgpu::Buffer, offset: u64, size: u64, out: &mut Vec<f32>) {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -490,6 +524,47 @@ mod tests {
 
         for j in 0..6 {
             assert_eq!(after.brain_state[O_HOMEO + j], 0.0);
+        }
+    }
+
+    #[test]
+    fn encode_produces_tanh_output() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+
+        // Set up identity-like weights: weight[0][d] = 1.0 for all d, rest = 0
+        // This means encoded[d] = fast_tanh(features[0] * 1.0 + bias[d])
+        let mut state = brain.read_agent_state(0);
+        // Zero all encoder weights
+        for i in 0..(FEATURE_COUNT * DIM) {
+            state.brain_state[O_ENC_WEIGHTS + i] = 0.0;
+        }
+        // Set weight[feature=0, dim=d] = 1.0 for all d
+        for d in 0..DIM {
+            state.brain_state[O_ENC_WEIGHTS + 0 * DIM + d] = 1.0;
+        }
+        // Zero biases
+        for d in 0..DIM {
+            state.brain_state[O_ENC_BIASES + d] = 0.0;
+        }
+        brain.write_agent_state(0, &state);
+
+        // Create a frame with known first pixel
+        let mut frame = SensoryFrame::new_blank(8, 6);
+        frame.vision.color[0] = 0.5; // features[0] = 0.5
+        brain.upload_sensory(&[frame]);
+        brain.run_feature_extract();
+        brain.run_encode();
+
+        // Read back encoded
+        let mut encoded = vec![0.0_f32; DIM];
+        brain.read_buffer_range(&brain.encoded_buf, 0, (DIM * 4) as u64, &mut encoded);
+
+        // All dims should be fast_tanh(0.5)
+        let expected = crate::fast_tanh(0.5);
+        for d in 0..DIM {
+            assert!((encoded[d] - expected).abs() < 0.01,
+                "dim {} expected {} got {}", d, expected, encoded[d]);
         }
     }
 }

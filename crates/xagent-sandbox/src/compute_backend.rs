@@ -43,7 +43,7 @@ impl ComputeBackend {
         let adapter_name = adapter.get_info().name.clone();
 
         // Request the adapter's actual storage buffer limit so shared
-        // device works with GpuBrainCompute (which needs large buffers).
+        // device works with large GPU pipelines.
         let adapter_limits = adapter.limits();
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_storage_buffer_binding_size =

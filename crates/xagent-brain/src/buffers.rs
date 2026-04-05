@@ -88,6 +88,79 @@ pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * DIM; // 236
 pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1;                   // 2369
 pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1;                  // 2370
 
+// ── Agent physics buffer layout (per agent, GPU-resident) ─────────────
+
+pub const P_POS_X: usize = 0;
+pub const P_POS_Y: usize = 1;
+pub const P_POS_Z: usize = 2;
+pub const P_VEL_X: usize = 3;
+pub const P_VEL_Y: usize = 4;
+pub const P_VEL_Z: usize = 5;
+pub const P_FACING_X: usize = 6;
+pub const P_FACING_Y: usize = 7;
+pub const P_FACING_Z: usize = 8;
+pub const P_YAW: usize = 9;
+pub const P_ANGULAR_VEL: usize = 10;
+pub const P_ENERGY: usize = 11;
+pub const P_MAX_ENERGY: usize = 12;
+pub const P_INTEGRITY: usize = 13;
+pub const P_MAX_INTEGRITY: usize = 14;
+pub const P_PREV_ENERGY: usize = 15;
+pub const P_PREV_INTEGRITY: usize = 16;
+pub const P_ALIVE: usize = 17;
+pub const P_FOOD_COUNT: usize = 18;
+pub const P_TICKS_ALIVE: usize = 19;
+pub const P_DIED_FLAG: usize = 20;
+pub const P_MEMORY_CAP: usize = 21;
+pub const P_PROCESSING_SLOTS: usize = 22;
+pub const P_PAD: usize = 23;
+pub const PHYS_STRIDE: usize = 24;
+
+// ── Food buffer layout (per food item) ───────────────────────────────
+
+pub const F_POS_X: usize = 0;
+pub const F_POS_Y: usize = 1;
+pub const F_POS_Z: usize = 2;
+pub const F_RESPAWN_TIMER: usize = 3;
+pub const FOOD_STATE_STRIDE: usize = 4;
+
+// ── Grid constants ───────────────────────────────────────────────────
+
+pub const GRID_CELL_SIZE: f32 = 8.0;
+pub const FOOD_GRID_MAX_PER_CELL: usize = 16;
+pub const FOOD_GRID_CELL_STRIDE: usize = 1 + FOOD_GRID_MAX_PER_CELL; // 17
+pub const AGENT_GRID_MAX_PER_CELL: usize = 32;
+pub const AGENT_GRID_CELL_STRIDE: usize = 1 + AGENT_GRID_MAX_PER_CELL; // 33
+
+/// Compute grid width (cells per axis) for a given world size.
+pub fn grid_width(world_size: f32) -> usize {
+    (world_size / GRID_CELL_SIZE).ceil() as usize + 4
+}
+
+// ── World config uniform layout ──────────────────────────────────────
+
+pub const WC_WORLD_SIZE: usize = 0;
+pub const WC_DT: usize = 1;
+pub const WC_ENERGY_DEPLETION: usize = 2;
+pub const WC_MOVEMENT_COST: usize = 3;
+pub const WC_HAZARD_DAMAGE: usize = 4;
+pub const WC_INTEGRITY_REGEN: usize = 5;
+pub const WC_FOOD_ENERGY: usize = 6;
+pub const WC_FOOD_RADIUS: usize = 7;
+pub const WC_TERRAIN_VPS: usize = 8;
+pub const WC_TERRAIN_INV_STEP: usize = 9;
+pub const WC_TERRAIN_HALF: usize = 10;
+pub const WC_BIOME_INV_CELL: usize = 11;
+pub const WC_FOOD_COUNT: usize = 12;
+pub const WC_AGENT_COUNT: usize = 13;
+pub const WC_TICK: usize = 14;
+pub const WC_RNG_SEED: usize = 15;
+pub const WC_WORLD_HALF_BOUND: usize = 16;
+pub const WC_BIOME_GRID_RES: usize = 17;
+pub const WC_GRID_WIDTH: usize = 18;
+pub const WC_GRID_OFFSET: usize = 19;
+pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
+
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
 pub const FEATURES_STRIDE: usize = FEATURE_COUNT;     // 217
@@ -300,6 +373,167 @@ fn rand_normal(seed1: u32, seed2: u32) -> f32 {{
 }}
 ",
     )
+}
+
+/// Generate WGSL constants for physics/vision shaders.
+/// These are separate from brain constants to avoid name collisions.
+pub fn wgsl_physics_constants(
+    world_size: f32,
+    food_count: usize,
+    agent_count: usize,
+) -> String {
+    let gw = grid_width(world_size);
+    let go = gw / 2;
+    let terrain_vps: u32 = 129;
+    let terrain_step = world_size / 128.0;
+    format!(
+r#"// Auto-generated physics constants — do not edit manually
+const PHYS_STRIDE: u32 = {PHYS_STRIDE}u;
+const P_POS_X: u32 = {P_POS_X}u;
+const P_POS_Y: u32 = {P_POS_Y}u;
+const P_POS_Z: u32 = {P_POS_Z}u;
+const P_VEL_X: u32 = {P_VEL_X}u;
+const P_VEL_Y: u32 = {P_VEL_Y}u;
+const P_VEL_Z: u32 = {P_VEL_Z}u;
+const P_FACING_X: u32 = {P_FACING_X}u;
+const P_FACING_Y: u32 = {P_FACING_Y}u;
+const P_FACING_Z: u32 = {P_FACING_Z}u;
+const P_YAW: u32 = {P_YAW}u;
+const P_ANGULAR_VEL: u32 = {P_ANGULAR_VEL}u;
+const P_ENERGY: u32 = {P_ENERGY}u;
+const P_MAX_ENERGY: u32 = {P_MAX_ENERGY}u;
+const P_INTEGRITY: u32 = {P_INTEGRITY}u;
+const P_MAX_INTEGRITY: u32 = {P_MAX_INTEGRITY}u;
+const P_PREV_ENERGY: u32 = {P_PREV_ENERGY}u;
+const P_PREV_INTEGRITY: u32 = {P_PREV_INTEGRITY}u;
+const P_ALIVE: u32 = {P_ALIVE}u;
+const P_FOOD_COUNT: u32 = {P_FOOD_COUNT}u;
+const P_TICKS_ALIVE: u32 = {P_TICKS_ALIVE}u;
+const P_DIED_FLAG: u32 = {P_DIED_FLAG}u;
+const P_MEMORY_CAP: u32 = {P_MEMORY_CAP}u;
+const P_PROCESSING_SLOTS: u32 = {P_PROCESSING_SLOTS}u;
+
+const FOOD_STATE_STRIDE: u32 = {FOOD_STATE_STRIDE}u;
+const F_POS_X: u32 = {F_POS_X}u;
+const F_POS_Y: u32 = {F_POS_Y}u;
+const F_POS_Z: u32 = {F_POS_Z}u;
+const F_RESPAWN_TIMER: u32 = {F_RESPAWN_TIMER}u;
+
+const GRAVITY: f32 = 20.0;
+const MOVE_SPEED: f32 = 8.0;
+const TURN_SPEED: f32 = 3.0;
+const AGENT_HALF_HEIGHT: f32 = 1.0;
+const METABOLIC_BASE_COST: f32 = 0.0001;
+const METABOLIC_MEMORY_COST: f32 = 0.00003;
+const METABOLIC_PROCESSING_COST: f32 = 0.0001;
+const FOOD_CONSUME_RADIUS_SQ: f32 = 6.25;
+const JUMP_VELOCITY: f32 = 8.0;
+const COLLISION_MIN_DIST: f32 = 2.0;
+const COLLISION_MIN_DIST_SQ: f32 = 4.0;
+const COLLISION_FIXED_SCALE: f32 = 1024.0;
+
+const CELL_SIZE: f32 = {GRID_CELL_SIZE};
+const GRID_WIDTH: u32 = {gw}u;
+const GRID_OFFSET: i32 = {go};
+const FOOD_GRID_MAX_PER_CELL: u32 = {FOOD_GRID_MAX_PER_CELL}u;
+const FOOD_GRID_CELL_STRIDE: u32 = {FOOD_GRID_CELL_STRIDE}u;
+const AGENT_GRID_MAX_PER_CELL: u32 = {AGENT_GRID_MAX_PER_CELL}u;
+const AGENT_GRID_CELL_STRIDE: u32 = {AGENT_GRID_CELL_STRIDE}u;
+
+const TERRAIN_VPS: u32 = {terrain_vps}u;
+const TERRAIN_MAX_IDX: u32 = {max_idx}u;
+const TERRAIN_INV_STEP: f32 = {inv_step};
+const TERRAIN_HALF: f32 = {half};
+const TERRAIN_MAX_COORD: f32 = {max_coord};
+const BIOME_GRID_RES: u32 = 256u;
+
+const FOOD_COUNT_VAL: u32 = {food_count}u;
+const AGENT_COUNT_VAL: u32 = {agent_count}u;
+
+const FOOD_RESPAWN_TIME: f32 = 10.0;
+const FOOD_HEIGHT_OFFSET: f32 = 0.35;
+const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
+
+const VISION_FOV_HALF: f32 = 0.7853982;  // PI/4 = 45 degrees (half of 90)
+const VISION_MAX_DIST: f32 = 50.0;
+const VISION_STEP_SIZE: f32 = 1.0;
+const VISION_NUM_STEPS: u32 = 50u;
+const VISION_RAYS: u32 = 48u;
+const VISION_W: u32 = 8u;
+const VISION_H: u32 = 6u;
+const VISION_COLOR_COUNT: u32 = 192u;  // 48 rays × 4 RGBA
+const VISION_DEPTH_COUNT: u32 = 48u;
+const MAX_TOUCH_CONTACTS: u32 = 4u;
+const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
+const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
+
+const TOUCH_FOOD: u32 = 1u;
+const TOUCH_TERRAIN_EDGE: u32 = 2u;
+const TOUCH_HAZARD: u32 = 3u;
+const TOUCH_AGENT: u32 = 4u;
+const TOUCH_FOOD_RANGE: f32 = 3.0;
+const TOUCH_AGENT_RANGE: f32 = 5.0;
+const TOUCH_EDGE_RANGE: f32 = 3.0;
+
+fn cell_coord(v: f32) -> i32 {{
+    return i32(floor(v / CELL_SIZE));
+}}
+
+fn height_at(hmap: ptr<storage, array<f32>, read>, x: f32, z: f32) -> f32 {{
+    let gx = clamp((x + TERRAIN_HALF) * TERRAIN_INV_STEP, 0.0, TERRAIN_MAX_COORD);
+    let gz = clamp((z + TERRAIN_HALF) * TERRAIN_INV_STEP, 0.0, TERRAIN_MAX_COORD);
+    let ix = min(u32(gx), TERRAIN_MAX_IDX);
+    let iz = min(u32(gz), TERRAIN_MAX_IDX);
+    let fx = gx - f32(ix);
+    let fz = gz - f32(iz);
+    let h00 = (*hmap)[iz * TERRAIN_VPS + ix];
+    let h10 = (*hmap)[iz * TERRAIN_VPS + ix + 1u];
+    let h01 = (*hmap)[(iz + 1u) * TERRAIN_VPS + ix];
+    let h11 = (*hmap)[(iz + 1u) * TERRAIN_VPS + ix + 1u];
+    return mix(mix(h00, h10, fx), mix(h01, h11, fx), fz);
+}}
+"#,
+        gw = gw,
+        go = go,
+        half = world_size / 2.0,
+        inv_step = 1.0 / terrain_step,
+        max_idx = terrain_vps - 2,
+        max_coord = (terrain_vps - 1) as f32,
+    )
+}
+
+/// Build the world config uniform data.
+pub fn build_world_config(
+    config: &xagent_shared::WorldConfig,
+    food_count: usize,
+    agent_count: usize,
+    tick: u64,
+) -> Vec<f32> {
+    let gw = grid_width(config.world_size);
+    let go = gw / 2;
+    let terrain_step = config.world_size / 128.0;
+    let mut wc = vec![0.0f32; WORLD_CONFIG_SIZE];
+    wc[WC_WORLD_SIZE] = config.world_size;
+    wc[WC_DT] = 1.0 / config.tick_rate;
+    wc[WC_ENERGY_DEPLETION] = config.energy_depletion_rate;
+    wc[WC_MOVEMENT_COST] = config.movement_energy_cost;
+    wc[WC_HAZARD_DAMAGE] = config.hazard_damage_rate;
+    wc[WC_INTEGRITY_REGEN] = config.integrity_regen_rate;
+    wc[WC_FOOD_ENERGY] = config.food_energy_value;
+    wc[WC_FOOD_RADIUS] = 2.5;
+    wc[WC_TERRAIN_VPS] = 129.0;
+    wc[WC_TERRAIN_INV_STEP] = 1.0 / terrain_step;
+    wc[WC_TERRAIN_HALF] = config.world_size / 2.0;
+    wc[WC_BIOME_INV_CELL] = 256.0 / config.world_size;
+    wc[WC_FOOD_COUNT] = food_count as f32;
+    wc[WC_AGENT_COUNT] = agent_count as f32;
+    wc[WC_TICK] = tick as f32;
+    wc[WC_RNG_SEED] = config.seed as f32;
+    wc[WC_WORLD_HALF_BOUND] = config.world_size / 2.0 - 1.0;
+    wc[WC_BIOME_GRID_RES] = 256.0;
+    wc[WC_GRID_WIDTH] = gw as f32;
+    wc[WC_GRID_OFFSET] = go as f32;
+    wc
 }
 
 /// Initialize brain_state buffer data for one agent from BrainConfig.

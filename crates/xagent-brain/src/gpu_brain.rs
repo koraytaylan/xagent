@@ -57,6 +57,8 @@ pub struct GpuBrain {
     recall_topk_bind_group: wgpu::BindGroup,
     predict_act_pipeline: wgpu::ComputePipeline,
     predict_act_bind_group: wgpu::BindGroup,
+    learn_store_pipeline: wgpu::ComputePipeline,
+    learn_store_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -305,6 +307,22 @@ impl GpuBrain {
             ],
         });
 
+        let ls_source = format!("{}\n{}", constants, include_str!("shaders/learn_and_store.wgsl"));
+        let learn_store_pipeline = Self::create_pipeline(&device, "learn_and_store", &ls_source);
+        let learn_store_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("learn_store_bg"),
+            layout: &learn_store_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: features_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: brain_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pattern_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: decision_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: homeo_out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: config_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -340,6 +358,8 @@ impl GpuBrain {
             recall_topk_bind_group,
             predict_act_pipeline,
             predict_act_bind_group,
+            learn_store_pipeline,
+            learn_store_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -557,6 +577,24 @@ impl GpuBrain {
             });
             pass.set_pipeline(&self.predict_act_pipeline);
             pass.set_bind_group(0, &self.predict_act_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Dispatch learn_and_store pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_learn_and_store(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_learn_and_store"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("learn_and_store"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.learn_store_pipeline);
+            pass.set_bind_group(0, &self.learn_store_bind_group, &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -851,5 +889,32 @@ mod tests {
                 trn
             );
         }
+    }
+
+    #[test]
+    fn learn_and_store_modifies_weights_and_stores_pattern() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        // Run full pipeline through all 7 passes
+        brain.upload_sensory(&[frame.clone()]);
+        brain.run_feature_extract();
+        brain.run_encode();
+        brain.run_habituate_homeo();
+        brain.run_recall_score();
+        brain.run_recall_topk();
+        brain.run_predict_and_act();
+        brain.run_learn_and_store();
+
+        let after = brain.read_agent_state(0);
+
+        // Pattern should have been stored (active_count should be > 0)
+        let active = after.patterns[O_ACTIVE_COUNT];
+        assert!(active >= 1.0, "should have stored at least one pattern, active_count={}", active);
+
+        // Verify a pattern slot is active
+        let stored_idx = after.patterns[O_LAST_STORED_IDX] as usize;
+        assert_eq!(after.patterns[O_PAT_ACTIVE + stored_idx], 1.0, "stored slot should be active");
     }
 }

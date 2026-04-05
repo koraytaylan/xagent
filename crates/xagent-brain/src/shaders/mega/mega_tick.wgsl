@@ -4,16 +4,21 @@
 //   vision_tick   — multi-workgroup, 1 ray per thread, ceil(agents*48/256) WGs
 //   brain_tick    — per-agent senses + 7-pass brain
 
+// Push constants: per-cycle tick values (avoids per-cycle submit overhead)
+struct PushConstants {
+    start_tick: u32,
+    ticks_to_run: u32,
+}
+var<push_constant> pc: PushConstants;
+
 // ── Physics mini-kernel ──────────────────────────────────────────────────
 @compute @workgroup_size(256)
 fn physics_tick(@builtin(local_invocation_id) lid: vec3u) {
     let tid = lid.x;
     let agent_count = wc_u32(WC_AGENT_COUNT);
-    let start_tick = wc_u32(WC_TICK);
-    let ticks_to_run = wc_u32(WC_TICKS_TO_RUN);
 
-    for (var t = 0u; t < ticks_to_run; t++) {
-        let tick = start_tick + t;
+    for (var t = 0u; t < pc.ticks_to_run; t++) {
+        let tick = pc.start_tick + t;
 
         phase_clear(tid);
         storageBarrier(); workgroupBarrier();

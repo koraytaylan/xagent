@@ -90,7 +90,27 @@ impl GpuBrain {
         .is_some()
     }
 
-    fn create_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
+    /// Expose the wgpu device for creating command encoders externally.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Expose the wgpu queue for submitting commands externally.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Expose the sensory input buffer for external writes (e.g., vision shader).
+    pub fn sensory_buf(&self) -> &wgpu::Buffer {
+        &self.sensory_buf
+    }
+
+    /// Expose the decision output buffer for external reads (e.g., physics shader).
+    pub fn decision_buf(&self) -> &wgpu::Buffer {
+        &self.decision_buf
+    }
+
+    pub(crate) fn create_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -135,6 +155,8 @@ impl GpuBrain {
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_storage_buffer_binding_size =
             adapter_limits.max_storage_buffer_binding_size;
+        required_limits.max_storage_buffers_per_shader_stage =
+            adapter_limits.max_storage_buffers_per_shader_stage.min(16);
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -717,6 +739,25 @@ impl GpuBrain {
         self.has_in_flight = true;
     }
 
+    /// Encode the 7 brain compute passes into an external command encoder.
+    /// Use this for unified dispatch (physics + vision + brain in one submit).
+    pub fn encode_brain_passes(&self, encoder: &mut wgpu::CommandEncoder) {
+        let pipelines_and_groups: &[(&wgpu::ComputePipeline, &wgpu::BindGroup)] = &[
+            (&self.feature_extract_pipeline, &self.feature_extract_bind_group),
+            (&self.encode_pipeline, &self.encode_bind_group),
+            (&self.habituate_homeo_pipeline, &self.habituate_homeo_bind_group),
+            (&self.recall_score_pipeline, &self.recall_score_bind_group),
+            (&self.recall_topk_pipeline, &self.recall_topk_bind_group),
+            (&self.predict_act_pipeline, &self.predict_act_bind_group),
+            (&self.learn_store_pipeline, &self.learn_store_bind_group),
+        ];
+        for (pipeline, bind_group) in pipelines_and_groups {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, *bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+    }
 
     /// Dispatch feature extraction pass (test-only).
     #[cfg(test)]

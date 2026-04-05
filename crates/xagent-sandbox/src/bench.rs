@@ -16,7 +16,7 @@ use crate::world::WorldState;
 /// agents reuse their cached motor command. Physics runs every tick.
 /// N=1 means no decimation (brain fires every tick).
 /// N=2 halves the brain/vision compute cost.
-const BRAIN_STRIDE: u64 = 2;
+const BRAIN_STRIDE: u64 = 4;
 
 /// Benchmark result returned by [`run_bench`].
 pub struct BenchResult {
@@ -80,24 +80,37 @@ fn run_bench_inner(
     gpu_physics.upload_world_config(gpu_brain.queue(), &world_config, food_count, agent_count, 0);
 
     let start = Instant::now();
+    let death_interval = gpu_physics.death_check_interval();
+    let mut encoder: Option<wgpu::CommandEncoder> = None;
 
     for tick in 0..total_ticks {
         let brain_tick = (tick % BRAIN_STRIDE) == 0;
 
+        let enc = encoder.get_or_insert_with(|| {
+            gpu_brain.device().create_command_encoder(&Default::default())
+        });
+
         gpu_physics.update_tick(gpu_brain.queue(), tick);
-
-        let mut encoder = gpu_brain.device().create_command_encoder(&Default::default());
-        gpu_physics.encode_tick(&mut encoder);
+        gpu_physics.encode_tick(enc);
         if brain_tick {
-            gpu_physics.encode_vision(&mut encoder);
-            gpu_brain.encode_brain_passes(&mut encoder);
+            gpu_physics.encode_vision(enc);
+            gpu_brain.encode_brain_passes(enc);
         }
-        gpu_brain.queue().submit(std::iter::once(encoder.finish()));
 
-        // Periodic death check
-        if tick % gpu_physics.death_check_interval() == 0 {
-            if tick > 0 {
-                // Wait for previous readback to complete, then collect
+        // At death-check boundaries: encode death copy, submit batch, handle deaths
+        if (tick + 1) % death_interval == 0 {
+            // Encode death flag copy into the same batch
+            {
+                let enc = encoder.get_or_insert_with(|| {
+                    gpu_brain.device().create_command_encoder(&Default::default())
+                });
+                gpu_physics.encode_death_readback(enc);
+            }
+            if let Some(enc) = encoder.take() {
+                gpu_brain.queue().submit(std::iter::once(enc.finish()));
+            }
+            gpu_physics.map_death_readback(gpu_brain.device());
+            if tick >= death_interval {
                 gpu_brain.device().poll(wgpu::Maintain::Wait);
                 if let Some(dead) = gpu_physics.try_collect_deaths(gpu_brain.device()) {
                     for idx in dead {
@@ -110,8 +123,12 @@ fn run_bench_inner(
                     }
                 }
             }
-            gpu_physics.submit_death_readback(gpu_brain.device(), gpu_brain.queue());
         }
+    }
+
+    // Submit any remaining ticks
+    if let Some(enc) = encoder.take() {
+        gpu_brain.queue().submit(std::iter::once(enc.finish()));
     }
 
     let elapsed = start.elapsed();

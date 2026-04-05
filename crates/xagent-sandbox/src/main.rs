@@ -1316,7 +1316,7 @@ impl ApplicationHandler for App {
                                 gpu_phys.update_tick(gpu_brain.queue(), self.tick);
                                 gpu_phys.encode_tick(enc);
 
-                                let brain_tick = (self.tick % 2) == 0;
+                                let brain_tick = (self.tick % 4) == 0;
                                 if brain_tick {
                                     gpu_phys.encode_vision(enc);
                                     gpu_brain.encode_brain_passes(enc);
@@ -1328,11 +1328,18 @@ impl ApplicationHandler for App {
                                     gov.tick();
                                 }
 
-                                // At death-check boundaries: submit batch, handle deaths
+                                // At death-check boundaries: encode death copy, submit, handle deaths
                                 if self.tick % death_interval == 0 {
+                                    {
+                                        let enc = encoder.get_or_insert_with(|| {
+                                            gpu_brain.device().create_command_encoder(&Default::default())
+                                        });
+                                        gpu_phys.encode_death_readback(enc);
+                                    }
                                     if let Some(enc) = encoder.take() {
                                         gpu_brain.queue().submit(std::iter::once(enc.finish()));
                                     }
+                                    gpu_phys.map_death_readback(gpu_brain.device());
 
                                     if self.tick > death_interval {
                                         gpu_brain.device().poll(wgpu::Maintain::Wait);
@@ -1354,7 +1361,6 @@ impl ApplicationHandler for App {
                                             }
                                         }
                                     }
-                                    gpu_phys.submit_death_readback(gpu_brain.device(), gpu_brain.queue());
                                 }
                             }
 

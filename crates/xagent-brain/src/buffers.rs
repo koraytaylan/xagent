@@ -455,9 +455,9 @@ const FOOD_HEIGHT_OFFSET: f32 = 0.35;
 const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 const VISION_FOV_HALF: f32 = 0.7853982;  // PI/4 = 45 degrees (half of 90)
-const VISION_MAX_DIST: f32 = 50.0;
-const VISION_STEP_SIZE: f32 = 1.0;
-const VISION_NUM_STEPS: u32 = 50u;
+const VISION_MAX_DIST: f32 = 30.0;
+const VISION_STEP_SIZE: f32 = 1.2;
+const VISION_NUM_STEPS: u32 = 25u;
 const VISION_RAYS: u32 = 48u;
 const VISION_W: u32 = 8u;
 const VISION_H: u32 = 6u;

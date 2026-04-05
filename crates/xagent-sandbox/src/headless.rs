@@ -136,22 +136,39 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         gpu_physics.upload_agents(gpu_brain.queue(), &agent_data);
         gpu_physics.upload_world_config(gpu_brain.queue(), &config.world, food_count, pop_size, 0);
 
+        let death_interval = gpu_physics.death_check_interval();
+        let mut encoder: Option<wgpu::CommandEncoder> = None;
+
         while !governor.generation_complete() {
-            let brain_tick = (tick % 2) == 0;
+            let brain_tick = (tick % 4) == 0;
+
+            let enc = encoder.get_or_insert_with(|| {
+                gpu_brain.device().create_command_encoder(&Default::default())
+            });
 
             gpu_physics.update_tick(gpu_brain.queue(), tick);
-
-            let mut encoder = gpu_brain.device().create_command_encoder(&Default::default());
-            gpu_physics.encode_tick(&mut encoder);
+            gpu_physics.encode_tick(enc);
             if brain_tick {
-                gpu_physics.encode_vision(&mut encoder);
-                gpu_brain.encode_brain_passes(&mut encoder);
+                gpu_physics.encode_vision(enc);
+                gpu_brain.encode_brain_passes(enc);
             }
-            gpu_brain.queue().submit(std::iter::once(encoder.finish()));
 
-            // Death check (same pattern as bench.rs)
-            if tick % gpu_physics.death_check_interval() == 0 {
-                if tick > 0 {
+            tick += 1;
+            governor.tick();
+
+            // At death-check boundaries: encode death copy, submit batch, handle deaths
+            if tick % death_interval == 0 {
+                {
+                    let enc = encoder.get_or_insert_with(|| {
+                        gpu_brain.device().create_command_encoder(&Default::default())
+                    });
+                    gpu_physics.encode_death_readback(enc);
+                }
+                if let Some(enc) = encoder.take() {
+                    gpu_brain.queue().submit(std::iter::once(enc.finish()));
+                }
+                gpu_physics.map_death_readback(gpu_brain.device());
+                if tick > death_interval {
                     gpu_brain.device().poll(wgpu::Maintain::Wait);
                     if let Some(dead) = gpu_physics.try_collect_deaths(gpu_brain.device()) {
                         for idx in dead {
@@ -168,15 +185,14 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                         }
                     }
                 }
-                gpu_physics.submit_death_readback(gpu_brain.device(), gpu_brain.queue());
             }
 
-            tick += 1;
-            governor.tick();
-
             // Periodic heatmap update: read back positions every 100 ticks
-            // to track exploration cells for fitness evaluation.
             if tick % 100 == 0 {
+                // Flush any pending work before blocking readback
+                if let Some(enc) = encoder.take() {
+                    gpu_brain.queue().submit(std::iter::once(enc.finish()));
+                }
                 let state = gpu_physics.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
                 for i in 0..agents.len() {
                     let base = i * xagent_brain::buffers::PHYS_STRIDE;
@@ -198,6 +214,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
+        }
+
+        // Submit any remaining ticks
+        if let Some(enc) = encoder.take() {
+            gpu_brain.queue().submit(std::iter::once(enc.finish()));
         }
 
         // Read back stats from GPU for fitness evaluation

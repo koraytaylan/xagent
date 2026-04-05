@@ -17,7 +17,8 @@ const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
 const BIOME_GRID_RES: usize = 256;
 /// How many ticks between death-flag readback submissions.
-const DEATH_CHECK_INTERVAL: u64 = 10;
+/// Higher values = fewer CPU↔GPU round-trips but slower death detection.
+const DEATH_CHECK_INTERVAL: u64 = 50;
 
 #[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
 pub struct GpuPhysics {
@@ -542,8 +543,8 @@ impl GpuPhysics {
         DEATH_CHECK_INTERVAL
     }
 
-    /// Initiate async readback of death flags. Call every DEATH_CHECK_INTERVAL ticks.
-    pub fn submit_death_readback(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Encode death flag copies into the given encoder. Call before the batch submit.
+    pub fn encode_death_readback(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let n = self.agent_count as usize;
         let widx = self.death_staging_idx;
 
@@ -552,8 +553,6 @@ impl GpuPhysics {
             self.death_staging_mapped[widx] = false;
         }
 
-        // Copy died_flag from agent_phys_buf to staging
-        let mut encoder = device.create_command_encoder(&Default::default());
         for i in 0..n {
             let src_offset = ((i * PHYS_STRIDE + P_DIED_FLAG) * 4) as u64;
             let dst_offset = (i * 4) as u64;
@@ -563,8 +562,13 @@ impl GpuPhysics {
                 4,
             );
         }
-        queue.submit(std::iter::once(encoder.finish()));
+    }
 
+    /// Map the death staging buffer after submit. Must be called AFTER the
+    /// encoder containing encode_death_readback is submitted.
+    pub fn map_death_readback(&mut self, device: &wgpu::Device) {
+        let n = self.agent_count as usize;
+        let widx = self.death_staging_idx;
         let death_size = (n * 4) as u64;
         let seq = self.death_submit_seq + 1;
         self.death_submit_seq = seq;
@@ -578,6 +582,16 @@ impl GpuPhysics {
             });
         self.death_staging_mapped[widx] = true;
         self.death_staging_idx = 1 - self.death_staging_idx;
+        device.poll(wgpu::Maintain::Poll);
+    }
+
+    /// Legacy: initiate async readback with its own submit. Used by callers
+    /// that don't have an open encoder.
+    pub fn submit_death_readback(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.encode_death_readback(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        self.map_death_readback(device);
     }
 
     /// Try to read back death flags (non-blocking). Returns indices of dead agents.

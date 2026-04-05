@@ -1273,6 +1273,11 @@ impl ApplicationHandler for App {
                     // repeated heap allocations (12 agents × 10 ticks = 120/frame).
                     let mut all_positions: Vec<(Vec3, bool)> =
                         Vec::with_capacity(self.agents.len());
+                    // Reusable spatial grid — rebuild() reuses Vec allocations
+                    // instead of re-creating 1,296 Vecs per tick.
+                    let mut agent_grid = xagent_sandbox::world::spatial::AgentGrid::new(
+                        self.world_config.world_size,
+                    );
 
                     // Lazily initialize GPU compute if GPU was detected at startup
                     self.ensure_gpu_compute();
@@ -1361,8 +1366,9 @@ impl ApplicationHandler for App {
                                 let speed = self.speed_multiplier;
                                 let world_ref: &WorldState = &*world;
                                 let all_pos = &all_positions;
-                                let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos, self.world_config.world_size);
+                                agent_grid.rebuild(all_pos);
 
+                                let brain_tick = (tick % 2) == 0;
                                 let results: Vec<(Option<usize>, bool)> = self.agents
                                     .par_iter_mut()
                                     .enumerate()
@@ -1371,18 +1377,20 @@ impl ApplicationHandler for App {
                                             return (None, false);
                                         }
 
-                                        senses::extract_senses_with_positions(
-                                            &agent.body,
-                                            world_ref,
-                                            tick,
-                                            all_pos,
-                                            i,
-                                            &agent_grid,
-                                            &mut agent.cached_frame,
-                                        );
+                                        if brain_tick {
+                                            senses::extract_senses_with_positions(
+                                                &agent.body,
+                                                world_ref,
+                                                tick,
+                                                all_pos,
+                                                i,
+                                                &agent_grid,
+                                                &mut agent.cached_frame,
+                                            );
 
-                                        agent.cached_motor =
-                                            agent.brain.tick(&agent.cached_frame);
+                                            agent.cached_motor =
+                                                agent.brain.tick(&agent.cached_frame);
+                                        }
                                         if speed <= 1 {
                                             record_agent_histories(agent);
                                         }
@@ -1659,7 +1667,7 @@ impl ApplicationHandler for App {
                             let world_ref: &WorldState = world;
                             let all_pos = &all_positions;
                             let tick = self.tick;
-                            let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(all_pos, self.world_config.world_size);
+                            agent_grid.rebuild(all_pos);
 
                             // Parallel sensory extraction for ALL alive agents
                             struct AgentGpuSlice {

@@ -17,6 +17,16 @@ use xagent_shared::{BrainConfig, WorldConfig};
 use crate::agent::{senses, Agent, AgentBody};
 use crate::world::WorldState;
 
+/// Agent count at or below which we skip rayon and run sequentially.
+/// For very small populations, rayon dispatch overhead exceeds the parallel benefit.
+const RAYON_THRESHOLD: usize = 4;
+
+/// Brain decimation stride: senses + brain run every Nth tick; on other ticks,
+/// agents reuse their cached motor command. Physics runs every tick.
+/// N=1 means no decimation (brain fires every tick).
+/// N=2 halves the brain/vision compute cost.
+const BRAIN_STRIDE: u64 = 2;
+
 /// Benchmark result returned by [`run_bench`].
 pub struct BenchResult {
     pub total_ticks: u64,
@@ -62,14 +72,29 @@ pub fn run_bench(
     }
 }
 
-/// CPU-only benchmark path (original implementation).
+/// CPU-only benchmark path.
 ///
-/// The loop replicates the four core phases:
-/// 1. Snapshot agent positions
-/// 2. Brain ticks via rayon (senses + brain.tick)
-/// 3. Sequential physics (step + metabolic drain + death/respawn)
-/// 4. Collision resolution (O(n^2) pairwise)
+/// Merges senses + brain + physics into a single parallel pass to minimize
+/// rayon dispatch overhead. Brain decimation (BRAIN_STRIDE) skips senses +
+/// brain on non-stride ticks, reusing the cached motor command.
 pub fn run_bench_cpu(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+) -> BenchResult {
+    // Limit rayon thread count based on agent count and available P-cores.
+    let p_cores = detect_perf_core_count();
+    let max_threads = if p_cores > 0 { p_cores } else { rayon::current_num_threads() };
+    let threads = agent_count.min(max_threads);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+
+    run_bench_cpu_inner(brain, world_config, agent_count, total_ticks)
+}
+
+fn run_bench_cpu_inner(
     brain: BrainConfig,
     world_config: WorldConfig,
     agent_count: usize,
@@ -86,6 +111,8 @@ pub fn run_bench_cpu(
         .collect();
 
     let mut all_positions: Vec<(Vec3, bool)> = Vec::with_capacity(agent_count);
+    let mut agent_grid = crate::world::spatial::AgentGrid::new(world.config.world_size);
+    let mut results: Vec<(Option<usize>, bool)> = vec![(None, false); agent_count];
     let start = Instant::now();
 
     for tick in 0..total_ticks {
@@ -97,26 +124,53 @@ pub fn run_bench_cpu(
             all_positions[i] = (agent.body.body.position, agent.body.body.alive);
         }
 
-        // Phase 2: brain ticks (rayon parallel)
-        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
-        {
+        // Phase 2+3: senses + brain + physics (merged into one pass)
+        agent_grid.rebuild(&all_positions);
+        if agent_count <= RAYON_THRESHOLD {
+            for (i, agent) in agents.iter_mut().enumerate() {
+                results[i] = tick_one_agent(i, agent, &world, &all_positions, &agent_grid, tick, dt);
+            }
+        } else {
             let world_ref: &WorldState = &world;
             let pos = &all_positions;
-            agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
-                if !agent.body.body.alive {
-                    return;
-                }
-                senses::extract_senses_with_positions(
-                    &agent.body, world_ref, tick, pos, i,
-                    &agent_grid,
-                    &mut agent.cached_frame,
-                );
-                agent.cached_motor = agent.brain.tick(&agent.cached_frame);
-            });
+            let grid_ref = &agent_grid;
+            agents.iter_mut().enumerate()
+                .zip(results.iter_mut())
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .for_each(|((i, agent), result)| {
+                    *result = tick_one_agent(i, agent, world_ref, pos, grid_ref, tick, dt);
+                });
         }
 
-        // Phase 3: parallel physics via step_pure + deferred food consumption + respawns
-        run_physics_and_respawn(&mut agents, &mut world, dt);
+        // Deferred food consumption (sequential — mutates world)
+        for (i, (consumed, _)) in results.iter().enumerate() {
+            if let Some(idx) = consumed {
+                let food = &mut world.food_items[*idx];
+                if !food.consumed {
+                    let fx = food.position.x;
+                    let fz = food.position.z;
+                    food.consumed = true;
+                    food.respawn_timer = 10.0;
+                    world.food_grid.remove(*idx, fx, fz);
+                    agents[i].body.body.internal.energy =
+                        (agents[i].body.body.internal.energy + world.config.food_energy_value)
+                            .min(agents[i].body.body.internal.max_energy);
+                }
+            }
+        }
+
+        // Respawn dead agents
+        for (i, (_, died)) in results.iter().enumerate() {
+            if *died || !agents[i].body.body.alive {
+                let pos = world.safe_spawn_position();
+                agents[i].body = AgentBody::new(pos);
+                agents[i].body.body.internal.integrity =
+                    agents[i].body.body.internal.max_integrity;
+                agents[i].brain.death_signal();
+                agents[i].brain.trauma(0.5);
+            }
+        }
 
         // Phase 4: collision resolution (O(n^2) pairwise)
         run_collision(&mut agents);
@@ -192,6 +246,7 @@ fn run_bench_gpu(
     );
 
     let mut all_positions: Vec<(Vec3, bool)> = Vec::with_capacity(agent_count);
+    let mut agent_grid = crate::world::spatial::AgentGrid::new(world.config.world_size);
     let num_rays = 48usize;
     // Pre-allocate GPU data buffers outside the loop to avoid per-tick allocation
     let mut agent_poses: Vec<(Vec3, f32)> = Vec::with_capacity(agent_count);
@@ -240,7 +295,7 @@ fn run_bench_gpu(
             .expect("[bench] GPU vision collect failed");
 
         // Phase 2e+2f: build frames from GPU vision + CPU touch, then brain.tick
-        let agent_grid = crate::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
+        agent_grid.rebuild(&all_positions);
         {
             let world_ref: &WorldState = &world;
             let pos = &all_positions;
@@ -302,11 +357,52 @@ fn run_bench_gpu(
     }
 }
 
-// ── Shared physics + collision helpers ────────────────────────────────
+// ── Shared helpers ────────────────────────────────────────────────────
+
+/// Process one agent: senses + brain + physics. Returns (consumed_food_idx, died).
+/// Brain decimation: senses + brain only run on stride ticks; physics runs every tick.
+#[inline(always)]
+fn tick_one_agent(
+    i: usize,
+    agent: &mut Agent,
+    world: &WorldState,
+    positions: &[(Vec3, bool)],
+    agent_grid: &crate::world::spatial::AgentGrid,
+    tick: u64,
+    dt: f32,
+) -> (Option<usize>, bool) {
+    if !agent.body.body.alive {
+        return (None, false);
+    }
+
+    if (tick % BRAIN_STRIDE) == 0 {
+        senses::extract_senses_with_positions(
+            &agent.body, world, tick, positions, i,
+            agent_grid,
+            &mut agent.cached_frame,
+        );
+        agent.cached_motor = agent.brain.tick(&agent.cached_frame);
+    }
+
+    let motor = agent.cached_motor.clone();
+    let (consumed, died) =
+        crate::physics::step_pure(&mut agent.body, &motor, world, dt);
+
+    let brain_drain = crate::physics::metabolic_drain_per_tick(
+        agent.brain.config.memory_capacity,
+        agent.brain.config.processing_slots,
+    );
+    agent.body.body.internal.energy -= brain_drain;
+    if agent.body.body.internal.energy <= 0.0 {
+        agent.body.body.internal.energy = 0.0;
+        agent.body.body.alive = false;
+    }
+
+    (consumed, died || !agent.body.body.alive)
+}
 
 /// Run physics (parallel), deferred food consumption, and dead-agent respawn.
 fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32) {
-    // 3a: parallel physics (rayon)
     let results: Vec<(Option<usize>, bool)> = {
         let world_ref: &WorldState = world;
         agents
@@ -335,8 +431,6 @@ fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32
             .collect()
     };
 
-    // 3b: deferred food consumption (sequential -- mutates world)
-    // Deduplicate: only the first agent claiming a food index gets the energy.
     for (i, (consumed, _)) in results.iter().enumerate() {
         if let Some(idx) = consumed {
             let food = &mut world.food_items[*idx];
@@ -346,16 +440,13 @@ fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32
                 food.consumed = true;
                 food.respawn_timer = 10.0;
                 world.food_grid.remove(*idx, fx, fz);
-                // Award energy only to the winning consumer
                 agents[i].body.body.internal.energy =
                     (agents[i].body.body.internal.energy + world.config.food_energy_value)
                         .min(agents[i].body.body.internal.max_energy);
             }
-            // else: another agent already claimed this food — no energy
         }
     }
 
-    // 3c: respawn dead agents (sequential -- needs mutable world for safe_spawn_position)
     for (i, (_, died)) in results.iter().enumerate() {
         if *died || !agents[i].body.body.alive {
             let pos = world.safe_spawn_position();
@@ -365,6 +456,32 @@ fn run_physics_and_respawn(agents: &mut [Agent], world: &mut WorldState, dt: f32
             agents[i].brain.death_signal();
             agents[i].brain.trauma(0.5);
         }
+    }
+}
+
+/// Detect the number of performance (P) cores on the current CPU.
+/// Returns 0 on platforms where this is unavailable (caller uses default).
+fn detect_perf_core_count() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.logicalcpu"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(s) = std::str::from_utf8(&output.stdout) {
+                    if let Ok(n) = s.trim().parse::<usize>() {
+                        return n;
+                    }
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
     }
 }
 

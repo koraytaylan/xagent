@@ -166,10 +166,10 @@ fn march_ray_unified(
         }
     }
 
-    let mut t = 0.0_f32;
-    while t < max_dist {
-        let p = origin + dir * t;
-
+    let num_steps = (max_dist / step) as u32;
+    let dir_step = dir * step;
+    let mut p = origin;
+    for s in 0..num_steps {
         // Check food items via spatial grid (O(1) per step)
         for idx in world.food_grid.query_nearby(p.x, p.z) {
             let food = &world.food_items[idx];
@@ -178,7 +178,7 @@ fn march_ray_unified(
             }
             let diff = p - food.position;
             if diff.length_squared() < food_radius_sq {
-                return (food_color, t);
+                return (food_color, s as f32 * step);
             }
         }
 
@@ -191,7 +191,7 @@ fn march_ray_unified(
                     }
                     let diff = p - other.position;
                     if diff.length_squared() < agent_radius_sq {
-                        return (agent_color, t);
+                        return (agent_color, s as f32 * step);
                     }
                 }
             }
@@ -206,7 +206,7 @@ fn march_ray_unified(
                     }
                     let diff = p - other_pos;
                     if diff.length_squared() < agent_radius_sq {
-                        return (agent_color, t);
+                        return (agent_color, s as f32 * step);
                     }
                 }
             }
@@ -220,9 +220,9 @@ fn march_ray_unified(
                 BiomeType::Barren => [0.50, 0.40, 0.20, 1.0],
                 BiomeType::Danger => [0.60, 0.20, 0.10, 1.0],
             };
-            return (c, t);
+            return (c, s as f32 * step);
         }
-        t += step;
+        p += dir_step;
     }
     (sky, max_dist)
 }

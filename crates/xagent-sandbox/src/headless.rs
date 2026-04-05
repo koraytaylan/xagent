@@ -105,6 +105,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         let gen_start = Instant::now();
         let mut tick: u64 = 0;
         let mut positions: Vec<(Vec3, bool)> = Vec::with_capacity(agents.len());
+        let mut agent_grid = crate::world::spatial::AgentGrid::new(world.config.world_size);
 
         while !governor.generation_complete() {
             if positions.len() != agents.len() {
@@ -114,55 +115,106 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 positions[i] = (a.body.body.position, a.body.body.alive);
             }
 
-            // Brain ticks (CPU rayon)
-            let agent_grid = crate::world::spatial::AgentGrid::from_positions(&positions, world.config.world_size);
-            {
-                let world_ref: &WorldState = &world;
-                let pos = &positions;
-                agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
-                    if !agent.body.body.alive {
-                        return;
-                    }
+            // Merged senses + brain + physics
+            // Sequential for small populations (avoids rayon dispatch overhead).
+            agent_grid.rebuild(&positions);
+            let brain_tick = (tick % 2) == 0;
+            let tick_one = |i: usize, agent: &mut Agent| -> (Option<usize>, bool) {
+                if !agent.body.body.alive {
+                    return (None, false);
+                }
+                if brain_tick {
                     senses::extract_senses_with_positions(
-                        &agent.body, world_ref, tick, pos, i,
+                        &agent.body, &world, tick, &positions, i,
                         &agent_grid,
                         &mut agent.cached_frame,
                     );
                     agent.cached_motor = agent.brain.tick(&agent.cached_frame);
-                });
+                }
+
+                let motor = agent.cached_motor.clone();
+                let (consumed, died) =
+                    crate::physics::step_pure(&mut agent.body, &motor, &world, dt);
+
+                let brain_drain = crate::physics::metabolic_drain_per_tick(
+                    agent.brain.config.memory_capacity,
+                    agent.brain.config.processing_slots,
+                );
+                agent.body.body.internal.energy -= brain_drain;
+                if agent.body.body.internal.energy <= 0.0 {
+                    agent.body.body.internal.energy = 0.0;
+                    agent.body.body.alive = false;
+                    return (consumed, true);
+                }
+
+                agent.total_ticks_alive += 1;
+                (consumed, died)
+            };
+            let results: Vec<(Option<usize>, bool)> = if agents.len() <= 32 {
+                agents.iter_mut().enumerate()
+                    .map(|(i, agent)| tick_one(i, agent))
+                    .collect()
+            } else {
+                let world_ref: &WorldState = &world;
+                let pos = &positions;
+                let grid_ref = &agent_grid;
+                agents.par_iter_mut().enumerate()
+                    .map(|(i, agent)| {
+                        if !agent.body.body.alive { return (None, false); }
+                        if brain_tick {
+                            senses::extract_senses_with_positions(
+                                &agent.body, world_ref, tick, pos, i, grid_ref,
+                                &mut agent.cached_frame,
+                            );
+                            agent.cached_motor = agent.brain.tick(&agent.cached_frame);
+                        }
+                        let motor = agent.cached_motor.clone();
+                        let (consumed, died) =
+                            crate::physics::step_pure(&mut agent.body, &motor, world_ref, dt);
+                        let brain_drain = crate::physics::metabolic_drain_per_tick(
+                            agent.brain.config.memory_capacity, agent.brain.config.processing_slots,
+                        );
+                        agent.body.body.internal.energy -= brain_drain;
+                        if agent.body.body.internal.energy <= 0.0 {
+                            agent.body.body.internal.energy = 0.0;
+                            agent.body.body.alive = false;
+                            return (consumed, true);
+                        }
+                        agent.total_ticks_alive += 1;
+                        (consumed, died)
+                    })
+                    .collect()
+            };
+
+            // Deferred food consumption (sequential — mutates world)
+            for (i, (consumed, _)) in results.iter().enumerate() {
+                if let Some(idx) = consumed {
+                    let food = &mut world.food_items[*idx];
+                    if !food.consumed {
+                        let fx = food.position.x;
+                        let fz = food.position.z;
+                        food.consumed = true;
+                        food.respawn_timer = 10.0;
+                        world.food_grid.remove(*idx, fx, fz);
+                        agents[i].body.body.internal.energy =
+                            (agents[i].body.body.internal.energy + world.config.food_energy_value)
+                                .min(agents[i].body.body.internal.max_energy);
+                        agents[i].food_consumed += 1;
+                    }
+                }
             }
 
-            // Sequential physics + respawn (mutates world)
-            for i in 0..agents.len() {
-                let agent = &mut agents[i];
-                if agent.body.body.alive {
-                    let motor = agent.cached_motor.clone();
-                    let consumed = crate::physics::step(
-                        &mut agent.body, &motor, &mut world, dt,
-                    );
-                    // Metabolic cost: brain capacity drains energy
-                    let brain_drain = crate::physics::metabolic_drain_per_tick(
-                        agent.brain.config.memory_capacity,
-                        agent.brain.config.processing_slots,
-                    );
-                    agent.body.body.internal.energy -= brain_drain;
-                    if agent.body.body.internal.energy <= 0.0 {
-                        agent.body.body.internal.energy = 0.0;
-                        agent.body.body.alive = false;
-                    }
-                    if consumed.is_some() {
-                        agent.food_consumed += 1;
-                    }
-                    agent.total_ticks_alive += 1;
-                } else {
+            // Respawn dead agents
+            for (i, (_, died)) in results.iter().enumerate() {
+                if *died || !agents[i].body.body.alive {
                     let pos = world.safe_spawn_position();
-                    agent.body = AgentBody::new(pos);
-                    agent.body.body.internal.integrity =
-                        agent.body.body.internal.max_integrity;
-                    agent.brain.death_signal();
-                    agent.brain.trauma(0.5);
-                    agent.death_count += 1;
-                    agent.life_start_tick = tick;
+                    agents[i].body = AgentBody::new(pos);
+                    agents[i].body.body.internal.integrity =
+                        agents[i].body.body.internal.max_integrity;
+                    agents[i].brain.death_signal();
+                    agents[i].brain.trauma(0.5);
+                    agents[i].death_count += 1;
+                    agents[i].life_start_tick = tick;
                 }
             }
 

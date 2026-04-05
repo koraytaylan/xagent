@@ -76,18 +76,7 @@ impl FoodGrid {
     /// Return indices of food items in the 3×3 cell neighborhood of `(x, z)`.
     #[inline]
     pub fn query_nearby(&self, x: f32, z: f32) -> FlatNearbyIter<'_> {
-        let cx = cell_coord(x);
-        let cz = cell_coord(z);
-        FlatNearbyIter {
-            cells: &self.cells,
-            width: self.width,
-            offset: self.offset,
-            cx,
-            cz,
-            dx: -1,
-            dz: -1,
-            inner_idx: 0,
-        }
+        FlatNearbyIter::new(&self.cells, self.width, self.offset, x, z)
     }
 
     /// Mark a food item as consumed (remove from its cell).
@@ -127,6 +116,17 @@ pub struct AgentGrid {
 }
 
 impl AgentGrid {
+    /// Create an empty agent grid sized for the given world.
+    pub fn new(world_size: f32) -> Self {
+        let width = grid_width(world_size);
+        let offset = width / 2;
+        AgentGrid {
+            cells: vec![Vec::new(); (width * width) as usize],
+            width,
+            offset,
+        }
+    }
+
     /// Build the grid from agent positions. Dead agents (alive==false) are skipped.
     pub fn from_positions(positions: &[(Vec3, bool)], world_size: f32) -> Self {
         let width = grid_width(world_size);
@@ -165,18 +165,7 @@ impl AgentGrid {
     /// Return indices of agents in the 3×3 cell neighborhood of `(x, z)`.
     #[inline]
     pub fn query_nearby(&self, x: f32, z: f32) -> FlatNearbyIter<'_> {
-        let cx = cell_coord(x);
-        let cz = cell_coord(z);
-        FlatNearbyIter {
-            cells: &self.cells,
-            width: self.width,
-            offset: self.offset,
-            cx,
-            cz,
-            dx: -1,
-            dz: -1,
-            inner_idx: 0,
-        }
+        FlatNearbyIter::new(&self.cells, self.width, self.offset, x, z)
     }
 }
 
@@ -184,44 +173,67 @@ impl AgentGrid {
 
 /// Iterator over indices in the 3×3 neighborhood of a query cell.
 /// Shared by both `FoodGrid` and `AgentGrid`.
+///
+/// Valid cell flat-indices are pre-computed at construction so the hot
+/// `next()` loop contains no bounds checks — just a cursor walk over
+/// the pre-validated cells.
 pub struct FlatNearbyIter<'a> {
     cells: &'a [Vec<usize>],
-    width: i32,
-    offset: i32,
-    cx: i32,
-    cz: i32,
-    dx: i32,
-    dz: i32,
+    /// Pre-computed flat indices of valid cells in the 3×3 neighborhood.
+    valid_cells: [usize; 9],
+    /// Number of valid entries in `valid_cells`.
+    num_valid: u8,
+    /// Current position in `valid_cells`.
+    cell_cursor: u8,
+    /// Current position within the cell at `valid_cells[cell_cursor]`.
     inner_idx: usize,
+}
+
+impl<'a> FlatNearbyIter<'a> {
+    #[inline]
+    fn new(cells: &'a [Vec<usize>], width: i32, offset: i32, x: f32, z: f32) -> Self {
+        let cx = cell_coord(x);
+        let cz = cell_coord(z);
+        let mut valid_cells = [0usize; 9];
+        let mut num_valid = 0u8;
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let rx = cx + dx + offset;
+                let rz = cz + dz + offset;
+                if rx >= 0 && rx < width && rz >= 0 && rz < width {
+                    valid_cells[num_valid as usize] = (rx * width + rz) as usize;
+                    num_valid += 1;
+                }
+            }
+        }
+        FlatNearbyIter {
+            cells,
+            valid_cells,
+            num_valid,
+            cell_cursor: 0,
+            inner_idx: 0,
+        }
+    }
 }
 
 impl<'a> Iterator for FlatNearbyIter<'a> {
     type Item = usize;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<usize> {
         loop {
-            let rx = self.cx + self.dx + self.offset;
-            let rz = self.cz + self.dz + self.offset;
-            if rx >= 0 && rx < self.width && rz >= 0 && rz < self.width {
-                let flat = (rx * self.width + rz) as usize;
-                let cell = &self.cells[flat];
-                if self.inner_idx < cell.len() {
-                    let val = cell[self.inner_idx];
-                    self.inner_idx += 1;
-                    return Some(val);
-                }
+            if self.cell_cursor >= self.num_valid {
+                return None;
             }
-            // Advance to next cell in 3×3 neighborhood
+            let flat = self.valid_cells[self.cell_cursor as usize];
+            let cell = &self.cells[flat];
+            if self.inner_idx < cell.len() {
+                let val = cell[self.inner_idx];
+                self.inner_idx += 1;
+                return Some(val);
+            }
             self.inner_idx = 0;
-            self.dx += 1;
-            if self.dx > 1 {
-                self.dx = -1;
-                self.dz += 1;
-                if self.dz > 1 {
-                    return None;
-                }
-            }
+            self.cell_cursor += 1;
         }
     }
 }

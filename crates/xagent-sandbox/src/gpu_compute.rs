@@ -1609,6 +1609,15 @@ impl GpuUnifiedPipeline {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vision_params_is_64_bytes() {
+        assert_eq!(
+            std::mem::size_of::<VisionParams>(),
+            64,
+            "VisionParams must be 64 bytes to match WGSL uniform layout"
+        );
+    }
+
     fn try_gpu(
         num_agents: u32,
         dim: u32,

@@ -5,7 +5,6 @@ use crate::renderer::Vertex;
 use crate::world::Mesh;
 use glam::Vec3;
 use rand::Rng;
-use xagent_brain::Brain;
 
 /// Upper bound for memory_capacity to prevent GPU buffer overflow.
 /// Large preset uses 512; 2048 gives ~4x evolutionary headroom.
@@ -14,7 +13,10 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::LearnedState;
+use xagent_brain::buffers::{
+    AgentBrainState, DIM, FEATURE_COUNT, O_ACT_FWD_WTS, O_ACT_TURN_WTS, O_ENC_WEIGHTS,
+    O_PRED_WEIGHTS,
+};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -106,11 +108,14 @@ pub const REPRODUCTION_THRESHOLD: u64 = 5000;
 
 // ── Agent: bundles body + brain + metadata ─────────────────────────────
 
-/// A complete agent with body, brain, and metadata.
+/// A complete agent with body, brain index, and metadata.
+/// The brain itself lives on GPU via GpuBrain; Agent only stores its index
+/// and a copy of BrainConfig for metabolic drain and evolution.
 pub struct Agent {
     pub id: u32,
     pub body: AgentBody,
-    pub brain: Brain,
+    pub brain_idx: u32,
+    pub brain_config: BrainConfig,
     pub color: [f32; 3],
     pub birth_tick: u64,
     pub death_count: u32,
@@ -138,21 +143,18 @@ pub struct Agent {
     pub energy_history: std::collections::VecDeque<f32>,
     pub integrity_history: std::collections::VecDeque<f32>,
     pub fatigue_history: std::collections::VecDeque<f32>,
-    /// Ring buffer of recent brain decisions for the decision stream UI.
-    pub decision_log: std::collections::VecDeque<xagent_brain::DecisionSnapshot>,
     /// Pre-allocated sensory frame buffer, reused each tick to avoid heap churn.
     pub cached_frame: SensoryFrame,
 }
 
 impl Agent {
-    /// Create a new agent with a fresh brain, assigned color, and zero death count.
-    pub fn new(id: u32, position: Vec3, config: BrainConfig, tick: u64) -> Self {
-        let mut brain = Brain::new(config);
-        brain.reseed_exploration(id as u64);
+    /// Create a new agent with an assigned GPU brain index, color, and zero death count.
+    pub fn new(id: u32, position: Vec3, brain_idx: u32, config: BrainConfig, tick: u64) -> Self {
         Self {
             id,
             body: AgentBody::new(position),
-            brain,
+            brain_idx,
+            brain_config: config,
             color: agent_color(id as usize),
             birth_tick: tick,
             death_count: 0,
@@ -172,7 +174,6 @@ impl Agent {
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
-            decision_log: std::collections::VecDeque::with_capacity(256),
             cached_frame: SensoryFrame::new_blank(8, 6),
         }
     }
@@ -231,11 +232,10 @@ impl Agent {
     }
 
     /// Reset per-generation stats for evolution. Keeps BrainConfig (the "genome")
-    /// but zeroes cumulative fitness counters and resets the body/brain.
+    /// but zeroes cumulative fitness counters and resets the body.
+    /// Note: brain state reset must be done externally via GpuBrain.
     pub fn reset_for_new_life(&mut self, position: Vec3, tick: u64) {
         self.body = AgentBody::new(position);
-        self.brain = Brain::new(self.brain.config.clone());
-        self.brain.reseed_exploration(self.id as u64);
         self.death_count = 0;
         self.generation = 0;
         self.life_start_tick = tick;
@@ -252,7 +252,6 @@ impl Agent {
         self.energy_history.clear();
         self.integrity_history.clear();
         self.fatigue_history.clear();
-        self.decision_log.clear();
     }
 }
 
@@ -285,29 +284,45 @@ pub fn mutate_config_with_strength(
     }
 }
 
-/// Perturb inherited weights for neuroevolution.
-/// Mutates a random 10% of action weights by +/-strength, and 1% of encoder
-/// weights by +/-(strength * 0.1). This lets evolution explore behavioral
+/// Perturb inherited GPU brain state for neuroevolution.
+/// Mutates encoder weights (10%), action weights (20%), and predictor weights (5%)
+/// with configurable strength. This lets evolution explore behavioral
 /// variations that within-lifetime learning might miss.
-pub fn mutate_learned_state(state: &LearnedState, strength: f32) -> LearnedState {
+pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainState {
     let mut rng = rand::rng();
-    let mut result = state.clone();
+    let mut mutated = state.clone();
 
-    // Perturb action weights (forward + turn + biases)
-    for w in result.action_weights.iter_mut() {
+    // Mutate encoder weights (small perturbation)
+    for i in 0..(FEATURE_COUNT * DIM) {
         if rng.random::<f32>() < 0.1 {
-            *w += rng.random_range(-strength..strength);
+            mutated.brain_state[O_ENC_WEIGHTS + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
+            mutated.brain_state[O_ENC_WEIGHTS + i] =
+                mutated.brain_state[O_ENC_WEIGHTS + i].clamp(-2.0, 2.0);
         }
     }
 
-    // Perturb encoder weights more conservatively
-    for w in result.encoder_weights.iter_mut() {
-        if rng.random::<f32>() < 0.01 {
-            *w += rng.random_range(-strength * 0.1..strength * 0.1);
+    // Mutate action weights
+    for i in 0..DIM {
+        if rng.random::<f32>() < 0.2 {
+            mutated.brain_state[O_ACT_FWD_WTS + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
+            mutated.brain_state[O_ACT_TURN_WTS + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
         }
     }
 
-    result
+    // Mutate predictor weights
+    for i in 0..(DIM * DIM) {
+        if rng.random::<f32>() < 0.05 {
+            mutated.brain_state[O_PRED_WEIGHTS + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
+            mutated.brain_state[O_PRED_WEIGHTS + i] =
+                mutated.brain_state[O_PRED_WEIGHTS + i].clamp(-3.0, 3.0);
+        }
+    }
+
+    mutated
 }
 
 /// Uniform crossover: randomly pick each parameter from parent A or B.
@@ -467,7 +482,7 @@ mod tests {
 
     #[test]
     fn reset_for_new_life_clears_fatigue_history() {
-        let mut agent = Agent::new(0, Vec3::ZERO, BrainConfig::default(), 0);
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
         // Simulate accumulated fatigue history from a previous life.
         for i in 0..50 {
             agent.fatigue_history.push_back(1.0 - i as f32 * 0.01);
@@ -483,22 +498,17 @@ mod tests {
     }
 
     #[test]
-    fn mutate_learned_state_perturbs_weights() {
-        let state = LearnedState {
-            encoder_weights: vec![1.0; 100],
-            encoder_biases: vec![0.0; 10],
-            action_weights: vec![0.5; 66],
-            predictor_weights: vec![0.0; 100],
-            predictor_context_weight: 0.2,
-        };
-        let mutated = mutate_learned_state(&state, 0.1);
-        // Action weights should differ (10% mutation rate)
-        assert_ne!(mutated.action_weights, state.action_weights);
-        // Predictor weights should be unchanged
-        assert_eq!(mutated.predictor_weights, state.predictor_weights);
-        // Predictor context weight should be unchanged
-        assert_eq!(mutated.predictor_context_weight, state.predictor_context_weight);
-        // Encoder biases should be unchanged
-        assert_eq!(mutated.encoder_biases, state.encoder_biases);
+    fn mutate_brain_state_perturbs_weights() {
+        let mut state = AgentBrainState::new_blank();
+        // Set some non-zero action weights
+        for i in 0..DIM {
+            state.brain_state[O_ACT_FWD_WTS + i] = 0.5;
+            state.brain_state[O_ACT_TURN_WTS + i] = 0.5;
+        }
+        let mutated = mutate_brain_state(&state, 0.1);
+        // Action weights should differ (20% mutation rate per weight)
+        let fwd_same = (0..DIM)
+            .all(|i| mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]);
+        assert!(!fwd_same, "mutate_brain_state should perturb action weights");
     }
 }

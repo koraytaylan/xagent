@@ -10,9 +10,10 @@ use log::info;
 use rayon::prelude::*;
 use xagent_shared::{BrainConfig, FullConfig};
 
-use xagent_brain::LearnedState;
+use xagent_brain::GpuBrain;
+use xagent_brain::AgentBrainState;
 
-use crate::agent::{mutate_config, mutate_learned_state, senses, Agent, AgentBody};
+use crate::agent::{mutate_brain_state, mutate_config, senses, Agent, AgentBody};
 use crate::governor::{AdvanceResult, Governor};
 use crate::world::WorldState;
 
@@ -60,12 +61,16 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         configs
     };
 
-    // Learned state inherited from the previous generation's best performer.
+    // Brain state inherited from the previous generation's best performer.
     // Champions (first eval_repeats agents) receive these weights so learning
     // accumulates across generations instead of restarting from scratch.
-    let mut inherited_state: Option<LearnedState> = None;
+    let mut inherited_state: Option<AgentBrainState> = None;
     let mut inherited_mutation_strength: f32 = 0.0;
     let repeats = governor.config.eval_repeats.max(1);
+
+    // Create GpuBrain once — shared across all generations.
+    let pop_size = governor.config.population_size;
+    let mut gpu_brain = GpuBrain::new(pop_size as u32, &seed_config);
 
     loop {
         if governor.evolution_complete() {
@@ -80,7 +85,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .enumerate()
             .map(|(i, cfg)| {
                 let pos = world.safe_spawn_position();
-                Agent::new(i as u32, pos, cfg.clone(), 0)
+                Agent::new(i as u32, pos, i as u32, cfg.clone(), 0)
             })
             .collect();
 
@@ -90,11 +95,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             for (i, agent) in agents.iter_mut().enumerate() {
                 if i < repeats {
                     // Champion: exact inherited weights
-                    agent.brain.import_learned_state(state);
+                    gpu_brain.write_agent_state(agent.brain_idx, state);
                 } else {
                     // Mutant: inherited weights + small perturbation
-                    let mutated = mutate_learned_state(state, inherited_mutation_strength);
-                    agent.brain.import_learned_state(&mutated);
+                    let mutated = mutate_brain_state(state, inherited_mutation_strength);
+                    gpu_brain.write_agent_state(agent.brain_idx, &mutated);
                 }
             }
         }
@@ -115,76 +120,57 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 positions[i] = (a.body.body.position, a.body.body.alive);
             }
 
-            // Merged senses + brain + physics
-            // Sequential for small populations (avoids rayon dispatch overhead).
             agent_grid.rebuild(&positions);
             let brain_tick = (tick % 2) == 0;
-            let tick_one = |i: usize, agent: &mut Agent| -> (Option<usize>, bool) {
-                if !agent.body.body.alive {
-                    return (None, false);
-                }
-                if brain_tick {
+
+            // Senses extraction (parallel)
+            if brain_tick {
+                let world_ref: &WorldState = &world;
+                let pos = &positions;
+                let grid_ref = &agent_grid;
+                agents.par_iter_mut().enumerate().for_each(|(i, agent)| {
+                    if !agent.body.body.alive { return; }
                     senses::extract_senses_with_positions(
-                        &agent.body, &world, tick, &positions, i,
-                        &agent_grid,
+                        &agent.body, world_ref, tick, pos, i, grid_ref,
                         &mut agent.cached_frame,
                     );
-                    agent.cached_motor = agent.brain.tick(&agent.cached_frame);
-                }
+                });
 
+                // Batched GPU brain tick
+                let frames: Vec<xagent_shared::SensoryFrame> =
+                    agents.iter().map(|a| a.cached_frame.clone()).collect();
+                let motors = gpu_brain.tick(&frames);
+                for (i, motor) in motors.into_iter().enumerate() {
+                    agents[i].cached_motor = motor;
+                }
+            }
+
+            // Physics (sequential — small populations don't benefit from rayon here)
+            let mut results: Vec<(Option<usize>, bool)> = Vec::with_capacity(agents.len());
+            for agent in agents.iter_mut() {
+                if !agent.body.body.alive {
+                    results.push((None, false));
+                    continue;
+                }
                 let motor = agent.cached_motor.clone();
                 let (consumed, died) =
                     crate::physics::step_pure(&mut agent.body, &motor, &world, dt);
 
                 let brain_drain = crate::physics::metabolic_drain_per_tick(
-                    agent.brain.config.memory_capacity,
-                    agent.brain.config.processing_slots,
+                    agent.brain_config.memory_capacity,
+                    agent.brain_config.processing_slots,
                 );
                 agent.body.body.internal.energy -= brain_drain;
                 if agent.body.body.internal.energy <= 0.0 {
                     agent.body.body.internal.energy = 0.0;
                     agent.body.body.alive = false;
-                    return (consumed, true);
+                    results.push((consumed, true));
+                    continue;
                 }
 
                 agent.total_ticks_alive += 1;
-                (consumed, died)
-            };
-            let results: Vec<(Option<usize>, bool)> = if agents.len() <= 32 {
-                agents.iter_mut().enumerate()
-                    .map(|(i, agent)| tick_one(i, agent))
-                    .collect()
-            } else {
-                let world_ref: &WorldState = &world;
-                let pos = &positions;
-                let grid_ref = &agent_grid;
-                agents.par_iter_mut().enumerate()
-                    .map(|(i, agent)| {
-                        if !agent.body.body.alive { return (None, false); }
-                        if brain_tick {
-                            senses::extract_senses_with_positions(
-                                &agent.body, world_ref, tick, pos, i, grid_ref,
-                                &mut agent.cached_frame,
-                            );
-                            agent.cached_motor = agent.brain.tick(&agent.cached_frame);
-                        }
-                        let motor = agent.cached_motor.clone();
-                        let (consumed, died) =
-                            crate::physics::step_pure(&mut agent.body, &motor, world_ref, dt);
-                        let brain_drain = crate::physics::metabolic_drain_per_tick(
-                            agent.brain.config.memory_capacity, agent.brain.config.processing_slots,
-                        );
-                        agent.body.body.internal.energy -= brain_drain;
-                        if agent.body.body.internal.energy <= 0.0 {
-                            agent.body.body.internal.energy = 0.0;
-                            agent.body.body.alive = false;
-                            return (consumed, true);
-                        }
-                        agent.total_ticks_alive += 1;
-                        (consumed, died)
-                    })
-                    .collect()
-            };
+                results.push((consumed, died));
+            }
 
             // Deferred food consumption (sequential — mutates world)
             for (i, (consumed, _)) in results.iter().enumerate() {
@@ -211,8 +197,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                     agents[i].body = AgentBody::new(pos);
                     agents[i].body.body.internal.integrity =
                         agents[i].body.body.internal.max_integrity;
-                    agents[i].brain.death_signal();
-                    agents[i].brain.trauma(0.5);
+                    gpu_brain.death_signal(agents[i].brain_idx);
                     agents[i].death_count += 1;
                     agents[i].life_start_tick = tick;
                 }
@@ -235,10 +220,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         let fitness = governor.evaluate(&agents);
 
-        // Capture best agent's learned state using actual composite fitness.
+        // Capture best agent's brain state using actual composite fitness.
         // fitness is sorted descending — first entry is the best performer.
         let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-        inherited_state = agents.get(best_idx).map(|a| a.brain.export_learned_state());
+        inherited_state = agents.get(best_idx).map(|a| gpu_brain.read_agent_state(a.brain_idx));
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",

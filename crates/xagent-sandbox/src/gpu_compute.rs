@@ -614,9 +614,45 @@ impl GpuBrainCompute {
         })
     }
 
-    /// Submit GPU compute work asynchronously.
+    /// Upload slow-changing buffers: encoder weights, biases, memory patterns, active mask.
     ///
-    /// Uploads data, dispatches encode + recall shaders, copies results to a
+    /// Call once at generation start, then periodically (every N brain ticks) to
+    /// sync learning-induced weight drift. GPU buffers retain their values between
+    /// dispatches, so these don't need to be re-uploaded every tick.
+    pub fn upload_slow_buffers(
+        &mut self,
+        enc_weights: &[f32],
+        enc_biases: &[f32],
+        mem_patterns: &[f32],
+        mem_active: &[u32],
+    ) {
+        self.queue
+            .write_buffer(&self.enc_weights_buf, 0, bytemuck::cast_slice(enc_weights));
+        self.queue
+            .write_buffer(&self.enc_biases_buf, 0, bytemuck::cast_slice(enc_biases));
+        self.queue.write_buffer(
+            &self.mem_patterns_buf,
+            0,
+            bytemuck::cast_slice(mem_patterns),
+        );
+        self.queue
+            .write_buffer(&self.mem_active_buf, 0, bytemuck::cast_slice(mem_active));
+    }
+
+    /// Submit with only features (fast path).
+    ///
+    /// Reuses previously uploaded weights/biases/patterns already on GPU.
+    /// Transfers ~43KB instead of ~2.2MB per brain tick (50× reduction).
+    pub fn submit_features_only(&mut self, features: &[f32]) {
+        self.prepare_staging();
+        self.queue
+            .write_buffer(&self.features_buf, 0, bytemuck::cast_slice(features));
+        self.dispatch_and_readback();
+    }
+
+    /// Submit GPU compute work asynchronously (full upload).
+    ///
+    /// Uploads ALL data, dispatches encode + recall shaders, copies results to a
     /// staging buffer, and requests an async map — then returns immediately
     /// without waiting for the GPU. Call `collect()` later to read back the
     /// results (typically after doing CPU-side sensory extraction in parallel).
@@ -628,18 +664,7 @@ impl GpuBrainCompute {
         mem_patterns: &[f32],
         mem_active: &[u32],
     ) {
-        let widx = self.staging_idx;
-
-        // If a previous dispatch mapped this staging pair and it was never
-        // collected, unmap it so it can be used as a copy destination again.
-        // Only unmap buffers that are actually mapped (avoids wgpu panic).
-        if self.staging_mapped[widx] {
-            self.encoded_staging[widx].unmap();
-            self.similarities_staging[widx].unmap();
-            self.staging_mapped[widx] = false;
-        }
-
-        // Upload input data
+        self.prepare_staging();
         self.queue
             .write_buffer(&self.features_buf, 0, bytemuck::cast_slice(features));
         self.queue
@@ -653,6 +678,22 @@ impl GpuBrainCompute {
         );
         self.queue
             .write_buffer(&self.mem_active_buf, 0, bytemuck::cast_slice(mem_active));
+        self.dispatch_and_readback();
+    }
+
+    /// Unmap staging buffers if a previous dispatch left them mapped.
+    fn prepare_staging(&mut self) {
+        let widx = self.staging_idx;
+        if self.staging_mapped[widx] {
+            self.encoded_staging[widx].unmap();
+            self.similarities_staging[widx].unmap();
+            self.staging_mapped[widx] = false;
+        }
+    }
+
+    /// Dispatch encode + recall shaders, copy to staging, request async map.
+    fn dispatch_and_readback(&mut self) {
+        let widx = self.staging_idx;
 
         let mut cmd = self
             .device

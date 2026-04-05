@@ -1285,74 +1285,93 @@ impl ApplicationHandler for App {
                     let budget_check_interval: u32 = if self.speed_multiplier > 100 { 64 } else { 16 };
                     let tick_start = Instant::now();
 
-                    while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
-                        self.sim_accumulator -= SIM_DT;
-                        ticks_run += 1;
+                    // ── Batched GPU tick loop: one submit per death-check interval ──
+                    // Encode multiple ticks into a single command encoder to avoid
+                    // per-tick queue.submit() round-trips (~2.4ms each on Metal).
+                    // Only break the batch at death-check boundaries (every 10 ticks).
+                    {
+                        let mut death_brain_signals: Vec<u32> = Vec::new();
 
-                        if ticks_run % budget_check_interval == 0
-                            && tick_start.elapsed().as_millis() >= tick_budget_ms
+                        if let (Some(ref mut gpu_phys), Some(ref gpu_brain)) =
+                            (&mut self.gpu_physics, &self.gpu_brain)
                         {
-                            break;
-                        }
+                            let death_interval = gpu_phys.death_check_interval();
+                            let mut encoder: Option<wgpu::CommandEncoder> = None;
 
-                        if let Some(world) = &mut self.world {
-                            // ── GPU dispatch: physics + food + collision + vision + brain ──
-                            let mut death_brain_signals: Vec<u32> = Vec::new();
-                            if let (Some(ref mut gpu_phys), Some(ref gpu_brain)) =
-                                (&mut self.gpu_physics, &self.gpu_brain)
-                            {
+                            while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
+                                self.sim_accumulator -= SIM_DT;
+                                ticks_run += 1;
+
+                                if ticks_run % budget_check_interval == 0
+                                    && tick_start.elapsed().as_millis() >= tick_budget_ms
+                                {
+                                    break;
+                                }
+
+                                // Lazily create encoder for this batch
+                                let enc = encoder.get_or_insert_with(|| {
+                                    gpu_brain.device().create_command_encoder(&Default::default())
+                                });
+
                                 gpu_phys.update_tick(gpu_brain.queue(), self.tick);
-
-                                let mut encoder = gpu_brain.device().create_command_encoder(&Default::default());
-                                gpu_phys.encode_tick(&mut encoder);
+                                gpu_phys.encode_tick(enc);
 
                                 let brain_tick = (self.tick % 2) == 0;
                                 if brain_tick {
-                                    gpu_phys.encode_vision(&mut encoder);
-                                    gpu_brain.encode_brain_passes(&mut encoder);
+                                    gpu_phys.encode_vision(enc);
+                                    gpu_brain.encode_brain_passes(enc);
                                 }
-                                gpu_brain.queue().submit(std::iter::once(encoder.finish()));
 
-                                // Death check (periodic, async double-buffered readback)
-                                if self.tick % gpu_phys.death_check_interval() == 0 {
-                                    if self.tick > 0 {
+                                self.tick += 1;
+                                self.tps_tick_count += 1;
+                                if let Some(gov) = &mut self.governor {
+                                    gov.tick();
+                                }
+
+                                // At death-check boundaries: submit batch, handle deaths
+                                if self.tick % death_interval == 0 {
+                                    if let Some(enc) = encoder.take() {
+                                        gpu_brain.queue().submit(std::iter::once(enc.finish()));
+                                    }
+
+                                    if self.tick > death_interval {
                                         gpu_brain.device().poll(wgpu::Maintain::Wait);
                                         if let Some(dead) = gpu_phys.try_collect_deaths(gpu_brain.device()) {
-                                            for idx in dead {
-                                                let pos = world.safe_spawn_position();
-                                                gpu_phys.respawn_agent(
-                                                    gpu_brain.queue(), idx, pos,
-                                                    self.agents[idx as usize].body.body.internal.max_energy,
-                                                    self.agents[idx as usize].body.body.internal.max_integrity,
-                                                    self.agents[idx as usize].brain_config.memory_capacity,
-                                                    self.agents[idx as usize].brain_config.processing_slots,
-                                                );
-                                                death_brain_signals.push(self.agents[idx as usize].brain_idx);
-                                                self.agents[idx as usize].death_count += 1;
+                                            if let Some(world) = &self.world {
+                                                for idx in dead {
+                                                    let pos = world.safe_spawn_position();
+                                                    gpu_phys.respawn_agent(
+                                                        gpu_brain.queue(), idx, pos,
+                                                        self.agents[idx as usize].body.body.internal.max_energy,
+                                                        self.agents[idx as usize].body.body.internal.max_integrity,
+                                                        self.agents[idx as usize].brain_config.memory_capacity,
+                                                        self.agents[idx as usize].brain_config.processing_slots,
+                                                    );
+                                                    death_brain_signals.push(self.agents[idx as usize].brain_idx);
+                                                    self.agents[idx as usize].death_count += 1;
+                                                }
                                             }
                                         }
                                     }
                                     gpu_phys.submit_death_readback(gpu_brain.device(), gpu_brain.queue());
                                 }
                             }
-                            // Issue death signals to GpuBrain (needs &mut, so done after immutable borrow)
-                            if !death_brain_signals.is_empty() {
-                                if let Some(ref mut gpu_brain) = self.gpu_brain {
-                                    for idx in death_brain_signals {
-                                        gpu_brain.death_signal(idx);
-                                    }
-                                }
+
+                            // Submit any remaining ticks in the current batch
+                            if let Some(enc) = encoder.take() {
+                                gpu_brain.queue().submit(std::iter::once(enc.finish()));
                             }
 
                             self.food_dirty = true;
                         }
 
-                        self.tick += 1;
-                        self.tps_tick_count += 1;
-
-                        // ── Governor tick tracking ──────────────
-                        if let Some(gov) = &mut self.governor {
-                            gov.tick();
+                        // Issue deferred death signals (needs &mut gpu_brain)
+                        if !death_brain_signals.is_empty() {
+                            if let Some(ref mut gpu_brain) = self.gpu_brain {
+                                for idx in death_brain_signals {
+                                    gpu_brain.death_signal(idx);
+                                }
+                            }
                         }
                     }
 

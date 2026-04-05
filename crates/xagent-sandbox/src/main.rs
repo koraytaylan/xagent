@@ -305,7 +305,7 @@ struct App {
     governor_config: GovernorConfig,
 
     // GPU brain compute (encode + recall offload)
-    has_gpu: bool,
+    gpu_device_queue: Option<(wgpu::Device, wgpu::Queue)>,
     gpu_compute: Option<xagent_sandbox::gpu_compute::GpuBrainCompute>,
 
     // Per-frame GPU pipeline state: stores previous frame's sensory data
@@ -346,7 +346,7 @@ impl App {
         governor_config: GovernorConfig,
         enable_logging: bool,
         db_path: &str,
-        has_gpu: bool,
+        gpu_device_queue: Option<(wgpu::Device, wgpu::Queue)>,
     ) -> Self {
         let logger = if enable_logging {
             match MetricsLogger::new() {
@@ -447,7 +447,7 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            has_gpu,
+            gpu_device_queue,
             gpu_compute: None,
             gpu_prev_frames: Vec::new(),
             gpu_prev_agent_dims: Vec::new(),
@@ -489,7 +489,7 @@ impl App {
     /// Ensure GPU compute pipeline matches current agent configuration.
     /// Creates or recreates the pipeline if dimensions changed.
     fn ensure_gpu_compute(&mut self) {
-        if !self.has_gpu || self.agents.is_empty() {
+        if self.gpu_device_queue.is_none() || self.agents.is_empty() {
             return;
         }
         let n = self.agents.len() as u32;
@@ -504,7 +504,8 @@ impl App {
             }
         }
 
-        match GpuBrainCompute::try_new(n, dim, fc, cap) {
+        let (device, queue) = self.gpu_device_queue.as_ref().unwrap();
+        match GpuBrainCompute::with_device(device.clone(), queue.clone(), n, dim, fc, cap) {
             Some(gpu) => {
                 self.log_msg(format!(
                     "[GPU] Compute pipeline: {} agents, dim={}, features={}, memory={}",
@@ -513,8 +514,8 @@ impl App {
                 self.gpu_compute = Some(gpu);
             }
             None => {
-                self.log_msg("[GPU] No GPU available, falling back to CPU".into());
-                self.has_gpu = false;
+                self.log_msg("[GPU] Buffer sizes exceed device limits, falling back to CPU".into());
+                self.gpu_device_queue = None;
             }
         }
     }
@@ -2588,10 +2589,15 @@ fn main() {
     print_config(&config);
 
     let backend = xagent_sandbox::compute_backend::ComputeBackend::probe();
-    let has_gpu = backend.has_gpu();
+    let gpu_device_queue = match backend {
+        xagent_sandbox::compute_backend::ComputeBackend::GpuAccelerated { device, queue, .. } => {
+            Some((device, queue))
+        }
+        xagent_sandbox::compute_backend::ComputeBackend::CpuOptimized => None,
+    };
 
     if cli.no_render {
-        headless::run_headless(config, &cli.db, cli.resume, has_gpu);
+        headless::run_headless(config, &cli.db, cli.resume, gpu_device_queue.is_some());
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let mut app = App::new(
@@ -2600,7 +2606,7 @@ fn main() {
             config.governor,
             cli.log,
             &cli.db,
-            has_gpu,
+            gpu_device_queue,
         );
         event_loop.run_app(&mut app).expect("Event loop error");
     }

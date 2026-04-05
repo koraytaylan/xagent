@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 use glam::Vec3;
 
-/// Cell size in world units. Must be >= the largest query radius (3.0 for touch)
-/// so that a 3×3 neighborhood always covers the search area.
+/// Cell size in world units. Must be >= the largest query radius used by
+/// proximity checks (currently 5.0 for agent touch) so that a 3×3
+/// neighborhood always covers the search area.
 const CELL_SIZE: f32 = 8.0;
 
 /// Spatial grid mapping cell coordinates to food item indices.
@@ -31,9 +32,11 @@ impl FoodGrid {
         FoodGrid { cells }
     }
 
-    /// Rebuild from current food items (reuses allocation).
+    /// Rebuild from current food items (reuses Vec allocations within cells).
     pub fn rebuild(&mut self, items: &[super::entity::FoodItem]) {
-        self.cells.clear();
+        for cell in self.cells.values_mut() {
+            cell.clear();
+        }
         for (i, item) in items.iter().enumerate() {
             if item.consumed {
                 continue;
@@ -41,6 +44,7 @@ impl FoodGrid {
             let key = Self::cell_key(item.position.x, item.position.z);
             self.cells.entry(key).or_default().push(i);
         }
+        self.cells.retain(|_, v| !v.is_empty());
     }
 
     /// Return indices of food items within `radius` of `(x, z)`.
@@ -138,9 +142,11 @@ impl AgentGrid {
         AgentGrid { cells }
     }
 
-    /// Clear and rebuild from current positions (reuses allocation).
+    /// Clear and rebuild from current positions (reuses Vec allocations within cells).
     pub fn rebuild(&mut self, positions: &[(Vec3, bool)]) {
-        self.cells.clear();
+        for cell in self.cells.values_mut() {
+            cell.clear();
+        }
         for (i, (pos, alive)) in positions.iter().enumerate() {
             if !alive {
                 continue;
@@ -148,6 +154,7 @@ impl AgentGrid {
             let key = Self::cell_key(pos.x, pos.z);
             self.cells.entry(key).or_default().push(i);
         }
+        self.cells.retain(|_, v| !v.is_empty());
     }
 
     /// Return indices of agents in the 3×3 cell neighborhood of `(x, z)`.

@@ -1118,12 +1118,18 @@ pub struct VisionParams {
 /// Uploads terrain heightmap, food positions, agent positions, and ray
 /// parameters. Each thread marches one ray for one agent. Output is
 /// RGBA+depth per ray, identical to CPU `sample_vision_positions`.
+///
+/// Buffer capacities are fixed when the pipeline is constructed. Callers
+/// must not submit more food positions, agent positions, or rays than the
+/// counts this instance was created to support; create a new
+/// `GpuVisionCompute` if larger capacities are needed.
 pub struct GpuVisionCompute {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    // Buffers -- sized for max agents and recreated if capacity changes
+    bind_group: wgpu::BindGroup,
+    // Buffers -- allocated at construction for fixed capacities
     params_buf: wgpu::Buffer,
     terrain_buf: wgpu::Buffer,
     biome_buf: wgpu::Buffer,
@@ -1234,6 +1240,22 @@ impl GpuVisionCompute {
         });
         let vision_staging = make_staging(&device, "vision-staging", vision_size_bytes);
 
+        // Create bind group once — buffers are fixed for the pipeline's lifetime
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vision-bg"),
+            layout: &bind_group_layout,
+            entries: &[
+                bg_buf(0, &params_buf),
+                bg_buf(1, &terrain_buf),
+                bg_buf(2, &biome_buf),
+                bg_buf(3, &food_buf),
+                bg_buf(4, &agent_pos_buf),
+                bg_buf(5, &ray_origins_buf),
+                bg_buf(6, &ray_dirs_buf),
+                bg_buf(7, &vision_buf),
+            ],
+        });
+
         log::info!(
             "[GPU-VISION] Ready: {} agents, {} rays/agent, terrain_vps={}, {} food, {} agents_total",
             num_agents, num_rays, terrain_vps, num_food, num_agents_total,
@@ -1244,6 +1266,7 @@ impl GpuVisionCompute {
             queue,
             pipeline,
             bind_group_layout,
+            bind_group,
             params_buf,
             terrain_buf,
             biome_buf,
@@ -1275,7 +1298,30 @@ impl GpuVisionCompute {
         ray_origins: &[f32],
         ray_dirs: &[f32],
     ) {
-        // Update params (num_food/num_agents_total may change per tick)
+        // Validate that slice sizes fit the pre-allocated buffers
+        assert!(
+            food_positions.len() * 4 <= self.food_buf.size() as usize,
+            "food_positions ({} floats) exceeds food buffer capacity",
+            food_positions.len(),
+        );
+        assert!(
+            agent_positions.len() * 4 <= self.agent_pos_buf.size() as usize,
+            "agent_positions ({} floats) exceeds agent_pos buffer capacity",
+            agent_positions.len(),
+        );
+        assert!(
+            ray_origins.len() * 4 <= self.ray_origins_buf.size() as usize,
+            "ray_origins ({} floats) exceeds ray_origins buffer capacity",
+            ray_origins.len(),
+        );
+        assert!(
+            ray_dirs.len() * 4 <= self.ray_dirs_buf.size() as usize,
+            "ray_dirs ({} floats) exceeds ray_dirs buffer capacity",
+            ray_dirs.len(),
+        );
+
+        // Update params (num_food/num_agents_total may change per tick
+        // within the pre-allocated capacity)
         let num_food = (food_positions.len() / 4) as u32;
         let num_agents_total = (agent_positions.len() / 4) as u32;
         let params = VisionParams {
@@ -1300,22 +1346,7 @@ impl GpuVisionCompute {
         self.queue.write_buffer(&self.ray_origins_buf, 0, bytemuck::cast_slice(ray_origins));
         self.queue.write_buffer(&self.ray_dirs_buf, 0, bytemuck::cast_slice(ray_dirs));
 
-        // Recreate bind group each submit (food/agent counts may differ)
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vision-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                bg_buf(0, &self.params_buf),
-                bg_buf(1, &self.terrain_buf),
-                bg_buf(2, &self.biome_buf),
-                bg_buf(3, &self.food_buf),
-                bg_buf(4, &self.agent_pos_buf),
-                bg_buf(5, &self.ray_origins_buf),
-                bg_buf(6, &self.ray_dirs_buf),
-                bg_buf(7, &self.vision_buf),
-            ],
-        });
-
+        // Reuse bind group created at construction (buffers are fixed)
         let mut cmd = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vision-compute"),
         });
@@ -1326,7 +1357,7 @@ impl GpuVisionCompute {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &self.bind_group, &[]);
             // dispatch(1, num_agents, 1) — workgroup_size is (48, 1, 1)
             pass.dispatch_workgroups(1, self.num_agents, 1);
         }

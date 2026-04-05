@@ -155,10 +155,11 @@ pub fn step(
 /// Pure (read-only world) variant of [`step`] for parallel physics.
 ///
 /// Does everything `step()` does except mutating the world. Food detection
-/// is read-only: finds the nearest unconsumed food within range and applies
-/// the energy gain to the agent, but does **not** mark the food as consumed
-/// or remove it from the spatial grid. The caller is responsible for
-/// applying food consumption sequentially after the parallel pass.
+/// is read-only: it finds the nearest unconsumed food within range, but does
+/// **not** mark the food as consumed, remove it from the spatial grid, or
+/// apply any energy gain to the agent. The caller is responsible for
+/// deduplicating food claims and awarding energy sequentially after the
+/// parallel pass.
 ///
 /// Returns `(consumed_food_index, died)`:
 /// - `consumed_food_index`: `Some(idx)` if the agent found food to consume

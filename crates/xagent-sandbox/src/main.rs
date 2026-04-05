@@ -1313,24 +1313,6 @@ impl ApplicationHandler for App {
                                 }
                                 gpu_brain.queue().submit(std::iter::once(encoder.finish()));
 
-                                // Read back agent state for rendering/UI
-                                let state = gpu_phys.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
-                                for i in 0..self.agents.len() {
-                                    let base = i * PHYS_STRIDE;
-                                    let a = &mut self.agents[i];
-                                    a.body.body.position = Vec3::new(state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
-                                    a.body.body.alive = state[base + P_ALIVE] > 0.5;
-                                    a.body.yaw = state[base + P_YAW];
-                                    a.body.body.internal.energy = state[base + P_ENERGY];
-                                    a.body.body.internal.integrity = state[base + P_INTEGRITY];
-                                    a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
-                                    a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
-                                    a.body.body.velocity = Vec3::new(state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
-                                    a.food_consumed = state[base + P_FOOD_COUNT] as u32;
-                                    a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
-                                    a.body.body.facing = Vec3::new(state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
-                                }
-
                                 // Death check (periodic, async double-buffered readback)
                                 if self.tick % gpu_phys.death_check_interval() == 0 {
                                     if self.tick > 0 {
@@ -1362,12 +1344,44 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // GPU handles food; always mark dirty since we can't cheaply
-                            // tell if food changed on GPU this tick.
                             self.food_dirty = true;
+                        }
 
-                            // Per-agent bookkeeping (sequential, only at 1x speed)
-                            if self.speed_multiplier <= 1 {
+                        self.tick += 1;
+                        self.tps_tick_count += 1;
+
+                        // ── Governor tick tracking ──────────────
+                        if let Some(gov) = &mut self.governor {
+                            gov.tick();
+                        }
+                    }
+
+                    // ── End-of-frame: single GPU readback for rendering/UI ──
+                    if ticks_run > 0 {
+                        if let (Some(ref gpu_phys), Some(ref gpu_brain)) =
+                            (&self.gpu_physics, &self.gpu_brain)
+                        {
+                            let state = gpu_phys.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
+                            for i in 0..self.agents.len() {
+                                let base = i * PHYS_STRIDE;
+                                let a = &mut self.agents[i];
+                                a.body.body.position = Vec3::new(state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
+                                a.body.body.alive = state[base + P_ALIVE] > 0.5;
+                                a.body.yaw = state[base + P_YAW];
+                                a.body.body.internal.energy = state[base + P_ENERGY];
+                                a.body.body.internal.integrity = state[base + P_INTEGRITY];
+                                a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
+                                a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
+                                a.body.body.velocity = Vec3::new(state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
+                                a.food_consumed = state[base + P_FOOD_COUNT] as u32;
+                                a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+                                a.body.body.facing = Vec3::new(state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
+                            }
+                        }
+
+                        // Per-agent bookkeeping (only at 1x speed)
+                        if self.speed_multiplier <= 1 {
+                            if let Some(world) = &self.world {
                                 for agent in &mut self.agents {
                                     record_agent_histories(agent);
                                 }
@@ -1391,59 +1405,9 @@ impl ApplicationHandler for App {
                                     self.error_count += 1;
                                 }
                             }
-
-                            // World update — tracks food respawn for recording (GPU is authoritative
-                            // for actual physics, but CPU world still maintains respawn indices).
-                            let _respawned = world.update(SIM_DT);
-                            self.heatmap_dirty = true;
-
-                            // ── Recording: capture tick data ──
-                            if let Some(ref mut rec) = self.recording {
-                                use xagent_sandbox::replay::{TickRecord, VISION_KEYFRAME_INTERVAL, GenerationRecording};
-                                let tick = self.tick;
-                                let is_keyframe = tick % VISION_KEYFRAME_INTERVAL == 0;
-
-                                let records: Vec<TickRecord> = self.agents.iter().map(|a| {
-                                    TickRecord {
-                                        position: [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z],
-                                        yaw: a.body.yaw,
-                                        alive: a.body.body.alive,
-                                        energy: a.body.body.internal.energy,
-                                        integrity: a.body.body.internal.integrity,
-                                        motor_forward: a.cached_motor.forward,
-                                        motor_turn: a.cached_motor.turn,
-                                        exploration_rate: 0.0, // GPU telemetry TBD
-                                        prediction_error: 0.0, // GPU telemetry TBD
-                                        gradient: 0.0,         // GPU telemetry TBD
-                                        raw_gradient: 0.0,     // GPU telemetry TBD
-                                        urgency: 0.0,          // GPU telemetry TBD
-                                        credit_magnitude: 0.0, // GPU telemetry TBD
-                                        patterns_recalled: 0,  // GPU telemetry TBD
-                                        phase: GenerationRecording::phase_to_u8("UNKNOWN"),
-                                        mean_attenuation: 0.0, // GPU telemetry TBD
-                                        curiosity_bonus: 0.0,  // GPU telemetry TBD
-                                        fatigue_factor: 1.0,   // GPU telemetry TBD
-                                        motor_variance: 0.0,   // GPU telemetry TBD
-                                        vision_color: if is_keyframe {
-                                            Some(a.cached_frame.vision.color.clone())
-                                        } else {
-                                            None
-                                        },
-                                    }
-                                }).collect();
-                                rec.record_tick(tick, &records);
-                            }
                         }
 
-                        self.tick += 1;
-                        self.tps_tick_count += 1;
-
-                        // ── Governor tick tracking ──────────────
-                        if let Some(gov) = &mut self.governor {
-                            gov.tick();
-                        }
-
-                        // (telemetry is shown on-screen via HUD — no console spam)
+                        self.heatmap_dirty = true;
                     }
 
                     // ── Generation completion check (after tick batch) ──

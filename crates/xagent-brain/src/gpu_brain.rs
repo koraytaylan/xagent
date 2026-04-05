@@ -95,7 +95,15 @@ impl GpuBrain {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .expect("No GPU adapter found");
+        .or_else(|| {
+            log::warn!("[GpuBrain] No GPU adapter found, trying fallback (CPU) adapter");
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
+        .expect("No GPU or fallback adapter found");
 
         log::info!("[GpuBrain] Adapter: {:?}", adapter.get_info());
 

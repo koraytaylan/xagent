@@ -13,6 +13,7 @@ use xagent_shared::{BrainConfig, MotorCommand, SensoryFrame};
 
 use crate::buffers::*;
 
+#[allow(dead_code)] // Transient GPU buffers are only read via bind groups, not Rust field access
 pub struct GpuBrain {
     device: wgpu::Device,
     queue: wgpu::Queue,

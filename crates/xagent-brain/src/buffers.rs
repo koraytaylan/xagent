@@ -278,6 +278,7 @@ const CFG_DECAY_RATE: u32 = {CFG_DECAY_RATE}u;
 const CFG_DISTRESS_EXP: u32 = {CFG_DISTRESS_EXP}u;
 
 fn fast_tanh(x: f32) -> f32 {{
+    if (abs(x) > 4.5) {{ return sign(x); }}
     let x2 = x * x;
     return x * (27.0 + x2) / (27.0 + 9.0 * x2);
 }}

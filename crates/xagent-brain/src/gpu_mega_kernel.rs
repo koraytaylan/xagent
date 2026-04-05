@@ -40,8 +40,10 @@ pub struct GpuMegaKernel {
     history_buf: wgpu::Buffer,
     brain_config_buf: wgpu::Buffer,
 
-    // ── Pipeline ──
-    pipeline: wgpu::ComputePipeline,
+    // ── Pipelines (physics / vision / brain) ──
+    physics_pipeline: wgpu::ComputePipeline,
+    vision_pipeline: wgpu::ComputePipeline,
+    brain_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
 
     // ── Async state readback (double-buffered) ──
@@ -264,24 +266,94 @@ impl GpuMegaKernel {
         ]
         .join("\n");
 
-        // ── Create pipeline ──
+        // ── Explicit bind group layout (all 15 bindings) ──
+        // Each pipeline entry point only references a subset of bindings, but we
+        // need a single shared layout so one bind group works for all 3 pipelines.
+        use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
+        let storage_rw_entry = |binding: u32| -> BindGroupLayoutEntry {
+            BindGroupLayoutEntry {
+                binding,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }
+        };
+        let storage_ro_entry = |binding: u32| -> BindGroupLayoutEntry {
+            BindGroupLayoutEntry {
+                binding,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }
+        };
+        let uniform_entry = |binding: u32| -> BindGroupLayoutEntry {
+            BindGroupLayoutEntry {
+                binding,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }
+        };
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mega_bgl"),
+            entries: &[
+                storage_rw_entry(0),   // agent_phys
+                storage_rw_entry(1),   // decision
+                storage_ro_entry(2),   // heightmap
+                storage_ro_entry(3),   // biome
+                uniform_entry(4),      // world_config
+                storage_rw_entry(5),   // food_state
+                storage_rw_entry(6),   // food_flags
+                storage_rw_entry(7),   // food_grid
+                storage_rw_entry(8),   // agent_grid
+                storage_rw_entry(9),   // collision_scratch
+                storage_rw_entry(10),  // sensory
+                storage_rw_entry(11),  // brain_state
+                storage_rw_entry(12),  // pattern
+                storage_rw_entry(13),  // history
+                uniform_entry(14),     // brain_config
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mega_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // ── Create 3 pipelines: physics, vision (multi-WG), brain ──
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mega_tick"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mega_tick"),
-            layout: None,
+        let physics_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("physics_tick"),
+            layout: Some(&pipeline_layout),
             module: &module,
-            entry_point: Some("mega_tick"),
+            entry_point: Some("physics_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let vision_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vision_tick"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("vision_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let brain_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("brain_tick"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("brain_tick"),
             compilation_options: Default::default(),
             cache: None,
         });
 
-        // ── Create bind group (binding order must match common.wgsl) ──
+        // ── Create bind group ──
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mega_tick_bg"),
-            layout: &pipeline.get_bind_group_layout(0),
+            layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0,  resource: agent_phys_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1,  resource: decision_buf.as_entire_binding() },
@@ -321,7 +393,9 @@ impl GpuMegaKernel {
             pattern_buf,
             history_buf,
             brain_config_buf,
-            pipeline,
+            physics_pipeline,
+            vision_pipeline,
+            brain_pipeline,
             bind_group,
             state_staging,
             staging_idx: 0,
@@ -394,27 +468,98 @@ impl GpuMegaKernel {
         self.queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
     }
 
-    /// Dispatch a batch of N ticks. Uploads config, dispatches (1,1,1),
-    /// copies agent_phys to staging, submits, and maps staging for async read.
+    /// Dispatch a batch of N ticks using 3-pipeline cycle:
+    ///   physics_tick (single WG, BRAIN_STRIDE ticks) → vision_tick (multi-WG) → brain_tick
+    /// All encoded into one command buffer, one submit.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) {
-        self.upload_world_config(start_tick, ticks_to_run);
+        const BRAIN_STRIDE: u32 = 4;
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+
+        // Upload base world config (everything except tick/ticks_to_run)
+        self.upload_world_config(start_tick, BRAIN_STRIDE);
+
+        // Pre-fill tick schedule: one f32 per cycle with that cycle's start_tick
+        let num_cycles = ticks_to_run / BRAIN_STRIDE;
+        let remainder = ticks_to_run % BRAIN_STRIDE;
+        let total_entries = num_cycles + if remainder > 0 { 1 } else { 0 };
+
+        let mut tick_vals = Vec::with_capacity(total_entries as usize);
+        for i in 0..total_entries {
+            tick_vals.push((start_tick + (i * BRAIN_STRIDE) as u64) as f32);
+        }
+        // Also prepare ticks_to_run values (BRAIN_STRIDE for full cycles, remainder for last)
+        let mut stride_vals = Vec::with_capacity(total_entries as usize);
+        for i in 0..total_entries {
+            if i < num_cycles {
+                stride_vals.push(BRAIN_STRIDE as f32);
+            } else {
+                stride_vals.push(remainder as f32);
+            }
+        }
+
+        let tick_schedule = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tick_schedule"),
+            size: (total_entries as u64 * 4).max(4),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&tick_schedule, 0, bytemuck::cast_slice(&tick_vals));
+
+        let stride_schedule = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stride_schedule"),
+            size: (total_entries as u64 * 4).max(4),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&stride_schedule, 0, bytemuck::cast_slice(&stride_vals));
+
+        let ray_workgroups = ((self.agent_count as u32 * 48 + 255) / 256).max(1);
+        let wc_tick_offset = (WC_TICK * 4) as u64;
+        let wc_stride_offset = (WC_TICKS_TO_RUN * 4) as u64;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("mega_batch"),
         });
 
-        // Dispatch the mega-kernel: single workgroup of 256 threads
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+        for i in 0..total_entries {
+            let is_full_cycle = i < num_cycles;
+            let byte_offset = i as u64 * 4;
+
+            // Copy this cycle's start_tick and ticks_to_run into world_config uniform
+            encoder.copy_buffer_to_buffer(&tick_schedule, byte_offset, &self.world_config_buf, wc_tick_offset, 4);
+            encoder.copy_buffer_to_buffer(&stride_schedule, byte_offset, &self.world_config_buf, wc_stride_offset, 4);
+
+            // Physics mini-kernel: BRAIN_STRIDE ticks (or remainder) with barriers
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+
+            // Vision + brain only on full cycles (each cycle ends on a brain tick)
+            if is_full_cycle {
+                // Vision: multi-workgroup, 1 ray per thread
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(ray_workgroups, 1, 1);
+                }
+
+                // Brain: senses + 7-pass brain
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.brain_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+            }
         }
 
         // Copy agent_phys to staging for async readback
         let widx = self.staging_idx;
-        let n = self.agent_count as usize;
-        let buf_size = (n * PHYS_STRIDE * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[widx], 0, buf_size);
 
         self.queue.submit(std::iter::once(encoder.finish()));

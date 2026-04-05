@@ -475,52 +475,54 @@ impl GpuMegaKernel {
     }
 
     /// Dispatch a batch of N ticks using 3-pipeline cycle with push constants.
-    /// All cycles encoded into ONE command buffer, ONE submit.
-    /// Push constants deliver per-cycle tick values — no uniform update needed.
+    /// Batches cycles into groups to keep Metal command buffers manageable.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) {
         const BRAIN_STRIDE: u32 = 4;
+        const CYCLES_PER_SUBMIT: u32 = 100; // ~300 passes per submit — Metal-safe
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        // Upload world config once (static fields only — tick comes from push constants)
+        // Upload world config once (static fields — tick comes from push constants)
         self.upload_world_config(start_tick, BRAIN_STRIDE);
 
         let num_cycles = ticks_to_run / BRAIN_STRIDE;
         let remainder = ticks_to_run % BRAIN_STRIDE;
         let ray_workgroups = ((self.agent_count as u32 * 48 + 255) / 256).max(1);
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mega_batch"),
-        });
+        let mut cycle = 0u32;
+        while cycle < num_cycles {
+            let batch_end = (cycle + CYCLES_PER_SUBMIT).min(num_cycles);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mega_batch"),
+            });
 
-        for i in 0..num_cycles {
-            let tick = (start_tick + (i * BRAIN_STRIDE) as u64) as u32;
-            let pc: [u32; 2] = [tick, BRAIN_STRIDE];
+            for i in cycle..batch_end {
+                let tick = (start_tick + (i * BRAIN_STRIDE) as u64) as u32;
+                let pc: [u32; 2] = [tick, BRAIN_STRIDE];
 
-            // Physics: single WG, BRAIN_STRIDE ticks with barriers
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-                pass.dispatch_workgroups(1, 1, 1);
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.physics_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(ray_workgroups, 1, 1);
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.brain_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
             }
 
-            // Vision: multi-WG, 1 ray per thread
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.vision_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.dispatch_workgroups(ray_workgroups, 1, 1);
-            }
-
-            // Brain: senses + 7-pass brain
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.brain_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            cycle = batch_end;
         }
 
         // Remainder ticks (physics only)
@@ -528,17 +530,25 @@ impl GpuMegaKernel {
             let tick = (start_tick + (num_cycles * BRAIN_STRIDE) as u64) as u32;
             let pc: [u32; 2] = [tick, remainder];
 
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.physics_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-            pass.dispatch_workgroups(1, 1, 1);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("remainder"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
         // Async state readback
         let widx = self.staging_idx;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback"),
+        });
         encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[widx], 0, buf_size);
-
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let seq = self.state_submit_seq + 1;

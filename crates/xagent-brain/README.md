@@ -663,7 +663,7 @@ pub struct GpuBrain {
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `new` | `(agent_count: u32, config: &BrainConfig) -> Self` | Creates wgpu device, allocates all buffers, compiles all 7 shaders with auto-generated constants header |
+| `new` | `(agent_count: u32, config: &BrainConfig) -> Self` | Creates wgpu device (tries real GPU first, falls back to CPU/software adapter for headless CI), allocates all buffers, compiles all 7 shaders with auto-generated constants header |
 | `tick` | `(&mut self, frames: &[SensoryFrame]) -> Vec<MotorCommand>` | Synchronous: upload, dispatch all 7 passes, readback |
 | `submit` | `(&mut self, frames: &[SensoryFrame])` | Async step 1: upload sensory + dispatch all passes + copy motor to staging |
 | `collect` | `(&mut self) -> Vec<MotorCommand>` | Async step 2: map staging buffer, read motor commands |

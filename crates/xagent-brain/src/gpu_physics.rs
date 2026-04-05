@@ -1,0 +1,436 @@
+//! GPU-resident physics: all world/physics computation runs on GPU.
+//!
+//! Owns world buffers (terrain, biome, food, grids), agent physics state,
+//! and 8 compute pipelines. Shares sensory/decision buffers with GpuBrain.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use wgpu;
+use xagent_shared::WorldConfig;
+
+use crate::buffers::*;
+use crate::gpu_brain::GpuBrain;
+
+/// Terrain heightmap vertices per side.
+const TERRAIN_VPS: usize = 129;
+/// Biome grid resolution (cells per side).
+const BIOME_GRID_RES: usize = 256;
+
+#[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
+pub struct GpuPhysics {
+    pub(crate) agent_count: u32,
+    pub(crate) food_count: usize,
+    pub(crate) world_config: WorldConfig,
+
+    // ── World buffers ──
+    pub(crate) heightmap_buf: wgpu::Buffer,
+    pub(crate) biome_buf: wgpu::Buffer,
+    pub(crate) food_state_buf: wgpu::Buffer,
+    pub(crate) food_flags_buf: wgpu::Buffer,
+    pub(crate) food_grid_buf: wgpu::Buffer,
+    pub(crate) world_config_buf: wgpu::Buffer,
+
+    // ── Agent physics ──
+    pub(crate) agent_phys_buf: wgpu::Buffer,
+
+    // ── Spatial grids ──
+    pub(crate) agent_grid_buf: wgpu::Buffer,
+
+    // ── Collision scratch ──
+    pub(crate) collision_scratch_buf: wgpu::Buffer,
+
+    // ── Death readback staging (double-buffered) ──
+    pub(crate) death_staging: [wgpu::Buffer; 2],
+    pub(crate) death_staging_idx: usize,
+    pub(crate) death_staging_mapped: [bool; 2],
+    pub(crate) death_submit_seq: u64,
+    pub(crate) death_mapped_seq: Arc<AtomicU64>,
+    pub(crate) death_has_in_flight: bool,
+
+    // ── Compute pipelines + bind groups ──
+    pub(crate) physics_pipeline: wgpu::ComputePipeline,
+    pub(crate) physics_bind_group: wgpu::BindGroup,
+
+    pub(crate) food_grid_build_pipeline: wgpu::ComputePipeline,
+    pub(crate) food_grid_build_bind_group: wgpu::BindGroup,
+
+    pub(crate) food_detect_pipeline: wgpu::ComputePipeline,
+    pub(crate) food_detect_bind_group: wgpu::BindGroup,
+
+    pub(crate) food_respawn_pipeline: wgpu::ComputePipeline,
+    pub(crate) food_respawn_bind_group: wgpu::BindGroup,
+
+    pub(crate) agent_grid_build_pipeline: wgpu::ComputePipeline,
+    pub(crate) agent_grid_build_bind_group: wgpu::BindGroup,
+
+    pub(crate) collision_accumulate_pipeline: wgpu::ComputePipeline,
+    pub(crate) collision_accumulate_bind_group: wgpu::BindGroup,
+
+    pub(crate) collision_apply_pipeline: wgpu::ComputePipeline,
+    pub(crate) collision_apply_bind_group: wgpu::BindGroup,
+
+    pub(crate) vision_pipeline: wgpu::ComputePipeline,
+    pub(crate) vision_bind_group: wgpu::BindGroup,
+}
+
+impl GpuPhysics {
+    /// Create a new GpuPhysics instance, sharing device/queue/buffers from an existing GpuBrain.
+    pub fn new(
+        brain: &GpuBrain,
+        agent_count: u32,
+        food_count: usize,
+        world_config: &WorldConfig,
+    ) -> Self {
+        let device = brain.device();
+        let n = agent_count as usize;
+        let f = food_count;
+        let gw = grid_width(world_config.world_size);
+        let grid_cells = gw * gw;
+
+        let storage_rw = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+
+        // ── World buffers ──
+        let heightmap_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_heightmap"),
+            size: (TERRAIN_VPS * TERRAIN_VPS * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let biome_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_biome"),
+            size: (BIOME_GRID_RES * BIOME_GRID_RES * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let food_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_food_state"),
+            size: (f * FOOD_STATE_STRIDE * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+        let food_flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_food_flags"),
+            size: (f * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+        let food_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_food_grid"),
+            size: (grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+        let world_config_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_world_config"),
+            size: (WORLD_CONFIG_SIZE * 4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ── Agent physics buffer ──
+        let agent_phys_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_agent_phys"),
+            size: (n * PHYS_STRIDE * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+
+        // ── Spatial grids ──
+        let agent_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_agent_grid"),
+            size: (grid_cells * AGENT_GRID_CELL_STRIDE * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+
+        // ── Collision scratch (3 i32 per agent: push_x, push_y, push_z) ──
+        let collision_scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys_collision_scratch"),
+            size: (n * 3 * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
+
+        // ── Death readback staging (double-buffered) ──
+        // One f32 per agent (the died_flag): n * 4 bytes.
+        let death_size = (n * 4) as u64;
+        let death_staging = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("death_staging_0"),
+                size: death_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("death_staging_1"),
+                size: death_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        // ── Shader constants ──
+        let brain_consts = wgsl_constants();
+        let phys_consts = wgsl_physics_constants(world_config.world_size, f, n);
+
+        // ── Physics pipeline ──
+        let physics_source = format!(
+            "{}\n{}\n{}",
+            brain_consts,
+            phys_consts,
+            include_str!("shaders/physics.wgsl"),
+        );
+        let physics_pipeline = GpuBrain::create_pipeline(device, "physics", &physics_source);
+        let physics_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("physics_bg"),
+            layout: &physics_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: brain.decision_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: heightmap_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: biome_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: world_config_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Food grid build pipeline ──
+        let food_grid_build_source = format!(
+            "{}\n{}",
+            phys_consts,
+            include_str!("shaders/food_grid_build.wgsl"),
+        );
+        let food_grid_build_pipeline = GpuBrain::create_pipeline(device, "food_grid_build", &food_grid_build_source);
+        let food_grid_build_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("food_grid_build_bg"),
+            layout: &food_grid_build_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: food_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: food_flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: food_grid_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Food detect pipeline ──
+        let food_detect_source = format!(
+            "{}\n{}",
+            phys_consts,
+            include_str!("shaders/food_detect.wgsl"),
+        );
+        let food_detect_pipeline = GpuBrain::create_pipeline(device, "food_detect", &food_detect_source);
+        let food_detect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("food_detect_bg"),
+            layout: &food_detect_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: food_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: food_flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: food_grid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: world_config_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Food respawn pipeline (needs brain consts for pcg_hash) ──
+        let food_respawn_source = format!(
+            "{}\n{}\n{}",
+            brain_consts,
+            phys_consts,
+            include_str!("shaders/food_respawn.wgsl"),
+        );
+        let food_respawn_pipeline = GpuBrain::create_pipeline(device, "food_respawn", &food_respawn_source);
+        let food_respawn_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("food_respawn_bg"),
+            layout: &food_respawn_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: food_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: food_flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: food_grid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: heightmap_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: biome_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: world_config_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Agent grid build pipeline ──
+        let agent_grid_build_source = format!(
+            "{}\n{}",
+            phys_consts,
+            include_str!("shaders/agent_grid_build.wgsl"),
+        );
+        let agent_grid_build_pipeline = GpuBrain::create_pipeline(device, "agent_grid_build", &agent_grid_build_source);
+        let agent_grid_build_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("agent_grid_build_bg"),
+            layout: &agent_grid_build_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: agent_grid_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Collision accumulate pipeline ──
+        let collision_accumulate_source = format!(
+            "{}\n{}",
+            phys_consts,
+            include_str!("shaders/collision_accumulate.wgsl"),
+        );
+        let collision_accumulate_pipeline = GpuBrain::create_pipeline(device, "collision_accumulate", &collision_accumulate_source);
+        let collision_accumulate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("collision_accumulate_bg"),
+            layout: &collision_accumulate_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: agent_grid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: collision_scratch_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Collision apply pipeline ──
+        let collision_apply_source = format!(
+            "{}\n{}",
+            phys_consts,
+            include_str!("shaders/collision_apply.wgsl"),
+        );
+        let collision_apply_pipeline = GpuBrain::create_pipeline(device, "collision_apply", &collision_apply_source);
+        let collision_apply_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("collision_apply_bg"),
+            layout: &collision_apply_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: collision_scratch_buf.as_entire_binding() },
+            ],
+        });
+
+        // ── Vision pipeline (needs brain consts for SENSORY_STRIDE) ──
+        let vision_source = format!(
+            "{}\n{}\n{}",
+            brain_consts,
+            phys_consts,
+            include_str!("shaders/vision.wgsl"),
+        );
+        let vision_pipeline = GpuBrain::create_pipeline(device, "vision", &vision_source);
+        let vision_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vision_bg"),
+            layout: &vision_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: agent_phys_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: heightmap_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: biome_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: food_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: food_flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: food_grid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: agent_grid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: brain.sensory_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: world_config_buf.as_entire_binding() },
+            ],
+        });
+
+        Self {
+            agent_count,
+            food_count,
+            world_config: world_config.clone(),
+            heightmap_buf,
+            biome_buf,
+            food_state_buf,
+            food_flags_buf,
+            food_grid_buf,
+            world_config_buf,
+            agent_phys_buf,
+            agent_grid_buf,
+            collision_scratch_buf,
+            death_staging,
+            death_staging_idx: 0,
+            death_staging_mapped: [false, false],
+            death_submit_seq: 0,
+            death_mapped_seq: Arc::new(AtomicU64::new(0)),
+            death_has_in_flight: false,
+            physics_pipeline,
+            physics_bind_group,
+            food_grid_build_pipeline,
+            food_grid_build_bind_group,
+            food_detect_pipeline,
+            food_detect_bind_group,
+            food_respawn_pipeline,
+            food_respawn_bind_group,
+            agent_grid_build_pipeline,
+            agent_grid_build_bind_group,
+            collision_accumulate_pipeline,
+            collision_accumulate_bind_group,
+            collision_apply_pipeline,
+            collision_apply_bind_group,
+            vision_pipeline,
+            vision_bind_group,
+        }
+    }
+
+    /// Upload all world state to GPU. Call once per generation.
+    pub fn upload_world(
+        &self,
+        queue: &wgpu::Queue,
+        terrain_heights: &[f32],
+        biome_grid: &[u32],
+        food_positions: &[(f32, f32, f32)],
+        food_consumed: &[bool],
+        food_timers: &[f32],
+    ) {
+        queue.write_buffer(&self.heightmap_buf, 0, bytemuck::cast_slice(terrain_heights));
+        queue.write_buffer(&self.biome_buf, 0, bytemuck::cast_slice(biome_grid));
+        let mut food_data = Vec::with_capacity(food_positions.len() * FOOD_STATE_STRIDE);
+        for (i, &(x, y, z)) in food_positions.iter().enumerate() {
+            food_data.push(x);
+            food_data.push(y);
+            food_data.push(z);
+            food_data.push(food_timers[i]);
+        }
+        queue.write_buffer(&self.food_state_buf, 0, bytemuck::cast_slice(&food_data));
+        let flags: Vec<u32> = food_consumed.iter().map(|&c| if c { 1 } else { 0 }).collect();
+        queue.write_buffer(&self.food_flags_buf, 0, bytemuck::cast_slice(&flags));
+    }
+
+    /// Upload initial agent physics state to GPU. Call once per generation.
+    pub fn upload_agents(
+        &self,
+        queue: &wgpu::Queue,
+        agents: &[(glam::Vec3, f32, f32, usize, usize)], // (pos, max_energy, max_integrity, mem_cap, proc_slots)
+    ) {
+        let mut data = vec![0.0f32; self.agent_count as usize * PHYS_STRIDE];
+        for (i, &(pos, max_e, max_i, mem_cap, proc_slots)) in agents.iter().enumerate() {
+            let base = i * PHYS_STRIDE;
+            data[base + P_POS_X] = pos.x;
+            data[base + P_POS_Y] = pos.y;
+            data[base + P_POS_Z] = pos.z;
+            data[base + P_FACING_Z] = 1.0; // default facing forward (+Z)
+            data[base + P_ENERGY] = max_e;
+            data[base + P_MAX_ENERGY] = max_e;
+            data[base + P_INTEGRITY] = max_i;
+            data[base + P_MAX_INTEGRITY] = max_i;
+            data[base + P_PREV_ENERGY] = max_e;
+            data[base + P_PREV_INTEGRITY] = max_i;
+            data[base + P_ALIVE] = 1.0;
+            data[base + P_MEMORY_CAP] = mem_cap as f32;
+            data[base + P_PROCESSING_SLOTS] = proc_slots as f32;
+        }
+        queue.write_buffer(&self.agent_phys_buf, 0, bytemuck::cast_slice(&data));
+    }
+
+    /// Update the tick counter in the world config uniform. Call every tick.
+    pub fn update_tick(&self, queue: &wgpu::Queue, tick: u64) {
+        let tick_offset = (WC_TICK * 4) as u64;
+        let tick_val = [tick as f32];
+        queue.write_buffer(&self.world_config_buf, tick_offset, bytemuck::cast_slice(&tick_val));
+    }
+
+    /// Upload the full world config uniform. Call once per generation.
+    pub fn upload_world_config(
+        &self,
+        queue: &wgpu::Queue,
+        config: &WorldConfig,
+        food_count: usize,
+        agent_count: usize,
+        tick: u64,
+    ) {
+        let wc = build_world_config(config, food_count, agent_count, tick);
+        queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
+    }
+}

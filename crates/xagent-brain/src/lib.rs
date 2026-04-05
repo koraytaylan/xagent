@@ -7,6 +7,7 @@
 
 pub mod buffers;
 pub mod gpu_brain;
+pub mod gpu_physics;
 
 pub use buffers::AgentBrainState;
 pub use gpu_brain::GpuBrain;

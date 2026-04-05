@@ -160,6 +160,7 @@ pub const WC_BIOME_GRID_RES: usize = 17;
 pub const WC_GRID_WIDTH: usize = 18;
 pub const WC_GRID_OFFSET: usize = 19;
 pub const WC_TICKS_TO_RUN: usize = 20;
+pub const WC_PHASE_MASK: usize = 21;  // bit0=physics, bit1=vision, bit2=brain
 pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────

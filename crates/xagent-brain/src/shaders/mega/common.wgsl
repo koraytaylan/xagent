@@ -206,6 +206,7 @@ const WC_BIOME_GRID_RES: u32 = 17u;
 const WC_GRID_WIDTH: u32 = 18u;
 const WC_GRID_OFFSET: u32 = 19u;
 const WC_TICKS_TO_RUN: u32 = 20u;
+const WC_PHASE_MASK: u32 = 21u;  // bit0=physics, bit1=vision, bit2=brain
 
 // ── Habituation / homeostasis constants ─────────────────────────────────────
 

@@ -103,6 +103,10 @@ struct Cli {
     /// Override world size for --bench mode (default: from preset)
     #[arg(long)]
     world_size: Option<f32>,
+
+    /// Run phase profiler: breaks down time by physics/vision/brain
+    #[arg(long)]
+    bench_profile: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -2205,6 +2209,18 @@ fn main() {
         let json = serde_json::to_string_pretty(&config)
             .expect("Failed to serialize config");
         println!("{}", json);
+        return;
+    }
+
+    if cli.bench_profile {
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        xagent_sandbox::bench::run_profile(
+            config.brain, config.world, agent_count, total_ticks,
+        );
         return;
     }
 

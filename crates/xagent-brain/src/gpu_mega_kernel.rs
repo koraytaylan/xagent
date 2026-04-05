@@ -444,14 +444,68 @@ impl GpuMegaKernel {
 
     /// Write world config uniform with batch parameters.
     pub fn upload_world_config(&self, start_tick: u64, ticks_to_run: u32) {
-        let wc = build_world_config(
+        self.upload_world_config_masked(start_tick, ticks_to_run, 0x7);
+    }
+
+    /// Write world config with explicit phase mask.
+    /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
+    pub fn upload_world_config_masked(&self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
+        let mut wc = build_world_config(
             &self.world_config,
             self.food_count,
             self.agent_count as usize,
             start_tick,
             ticks_to_run,
         );
+        wc[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
+    }
+
+    /// Dispatch with explicit phase mask (for profiling).
+    /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
+    pub fn dispatch_batch_masked(&mut self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+
+        self.upload_world_config_masked(start_tick, ticks_to_run, phase_mask);
+
+        let pc: [u32; 2] = [start_tick as u32, ticks_to_run];
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mega_dispatch"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[self.staging_idx], 0, buf_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+    }
+
+    /// Ensure any pending staging buffer mapping is collected before reuse.
+    fn collect_pending_staging(&mut self) {
+        if self.state_submit_seq == 0 {
+            return;
+        }
+        // Poll until the pending mapping completes
+        while self.state_mapped_seq.load(Ordering::Acquire) < self.state_submit_seq {
+            self.device.poll(wgpu::Maintain::Poll);
+        }
+        // Read and unmap the mapped staging buffer
+        let read_idx = 1 - self.staging_idx;
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let slice = self.state_staging[read_idx].slice(..buf_size);
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        self.state_cache.clear();
+        self.state_cache.extend_from_slice(floats);
+        drop(data);
+        self.state_staging[read_idx].unmap();
     }
 
     /// Dispatch all ticks in a single GPU kernel invocation.
@@ -459,6 +513,9 @@ impl GpuMegaKernel {
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
+
+        // Ensure no staging buffer is still mapped (would cause submit error)
+        self.collect_pending_staging();
 
         self.upload_world_config(start_tick, ticks_to_run);
 

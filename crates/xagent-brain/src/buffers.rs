@@ -478,20 +478,6 @@ const TOUCH_EDGE_RANGE: f32 = 3.0;
 fn cell_coord(v: f32) -> i32 {{
     return i32(floor(v / CELL_SIZE));
 }}
-
-fn height_at(hmap: ptr<storage, array<f32>, read>, x: f32, z: f32) -> f32 {{
-    let gx = clamp((x + TERRAIN_HALF) * TERRAIN_INV_STEP, 0.0, TERRAIN_MAX_COORD);
-    let gz = clamp((z + TERRAIN_HALF) * TERRAIN_INV_STEP, 0.0, TERRAIN_MAX_COORD);
-    let ix = min(u32(gx), TERRAIN_MAX_IDX);
-    let iz = min(u32(gz), TERRAIN_MAX_IDX);
-    let fx = gx - f32(ix);
-    let fz = gz - f32(iz);
-    let h00 = (*hmap)[iz * TERRAIN_VPS + ix];
-    let h10 = (*hmap)[iz * TERRAIN_VPS + ix + 1u];
-    let h01 = (*hmap)[(iz + 1u) * TERRAIN_VPS + ix];
-    let h11 = (*hmap)[(iz + 1u) * TERRAIN_VPS + ix + 1u];
-    return mix(mix(h00, h10, fx), mix(h01, h11, fx), fz);
-}}
 "#,
         gw = gw,
         go = go,

@@ -9,4 +9,14 @@
 @group(0) @binding(8) var<uniform> wconfig: array<vec4<f32>, 6>;
 
 @compute @workgroup_size(48)
-fn main() {}
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= arrayLength(&agent_phys) { return; }
+    let _h = heightmap[0];
+    let _b = biome[0];
+    let _fs = food_state[0];
+    let _ff = food_flags[0];
+    let _fg = food_grid[0];
+    let _ag = agent_grid[0];
+    sensory[0] = 0.0;
+    let _wc = wconfig[0];
+}

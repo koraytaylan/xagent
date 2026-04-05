@@ -107,19 +107,19 @@ impl GpuPhysics {
         });
         let food_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phys_food_state"),
-            size: (f * FOOD_STATE_STRIDE * 4) as u64,
+            size: ((f * FOOD_STATE_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let food_flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phys_food_flags"),
-            size: (f * 4) as u64,
+            size: ((f * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let food_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phys_food_grid"),
-            size: (grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64,
+            size: ((grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
@@ -432,5 +432,70 @@ impl GpuPhysics {
     ) {
         let wc = build_world_config(config, food_count, agent_count, tick);
         queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physics_shader_moves_agent_forward() {
+        if !GpuBrain::is_available() { return; }
+        let brain_config = xagent_shared::BrainConfig::default();
+        let world_config = xagent_shared::WorldConfig::default();
+        let brain = GpuBrain::new(1, &brain_config);
+
+        // Write a forward motor command into decision_buf
+        let mut decision_data = vec![0.0f32; DECISION_STRIDE];
+        decision_data[DIM + DIM] = 1.0; // forward = 1.0
+        brain.queue().write_buffer(brain.decision_buf(), 0, bytemuck::cast_slice(&decision_data));
+
+        let phys = GpuPhysics::new(&brain, 1, 0, &world_config);
+
+        // Upload a flat terrain (all zeros)
+        let heights = vec![0.0f32; 129 * 129];
+        let biomes = vec![0u32; 256 * 256]; // all FoodRich
+        phys.upload_world(brain.queue(), &heights, &biomes, &[], &[], &[]);
+
+        // Place agent at origin, facing +Z
+        let agents = vec![(glam::Vec3::new(0.0, 1.0, 0.0), 100.0, 100.0, 128, 16)];
+        phys.upload_agents(brain.queue(), &agents);
+        phys.upload_world_config(brain.queue(), &world_config, 0, 1, 0);
+
+        // Dispatch physics
+        let mut encoder = brain.device().create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.physics_pipeline);
+            pass.set_bind_group(0, &phys.physics_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        brain.queue().submit(std::iter::once(encoder.finish()));
+
+        // Read back agent position
+        let readback = brain.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (PHYS_STRIDE * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc2 = brain.device().create_command_encoder(&Default::default());
+        enc2.copy_buffer_to_buffer(&phys.agent_phys_buf, 0, &readback, 0, (PHYS_STRIDE * 4) as u64);
+        brain.queue().submit(std::iter::once(enc2.finish()));
+        brain.device().poll(wgpu::Maintain::Wait);
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        brain.device().poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        // Agent should have moved in +Z direction (facing +Z, forward=1)
+        let new_z = floats[P_POS_Z];
+        assert!(new_z > 0.0, "agent should move forward in Z: got {}", new_z);
+        assert!(floats[P_ALIVE] > 0.5, "agent should still be alive");
     }
 }

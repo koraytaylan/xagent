@@ -3,4 +3,8 @@
 @group(0) @binding(2) var<storage, read_write> collision_scratch: array<atomic<i32>>;
 
 @compute @workgroup_size(1)
-fn main() {}
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= arrayLength(&agent_phys) { return; }
+    let _ag = agent_grid[0];
+    let _cs = atomicLoad(&collision_scratch[0]);
+}

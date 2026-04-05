@@ -2,4 +2,7 @@
 @group(0) @binding(1) var<storage, read_write> agent_grid: array<atomic<u32>>;
 
 @compute @workgroup_size(1)
-fn main() {}
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= arrayLength(&agent_phys) { return; }
+    let _ag = atomicLoad(&agent_grid[0]);
+}

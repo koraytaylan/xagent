@@ -561,6 +561,102 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
     );
 }
 
+// ── FoodGrid Tests ──────────────────────────────────────────────────
+
+#[test]
+fn food_grid_query_returns_nearby_food() {
+    use xagent_sandbox::world::spatial::FoodGrid;
+    use xagent_sandbox::world::entity::FoodItem;
+
+    let items = vec![
+        FoodItem::new(Vec3::new(0.0, 0.0, 0.0)),   // 0: at origin
+        FoodItem::new(Vec3::new(1.0, 0.0, 1.0)),    // 1: nearby origin
+        FoodItem::new(Vec3::new(100.0, 0.0, 100.0)),// 2: far away
+    ];
+    let grid = FoodGrid::from_items(&items, 256.0);
+
+    let nearby: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
+    assert!(nearby.contains(&0), "Should find food 0 near origin");
+    assert!(nearby.contains(&1), "Should find food 1 near origin");
+    assert!(!nearby.contains(&2), "Should NOT find distant food 2");
+
+    let far: Vec<usize> = grid.query_nearby(100.0, 100.0).collect();
+    assert!(far.contains(&2), "Should find food 2 near (100,100)");
+    assert!(!far.contains(&0), "Should NOT find food 0 near (100,100)");
+
+    let empty: Vec<usize> = grid.query_nearby(-500.0, -500.0).collect();
+    assert!(empty.is_empty(), "Should find no food in empty area");
+}
+
+#[test]
+fn food_grid_skips_consumed_items() {
+    use xagent_sandbox::world::spatial::FoodGrid;
+    use xagent_sandbox::world::entity::FoodItem;
+
+    let mut item = FoodItem::new(Vec3::new(5.0, 0.0, 5.0));
+    item.consumed = true;
+    let items = vec![
+        FoodItem::new(Vec3::new(0.0, 0.0, 0.0)), // 0: unconsumed
+        item,                                      // 1: consumed
+    ];
+    let grid = FoodGrid::from_items(&items, 256.0);
+
+    let nearby: Vec<usize> = grid.query_nearby(3.0, 3.0).collect();
+    assert!(nearby.contains(&0), "Should find unconsumed food 0");
+    assert!(!nearby.contains(&1), "Should NOT find consumed food 1");
+}
+
+#[test]
+fn food_grid_remove_and_insert() {
+    use xagent_sandbox::world::spatial::FoodGrid;
+    use xagent_sandbox::world::entity::FoodItem;
+
+    let items = vec![
+        FoodItem::new(Vec3::new(10.0, 0.0, 10.0)),
+        FoodItem::new(Vec3::new(12.0, 0.0, 12.0)),
+    ];
+    let mut grid = FoodGrid::from_items(&items, 256.0);
+
+    // Both should be found
+    let nearby: Vec<usize> = grid.query_nearby(11.0, 11.0).collect();
+    assert!(nearby.contains(&0));
+    assert!(nearby.contains(&1));
+
+    // Remove food 0
+    grid.remove(0, 10.0, 10.0);
+    let after_remove: Vec<usize> = grid.query_nearby(11.0, 11.0).collect();
+    assert!(!after_remove.contains(&0), "Food 0 should be gone after remove");
+    assert!(after_remove.contains(&1), "Food 1 should remain");
+
+    // Insert food 0 at a new position
+    grid.insert(0, 50.0, 50.0);
+    let at_new_pos: Vec<usize> = grid.query_nearby(50.0, 50.0).collect();
+    assert!(at_new_pos.contains(&0), "Food 0 should be at new position");
+}
+
+#[test]
+fn food_grid_rebuild_clears_and_repopulates() {
+    use xagent_sandbox::world::spatial::FoodGrid;
+    use xagent_sandbox::world::entity::FoodItem;
+
+    let items_a = vec![
+        FoodItem::new(Vec3::new(0.0, 0.0, 0.0)),
+        FoodItem::new(Vec3::new(50.0, 0.0, 50.0)),
+    ];
+    let mut grid = FoodGrid::from_items(&items_a, 256.0);
+
+    let items_b = vec![
+        FoodItem::new(Vec3::new(80.0, 0.0, 80.0)),
+    ];
+    grid.rebuild(&items_b);
+
+    let near_origin: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
+    assert!(near_origin.is_empty(), "Old food at origin should be gone after rebuild");
+
+    let near_new: Vec<usize> = grid.query_nearby(80.0, 80.0).collect();
+    assert!(near_new.contains(&0), "New food 0 should be at (80,80)");
+}
+
 // ── AgentGrid Tests ─────────────────────────────────────────────────
 
 #[test]

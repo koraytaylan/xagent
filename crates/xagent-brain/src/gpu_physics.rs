@@ -500,6 +500,78 @@ mod tests {
     }
 
     #[test]
+    fn collision_pushes_overlapping_agents_apart() {
+        if !GpuBrain::is_available() { return; }
+        let brain_config = xagent_shared::BrainConfig::default();
+        let world_config = xagent_shared::WorldConfig::default();
+        let brain = GpuBrain::new(2, &brain_config);
+        let phys = GpuPhysics::new(&brain, 2, 0, &world_config);
+
+        let heights = vec![0.0f32; 129 * 129];
+        let biomes = vec![0u32; 256 * 256];
+        phys.upload_world(brain.queue(), &heights, &biomes, &[], &[], &[]);
+
+        // Two agents overlapping at nearly the same position
+        let agents = vec![
+            (glam::Vec3::new(0.0, 1.0, 0.0), 100.0, 100.0, 128, 16),
+            (glam::Vec3::new(0.5, 1.0, 0.0), 100.0, 100.0, 128, 16),
+        ];
+        phys.upload_agents(brain.queue(), &agents);
+        phys.upload_world_config(brain.queue(), &world_config, 0, 2, 0);
+
+        let mut encoder = brain.device().create_command_encoder(&Default::default());
+        encoder.clear_buffer(&phys.agent_grid_buf, 0, None);
+        encoder.clear_buffer(&phys.collision_scratch_buf, 0, None);
+        // Build agent grid
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.agent_grid_build_pipeline);
+            pass.set_bind_group(0, &phys.agent_grid_build_bind_group, &[]);
+            pass.dispatch_workgroups(2, 1, 1);
+        }
+        // Collision accumulate + apply
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.collision_accumulate_pipeline);
+            pass.set_bind_group(0, &phys.collision_accumulate_bind_group, &[]);
+            pass.dispatch_workgroups(2, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&phys.collision_apply_pipeline);
+            pass.set_bind_group(0, &phys.collision_apply_bind_group, &[]);
+            pass.dispatch_workgroups(2, 1, 1);
+        }
+        brain.queue().submit(std::iter::once(encoder.finish()));
+
+        // Read back both agents
+        let buf_size = (2 * PHYS_STRIDE * 4) as u64;
+        let readback = brain.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc2 = brain.device().create_command_encoder(&Default::default());
+        enc2.copy_buffer_to_buffer(&phys.agent_phys_buf, 0, &readback, 0, buf_size);
+        brain.queue().submit(std::iter::once(enc2.finish()));
+        brain.device().poll(wgpu::Maintain::Wait);
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        brain.device().poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        let x0 = floats[P_POS_X];
+        let x1 = floats[PHYS_STRIDE + P_POS_X];
+        let dist = (x1 - x0).abs();
+        assert!(dist > 0.5, "agents should be pushed further apart: dist={}", dist);
+    }
+
+    #[test]
     fn food_detect_awards_energy_on_claim() {
         if !GpuBrain::is_available() { return; }
         let brain_config = xagent_shared::BrainConfig::default();

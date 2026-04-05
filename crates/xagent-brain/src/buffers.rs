@@ -107,7 +107,7 @@ pub const CFG_RECALL_K: usize = 3;
 pub const CFG_LEARNING_RATE: usize = 4;
 pub const CFG_DECAY_RATE: usize = 5;
 pub const CFG_DISTRESS_EXP: usize = 6;
-pub const CONFIG_SIZE: usize = 7;
+pub const CONFIG_SIZE: usize = 8; // padded to 8 for uniform vec4 alignment
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
 

@@ -49,6 +49,8 @@ pub struct GpuBrain {
     feature_extract_bind_group: wgpu::BindGroup,
     encode_pipeline: wgpu::ComputePipeline,
     encode_bind_group: wgpu::BindGroup,
+    habituate_homeo_pipeline: wgpu::ComputePipeline,
+    habituate_homeo_bind_group: wgpu::BindGroup,
 
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
@@ -241,6 +243,21 @@ impl GpuBrain {
             ],
         });
 
+        let hh_source = format!("{}\n{}", constants, include_str!("shaders/habituate_homeo.wgsl"));
+        let habituate_homeo_pipeline = Self::create_pipeline(&device, "habituate_homeo", &hh_source);
+        let habituate_homeo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("habituate_homeo_bg"),
+            layout: &habituate_homeo_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: encoded_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sensory_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: brain_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: habituated_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: homeo_out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: config_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -268,6 +285,8 @@ impl GpuBrain {
             feature_extract_bind_group,
             encode_pipeline,
             encode_bind_group,
+            habituate_homeo_pipeline,
+            habituate_homeo_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -413,6 +432,24 @@ impl GpuBrain {
             });
             pass.set_pipeline(&self.encode_pipeline);
             pass.set_bind_group(0, &self.encode_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Dispatch habituate+homeo pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_habituate_homeo(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_habituate_homeo"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("habituate_homeo"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.habituate_homeo_pipeline);
+            pass.set_bind_group(0, &self.habituate_homeo_bind_group, &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -566,5 +603,32 @@ mod tests {
             assert!((encoded[d] - expected).abs() < 0.01,
                 "dim {} expected {} got {}", d, expected, encoded[d]);
         }
+    }
+
+    #[test]
+    fn habituation_attenuates_repeated_input() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+
+        let frame = SensoryFrame::new_blank(8, 6);
+
+        // Run feature_extract + encode + habituate_homeo multiple times with constant input
+        for _ in 0..100 {
+            brain.upload_sensory(&[frame.clone()]);
+            brain.run_feature_extract();
+            brain.run_encode();
+            brain.run_habituate_homeo();
+        }
+
+        // Read back attenuation values from brain_state
+        let state = brain.read_agent_state(0);
+        let mut mean_atten = 0.0;
+        for d in 0..DIM {
+            mean_atten += state.brain_state[O_HAB_ATTEN + d];
+        }
+        mean_atten /= DIM as f32;
+
+        // Constant input should drive attenuation down toward floor (0.1)
+        assert!(mean_atten < 0.5, "Constant input should reduce attenuation, got mean={}", mean_atten);
     }
 }

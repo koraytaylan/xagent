@@ -544,6 +544,10 @@ fn evolution_snapshot_default_tree_pane_fraction() {
 
 #[test]
 fn bench_runner_completes_and_reports_ticks_per_sec() {
+    if !xagent_brain::GpuBrain::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
     let brain = BrainConfig::default();
     let world = WorldConfig::default();
     let agent_count = 4;
@@ -888,6 +892,10 @@ fn deferred_consumption_awards_energy_to_only_one_agent() {
 
 #[test]
 fn deterministic_bench_produces_same_state_twice() {
+    if !xagent_brain::GpuBrain::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
     use xagent_shared::{BrainConfig, WorldConfig};
 
     // Pin rayon to 1 thread to eliminate any scheduling non-determinism.

@@ -683,6 +683,111 @@ fn step_pure_matches_step_for_movement() {
     );
 }
 
+// ── Deferred Food Consumption Tests ─────────────────────────────────
+
+#[test]
+fn step_pure_does_not_apply_food_energy() {
+    let world = test_world();
+
+    // Find an unconsumed food item
+    let food_pos = match world.food_items.iter().find(|f| !f.consumed) {
+        Some(f) => f.position,
+        None => return,
+    };
+
+    let spawn_pos = Vec3::new(food_pos.x, food_pos.y + 1.0, food_pos.z);
+    let mut agent = agent_at(spawn_pos);
+    agent.body.internal.energy = 50.0;
+    let energy_before = agent.body.internal.energy;
+
+    let motor = MotorCommand {
+        forward: 0.0,
+        strafe: 0.0,
+        turn: 0.0,
+        action: Some(MotorAction::Consume),
+    };
+    let dt = 1.0 / 30.0;
+
+    let (consumed, _died) = physics::step_pure(&mut agent, &motor, &world, dt);
+
+    // step_pure should detect food but NOT apply energy gain
+    assert!(consumed.is_some(), "Should detect nearby food");
+    // Energy should have decreased (depletion) or stayed the same, never increased
+    assert!(
+        agent.body.internal.energy <= energy_before,
+        "step_pure must not apply food energy: before={}, after={}",
+        energy_before,
+        agent.body.internal.energy,
+    );
+}
+
+#[test]
+fn deferred_consumption_awards_energy_to_only_one_agent() {
+    let mut world = test_world();
+
+    // Find an unconsumed food item
+    let (food_idx, food_pos) = match world
+        .food_items
+        .iter()
+        .enumerate()
+        .find(|(_, f)| !f.consumed)
+    {
+        Some((i, f)) => (i, f.position),
+        None => return,
+    };
+
+    // Place two agents at the same food position
+    let spawn_pos = Vec3::new(food_pos.x, food_pos.y + 1.0, food_pos.z);
+    let mut agent_a = agent_at(spawn_pos);
+    let mut agent_b = agent_at(spawn_pos);
+    agent_a.body.internal.energy = 50.0;
+    agent_b.body.internal.energy = 50.0;
+
+    let motor = MotorCommand {
+        forward: 0.0,
+        strafe: 0.0,
+        turn: 0.0,
+        action: Some(MotorAction::Consume),
+    };
+    let dt = 1.0 / 30.0;
+
+    // Both agents detect the same food
+    let (consumed_a, _) = physics::step_pure(&mut agent_a, &motor, &world, dt);
+    let (consumed_b, _) = physics::step_pure(&mut agent_b, &motor, &world, dt);
+
+    assert_eq!(consumed_a, Some(food_idx));
+    assert_eq!(consumed_b, Some(food_idx));
+
+    let energy_a_before = agent_a.body.internal.energy;
+    let energy_b_before = agent_b.body.internal.energy;
+
+    // Simulate the sequential deferred consumption (same logic as bench.rs)
+    let results = vec![(consumed_a, false), (consumed_b, false)];
+    let mut agents_energy = [energy_a_before, energy_b_before];
+
+    for (i, (consumed, _)) in results.iter().enumerate() {
+        if let Some(idx) = consumed {
+            let food = &mut world.food_items[*idx];
+            if !food.consumed {
+                food.consumed = true;
+                food.respawn_timer = 10.0;
+                // Award energy only to the winning consumer
+                agents_energy[i] += world.config.food_energy_value;
+            }
+        }
+    }
+
+    // Only one agent should have received the energy
+    let a_got_food = agents_energy[0] > energy_a_before;
+    let b_got_food = agents_energy[1] > energy_b_before;
+    assert!(
+        a_got_food && !b_got_food,
+        "Only the first agent should get food energy: a_got={}, b_got={}",
+        a_got_food,
+        b_got_food,
+    );
+}
+
 // ── Determinism Tests ───────────────────────────────────────────────
 
 #[test]

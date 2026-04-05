@@ -136,13 +136,18 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                     );
                 });
 
-                // Batched GPU brain tick
+                // Collect previous tick's results (non-blocking — GPU has had
+                // a full tick of CPU work to finish since the last submit)
+                if let Some(motors) = gpu_brain.try_collect() {
+                    for (i, motor) in motors.into_iter().enumerate() {
+                        agents[i].cached_motor = motor;
+                    }
+                }
+
+                // Submit this tick's brain work (non-blocking)
                 let frames: Vec<xagent_shared::SensoryFrame> =
                     agents.iter().map(|a| a.cached_frame.clone()).collect();
-                let motors = gpu_brain.tick(&frames);
-                for (i, motor) in motors.into_iter().enumerate() {
-                    agents[i].cached_motor = motor;
-                }
+                gpu_brain.submit(&frames);
             }
 
             // Physics (sequential — small populations don't benefit from rayon here)

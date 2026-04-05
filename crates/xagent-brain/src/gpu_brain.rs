@@ -45,6 +45,9 @@ pub struct GpuBrain {
     mapped_seq: Arc<AtomicU64>,
     has_in_flight: bool,
 
+    // ── Deferred operations ──
+    pending_deaths: Vec<u32>,
+
     // ── Compute pipelines ──
     feature_extract_pipeline: wgpu::ComputePipeline,
     feature_extract_bind_group: wgpu::BindGroup,
@@ -376,6 +379,7 @@ impl GpuBrain {
             submit_seq: 0,
             mapped_seq: Arc::new(AtomicU64::new(0)),
             has_in_flight: false,
+            pending_deaths: Vec::new(),
             feature_extract_pipeline,
             feature_extract_bind_group,
             encode_pipeline,
@@ -419,8 +423,49 @@ impl GpuBrain {
         );
     }
 
-    /// Read back motor commands from staging buffer.
-    pub fn read_motor_output(&mut self) -> Vec<MotorCommand> {
+    /// Non-blocking: try to read motor commands from the previously submitted tick.
+    /// Returns `Some(commands)` if the GPU has finished, `None` if still in-flight.
+    /// Callers should keep using cached motor commands when this returns `None`.
+    pub fn try_collect(&mut self) -> Option<Vec<MotorCommand>> {
+        let n = self.agent_count as usize;
+        if !self.has_in_flight {
+            return None;
+        }
+
+        // Non-blocking poll — just nudge the driver, don't wait
+        self.device.poll(wgpu::Maintain::Poll);
+
+        // Check if the mapping callback has fired
+        let read_idx = 1 - self.staging_idx;
+        if self.mapped_seq.load(Ordering::Acquire) < self.submit_seq {
+            return None; // GPU not done yet
+        }
+
+        let motor_size = (n * 4 * 4) as u64;
+        let slice = self.motor_staging[read_idx].slice(..motor_size);
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        let mut commands = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * 4;
+            commands.push(MotorCommand {
+                forward: floats[base],
+                turn: floats[base + 1],
+                strafe: floats[base + 2],
+                action: None,
+            });
+        }
+        drop(data);
+        self.motor_staging[read_idx].unmap();
+        self.staging_mapped[read_idx] = false;
+        self.has_in_flight = false;
+
+        Some(commands)
+    }
+
+    /// Blocking: wait for GPU and return motor commands.
+    pub fn collect_blocking(&mut self) -> Vec<MotorCommand> {
         let n = self.agent_count as usize;
         if !self.has_in_flight {
             return vec![MotorCommand::default(); n];
@@ -485,39 +530,96 @@ impl GpuBrain {
         self.queue.write_buffer(&self.history_buf, hist_offset, bytemuck::cast_slice(&state.history));
     }
 
-    /// Signal agent death: halve all pattern reinforcements and reset homeostasis.
+    /// Queue a death signal for deferred processing. Actual state modification
+    /// happens in `flush_death_signals()`, which must be called before the next
+    /// `submit()` (this is done automatically by `submit()`).
     pub fn death_signal(&mut self, index: u32) {
-        let mut state = self.read_agent_state(index);
-
-        // Halve all pattern reinforcements (trauma)
-        let base = O_PAT_REINF;
-        for j in 0..MEMORY_CAP {
-            state.patterns[base + j] *= 0.5;
-        }
-
-        // Reset homeostasis EMAs
-        let h = O_HOMEO;
-        for j in 0..6 {
-            state.brain_state[h + j] = 0.0;
-        }
-
-        // Reset action history
-        state.history = init_action_history();
-
-        // Reset exploration rate to 0.5
-        state.brain_state[O_EXPLORATION_RATE] = 0.5;
-
-        self.write_agent_state(index, &state);
+        self.pending_deaths.push(index);
     }
 
-    /// Upload sensory frames, run full brain tick (7 passes), return motor commands.
+    /// Process all pending death signals. Writes resets directly to GPU buffers
+    /// without reading back — only reads the 128-f32 reinforcement slice to halve it.
+    /// Called automatically by `submit()` so deaths are batched between brain ticks.
+    fn flush_death_signals(&mut self) {
+        if self.pending_deaths.is_empty() {
+            return;
+        }
+
+        let indices: Vec<u32> = self.pending_deaths.drain(..).collect();
+
+        // Read reinforcements for all dead agents in one poll
+        let mut reinf_data: Vec<(u32, Vec<f32>)> = Vec::with_capacity(indices.len());
+        {
+            // Submit all copy commands in one encoder
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("death_read"),
+            });
+            let reinf_size = (MEMORY_CAP * 4) as u64;
+            let stagings: Vec<wgpu::Buffer> = indices.iter().map(|&idx| {
+                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("death_reinf_staging"),
+                    size: reinf_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let src_offset = (idx as usize * PATTERN_STRIDE + O_PAT_REINF) as u64 * 4;
+                encoder.copy_buffer_to_buffer(&self.pattern_buf, src_offset, &staging, 0, reinf_size);
+                staging
+            }).collect();
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Map all staging buffers
+            for staging in &stagings {
+                staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            }
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+
+            // Read and halve reinforcements
+            for (i, staging) in stagings.iter().enumerate() {
+                let data = staging.slice(..reinf_size).get_mapped_range();
+                let floats: &[f32] = bytemuck::cast_slice(&data);
+                let halved: Vec<f32> = floats.iter().map(|v| v * 0.5).collect();
+                drop(data);
+                staging.unmap();
+                reinf_data.push((indices[i], halved));
+            }
+        }
+
+        // Write everything back without reading
+        for (idx, halved_reinf) in &reinf_data {
+            let i = *idx as usize;
+
+            // Write halved reinforcements
+            let reinf_offset = (i * PATTERN_STRIDE + O_PAT_REINF) as u64 * 4;
+            self.queue.write_buffer(&self.pattern_buf, reinf_offset, bytemuck::cast_slice(halved_reinf));
+
+            // Reset homeostasis EMAs (6 zeros)
+            let homeo_offset = (i * BRAIN_STRIDE + O_HOMEO) as u64 * 4;
+            let zeros = [0.0f32; 6];
+            self.queue.write_buffer(&self.brain_state_buf, homeo_offset, bytemuck::cast_slice(&zeros));
+
+            // Reset exploration rate to 0.5
+            let exp_offset = (i * BRAIN_STRIDE + O_EXPLORATION_RATE) as u64 * 4;
+            let exp_val = [0.5f32];
+            self.queue.write_buffer(&self.brain_state_buf, exp_offset, bytemuck::cast_slice(&exp_val));
+
+            // Reset action history
+            let hist_offset = (i * HISTORY_STRIDE) as u64 * 4;
+            let fresh_hist = init_action_history();
+            self.queue.write_buffer(&self.history_buf, hist_offset, bytemuck::cast_slice(&fresh_hist));
+        }
+    }
+
+    /// Blocking tick: upload, dispatch all 7 passes, wait for motor commands.
+    /// Prefer the pipelined `submit()` + `try_collect()` pattern for production use.
     pub fn tick(&mut self, frames: &[SensoryFrame]) -> Vec<MotorCommand> {
         self.submit(frames);
-        self.collect()
+        self.collect_blocking()
     }
 
-    /// Non-blocking submit: upload sensory data, dispatch all 7 passes.
+    /// Non-blocking submit: flush pending death signals, upload sensory data, dispatch all 7 passes.
     pub fn submit(&mut self, frames: &[SensoryFrame]) {
+        self.flush_death_signals();
         self.upload_sensory(frames);
 
         let widx = self.staging_idx;
@@ -615,10 +717,6 @@ impl GpuBrain {
         self.has_in_flight = true;
     }
 
-    /// Blocking collect: wait for GPU and return motor commands.
-    pub fn collect(&mut self) -> Vec<MotorCommand> {
-        self.read_motor_output()
-    }
 
     /// Dispatch feature extraction pass (test-only).
     #[cfg(test)]
@@ -846,6 +944,7 @@ mod tests {
         brain.write_agent_state(0, &state);
 
         brain.death_signal(0);
+        brain.flush_death_signals();
 
         let after = brain.read_agent_state(0);
         assert!((after.patterns[O_PAT_REINF] - 1.0).abs() < 0.01);

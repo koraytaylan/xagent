@@ -106,13 +106,17 @@ fn run_bench_inner(
                 }
             }
 
-            // Batched GPU brain tick
+            // Collect previous tick's results (non-blocking)
+            if let Some(motors) = gpu_brain.try_collect() {
+                for (i, motor) in motors.into_iter().enumerate() {
+                    agents[i].cached_motor = motor;
+                }
+            }
+
+            // Submit this tick's brain work (non-blocking)
             let frames: Vec<xagent_shared::SensoryFrame> =
                 agents.iter().map(|a| a.cached_frame.clone()).collect();
-            let motors = gpu_brain.tick(&frames);
-            for (i, motor) in motors.into_iter().enumerate() {
-                agents[i].cached_motor = motor;
-            }
+            gpu_brain.submit(&frames);
         }
 
         // Physics

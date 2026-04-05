@@ -1303,14 +1303,16 @@ impl ApplicationHandler for App {
                                             );
                                         });
 
-                                    // Batched GPU brain tick
+                                    // Pipelined GPU brain: collect last tick, submit this tick
                                     if let Some(ref mut gpu_brain) = self.gpu_brain {
+                                        if let Some(motors) = gpu_brain.try_collect() {
+                                            for (i, motor) in motors.into_iter().enumerate() {
+                                                self.agents[i].cached_motor = motor;
+                                            }
+                                        }
                                         let frames: Vec<SensoryFrame> =
                                             self.agents.iter().map(|a| a.cached_frame.clone()).collect();
-                                        let motors = gpu_brain.tick(&frames);
-                                        for (i, motor) in motors.into_iter().enumerate() {
-                                            self.agents[i].cached_motor = motor;
-                                        }
+                                        gpu_brain.submit(&frames);
                                     }
                                 }
 

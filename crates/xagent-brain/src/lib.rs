@@ -12,6 +12,7 @@ pub mod brain;
 pub mod buffers;
 pub mod capacity;
 pub mod encoder;
+pub mod gpu_brain;
 pub mod homeostasis;
 pub mod memory;
 pub mod predictor;
@@ -28,6 +29,8 @@ pub(crate) fn fast_tanh(x: f32) -> f32 {
 }
 
 pub use brain::{Brain, BrainTelemetry, DecisionSnapshot, LearnedState};
+pub use buffers::AgentBrainState;
+pub use gpu_brain::GpuBrain;
 pub use habituation::SensoryHabituation;
 pub use memory::RecalledPattern;
 pub use motor_fatigue::MotorFatigue;

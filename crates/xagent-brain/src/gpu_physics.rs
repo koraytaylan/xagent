@@ -16,6 +16,8 @@ use crate::gpu_brain::GpuBrain;
 const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
 const BIOME_GRID_RES: usize = 256;
+/// How many ticks between death-flag readback submissions.
+const DEATH_CHECK_INTERVAL: u64 = 10;
 
 #[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
 pub struct GpuPhysics {
@@ -432,6 +434,216 @@ impl GpuPhysics {
     ) {
         let wc = build_world_config(config, food_count, agent_count, tick);
         queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
+    }
+
+    /// Encode all physics dispatches for one tick into the command encoder.
+    /// Does NOT include vision or brain passes.
+    pub fn encode_tick(&self, encoder: &mut wgpu::CommandEncoder) {
+        // Clear grids
+        encoder.clear_buffer(&self.food_grid_buf, 0, None);
+        encoder.clear_buffer(&self.agent_grid_buf, 0, None);
+        encoder.clear_buffer(&self.collision_scratch_buf, 0, None);
+
+        // 1. Rebuild food grid
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.food_grid_build_pipeline);
+            pass.set_bind_group(0, &self.food_grid_build_bind_group, &[]);
+            pass.dispatch_workgroups(self.food_count as u32, 1, 1);
+        }
+
+        // 2. Physics
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.physics_pipeline);
+            pass.set_bind_group(0, &self.physics_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+
+        // 3. Food detect
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.food_detect_pipeline);
+            pass.set_bind_group(0, &self.food_detect_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+
+        // 4. Food respawn
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.food_respawn_pipeline);
+            pass.set_bind_group(0, &self.food_respawn_bind_group, &[]);
+            pass.dispatch_workgroups(self.food_count as u32, 1, 1);
+        }
+
+        // 5. Agent grid build
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.agent_grid_build_pipeline);
+            pass.set_bind_group(0, &self.agent_grid_build_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+
+        // 6. Collision: 3 iterations × (accumulate + apply)
+        for _ in 0..3 {
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.collision_accumulate_pipeline);
+                pass.set_bind_group(0, &self.collision_accumulate_bind_group, &[]);
+                pass.dispatch_workgroups(self.agent_count, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.collision_apply_pipeline);
+                pass.set_bind_group(0, &self.collision_apply_bind_group, &[]);
+                pass.dispatch_workgroups(self.agent_count, 1, 1);
+            }
+        }
+    }
+
+    /// Encode vision dispatch (fills sensory_buf). Call on brain ticks only.
+    pub fn encode_vision(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.vision_pipeline);
+        pass.set_bind_group(0, &self.vision_bind_group, &[]);
+        pass.dispatch_workgroups(self.agent_count, 1, 1);
+    }
+
+    /// Returns the death check interval.
+    pub fn death_check_interval(&self) -> u64 {
+        DEATH_CHECK_INTERVAL
+    }
+
+    /// Initiate async readback of death flags. Call every DEATH_CHECK_INTERVAL ticks.
+    pub fn submit_death_readback(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let n = self.agent_count as usize;
+        let widx = self.death_staging_idx;
+
+        if self.death_staging_mapped[widx] {
+            self.death_staging[widx].unmap();
+            self.death_staging_mapped[widx] = false;
+        }
+
+        // Copy died_flag from agent_phys_buf to staging
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for i in 0..n {
+            let src_offset = ((i * PHYS_STRIDE + P_DIED_FLAG) * 4) as u64;
+            let dst_offset = (i * 4) as u64;
+            encoder.copy_buffer_to_buffer(
+                &self.agent_phys_buf, src_offset,
+                &self.death_staging[widx], dst_offset,
+                4,
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let death_size = (n * 4) as u64;
+        let seq = self.death_submit_seq + 1;
+        self.death_submit_seq = seq;
+        let flag = self.death_mapped_seq.clone();
+        self.death_staging[widx]
+            .slice(..death_size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    flag.store(seq, Ordering::Release);
+                }
+            });
+        self.death_staging_mapped[widx] = true;
+        self.death_staging_idx = 1 - self.death_staging_idx;
+    }
+
+    /// Try to read back death flags (non-blocking). Returns indices of dead agents.
+    pub fn try_collect_deaths(&mut self, device: &wgpu::Device) -> Option<Vec<u32>> {
+        device.poll(wgpu::Maintain::Poll);
+
+        let read_idx = 1 - self.death_staging_idx;
+        if self.death_mapped_seq.load(Ordering::Acquire) < self.death_submit_seq {
+            return None;
+        }
+
+        let n = self.agent_count as usize;
+        let death_size = (n * 4) as u64;
+        let slice = self.death_staging[read_idx].slice(..death_size);
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        let mut dead = Vec::new();
+        for i in 0..n {
+            if floats[i] > 0.5 {
+                dead.push(i as u32);
+            }
+        }
+        drop(data);
+        self.death_staging[read_idx].unmap();
+        self.death_staging_mapped[read_idx] = false;
+
+        Some(dead)
+    }
+
+    /// Respawn a dead agent at a new position. Resets physics state on GPU.
+    pub fn respawn_agent(
+        &self,
+        queue: &wgpu::Queue,
+        index: u32,
+        pos: glam::Vec3,
+        max_energy: f32,
+        max_integrity: f32,
+        memory_cap: usize,
+        processing_slots: usize,
+    ) {
+        let mut data = vec![0.0f32; PHYS_STRIDE];
+        data[P_POS_X] = pos.x;
+        data[P_POS_Y] = pos.y;
+        data[P_POS_Z] = pos.z;
+        data[P_FACING_Z] = 1.0;
+        data[P_ENERGY] = max_energy;
+        data[P_MAX_ENERGY] = max_energy;
+        data[P_INTEGRITY] = max_integrity;
+        data[P_MAX_INTEGRITY] = max_integrity;
+        data[P_PREV_ENERGY] = max_energy;
+        data[P_PREV_INTEGRITY] = max_integrity;
+        data[P_ALIVE] = 1.0;
+        data[P_DIED_FLAG] = 0.0;
+        data[P_MEMORY_CAP] = memory_cap as f32;
+        data[P_PROCESSING_SLOTS] = processing_slots as f32;
+        // food_count and ticks_alive are NOT reset (for fitness tracking)
+
+        let offset = (index as usize * PHYS_STRIDE * 4) as u64;
+        queue.write_buffer(&self.agent_phys_buf, offset, bytemuck::cast_slice(&data));
+    }
+
+    /// Blocking readback of agent stats for fitness evaluation. Call at generation end.
+    pub fn read_agent_stats(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<(u32, u64)> {
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &staging, 0, buf_size);
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::Maintain::Wait);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        let mut stats = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * PHYS_STRIDE;
+            let food = floats[base + P_FOOD_COUNT] as u32;
+            let ticks = floats[base + P_TICKS_ALIVE] as u64;
+            stats.push((food, ticks));
+        }
+        stats
     }
 }
 

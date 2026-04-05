@@ -44,11 +44,30 @@ pub struct GpuBrain {
     mapped_seq: Arc<AtomicU64>,
     has_in_flight: bool,
 
+    // ── Compute pipelines ──
+    feature_extract_pipeline: wgpu::ComputePipeline,
+    feature_extract_bind_group: wgpu::BindGroup,
+
     // ── Packing scratch ──
     sensory_scratch: Vec<f32>,
 }
 
 impl GpuBrain {
+    fn create_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
     /// Create a GPU brain for `agent_count` agents.
     pub fn new(agent_count: u32, config: &BrainConfig) -> Self {
         let n = agent_count as usize;
@@ -195,6 +214,19 @@ impl GpuBrain {
         queue.write_buffer(&history_buf, 0, bytemuck::cast_slice(&history_data));
         queue.write_buffer(&config_buf, 0, bytemuck::cast_slice(&build_config(config)));
 
+        // ── Compute pipelines ──
+        let constants = crate::buffers::wgsl_constants();
+        let fe_source = format!("{}\n{}", constants, include_str!("shaders/feature_extract.wgsl"));
+        let feature_extract_pipeline = Self::create_pipeline(&device, "feature_extract", &fe_source);
+        let feature_extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("feature_extract_bg"),
+            layout: &feature_extract_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sensory_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: features_buf.as_entire_binding() },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -218,6 +250,8 @@ impl GpuBrain {
             submit_seq: 0,
             mapped_seq: Arc::new(AtomicU64::new(0)),
             has_in_flight: false,
+            feature_extract_pipeline,
+            feature_extract_bind_group,
             sensory_scratch: vec![0.0; n * SENSORY_STRIDE],
         }
     }
@@ -332,6 +366,24 @@ impl GpuBrain {
         self.write_agent_state(index, &state);
     }
 
+    /// Dispatch feature extraction pass (test-only).
+    #[cfg(test)]
+    pub(crate) fn run_feature_extract(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_feature_extract"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("feature_extract"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.feature_extract_pipeline);
+            pass.set_bind_group(0, &self.feature_extract_bind_group, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
     pub(crate) fn read_buffer_range(&self, buffer: &wgpu::Buffer, offset: u64, size: u64, out: &mut Vec<f32>) {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -388,6 +440,36 @@ mod tests {
 
         let state1 = brain.read_agent_state(1);
         assert_ne!(state1.brain_state[O_ENC_BIASES], 42.0);
+    }
+
+    #[test]
+    fn feature_extract_produces_correct_output() {
+        let config = BrainConfig::default();
+        let mut brain = GpuBrain::new(1, &config);
+
+        // Create a frame with known values
+        let mut frame = SensoryFrame::new_blank(8, 6);
+        frame.vision.color[0] = 0.5; // First pixel R
+        frame.vision.color[1] = 0.3; // First pixel G
+        frame.velocity = glam::Vec3::new(3.0, 4.0, 0.0); // magnitude = 5.0
+        frame.energy_signal = 0.8;
+
+        brain.upload_sensory(&[frame]);
+        brain.run_feature_extract();
+
+        // Read back features
+        let mut features = vec![0.0_f32; FEATURES_STRIDE];
+        brain.read_buffer_range(&brain.features_buf, 0, (FEATURES_STRIDE * 4) as u64, &mut features);
+
+        // Vision color should be copied directly
+        assert!((features[0] - 0.5).abs() < 0.001, "pixel R");
+        assert!((features[1] - 0.3).abs() < 0.001, "pixel G");
+
+        // Velocity magnitude at index 192
+        assert!((features[192] - 5.0).abs() < 0.01, "vel magnitude");
+
+        // Energy at index 197 (192 + vel_mag(1) + facing(3) + ang_vel(1) = 197)
+        assert!((features[197] - 0.8).abs() < 0.001, "energy");
     }
 
     #[test]

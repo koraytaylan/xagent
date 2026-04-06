@@ -1608,8 +1608,8 @@ impl ApplicationHandler for App {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         let energy = agent.body.body.internal.energy_signal();
                         let integrity = agent.body.body.internal.integrity_signal();
-                        let pred_err = 0.0_f32; // GPU telemetry TBD
-                        let explore = 0.0_f32;  // GPU telemetry TBD
+                        let pred_err = agent.cached_prediction_error;
+                        let explore = agent.cached_exploration_rate;
 
                         text_items.push(TextItem {
                             text: format!("Energy: {:.0}%", energy * 100.0),

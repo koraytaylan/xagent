@@ -325,7 +325,7 @@ impl Governor {
             .map(|(i, a)| {
                 AgentFitness {
                     agent_index: i,
-                    config: a.brain.config.clone(),
+                    config: a.brain_config.clone(),
                     total_ticks_alive: a.total_ticks_alive,
                     death_count: a.death_count,
                     food_consumed: a.food_consumed,

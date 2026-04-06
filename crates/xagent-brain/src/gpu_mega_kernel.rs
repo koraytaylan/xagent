@@ -23,6 +23,8 @@ pub struct AgentTelemetry {
     pub motor_variance: f32,
     pub urgency: f32,
     pub gradient: f32,
+    pub prediction_error: f32,
+    pub exploration_rate: f32,
 }
 
 /// Terrain heightmap vertices per side.
@@ -1254,6 +1256,14 @@ impl GpuMegaKernel {
         let gradient = homeo[0]; // grad
         let urgency = homeo[2];  // urgency
 
+        // Physics buffer: prediction_error and exploration_rate (written by brain shader)
+        let phys_offset = (i * PHYS_STRIDE * 4) as u64;
+        let phys_size = (PHYS_STRIDE * 4) as u64;
+        let mut phys = Vec::with_capacity(PHYS_STRIDE);
+        self.read_buffer_range(&self.agent_phys_buf, phys_offset, phys_size, &mut phys);
+        let prediction_error = phys[P_PREDICTION_ERROR];
+        let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
+
         AgentTelemetry {
             vision_color,
             motor_fwd,
@@ -1264,6 +1274,8 @@ impl GpuMegaKernel {
             motor_variance,
             urgency,
             gradient,
+            prediction_error,
+            exploration_rate,
         }
     }
 }

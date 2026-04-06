@@ -1388,6 +1388,8 @@ impl ApplicationHandler for App {
                                 a.cached_curiosity_bonus = tel.curiosity_bonus;
                                 a.cached_fatigue_factor = tel.fatigue_factor;
                                 a.cached_motor_variance = tel.motor_variance;
+                                a.cached_prediction_error = tel.prediction_error;
+                                a.cached_exploration_rate = tel.exploration_rate;
                             }
 
                             self.food_dirty = true;

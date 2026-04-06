@@ -48,6 +48,9 @@ pub struct GpuMegaKernel {
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
+    mega_pipeline: wgpu::ComputePipeline,
+    global_pipeline: wgpu::ComputePipeline,
+    vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
     active_config_idx: usize,
 
@@ -374,25 +377,8 @@ impl GpuMegaKernel {
         // ── Compose brain shader ──
         let mut brain_source = format!("{}\n{}", &common_src, include_str!("shaders/mega/brain_tick.wgsl"));
 
-        if has_subgroup {
-            // Add subgroup builtins to entry point
-            brain_source = brain_source.replace(
-                "// SUBGROUP_ENTRY_PARAMS",
-                "@builtin(subgroup_invocation_id) sgid: u32,",
-            );
-
-            // Add sgid to coop_recall_topk signature and call
-            brain_source = brain_source.replace(
-                "/* SUBGROUP_TOPK_PARAMS */",
-                ", sgid: u32",
-            );
-            brain_source = brain_source.replace(
-                "/* SUBGROUP_TOPK_ARGS */",
-                ", sgid",
-            );
-
-            // Replace bitonic sort with subgroup-accelerated version
-            let subgroup_sort = r#"
+        // Subgroup-accelerated bitonic sort (shared between brain and mega shaders)
+        let subgroup_sort = r#"
     // ── Subgroup-accelerated stages 0–4 (15 barrier-free passes) ──
     // Each of 128 threads holds one element in registers.
     // subgroupShuffle exchanges values within 32-wide subgroups.
@@ -461,6 +447,23 @@ impl GpuMegaKernel {
     }
 "#;
 
+        if has_subgroup {
+            // Add subgroup builtins to entry point
+            brain_source = brain_source.replace(
+                "// SUBGROUP_ENTRY_PARAMS",
+                "@builtin(subgroup_invocation_id) sgid: u32,",
+            );
+
+            // Add sgid to coop_recall_topk signature and call
+            brain_source = brain_source.replace(
+                "/* SUBGROUP_TOPK_PARAMS */",
+                ", sgid: u32",
+            );
+            brain_source = brain_source.replace(
+                "/* SUBGROUP_TOPK_ARGS */",
+                ", sgid",
+            );
+
             // Find and replace the bitonic sort block
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
@@ -476,6 +479,66 @@ impl GpuMegaKernel {
             brain_source = brain_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
             brain_source = brain_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
         }
+
+        // ── Compose mega-kernel shader ──
+        // brain_tick.wgsl functions (strip entry point) + mega_tick.wgsl
+        let brain_functions_src = include_str!("shaders/mega/brain_tick.wgsl");
+        let brain_fn_end = brain_functions_src
+            .find("@compute @workgroup_size(256)\nfn brain_tick(")
+            .unwrap_or(brain_functions_src.len());
+        let brain_fns_only = &brain_functions_src[..brain_fn_end];
+
+        let mut mega_source = format!(
+            "{}\n{}\n{}",
+            &common_src,
+            brain_fns_only,
+            include_str!("shaders/mega/mega_tick.wgsl"),
+        );
+
+        if has_subgroup {
+            mega_source = mega_source.replace(
+                "// MEGA_SUBGROUP_ENTRY_PARAMS",
+                "@builtin(subgroup_invocation_id) sgid: u32,",
+            );
+            mega_source = mega_source.replace(
+                "/* MEGA_SUBGROUP_TOPK_PARAMS */",
+                ", sgid: u32",
+            );
+            mega_source = mega_source.replace(
+                "/* MEGA_SUBGROUP_TOPK_ARGS */",
+                ", sgid",
+            );
+            mega_source = mega_source.replace(
+                "/* MEGA_SUBGROUP_TOPK_INNER_ARGS */",
+                ", sgid",
+            );
+
+            let begin_marker = "// BEGIN_BITONIC_SORT";
+            let end_marker = "// END_BITONIC_SORT";
+            if let (Some(begin_pos), Some(end_pos)) = (mega_source.find(begin_marker), mega_source.find(end_marker)) {
+                let end_pos = end_pos + end_marker.len();
+                mega_source.replace_range(begin_pos..end_pos, subgroup_sort);
+            } else {
+                log::error!("[GpuMegaKernel] Subgroup sort markers not found in mega shader");
+            }
+        } else {
+            mega_source = mega_source.replace("// MEGA_SUBGROUP_ENTRY_PARAMS\n", "");
+            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_PARAMS */", "");
+            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_ARGS */", "");
+            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_INNER_ARGS */", "");
+        }
+
+        // ── Compose global-pass shader ──
+        let global_source = [
+            &common_src,
+            include_str!("shaders/mega/phase_clear.wgsl"),
+            include_str!("shaders/mega/phase_food_grid.wgsl"),
+            include_str!("shaders/mega/phase_food_respawn.wgsl"),
+            include_str!("shaders/mega/phase_agent_grid.wgsl"),
+            include_str!("shaders/mega/phase_collision.wgsl"),
+            include_str!("shaders/mega/global_tick.wgsl"),
+        ]
+        .join("\n");
 
         // ── Explicit bind group layout (all 16 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
@@ -603,6 +666,44 @@ impl GpuMegaKernel {
             cache: None,
         });
 
+        // ── Global pipeline layout (push constants for tick) ──
+        let global_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("global_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..8,
+            }],
+        });
+
+        // ── Create mega-kernel pipeline (no push constants) ──
+        let mega_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mega_tick"),
+            source: wgpu::ShaderSource::Wgsl(mega_source.into()),
+        });
+        let mega_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mega_tick"),
+            layout: Some(&brain_layout),
+            module: &mega_module,
+            entry_point: Some("mega_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ── Create global pipeline ──
+        let global_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("global_tick"),
+            source: wgpu::ShaderSource::Wgsl(global_source.into()),
+        });
+        let global_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("global_tick"),
+            layout: Some(&global_layout),
+            module: &global_module,
+            entry_point: Some("global_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         // ── Create bind groups (double-buffered on world_config) ──
         let make_bind_group = |wc_buf: &wgpu::Buffer, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -658,6 +759,9 @@ impl GpuMegaKernel {
             physics_pipeline,
             vision_pipeline,
             brain_pipeline,
+            mega_pipeline,
+            global_pipeline,
+            vision_stride: brain_config.vision_stride,
             bind_groups,
             active_config_idx: 0,
             state_staging,
@@ -736,8 +840,8 @@ impl GpuMegaKernel {
             self.agent_count as usize,
             start_tick,
             ticks_to_run,
-            10,
-            4,
+            self.vision_stride,
+            self.brain_tick_stride,
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));

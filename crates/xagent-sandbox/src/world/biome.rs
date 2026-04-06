@@ -62,6 +62,24 @@ impl BiomeMap {
         }
     }
 
+    /// Return the grid resolution (BIOME_GRID_RES).
+    pub fn grid_res(&self) -> usize {
+        BIOME_GRID_RES
+    }
+
+    /// Return the biome grid as a flat `Vec<u32>` for GPU upload.
+    /// Mapping: FoodRich=0, Barren=1, Danger=2.
+    pub fn grid_as_u32(&self) -> Vec<u32> {
+        self.grid
+            .iter()
+            .map(|b| match b {
+                BiomeType::FoodRich => 0u32,
+                BiomeType::Barren => 1,
+                BiomeType::Danger => 2,
+            })
+            .collect()
+    }
+
     /// Return the biome type at world-space (x, z) via grid lookup.
     #[inline]
     pub fn biome_at(&self, x: f32, z: f32) -> BiomeType {

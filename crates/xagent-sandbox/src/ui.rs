@@ -73,8 +73,6 @@ pub struct AgentSnapshot {
     pub exploration_rate_history: Vec<f32>,
     pub energy_history: Vec<f32>,
     pub integrity_history: Vec<f32>,
-    /// Recent decision snapshots for the brain inspector stream.
-    pub decision_log: Vec<xagent_brain::DecisionSnapshot>,
     /// Homeostatic gradient (composite).
     pub gradient: f32,
     /// Urgency level.
@@ -665,7 +663,7 @@ impl<'a> TabContext<'a> {
                         exploration_rate_history: Vec::new(),
                         energy_history: Vec::new(),
                         integrity_history: Vec::new(),
-                        decision_log: Vec::new(),
+
                         gradient: record.gradient,
                         urgency: record.urgency,
                         food_consumed: 0,
@@ -742,7 +740,7 @@ impl<'a> TabContext<'a> {
                             exploration_rate_history: Vec::new(),
                             energy_history: Vec::new(),
                             integrity_history: Vec::new(),
-                            decision_log: Vec::new(),
+    
                             gradient: r.gradient,
                             urgency: r.urgency,
                             food_consumed: 0,
@@ -1149,152 +1147,15 @@ impl<'a> TabContext<'a> {
                 }
             }
 
-            // -- Brain Decision Stream --
+            // -- Brain Decision Stream (stubbed — GPU telemetry readback TBD) --
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Decision Stream").strong().size(14.0));
             ui.add_space(4.0);
-
-            if effective_snap.decision_log.is_empty() {
-                ui.label(
-                    egui::RichText::new("No decisions recorded yet.")
-                        .italics()
-                        .color(egui::Color32::GRAY),
-                );
-            } else {
-                let display_count = effective_snap.decision_log.len().min(64);
-                let start = effective_snap.decision_log.len() - display_count;
-
-                // Column headers
-                ui.horizontal(|ui| {
-                    let mono_gray = |text: &str| egui::RichText::new(text).small().strong().color(egui::Color32::from_gray(180)).monospace();
-                    ui.label(mono_gray("TICK"));
-                    ui.add_space(8.0);
-                    ui.label(mono_gray("MOTOR"));
-                    ui.add_space(20.0);
-                    ui.label(mono_gray("FEELING"));
-                    ui.add_space(16.0);
-                    ui.label(mono_gray("SIGNAL"));
-                    ui.add_space(16.0);
-                    ui.label(mono_gray("CONTEXT"));
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .id_salt("decision_stream")
-                    .max_height(300.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for d in effective_snap.decision_log[start..].iter().rev() {
-                            let bg = if d.credit_magnitude > 0.05 {
-                                if d.raw_gradient > 0.0 {
-                                    egui::Color32::from_rgba_premultiplied(30, 60, 30, 255)
-                                } else {
-                                    egui::Color32::from_rgba_premultiplied(60, 30, 30, 255)
-                                }
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-
-                            egui::Frame::NONE
-                                .fill(bg)
-                                .inner_margin(egui::Margin::symmetric(2, 1))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("{:>6}", d.tick))
-                                                .monospace()
-                                                .small()
-                                                .color(egui::Color32::from_gray(120)),
-                                        );
-
-                                        let fwd_char = if d.motor_forward > 0.3 { "^^" }
-                                            else if d.motor_forward > 0.05 { "^" }
-                                            else if d.motor_forward < -0.3 { "vv" }
-                                            else if d.motor_forward < -0.05 { "v" }
-                                            else { "--" };
-                                        let trn_char = if d.motor_turn > 0.3 { ">>" }
-                                            else if d.motor_turn > 0.05 { ">" }
-                                            else if d.motor_turn < -0.3 { "<<" }
-                                            else if d.motor_turn < -0.05 { "<" }
-                                            else { "--" };
-                                        ui.label(
-                                            egui::RichText::new(format!("{}{}", fwd_char, trn_char))
-                                                .monospace()
-                                                .small()
-                                                .color(egui::Color32::WHITE),
-                                        );
-
-                                        let grad_color = if d.raw_gradient > 0.01 {
-                                            egui::Color32::from_rgb(80, 200, 80)
-                                        } else if d.raw_gradient < -0.01 {
-                                            egui::Color32::from_rgb(220, 60, 60)
-                                        } else {
-                                            egui::Color32::from_gray(120)
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("g:{:+.3}", d.raw_gradient))
-                                                .monospace()
-                                                .small()
-                                                .color(grad_color),
-                                        );
-
-                                        let urgency_color = if d.urgency > 5.0 {
-                                            egui::Color32::from_rgb(220, 60, 60)
-                                        } else if d.urgency > 2.0 {
-                                            egui::Color32::YELLOW
-                                        } else {
-                                            egui::Color32::from_gray(120)
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("u:{:.1}", d.urgency))
-                                                .monospace()
-                                                .small()
-                                                .color(urgency_color),
-                                        );
-
-                                        if d.credit_magnitude > 0.01 {
-                                            let credit_color = if d.raw_gradient > 0.0 {
-                                                egui::Color32::from_rgb(80, 200, 80)
-                                            } else {
-                                                egui::Color32::from_rgb(220, 60, 60)
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(format!("cr:{:.3}", d.credit_magnitude))
-                                                    .monospace()
-                                                    .small()
-                                                    .color(credit_color),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new("cr:---")
-                                                    .monospace()
-                                                    .small()
-                                                    .color(egui::Color32::from_gray(60)),
-                                            );
-                                        }
-
-                                        ui.label(
-                                            egui::RichText::new(format!("pe:{:.3}", d.prediction_error))
-                                                .monospace()
-                                                .small()
-                                                .color(egui::Color32::from_rgb(200, 140, 60)),
-                                        );
-
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "ex:{:.0}% mem:{}",
-                                                d.exploration_rate * 100.0,
-                                                d.patterns_recalled
-                                            ))
-                                            .monospace()
-                                            .small()
-                                            .color(egui::Color32::from_rgb(180, 100, 220)),
-                                        );
-                                    });
-                                });
-                        }
-                    });
-            }
+            ui.label(
+                egui::RichText::new("Decision stream unavailable (GPU brain — telemetry readback TBD)")
+                    .italics()
+                    .color(egui::Color32::GRAY),
+            );
         });
     }
 
@@ -1407,6 +1268,28 @@ impl<'a> TabContext<'a> {
                     let mut vh = b.vision_h as i32;
                     ui.add(egui::DragValue::new(&mut vh).range(2..=32).speed(1));
                     b.vision_h = vh.max(2) as u32;
+                    ui.end_row();
+
+                    ui.label("brain_tick_stride");
+                    let mut bts = b.brain_tick_stride as i32;
+                    ui.add(egui::DragValue::new(&mut bts).range(1..=32).speed(1));
+                    b.brain_tick_stride = bts.clamp(1, 32) as u32;
+                    ui.end_row();
+
+                    ui.label("vision_stride");
+                    let mut vs = b.vision_stride as i32;
+                    ui.add(egui::DragValue::new(&mut vs).range(1..=50).speed(1));
+                    b.vision_stride = vs.clamp(1, 50) as u32;
+                    ui.end_row();
+
+                    ui.label("metabolic_rate");
+                    ui.add(egui::DragValue::new(&mut b.metabolic_rate)
+                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
+                    ui.end_row();
+
+                    ui.label("integrity_scale");
+                    ui.add(egui::DragValue::new(&mut b.integrity_scale)
+                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
                     ui.end_row();
                 });
         });

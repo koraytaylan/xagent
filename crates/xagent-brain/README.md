@@ -1,16 +1,24 @@
 # xagent-brain
 
-A general-purpose cognitive architecture based on **predictive processing**.
+A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU.
 
-The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors — no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
+The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors -- no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
 
 > **Prediction error drives everything.**
 
 ```
-sense → encode → recall → predict → learn → act → (repeat)
+sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> learn+store
+  |         |           |              |                |           |              |
+  |    feature_extract  |     habituate_homeo    recall_score  predict_and_act  learn_and_store
+  |      (pass 1)   encode      (pass 3)        recall_topk     (pass 6)        (pass 7)
+  |                 (pass 2)                    (pass 4 & 5)
+  |                                                                              |
+CPU uploads                                                              CPU reads back
+sensory frames                                                          motor commands
+(~52KB / 50 agents)                                                    (~800B / 50 agents)
 ```
 
-The brain receives a `SensoryFrame` and emits a `MotorCommand` (movement + discrete actions). Between those two endpoints, the encoder flattens all sensory data — regardless of modality — into an opaque numerical vector (`EncodedState`). The brain then recalls relevant past experiences, predicts what will happen next, measures how wrong it was, and uses that error signal to update every component. It never sees field names, struct types, or sensory modality labels. Capacity constraints force it to prioritize, giving rise to attention. Homeostatic feedback (numerical signals the brain must learn to interpret) is the only evaluative signal, giving rise to self-preserving behavior. There are no rewards, no utility functions, no explicit goals.
+The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. Between those two endpoints, 7 WGSL compute shaders run on GPU in a single `queue.submit()`. All persistent brain state lives permanently in GPU storage buffers -- there is no CPU-side brain state, no per-tick marshaling bottleneck. The only CPU<-->GPU transfers per tick are sensory input upload and motor command readback.
 
 ---
 
@@ -19,22 +27,22 @@ The brain receives a `SensoryFrame` and emits a `MotorCommand` (movement + discr
 1. [Theoretical Foundation](#1-theoretical-foundation)
 2. [Architecture Overview](#2-architecture-overview)
 3. [Data Flow Diagram](#3-data-flow-diagram)
-4. [Component Deep Dive](#4-component-deep-dive)
-   - [4.1 Sensory Encoder](#41-sensory-encoder-encoderrs)
-   - [4.2 Pattern Memory](#42-pattern-memory-memoryrs)
-   - [4.3 Prediction Engine](#43-prediction-engine-predictorrs)
-   - [4.4 Action Selector](#44-action-selector-actionrs)
-   - [4.5 Homeostatic Monitor](#45-homeostatic-monitor-homeostasisrs)
-   - [4.6 Sensory Habituation](#46-sensory-habituation-habituationrs)
-   - [4.7 Motor Fatigue](#47-motor-fatigue-fatiguers)
-   - [4.8 Capacity Manager](#48-capacity-manager-capacityrs)
-   - [4.9 Brain Orchestrator](#49-brain-orchestrator-brainrs)
-5. [Emergent Phenomena](#5-emergent-phenomena)
-6. [Configuration (BrainConfig)](#6-configuration-brainconfig)
-7. [Testing](#7-testing)
-8. [Design Decisions](#8-design-decisions)
-9. [CPU Performance Optimizations](#9-cpu-performance-optimizations)
-10. [Known Limitations & Future Work](#10-known-limitations--future-work)
+4. [GPU-Resident Design](#4-gpu-resident-design)
+5. [Buffer Layout](#5-buffer-layout)
+6. [Component Deep Dive: The 7-Pass Pipeline](#6-component-deep-dive-the-7-pass-pipeline)
+   - [6.1 Feature Extraction (Pass 1)](#61-feature-extraction-pass-1--feature_extractwgsl)
+   - [6.2 Encoding (Pass 2)](#62-encoding-pass-2--encodewgsl)
+   - [6.3 Habituation + Homeostasis (Pass 3)](#63-habituation--homeostasis-pass-3--habituate_homeowgsl)
+   - [6.4 Recall Scoring (Pass 4)](#64-recall-scoring-pass-4--recall_scorewgsl)
+   - [6.5 Recall Top-K Selection (Pass 5)](#65-recall-top-k-selection-pass-5--recall_topkwgsl)
+   - [6.6 Prediction + Action Selection (Pass 6)](#66-prediction--action-selection-pass-6--predict_and_actwgsl)
+   - [6.7 Learning + Memory Storage (Pass 7)](#67-learning--memory-storage-pass-7--learn_and_storewgsl)
+7. [Emergent Phenomena](#7-emergent-phenomena)
+8. [Host API (gpu_brain.rs)](#8-host-api-gpu_brainrs)
+9. [Configuration (BrainConfig)](#9-configuration-brainconfig)
+10. [Testing](#10-testing)
+11. [Design Decisions](#11-design-decisions)
+12. [Known Limitations & Future Work](#12-known-limitations--future-work)
 
 ---
 
@@ -42,18 +50,18 @@ The brain receives a `SensoryFrame` and emits a `MotorCommand` (movement + discr
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-The `SensoryFrame` that arrives from the sandbox has named fields — `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. The `SensoryEncoder` flattens *everything* into a single `Vec<f32>` (the `EncodedState`), and from that point on, the brain operates on an opaque numerical vector. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array, and `feature_extract.wgsl` further compresses it to 217 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
-World → SensoryFrame → Encoder → [0.31, 0.72, 0.08, ...] → Brain
-              ↑                          ↑
-     Named fields like           Brain sees only a
-     "vision", "energy"          flat Vec<f32>
+World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [217 f32]
+               |                                                        |
+      Named fields like                                        Brain sees only a
+      "vision", "energy"                                       flat array<f32>
 ```
 
-Consider what happens when another agent — say, a magenta-colored one — enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30°." It experiences indices 12–15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 78–80 (direction) and 81 (intensity with `surface_tag=4`). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers — through prediction error and homeostatic gradient alone — that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
+Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding — it's the "body's" wiring that collects data from the simulated world. The encoder strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
+This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
 
 ---
 
@@ -65,938 +73,712 @@ The brain crate implements a simplified version of the **predictive processing**
 
 - The brain constantly generates predictions about what sensory input it will receive next.
 - When reality differs from the prediction, the resulting **prediction error** is the signal that drives all learning and adaptation.
-- The brain's overarching goal is to minimize prediction error — either by updating its internal model (learning) or by acting on the world to make the prediction come true (active inference).
+- The brain's overarching goal is to minimize prediction error -- either by updating its internal model (learning) or by acting on the world to make the prediction come true (active inference).
 
 ### Prediction Error as Universal Currency
 
-In this crate, prediction error is not just one signal among many — it is the *only* learning signal. It:
+In this crate, prediction error is not just one signal among many -- it is the *only* learning signal. It:
 
-- **Modulates learning rates**: higher error → faster weight updates in encoder, predictor, and memory
-- **Drives exploration**: high error signals novelty → the action selector increases exploration rate
-- **Allocates capacity**: the capacity manager gives more recall budget when error is high
+- **Modulates learning rates**: higher error --> faster weight updates in predictor and encoder
+- **Drives exploration**: high error signals novelty --> the action policy increases exploration noise
 - **Reinforces memory**: patterns that co-occur with low prediction error get strengthened
+- **Guides prospection**: prediction confidence (inverse of error) controls how much weight the predicted future carries in action selection
 
 There is no separate reward signal. There is no loss function designed by a human. The agent learns because its predictions are wrong, and prediction error is metabolically expensive.
 
 ### Homeostatic Feedback as the Only Evaluative Signal
 
-The brain has no concept of "good" or "bad" built in. Instead, the `HomeostaticMonitor` tracks whether internal variables (energy, physical integrity) are trending toward or away from stability. This gradient — positive means improving, negative means worsening — modulates:
+The brain has no concept of "good" or "bad" built in. Instead, `habituate_homeo.wgsl` tracks whether internal variables (energy, physical integrity) are trending toward or away from stability. This gradient -- positive means improving, negative means worsening -- modulates:
 
-- **Learning rate**: the brain learns faster when homeostatic state is changing rapidly (either direction)
-- **Action selection**: negative gradient gives credit/blame to recent actions; positive gradient reinforces them
+- **Credit assignment**: the `predict_and_act.wgsl` pass uses the homeostatic gradient to assign credit/blame to recent actions in the 64-tick history ring
 - **Urgency**: when energy or integrity drops critically low, urgency suppresses exploration in favor of exploitation
 
-This is analogous to how biological organisms don't have explicit goals — they have homeostatic set points, and deviations from those set points drive behavior.
+This is analogous to how biological organisms don't have explicit goals -- they have homeostatic set points, and deviations from those set points drive behavior.
 
-### Capacity Constraints → Emergent Cognition
+### Capacity Constraints --> Emergent Cognition
 
 The brain has finite resources:
-- A fixed-size memory (`memory_capacity` patterns)
-- A per-tick processing budget (`processing_slots` recall operations)
-- A fixed-dimension representation space (`representation_dim`)
+- A fixed-size memory (`MEMORY_CAP = 128` patterns per agent)
+- A per-tick recall budget (`RECALL_K = 16` top patterns)
+- A fixed-dimension representation space (`DIM = 32`)
 
-These constraints aren't limitations to be engineered around — they are **generative**. Because the brain can't attend to everything, it must select. Because memory is finite, it must forget. Because the representation is compressed, it must abstract. These constraints give rise to attention, habit formation, chunking, and other cognitive phenomena without any of them being explicitly programmed.
+These constraints aren't limitations to be engineered around -- they are **generative**. Because the brain can't attend to everything, it must select. Because memory is finite, it must forget. Because the representation is compressed, it must abstract. These constraints give rise to attention, habit formation, chunking, and other cognitive phenomena without any of them being explicitly programmed.
 
 ---
 
 ## 2. Architecture Overview
 
 ```
-Brain
-├── SensoryEncoder    — Compresses raw sensory input into fixed-size representation
-├── PatternMemory     — Stores, recalls, and associates encoded patterns
-├── Predictor         — Predicts next state; generates prediction error
-├── ActionSelector    — Chooses motor commands based on context and outcomes
-├── HomeostaticMonitor — Tracks internal stability gradients and urgency
-└── CapacityManager   — Allocates processing budgets adaptively
+xagent-brain/src/
+  lib.rs              -- Re-exports, fast_tanh utility, BrainTelemetry, AgentTelemetry
+  gpu_brain.rs        -- GpuBrain struct, wgpu device/queue, 12 GPU buffers,
+                         7 compute pipelines, tick/submit/collect API,
+                         state read/write, death_signal, resize
+  gpu_mega_kernel.rs  -- GpuMegaKernel: fused dispatch, physics+brain in one kernel,
+                         async state readback, per-agent telemetry readback
+  buffers.rs          -- All buffer layout constants, sensory packing,
+                         initialization functions, AgentBrainState type
+
+xagent-brain/src/shaders/        -- 7-pass individual shaders (used by GpuBrain)
+  feature_extract.wgsl   -- Pass 1: raw sensory --> features
+  encode.wgsl            -- Pass 2: features --> encoded state
+  habituate_homeo.wgsl   -- Pass 3: habituation + homeostasis
+  recall_score.wgsl      -- Pass 4: cosine similarity scoring
+  recall_topk.wgsl       -- Pass 5: top-K pattern selection
+  predict_and_act.wgsl   -- Pass 6: prediction, credit, policy, fatigue
+  learn_and_store.wgsl   -- Pass 7: weight updates, memory store, decay
+
+xagent-brain/src/shaders/mega/   -- Fused mega-kernel shaders (used by GpuMegaKernel)
+  common.wgsl            -- Shared constants and world-config layout
+  mega_tick.wgsl         -- Fused per-agent kernel: physics + food detect +
+                            death/respawn + all 7 brain passes, looped over
+                            vision_stride cycles (dispatch: agent_count,1,1)
+  global_tick.wgsl       -- Grid rebuild + collision pass (dispatch: 1,1,1)
 ```
 
-All components are orchestrated by `Brain::tick()`, which runs once per simulation step. Components communicate through the encoded state representation (`EncodedState`) and scalar signals (prediction error, homeostatic gradient, urgency).
+Two dispatch modes are available:
+
+- **GpuBrain** orchestrates the 7 individual shader dispatches per tick, one thread per agent. Simple and inspectable.
+- **GpuMegaKernel** fuses all per-agent computation into a single dispatch with 256 threads per agent workgroup. A separate global pass handles grid rebuild, collisions, and vision. The `vision_stride` parameter controls how many brain+physics cycles run between global passes (default 10). This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement.
+
+Both modes produce identical simulation results — the mega-kernel is a performance optimization, not a behavioral change.
 
 ---
 
 ## 3. Data Flow Diagram
 
 ```
-                         ┌──────────────────────────────────────────────────────────────┐
-                         │                        Brain::tick()                         │
-                         └──────────────────────────────────────────────────────────────┘
+                     ┌──────────────────────────────────────────────────────────────────┐
+                     │                    GPU: 7 compute passes                         │
+                     └──────────────────────────────────────────────────────────────────┘
 
-  SensoryFrame                                                               MotorCommand
-  (structured data                                                           (forward, strafe,
-   from the body —                                                            turn, action)
-   brain never sees                                                                ▲
-   these field names)                                                              │
-       ▼                                                                           │
-  ┌─────────────┐    EncodedState     ┌──────────────┐                    ┌────────────────┐
-  │   Sensory   │───────────────────▶│   Pattern     │◀──recall_budget────│   Capacity     │
-  │   Encoder   │        │           │   Memory      │                    │   Manager      │
-  └─────────────┘        │           └──────┬────────┘                    └───────┬────────┘
-       ▲                 │                  │                                     ▲
-       │                 │          recalled patterns                             │
-  adapt(error, lr)       │                  │                              prediction_error
-       │                 │                  ▼                                     │
-       │                 │           ┌─────────────┐                              │
-       │                 └──────────▶│  Predictor  │────prediction_error──────────┘
-       │                             └──────┬──────┘
-       │                                    │
-       │                         prediction + error
-       │                                    │
-       │                                    ▼
-       │                            ┌──────────────┐     ┌────────────────────┐
-       │                            │   Action     │◀────│   Homeostatic      │
-       │                            │   Selector   │     │   Monitor          │
-       │                            └──────────────┘     └────────────────────┘
-       │                                    │                     ▲
-       │                             MotorCommand                 │
-       │                                                   energy_signal,
-       │                                                   integrity_signal
-       └──────────────────────────────────────────────────────────┘
-                          Learning signals flow back
+SensoryFrame                                                                  MotorCommand
+(packed on CPU                                                                (forward, turn)
+ 267 f32/agent)                                                                     |
+      |                                                                             |
+      v                                                                             |
+┌─────────────┐  features   ┌──────────┐  encoded   ┌──────────────────┐            |
+│   Pass 1:   │  (217 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
+│   Feature   │────────────>│  Encode  │───────────>│  Habituate +     │            |
+│   Extract   │             │          │            │  Homeostasis     │            |
+└─────────────┘             └──────────┘            └────────┬─────────┘            |
+                                                  habituated |  homeo_out           |
+                                                  (32 f32)   |  (6 f32)             |
+                                                             v                      |
+                                                    ┌─────────────────┐             |
+                                                    │    Pass 4:      │             |
+                                                    │  Recall Score   │             |
+                                                    │ (cosine sim x   │             |
+                                                    │  128 patterns)  │             |
+                                                    └────────┬────────┘             |
+                                                   sims(128) |                      |
+                                                             v                      |
+                                                    ┌─────────────────┐             |
+                                                    │    Pass 5:      │             |
+                                                    │  Recall Top-K   │             |
+                                                    │ (best 16 of 128)│             |
+                                                    └────────┬────────┘             |
+                                              recall_idx(17) |                      |
+                                                             v                      |
+                                                    ┌─────────────────┐             |
+                                                    │    Pass 6:      │     decision|
+                                                    │  Predict + Act  │─────────────┘
+                                                    │ (predict, credit│     (motor +
+                                                    │  policy, fatigue│      prediction +
+                                                    │  exploration)   │      credit signal)
+                                                    └────────┬────────┘
+                                                   decision  |
+                                                             v
+                                                    ┌─────────────────┐
+                                                    │    Pass 7:      │
+                                                    │  Learn + Store  │
+                                                    │ (grad descent,  │
+                                                    │  Hebbian credit,│
+                                                    │  memory reinf., │
+                                                    │  pattern store, │
+                                                    │  decay)         │
+                                                    └─────────────────┘
 
-  Legend:
-  ────▶  Data flow (per tick)
-  ◀────  Budget / modulation signal
+  Persistent GPU buffers (live across ticks):
+  ─── brain_state_buf ───  8,468 f32/agent  (encoder weights, predictor, habituation, homeo, action, fatigue)
+  ─── pattern_buf ────────  5,251 f32/agent  (128 patterns: states, norms, reinforcement, motor, meta, active)
+  ─── history_buf ────────  2,370 f32/agent  (64-entry action history ring: motor+state snapshots)
 
-  Note: Between Encoder and downstream consumers (Memory, Predictor, ActionSelector),
-  SensoryHabituation attenuates the encoded state and produces a curiosity_bonus.
-  After ActionSelector produces a MotorCommand, MotorFatigue dampens the output
-  based on recent motor variance.
+  Transient GPU buffers (overwritten each tick):
+  sensory, features, encoded, habituated, homeo_out, similarities, recall_buf, decision
 ```
 
-### Tick Execution Order (14 steps)
+### Tick Execution Order
 
 ```
- 1.  Encode sensory input           → EncodedState (opaque Vec<f32>)
- 1a. Apply sensory habituation      → habituated state, curiosity_bonus
- 2.  Update homeostasis             → HomeostaticState (gradient, urgency)
- 3.  Compute prediction error       → scalar_error, error_vec
-     ├─ Learn: memory reinforcement
-     ├─ Learn: predictor weights (gradient descent)
-     └─ Learn: encoder weights (L2 regularization)
- 4.  Allocate recall budget         → (recall_budget, surprise_budget)
- 5.  Recall similar patterns        → Vec<EncodedState>
- 6.  Predict next state             → prediction
- 7.  Store current pattern in memory
- 8.  Decay old patterns
- 9.  Select action (using habituated state and curiosity_bonus) → MotorCommand
- 9a. Apply motor fatigue            → dampened MotorCommand
-10.  Record prediction for next tick
-11.  Compute behavior quality metrics
-12.  Update telemetry snapshot
+1. CPU packs SensoryFrames into flat f32 arrays (pack_sensory_frame)
+2. CPU uploads sensory buffer to GPU                           (~52KB for 50 agents)
+3. GPU Pass 1: feature_extract   (267 f32 --> 217 f32)        one thread per agent
+4. GPU Pass 2: encode            (217 f32 --> 32 f32)         one thread per agent
+5. GPU Pass 3: habituate_homeo   (habituation EMA + homeostatic gradient/urgency)
+6. GPU Pass 4: recall_score      (cosine sim vs 128 patterns)
+7. GPU Pass 5: recall_topk       (top-16 selection, metadata update)
+8. GPU Pass 6: predict_and_act   (prediction error, credit assignment, policy eval,
+                                  prospection, memory blend, exploration noise,
+                                  motor fatigue, history recording)
+9. GPU Pass 7: learn_and_store   (predictor gradient descent, encoder Hebbian credit,
+                                  memory reinforcement, pattern storage, decay)
+10. CPU reads back motor commands from decision buffer         (~800B for 50 agents)
 ```
 
 ---
 
-## 4. Component Deep Dive
+## 4. GPU-Resident Design
 
-### 4.1 Sensory Encoder (`encoder.rs`)
+The previous CPU architecture allocated brain state as heap objects. The GPU rewrite moves **all** brain state permanently onto GPU storage buffers. This eliminates the CPU<-->GPU marshaling bottleneck that would otherwise dominate per-tick cost.
 
-**What it does**: Compresses a raw `SensoryFrame` (variable-size visual data + proprioceptive + interoceptive signals) into a fixed-size `EncodedState` vector of `representation_dim` floats. This is the **semantic firewall** — everything upstream has named fields and modality structure; everything downstream is an opaque `Vec<f32>`. The brain never sees the original field names, modality boundaries, or data types.
+### Per-Tick I/O Budget
 
-**Why it exists**: The brain needs a uniform representation to work with. Raw sensory data is high-dimensional (a 64×48 visual field = 12,288 RGBA values alone). The encoder acts as the bottleneck that forces information compression — what gets through this bottleneck is what the brain "pays attention to".
+| Direction | What | Size (50 agents) |
+|-----------|------|-------------------|
+| CPU --> GPU | Sensory frames | ~52 KB (`50 * 267 * 4 bytes`) |
+| GPU --> CPU | Motor commands | ~800 B (`50 * 4 * 4 bytes`) |
+| GPU only | Brain state, patterns, history | 0 bytes transferred |
 
-**How it works**:
+The asymmetry is extreme and intentional: sensory data is the only thing the GPU doesn't already have, and motor commands are the only thing the CPU needs back. Everything else -- the 8,468 f32s of brain state per agent, the 5,251 f32s of pattern memory, the 2,370 f32s of action history -- stays on GPU permanently.
 
-1. **Feature extraction** (`extract_features`):
-   - **Visual features**: Per-channel spatial pooling divides the visual field into `visual_encoding_size` spatial bins. Each bin produces 3 features (R, G, B averages), preserving color information. This is critical — danger zones (reddish) and food zones (greenish) are visually distinct, and the brain needs separate color channels to distinguish them. Alpha is dropped (carries no information).
-   - **Proprioceptive features** (5): velocity magnitude, facing direction (x, y, z), angular velocity
-   - **Interoceptive features** (4): energy level, integrity level, energy delta, integrity delta
-   - Total input dimensionality = `visual_encoding_size × 3 + 9`
+### Double-Buffered Readback
 
-2. **Projection**: The feature vector is multiplied by a weight matrix `[feature_count × representation_dim]` with bias terms, then passed through `tanh()` to produce the output:
+`GpuBrain` supports two usage patterns:
 
-   ```rust
-   for i in 0..self.representation_dim {
-       let mut sum = self.biases[i];
-       for (j, &feat) in features.iter().enumerate() {
-           sum += feat * self.weights[j * self.representation_dim + i];
-       }
-       data[i] = sum.tanh();
-   }
-   ```
+1. **Synchronous** (`tick(&frames) -> Vec<MotorCommand>`): Upload, dispatch all 7 passes, read back motor commands. Simple but blocks CPU until GPU finishes.
 
-3. **Weight initialization**: Xavier/Glorot uniform — `uniform(-limit, limit)` where `limit = sqrt(6 / (fan_in + fan_out))`. This prevents saturation of tanh activations at initialization.
+2. **Asynchronous** (`submit(&frames)` / `collect() -> Vec<MotorCommand>`): Pipeline the motor readback with the next frame's sensory packing. Two staging buffers alternate: while one is being filled by the GPU, the other is mapped for CPU reading. This hides readback latency behind computation.
 
-4. **Adaptation** (`adapt`): Uses L2 regularization to keep weights bounded. This is a simple but effective approach — rather than backpropagating through the predictor (which would be too indirect given the architecture), weights are gently pulled toward zero:
+### Buffer Allocation
 
-   ```rust
-   *w *= 1.0 - (learning_rate * L2_REGULARIZATION_FACTOR);  // 0.001
-   *w = w.clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE);   // ±2.0
-   ```
-
-**Key constants**:
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `NON_VISUAL_FEATURES` | 9 | Fixed proprioceptive + interoceptive feature count |
-| `WEIGHT_CLAMP_RANGE` | 2.0 | Prevents weight explosion |
-| `L2_REGULARIZATION_FACTOR` | 0.001 | Gentle regularization strength |
-
-**Emergent properties**: The encoder creates a **selectivity bottleneck**. With `visual_encoding_size=64` and `representation_dim=32`, a 16×12 RGBA image (768 values) becomes 192 per-channel features + 9 non-visual = 201 inputs, compressed to 32 floats. The per-channel pooling ensures the brain can learn color-based associations: "red ahead → danger" vs "green ahead → food."
-
-**Performance**: The encoder uses a pre-allocated **scratch buffer** for feature extraction — no heap allocations occur per tick. The `tanh()` activation is replaced with a **fast Padé approximant** (`fast_tanh`) that avoids the cost of the standard library's transcendental function while maintaining sufficient accuracy for the brain's purposes.
+All buffers are created at initialization (`GpuBrain::new`) with sizes proportional to agent count. The 4 persistent buffers use `STORAGE | COPY_SRC | COPY_DST` flags (allowing shader access plus CPU read/write for state I/O). The 8 transient buffers use `STORAGE` only.
 
 ---
 
-### 4.2 Pattern Memory (`memory.rs`)
+## 5. Buffer Layout
 
-**What it does**: Stores encoded states as `Pattern` objects in a fixed-capacity bank. Each pattern captures not just the sensory state but also the motor command that was active and the homeostatic outcome (valence) at storage time — forming situation-action-outcome triplets. Patterns can be recalled by similarity, associated with each other through co-occurrence, linked temporally (predecessor/successor), and decay over time unless reinforced.
+All buffer offsets and stride constants are defined once in `buffers.rs` and auto-generated into WGSL via `wgsl_constants()`. This function emits a constants header that is prepended to every shader at pipeline creation time. The constants include all offsets, strides, and utility functions (`fast_tanh`, `pcg_hash`, `rand_f32`, `rand_normal`). Because both Rust and WGSL code derive from the same source of truth, offset mismatch bugs are impossible.
 
-**Why it exists**: This is the agent's episodic motor memory — it allows the agent to recognize familiar situations, recall what actions worked (or failed) in similar states, anticipate what comes next (via temporal links), and build associations between co-occurring experiences. The motor context enables memory-informed action selection: recalled patterns directly suggest actions based on past outcomes. The fixed capacity means old, unused memories are eventually overwritten by new ones, implementing a form of forgetting.
+### Core Dimensions
 
-**How it works**:
-
-#### Storage
-
-When `store()` is called with the encoded state, motor command (forward, turn), and homeostatic gradient (outcome valence):
-1. A slot is found — either an empty one, or the one with the lowest reinforcement (weakest memory gets overwritten).
-2. If overwriting, temporal links pointing to the old pattern are cleaned up (`unlink_temporal`).
-3. The new pattern is created with `reinforcement=1.0`, `activation_count=1`, the current tick, and the motor/valence context.
-4. Temporal links are established: the previous pattern's `successor` points here, and this pattern's `predecessor` points back. Both forward (0.5 strength) and backward (0.3 strength) associations are created.
-
-#### Recall by Similarity
-
-`recall()` computes cosine similarity between the query and all stored patterns, sorts by similarity, and returns the top-N (capped by `budget`) as `RecalledPattern` structs. Each `RecalledPattern` contains the encoded state, similarity score, stored motor command (forward, turn), and outcome valence — providing the action selector with situation-action-outcome context. Each recalled pattern gets its `last_accessed` tick updated and `activation_count` incremented.
-
-```rust
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if mag_a < 1e-8 || mag_b < 1e-8 { return 0.0; }
-    (dot / (mag_a * mag_b)).clamp(-1.0, 1.0)
-}
-```
-
-#### Association Links with Generation Validation
-
-Each pattern can have associations to other patterns. An `AssociationLink` contains:
-- `target_idx`: the slot index of the associated pattern
-- `target_generation`: the generation of the target when the link was created
-- `strength`: how strong the association is (capped at `MAX_ASSOCIATION_STRENGTH = 5.0`)
-
-Generation validation solves the **stale link problem**: when a pattern at slot `i` is overwritten, its generation counter increments. Any association links pointing to slot `i` with the old generation are recognized as stale and ignored during `retrieve_associated()`. This avoids the need for expensive cleanup of all links across the memory bank every time a slot is overwritten.
-
-#### Temporal Sequence Tracking
-
-Each pattern stores `predecessor` and `successor` indices, forming a linked list of temporal experience. When pattern B is stored after pattern A, A's `successor` becomes B and B's `predecessor` becomes A. This allows the brain to "replay" sequences and predict what comes next.
-
-#### Association Chain Retrieval
-
-`retrieve_associated()` performs a BFS traversal through association links, prioritizing strongest links first. At each hop, strength decays by 0.5×, so distant associations contribute less. Only generation-validated links are followed.
-
-#### Smart Decay
-
-The `decay()` method doesn't remove patterns at a flat rate. Instead, each pattern's effective decay rate is modulated by:
-- **Frequency**: frequently accessed patterns decay slower — `frequency_factor = 1 / (1 + activation_count * 0.2)`
-- **Recency**: recently accessed patterns decay slower — `recency_factor = min(recency / 100, 3.0)`
-- **Combined**: `effective_rate = base_rate × frequency_factor × (0.2 + recency_factor)`
-
-Patterns whose reinforcement drops to zero are removed (set to `None`).
-
-#### Trauma
-
-The `trauma(severity)` method models the cognitive cost of catastrophic events (e.g., death). It applies a bulk reinforcement decay across all stored patterns:
-
-```rust
-pub fn trauma(&mut self, severity: f32) {
-    // severity typically 0.2 = 20% reinforcement decay
-    for pattern in &mut self.patterns {
-        if let Some(p) = pattern {
-            p.reinforcement *= 1.0 - severity;
-            // Patterns that drop below threshold are removed
-        }
-    }
-}
-```
-
-With a severity of 0.2 (used on agent death), the weakest memories are wiped while the strongest survive — a single trauma event removes approximately the bottom 20% of memories by reinforcement. This models the cognitive cost of catastrophic discontinuity: death damages memory, but deeply learned patterns persist.
-
-**Associations are capped** during recall to `.take(8)` for performance — only the 8 strongest associations per pattern are followed during retrieval.
-
-#### Learning
-
-`learn()` does three things:
-1. **Reinforcement**: Patterns similar to the current state (cosine similarity > 0.3) are reinforced proportional to `similarity × learning_rate × (1 - error)`. Low prediction error strengthens matching patterns more.
-2. **Retroactive valence update**: Similar patterns have their `outcome_valence` nudged toward the current homeostatic gradient via an EMA: `valence += sim × (learning_rate × 0.3) × (gradient - valence)`. This lets the agent update its assessment of past situations — "I thought this was bad, but it led to food" — creating a running evaluation that informs future action selection.
-3. **Co-occurrence association**: Patterns that are *both* highly similar to the current state (similarity > 0.5) are associated with each other via bidirectional links with strength `learning_rate × 0.1`.
-
-**Key constants**:
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `MAX_ASSOCIATION_STRENGTH` | 5.0 | Cap on association link strength |
-| `MAX_REINFORCEMENT` | 10.0 | Cap on pattern reinforcement |
-| `SIMILARITY_THRESHOLD` | 0.3 | Minimum similarity for reinforcement |
-| `HIGH_SIMILARITY_THRESHOLD` | 0.5 | Minimum similarity for co-occurrence association |
-| `FORWARD_ASSOCIATION_DEFAULT` | 0.5 | Initial temporal link strength (pred → succ) |
-| `BACKWARD_ASSOCIATION_DEFAULT` | 0.3 | Initial temporal link strength (succ → pred) |
-
-**Emergent properties**: Fixed capacity creates **memory competition** — important memories (frequently accessed, recently relevant) survive while unimportant ones are forgotten. Temporal links create **expectation chains** — the agent "knows" what typically comes after a given experience. Co-occurrence associations create **contextual binding** — experiences that happen together become linked, forming proto-concepts.
-
----
-
-### 4.3 Prediction Engine (`predictor.rs`)
-
-**What it does**: Predicts the next encoded state from the current state and recalled context patterns. Computes the prediction error that drives the entire learning system.
-
-**Why it exists**: Prediction error is the universal currency. Without the predictor, there is no error signal, and therefore no learning, no exploration modulation, no capacity allocation — nothing works. The predictor is the engine that converts experience into expectation.
-
-**How it works**:
-
-#### Prediction
-
-The predictor applies a learned linear transform to the current state, then blends in context from recalled patterns:
-
-```rust
-// 1. Linear transform: predicted = current × weights
-for i in 0..self.dim {
-    let mut sum = 0.0;
-    for j in 0..self.dim {
-        sum += current.data[j] * self.weights[j * self.dim + i];
-    }
-    predicted[i] = sum;
-}
-
-// 2. Blend recalled context (similarity-weighted)
-if !recalled.is_empty() {
-    let total_sim: f32 = recalled.iter().map(|(_, s)| s.max(0.0)).sum();
-    if total_sim > 1e-8 {
-        for (state, sim) in recalled {
-            let w = self.context_weight * sim.max(0.0) / total_sim;
-            for i in 0..self.dim {
-                predicted[i] += state.data[i] * w;
-            }
-        }
-    }
-}
-
-// 3. Nonlinearity
-for val in &mut predicted {
-    *val = val.tanh();
-}
-```
-
-The `context_weight` parameter controls how much influence recalled patterns have on the prediction. It is itself learned — increasing when prediction error is high (recalled context might help) and decreasing when error is low (the linear transform alone is sufficient).
-
-#### Weight Initialization
-
-The weight matrix starts as a **near-identity** with small off-diagonal noise:
-- Diagonal: 0.9 (predict next state ≈ current state)
-- Off-diagonal: uniform random in [-0.01, 0.01]
-
-This is a strong inductive bias: the default prediction is "things stay roughly the same". The predictor then learns deviations from this assumption.
-
-#### Online Gradient Descent
-
-After each tick, the predictor updates its weights using the error vector (predicted − actual):
-
-```rust
-for i in 0..dim {
-    let tanh_deriv = 1.0 - predicted[i].powi(2);  // tanh'(x) = 1 - tanh(x)²
-    for j in 0..dim {
-        let grad = (error[i] * tanh_deriv * input[j])
-            .clamp(-GRADIENT_CLAMP, GRADIENT_CLAMP);     // ±1.0
-        self.weights[j * dim + i] -= learning_rate * grad;
-        self.weights[j * dim + i] = self.weights[j * dim + i]
-            .clamp(-WEIGHT_CLAMP_RANGE, WEIGHT_CLAMP_RANGE); // ±3.0
-    }
-}
-```
-
-The tanh derivative is applied correctly — since the output passes through `tanh()`, the gradient must account for this nonlinearity. Gradient clipping at ±1.0 prevents instability.
-
-The context weight is also adapted:
-```rust
-self.context_weight += learning_rate * CONTEXT_WEIGHT_LR * (error_mag - 0.5);
-```
-If error magnitude > 0.5, context weight increases (the predictor needs more help from memory). If < 0.5, it decreases.
-
-#### Error Metrics
-
-- **Scalar error**: RMSE of the prediction error vector — `sqrt(mean((predicted - actual)²))`
-- **Error history**: A 128-entry ring buffer stores recent scalar errors for computing moving averages via `recent_avg_error(window)`.
-
-**Key constants**:
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `ERROR_HISTORY_LEN` | 128 | Ring buffer size for error tracking |
-| `GRADIENT_CLAMP` | 1.0 | Maximum gradient magnitude per update |
-| `WEIGHT_CLAMP_RANGE` | 3.0 | Maximum absolute weight value |
-| `CONTEXT_WEIGHT_LR` | 0.01 | Learning rate for context weight adaptation |
-| `CONTEXT_WEIGHT_MIN` | 0.05 | Minimum context blending weight |
-| `CONTEXT_WEIGHT_MAX` | 0.5 | Maximum context blending weight |
-
-**Emergent properties**: The predictor creates the **surprise signal** that powers the entire system. When the agent enters a novel environment, prediction errors spike, causing increased exploration, faster learning, and expanded recall. As the agent learns the regularities of its environment, errors decrease, exploration drops, and behavior stabilizes — the agent has *adapted*.
-
-**Performance**: The predictor uses a pre-allocated **scratch buffer** for prediction computation — no heap allocations per tick. The `tanh()` activation uses the same `fast_tanh` Padé approximant as the encoder.
-
----
-
-### 4.4 Action Selector (`action.rs`)
-
-**What it does**: Chooses one of 8 discrete motor commands each tick, balancing exploration (trying new things) with exploitation (repeating what worked).
-
-**Why it exists**: The brain needs to act, and those actions need to be informed by experience. The action selector learns a **linear policy** that maps encoded sensory features directly to action preferences, letting it discover associations like "when green pixels are ahead, forward is good."
-
-**How it works**:
-
-#### The 8-Action Discrete Space
-
-| Index | Action | MotorCommand |
-|-------|--------|--------------|
-| 0 | Move forward | `forward: 1.0` |
-| 1 | Move backward | `forward: -1.0` |
-| 2 | Turn left | `turn: -1.0` |
-| 3 | Turn right | `turn: 1.0` |
-| 4 | Forward-right curve | `forward: 0.5, turn: 0.3` |
-| 5 | Forward-left curve | `forward: 0.5, turn: -0.3` |
-| 6 | Jump | `action: Jump` |
-| 7 | Forage | `forward: 0.15, action: Consume` |
-
-#### Linear Policy (replaces context-hash table)
-
-Each action has a weight vector of size `repr_dim` (default 32). The preference for an action is computed as the dot product of the weight vector with the current encoded state, plus a global bias:
-
-```
-preference[a] = dot(action_weights[a], encoded_state) + global_bias[a]
-```
-
-This is fundamentally superior to the old context-hash approach because:
-- It uses **all dimensions** of the encoded state, not just 8
-- It's **continuous** — similar states produce similar preferences (no hash collisions)
-- Each action learns **which sensory features** predict positive outcomes
-- The weights learn relationships like "when visual feature X is high, forward is good"
-- Memory: `32 × 8 = 256` floats (smaller than the old `128 × 8 = 1024` hash table)
-
-#### Temporal Credit Assignment
-
-When the homeostatic gradient arrives (positive = things improved, negative = things worsened), each recent action's **state snapshot** (the encoded state at the time of action) is used to update the policy weights:
-
-```
-Δweights[action] += WEIGHT_LR × credit × state_similarity × state_snapshot_at_action_time
-```
-
-The effective credit signal combines two components:
-
-1. **Pain-amplified gradient**: Negative gradients are multiplied by `PAIN_AMPLIFIER` (3.0×), reflecting the biological reality that amygdala neurons respond 2-3× more strongly to aversive stimuli. This is NOT hard-coded avoidance; the brain must learn WHAT to do about the amplified signal.
-
-2. **Death signal**: When the agent dies, `death_signal()` fires a calibrated one-time credit event (`DEATH_CREDIT = -0.5`, which after PAIN_AMPLIFIER becomes -1.5 effective). This retroactively updates **state-dependent weights only** — global action biases are NOT modified. This is critical: without this guard, the death signal's accumulated credit across 64 recent actions creates a catastrophic shift in global bias per death, which punishes whichever action the agent was using regardless of context. By restricting the death signal to state-dependent weights, the agent learns "forward-in-danger is bad" without learning "forward is always bad."
-
-**Credit deadzone** (`CREDIT_DEADZONE = 0.01`): In `assign_credit()`, if the absolute gradient is below 0.01, credit assignment is skipped entirely. This silences the constant metabolic noise — energy depletion produces a gradient of ~0.006/tick, which is below the deadzone threshold. Meaningful signals like food (+0.03), damage (-0.02), and death (-0.5) exceed the threshold and pass through. Without the deadzone, constant metabolic noise triggers credit updates every tick, eroding learned associations with random noise.
-
-**State-conditioned credit**: Credit is modulated by the **cosine similarity** between the current state (when the event occurs) and each recorded state in the action history ring buffer. This means death in a danger zone only penalizes actions taken in danger-similar states; actions taken in safe-state contexts are spared. This is analogous to biological synaptic plasticity being context-dependent — a burn from a stove doesn't make you afraid of chairs.
-
-**Weight normalization** (`MAX_WEIGHT_NORM = 2.0`): After each credit assignment pass, per-action weight vectors are clipped to L2 norm ≤ 2.0. This prevents unbounded weight accumulation from repeated reinforcement and acts as synaptic homeostasis — ensuring no single action's weight vector can dominate the preference space.
-
-The credit decays exponentially with action age. The key insight: because each action stores the state snapshot from when it was chosen (not the current state), the weights learn to associate the **correct sensory context** with the action.
-
-Global action biases are updated via EMA:
-
-```
-global_bias[a] = global_bias[a] × 0.995 + accumulated_credit[a] × 0.08
-```
-
-The last 64 actions are tracked with zero per-tick heap allocation (pre-allocated ring buffer for state snapshots). The most recent action gets full credit; an action from 30 ticks ago gets `exp(-30 × 0.04) ≈ 30%` of the credit.
-
-#### Memory-Informed Motor Blending
-
-After the reactive policy computes raw motor output and prospective evaluation adjusts it, recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
-
-```
-mem_fwd = Σ (similarity × valence × stored_forward) / Σ |similarity × valence|
-mem_trn = Σ (similarity × valence × stored_turn)   / Σ |similarity × valence|
-mix = memory_strength × 0.4   // memory contributes up to 40% of motor signal
-fwd = fwd × (1 - mix) + mem_fwd × mix
-```
-
-- **Positive valence**: "do what I did before" — reinforces the recalled motor command
-- **Negative valence**: "do the opposite" — the sign flip steers away from past mistakes
-- **Low similarity**: contributes little (similarity weights the influence)
-- **Memory strength** scales with the average |similarity × valence| across recalled patterns, clamped to [0, 1]
-
-This creates a direct pathway from memory to action — agents with larger memory accumulate a richer library of situation-action-outcome triplets that directly guide behavior.
-
-#### Adaptive Exploration Rate
-
-The exploration rate is computed dynamically each tick, based on **policy confidence** rather than recall count:
-
-```rust
-let raw_signal = fwd.abs() + trn.abs();  // combined motor output magnitude
-let policy_confidence = (raw_signal / 2.0).clamp(0.0, 1.0);
-let novelty_bonus = (prediction_error * 2.0).min(0.4);
-let urgency_penalty = (urgency * 0.4).min(0.5);
-exploration_rate = (0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity_bonus - urgency_penalty)
-    .clamp(0.10, 0.85);
-```
-
-- **Base rate is 0.5** — agent exploits ~50% of the time by default
-- **Strong policy signal** (trained weights + memory advice) → less exploration
-- **Untrained agent** (weights ≈ 0, no memory) → high exploration (exploration IS the strategy)
-- **Higher prediction error** (novel situation) → more exploration
-- **Higher curiosity bonus** (sensory monotony) → more exploration
-- **Higher urgency** (danger) → less exploration (exploit known-good actions)
-- **Exploration floor is 10%** — even at maximum urgency, agents explore at least 10% of the time
-
-Previously, exploration was inversely proportional to the number of recalled patterns (`stability = recalled.len() / 16.0`). This created perverse evolutionary pressure: agents with larger memory recalled more patterns, explored less, and followed untrained policy weights — effectively paralyzing themselves. The policy-confidence approach decouples exploration from memory capacity, allowing evolution to find the optimal brain size without exploration penalties.
-
-#### Uniform Random Exploration
-
-When exploring, the agent picks an action uniformly at random (`rng.random_range(0..NUM_ACTIONS)`), giving each action a 12.5% chance. The previous softmax-biased exploration was effectively deterministic: in 32 dimensions with norm-2 weight vectors, dot product differences between actions were large enough that the best action received 99%+ of the softmax probability mass, defeating the purpose of exploration entirely. Uniform random guarantees genuine coverage of the action space.
-
-#### Prospective Evaluation (Model-Based Reasoning)
-
-The action selector applies its learned weights not just to the **current** state but also to the **predicted future** state. Critically, this prediction is not a single-tick lookahead but a **multi-step rollout**: the predictor is iteratively applied up to 10 times to mentally simulate the agent's trajectory ~1/3 second into the future.
-
-The prospection signal is **delta-based**: it measures the *change* in preferences between the current state and the predicted trajectory, not the absolute predicted value. This eliminates a fixed-point convergence problem where long rollouts contract to a constant state that overrides the reactive policy.
-
-```
-// In brain.rs — multi-step rollout for prospection
-look_ahead = confidence × MAX_LOOK_AHEAD     // scale by prediction accuracy
-far_prediction = predictor.rollout(prediction, look_ahead)
-
-// In action.rs — delta-based evaluation
-current_prefs[a] = dot(action_weights[a], current_state)
-future_prefs[a] = dot(action_weights[a], far_prediction)
-delta = future_prefs[a] - current_prefs[a]       // "is my trajectory improving?"
-preferences[a] += confidence × ANTICIPATION_WEIGHT × delta
-```
-
-**Why delta-based?** Iterative prediction contracts toward a fixed point (only 3% of state info survives 30 steps with near-identity weights). Evaluating the fixed point directly produces a constant bias that overrides the reactive policy — causing behavior to get *worse* over time. The delta approach eliminates this: it measures the *change* along the trajectory, which always depends on the current state and provides a directional "getting better/worse" signal.
-
-The key properties:
-- **No hardcoded avoidance**: The same learned weights (trained via credit assignment) are reused for both present and future evaluation. The agent doesn't know what's "dangerous" — it just knows which features correlated with negative outcomes.
-- **Directional signal**: Heading toward danger → delta < 0 → avoidance. Heading toward food → delta > 0 → approach. Stable trajectory → delta ≈ 0 → no effect.
-- **Self-calibrating horizon**: Look-ahead steps scale with prediction confidence. Low accuracy → short horizon. High accuracy → full foresight.
-- **Fixed-point immune**: The delta always depends on the current state, even if the rollout converges to a fixed point.
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `ANTICIPATION_WEIGHT` | 0.5 | How much the predicted trajectory change influences action preferences |
-| `MAX_LOOK_AHEAD` | 10 | Maximum rollout steps (~1/3 second of foresight at 30 ticks/sec) |
-
-#### Exploitation
-
-When exploiting, the agent picks the action with the highest preference (dot-product score + global bias). **Random argmax tie-breaking**: `best_action()` collects all actions sharing the maximum preference and picks one randomly. Previously, Rust's `max_by` returned the last tied index (action 7), creating a deterministic bias toward one action when all weights were zero-initialized. With random tie-breaking, a fresh agent distributes equally across all actions.
-
-**Key constants**:
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `NUM_ACTIONS` | 8 | Size of discrete action space |
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `DIM` | 32 | Internal representation dimensionality |
+| `FEATURE_COUNT` | 217 | Extracted feature count (192 RGBA + 25 non-visual) |
+| `MEMORY_CAP` | 128 | Maximum patterns per agent |
+| `RECALL_K` | 16 | Top-K recalled patterns per tick |
 | `ACTION_HISTORY_LEN` | 64 | Credit assignment lookback window |
-| `CREDIT_DECAY_RATE` | 0.04 | How fast credit decays with action age |
-| `WEIGHT_LR` | 0.02 | Learning rate for policy weight updates |
-| `WEIGHT_DECAY` | 0.00001 | L2 regularization per tick (tuned for ~4% loss per 4000-tick life) |
-| `PAIN_AMPLIFIER` | 3.0 | Negative gradient multiplier (pain teaches faster) |
-| `DEATH_CREDIT` | -0.5 | One-time retroactive signal on death (state-dependent weights only) |
-| `CREDIT_DEADZONE` | 0.01 | Minimum |gradient| to trigger credit assignment (filters metabolic noise) |
-| `MAX_WEIGHT_NORM` | 2.0 | L2 norm cap per action weight vector (synaptic homeostasis) |
-| `GLOBAL_LR` | 0.08 | EMA update factor for global biases |
-| `GLOBAL_RETAIN` | 0.995 | EMA retention for global biases |
-| `ANTICIPATION_WEIGHT` | 0.5 | How much the predicted trajectory change influences preferences |
+| `ERROR_HISTORY_LEN` | 128 | Prediction error ring buffer size |
 
-**Emergent properties**: The linear policy creates **continuous, state-dependent action preferences** — the agent learns to do different things in different situations through feature-level associations. The adaptive exploration rate creates a natural **curiosity → exploitation** transition: novel environments are explored, familiar environments are exploited. Urgency-driven exploitation creates **panic behavior** — when things are going badly, the agent falls back on what has worked before. The exploration floor (10%) ensures agents never stop trying new things, even under maximum urgency.
+### Sensory Input Layout (CPU --> GPU)
 
-**Performance**: The action selector uses **stack arrays** for action value computation and a **pre-allocated ring buffer** for state snapshots, eliminating all per-tick heap allocations.
+```
+[  192 RGBA vision  |  48 depth  |  vel(3)  fac(3)  ang(1)  e(1)  i(1)  ed(1)  id(1)  touch(16)  ]
+ ^                   ^            ^                                                                ^
+ 0                   192          240                                                              267
+```
+
+Total: `SENSORY_STRIDE = 267` f32 per agent. `pack_sensory_frame()` handles the CPU-side packing, including sorting touch contacts by intensity and zero-padding.
+
+### Brain State Buffer (per agent: `BRAIN_STRIDE = 8,468` f32)
+
+| Region | Offset | Size | Purpose |
+|--------|--------|------|---------|
+| Encoder weights | `O_ENC_WEIGHTS = 0` | 6,944 | `FEATURE_COUNT * DIM` weight matrix |
+| Encoder biases | `O_ENC_BIASES = 6944` | 32 | Per-dimension bias |
+| Predictor weights | `O_PRED_WEIGHTS = 6976` | 1,024 | `DIM * DIM` prediction matrix |
+| Predictor context weight | `O_PRED_CTX_WT = 8000` | 1 | Recall blending strength |
+| Prediction error ring | `O_PRED_ERR_RING = 8001` | 128 | Error history |
+| Habituation EMA | `O_HAB_EMA = 8131` | 32 | Per-dim change tracking |
+| Habituation attenuation | `O_HAB_ATTEN = 8163` | 32 | Per-dim dampening factor |
+| Previous encoded state | `O_PREV_ENCODED = 8195` | 32 | For habituation delta |
+| Homeostasis state | `O_HOMEO = 8227` | 6 | `[grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]` |
+| Action forward weights | `O_ACT_FWD_WTS = 8233` | 32 | Policy weights for forward |
+| Action turn weights | `O_ACT_TURN_WTS = 8265` | 32 | Policy weights for turn |
+| Action biases | `O_ACT_BIASES = 8297` | 2 | `[fwd_bias, turn_bias]` |
+| Exploration rate | `O_EXPLORATION_RATE = 8299` | 1 | Current exploration level |
+| Fatigue rings | `O_FATIGUE_FWD_RING = 8300` | 128 | `[fwd(64), turn(64)]` |
+| Fatigue state | `O_FATIGUE_CURSOR = 8428` | 3 | `[cursor, factor, length]` |
+| Previous prediction | `O_PREV_PREDICTION = 8431` | 32 | For next-tick error |
+| Tick count | `O_TICK_COUNT = 8463` | 1 | Agent-local tick counter |
+| Heritable config | `O_HAB_SENSITIVITY = 8464` | 4 | `[hab_sens, max_curiosity, fatigue_recovery, fatigue_floor]` |
+
+### Pattern Memory Buffer (per agent: `PATTERN_STRIDE = 5,251` f32)
+
+| Region | Offset | Size | Purpose |
+|--------|--------|------|---------|
+| Pattern states | `O_PAT_STATES = 0` | 4,096 | `128 * 32` encoded state per pattern |
+| Norms | `O_PAT_NORMS = 4096` | 128 | Cached L2 norm per pattern |
+| Reinforcement | `O_PAT_REINF = 4224` | 128 | Strength (decays over time) |
+| Motor context | `O_PAT_MOTOR = 4352` | 384 | `[forward, turn, outcome_valence] * 128` |
+| Metadata | `O_PAT_META = 4736` | 384 | `[created_at, last_accessed, activation_count] * 128` |
+| Active flags | `O_PAT_ACTIVE = 5120` | 128 | `1.0` = active, `0.0` = empty |
+| Bookkeeping | `O_ACTIVE_COUNT = 5248` | 3 | `[active_count, min_reinf_idx, last_stored_idx]` |
+
+### Action History Buffer (per agent: `HISTORY_STRIDE = 2,370` f32)
+
+| Region | Offset | Size | Purpose |
+|--------|--------|------|---------|
+| Motor ring | `O_MOTOR_RING = 0` | 320 | `[forward, turn, tick, gradient, _pad] * 64` |
+| State ring | `O_STATE_RING = 320` | 2,048 | `[encoded_state(32)] * 64` snapshots |
+| Bookkeeping | `O_HIST_CURSOR = 2368` | 2 | `[cursor, length]` |
+
+### Integer Storage Convention
+
+Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffers and cast via `u32()` in WGSL. This is safe for exact integers up to 2^24 = 16,777,216, which is far beyond any practical tick count or buffer index.
 
 ---
 
-### 4.5 Homeostatic Monitor (`homeostasis.rs`)
+## 6. Component Deep Dive: The 7-Pass Pipeline
 
-**What it does**: Tracks the agent's internal physiological signals (energy, integrity) across three timescales and computes a gradient (improving vs. worsening) plus a non-linear urgency signal.
+### 6.1 Feature Extraction (Pass 1) -- `feature_extract.wgsl`
 
-**Why it exists**: The homeostatic monitor provides the **only evaluative signal** in the entire brain. It is deliberately *not* a reward function — it doesn't say "eating is good" or "damage is bad". It simply reports whether internal variables are trending toward or away from their stable points. All behavior that appears goal-directed emerges from the brain learning to keep this gradient positive.
+**What it does**: Transforms raw sensory input (267 f32 per agent) into a feature vector (217 f32 per agent). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
 
 **How it works**:
 
-#### Three-Timescale Gradient Tracking
+1. **Vision RGBA**: Direct copy of 192 values (8x6 grid, 4 channels each). No spatial pooling -- the full color+alpha grid is preserved. This gives the brain per-pixel color access, critical for learning that "red ahead = danger zone" and "green ahead = food zone."
 
-Each tick, the raw gradient is computed from the change in energy and integrity:
+2. **Velocity magnitude**: Computes `sqrt(vx^2 + vy^2 + vz^2)` from the 3-component velocity vector, collapsing direction into a single speed scalar.
 
-```rust
-let raw_gradient = energy_delta * ENERGY_WEIGHT + integrity_delta * INTEGRITY_WEIGHT;
-// ENERGY_WEIGHT = 0.6, INTEGRITY_WEIGHT = 0.4
+3. **Proprioception**: Copies facing direction (3), angular velocity (1).
+
+4. **Interoception**: Copies energy (1), integrity (1), energy delta (1), integrity delta (1).
+
+5. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
+
+**Feature layout**: `[192 RGBA | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 217`
+
+**Why depth is skipped**: The 48 depth values from the sensory frame are present in the upload buffer but not extracted as features. Vision RGBA already encodes biome-specific color, which is the primary discriminant. Depth would add dimensionality without proportional information gain for the current world complexity.
+
+---
+
+### 6.2 Encoding (Pass 2) -- `encode.wgsl`
+
+**What it does**: Projects the 217-dimensional feature vector into a 32-dimensional encoded representation via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 217 inputs compressed to 32 outputs, forcing the brain to learn what matters.
+
+**How it works**:
+
+```
+encoded[d] = fast_tanh( sum_f( features[f] * weights[f * DIM + d] ) + biases[d] )
 ```
 
-Note that integrity is weighted lower than energy (0.4 vs 0.6). This raw gradient is then tracked at three timescales via exponential moving averages:
+For each of the 32 output dimensions, the shader computes a weighted sum across all 217 features (column-major weight layout: `weights[f * DIM + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
 
-| Timescale | EMA α | Effective window | Purpose |
-|-----------|-------|------------------|---------|
-| Fast | 0.4 | ~5 ticks | Immediate reactions (flinch, grab) |
-| Medium | 0.04 | ~50 ticks | Short-term strategy (approach food, avoid threats) |
-| Slow | 0.004 | ~500 ticks | Long-term trends (is this environment safe?) |
+**Weight initialization** (in `buffers::init_brain_state`): Xavier/Glorot uniform -- `uniform(-scale, scale)` where `scale = 1/sqrt(FEATURE_COUNT)`. This prevents tanh saturation at initialization.
 
-The composite gradient blends all three:
-```rust
-let base_gradient = gradient_fast * 0.50
-                  + gradient_medium * 0.35
-                  + gradient_slow * 0.15;
-let gradient = base_gradient * (1.0 + urgency);
-```
+**Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x DIM]`, indexed as `[f * DIM + d]`). This layout means each output dimension's weights are scattered across memory at stride `DIM` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
 
-The urgency amplifier means the gradient signal is stronger when the agent is in danger — a small improvement matters more when you're nearly dead.
+**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA values + 25 non-visual features = 217 inputs compressed to 32 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
 
-#### Bounded Distress Curve
+---
 
-Urgency is computed from a non-linear distress function that maps health levels [0, 1] to distress [0, 10]:
+### 6.3 Habituation + Homeostasis (Pass 3) -- `habituate_homeo.wgsl`
 
-```rust
-fn distress_curve(level: f32, exponent: f32) -> f32 {
-    let clamped = level.clamp(0.01, 1.0);
-    (1.0 - clamped).powf(exponent) * DISTRESS_SCALE  // DISTRESS_SCALE = 10.0
-}
-```
+Two independent subsystems combined into a single pass to reduce GPU dispatch count.
 
-The exponent is configurable via `BrainConfig::distress_exponent` (default 2.0, range [1.5, 5.0], heritable). Lower exponents make the agent react sooner to moderate drops; higher exponents keep the agent calm longer but produce sharper panic at critical levels.
+#### Habituation
 
-Example values (with default exponent 2.0):
-| Level | Distress | Interpretation |
-|-------|----------|----------------|
-| 1.0 | 0.0 | Perfect health, no urgency |
-| 0.8 | 0.4 | Mildly concerned |
-| 0.5 | 2.5 | Moderately urgent |
-| 0.2 | 6.4 | Highly urgent |
-| 0.1 | 8.1 | Critical |
-| 0.01 | 9.8 | Near death |
+**What it does**: Attenuates repetitive encoded dimensions and produces a habituated state used by all downstream passes.
 
-The shape means urgency increases slowly at first (the agent is tolerant of mild drops) but accelerates rapidly as levels approach zero. The exponent controls the steepness of this curve.
+**How it works**:
 
-Final urgency is the average distress of energy and integrity:
-```rust
-self.urgency = (energy_distress + integrity_distress) * 0.5;
-```
+For each dimension of the encoded state:
+1. **Per-dimension change EMA**: `ema[d] = (1 - alpha) * old_ema[d] + alpha * |encoded[d] - prev_encoded[d]|`
+2. **Attenuation**: `atten[d] = clamp(ema[d] * sensitivity, ATTEN_FLOOR, 1.0)`
+3. **Habituated state**: `habituated[d] = encoded[d] * atten[d]`
 
-#### HomeostaticState
+The curiosity bonus is not stored separately -- `predict_and_act.wgsl` computes it on-the-fly from the attenuation values stored in brain state: `curiosity = (1 - mean_atten) * max_curiosity_bonus`.
 
-The `HomeostaticState` struct returned from `update()` contains:
-- `gradient`: composite gradient (positive = improving)
-- `gradient_fast`, `gradient_medium`, `gradient_slow`: per-timescale gradients
-- `urgency`: non-linear distress signal [0, ∞)
+When all dimensions are changing rapidly, mean attenuation is high and curiosity is near zero. When the agent is stuck in a loop seeing the same thing, attenuation drops and curiosity rises, increasing exploration noise.
 
-**Key constants**:
-
-| Constant | Value | Effect |
+| Constant | Value | Source |
 |----------|-------|--------|
-| `ENERGY_WEIGHT` | 0.6 | Energy contribution to raw gradient |
-| `INTEGRITY_WEIGHT` | 0.4 | Integrity contribution to raw gradient |
-| `FAST_EMA_ALPHA` | 0.6 | Fast timescale responsiveness |
-| `MEDIUM_EMA_ALPHA` | 0.04 | Medium timescale responsiveness |
-| `SLOW_EMA_ALPHA` | 0.004 | Slow timescale responsiveness |
-| `GRADIENT_BLEND_FAST` | 0.5 | Fast timescale weight in composite |
-| `GRADIENT_BLEND_MEDIUM` | 0.35 | Medium timescale weight in composite |
-| `GRADIENT_BLEND_SLOW` | 0.15 | Slow timescale weight in composite |
-| `DISTRESS_SCALE` | 10.0 | Maximum distress value |
-| `MAX_DISTRESS` | 10.0 | Hard cap on distress |
+| `HAB_EMA_ALPHA` | 0.02 | Hardcoded in shader |
+| `ATTEN_FLOOR` | 0.1 | Hardcoded in shader |
+| `habituation_sensitivity` | 20.0 (default) | Per-agent in brain_state, heritable |
+| `max_curiosity_bonus` | 0.6 (default) | Per-agent in brain_state, heritable |
 
-**Emergent properties**: The three timescales create **temporal context** — the agent can react to immediate threats (fast gradient) while also considering whether its overall strategy is working (slow gradient). The urgency signal creates **survival pressure** — low health makes the agent conservative and reactive. The gradient amplification by urgency creates **desperation** — small improvements in critical situations feel much more significant.
+#### Homeostasis
 
----
-
-### 4.6 Sensory Habituation (`habituation.rs`)
-
-**What it does**: A post-encoder filter that attenuates repetitive sensory dimensions and produces a `curiosity_bonus` that feeds into the exploration rate. When the encoded state stops changing, habituation grows and curiosity rises, pushing the agent to break out of monotonous loops.
+**What it does**: Tracks the agent's internal physiological signals across three timescales and computes a composite gradient + non-linear urgency signal.
 
 **How it works**:
 
-For each dimension of the encoded state, an exponential moving average (EMA) tracks the magnitude of change between ticks. Dimensions with low change magnitude are attenuated (dampened toward zero), producing a **habituated state** that downstream consumers (Memory, Predictor, ActionSelector) use instead of the raw encoded state.
+1. **Raw gradient**: `raw = energy_delta * 0.6 + integrity_delta * 0.4`
 
-1. **Per-dimension change EMA**: `change_ema[i] = alpha * |current[i] - prev[i]| + (1 - alpha) * change_ema[i]`
-2. **Attenuation**: `attenuation[i] = max(ATTENUATION_FLOOR, change_ema[i] / sensitivity)`
-3. **Habituated state**: `habituated[i] = encoded[i] * attenuation[i]`
-4. **Curiosity bonus**: `curiosity_bonus = (1.0 - mean_attenuation) * max_curiosity_bonus`
+2. **Three-timescale EMA tracking**:
 
-When all dimensions are changing rapidly, mean attenuation is high and curiosity bonus is near zero. When the agent is stuck in a loop seeing the same thing, attenuation drops and curiosity bonus rises, increasing exploration.
+   | Timescale | Alpha | Effective window | Purpose |
+   |-----------|-------|------------------|---------|
+   | Fast | 0.6 | ~5 ticks | Immediate reactions (flinch, grab) |
+   | Medium | 0.04 | ~50 ticks | Short-term strategy (approach food, avoid threats) |
+   | Slow | 0.004 | ~500 ticks | Long-term trends (is this environment safe?) |
 
-**Key constants**:
+3. **Composite gradient**: `base = fast * 0.50 + med * 0.35 + slow * 0.15`, then amplified by urgency: `gradient = base * (1 + urgency)`
 
-| Constant / Parameter | Value | Configurable? |
-|----------------------|-------|---------------|
-| `HABITUATION_EMA_ALPHA` | 0.15 | No (hardcoded) |
-| `ATTENUATION_FLOOR` | 0.05 | No (hardcoded) |
-| `habituation_sensitivity` | 20.0 (default) | Yes (`BrainConfig`) |
-| `max_curiosity_bonus` | 0.6 (default) | Yes (`BrainConfig`) |
+4. **Distress curve**: `distress(level, exp) = min(pow(1 - clamp(level, 0.01, 1.0), exp) * 10.0, 10.0)`. The exponent is heritable via `BrainConfig::distress_exponent`.
 
----
+5. **Urgency**: `(energy_distress + integrity_distress) * 0.5`
 
-### 4.7 Motor Fatigue (`fatigue.rs`)
-
-**What it does**: Tracks a ring buffer of recent motor outputs and dampens the MotorCommand when motor variance is low. This prevents the agent from mechanically repeating the same motor pattern indefinitely. Recovery is immediate -- as soon as the agent produces varied output, fatigue lifts.
-
-**How it works**:
-
-A fixed-size ring buffer stores recent `(forward, turn)` pairs. The variance of each component is computed over the window. Low variance means repetitive output, which triggers fatigue dampening:
-
-1. **Motor variance**: `variance = var(forward_history) + var(turn_history)`
-2. **Fatigue factor**: `factor = max(fatigue_floor, 1.0 - exp(-variance * recovery_sensitivity))`
-3. **Dampened output**: `motor.forward *= factor; motor.turn *= factor;`
-
-When variance is high (diverse motor output), the fatigue factor is near 1.0 and output is unaffected. When variance is near zero (repetitive output), the factor drops toward `fatigue_floor`, weakening the command and giving other action candidates a chance to win on subsequent ticks.
-
-**Key constants / parameters**:
-
-| Constant / Parameter | Value | Configurable? |
-|----------------------|-------|---------------|
-| `FATIGUE_WINDOW` | 32 | No (hardcoded) |
-| `fatigue_recovery_sensitivity` | 8.0 (default) | Yes (`BrainConfig`) |
-| `fatigue_floor` | 0.1 (default) | Yes (`BrainConfig`) |
+**Output** (`homeo_out` buffer, 6 f32 per agent): `[gradient, raw_gradient_amplified, urgency, grad_fast, grad_med, grad_slow]`
 
 ---
 
-### 4.8 Capacity Manager (`capacity.rs`)
+### 6.4 Recall Scoring (Pass 4) -- `recall_score.wgsl`
 
-**What it does**: Manages the brain's per-tick processing budget, dynamically allocating recall slots and reserving capacity for surprise (novel patterns).
-
-**Why it exists**: Without capacity limits, the brain would recall all patterns every tick — there would be no selectivity, no attention, no prioritization. The capacity manager enforces scarcity, forcing the brain to be strategic about what it recalls. The adaptive allocation means the brain "thinks harder" about novel situations and "runs on autopilot" in familiar ones.
+**What it does**: Computes cosine similarity between the habituated state and all 128 memory patterns. Inactive slots receive a sentinel score of `-2.0`.
 
 **How it works**:
 
-#### Adaptive Recall Budget
-
-The recall budget scales linearly with prediction error:
-
-```rust
-let error_scale = (0.5 + avg_prediction_error * 2.0).clamp(0.5, 1.0);
-let base_budget = (max_recall_budget as f32 * error_scale).round() as usize;
+```
+For each pattern j in [0, MEMORY_CAP):
+    if not active: sim[j] = -2.0
+    else: sim[j] = clamp(dot(habituated, pattern[j]) / (||habituated|| * ||pattern[j]||), -1.0, 1.0)
 ```
 
-- Low error (familiar situation): use 50% of maximum budget
-- High error (novel situation): use up to 100% of maximum budget
+Pattern norms are pre-cached in `O_PAT_NORMS` (written during pattern storage in pass 7), avoiding redundant norm computation. The query norm is computed once per agent at the start of the pass.
 
-#### Surprise Budget
+**Why cosine similarity**: The encoder uses `tanh()`, so all values are in [-1, 1] -- magnitude carries less information than direction. Patterns with similar perceptual meaning should be similar regardless of activation strength.
 
-A fraction of the total capacity is reserved for novel/unexpected patterns. This fraction increases when a surprise spike is detected:
+---
+
+### 6.5 Recall Top-K Selection (Pass 5) -- `recall_topk.wgsl`
+
+**What it does**: Selects the best K=16 patterns from the 128 similarity scores. Each selected pattern is marked with `-3.0` in the similarities buffer to exclude it from subsequent iterations.
+
+**How it works**:
+
+A simple iterative argmax loop runs K times:
+1. Find the slot with the highest similarity score.
+2. If the best score is <= -1.5 (meaning only inactive/already-selected slots remain), stop early.
+3. Record the slot index in the recall buffer, increment the count.
+4. Update the pattern's `last_accessed` tick and `activation_count` metadata.
+5. Write `-3.0` to the selected slot's similarity score to exclude it.
+
+**Output** (`recall_buf`, 17 f32 per agent): `[idx_0, idx_1, ..., idx_15, count]`. The count is stored at position `RECALL_K` (index 16). Unused slots are zeroed.
+
+---
+
+### 6.6 Prediction + Action Selection (Pass 6) -- `predict_and_act.wgsl`
+
+This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with prospection and memory blend, exploration noise, and motor fatigue.
+
+#### 6.6.1 Prediction Error
+
+Computes RMSE between the previous tick's prediction (stored in `O_PREV_PREDICTION`) and the current habituated state:
+
+```
+pred_error = sqrt( mean( (prev_prediction[d] - habituated[d])^2 ) )
+```
+
+The scalar error is recorded into the 128-entry error ring buffer for moving average computation.
+
+#### 6.6.2 Predictor
+
+Predicts the next encoded state from the current habituated state and recalled context:
+
+1. **Linear transform**: `prediction[i] = sum_j( habituated[j] * pred_weights[i * DIM + j] )`
+2. **Context blend**: If recalled patterns exist, blend them in weighted by similarity: `prediction[d] += context_weight * sim * pattern[d] / total_sim`
+3. **Nonlinearity**: `prediction[d] = fast_tanh(prediction[d])`
+
+The `context_weight` parameter (stored at `O_PRED_CTX_WT`, initialized to 0.15) controls how much recalled patterns influence the prediction. It is itself adapted in pass 7.
+
+#### 6.6.3 Credit Assignment
+
+The homeostatic gradient is used to assign credit/blame to recent actions in the 64-entry history ring buffer. For each recorded action:
+
+1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.04`. Actions older than ~60 ticks contribute negligibly.
+2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.01)`, skip (filters metabolic noise).
+3. **Pain amplification**: Negative improvements are multiplied by `PAIN_AMP = 3.0`, reflecting the biological reality that aversive stimuli produce stronger learning signals.
+4. **State-conditioned weight update**: `weights[d] += WEIGHT_LR * credit * recorded_motor * recorded_state[d]`. The recorded state snapshot from when the action was taken ensures credit is attributed to the correct sensory context.
+
+**Weight normalization**: After credit assignment, forward and turn weight vectors are clipped to L2 norm <= `MAX_WEIGHT_NORM = 2.0` (synaptic homeostasis).
+
+#### 6.6.4 Policy Evaluation
+
+Continuous motor output is computed as a dot product of learned weights with the habituated state:
+
+```
+fwd = dot(fwd_weights, habituated) + fwd_bias
+trn = dot(trn_weights, habituated) + trn_bias
+```
+
+This is a continuous-output linear policy -- no discrete action table. The agent learns which features predict beneficial forward motion and which predict beneficial turning.
+
+#### 6.6.5 Prospective Evaluation
+
+The policy weights are applied not just to the current state but also to the predicted future state:
+
+```
+fwd += confidence * ANTICIPATION_WEIGHT * (fwd_future - fwd)
+trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn)
+```
+
+This is delta-based: it measures the *change* between current and predicted preferences, not the absolute predicted value. This eliminates fixed-point convergence problems. `confidence = 1 - clamp(pred_error, 0, 1)` -- low accuracy means short effective horizon.
+
+#### 6.6.6 Memory-Informed Motor Blend
+
+Recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
+
+```
+mem_fwd = sum( sim * valence * stored_forward ) / sum( |sim * valence| )
+mix = clamp(mean_|sim*valence|, 0, 1) * 0.4
+fwd = fwd * (1 - mix) + mem_fwd * mix
+```
+
+- **Positive valence**: "do what I did before" -- reinforces the recalled motor command
+- **Negative valence**: "do the opposite" -- the sign flip steers away from past mistakes
+- Memory contributes up to 40% of motor signal
+
+#### 6.6.7 Exploration Noise
+
+Exploration rate is computed dynamically:
+
+```
+novelty_bonus = min(pred_error * 2.0, 0.4)
+urgency_penalty = min(urgency * 0.4, 0.5)
+policy_confidence = clamp((|fwd| + |trn|) / 2.0, 0.0, 1.0)
+exploration_rate = clamp(0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity - urgency_penalty, 0.10, 0.85)
+```
+
+Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG seeded by `(agent * 1000 + tick)`. The motor output is clamped to [-1, 1].
+
+#### 6.6.8 Motor Fatigue
+
+A ring buffer of recent motor outputs (forward and turn separately) tracks motor variance. Low variance means repetitive output, which triggers dampening:
+
+```
+motor_variety = sqrt(var_fwd + var_trn) * recovery_sensitivity
+fatigue_factor = clamp(floor + (1 - floor) * clamp(motor_variety, 0, 1), floor, 1.0)
+fwd *= fatigue_factor
+trn *= fatigue_factor
+```
+
+When motor output is varied, fatigue factor is near 1.0 (no dampening). When output is repetitive, the factor drops toward `fatigue_floor`, weakening the command and giving other motor patterns a chance.
+
+| Constant | Value | Source |
+|----------|-------|--------|
+| `fatigue_recovery_sensitivity` | 8.0 (default) | Per-agent, heritable |
+| `fatigue_floor` | 0.1 (default) | Per-agent, heritable |
+
+#### 6.6.9 Output Recording
+
+After computing final motor output:
+1. Records `[fwd, trn, tick, gradient, _pad]` to the action history ring at `O_MOTOR_RING`.
+2. Records the habituated state snapshot at `O_STATE_RING` for future credit assignment.
+3. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
+4. Increments `O_TICK_COUNT`.
+5. Writes `[prediction(32), credit_signal(32), fwd, trn, strafe, _pad]` to the decision buffer for pass 7 and CPU readback.
+
+---
+
+### 6.7 Learning + Memory Storage (Pass 7) -- `learn_and_store.wgsl`
+
+Five learning operations packed into a single pass, using the prediction and credit signal from the decision buffer written by pass 6.
+
+#### 6.7.1 Predictor Gradient Descent
+
+Online gradient descent on prediction error:
+
+```
+error_vec[d] = prediction[d] - habituated[d]
+for each (i, j):
+    grad = clamp(error_vec[i] * (1 - prediction[i]^2) * habituated[j], -1.0, 1.0)
+    weights[i * DIM + j] -= learning_rate * grad
+    weights[i * DIM + j] = clamp(weights[i * DIM + j], -3.0, 3.0)
+```
+
+The `(1 - prediction^2)` term is the tanh derivative, correctly accounting for the nonlinearity. Gradient clipping at +/-1.0 prevents instability.
+
+The context weight is also adapted: `ctx_wt += learning_rate * 0.01 * (error_mag - 0.5)`. If error > 0.5, context weight increases (the predictor needs more help from memory). If < 0.5, it decreases.
+
+#### 6.7.2 Encoder Hebbian Credit Adaptation
+
+The encoder weights are adapted based on the credit signal from pass 6:
+
+```
+for each (i, j) where |credit_signal[i]| > 1e-6:
+    weights[j * DIM + i] += learning_rate * credit_signal[i] * 0.001 * features[j]
+    weights[j * DIM + i] = clamp(weights, -2.0, 2.0)
+```
+
+This is a Hebbian-style update: features that co-occur with strong credit signals have their encoder weights strengthened. The 0.001 scale factor makes encoder adaptation much slower than predictor learning, reflecting the intuition that the perceptual representation should change gradually while the prediction model adapts quickly.
+
+#### 6.7.3 Memory Reinforcement
+
+Active patterns with cosine similarity > 0.3 to the current habituated state are reinforced:
+
+```
+reinforcement[j] += sim * learning_rate * (1 - pred_error)
+```
+
+Low prediction error strengthens matching patterns more -- successful prediction means the memory is accurate.
+
+**Retroactive valence update**: Similar patterns have their `outcome_valence` nudged toward the current homeostatic gradient via an EMA: `valence += sim * (learning_rate * 0.3) * (gradient - valence)`. This lets the agent update its assessment of past situations.
+
+#### 6.7.4 Pattern Storage
+
+Each tick, the current habituated state is stored to the weakest memory slot (the one with the lowest reinforcement, tracked at `O_MIN_REINF_IDX`):
+
+- State vector and cached norm are written to the pattern slot.
+- Motor context `[fwd, trn, raw_gradient]` is stored.
+- Metadata `[created_at, last_accessed, activation_count]` is initialized.
+- Active flag is set to 1.0.
+- Active count is incremented if the slot was previously empty.
+
+#### 6.7.5 Memory Decay
+
+For each active pattern, an effective decay rate is computed that is modulated by:
+- **Frequency**: `freq_factor = 1 / (1 + activation_count * 0.2)` -- frequently accessed patterns decay slower
+- **Recency**: `recency_factor = min((tick - last_accessed) / 100, 3.0)` -- recently accessed patterns decay slower
+- **Combined**: `effective_rate = base_decay * freq_factor * (0.2 + recency_factor)`
+
+Patterns whose reinforcement drops to zero are deactivated. After decay, the slot with the minimum reinforcement is identified and cached in `O_MIN_REINF_IDX` for next tick's storage target.
+
+---
+
+## 7. Emergent Phenomena
+
+None of these behaviors are explicitly programmed. They arise from the interaction of the 7 shader passes and their shared constraints:
+
+| Phenomenon | How It Emerges | Contributing Passes |
+|------------|---------------|---------------------|
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (217 --> 32) compresses information | Pass 2, Pass 4-5 |
+| **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | Pass 3, 6 (credit + prospection) |
+| **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | Pass 3 (habituation), Pass 6 (exploration) |
+| **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | Pass 6 (credit), Pass 7 (reinforcement) |
+| **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | Pass 6 (error + exploration) |
+| **Adaptation** | Prediction error decreases in stable environments --> exploration drops --> behavior stabilizes | Pass 6, Pass 7 (predictor learning) |
+| **Panic** | Low energy/integrity --> high urgency --> exploration suppressed --> agent falls back on policy weights | Pass 3 (urgency), Pass 6 (exploration) |
+| **Forgetting** | Patterns not recalled or reinforced decay below zero and are deactivated | Pass 7 (decay) |
+| **Boredom / Loop Breaking** | Monotonous input --> habituation attenuates repetitive dimensions --> curiosity rises --> exploration increases; simultaneously, low motor variance --> fatigue dampens output --> repeated action weakens | Pass 3 (habituation), Pass 6 (fatigue + exploration) |
+| **Contextual Memory** | Policy weights map encoded features to motor preferences -- different percepts trigger different behaviors; recalled patterns blend motor advice | Pass 6 (policy + memory blend) |
+| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | Pass 3 (homeostasis) |
+
+---
+
+## 8. Host API (gpu_brain.rs)
+
+### GpuBrain
 
 ```rust
-if prediction_error > avg_prediction_error * 2.0 && prediction_error > 0.05 {
-    self.surprise_fraction = (self.surprise_fraction + 0.05).min(0.4);
-    self.surprise_active_ticks = 0;
-} else {
-    // Decay surprise fraction after 20 ticks of no surprises
-    if self.surprise_active_ticks > 20 {
-        self.surprise_fraction = (self.surprise_fraction - 0.01).max(0.05);
-    }
+pub struct GpuBrain {
+    // wgpu device + queue
+    // 4 persistent buffers (brain_state, pattern, history, config)
+    // 8 transient buffers (sensory, features, encoded, habituated, homeo_out, similarities, recall, decision)
+    // 2 staging buffers for double-buffered motor readback
+    // 7 compute pipelines + bind groups
 }
 ```
 
-The surprise budget is subtracted from the recall budget:
-```rust
-let recall_budget = base_budget.min(max_recall_budget - surprise_budget);
-```
+### Public API
 
-#### Cognitive Load Tracking
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `is_available` | `() -> bool` | Static probe: returns true if any wgpu adapter (real GPU or software fallback) exists. Used by tests to skip GPU work on headless CI |
+| `new` | `(agent_count: u32, config: &BrainConfig) -> Self` | Creates wgpu device (tries real GPU first, falls back to CPU/software adapter for headless CI), allocates all buffers, compiles all 7 shaders with auto-generated constants header |
+| `tick` | `(&mut self, frames: &[SensoryFrame]) -> Vec<MotorCommand>` | Synchronous: upload, dispatch all 7 passes, readback |
+| `submit` | `(&mut self, frames: &[SensoryFrame])` | Async step 1: upload sensory + dispatch all passes + copy motor to staging |
+| `collect` | `(&mut self) -> Vec<MotorCommand>` | Async step 2: map staging buffer, read motor commands |
+| `read_agent_state` | `(&mut self, index: u32) -> AgentBrainState` | Download one agent's full brain state from GPU for inspection/inheritance |
+| `write_agent_state` | `(&mut self, index: u32, state: &AgentBrainState)` | Upload one agent's brain state to GPU (for offspring initialization) |
+| `death_signal` | `(&mut self, index: u32)` | Halves all pattern reinforcements, resets homeostasis + exploration |
+| `resize` | `(&mut self, agent_count: u32)` | Rebuilds all buffers and pipelines for a new agent count |
 
-The `CognitiveLoad` struct tracks:
-- `recall_budget`: current allocation
-- `surprise_budget`: reserved for novelty
-- `avg_utilization`: EMA of actual slots used vs. available
-- `avg_prediction_error`: EMA of prediction error
-
-**Emergent properties**: The adaptive budget creates **attentional focus** — novel situations get more processing resources. The surprise budget creates **novelty bias** — capacity is reserved so the brain can respond to unexpected events even when fully loaded. The overall constraint creates **cognitive load** — the brain can be "overwhelmed" in highly novel, rapidly changing environments.
-
----
-
-### 4.9 Brain Orchestrator (`brain.rs`)
-
-**What it does**: Owns all components, orchestrates the tick loop, and produces telemetry.
-
-**Why it exists**: Individual components need to be coordinated in a specific order (you can't compute prediction error before you have the prediction and the actual state). The brain struct is the integration point that wires everything together.
-
-#### The tick() Method
-
-The 14-step orchestration documented in the [Data Flow Diagram](#3-data-flow-diagram) section. Key design choice: learning happens *before* recall and prediction, using the *previous* tick's prediction error. This means the brain is always learning from one tick ago, which avoids circular dependencies.
-
-#### The trauma() Method
-
-`Brain::trauma(severity)` delegates to `PatternMemory::trauma()`, applying a bulk reinforcement decay across all stored patterns. Called by the sandbox on agent death (with severity 0.2) when brain persistence is enabled. This models the cognitive cost of catastrophic discontinuity — death damages memory, but deeply learned patterns persist.
-
-#### The death_signal() Method
-
-`Brain::death_signal()` delegates to `ActionSelector::death_signal()`, which fires a calibrated negative credit event (`DEATH_CREDIT = -0.5`, urgency = 0.0) with `update_global = false`. After pain amplification (3.0×), the effective gradient is -1.5. This retroactively penalizes all recent actions in the 64-tick history buffer, with exponential decay so the most recent actions receive the strongest penalty. It also resets `MotorFatigue`, clearing the ring buffer so the respawned agent starts with a fresh fatigue factor of 1.0 — without this, the dying agent's constant motor output saturates the buffer and locks fatigue at maximum on respawn.
-
-**Global biases are intentionally excluded** from the death signal. Without this guard, the accumulated credit across 64 recent actions (typically all the same action) creates a ~-0.68 shift in global bias per death — catastrophically destroying whichever action the agent happened to be using. This leads to the agent cycling through punishing every action until all global biases are equally negative, causing "learned helplessness" (straight-line walking). By restricting death credit to state-dependent weights only, the agent learns context-specific avoidance ("forward when I see red terrain is bad") without context-independent punishment ("forward is always bad").
-
-#### BrainTelemetry
-
-All tracked metrics per tick:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `tick` | `u64` | Current tick number |
-| `prediction_error` | `f32` | This tick's prediction error (0 = perfect) |
-| `memory_utilization` | `f32` | Fraction of memory slots in use [0, 1] |
-| `memory_active_count` | `usize` | Number of active patterns |
-| `action_entropy` | `f32` | Shannon entropy of action distribution |
-| `exploration_rate` | `f32` | Current exploration probability |
-| `homeostatic_gradient` | `f32` | Composite gradient (+ improving, − worsening) |
-| `homeostatic_urgency` | `f32` | Non-linear distress level |
-| `recall_budget` | `usize` | Recall slots allocated this tick |
-| `avg_prediction_error` | `f32` | Moving average error (window=32) |
-| `exploitation_ratio` | `f32` | Fraction of actions that were exploitative [0, 1] |
-| `decision_quality` | `f32` | Composite quality score [0, 1] |
-
-#### Decision Quality Score
+### AgentBrainState
 
 ```rust
-let decision_quality = (1.0 - scalar_error.clamp(0.0, 1.0))
-    * (1.0 - exploration_rate)
-    * (1.0 + homeo_state.gradient).clamp(0.0, 2.0)
-    / 2.0;
+pub struct AgentBrainState {
+    pub brain_state: Vec<f32>,   // BRAIN_STRIDE = 8,468 f32
+    pub patterns: Vec<f32>,      // PATTERN_STRIDE = 5,251 f32
+    pub history: Vec<f32>,       // HISTORY_STRIDE = 2,370 f32
+}
 ```
 
-This is a composite metric that is high when:
-- Prediction error is low (the agent understands its environment)
-- Exploration rate is low (the agent is exploiting learned knowledge)
-- Homeostatic gradient is positive (things are going well)
+Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring), mutation, and DB persistence. The three vectors are the exact GPU buffer contents for one agent slice.
 
-Divided by 2.0 to normalize to [0, 1].
+### death_signal Behavior
 
-#### Behavior Phase Classification
+`death_signal(index)` performs three operations:
 
-Based on a composite behavioral score that accounts for exploitation, prediction accuracy, and homeostatic state:
+1. **Trauma**: Halves all pattern reinforcements. Patterns with reinforcement below 0.5 are deactivated. The weakest memories are wiped while the strongest survive.
+2. **Homeostasis reset**: Zeros all gradient EMAs (`grad_fast`, `grad_med`, `grad_slow`), urgency, and previous energy/integrity. The respawned agent starts with no homeostatic memory.
+3. **Exploration reset**: Sets exploration rate to 0.5 (balanced start).
 
-```
-score = exploitation_ratio × (1 − prediction_error) × (1 − homeostatic_urgency)
-```
+### BrainTelemetry
 
-This means an agent that avoids danger but starves (high urgency) cannot reach ADAPTED.
+Stub telemetry struct for UI/recording compatibility. Key fields: `prediction_error`, `memory_utilization`, `exploration_rate`, `homeostatic_gradient`, `homeostatic_urgency`, `fatigue_factor`, etc.
+
+### AgentTelemetry (GpuMegaKernel)
+
+`GpuMegaKernel::read_agent_telemetry(index)` performs a blocking readback of one agent's sensory, decision, and brain-state buffers, returning an `AgentTelemetry` struct with: vision color (192 RGBA floats), motor forward/turn, mean habituation attenuation, curiosity bonus, fatigue factor, motor variance, urgency, and homeostatic gradient. Called once per frame for the selected agent — not per-tick for all agents, which would negate performance gains.
+
+The `behavior_phase()` method classifies agent state:
 
 | Phase | Composite Score | Interpretation |
-|-------|-------------------|----------------|
+|-------|----------------|----------------|
 | `RANDOM` | < 2% | Brain is mostly exploring randomly |
-| `EXPLORING` | 2–8% | Starting to learn, still exploring heavily |
-| `LEARNING` | 8–20% | Learning is working, composite score increasing |
-| `ADAPTED` | ≥ 20% | Brain has adapted to its environment |
-
-#### DecisionSnapshot
-
-A per-tick snapshot of the brain's decision state, captured at the end of `tick_inner()` and stored in `Brain::last_decision`. This enables the UI to show a real-time "decision stream" — a scrollable log of what the brain decided, why, and what happened.
-
-```rust
-pub struct DecisionSnapshot {
-    pub tick: u64,
-    pub motor_forward: f32,
-    pub motor_turn: f32,
-    pub exploration_rate: f32,
-    pub gradient: f32,          // composite homeostatic gradient
-    pub raw_gradient: f32,      // avg prediction error (raw)
-    pub urgency: f32,           // homeostatic urgency
-    pub prediction_error: f32,
-    pub patterns_recalled: usize,
-    pub credit_magnitude: f32,  // abs sum of credit assigned this tick
-    pub energy: f32,            // energy signal [0, 1]
-    pub integrity: f32,         // integrity signal [0, 1]
-    pub phase: &'static str,    // behavior phase label
-    pub alive: bool,
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `motor_forward` / `motor_turn` | The continuous motor outputs chosen this tick |
-| `exploration_rate` | Current exploration probability (higher = more random) |
-| `gradient` | Composite homeostatic gradient (positive = improving) |
-| `raw_gradient` | Rolling average prediction error |
-| `urgency` | Non-linear distress level (suppresses exploration) |
-| `prediction_error` | This tick's prediction error |
-| `patterns_recalled` | How many memory patterns were recalled this tick |
-| `credit_magnitude` | Total absolute credit assigned to actions this tick (higher = stronger learning signal) |
-| `energy` / `integrity` | Normalized physiological signals at decision time |
-| `phase` | Current behavior phase label (RANDOM/EXPLORING/LEARNING/ADAPTED) |
-
-The sandbox's agent detail tab renders this as a color-coded scrollable log, with credit magnitude highlighted in green (positive) or red (negative gradient) to show at a glance whether the agent's recent decisions are being reinforced or penalized.
+| `EXPLORING` | 2-8% | Starting to learn, still exploring heavily |
+| `LEARNING` | 8-20% | Learning is working, composite score increasing |
+| `ADAPTED` | >= 20% | Brain has adapted to its environment |
 
 ---
 
-## 5. Emergent Phenomena
+## 9. Configuration (BrainConfig)
 
-None of these behaviors are explicitly programmed. They arise from the interaction of components and constraints:
+The `BrainConfig` struct (defined in `xagent-shared`) provides heritable parameters. Fixed dimensions (`DIM`, `FEATURE_COUNT`, `MEMORY_CAP`, `RECALL_K`) are constants in `buffers.rs`. Tunable parameters are stored per-agent in the brain state buffer and passed to shaders via the config uniform:
 
-| Phenomenon | How It Emerges | Contributing Components |
-|------------|---------------|------------------------|
-| **Attention** | Capacity constraints force selective recall; encoder bottleneck compresses information | Encoder, Capacity Manager |
-| **Fear / Avoidance** | Negative homeostatic gradient from damage → pain amplifier (3×) makes damage signal loud → credit assignment blames recent actions via state snapshots → policy weights learn to avoid danger-associated sensory features → **prospective evaluation** applies these learned associations to the predicted future, so the agent anticipates danger before entering it | Memory, Action Selector, Predictor, Homeostasis |
-| **Curiosity** | High prediction error in safe (low urgency) situations → exploration rate increases; additionally, sensory habituation produces a curiosity_bonus when input is monotonous, further boosting exploration even when prediction error is low | Predictor, Action Selector, Capacity Manager, Sensory Habituation |
-| **Habit Formation** | Repeated successful actions build strong context-action values → exploitation ratio increases → behavior becomes automatic | Memory, Action Selector |
-| **Startle / Surprise** | Sudden prediction error spike → surprise budget increases → recall budget shifts → exploration spikes | Predictor, Capacity Manager, Action Selector |
-| **Adaptation** | Prediction error decreases over time in stable environments → exploration drops → behavior stabilizes | Predictor, Action Selector |
-| **Panic** | Low energy/integrity → high urgency → exploration suppressed → agent falls back on best-known actions | Homeostasis, Action Selector |
-| **Forgetting** | Patterns that are not recalled or reinforced decay below threshold and are removed | Memory (smart decay) |
-| **Chunking** | Co-occurring patterns get associated → recalling one activates the chain → complex sequences are treated as units | Memory (associations) |
-| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | Homeostasis (multi-timescale) |
-| **Contextual Memory** | Linear policy weights map encoded state features to action preferences — different percepts trigger different behaviors | Action Selector, Encoder |
-| **Boredom / Loop Breaking** | Monotonous sensory input → sensory habituation attenuates repetitive dimensions → curiosity_bonus rises → exploration increases; simultaneously, low motor variance → motor fatigue dampens output → agent's repeated action weakens, giving other actions a chance | Sensory Habituation, Motor Fatigue, Action Selector |
-| **Cognitive Overload** | Novel, rapidly changing environments exhaust recall budget → brain can't keep up → behavior degrades | Capacity Manager, Memory |
-
----
-
-## 6. Configuration (BrainConfig)
-
-```rust
-pub struct BrainConfig {
-    pub memory_capacity: usize,            // Maximum stored patterns
-    pub processing_slots: usize,           // Max recall operations per tick
-    pub visual_encoding_size: usize,       // Visual downsampling resolution
-    pub representation_dim: usize,         // Internal representation vector length
-    pub learning_rate: f32,                // Base learning rate
-    pub decay_rate: f32,                   // Pattern decay per tick
-    pub distress_exponent: f32,            // Distress curve exponent (default 2.0)
-    pub habituation_sensitivity: f32,      // Boredom speed (default 20.0)
-    pub max_curiosity_bonus: f32,          // Max exploration from monotony (default 0.6)
-    pub fatigue_recovery_sensitivity: f32, // Fatigue relief speed (default 8.0)
-    pub fatigue_floor: f32,                // Min motor output under fatigue (default 0.1)
-}
-```
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `learning_rate` | 0.05 | Base rate for predictor gradient descent, memory reinforcement, encoder credit |
+| `decay_rate` | 0.001 | Pattern reinforcement decay per tick |
+| `distress_exponent` | 2.0 | Urgency curve steepness (heritable, range [1.5, 5.0]) |
+| `habituation_sensitivity` | 20.0 | How fast attenuation responds to change (heritable) |
+| `max_curiosity_bonus` | 0.6 | Maximum exploration boost from sensory monotony (heritable) |
+| `fatigue_recovery_sensitivity` | 8.0 | How fast fatigue lifts when motor output diversifies (heritable) |
+| `fatigue_floor` | 0.1 | Minimum motor output under full fatigue (heritable) |
+| `vision_rays` | 48 | Number of vision rays (W×H). Affects sensory buffer size |
+| `brain_tick_stride` | 4 | Physics ticks per brain+vision cycle. Higher → faster, less responsive |
+| `vision_stride` | 10 | Brain cycles between global passes (grid, collisions, vision). Higher → more throughput |
+| `metabolic_rate` | 1.0 | Multiplier for all energy costs. Lower → agents survive longer |
+| `integrity_scale` | 1.0 | Multiplier for integrity damage/regen. Higher → deadlier hazards |
 
 ### Parameter Effects
 
 | Parameter | Low Value | High Value |
 |-----------|-----------|------------|
-| `memory_capacity` | Rapid forgetting, lives in the moment, fast adaptation but no long-term memory | Rich memory, can recognize situations seen long ago, but slower slot search |
-| `processing_slots` | Narrow attention, only recalls best match, focused but brittle | Broad attention, considers many patterns, flexible but slower per tick |
-| `visual_encoding_size` | Coarse vision, can't distinguish similar scenes, but small weight matrix | Fine vision, better visual discrimination, but more parameters to learn |
-| `representation_dim` | Compressed representation, fast but loses information | Rich representation, captures more nuance but harder to learn |
-| `learning_rate` | Slow adaptation, stable but takes longer to respond to change | Fast adaptation, responsive but risks oscillation |
-| `decay_rate` | Long memory retention, accumulates patterns, can fill memory with stale data | Aggressive forgetting, only keeps very recent/frequent patterns |
-| `distress_exponent` | Reacts sooner to moderate health drops, more cautious overall | Stays calm longer, but panics harder at critical levels |
-| `habituation_sensitivity` | Slow to bore, tolerates repetitive input longer | Bores quickly, curiosity bonus rises fast in monotonous situations |
-| `max_curiosity_bonus` | Weak exploration boost from monotony, loops persist longer | Strong exploration boost from monotony, breaks loops aggressively |
-| `fatigue_recovery_sensitivity` | Slow fatigue recovery, motor dampening lingers after variance returns | Fast fatigue recovery, dampening lifts immediately with diverse output |
-| `fatigue_floor` | Motor output can be nearly zeroed by fatigue, strong loop-breaking | Motor output stays substantial even under full fatigue, gentler loop-breaking |
-
-### Presets
-
-| Preset | Capacity | Slots | Visual | Repr Dim | LR | Decay | Distress Exp | Hab. Sens. | Max Curiosity | Fatigue Recov. | Fatigue Floor | Character |
-|--------|----------|-------|--------|----------|------|-------|-------------|-----------|---------------|---------------|--------------|-----------|
-| `tiny()` | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 25.0 | 0.6 | 10.0 | 0.15 | Reactive, impulsive, forgetful. Bores fast, breaks loops quickly. |
-| `default()` | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 | Balanced. Good starting point for all anti-loop parameters. |
-| `large()` | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.5 | 15.0 | 0.4 | 6.0 | 0.1 | Thoughtful, patient. Slower to bore, calmer under moderate stress. |
+| `learning_rate` | Slow adaptation, stable but takes longer to respond | Fast adaptation, responsive but risks oscillation |
+| `decay_rate` | Long memory retention, can fill memory with stale data | Aggressive forgetting, only keeps recent/frequent patterns |
+| `distress_exponent` | Reacts sooner to moderate health drops, more cautious | Stays calm longer, but panics harder at critical levels |
+| `habituation_sensitivity` | Slow to bore, tolerates repetitive input longer | Bores quickly, curiosity bonus rises fast |
+| `max_curiosity_bonus` | Weak exploration boost from monotony, loops persist | Strong exploration boost, breaks loops aggressively |
+| `fatigue_recovery_sensitivity` | Slow fatigue recovery, dampening lingers | Fast recovery, dampening lifts immediately with diverse output |
+| `fatigue_floor` | Motor output nearly zeroed by fatigue, strong loop-breaking | Motor output stays substantial under fatigue, gentler |
 
 ### Tuning Guide
 
 | Problem | Likely Cause | Try |
 |---------|-------------|-----|
-| Agent is too random / never settles | Learning rate too low, or memory too small to build stable patterns | Increase `learning_rate` to 0.08–0.1, or increase `memory_capacity` |
-| Agent gets stuck doing one thing | Learning rate too high (overfit to first success), or decay too low (stale patterns dominate) | Decrease `learning_rate`, increase `decay_rate`, or decrease `memory_capacity` |
-| Agent ignores visual changes | `visual_encoding_size` too small, or `representation_dim` too small to capture visual information | Increase `visual_encoding_size` and `representation_dim` together |
-| Agent seems "blind" to threats | Homeostatic gradient is too slow to react (this is in homeostasis constants, not config) | Increase `learning_rate` so credit assignment is stronger |
-| Agent panics too early | Urgency distress curve kicks in at moderate levels | Increase `distress_exponent` (e.g., 3.0–4.0) — agent stays calmer longer but panics harder at critical levels |
-| Agent stuck in loops | Repetitive sensory input and motor output without breaking free | Increase `habituation_sensitivity` and `max_curiosity_bonus`, decrease `fatigue_floor` |
-| Memory fills up too fast | `decay_rate` too low or `memory_capacity` too small | Increase `decay_rate` or increase `memory_capacity` |
+| Agent is too random / never settles | Learning rate too low | Increase `learning_rate` to 0.08-0.1 |
+| Agent gets stuck doing one thing | Learning rate too high or decay too low | Decrease `learning_rate`, increase `decay_rate` |
+| Agent ignores visual changes | Encoder weights adapting too slowly | Increase `learning_rate` (credit signal scales with it) |
+| Agent panics too early | Urgency kicks in at moderate levels | Increase `distress_exponent` (e.g., 3.0-4.0) |
+| Agent stuck in loops | Repetitive sensory + motor without breaking free | Increase `habituation_sensitivity` and `max_curiosity_bonus`, decrease `fatigue_floor` |
+| Memory fills with stale data | Decay too slow | Increase `decay_rate` |
 
 ---
 
-## 7. Testing
+## 10. Testing
 
 ### Philosophy
 
 Tests verify **behavioral properties**, not implementation details. They check things like:
-- "prediction error should decrease with repeated input" (the system learns)
-- "similar inputs should produce similar encodings" (the encoder preserves similarity)
-- "positive gradient should increase action value" (credit assignment works)
-- "the brain should not produce NaN with extreme inputs" (numerical stability)
+- "the encode pass produces tanh-bounded output" (the shader computes correctly)
+- "habituation attenuates repeated input" (the system detects monotony)
+- "learning changes weights" (gradient descent actually runs)
+- "agents produce varied motor output" (the system isn't degenerate)
 
 ### Running Tests
 
@@ -1004,137 +786,101 @@ Tests verify **behavioral properties**, not implementation details. They check t
 cargo test -p xagent-brain --lib
 ```
 
-### Test Categories
+### Test Categories (38 tests)
 
 | Module | Tests | What They Verify |
 |--------|-------|-----------------|
-| `encoder` | 5 | Similarity preservation, dimension correctness, determinism, adaptation modifies weights, different inputs ≠ same encoding |
-| `memory` | 8 | Store/recall, smart decay, frequency-based retention, temporal sequence tracking, association chains, capacity limits, generation-based staleness detection, co-occurrence strengthening |
-| `predictor` | 5 | Zero error for identical states, error decreases with learning, context influences prediction, error history tracking, gradient descent convergence |
-| `action` | 7 | Exploration increases with prediction error, urgency decreases exploration, initial entropy is maximal, positive gradient increases action values, exploitation ratio starts at zero, stability reduces exploration, linear policy learns state-dependent preferences |
-| `homeostasis` | 8 | Stable signals → zero gradient, improving → positive gradient, worsening → negative gradient, critical levels → high urgency, multi-timescale separation, distress curve bounds, energy drop/gain response, low-level urgency |
-| `capacity` | 3 | High error increases recall budget, surprise spikes increase surprise fraction, cognitive load reporting |
-| `brain` | 5 | Produces motor command, telemetry updates each tick, runs 100 ticks without panic, prediction error decreases with repeated input, handles extreme inputs (all-zero, all-one) |
+| `buffers` | 6 | Sensory stride matches feature count, brain/pattern/history stride consistency, pack_sensory_frame fills buffer with finite values, init_brain_state produces correct-length output |
+| `gpu_brain` (buffer/init) | 2 | GPU brain initializes without panic, read/write state roundtrip preserves data |
+| `gpu_brain` (per-shader) | 7 | Feature extraction produces correct output, encode produces tanh-bounded output, habituation attenuates repeated input, recall_score computes cosine similarity, recall_topk selects best patterns, predict_and_act produces valid motor, learn_and_store modifies weights and stores patterns |
+| `gpu_brain` (integration) | 4 | Full tick produces valid motor commands, learning changes weights over 50 ticks, memory fills over time, resize changes agent count |
+| `gpu_brain` (behavioral) | 2 | Multi-agent variance (50 agents produce non-degenerate output), death_signal halves reinforcement |
 
 ---
 
-## 8. Design Decisions
+## 11. Design Decisions
 
-### Why Explicit Data Structures Over Neural Networks
+### Why GPU-Resident Over CPU
 
-The brain uses weight matrices and hash tables instead of deep neural networks. This is intentional:
-- **Inspectability**: Every policy weight, every association link, every pattern reinforcement can be read and understood. You can answer "why did the agent turn left?" by inspecting the action weight vectors and seeing which sensory features drove the preference.
-- **Deterministic debugging**: Given the same state, you can trace exactly which patterns were recalled, what prediction was made, and why a particular action was chosen.
-- **Minimal dependencies**: No ML framework needed. Just `f32` arrays and standard math.
-- **Interpretable emergence**: When interesting behavior appears, you can trace it to specific data structure interactions rather than opaque deep weight matrices.
+The previous CPU implementation had one `Brain` struct per agent with heap-allocated weight matrices, pattern vectors, and ring buffers. At 50+ agents, the per-tick cost was dominated by:
+- 50 independent matrix multiplies (encoder: 217x32, predictor: 32x32)
+- 50 * 128 cosine similarity computations (recall scoring)
+- Scattered memory access patterns (each agent's data in different heap locations)
+
+Moving to GPU makes all 50 agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. The CPU's only job is packing sensory frames and reading motor commands.
+
+### Why 7 Passes (GpuBrain) and Why a Fused Kernel (GpuMegaKernel)
+
+**GpuBrain uses 7 passes** because each shader reads from and writes to global storage buffers, keeping the working set per invocation small. The pipeline barriers between passes are cheap (all dispatches go into a single command encoder), and the data locality benefits of specialized shaders make the code inspectable and testable.
+
+**GpuMegaKernel fuses everything** because CPU↔GPU coordination overhead dominates at high tick rates. The 7-pass model achieved ~600 ticks/second due to 11–19 dispatches per tick, per-tick `write_buffer` calls, and blocking readback. The fused kernel runs N brain cycles in a single dispatch — 256 threads per agent, workgroup barriers between phases, shared memory for cooperative food detection. The CPU encodes a fixed number of passes regardless of brain cycle count, achieving 60,000+ ticks/second. The brain function code is composed from the same WGSL source files, so both modes execute identical math.
+
+### Why Flat array<f32> Instead of Structured Buffers
+
+WGSL's structured buffer support requires compile-time-known layouts. With per-agent strides computed from constants (e.g., `agent * BRAIN_STRIDE + O_ENC_WEIGHTS`), a flat `array<f32>` with computed offsets is simpler and more flexible than nested structs. The offset constants are auto-generated from Rust, so the "indexing math" is actually just named constants that read like field accesses.
+
+### Why wgsl_constants() Auto-Generation
+
+Every shader needs the same set of 50+ offset constants, utility functions (`fast_tanh`, `pcg_hash`), and dimension values. Manually keeping these in sync between Rust and WGSL would be a maintenance nightmare. `wgsl_constants()` generates the shared header from Rust constants, which is prepended to each shader source at pipeline creation time. A single source of truth, zero chance of offset mismatch.
 
 ### Why Cosine Similarity for Pattern Matching
 
 Cosine similarity measures angle between vectors, ignoring magnitude. This is correct for encoded states because:
-- The encoder uses `tanh()`, so all values are in [-1, 1] — magnitude carries less information than direction.
+- The encoder uses `tanh()`, so all values are in [-1, 1] -- magnitude carries less information than direction.
 - Patterns with similar perceptual meaning should be similar regardless of activation strength.
 - It's cheap to compute (dot product + two norms) and well-understood.
 
-### Why Generation Counters for Association Integrity
-
-When a memory slot is overwritten, all association links pointing to that slot become stale. We could scan all patterns and remove stale links (O(n × k) where k = average associations per pattern), or we can use generation counters and validate lazily at retrieval time (O(1) per link check). The generation approach is both simpler and faster.
-
 ### Why Three Timescales in Homeostasis
 
-Biological nervous systems track changes at multiple timescales — immediate reflexes (milliseconds), emotional responses (seconds-minutes), and mood/disposition (hours-days). Three timescales (fast ≈5 ticks, medium ≈50 ticks, slow ≈500 ticks) capture this hierarchy:
-- **Fast**: "I just got hit" — immediate reaction
-- **Medium**: "This area has been bad for me" — tactical adjustment
-- **Slow**: "My overall strategy isn't working" — strategic shift
+Biological nervous systems track changes at multiple timescales -- immediate reflexes (milliseconds), emotional responses (seconds-minutes), and mood/disposition (hours-days). Three timescales (fast ~5 ticks, medium ~50 ticks, slow ~500 ticks) capture this hierarchy:
+- **Fast**: "I just got hit" -- immediate reaction
+- **Medium**: "This area has been bad for me" -- tactical adjustment
+- **Slow**: "My overall strategy isn't working" -- strategic shift
 
-### Why Linear Policy Instead of Context Hashing
+### Why Continuous Motor Output Instead of Discrete Actions
 
-The original context-hash approach used 128 buckets to discretize the encoded state. This had three critical flaws:
-1. **Credit assigned to wrong context**: All actions in history were credited in the *current* bucket, not the bucket where each action was originally chosen.
-2. **Hash collisions**: 128 buckets from hashing 8 quantized dimensions → similar scenes mapped to different buckets, requiring 128× more experience.
-3. **Random walks give equal credit**: All 8 action types received roughly equal credit from random exploration, producing no net learning.
-
-The linear policy replaces the hash table with a weight matrix (`repr_dim × NUM_ACTIONS`). Each action's preference is `dot(weights[a], state)`. Credit assignment uses the stored state snapshot from when each action was chosen:
-
-```
-Δweights[a] += lr × credit × state_similarity × state_snapshot_at_action_time
-```
-
-This means the weights learn **which features of the encoded state predict good outcomes for each action**. The linear policy is continuous (similar states → similar preferences), uses all encoded dimensions, and correctly attributes credit to the sensory context where each action was taken.
+The old CPU architecture used a discrete 8-action space with a learned preference table. The GPU rewrite replaces this with continuous forward/turn output computed as `dot(weights, habituated) + bias`. This is both simpler (no action table, no softmax, no argmax tie-breaking) and more expressive (the agent can move at any speed and turn at any angle). Credit assignment updates the weight vectors directly via state-conditioned gradient, which is more natural for continuous outputs.
 
 ### Why Credit Deadzone Filters Metabolic Noise
 
-Every tick, energy depletion produces a small negative homeostatic gradient (~0.006). Without a deadzone, this constant signal triggers credit assignment on every tick, treating normal metabolism as a negative outcome. The `CREDIT_DEADZONE = 0.01` threshold ensures only meaningful events — food consumption (+0.03), damage (-0.02), death (-0.5) — produce weight updates. This is analogous to sensory gating in biological systems, where constant background stimuli are filtered out to preserve signal clarity.
+Every tick, energy depletion produces a small negative homeostatic gradient (~0.006). Without a deadzone, this constant signal triggers credit assignment on every tick, treating normal metabolism as a negative outcome. The `DEADZONE = 0.01` threshold ensures only meaningful events -- food consumption (+0.03), damage (-0.02), death (-0.5) -- produce weight updates. This is analogous to sensory gating in biological systems, where constant background stimuli are filtered out to preserve signal clarity.
 
 ### Why State-Conditioned Credit Assignment
 
-Naive credit assignment applies the same credit to all recent actions regardless of the state in which they were taken. This means dying in a danger zone penalizes actions taken in safe states equally — the agent learns "forward is bad everywhere" instead of "forward-in-danger is bad." State-conditioned credit modulates each action's update by the cosine similarity between the current state and the state when that action was chosen. High similarity → full credit. Low similarity → minimal credit. This is analogous to context-dependent synaptic plasticity in biological systems.
+Naive credit assignment applies the same credit to all recent actions regardless of the state in which they were taken. This means dying in a danger zone penalizes actions taken in safe states equally -- the agent learns "forward is bad everywhere" instead of "forward-in-danger is bad." State-conditioned credit uses the recorded state snapshot from when each action was chosen, so the weight update is proportional to `recorded_state[d]`. High feature activation at action time --> full credit. Low activation --> minimal credit.
 
-### Why Weight Normalization (Synaptic Homeostasis)
+### Why Pain Amplification (3x)
 
-Without a norm cap, repeated reinforcement in one context causes unbounded weight growth, which creates two problems: (1) dot-product preferences become so large that exploration-phase softmax collapses to a deterministic choice, and (2) future credit updates in different contexts are overwhelmed by the accumulated magnitude. Clipping to `MAX_WEIGHT_NORM = 2.0` after each credit pass provides synaptic homeostasis — keeping weights in a range where learning remains effective and exploration remains meaningful.
+Negative homeostatic gradients receive a 3x multiplier in credit assignment. This reflects the biological reality that amygdala neurons respond 2-3x more strongly to aversive stimuli. This is NOT hardcoded avoidance -- the brain must learn WHAT to do about the amplified signal. The amplification just ensures that negative outcomes produce louder learning signals than positive ones, which is necessary because damage is typically more catastrophic than the benefit of a single meal.
 
-### Why Uniform Random Exploration Instead of Softmax
+### Why Encoder Adaptation is Hebbian, Not Backpropagated
 
-Softmax exploration was effectively deterministic with the linear policy. In 32 dimensions with norm-2 weight vectors, the dot product differences between the best and worst actions are large enough that the softmax assigns 99%+ probability to the best action. This makes "exploration" functionally identical to exploitation. Uniform random (`rng.random_range(0..NUM_ACTIONS)`) guarantees 12.5% probability per action during exploration ticks, ensuring genuine behavioral diversity.
-
-### Why Random Argmax Tie-Breaking
-
-With zero-initialized weights, all actions have identical preferences. Rust's `max_by` deterministically returns the last tied element (action 7), creating a fixed behavioral bias from tick zero. Random tie-breaking ensures a fresh agent distributes equally across all actions until learning creates genuine preference differences.
-
-### Why "Forage" Replaced "Do Nothing" (Action 7)
-
-The original action 7 was "stay still" (zero motor output). This created a freeze trap: agents with no learned preferences defaulted to action 7 (due to `max_by` tie-breaking) and never moved, making it impossible to encounter food or threats and bootstrap learning. Replacing it with "forage" (`forward: 0.15, action: Consume`) ensures every action produces some movement, guaranteeing environmental interaction even with untrained weights.
-
-### Why Learning Rate is Modulated by Homeostatic Gradient
-
-```rust
-let modulated_lr = self.config.learning_rate * (1.0 + homeo_state.gradient.abs());
-```
-
-When internal state is changing rapidly (either improving or worsening), the brain should learn faster — these are the moments that matter. When things are stable, there's less to learn. This mimics the role of neuromodulators (dopamine, norepinephrine) in biological brains, which modulate synaptic plasticity based on salience.
+Backpropagating prediction error through the predictor and into the encoder weights would be the "correct" gradient. But on GPU, the encoder and predictor run in separate passes (2 and 7), and computing the full chain would require storing intermediate Jacobians. Instead, the encoder weights are adapted via a Hebbian credit signal from pass 6: features that co-occur with strong credit (positive or negative) have their encoder weights nudged. This is biologically plausible, computationally cheap, and empirically sufficient -- the encoder's main job is dimensionality reduction, and Xavier-initialized random projections already do a decent job of that.
 
 ---
 
-## 9. CPU Performance Optimizations
-
-The brain is designed for **zero per-tick heap allocations**. Key optimizations:
-
-| Component | Optimization | Impact |
-|-----------|-------------|--------|
-| **Encoder** | Pre-allocated scratch buffer for feature extraction | No `Vec` allocation per tick |
-| **Encoder / Predictor** | `fast_tanh` Padé approximant replaces `f32::tanh()` | Avoids expensive transcendental function |
-| **Memory** | Capped associations (`.take(8)`) during retrieval | Bounds work per recall operation |
-| **Predictor** | Pre-allocated scratch buffer for prediction computation | No `Vec` allocation per tick |
-| **Action Selector** | Stack arrays for action value computation | No heap allocation for selection |
-
-The `fast_tanh` approximant uses a rational Padé form that is accurate to within ~0.001 for inputs in [-3, 3] (which covers the clamped weight range), while being significantly cheaper than the standard library implementation.
-
----
-
-## 10. Known Limitations & Future Work
+## 12. Known Limitations & Future Work
 
 ### Current Limitations
 
-- **Encoder adaptation is minimal**: Only L2 regularization is applied. The encoder weights are never truly trained to optimize prediction — they are initialized randomly and gently constrained. A future version could use prediction-error-driven weight updates that flow through the predictor.
+- **GpuBrain uses single-threaded workgroups**: The 7-pass `GpuBrain` dispatches one thread per agent (`@workgroup_size(1)`). The `GpuMegaKernel` addresses this with 256-thread workgroups and fused passes, but the 7-pass mode is retained for inspectability and testing.
 
-- **Action space is discrete and fixed**: The 8 actions are hardcoded. A continuous action space with learned parameterization would allow more nuanced behavior (e.g., moving at different speeds, turning at specific angles).
+- **No hierarchical pattern abstraction**: All 128 patterns are stored at the same level of abstraction. There is no mechanism for forming higher-order patterns ("I'm in a corridor" from a sequence of wall-patterns) or chunking temporal sequences into reusable units.
 
-- **No hierarchical pattern abstraction**: All patterns are stored at the same level of abstraction. There is no mechanism for forming higher-order patterns ("I'm in a corridor" from a sequence of wall-patterns) or chunking temporal sequences into reusable units.
-
-- **Memory capacity is fixed**: The brain cannot grow its memory. A dynamic capacity that expands in rich environments and contracts in simple ones would better match biological memory allocation.
+- **Fixed memory capacity**: The brain cannot grow its memory. A dynamic capacity that expands in rich environments and contracts in simple ones would better match biological memory allocation.
 
 - **No inter-agent brain communication**: Each brain is entirely isolated. There is no mechanism for one agent to share learned patterns or action values with another. Social learning and cultural transmission would require some form of brain-to-brain communication channel.
 
-- **Flat recall search**: Recall iterates over all patterns (O(n)) every tick. For large memory capacities, this becomes expensive. A spatial index (e.g., locality-sensitive hashing) would enable sub-linear recall.
+- **No sleep/consolidation**: Biological brains consolidate memories during sleep, replaying and strengthening important patterns. The current system has no offline consolidation phase -- all learning happens online during ticks.
 
-- **No sleep/consolidation**: Biological brains consolidate memories during sleep, replaying and strengthening important patterns. The current system has no offline consolidation phase — all learning happens online during ticks.
+- **Telemetry is per-selected-agent only**: `GpuMegaKernel::read_agent_telemetry()` reads vision, motor, and brain-state data for one agent per frame. Full telemetry for all agents simultaneously would still negate performance benefits.
 
-- **Single sensory modality fusion**: All sensory inputs are concatenated into a single feature vector. There is no modality-specific processing (e.g., separate visual and proprioceptive streams that are later integrated).
+- **Depth features unused**: The 48 depth values from the sensory frame are uploaded but not extracted as features. Adding depth as a feature channel would improve spatial reasoning at the cost of a larger encoder weight matrix.
 
 ### Future Directions
 
 - **Hierarchical temporal memory**: Stack multiple levels of pattern memory, each operating at a different temporal granularity.
-- **Continuous action space**: Replace the 8-action table with a continuous policy parameterized by the encoded state.
-- **Curiosity-driven exploration**: Use prediction error as an intrinsic reward for exploration, beyond just modulating the exploration rate.
 - **Multi-agent pattern sharing**: Allow agents to "teach" each other by sharing association strengths or pattern representations.
 - **Dreaming/replay**: Periodically replay stored pattern sequences during idle time to consolidate important memories and prune irrelevant ones.
+- **Depth feature integration**: Extract depth as a separate feature channel for improved spatial awareness.
+- **Broadcast telemetry**: Extend the per-selected-agent telemetry to sample multiple agents without blocking the render loop.

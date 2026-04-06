@@ -152,6 +152,145 @@ pub fn step(
     consumed
 }
 
+/// Pure (read-only world) variant of [`step`] for parallel physics.
+///
+/// Does everything `step()` does except mutating the world. Food detection
+/// is read-only: it finds the nearest unconsumed food within range, but does
+/// **not** mark the food as consumed, remove it from the spatial grid, or
+/// apply any energy gain to the agent. The caller is responsible for
+/// deduplicating food claims and awarding energy sequentially after the
+/// parallel pass.
+///
+/// Returns `(consumed_food_index, died)`:
+/// - `consumed_food_index`: `Some(idx)` if the agent found food to consume
+/// - `died`: whether the agent died this tick
+pub fn step_pure(
+    agent: &mut AgentBody,
+    motor: &MotorCommand,
+    world: &WorldState,
+    dt: f32,
+) -> (Option<usize>, bool) {
+    if !agent.body.alive {
+        return (None, false);
+    }
+
+    let motor = sanitize_motor(motor);
+
+    // Save last known good position/velocity for NaN recovery
+    let last_good_position = agent.body.position;
+    let last_good_velocity = agent.body.velocity;
+
+    agent.snapshot_internals();
+
+    // ── turning ────────────────────────────────────────────────────
+    let prev_yaw = agent.yaw;
+    agent.yaw += motor.turn * TURN_SPEED * dt;
+    agent.angular_velocity = (agent.yaw - prev_yaw) / dt.max(1e-6);
+    agent.body.facing = Vec3::new(agent.yaw.sin(), 0.0, agent.yaw.cos()).normalize();
+
+    // ── locomotion ─────────────────────────────────────────────────
+    let right = Vec3::new(agent.body.facing.z, 0.0, -agent.body.facing.x);
+    let mut desired = agent.body.facing * motor.forward + right * motor.strafe;
+    if desired.length_squared() > 1.0 {
+        desired = desired.normalize();
+    }
+    agent.body.velocity.x = desired.x * MOVE_SPEED;
+    agent.body.velocity.z = desired.z * MOVE_SPEED;
+
+    // ── gravity ────────────────────────────────────────────────────
+    agent.body.velocity.y -= GRAVITY * dt;
+
+    // ── integrate position ─────────────────────────────────────────
+    agent.body.position += agent.body.velocity * dt;
+
+    // ── clamp to world bounds ──────────────────────────────────────
+    let half = world.config.world_size / 2.0 - 1.0;
+    agent.body.position.x = agent.body.position.x.clamp(-half, half);
+    agent.body.position.z = agent.body.position.z.clamp(-half, half);
+
+    // ── ground collision ───────────────────────────────────────────
+    let ground = world.terrain.height_at(agent.body.position.x, agent.body.position.z);
+    if agent.body.position.y < ground + AGENT_HALF_HEIGHT {
+        agent.body.position.y = ground + AGENT_HALF_HEIGHT;
+        agent.body.velocity.y = 0.0;
+    }
+
+    // ── NaN/infinity recovery ──────────────────────────────────────
+    fn vec3_is_finite(v: Vec3) -> bool {
+        v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
+    }
+    if !vec3_is_finite(agent.body.position) || !vec3_is_finite(agent.body.velocity) {
+        agent.body.position = last_good_position;
+        agent.body.velocity = last_good_velocity;
+    }
+
+    // ── jump ───────────────────────────────────────────────────────
+    if motor.action == Some(MotorAction::Jump)
+        && (agent.body.position.y - ground - AGENT_HALF_HEIGHT).abs() < 0.1
+    {
+        agent.body.velocity.y = 8.0;
+    }
+
+    // ── energy depletion ───────────────────────────────────────────
+    let movement_mag = (motor.forward.abs() + motor.strafe.abs()).min(1.414);
+    agent.body.internal.energy -= world.config.energy_depletion_rate;
+    agent.body.internal.energy -= movement_mag * world.config.movement_energy_cost;
+
+    // ── biome effects ──────────────────────────────────────────────
+    let biome = world.biome_map.biome_at(agent.body.position.x, agent.body.position.z);
+    if biome == BiomeType::Danger {
+        agent.body.internal.integrity -= world.config.hazard_damage_rate;
+    }
+
+    // integrity regen when energy > 50 %
+    if agent.body.internal.energy_signal() > 0.5
+        && agent.body.internal.integrity < agent.body.internal.max_integrity
+    {
+        agent.body.internal.integrity = (agent.body.internal.integrity
+            + world.config.integrity_regen_rate)
+            .min(agent.body.internal.max_integrity);
+    }
+
+    // ── read-only food detection ──────────────────────────────────
+    let consumed = try_detect_food(agent, world);
+
+    // ── clamp & death check ────────────────────────────────────────
+    agent.body.internal.energy = agent.body.internal.energy.max(0.0);
+    agent.body.internal.integrity = agent.body.internal.integrity.max(0.0);
+    let died = if agent.body.internal.is_dead() {
+        agent.body.alive = false;
+        true
+    } else {
+        false
+    };
+
+    (consumed, died)
+}
+
+/// Read-only food detection: finds the nearest unconsumed food within range
+/// but does NOT apply energy gain or mutate the world. The caller must
+/// deduplicate claims (multiple agents may detect the same food) and apply
+/// the energy gain to the winning consumer in the sequential phase.
+fn try_detect_food(agent: &AgentBody, world: &WorldState) -> Option<usize> {
+    let pos = agent.body.position;
+    let mut best: Option<(usize, f32)> = None;
+
+    for idx in world.food_grid.query_nearby(pos.x, pos.z) {
+        let food = &world.food_items[idx];
+        if food.consumed {
+            continue;
+        }
+        let d = (food.position - pos).length();
+        if d < FOOD_CONSUME_RADIUS {
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((idx, d));
+            }
+        }
+    }
+
+    best.map(|(idx, _)| idx)
+}
+
 /// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.
 /// Uses the spatial grid for O(1) lookup instead of scanning all food items.
 /// Awards food_energy_value to the agent and marks the food as consumed

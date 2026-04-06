@@ -25,3 +25,8 @@ jobs:
 
       - name: Cargo test
         run: cargo test -p xagent-sandbox
+
+      - name: Benchmark (informational)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: cargo run --release -p xagent-sandbox -- --bench --bench-ticks 5000 --bench-agents 10 2>&1 | tee bench-output.txt

@@ -10,7 +10,7 @@ use std::io::{BufWriter, Write};
 use std::time::SystemTime;
 
 use glam::Vec3;
-use xagent_brain::brain::BrainTelemetry;
+use xagent_brain::BrainTelemetry;
 use xagent_shared::MotorCommand;
 
 use crate::world::biome::BiomeType;

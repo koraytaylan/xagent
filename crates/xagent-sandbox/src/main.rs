@@ -26,7 +26,7 @@ use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
 use xagent_brain::GpuMegaKernel;
-use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT};
+use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT, P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT};
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
@@ -178,46 +178,40 @@ fn print_config(config: &FullConfig) {
     println!("──────────────────────────────────────────────────");
 }
 
+/// Data collected on the main thread for upload once the background-created
+/// mega-kernel is ready.  Avoids passing world/agent refs across threads.
+struct PendingUpload {
+    heights: Vec<f32>,
+    biomes: Vec<u32>,
+    food_pos: Vec<(f32, f32, f32)>,
+    food_consumed: Vec<bool>,
+    food_timers: Vec<f32>,
+    agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
+}
+
 /// Base simulation rate in Hz. The simulation runs at this rate (scaled by
 /// speed multiplier) regardless of rendering frame rate.
 const SIM_RATE: f32 = 60.0;
 const SIM_DT: f32 = 1.0 / SIM_RATE;
 
 /// Record per-tick telemetry into agent sparkline histories.
-/// Note: brain telemetry (prediction_error, exploration_rate, fatigue) is
-/// unavailable with GPU brain. These are stubbed to 0.0 until GPU telemetry
-/// readback is implemented.
 fn record_agent_histories(agent: &mut Agent) {
     let cap = 10_000;
-    let h = &mut agent.prediction_error_history;
-    if h.len() >= cap {
-        h.pop_front();
+    macro_rules! push_hist {
+        ($h:expr, $v:expr) => {
+            if $h.len() >= cap { $h.pop_front(); }
+            $h.push_back($v);
+        };
     }
-    h.push_back(0.0); // GPU telemetry TBD
-    let h = &mut agent.exploration_rate_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(0.0); // GPU telemetry TBD
+    push_hist!(agent.prediction_error_history, agent.cached_prediction_error);
+    push_hist!(agent.exploration_rate_history, agent.cached_exploration_rate);
     let ef = agent.body.body.internal.energy
         / agent.body.body.internal.max_energy.max(0.001);
-    let h = &mut agent.energy_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(ef.clamp(0.0, 1.0));
+    push_hist!(agent.energy_history, ef.clamp(0.0, 1.0));
     let inf = agent.body.body.internal.integrity
         / agent.body.body.internal.max_integrity.max(0.001);
-    let h = &mut agent.integrity_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(inf.clamp(0.0, 1.0));
-    let h = &mut agent.fatigue_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(0.0); // GPU telemetry TBD
+    push_hist!(agent.integrity_history, inf.clamp(0.0, 1.0));
+    push_hist!(agent.fatigue_history, agent.cached_fatigue_factor);
 }
 
 struct App {
@@ -308,9 +302,15 @@ struct App {
 
     // GPU mega-kernel (all simulation computation in single dispatch)
     gpu_mega_kernel: Option<GpuMegaKernel>,
+    pending_mega_kernel: Option<std::thread::JoinHandle<GpuMegaKernel>>,
+    /// Data collected for upload once the background kernel is ready.
+    pending_upload: Option<PendingUpload>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
+
+    // Adaptive GPU tick budget — keeps dispatch under ~8ms wall time
+    gpu_tick_budget: u32,
 
     // Sidebar sort mode
     sort_mode: SortMode,
@@ -434,7 +434,10 @@ impl App {
             db_path: db_path.to_string(),
             governor_config,
             gpu_mega_kernel: None,
+            pending_mega_kernel: None,
+            pending_upload: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
+            gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
             world_snapshot: WorldSnapshot::default(),
             recording: None,
@@ -471,34 +474,56 @@ impl App {
             Some(w) => w,
             None => return,
         };
+
+        // Check if background creation finished.
+        if let Some(ref handle) = self.pending_mega_kernel {
+            if handle.is_finished() {
+                let handle = self.pending_mega_kernel.take().unwrap();
+                let mk = handle.join().expect("mega-kernel background thread panicked");
+                // Upload world + agent data (fast, main thread).
+                if let Some(upload) = self.pending_upload.take() {
+                    mk.upload_world(
+                        &upload.heights, &upload.biomes, &upload.food_pos,
+                        &upload.food_consumed, &upload.food_timers,
+                    );
+                    mk.upload_agents(&upload.agent_data);
+                }
+                let ac = mk.agent_count();
+                self.gpu_mega_kernel = Some(mk);
+                self.log_msg(format!("[GPU] MegaKernel ready ({} agents)", ac));
+            }
+            return; // still creating
+        }
+
+        // Collect data for upload (kept on main thread).
         let agent_count = self.agents.len() as u32;
         let food_count = world.food_items.len();
+        let brain_config = self.brain_config.clone();
+        let world_config = world.config.clone();
 
-        let mk = GpuMegaKernel::new(
-            agent_count, food_count, &self.brain_config, &world.config,
-        );
+        self.pending_upload = Some(PendingUpload {
+            heights: world.terrain.heights.clone(),
+            biomes: world.biome_map.grid_as_u32(),
+            food_pos: world.food_items.iter()
+                .map(|f| (f.position.x, f.position.y, f.position.z)).collect(),
+            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
+            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
+            agent_data: self.agents.iter()
+                .map(|a| (
+                    a.body.body.position,
+                    a.body.body.internal.max_energy,
+                    a.body.body.internal.max_integrity,
+                    a.brain_config.memory_capacity,
+                    a.brain_config.processing_slots,
+                ))
+                .collect(),
+        });
 
-        let heights = world.terrain.heights.clone();
-        let biomes = world.biome_map.grid_as_u32();
-        let food_pos: Vec<(f32, f32, f32)> = world.food_items.iter()
-            .map(|f| (f.position.x, f.position.y, f.position.z)).collect();
-        let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
-        let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
-        mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
-
-        let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = self.agents.iter()
-            .map(|a| (
-                a.body.body.position,
-                a.body.body.internal.max_energy,
-                a.body.body.internal.max_integrity,
-                a.brain_config.memory_capacity,
-                a.brain_config.processing_slots,
-            ))
-            .collect();
-        mk.upload_agents(&agent_data);
-
-        self.log_msg(format!("[GPU] MegaKernel created for {} agents, {} food", agent_count, food_count));
-        self.gpu_mega_kernel = Some(mk);
+        // Spawn background thread for device + shader compilation.
+        self.pending_mega_kernel = Some(std::thread::spawn(move || {
+            GpuMegaKernel::new(agent_count, food_count, &brain_config, &world_config)
+        }));
+        self.log_msg("[GPU] Creating MegaKernel (background)...".into());
     }
 
     fn handle_evolution_action(&mut self, action: EvolutionAction) {
@@ -531,6 +556,8 @@ impl App {
                         self.tps_display = 0.0;
                         self.paused = false;
                         self.gpu_mega_kernel = None;
+                        self.pending_mega_kernel = None;
+                        self.pending_upload = None;
                         self.spawn_evolution_population();
                         self.ensure_mega_kernel();
                         self.log_msg("[EVOLUTION] Started new run".into());
@@ -558,6 +585,8 @@ impl App {
                         self.tps_display = 0.0;
                         self.paused = false;
                         self.gpu_mega_kernel = None;
+                        self.pending_mega_kernel = None;
+                        self.pending_upload = None;
                         self.spawn_evolution_population();
                         self.ensure_mega_kernel();
                         self.log_msg("[EVOLUTION] Resumed from database".into());
@@ -587,6 +616,8 @@ impl App {
             EvolutionAction::Reset => {
                 self.governor = None;
                 self.gpu_mega_kernel = None;
+                self.pending_mega_kernel = None;
+                self.pending_upload = None;
                 self.agents.clear();
                 self.next_agent_id = 0;
                 self.tick = 0;
@@ -714,9 +745,32 @@ impl App {
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
                 self.spawn_population_from_configs(&configs);
-                // Re-create GpuMegaKernel for the new population
-                self.gpu_mega_kernel = None;
-                self.ensure_mega_kernel();
+
+                // Reuse existing kernel if population size matches,
+                // otherwise drop and recreate in background.
+                let can_reuse = self.gpu_mega_kernel.as_ref()
+                    .is_some_and(|mk| mk.agent_count() == self.agents.len() as u32);
+
+                if can_reuse {
+                    let mk = self.gpu_mega_kernel.as_mut().unwrap();
+                    mk.reset_agents(&self.brain_config);
+                    let agent_data: Vec<_> = self.agents.iter()
+                        .map(|a| (
+                            a.body.body.position,
+                            a.body.body.internal.max_energy,
+                            a.body.body.internal.max_integrity,
+                            a.brain_config.memory_capacity,
+                            a.brain_config.processing_slots,
+                        ))
+                        .collect();
+                    mk.upload_agents(&agent_data);
+                } else {
+                    self.gpu_mega_kernel = None;
+                    self.pending_mega_kernel = None;
+                    self.pending_upload = None;
+                    self.ensure_mega_kernel();
+                }
+
                 // Inherit learned weights: champions get exact weights,
                 // mutants get perturbed weights for neuroevolution.
                 if let Some(ref state) = inherited_state {
@@ -884,8 +938,8 @@ impl App {
 
         let energy = agent.body.body.internal.energy_signal();
         let integrity = agent.body.body.internal.integrity_signal();
-        let pred_err = 0.0_f32; // GPU telemetry TBD
-        let explore = 0.0_f32;  // GPU telemetry TBD
+        let pred_err = agent.cached_prediction_error;
+        let explore = agent.cached_exploration_rate;
 
         let bar_w = 0.35;
         let bar_h = 0.025;
@@ -1245,39 +1299,51 @@ impl ApplicationHandler for App {
                     self.camera.update(dt);
                 }
 
-                // ── simulation ticks (fixed timestep) ──────────
+                // ── simulation ticks (fixed timestep, adaptive budget) ──
                 if !self.paused {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
-                    let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
-
-                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
-                    let ticks_to_run = (self.sim_accumulator / SIM_DT) as u32;
+                    // Cap accumulator to 2× budget so debt stays bounded.
+                    let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
+                    self.sim_accumulator = self.sim_accumulator.min(max_acc);
+                    let ticks_to_run = ((self.sim_accumulator / SIM_DT) as u32)
+                        .min(self.gpu_tick_budget);
 
                     if ticks_to_run > 0 {
                         self.ensure_mega_kernel();
 
                         if let Some(ref mut mk) = self.gpu_mega_kernel {
-                            // Single dispatch — all ticks run inside GPU mega-kernel
-                            // Returns true if previous batch's state was collected
-                            let prev_ready = mk.dispatch_batch(self.tick, ticks_to_run);
+                            let t0 = Instant::now();
+                            let (dispatched, state_updated) = mk.dispatch_batch(self.tick, ticks_to_run);
+                            let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
-                            self.tick += ticks_to_run as u64;
-                            self.tps_tick_count += ticks_to_run as u64;
-                            self.sim_accumulator -= SIM_DT * ticks_to_run as f32;
+                            if dispatched {
+                                // Adapt budget: keep dispatch under ~8ms.
+                                if wall_ms > 10.0 {
+                                    self.gpu_tick_budget =
+                                        (self.gpu_tick_budget / 2).max(4);
+                                } else if wall_ms < 4.0 {
+                                    self.gpu_tick_budget =
+                                        (self.gpu_tick_budget + self.gpu_tick_budget / 10 + 1)
+                                            .min(4000);
+                                }
 
-                            if let Some(gov) = &mut self.governor {
-                                for _ in 0..ticks_to_run {
-                                    gov.tick();
+                                self.tick += ticks_to_run as u64;
+                                self.tps_tick_count += ticks_to_run as u64;
+                                self.sim_accumulator -= SIM_DT * ticks_to_run as f32;
+
+                                if let Some(gov) = &mut self.governor {
+                                    for _ in 0..ticks_to_run {
+                                        gov.tick();
+                                    }
                                 }
                             }
+                            // else: GPU backpressure — skip this frame, retry next
 
-                            // Use state from previous batch (collected during dispatch)
-                            // or try non-blocking readback of current batch
-                            if prev_ready || mk.try_collect_state() {
+                            if state_updated || mk.try_collect_state() {
                                 let state = mk.cached_state();
                                 for i in 0..self.agents.len() {
                                     let base = i * PHYS_STRIDE;
-                                    if base + P_FACING_Z >= state.len() { break; }
+                                    if base + P_FATIGUE_FACTOR_OUT >= state.len() { break; }
                                     let a = &mut self.agents[i];
                                     a.body.body.position = Vec3::new(
                                         state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
@@ -1298,6 +1364,9 @@ impl ApplicationHandler for App {
                                     a.death_count = new_deaths;
                                     a.body.body.facing = Vec3::new(
                                         state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
+                                    a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
+                                    a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
+                                    a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
                                 }
                             }
 
@@ -1660,8 +1729,8 @@ impl ApplicationHandler for App {
                                         deaths: a.death_count,
                                         color: a.color,
                                         longest_life: a.longest_life,
-                                        exploration_rate: 0.0, // GPU telemetry TBD
-                                        prediction_error: 0.0, // GPU telemetry TBD
+                                        exploration_rate: a.cached_exploration_rate,
+                                        prediction_error: a.cached_prediction_error,
                                         forward_weight_norm: 0.0, // GPU telemetry TBD
                                         turn_weight_norm: 0.0,    // GPU telemetry TBD
                                         prediction_error_history: tail(&a.prediction_error_history),
@@ -2294,16 +2363,6 @@ fn speed_label(multiplier: u32) -> &'static str {
     }
 }
 
-/// Cap per-frame ticks proportional to speed, with a reasonable ceiling.
-/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 1,000,000).
-fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
-    if render_3d {
-        (speed_multiplier * 2).min(4000)
-    } else {
-        (speed_multiplier * 10).min(1_000_000)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,27 +2389,6 @@ mod tests {
         assert_eq!(speed_label(999), "?×");
     }
 
-    // ── max_ticks_per_frame ──────────────────────────────────────────
-
-    #[test]
-    fn max_ticks_3d_scales_linearly_then_caps() {
-        assert_eq!(max_ticks_per_frame(1, true), 2);
-        assert_eq!(max_ticks_per_frame(10, true), 20);
-        assert_eq!(max_ticks_per_frame(1000, true), 2000);
-        assert_eq!(max_ticks_per_frame(5000, true), 4000); // capped
-        assert_eq!(max_ticks_per_frame(1_000_000, true), 4000); // capped
-    }
-
-    #[test]
-    fn max_ticks_fast_mode_scales_then_caps() {
-        assert_eq!(max_ticks_per_frame(1, false), 10);
-        assert_eq!(max_ticks_per_frame(100, false), 1000);
-        assert_eq!(max_ticks_per_frame(1000, false), 10_000);
-        assert_eq!(max_ticks_per_frame(10_000, false), 100_000);
-        assert_eq!(max_ticks_per_frame(100_000, false), 1_000_000); // at cap
-        assert_eq!(max_ticks_per_frame(1_000_000, false), 1_000_000); // capped
-    }
-
     // ── key-to-multiplier mapping ────────────────────────────────────
 
     #[test]
@@ -2358,17 +2396,6 @@ mod tests {
         let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
         for &m in levels {
             assert_ne!(speed_label(m), "?×", "missing label for multiplier {}", m);
-        }
-    }
-
-    #[test]
-    fn fast_mode_always_ge_3d_mode() {
-        for speed in [1, 2, 5, 10, 100, 1000, 10_000, 100_000, 1_000_000] {
-            assert!(
-                max_ticks_per_frame(speed, false) >= max_ticks_per_frame(speed, true),
-                "fast mode should allow >= 3D ticks at speed {}",
-                speed,
-            );
         }
     }
 }

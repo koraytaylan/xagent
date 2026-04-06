@@ -88,6 +88,22 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Reset exploration rate
     brain_state[brain_base + O_EXPLORATION_RATE] = 0.5;
 
+    // Reset fatigue state (ring buffer, cursor, length, factor)
+    for (var i = 0u; i < ACTION_HISTORY_LEN; i++) {
+        brain_state[brain_base + O_FATIGUE_FWD_RING + i] = 0.0;
+        brain_state[brain_base + O_FATIGUE_TURN_RING + i] = 0.0;
+    }
+    brain_state[brain_base + O_FATIGUE_CURSOR] = 0.0;
+    brain_state[brain_base + O_FATIGUE_LEN] = 0.0;
+    brain_state[brain_base + O_FATIGUE_FACTOR] = 1.0;
+
+    // Reset habituation (fresh start for new life's perceptual context)
+    for (var i = 0u; i < DIM; i++) {
+        brain_state[brain_base + O_HAB_EMA + i] = 0.0;
+        brain_state[brain_base + O_HAB_ATTEN + i] = 1.0;
+        brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
+    }
+
     // Zero action history
     let hist_base = tid * HISTORY_STRIDE;
     for (var i = 0u; i < HISTORY_STRIDE; i++) {

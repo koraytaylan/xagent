@@ -114,9 +114,68 @@ pub const P_DIED_FLAG: usize = 20;
 pub const P_MEMORY_CAP: usize = 21;
 pub const P_PROCESSING_SLOTS: usize = 22;
 pub const P_DEATH_COUNT: usize = 23;
-pub const PHYS_STRIDE: usize = 24;
+pub const P_PREDICTION_ERROR: usize = 24;
+pub const P_EXPLORATION_RATE_OUT: usize = 25;
+pub const P_FATIGUE_FACTOR_OUT: usize = 26;
+pub const PHYS_STRIDE: usize = 27;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
+
+// ── Runtime layout for configurable vision_rays ──────────────────────
+
+/// Compute vision grid W×H from total ray count.
+/// Picks the largest H ≤ sqrt(rays) that divides evenly.
+pub fn vision_wh(rays: u32) -> (u32, u32) {
+    let s = (rays as f32).sqrt().floor() as u32;
+    let mut best_h = 1;
+    for i in 1..=s {
+        if rays % i == 0 {
+            best_h = i;
+        }
+    }
+    (rays / best_h, best_h)
+}
+
+/// Runtime-computed buffer layout that depends on vision_rays.
+/// All strides and offsets cascade from the ray count.
+#[derive(Clone, Debug)]
+pub struct BrainLayout {
+    pub vision_w: u32,
+    pub vision_h: u32,
+    pub vision_color_count: usize,
+    pub vision_depth_count: usize,
+    pub feature_count: usize,
+    pub sensory_stride: usize,
+    pub brain_stride: usize,
+}
+
+impl BrainLayout {
+    pub fn new(vision_rays: u32) -> Self {
+        let (w, h) = vision_wh(vision_rays);
+        let color_count = vision_rays as usize * 4;
+        let depth_count = vision_rays as usize;
+        let feature_count = color_count + 25;
+        let sensory_stride = color_count + depth_count + NON_VISUAL_COUNT;
+        // brain_stride = feature_count * DIM + DIM + DIM*DIM + 468
+        // (468 = fixed fields after O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1)
+        let brain_stride = feature_count * DIM + DIM + DIM * DIM + 468;
+        Self {
+            vision_w: w,
+            vision_h: h,
+            vision_color_count: color_count,
+            vision_depth_count: depth_count,
+            feature_count,
+            sensory_stride,
+            brain_stride,
+        }
+    }
+}
+
+impl Default for BrainLayout {
+    fn default() -> Self {
+        Self::new(48)
+    }
+}
 
 // ── Food buffer layout (per food item) ───────────────────────────────
 
@@ -184,7 +243,9 @@ pub const CFG_RECALL_K: usize = 3;
 pub const CFG_LEARNING_RATE: usize = 4;
 pub const CFG_DECAY_RATE: usize = 5;
 pub const CFG_DISTRESS_EXP: usize = 6;
-pub const CONFIG_SIZE: usize = 8; // padded to 8 for uniform vec4 alignment
+pub const CFG_METABOLIC_RATE: usize = 7;
+pub const CFG_INTEGRITY_SCALE: usize = 8;
+pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
 
@@ -199,8 +260,12 @@ pub struct AgentBrainState {
 
 impl AgentBrainState {
     pub fn new_blank() -> Self {
+        Self::new_for(BRAIN_STRIDE)
+    }
+
+    pub fn new_for(brain_stride: usize) -> Self {
         Self {
-            brain_state: vec![0.0; BRAIN_STRIDE],
+            brain_state: vec![0.0; brain_stride],
             patterns: vec![0.0; PATTERN_STRIDE],
             history: vec![0.0; HISTORY_STRIDE],
         }
@@ -531,40 +596,57 @@ pub fn build_world_config(
 /// Initialize brain_state buffer data for one agent from BrainConfig.
 /// Xavier init for encoder, small random for predictor, zero for rest.
 pub fn init_brain_state(config: &BrainConfig, rng: &mut impl rand::Rng) -> Vec<f32> {
-    let mut state = vec![0.0_f32; BRAIN_STRIDE];
+    init_brain_state_for(config, &BrainLayout::default(), rng)
+}
+
+/// Layout-aware version for configurable vision_rays.
+pub fn init_brain_state_for(config: &BrainConfig, layout: &BrainLayout, rng: &mut impl rand::Rng) -> Vec<f32> {
+    let fc = layout.feature_count;
+    let mut state = vec![0.0_f32; layout.brain_stride];
 
     // Encoder weights: Xavier init (scale = 1/sqrt(feature_count))
-    let scale = 1.0 / (FEATURE_COUNT as f32).sqrt();
-    for i in 0..(FEATURE_COUNT * DIM) {
-        state[O_ENC_WEIGHTS + i] = (rng.random::<f32>() * 2.0 - 1.0) * scale;
+    let scale = 1.0 / (fc as f32).sqrt();
+    for i in 0..(fc * DIM) {
+        state[i] = (rng.random::<f32>() * 2.0 - 1.0) * scale;
     }
 
-    // Encoder biases: zero (already)
+    // Compute dynamic offsets: O_PRED_CTX_WT = fc*DIM + DIM + DIM*DIM
+    let o_pred_weights = fc * DIM + DIM;
+    let o_pred_ctx_wt = o_pred_weights + DIM * DIM;
 
     // Predictor weights: small random
     for i in 0..(DIM * DIM) {
-        state[O_PRED_WEIGHTS + i] = (rng.random::<f32>() * 2.0 - 1.0) * 0.1;
+        state[o_pred_weights + i] = (rng.random::<f32>() * 2.0 - 1.0) * 0.1;
     }
 
     // Predictor context weight: 0.15
-    state[O_PRED_CTX_WT] = 0.15;
+    state[o_pred_ctx_wt] = 0.15;
+
+    // Fixed deltas from O_PRED_CTX_WT (same regardless of feature_count)
+    let delta_hab_atten = O_HAB_ATTEN - O_PRED_CTX_WT;
+    let delta_exploration = O_EXPLORATION_RATE - O_PRED_CTX_WT;
+    let delta_fatigue_factor = O_FATIGUE_FACTOR - O_PRED_CTX_WT;
+    let delta_hab_sens = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
+    let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT;
+    let delta_fatigue_rec = O_FATIGUE_RECOVERY - O_PRED_CTX_WT;
+    let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PRED_CTX_WT;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
     for i in 0..DIM {
-        state[O_HAB_ATTEN + i] = 1.0;
+        state[o_pred_ctx_wt + delta_hab_atten + i] = 1.0;
     }
 
     // Exploration rate: 0.5 (balanced start)
-    state[O_EXPLORATION_RATE] = 0.5;
+    state[o_pred_ctx_wt + delta_exploration] = 0.5;
 
     // Fatigue factor: 1.0 (no fatigue)
-    state[O_FATIGUE_FACTOR] = 1.0;
+    state[o_pred_ctx_wt + delta_fatigue_factor] = 1.0;
 
     // Heritable config values (stored per-agent for GPU access)
-    state[O_HAB_SENSITIVITY] = config.habituation_sensitivity;
-    state[O_HAB_MAX_CURIOSITY] = config.max_curiosity_bonus;
-    state[O_FATIGUE_RECOVERY] = config.fatigue_recovery_sensitivity;
-    state[O_FATIGUE_FLOOR] = config.fatigue_floor;
+    state[o_pred_ctx_wt + delta_hab_sens] = config.habituation_sensitivity;
+    state[o_pred_ctx_wt + delta_hab_curiosity] = config.max_curiosity_bonus;
+    state[o_pred_ctx_wt + delta_fatigue_rec] = config.fatigue_recovery_sensitivity;
+    state[o_pred_ctx_wt + delta_fatigue_floor] = config.fatigue_floor;
 
     state
 }
@@ -579,16 +661,23 @@ pub fn init_action_history() -> Vec<f32> {
     vec![0.0_f32; HISTORY_STRIDE]
 }
 
-/// Build config buffer values from BrainConfig.
+/// Build config buffer values from BrainConfig (default layout).
 pub fn build_config(config: &BrainConfig) -> Vec<f32> {
+    build_config_for(config, &BrainLayout::default())
+}
+
+/// Build config buffer values with explicit layout.
+pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> {
     let mut cfg = vec![0.0_f32; CONFIG_SIZE];
     cfg[CFG_REPR_DIM] = DIM as f32;
-    cfg[CFG_FEATURE_COUNT] = FEATURE_COUNT as f32;
+    cfg[CFG_FEATURE_COUNT] = layout.feature_count as f32;
     cfg[CFG_MEMORY_CAP] = MEMORY_CAP as f32;
     cfg[CFG_RECALL_K] = RECALL_K as f32;
     cfg[CFG_LEARNING_RATE] = config.learning_rate;
     cfg[CFG_DECAY_RATE] = config.decay_rate;
     cfg[CFG_DISTRESS_EXP] = config.distress_exponent;
+    cfg[CFG_METABOLIC_RATE] = config.metabolic_rate;
+    cfg[CFG_INTEGRITY_SCALE] = config.integrity_scale;
     cfg
 }
 
@@ -633,5 +722,192 @@ mod tests {
         let mut rng = rand::rng();
         let state = init_brain_state(&config, &mut rng);
         assert_eq!(state.len(), BRAIN_STRIDE);
+    }
+
+    #[test]
+    fn brain_layout_default_matches_constants() {
+        let layout = BrainLayout::default();
+        assert_eq!(layout.vision_w, 8);
+        assert_eq!(layout.vision_h, 6);
+        assert_eq!(layout.feature_count, FEATURE_COUNT);
+        assert_eq!(layout.sensory_stride, SENSORY_STRIDE);
+        assert_eq!(layout.brain_stride, BRAIN_STRIDE);
+    }
+
+    #[test]
+    fn brain_layout_dynamic_is_consistent() {
+        for rays in [16, 24, 32, 48, 64, 96] {
+            let layout = BrainLayout::new(rays);
+            assert_eq!(layout.vision_w * layout.vision_h, rays);
+            assert_eq!(layout.vision_color_count, rays as usize * 4);
+            assert_eq!(layout.feature_count, layout.vision_color_count + 25);
+            // Verify brain_stride matches the offset chain
+            let fc = layout.feature_count;
+            let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
+            assert_eq!(layout.brain_stride, o_pred_ctx_wt + 468);
+        }
+    }
+
+    #[test]
+    fn init_brain_state_for_dynamic_layout() {
+        let config = BrainConfig::default();
+        let layout = BrainLayout::new(24);
+        let mut rng = rand::rng();
+        let state = init_brain_state_for(&config, &layout, &mut rng);
+        assert_eq!(state.len(), layout.brain_stride);
+    }
+
+    // ── Config buffer invariants ─────────────────────────────────────────
+
+    #[test]
+    fn config_size_fits_vec4_alignment() {
+        assert_eq!(CONFIG_SIZE % 4, 0, "CONFIG_SIZE must be a multiple of 4 (vec4 alignment)");
+    }
+
+    #[test]
+    fn config_indices_within_bounds() {
+        assert!(CFG_REPR_DIM < CONFIG_SIZE);
+        assert!(CFG_FEATURE_COUNT < CONFIG_SIZE);
+        assert!(CFG_MEMORY_CAP < CONFIG_SIZE);
+        assert!(CFG_RECALL_K < CONFIG_SIZE);
+        assert!(CFG_LEARNING_RATE < CONFIG_SIZE);
+        assert!(CFG_DECAY_RATE < CONFIG_SIZE);
+        assert!(CFG_DISTRESS_EXP < CONFIG_SIZE);
+        assert!(CFG_METABOLIC_RATE < CONFIG_SIZE);
+        assert!(CFG_INTEGRITY_SCALE < CONFIG_SIZE);
+    }
+
+    #[test]
+    fn build_config_packs_metabolic_rate_and_integrity_scale() {
+        let mut config = BrainConfig::default();
+        config.metabolic_rate = 0.01;
+        config.integrity_scale = 0.02;
+        let packed = build_config(&config);
+        assert_eq!(packed.len(), CONFIG_SIZE);
+        assert!((packed[CFG_METABOLIC_RATE] - 0.01).abs() < 1e-7,
+            "metabolic_rate not packed at index {}: got {}",
+            CFG_METABOLIC_RATE, packed[CFG_METABOLIC_RATE]);
+        assert!((packed[CFG_INTEGRITY_SCALE] - 0.02).abs() < 1e-7,
+            "integrity_scale not packed at index {}: got {}",
+            CFG_INTEGRITY_SCALE, packed[CFG_INTEGRITY_SCALE]);
+    }
+
+    #[test]
+    fn build_config_non_default_values_survive_roundtrip() {
+        let mut config = BrainConfig::default();
+        config.learning_rate = 0.123;
+        config.decay_rate = 0.456;
+        config.distress_exponent = 3.5;
+        config.metabolic_rate = 0.05;
+        config.integrity_scale = 0.03;
+        let packed = build_config(&config);
+        assert!((packed[CFG_LEARNING_RATE] - 0.123).abs() < 1e-6);
+        assert!((packed[CFG_DECAY_RATE] - 0.456).abs() < 1e-6);
+        assert!((packed[CFG_DISTRESS_EXP] - 3.5).abs() < 1e-6);
+        assert!((packed[CFG_METABOLIC_RATE] - 0.05).abs() < 1e-7);
+        assert!((packed[CFG_INTEGRITY_SCALE] - 0.03).abs() < 1e-7);
+    }
+
+    // ── Shader↔Rust constant sync ────────────────────────────────────────
+
+    /// Parse `const NAME: TY = VALu;` lines from the shader source
+    /// and return a map of name→value for all integer constants.
+    fn parse_wgsl_u32_constants(src: &str) -> std::collections::HashMap<String, u32> {
+        let mut map = std::collections::HashMap::new();
+        for line in src.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("const ") {
+                // e.g. "P_ENERGY: u32 = 11u;"
+                if let Some((name, tail)) = rest.split_once(':') {
+                    if let Some(val_part) = tail.split('=').nth(1) {
+                        let val_str = val_part.trim().trim_end_matches(';').trim_end_matches('u').trim();
+                        if let Ok(v) = val_str.parse::<u32>() {
+                            map.insert(name.trim().to_string(), v);
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn shader_phys_constants_match_rust() {
+        let src = include_str!("shaders/mega/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+
+        assert_eq!(wgsl["PHYS_STRIDE"], PHYS_STRIDE as u32);
+        assert_eq!(wgsl["P_POS_X"], P_POS_X as u32);
+        assert_eq!(wgsl["P_POS_Y"], P_POS_Y as u32);
+        assert_eq!(wgsl["P_POS_Z"], P_POS_Z as u32);
+        assert_eq!(wgsl["P_VEL_X"], P_VEL_X as u32);
+        assert_eq!(wgsl["P_VEL_Y"], P_VEL_Y as u32);
+        assert_eq!(wgsl["P_VEL_Z"], P_VEL_Z as u32);
+        assert_eq!(wgsl["P_ENERGY"], P_ENERGY as u32);
+        assert_eq!(wgsl["P_MAX_ENERGY"], P_MAX_ENERGY as u32);
+        assert_eq!(wgsl["P_INTEGRITY"], P_INTEGRITY as u32);
+        assert_eq!(wgsl["P_MAX_INTEGRITY"], P_MAX_INTEGRITY as u32);
+        assert_eq!(wgsl["P_PREV_ENERGY"], P_PREV_ENERGY as u32);
+        assert_eq!(wgsl["P_PREV_INTEGRITY"], P_PREV_INTEGRITY as u32);
+        assert_eq!(wgsl["P_ALIVE"], P_ALIVE as u32);
+        assert_eq!(wgsl["P_FOOD_COUNT"], P_FOOD_COUNT as u32);
+        assert_eq!(wgsl["P_TICKS_ALIVE"], P_TICKS_ALIVE as u32);
+        assert_eq!(wgsl["P_DIED_FLAG"], P_DIED_FLAG as u32);
+        assert_eq!(wgsl["P_MEMORY_CAP"], P_MEMORY_CAP as u32);
+        assert_eq!(wgsl["P_PROCESSING_SLOTS"], P_PROCESSING_SLOTS as u32);
+        assert_eq!(wgsl["P_DEATH_COUNT"], P_DEATH_COUNT as u32);
+        assert_eq!(wgsl["P_PREDICTION_ERROR"], P_PREDICTION_ERROR as u32);
+        assert_eq!(wgsl["P_EXPLORATION_RATE_OUT"], P_EXPLORATION_RATE_OUT as u32);
+        assert_eq!(wgsl["P_FATIGUE_FACTOR_OUT"], P_FATIGUE_FACTOR_OUT as u32);
+    }
+
+    #[test]
+    fn shader_config_constants_match_rust() {
+        let src = include_str!("shaders/mega/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+
+        assert_eq!(wgsl["CFG_LEARNING_RATE"], CFG_LEARNING_RATE as u32);
+        assert_eq!(wgsl["CFG_DECAY_RATE"], CFG_DECAY_RATE as u32);
+        assert_eq!(wgsl["CFG_DISTRESS_EXP"], CFG_DISTRESS_EXP as u32);
+        assert_eq!(wgsl["CFG_METABOLIC_RATE"], CFG_METABOLIC_RATE as u32);
+        assert_eq!(wgsl["CFG_INTEGRITY_SCALE"], CFG_INTEGRITY_SCALE as u32);
+    }
+
+    #[test]
+    fn shader_brain_config_array_size_matches_config_size() {
+        let src = include_str!("shaders/mega/common.wgsl");
+        // Find: brain_config: array<vec4<f32>, N>
+        let needle = "brain_config:";
+        let line = src.lines().find(|l| l.contains(needle))
+            .expect("brain_config binding not found in shader");
+        // Extract N from array<vec4<f32>, N>
+        let after_comma = line.split("array<vec4<f32>,").nth(1)
+            .expect("unexpected brain_config type format");
+        let n_str = after_comma.trim().trim_end_matches(';').trim_end_matches('>')
+            .trim();
+        let shader_vec4_count: usize = n_str.parse()
+            .expect("failed to parse brain_config array size");
+        assert_eq!(shader_vec4_count * 4, CONFIG_SIZE,
+            "shader brain_config has {} vec4s (={} floats) but CONFIG_SIZE={}",
+            shader_vec4_count, shader_vec4_count * 4, CONFIG_SIZE);
+    }
+
+    #[test]
+    fn phys_stride_covers_all_fields() {
+        // Highest P_* offset + 1 must equal PHYS_STRIDE
+        let max_field = *[
+            P_POS_X, P_POS_Y, P_POS_Z,
+            P_VEL_X, P_VEL_Y, P_VEL_Z,
+            P_FACING_X, P_FACING_Y, P_FACING_Z,
+            P_YAW, P_ANGULAR_VEL,
+            P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY,
+            P_PREV_ENERGY, P_PREV_INTEGRITY,
+            P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DIED_FLAG,
+            P_MEMORY_CAP, P_PROCESSING_SLOTS, P_DEATH_COUNT,
+            P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT,
+        ].iter().max().unwrap();
+        assert_eq!(PHYS_STRIDE, max_field + 1,
+            "PHYS_STRIDE ({}) should be highest field offset ({}) + 1",
+            PHYS_STRIDE, max_field);
     }
 }

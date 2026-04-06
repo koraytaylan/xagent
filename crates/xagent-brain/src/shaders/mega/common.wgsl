@@ -3,62 +3,66 @@
 // Values MUST match buffers.rs and the per-shader constants injected by
 // wgsl_constants() / wgsl_physics_constants().
 
+// ── Vision grid (string-replaced at shader compile time) ───────────────────
+
+const VISION_W: u32 = 8u;
+const VISION_H: u32 = 6u;
+
+// ── Derived vision / sensory constants ─────────────────────────────────────
+
+const VISION_RAYS: u32 = VISION_W * VISION_H;
+const VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
+const VISION_DEPTH_COUNT: u32 = VISION_RAYS;
+const MAX_TOUCH_CONTACTS: u32 = 4u;
+const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
+
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
 const DIM: u32 = 32u;
-const FEATURE_COUNT: u32 = 217u;
+const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
 const ACTION_HISTORY_LEN: u32 = 64u;
 const ERROR_HISTORY_LEN: u32 = 128u;
 
-// ── Sensory input layout ────────────────────────────────────────────────────
+// ── Brain state offsets (derived from FEATURE_COUNT) ────────────────────────
 
-const VISION_W: u32 = 8u;
-const VISION_H: u32 = 6u;
-const VISION_COLOR_COUNT: u32 = 192u;  // 48 rays x 4 RGBA
-const VISION_DEPTH_COUNT: u32 = 48u;
-const MAX_TOUCH_CONTACTS: u32 = 4u;
-const SENSORY_STRIDE: u32 = 267u;      // 192 + 48 + 27
+const O_ENC_WEIGHTS: u32 = 0u;
+const O_ENC_BIASES: u32 = FEATURE_COUNT * DIM;
+const O_PRED_WEIGHTS: u32 = O_ENC_BIASES + DIM;
+const O_PRED_CTX_WT: u32 = O_PRED_WEIGHTS + DIM * DIM;
+const O_PRED_ERR_RING: u32 = O_PRED_CTX_WT + 1u;
+const O_PRED_ERR_CURSOR: u32 = O_PRED_ERR_RING + ERROR_HISTORY_LEN;
+const O_PRED_ERR_COUNT: u32 = O_PRED_ERR_CURSOR + 1u;
+const O_HAB_EMA: u32 = O_PRED_ERR_COUNT + 1u;
+const O_HAB_ATTEN: u32 = O_HAB_EMA + DIM;
+const O_PREV_ENCODED: u32 = O_HAB_ATTEN + DIM;
+const O_HOMEO: u32 = O_PREV_ENCODED + DIM;
+const O_ACT_FWD_WTS: u32 = O_HOMEO + 6u;
+const O_ACT_TURN_WTS: u32 = O_ACT_FWD_WTS + DIM;
+const O_ACT_BIASES: u32 = O_ACT_TURN_WTS + DIM;
+const O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
+const O_FATIGUE_FWD_RING: u32 = O_EXPLORATION_RATE + 1u;
+const O_FATIGUE_TURN_RING: u32 = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN;
+const O_FATIGUE_CURSOR: u32 = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN;
+const O_FATIGUE_FACTOR: u32 = O_FATIGUE_CURSOR + 1u;
+const O_FATIGUE_LEN: u32 = O_FATIGUE_FACTOR + 1u;
+const O_PREV_PREDICTION: u32 = O_FATIGUE_LEN + 1u;
+const O_TICK_COUNT: u32 = O_PREV_PREDICTION + DIM;
+const O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
+const O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
+const O_FATIGUE_RECOVERY: u32 = O_HAB_MAX_CURIOSITY + 1u;
+const O_FATIGUE_FLOOR: u32 = O_FATIGUE_RECOVERY + 1u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-const BRAIN_STRIDE: u32 = 8468u;
+const BRAIN_STRIDE: u32 = O_FATIGUE_FLOOR + 1u;
 const PATTERN_STRIDE: u32 = 5251u;
 const HISTORY_STRIDE: u32 = 2370u;
-const FEATURES_STRIDE: u32 = 217u;
+const FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_STRIDE: u32 = 68u;      // prediction(32) + credit(32) + motor(4)
 const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
-
-// ── Brain state offsets (O_*) ───────────────────────────────────────────────
-
-const O_ENC_WEIGHTS: u32 = 0u;
-const O_ENC_BIASES: u32 = 6944u;
-const O_PRED_WEIGHTS: u32 = 6976u;
-const O_PRED_CTX_WT: u32 = 8000u;
-const O_PRED_ERR_RING: u32 = 8001u;
-const O_PRED_ERR_CURSOR: u32 = 8129u;
-const O_PRED_ERR_COUNT: u32 = 8130u;
-const O_HAB_EMA: u32 = 8131u;
-const O_HAB_ATTEN: u32 = 8163u;
-const O_PREV_ENCODED: u32 = 8195u;
-const O_HOMEO: u32 = 8227u;
-const O_ACT_FWD_WTS: u32 = 8233u;
-const O_ACT_TURN_WTS: u32 = 8265u;
-const O_ACT_BIASES: u32 = 8297u;
-const O_EXPLORATION_RATE: u32 = 8299u;
-const O_FATIGUE_FWD_RING: u32 = 8300u;
-const O_FATIGUE_TURN_RING: u32 = 8364u;
-const O_FATIGUE_CURSOR: u32 = 8428u;
-const O_FATIGUE_FACTOR: u32 = 8429u;
-const O_FATIGUE_LEN: u32 = 8430u;
-const O_PREV_PREDICTION: u32 = 8431u;
-const O_TICK_COUNT: u32 = 8463u;
-const O_HAB_SENSITIVITY: u32 = 8464u;
-const O_HAB_MAX_CURIOSITY: u32 = 8465u;
-const O_FATIGUE_RECOVERY: u32 = 8466u;
-const O_FATIGUE_FLOOR: u32 = 8467u;
 
 // ── Pattern memory offsets ──────────────────────────────────────────────────
 
@@ -84,10 +88,12 @@ const O_HIST_LEN: u32 = 2369u;
 const CFG_LEARNING_RATE: u32 = 4u;
 const CFG_DECAY_RATE: u32 = 5u;
 const CFG_DISTRESS_EXP: u32 = 6u;
+const CFG_METABOLIC_RATE: u32 = 7u;
+const CFG_INTEGRITY_SCALE: u32 = 8u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 24u;
+const PHYS_STRIDE: u32 = 27u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -112,6 +118,9 @@ const P_DIED_FLAG: u32 = 20u;
 const P_MEMORY_CAP: u32 = 21u;
 const P_PROCESSING_SLOTS: u32 = 22u;
 const P_DEATH_COUNT: u32 = 23u;
+const P_PREDICTION_ERROR: u32 = 24u;
+const P_EXPLORATION_RATE_OUT: u32 = 25u;
+const P_FATIGUE_FACTOR_OUT: u32 = 26u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -164,7 +173,6 @@ const VISION_FOV_HALF: f32 = 0.7853982;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
-const VISION_RAYS: u32 = 48u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
 const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
 
@@ -251,7 +259,7 @@ const ANTICIPATION_WEIGHT: f32 = 0.5;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buf:       array<f32>;
 @group(0) @binding(13) var<storage, read_write> history_buf:       array<f32>;
-@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 2>;
+@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper functions
@@ -265,6 +273,10 @@ fn wc_f32(idx: u32) -> f32 {
 
 fn wc_u32(idx: u32) -> u32 {
     return u32(wconfig[idx / 4u][idx % 4u]);
+}
+
+fn bc_f32(idx: u32) -> f32 {
+    return brain_config[idx / 4u][idx % 4u];
 }
 
 // ── RNG (PCG hash) ──────────────────────────────────────────────────────────

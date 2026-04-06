@@ -10,7 +10,7 @@ pub mod gpu_brain;
 pub mod gpu_mega_kernel;
 pub mod gpu_physics;
 
-pub use buffers::AgentBrainState;
+pub use buffers::{AgentBrainState, BrainLayout};
 pub use gpu_brain::GpuBrain;
 pub use gpu_mega_kernel::GpuMegaKernel;
 

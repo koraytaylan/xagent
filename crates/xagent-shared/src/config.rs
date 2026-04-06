@@ -41,6 +41,22 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
+    /// Number of vision rays (W × H). Affects sensory buffer size and feature count.
+    /// Lower = faster vision dispatch. Default 48 (8×6).
+    #[serde(default = "default_vision_rays")]
+    pub vision_rays: u32,
+    /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
+    /// Default 4.
+    #[serde(default = "default_brain_tick_stride")]
+    pub brain_tick_stride: u32,
+    /// Multiplier for all energy costs (metabolic + movement). Default 1.0.
+    /// Lower = agents survive longer. Higher = harsher energy pressure.
+    #[serde(default = "default_metabolic_rate")]
+    pub metabolic_rate: f32,
+    /// Multiplier for integrity damage and regen. Default 1.0.
+    /// Lower = agents take less damage. Higher = hazard zones are deadlier.
+    #[serde(default = "default_integrity_scale")]
+    pub integrity_scale: f32,
 }
 
 /// Configuration for the world simulation.
@@ -89,6 +105,22 @@ fn default_fatigue_floor() -> f32 {
 
 fn default_seed() -> u64 {
     42
+}
+
+fn default_vision_rays() -> u32 {
+    48
+}
+
+fn default_brain_tick_stride() -> u32 {
+    4
+}
+
+fn default_metabolic_rate() -> f32 {
+    1.0
+}
+
+fn default_integrity_scale() -> f32 {
+    1.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -201,6 +233,10 @@ impl Default for BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_rays: 48,
+            brain_tick_stride: 4,
+            metabolic_rate: 1.0,
+            integrity_scale: 1.0,
         }
     }
 }
@@ -220,6 +256,10 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_rays: 24,
+            brain_tick_stride: 4,
+            metabolic_rate: 1.0,
+            integrity_scale: 1.0,
         }
     }
 
@@ -237,6 +277,10 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_rays: 96,
+            brain_tick_stride: 4,
+            metabolic_rate: 1.0,
+            integrity_scale: 1.0,
         }
     }
 }

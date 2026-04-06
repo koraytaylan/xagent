@@ -13,10 +13,7 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::buffers::{
-    AgentBrainState, DIM, FEATURE_COUNT, O_ACT_FWD_WTS, O_ACT_TURN_WTS, O_ENC_WEIGHTS,
-    O_PRED_WEIGHTS,
-};
+use xagent_brain::buffers::{AgentBrainState, DIM, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -137,6 +134,10 @@ pub struct Agent {
     pub trail_dirty: bool,
     /// Cached motor command for ticks where the brain is decimated.
     pub cached_motor: xagent_shared::MotorCommand,
+    /// Brain telemetry from GPU physics readback.
+    pub cached_prediction_error: f32,
+    pub cached_exploration_rate: f32,
+    pub cached_fatigue_factor: f32,
     /// Rolling history for sidebar sparklines (capped length).
     pub prediction_error_history: std::collections::VecDeque<f32>,
     pub exploration_rate_history: std::collections::VecDeque<f32>,
@@ -169,6 +170,9 @@ impl Agent {
             trail: Vec::with_capacity(256),
             trail_dirty: false,
             cached_motor: xagent_shared::MotorCommand::default(),
+            cached_prediction_error: 0.0,
+            cached_exploration_rate: 0.0,
+            cached_fatigue_factor: 1.0,
             prediction_error_history: std::collections::VecDeque::with_capacity(128),
             exploration_rate_history: std::collections::VecDeque::with_capacity(128),
             energy_history: std::collections::VecDeque::with_capacity(128),
@@ -281,6 +285,10 @@ pub fn mutate_config_with_strength(
         max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
         fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
         fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
+        vision_rays: parent.vision_rays,
+        brain_tick_stride: parent.brain_tick_stride,
+        metabolic_rate: parent.metabolic_rate,
+        integrity_scale: parent.integrity_scale,
     }
 }
 
@@ -292,22 +300,31 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut rng = rand::rng();
     let mut mutated = state.clone();
 
+    // Derive layout from actual state length (supports dynamic vision_rays).
+    // brain_stride = fc * DIM + DIM + DIM*DIM + 468
+    let fc = (state.brain_state.len() - DIM - DIM * DIM - 468) / DIM;
+    let o_pred_wts = fc * DIM + DIM;
+    // Delta from the default compile-time O_PRED_CTX_WT to O_ACT_FWD_WTS is fixed
+    let o_pred_ctx = o_pred_wts + DIM * DIM;
+    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_WEIGHTS - DIM * DIM);
+    let act_turn = act_fwd + DIM;
+
     // Mutate encoder weights (small perturbation)
-    for i in 0..(FEATURE_COUNT * DIM) {
+    for i in 0..(fc * DIM) {
         if rng.random::<f32>() < 0.1 {
-            mutated.brain_state[O_ENC_WEIGHTS + i] +=
+            mutated.brain_state[i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[O_ENC_WEIGHTS + i] =
-                mutated.brain_state[O_ENC_WEIGHTS + i].clamp(-2.0, 2.0);
+            mutated.brain_state[i] =
+                mutated.brain_state[i].clamp(-2.0, 2.0);
         }
     }
 
     // Mutate action weights
     for i in 0..DIM {
         if rng.random::<f32>() < 0.2 {
-            mutated.brain_state[O_ACT_FWD_WTS + i] +=
+            mutated.brain_state[act_fwd + i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
-            mutated.brain_state[O_ACT_TURN_WTS + i] +=
+            mutated.brain_state[act_turn + i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
         }
     }
@@ -315,10 +332,10 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     // Mutate predictor weights
     for i in 0..(DIM * DIM) {
         if rng.random::<f32>() < 0.05 {
-            mutated.brain_state[O_PRED_WEIGHTS + i] +=
+            mutated.brain_state[o_pred_wts + i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[O_PRED_WEIGHTS + i] =
-                mutated.brain_state[O_PRED_WEIGHTS + i].clamp(-3.0, 3.0);
+            mutated.brain_state[o_pred_wts + i] =
+                mutated.brain_state[o_pred_wts + i].clamp(-3.0, 3.0);
         }
     }
 
@@ -376,6 +393,10 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.fatigue_floor
         },
+        vision_rays: a.vision_rays,
+        brain_tick_stride: a.brain_tick_stride,
+        metabolic_rate: a.metabolic_rate,
+        integrity_scale: a.integrity_scale,
     }
 }
 
@@ -479,6 +500,7 @@ pub fn generate_all_agents_mesh(agents: &[Agent]) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xagent_brain::buffers::O_ACT_TURN_WTS;
 
     #[test]
     fn reset_for_new_life_clears_fatigue_history() {

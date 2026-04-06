@@ -4,7 +4,7 @@
 
 // ── Shared memory (~2 KB) ──────────────────────────────────────────────────
 
-var<workgroup> s_features: array<f32, 217>;
+var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, 32>;
 var<workgroup> s_habituated: array<f32, 32>;
 var<workgroup> s_homeo: array<f32, 6>;
@@ -45,11 +45,11 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
     if (tid == 0u) {
         let s_base = agent_id * SENSORY_STRIDE;
         var fi: u32 = 0u;
-        for (var i: u32 = 0u; i < 192u; i = i + 1u) {
+        for (var i: u32 = 0u; i < VISION_COLOR_COUNT; i = i + 1u) {
             s_features[fi] = sensory_buf[s_base + i];
             fi = fi + 1u;
         }
-        let vel_offset = 192u + 48u;
+        let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
         let vx = sensory_buf[s_base + vel_offset];
         let vy = sensory_buf[s_base + vel_offset + 1u];
         let vz = sensory_buf[s_base + vel_offset + 2u];
@@ -113,7 +113,7 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
 
     if (tid == 0u) {
         let s_base = agent_id * SENSORY_STRIDE;
-        let vel_offset = 192u + 48u;
+        let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
         let energy = sensory_buf[s_base + vel_offset + 7u];
         let integrity = sensory_buf[s_base + vel_offset + 8u];
         let prev_energy = brain_state[b + O_HOMEO + 4u];
@@ -403,14 +403,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
 
         fwd = fast_tanh(fwd);
         trn = fast_tanh(trn);
-        let tick_u = u32(tick_count);
-        let seed_base = agent_id * 1000u + tick_u;
-        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5;
-        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5;
-        fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
-        trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
 
-        // Motor fatigue
+        // Motor fatigue: record PRE-NOISE commands so exploration noise
+        // doesn't mask repetitive brain decisions.
         let fatigue_cursor = u32(brain_state[b + O_FATIGUE_CURSOR]);
         brain_state[b + O_FATIGUE_FWD_RING + fatigue_cursor] = fwd;
         brain_state[b + O_FATIGUE_TURN_RING + fatigue_cursor] = trn;
@@ -445,6 +440,16 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             floor_val, 1.0
         );
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
+
+        // Exploration noise (applied after fatigue ring to not pollute it)
+        let tick_u = u32(tick_count);
+        let seed_base = agent_id * 1000u + tick_u;
+        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5;
+        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5;
+        fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
+        trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
+
+        // Apply fatigue to final output
         fwd *= fatigue_factor;
         trn *= fatigue_factor;
 
@@ -485,6 +490,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         decision_buf[d_base + DIM + DIM + 1u] = trn;
         decision_buf[d_base + DIM + DIM + 2u] = 0.0;
         decision_buf[d_base + DIM + DIM + 3u] = 0.0;
+
+        // Write telemetry to physics buffer for CPU readback
+        let phys_base = agent_id * PHYS_STRIDE;
+        agent_phys[phys_base + P_PREDICTION_ERROR] = s_pred_error;
+        agent_phys[phys_base + P_EXPLORATION_RATE_OUT] = exploration_rate;
+        agent_phys[phys_base + P_FATIGUE_FACTOR_OUT] = fatigue_factor;
     }
 }
 

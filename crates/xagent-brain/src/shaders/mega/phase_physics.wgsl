@@ -91,16 +91,18 @@ fn phase_physics(tid: u32, tick: u32) {
     agent_phys[b + P_POS_Y] = pos.y;
     agent_phys[b + P_POS_Z] = pos.z;
 
-    // Energy depletion
+    // Energy depletion (scaled by metabolic_rate from brain config)
+    let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
     let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414);
     var energy = agent_phys[b + P_ENERGY];
-    energy -= wc_f32(WC_ENERGY_DEPLETION);
-    energy -= movement_mag * wc_f32(WC_MOVEMENT_COST);
+    energy -= wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
+    energy -= movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;
 
-    // Biome damage
+    // Biome damage (scaled by integrity_scale from brain config)
+    let integrity_scale = bc_f32(CFG_INTEGRITY_SCALE);
     let biome_type = sample_biome(pos.x, pos.z);
     if biome_type == BIOME_DANGER {
-        agent_phys[b + P_INTEGRITY] = agent_phys[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE);
+        agent_phys[b + P_INTEGRITY] = agent_phys[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
     }
 
     // Integrity regen when energy > 50%
@@ -108,13 +110,13 @@ fn phase_physics(tid: u32, tick: u32) {
     var integrity = agent_phys[b + P_INTEGRITY];
     let max_i = agent_phys[b + P_MAX_INTEGRITY];
     if energy / max_e > 0.5 && integrity < max_i {
-        integrity = min(integrity + wc_f32(WC_INTEGRITY_REGEN), max_i);
+        integrity = min(integrity + wc_f32(WC_INTEGRITY_REGEN) * integrity_scale, max_i);
     }
 
     // Metabolic brain drain
     let mem_cap = agent_phys[b + P_MEMORY_CAP];
     let proc_slots = agent_phys[b + P_PROCESSING_SLOTS];
-    energy -= METABOLIC_BASE_COST + mem_cap * METABOLIC_MEMORY_COST + proc_slots * METABOLIC_PROCESSING_COST;
+    energy -= (METABOLIC_BASE_COST + mem_cap * METABOLIC_MEMORY_COST + proc_slots * METABOLIC_PROCESSING_COST) * metabolic_rate;
 
     // Clamp and death check
     energy = max(energy, 0.0);

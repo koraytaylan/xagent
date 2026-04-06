@@ -1257,6 +1257,28 @@ impl<'a> TabContext<'a> {
                     ui.add(egui::DragValue::new(&mut b.decay_rate)
                         .range(0.0001..=1.0).speed(0.001).max_decimals(5));
                     ui.end_row();
+
+                    ui.label("vision_rays");
+                    let mut vr = b.vision_rays as i32;
+                    ui.add(egui::DragValue::new(&mut vr).range(16..=96).speed(1));
+                    b.vision_rays = vr.max(16) as u32;
+                    ui.end_row();
+
+                    ui.label("brain_tick_stride");
+                    let mut bts = b.brain_tick_stride as i32;
+                    ui.add(egui::DragValue::new(&mut bts).range(1..=32).speed(1));
+                    b.brain_tick_stride = bts.max(1) as u32;
+                    ui.end_row();
+
+                    ui.label("metabolic_rate");
+                    ui.add(egui::DragValue::new(&mut b.metabolic_rate)
+                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
+                    ui.end_row();
+
+                    ui.label("integrity_scale");
+                    ui.add(egui::DragValue::new(&mut b.integrity_scale)
+                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
+                    ui.end_row();
                 });
         });
 

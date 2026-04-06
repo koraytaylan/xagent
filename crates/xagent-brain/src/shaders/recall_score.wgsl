@@ -30,7 +30,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Dot product
         var dot: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            dot += habituated[h_base + d] * patterns[p_base + O_PAT_STATES + j * DIM + d];
+            dot += habituated[h_base + d] * patterns[p_base + d * MEMORY_CAP + j];
         }
 
         let p_norm = patterns[p_base + O_PAT_NORMS + j];

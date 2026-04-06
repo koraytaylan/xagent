@@ -99,7 +99,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Cosine similarity
         var dot_val: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            dot_val += habituated[h_base + d] * patterns[p_base + O_PAT_STATES + j * DIM + d];
+            dot_val += habituated[h_base + d] * patterns[p_base + d * MEMORY_CAP + j];
         }
         let p_norm = patterns[p_base + O_PAT_NORMS + j];
         if (h_norm < 1e-8 || p_norm < 1e-8) {
@@ -129,7 +129,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Store habituated state to the slot
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-        patterns[p_base + O_PAT_STATES + min_idx * DIM + d] = habituated[h_base + d];
+        patterns[p_base + d * MEMORY_CAP + min_idx] = habituated[h_base + d];
     }
 
     // Cache norm

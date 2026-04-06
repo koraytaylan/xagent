@@ -832,6 +832,23 @@ mod tests {
     }
 
     #[test]
+    fn soa_pattern_index_covers_same_region_as_aos() {
+        let mut aos_offsets = std::collections::HashSet::new();
+        let mut soa_offsets = std::collections::HashSet::new();
+        for pat in 0..MEMORY_CAP {
+            for d in 0..DIM {
+                aos_offsets.insert(O_PAT_STATES + pat * DIM + d);
+                soa_offsets.insert(O_PAT_STATES + d * MEMORY_CAP + pat);
+            }
+        }
+        assert_eq!(aos_offsets.len(), MEMORY_CAP * DIM);
+        assert_eq!(soa_offsets.len(), MEMORY_CAP * DIM);
+        assert_eq!(aos_offsets, soa_offsets, "SoA and AoS must cover identical offsets");
+        assert_eq!(*aos_offsets.iter().min().unwrap(), 0);
+        assert_eq!(*aos_offsets.iter().max().unwrap(), MEMORY_CAP * DIM - 1);
+    }
+
+    #[test]
     fn shader_phys_constants_match_rust() {
         let src = include_str!("shaders/mega/common.wgsl");
         let wgsl = parse_wgsl_u32_constants(src);

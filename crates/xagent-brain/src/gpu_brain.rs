@@ -1076,8 +1076,9 @@ mod tests {
         state.patterns[O_ACTIVE_COUNT] = 1.0;
 
         // Pattern state: all 1.0 (norm = sqrt(32))
+        // SoA indexing: d * MEMORY_CAP + pattern_idx
         for d in 0..DIM {
-            state.patterns[O_PAT_STATES + d] = 1.0;
+            state.patterns[O_PAT_STATES + d * MEMORY_CAP] = 1.0;
         }
         state.patterns[O_PAT_NORMS] = (DIM as f32).sqrt(); // pre-cached norm
 

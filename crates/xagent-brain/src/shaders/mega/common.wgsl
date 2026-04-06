@@ -65,6 +65,10 @@ const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 
 // ── Pattern memory offsets ──────────────────────────────────────────────────
+// O_PAT_STATES uses SoA (Structure-of-Arrays) layout: [dim][pattern]
+// Index as: p_base + d * MEMORY_CAP + pattern_idx
+// This gives coalesced reads when 128 threads each read one pattern.
+// Other regions (norms, reinf, motor, meta, active) remain AoS.
 
 const O_PAT_STATES: u32 = 0u;
 const O_PAT_NORMS: u32 = 4096u;

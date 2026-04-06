@@ -25,7 +25,7 @@ fn cosine_sim(h_base: u32, p_base: u32, idx: u32) -> f32 {
     var h_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
         let h = habituated[h_base + d];
-        let p = patterns[p_base + O_PAT_STATES + idx * DIM + d];
+        let p = patterns[p_base + d * MEMORY_CAP + idx];
         dot_val += h * p;
         h_norm_sq += h * h;
     }
@@ -105,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let sim = cosine_sim(h_base, p_base, idx);
                 let w = context_weight * max(sim, 0.0) / total_sim;
                 for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                    prediction[d] += patterns[p_base + O_PAT_STATES + idx * DIM + d] * w;
+                    prediction[d] += patterns[p_base + d * MEMORY_CAP + idx] * w;
                 }
             }
         }

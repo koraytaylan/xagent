@@ -28,7 +28,7 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
     var h_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
         let h = s_habituated[d];
-        let p = pattern_buf[p_base + O_PAT_STATES + idx * DIM + d];
+        let p = pattern_buf[p_base + d * MEMORY_CAP + idx];
         dot_val += h * p;
         h_norm_sq += h * h;
     }
@@ -171,7 +171,7 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         } else {
             var dot: f32 = 0.0;
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                dot += s_habituated[d] * pattern_buf[p_base + O_PAT_STATES + tid * DIM + d];
+                dot += s_habituated[d] * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
             if (q_norm < 1e-8 || p_norm < 1e-8) {
@@ -305,7 +305,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
                     let sim = cosine_sim_pat_s(agent_id, idx);
                     let w = context_weight * max(sim, 0.0) / total_sim;
                     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                        s_prediction[d] += pattern_buf[p_base + O_PAT_STATES + idx * DIM + d] * w;
+                        s_prediction[d] += pattern_buf[p_base + d * MEMORY_CAP + idx] * w;
                     }
                 }
             }
@@ -597,7 +597,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
                 let h = s_habituated[d];
                 h_norm_sq += h * h;
-                dot_val += h * pattern_buf[p_base + O_PAT_STATES + tid * DIM + d];
+                dot_val += h * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
             let h_norm = sqrt(h_norm_sq);
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
@@ -626,7 +626,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
             let h = s_habituated[d];
             h_norm_sq += h * h;
-            pattern_buf[p_base + O_PAT_STATES + min_idx * DIM + d] = h;
+            pattern_buf[p_base + d * MEMORY_CAP + min_idx] = h;
         }
         pattern_buf[p_base + O_PAT_NORMS + min_idx] = sqrt(h_norm_sq);
         pattern_buf[p_base + O_PAT_REINF + min_idx] = 1.0;

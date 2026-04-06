@@ -296,8 +296,8 @@ pub fn mutate_config_with_strength(
         distress_exponent: momentum.biased_perturb_f(&mut rng, parent.distress_exponent, "distress_exponent", strength).clamp(1.5, 5.0),
         habituation_sensitivity: momentum.biased_perturb_f(&mut rng, parent.habituation_sensitivity, "habituation_sensitivity", strength).clamp(5.0, 50.0),
         max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
-        fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
-        fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
+        fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 10.0),
+        fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.15),
         vision_w: parent.vision_w,
         vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
@@ -549,5 +549,40 @@ mod tests {
         let fwd_same = (0..DIM)
             .all(|i| mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]);
         assert!(!fwd_same, "mutate_brain_state should perturb action weights");
+    }
+
+    #[test]
+    fn mutate_config_respects_fatigue_bounds() {
+        let momentum = MutationMomentum::new(0.9);
+        // Push initial config to the old (now invalid) upper limits to verify
+        // the tighter clamps rein them back in.
+        let parent = BrainConfig {
+            fatigue_recovery_sensitivity: 20.0,
+            fatigue_floor: 0.4,
+            ..BrainConfig::default()
+        };
+        for _ in 0..50 {
+            let child = mutate_config_with_strength(&parent, 0.3, &momentum);
+            assert!(
+                child.fatigue_recovery_sensitivity <= 10.0,
+                "fatigue_recovery must be ≤ 10.0, got {}",
+                child.fatigue_recovery_sensitivity,
+            );
+            assert!(
+                child.fatigue_recovery_sensitivity >= 2.0,
+                "fatigue_recovery must be ≥ 2.0, got {}",
+                child.fatigue_recovery_sensitivity,
+            );
+            assert!(
+                child.fatigue_floor <= 0.15,
+                "fatigue_floor must be ≤ 0.15, got {}",
+                child.fatigue_floor,
+            );
+            assert!(
+                child.fatigue_floor >= 0.05,
+                "fatigue_floor must be ≥ 0.05, got {}",
+                child.fatigue_floor,
+            );
+        }
     }
 }

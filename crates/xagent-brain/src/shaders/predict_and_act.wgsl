@@ -309,11 +309,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var_f /= f32(f_len);
     var_t /= f32(f_len);
 
+    // Turn-direction consistency: detect sustained same-direction turning
+    // (circling signature). turn_bias → 1 when all turns share the same
+    // sign, → 0 when turns are balanced left/right.
+    var sum_turn: f32 = 0.0;
+    var sum_abs_turn: f32 = 0.0;
+    for (var i: u32 = 0u; i < f_len; i = i + 1u) {
+        let t = brain_state[b + O_FATIGUE_TURN_RING + i];
+        sum_turn += t;
+        sum_abs_turn += abs(t);
+    }
+    let turn_bias = select(0.0, abs(sum_turn) / sum_abs_turn, sum_abs_turn > 0.01);
+    // Squared for gentle onset; suppresses variety when turning monotonically
+    let monotony = turn_bias * turn_bias;
+
     let recovery = brain_state[b + O_FATIGUE_RECOVERY];
     let floor = brain_state[b + O_FATIGUE_FLOOR];
     let motor_variety = sqrt(var_f + var_t) * recovery;
+    let effective_variety = motor_variety * (1.0 - monotony * 0.75);
     let fatigue_factor = clamp(
-        floor + (1.0 - floor) * clamp(motor_variety, 0.0, 1.0),
+        floor + (1.0 - floor) * clamp(effective_variety, 0.0, 1.0),
         floor, 1.0
     );
     brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;

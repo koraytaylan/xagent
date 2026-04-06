@@ -3,10 +3,6 @@
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 
-// ── Additional shared memory for food detection ───────────────────────────
-var<workgroup> s_best_food_idx: u32;
-var<workgroup> s_best_food_dist: f32;
-
 // ── Eat radius constant (sqrt of FOOD_CONSUME_RADIUS_SQ) ─────────────────
 const EAT_RADIUS: f32 = 2.5;  // sqrt(6.25)
 

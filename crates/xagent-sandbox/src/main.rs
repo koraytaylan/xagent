@@ -26,7 +26,7 @@ use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
 use xagent_brain::GpuMegaKernel;
-use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE};
+use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT};
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
@@ -1258,7 +1258,8 @@ impl ApplicationHandler for App {
 
                         if let Some(ref mut mk) = self.gpu_mega_kernel {
                             // Single dispatch — all ticks run inside GPU mega-kernel
-                            mk.dispatch_batch(self.tick, ticks_to_run);
+                            // Returns true if previous batch's state was collected
+                            let prev_ready = mk.dispatch_batch(self.tick, ticks_to_run);
 
                             self.tick += ticks_to_run as u64;
                             self.tps_tick_count += ticks_to_run as u64;
@@ -1270,8 +1271,9 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Non-blocking readback from previous batch
-                            if mk.try_collect_state() {
+                            // Use state from previous batch (collected during dispatch)
+                            // or try non-blocking readback of current batch
+                            if prev_ready || mk.try_collect_state() {
                                 let state = mk.cached_state();
                                 for i in 0..self.agents.len() {
                                     let base = i * PHYS_STRIDE;
@@ -1289,6 +1291,7 @@ impl ApplicationHandler for App {
                                         state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
                                     a.food_consumed = state[base + P_FOOD_COUNT] as u32;
                                     a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+                                    a.death_count = state[base + P_DEATH_COUNT] as u32;
                                     a.body.body.facing = Vec3::new(
                                         state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
                                 }

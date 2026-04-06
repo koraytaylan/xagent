@@ -487,9 +487,10 @@ impl GpuMegaKernel {
     }
 
     /// Ensure any pending staging buffer mapping is collected before reuse.
-    fn collect_pending_staging(&mut self) {
+    /// Returns true if new state data was collected into state_cache.
+    fn collect_pending_staging(&mut self) -> bool {
         if self.state_submit_seq == 0 {
-            return;
+            return false;
         }
         // Poll until the pending mapping completes
         while self.state_mapped_seq.load(Ordering::Acquire) < self.state_submit_seq {
@@ -506,16 +507,17 @@ impl GpuMegaKernel {
         self.state_cache.extend_from_slice(floats);
         drop(data);
         self.state_staging[read_idx].unmap();
+        true
     }
 
     /// Dispatch all ticks in a single GPU kernel invocation.
-    /// The shader loops internally — zero dispatch overhead.
-    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) {
+    /// Returns true if state_cache was updated with results from the previous dispatch.
+    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        // Ensure no staging buffer is still mapped (would cause submit error)
-        self.collect_pending_staging();
+        // Collect previous dispatch's state (unmap staging buffer before reuse)
+        let collected = self.collect_pending_staging();
 
         self.upload_world_config(start_tick, ticks_to_run);
 
@@ -548,6 +550,7 @@ impl GpuMegaKernel {
                 }
             });
         self.staging_idx = 1 - self.staging_idx;
+        collected
     }
 
     /// Non-blocking poll + read staging. Returns true if new data was collected.

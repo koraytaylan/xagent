@@ -111,6 +111,7 @@ const P_TICKS_ALIVE: u32 = 19u;
 const P_DIED_FLAG: u32 = 20u;
 const P_MEMORY_CAP: u32 = 21u;
 const P_PROCESSING_SLOTS: u32 = 22u;
+const P_DEATH_COUNT: u32 = 23u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 

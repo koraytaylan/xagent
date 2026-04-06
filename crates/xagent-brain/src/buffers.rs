@@ -113,7 +113,7 @@ pub const P_TICKS_ALIVE: usize = 19;
 pub const P_DIED_FLAG: usize = 20;
 pub const P_MEMORY_CAP: usize = 21;
 pub const P_PROCESSING_SLOTS: usize = 22;
-pub const P_PAD: usize = 23;
+pub const P_DEATH_COUNT: usize = 23;
 pub const PHYS_STRIDE: usize = 24;
 
 // ── Food buffer layout (per food item) ───────────────────────────────

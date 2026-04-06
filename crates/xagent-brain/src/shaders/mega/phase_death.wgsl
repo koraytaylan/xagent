@@ -38,6 +38,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // ── 2. Preserve fitness fields before reset ────────────────────────────
     let saved_food_count   = agent_phys[base + P_FOOD_COUNT];
     let saved_ticks_alive  = agent_phys[base + P_TICKS_ALIVE];
+    let saved_death_count  = agent_phys[base + P_DEATH_COUNT] + 1.0;
     let max_energy         = agent_phys[base + P_MAX_ENERGY];
     let max_integrity      = agent_phys[base + P_MAX_INTEGRITY];
     let memory_cap         = agent_phys[base + P_MEMORY_CAP];
@@ -68,6 +69,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Restore fitness fields
     agent_phys[base + P_FOOD_COUNT]      = saved_food_count;
     agent_phys[base + P_TICKS_ALIVE]     = saved_ticks_alive;
+    agent_phys[base + P_DEATH_COUNT]     = saved_death_count;
 
     // ── 4. Reset brain state ───────────────────────────────────────────────
     let brain_base = tid * BRAIN_STRIDE;

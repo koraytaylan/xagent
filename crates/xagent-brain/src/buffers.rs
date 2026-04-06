@@ -222,6 +222,8 @@ pub const WC_GRID_WIDTH: usize = 18;
 pub const WC_GRID_OFFSET: usize = 19;
 pub const WC_TICKS_TO_RUN: usize = 20;
 pub const WC_PHASE_MASK: usize = 21;  // bit0=physics, bit1=vision, bit2=brain
+pub const WC_VISION_STRIDE: usize = 22;
+pub const WC_BRAIN_TICK_STRIDE: usize = 23;
 pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
@@ -564,6 +566,8 @@ pub fn build_world_config(
     agent_count: usize,
     tick: u64,
     ticks_to_run: u32,
+    vision_stride: u32,
+    brain_tick_stride: u32,
 ) -> Vec<f32> {
     let gw = grid_width(config.world_size);
     let go = gw / 2;
@@ -590,6 +594,8 @@ pub fn build_world_config(
     wc[WC_GRID_WIDTH] = gw as f32;
     wc[WC_GRID_OFFSET] = go as f32;
     wc[WC_TICKS_TO_RUN] = ticks_to_run as f32;
+    wc[WC_VISION_STRIDE] = vision_stride as f32;
+    wc[WC_BRAIN_TICK_STRIDE] = brain_tick_stride as f32;
     wc
 }
 

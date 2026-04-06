@@ -220,6 +220,8 @@ const WC_GRID_WIDTH: u32 = 18u;
 const WC_GRID_OFFSET: u32 = 19u;
 const WC_TICKS_TO_RUN: u32 = 20u;
 const WC_PHASE_MASK: u32 = 21u;  // bit0=physics, bit1=vision, bit2=brain
+const WC_VISION_STRIDE: u32 = 22u;
+const WC_BRAIN_TICK_STRIDE: u32 = 23u;
 
 // ── Habituation / homeostasis constants ─────────────────────────────────────
 

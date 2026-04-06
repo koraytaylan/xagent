@@ -736,6 +736,8 @@ impl GpuMegaKernel {
             self.agent_count as usize,
             start_tick,
             ticks_to_run,
+            10,
+            4,
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));

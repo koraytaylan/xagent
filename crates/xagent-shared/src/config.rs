@@ -49,6 +49,11 @@ pub struct BrainConfig {
     /// Default 4.
     #[serde(default = "default_brain_tick_stride")]
     pub brain_tick_stride: u32,
+    /// Brain cycles between global passes (grid rebuild, collisions, vision).
+    /// Higher = more brain throughput, less frequent vision updates.
+    /// Default 10.
+    #[serde(default = "default_vision_stride")]
+    pub vision_stride: u32,
     /// Multiplier for all energy costs (metabolic + movement). Default 1.0.
     /// Lower = agents survive longer. Higher = harsher energy pressure.
     #[serde(default = "default_metabolic_rate")]
@@ -113,6 +118,10 @@ fn default_vision_rays() -> u32 {
 
 fn default_brain_tick_stride() -> u32 {
     4
+}
+
+fn default_vision_stride() -> u32 {
+    10
 }
 
 fn default_metabolic_rate() -> f32 {
@@ -235,6 +244,7 @@ impl Default for BrainConfig {
             fatigue_floor: 0.1,
             vision_rays: 48,
             brain_tick_stride: 4,
+            vision_stride: 10,
             metabolic_rate: 1.0,
             integrity_scale: 1.0,
         }
@@ -258,6 +268,7 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_rays: 24,
             brain_tick_stride: 4,
+            vision_stride: 10,
             metabolic_rate: 1.0,
             integrity_scale: 1.0,
         }
@@ -279,6 +290,7 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_rays: 96,
             brain_tick_stride: 4,
+            vision_stride: 10,
             metabolic_rate: 1.0,
             integrity_scale: 1.0,
         }

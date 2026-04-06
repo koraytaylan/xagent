@@ -461,7 +461,7 @@ impl GpuPhysics {
         agent_count: usize,
         tick: u64,
     ) {
-        let wc = build_world_config(config, food_count, agent_count, tick, 1);
+        let wc = build_world_config(config, food_count, agent_count, tick, 1, 10, 4);
         queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
     }
 

@@ -287,6 +287,7 @@ pub fn mutate_config_with_strength(
         fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
         vision_rays: parent.vision_rays,
         brain_tick_stride: parent.brain_tick_stride,
+        vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
         integrity_scale: parent.integrity_scale,
     }
@@ -395,6 +396,7 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         },
         vision_rays: a.vision_rays,
         brain_tick_stride: a.brain_tick_stride,
+        vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,
         integrity_scale: a.integrity_scale,
     }

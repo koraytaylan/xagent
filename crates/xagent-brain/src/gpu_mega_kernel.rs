@@ -23,7 +23,7 @@ pub struct GpuMegaKernel {
     agent_count: u32,
     food_count: usize,
 
-    // ── Shared buffers (15 storage + 2 uniform) ──
+    // ── Shared buffers (14 storage + 2 uniform + 1 indirect) ──
     agent_phys_buf: wgpu::Buffer,
     decision_buf: wgpu::Buffer,
     heightmap_buf: wgpu::Buffer,
@@ -40,7 +40,11 @@ pub struct GpuMegaKernel {
     history_buf: wgpu::Buffer,
     brain_config_buf: wgpu::Buffer,
 
+    // ── Indirect dispatch ──
+    dispatch_args_buf: wgpu::Buffer,
+
     // ── Pipelines ──
+    prepare_pipeline: wgpu::ComputePipeline,
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
@@ -280,6 +284,12 @@ impl GpuMegaKernel {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mega_dispatch_args"),
+            size: 6 * 4, // 2 × (x, y, z) u32 triplets
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // ── Async state readback staging (double-buffered) ──
         let state_size = (n * PHYS_STRIDE * 4) as u64;
@@ -354,7 +364,7 @@ impl GpuMegaKernel {
         ]
         .join("\n");
 
-        // ── Explicit bind group layout (all 15 bindings) ──
+        // ── Explicit bind group layout (all 16 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
         // need a single shared layout so one bind group works for all 3 pipelines.
         use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
@@ -400,6 +410,7 @@ impl GpuMegaKernel {
                 storage_rw_entry(12),  // pattern
                 storage_rw_entry(13),  // history
                 uniform_entry(14),     // brain_config
+                storage_rw_entry(15),  // dispatch_args
             ],
         });
         // ── Physics pipeline layout (has push constants) ──
@@ -461,6 +472,24 @@ impl GpuMegaKernel {
             cache: None,
         });
 
+        // ── Create prepare_dispatch pipeline (indirect dispatch args) ──
+        let prepare_source = [
+            &common_src,
+            include_str!("shaders/mega/phase_prepare_dispatch.wgsl"),
+        ].join("\n");
+        let prepare_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prepare_dispatch"),
+            source: wgpu::ShaderSource::Wgsl(prepare_source.into()),
+        });
+        let prepare_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("prepare_dispatch"),
+            layout: Some(&brain_layout),
+            module: &prepare_module,
+            entry_point: Some("prepare_dispatch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         // ── Create bind groups (double-buffered on world_config) ──
         let make_bind_group = |wc_buf: &wgpu::Buffer, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -482,6 +511,7 @@ impl GpuMegaKernel {
                     wgpu::BindGroupEntry { binding: 12, resource: pattern_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 13, resource: history_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 14, resource: brain_config_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: dispatch_args_buf.as_entire_binding() },
                 ],
             })
         };
@@ -510,6 +540,8 @@ impl GpuMegaKernel {
             pattern_buf,
             history_buf,
             brain_config_buf,
+            dispatch_args_buf,
+            prepare_pipeline,
             physics_pipeline,
             vision_pipeline,
             brain_pipeline,
@@ -618,6 +650,13 @@ impl GpuMegaKernel {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("dispatch_masked"),
             });
+            // Prepare indirect dispatch args (once per chunk)
+            if run_vision || run_brain {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.prepare_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
             for c in cycle..chunk_end {
                 let base_tick = start_tick + (c as u64) * (self.brain_tick_stride as u64);
                 let pc: [u32; 2] = [base_tick as u32, self.brain_tick_stride];
@@ -632,13 +671,13 @@ impl GpuMegaKernel {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 0);
                 }
                 if run_brain {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 12);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -719,6 +758,13 @@ impl GpuMegaKernel {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("dispatch_batch"),
             });
+            // Prepare indirect dispatch args (once per chunk)
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.prepare_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
             for c in cycle..chunk_end {
                 let base_tick = start_tick + (c as u64) * (self.brain_tick_stride as u64);
                 let pc: [u32; 2] = [base_tick as u32, self.brain_tick_stride];
@@ -732,20 +778,20 @@ impl GpuMegaKernel {
                     pass.dispatch_workgroups(1, 1, 1);
                 }
 
-                // Vision (agent_count workgroups)
+                // Vision (indirect: workgroup count from GPU)
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 0);
                 }
 
-                // Brain (agent_count workgroups, 256 cooperative threads)
+                // Brain (indirect: workgroup count from GPU)
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 12);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));

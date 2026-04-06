@@ -264,6 +264,7 @@ const ANTICIPATION_WEIGHT: f32 = 0.5;
 @group(0) @binding(12) var<storage, read_write> pattern_buf:       array<f32>;
 @group(0) @binding(13) var<storage, read_write> history_buf:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
+@group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper functions

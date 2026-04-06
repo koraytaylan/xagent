@@ -997,4 +997,14 @@ mod tests {
             "PHYS_STRIDE ({}) should be highest field offset ({}) + 1",
             PHYS_STRIDE, max_field);
     }
+
+    #[test]
+    fn shader_has_16_bindings() {
+        let src = include_str!("shaders/mega/common.wgsl");
+        let binding_count = src.lines()
+            .filter(|l| l.trim().starts_with("@group(0) @binding("))
+            .count();
+        assert_eq!(binding_count, 16,
+            "Expected 16 bindings (0-14 existing + 15 dispatch_args), found {}", binding_count);
+    }
 }

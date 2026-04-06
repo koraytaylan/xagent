@@ -42,6 +42,7 @@ pub struct GpuMegaKernel {
 
     // ── Pipelines ──
     physics_pipeline: wgpu::ComputePipeline,
+    vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
 
@@ -251,7 +252,7 @@ impl GpuMegaKernel {
         queue.write_buffer(&history_buf, 0, bytemuck::cast_slice(&history_data));
         queue.write_buffer(&brain_config_buf, 0, bytemuck::cast_slice(&build_config(brain_config)));
 
-        // ── Compose physics+vision shader ──
+        // ── Compose physics shader ──
         let physics_source = [
             include_str!("shaders/mega/common.wgsl"),
             include_str!("shaders/mega/phase_clear.wgsl"),
@@ -262,8 +263,15 @@ impl GpuMegaKernel {
             include_str!("shaders/mega/phase_food_respawn.wgsl"),
             include_str!("shaders/mega/phase_agent_grid.wgsl"),
             include_str!("shaders/mega/phase_collision.wgsl"),
+            include_str!("shaders/mega/physics_tick.wgsl"),
+        ]
+        .join("\n");
+
+        // ── Compose vision shader ──
+        let vision_source = [
+            include_str!("shaders/mega/common.wgsl"),
             include_str!("shaders/mega/phase_vision.wgsl"),
-            include_str!("shaders/mega/physics_vision_tick.wgsl"),
+            include_str!("shaders/mega/vision_tick.wgsl"),
         ]
         .join("\n");
 
@@ -341,14 +349,28 @@ impl GpuMegaKernel {
 
         // ── Create physics pipeline ──
         let physics_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("physics_vision_tick"),
+            label: Some("physics_tick"),
             source: wgpu::ShaderSource::Wgsl(physics_source.into()),
         });
         let physics_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("physics_vision_tick"),
+            label: Some("physics_tick"),
             layout: Some(&physics_layout),
             module: &physics_module,
-            entry_point: Some("physics_vision_tick"),
+            entry_point: Some("physics_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ── Create vision pipeline (no push constants, like brain) ──
+        let vision_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vision_tick"),
+            source: wgpu::ShaderSource::Wgsl(vision_source.into()),
+        });
+        let vision_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vision_tick"),
+            layout: Some(&brain_layout),
+            module: &vision_module,
+            entry_point: Some("vision_tick"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -411,6 +433,7 @@ impl GpuMegaKernel {
             history_buf,
             brain_config_buf,
             physics_pipeline,
+            vision_pipeline,
             brain_pipeline,
             bind_group,
             state_staging,
@@ -497,8 +520,8 @@ impl GpuMegaKernel {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        // Physics/vision mask: bits 0-1
-        let phys_mask = phase_mask & 0x3;
+        let phys_mask = phase_mask & 0x1;
+        let run_vision = (phase_mask & 0x2) != 0;
         let run_brain = (phase_mask & 0x4) != 0;
 
         self.upload_world_config_masked(start_tick, BRAIN_TICK_STRIDE, phys_mask);
@@ -506,7 +529,7 @@ impl GpuMegaKernel {
         let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
         let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
-        // Chunk cycles to avoid Metal command buffer deadlock (max ~200 passes per submit)
+        // Chunk cycles to avoid Metal command buffer deadlock
         const CYCLES_PER_CHUNK: u32 = 100;
         let mut cycle = 0u32;
         while cycle < num_cycles {
@@ -524,6 +547,12 @@ impl GpuMegaKernel {
                     pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                     pass.dispatch_workgroups(1, 1, 1);
                 }
+                if run_vision {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
                 if run_brain {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
@@ -535,7 +564,7 @@ impl GpuMegaKernel {
             cycle = chunk_end;
         }
 
-        // Remainder + readback in final submit
+        // Remainder: physics only (no vision/brain)
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dispatch_masked_final"),
         });
@@ -579,7 +608,7 @@ impl GpuMegaKernel {
         true
     }
 
-    /// Dispatch all ticks via alternating physics+brain passes.
+    /// Dispatch all ticks via alternating physics → vision → brain passes.
     /// Returns true if state_cache was updated with results from the previous dispatch.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let n = self.agent_count as usize;
@@ -587,13 +616,13 @@ impl GpuMegaKernel {
 
         let collected = self.collect_pending_staging();
 
-        // Upload world config once (mask=3: physics+vision enabled)
-        self.upload_world_config_masked(start_tick, BRAIN_TICK_STRIDE, 0x3);
+        // Upload world config once (mask=1: physics enabled)
+        self.upload_world_config_masked(start_tick, BRAIN_TICK_STRIDE, 0x1);
 
         let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
         let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
-        // Chunk cycles to avoid Metal command buffer deadlock (max ~200 passes per submit)
+        // Chunk cycles to avoid Metal command buffer deadlock
         const CYCLES_PER_CHUNK: u32 = 100;
         let mut cycle = 0u32;
         while cycle < num_cycles {
@@ -605,7 +634,7 @@ impl GpuMegaKernel {
                 let base_tick = start_tick + (c as u64) * (BRAIN_TICK_STRIDE as u64);
                 let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
 
-                // Physics + vision
+                // Physics
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.physics_pipeline);
@@ -614,7 +643,15 @@ impl GpuMegaKernel {
                     pass.dispatch_workgroups(1, 1, 1);
                 }
 
-                // Brain (agent_count workgroups × 256 threads)
+                // Vision (agent_count workgroups, 48 rays each)
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
+
+                // Brain (agent_count workgroups, 256 cooperative threads)
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);

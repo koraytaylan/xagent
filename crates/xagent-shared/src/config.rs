@@ -351,3 +351,14 @@ impl Default for AgentDescriptor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vision_stride_defaults_to_10() {
+        let config = BrainConfig::default();
+        assert_eq!(config.vision_stride, 10);
+    }
+}

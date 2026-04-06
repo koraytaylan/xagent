@@ -64,8 +64,9 @@ pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1;     // 8466
 pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1;         // 8467
 pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1;               // 8468
 
-/// Number of fixed-size fields from O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1.
-/// This tail is layout-independent: it doesn't change with feature_count / vision_rays.
+/// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
+/// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
+/// doesn't change with feature_count / vision_rays.
 pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT;   // 468
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
@@ -161,7 +162,7 @@ impl BrainLayout {
         let feature_count = color_count + 25;
         let sensory_stride = color_count + depth_count + NON_VISUAL_COUNT;
         // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-        // (FIXED_TAIL_SIZE = fixed fields after O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1)
+        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR)
         let brain_stride = feature_count * DIM + DIM + DIM * DIM + FIXED_TAIL_SIZE;
         Self {
             vision_w: w,

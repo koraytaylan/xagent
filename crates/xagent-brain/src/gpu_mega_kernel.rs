@@ -40,8 +40,9 @@ pub struct GpuMegaKernel {
     history_buf: wgpu::Buffer,
     brain_config_buf: wgpu::Buffer,
 
-    // ── Pipeline (single mega-kernel) ──
-    pipeline: wgpu::ComputePipeline,
+    // ── Pipelines ──
+    physics_pipeline: wgpu::ComputePipeline,
+    brain_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
 
     // ── Async state readback (double-buffered) ──
@@ -250,8 +251,8 @@ impl GpuMegaKernel {
         queue.write_buffer(&history_buf, 0, bytemuck::cast_slice(&history_data));
         queue.write_buffer(&brain_config_buf, 0, bytemuck::cast_slice(&build_config(brain_config)));
 
-        // ── Compose WGSL source from fragments ──
-        let source = [
+        // ── Compose physics+vision shader ──
+        let physics_source = [
             include_str!("shaders/mega/common.wgsl"),
             include_str!("shaders/mega/phase_clear.wgsl"),
             include_str!("shaders/mega/phase_food_grid.wgsl"),
@@ -262,8 +263,14 @@ impl GpuMegaKernel {
             include_str!("shaders/mega/phase_agent_grid.wgsl"),
             include_str!("shaders/mega/phase_collision.wgsl"),
             include_str!("shaders/mega/phase_vision.wgsl"),
-            include_str!("shaders/mega/phase_brain.wgsl"),
-            include_str!("shaders/mega/mega_tick.wgsl"),
+            include_str!("shaders/mega/physics_vision_tick.wgsl"),
+        ]
+        .join("\n");
+
+        // ── Compose brain shader ──
+        let brain_source = [
+            include_str!("shaders/mega/common.wgsl"),
+            include_str!("shaders/mega/brain_tick.wgsl"),
         ]
         .join("\n");
 
@@ -315,25 +322,47 @@ impl GpuMegaKernel {
                 uniform_entry(14),     // brain_config
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mega_layout"),
+        // ── Physics pipeline layout (has push constants) ──
+        let physics_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("physics_layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..8, // 2 × u32: start_tick, ticks_to_run
+                range: 0..8,
             }],
         });
 
-        // ── Create single mega-kernel pipeline ──
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mega_tick"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
+        // ── Brain pipeline layout (no push constants) ──
+        let brain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("brain_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mega_tick"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("mega_tick"),
+
+        // ── Create physics pipeline ──
+        let physics_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("physics_vision_tick"),
+            source: wgpu::ShaderSource::Wgsl(physics_source.into()),
+        });
+        let physics_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("physics_vision_tick"),
+            layout: Some(&physics_layout),
+            module: &physics_module,
+            entry_point: Some("physics_vision_tick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ── Create brain pipeline ──
+        let brain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("brain_tick"),
+            source: wgpu::ShaderSource::Wgsl(brain_source.into()),
+        });
+        let brain_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("brain_tick"),
+            layout: Some(&brain_layout),
+            module: &brain_module,
+            entry_point: Some("brain_tick"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -381,7 +410,8 @@ impl GpuMegaKernel {
             pattern_buf,
             history_buf,
             brain_config_buf,
-            pipeline,
+            physics_pipeline,
+            brain_pipeline,
             bind_group,
             state_staging,
             staging_idx: 0,
@@ -467,20 +497,49 @@ impl GpuMegaKernel {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        self.upload_world_config_masked(start_tick, ticks_to_run, phase_mask);
+        // Physics/vision mask: bits 0-1
+        let phys_mask = phase_mask & 0x3;
+        let run_brain = (phase_mask & 0x4) != 0;
 
-        let pc: [u32; 2] = [start_tick as u32, ticks_to_run];
+        self.upload_world_config_masked(start_tick, BRAIN_TICK_STRIDE, phys_mask);
+
+        let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
+        let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mega_dispatch"),
+            label: Some("dispatch_masked"),
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-            pass.dispatch_workgroups(1, 1, 1);
+
+        for cycle in 0..num_cycles {
+            let base_tick = start_tick + (cycle as u64) * (BRAIN_TICK_STRIDE as u64);
+            let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            if run_brain {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.brain_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(self.agent_count, 1, 1);
+            }
         }
+
+        if remainder > 0 {
+            let rem_base = start_tick + (num_cycles as u64) * (BRAIN_TICK_STRIDE as u64);
+            let pc: [u32; 2] = [rem_base as u32, remainder];
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+        }
+
         encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[self.staging_idx], 0, buf_size);
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
@@ -510,28 +569,57 @@ impl GpuMegaKernel {
         true
     }
 
-    /// Dispatch all ticks in a single GPU kernel invocation.
+    /// Dispatch all ticks via alternating physics+brain passes.
     /// Returns true if state_cache was updated with results from the previous dispatch.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        // Collect previous dispatch's state (unmap staging buffer before reuse)
         let collected = self.collect_pending_staging();
 
-        self.upload_world_config(start_tick, ticks_to_run);
+        // Upload world config once (mask=3: physics+vision enabled)
+        self.upload_world_config_masked(start_tick, BRAIN_TICK_STRIDE, 0x3);
 
-        let pc: [u32; 2] = [start_tick as u32, ticks_to_run];
+        let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
+        let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mega_dispatch"),
+            label: Some("dispatch_batch"),
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-            pass.dispatch_workgroups(1, 1, 1);
+
+        for cycle in 0..num_cycles {
+            let base_tick = start_tick + (cycle as u64) * (BRAIN_TICK_STRIDE as u64);
+            let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
+
+            // Physics + vision
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+
+            // Brain (agent_count workgroups × 256 threads)
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.brain_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(self.agent_count, 1, 1);
+            }
+        }
+
+        // Remainder: physics + vision only (no brain)
+        if remainder > 0 {
+            let rem_base = start_tick + (num_cycles as u64) * (BRAIN_TICK_STRIDE as u64);
+            let pc: [u32; 2] = [rem_base as u32, remainder];
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
         }
 
         // Async state readback

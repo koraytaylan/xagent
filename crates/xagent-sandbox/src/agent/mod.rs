@@ -13,7 +13,7 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::buffers::{AgentBrainState, DIM, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
+use xagent_brain::buffers::{AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -157,6 +157,8 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with an assigned GPU brain index, color, and zero death count.
     pub fn new(id: u32, position: Vec3, brain_idx: u32, config: BrainConfig, tick: u64) -> Self {
+        let vw = config.vision_w;
+        let vh = config.vision_h;
         Self {
             id,
             body: AgentBody::new(position),
@@ -184,7 +186,7 @@ impl Agent {
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
-            cached_frame: SensoryFrame::new_blank(8, 6),
+            cached_frame: SensoryFrame::new_blank(vw, vh),
             cached_urgency: 0.0,
             cached_gradient: 0.0,
             cached_mean_attenuation: 0.0,
@@ -296,7 +298,8 @@ pub fn mutate_config_with_strength(
         max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
         fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
         fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
-        vision_rays: parent.vision_rays,
+        vision_w: parent.vision_w,
+        vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
         vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
@@ -312,9 +315,9 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut rng = rand::rng();
     let mut mutated = state.clone();
 
-    // Derive layout from actual state length (supports dynamic vision_rays).
-    // brain_stride = fc * DIM + DIM + DIM*DIM + 468
-    let fc = (state.brain_state.len() - DIM - DIM * DIM - 468) / DIM;
+    // Derive layout from actual state length (supports dynamic vision_w × vision_h).
+    // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+    let fc = (state.brain_state.len() - DIM - DIM * DIM - FIXED_TAIL_SIZE) / DIM;
     let o_pred_wts = fc * DIM + DIM;
     // Delta from the default compile-time O_PRED_CTX_WT to O_ACT_FWD_WTS is fixed
     let o_pred_ctx = o_pred_wts + DIM * DIM;
@@ -405,7 +408,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.fatigue_floor
         },
-        vision_rays: a.vision_rays,
+        vision_w: a.vision_w,
+        vision_h: a.vision_h,
         brain_tick_stride: a.brain_tick_stride,
         vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,

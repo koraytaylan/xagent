@@ -9,6 +9,7 @@ var<workgroup> s_encoded: array<f32, 32>;
 var<workgroup> s_habituated: array<f32, 32>;
 var<workgroup> s_homeo: array<f32, 6>;
 var<workgroup> s_similarities: array<f32, 128>;  // reused for decay tracking in pass 7
+var<workgroup> s_sort_idx: array<u32, 128>;   // tracks pattern index through bitonic sort
 var<workgroup> s_recall: array<f32, 17>;
 var<workgroup> s_prediction: array<f32, 32>;
 var<workgroup> s_credit: array<f32, 32>;
@@ -183,31 +184,66 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 5: Top-K selection (thread 0 — serial over 128 shared values)
+// Pass 5: Top-K selection (64 threads — parallel bitonic sort of 128 shared values)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn coop_recall_topk(agent_id: u32) {
+fn coop_recall_topk(agent_id: u32, tid: u32) {
     let p_base = agent_id * PATTERN_STRIDE;
     let b_base = agent_id * BRAIN_STRIDE;
     let tick = brain_state[b_base + O_TICK_COUNT];
-    var count: u32 = 0u;
 
-    for (var k: u32 = 0u; k < RECALL_K; k = k + 1u) {
-        var best_idx: u32 = 0u;
-        var best_sim: f32 = -3.0;
-        for (var j: u32 = 0u; j < MEMORY_CAP; j = j + 1u) {
-            let sim = s_similarities[j];
-            if (sim > best_sim) { best_sim = sim; best_idx = j; }
-        }
-        if (best_sim <= -1.5) { break; }
-        s_recall[k] = f32(best_idx);
-        count = count + 1u;
-        pattern_buf[p_base + O_PAT_META + best_idx * 3u + 1u] = tick;
-        pattern_buf[p_base + O_PAT_META + best_idx * 3u + 2u] += 1.0;
-        s_similarities[best_idx] = -3.0;
+    // Initialize sort index: threads 0..127
+    if (tid < MEMORY_CAP) {
+        s_sort_idx[tid] = tid;
     }
-    for (var k: u32 = count; k < RECALL_K; k = k + 1u) { s_recall[k] = 0.0; }
-    s_recall[RECALL_K] = f32(count);
+    workgroupBarrier();
+
+    // Bitonic sort: 7 stages, 28 total barrier passes
+    // Sort s_similarities descending (largest at index 0)
+    // BEGIN_BITONIC_SORT
+    for (var stage: u32 = 0u; stage < 7u; stage = stage + 1u) {
+        for (var step: u32 = 0u; step <= stage; step = step + 1u) {
+            if (tid < 64u) {
+                let block_size = 1u << (stage + 1u - step);
+                let half = block_size >> 1u;
+                let group = tid / half;
+                let local_id = tid % half;
+                let i = group * block_size + local_id;
+                let j = i + half;
+                let descending = ((i >> (stage + 1u)) & 1u) == 0u;
+
+                let val_i = s_similarities[i];
+                let val_j = s_similarities[j];
+                let idx_i = s_sort_idx[i];
+                let idx_j = s_sort_idx[j];
+
+                let should_swap = (descending && val_i < val_j) || (!descending && val_i > val_j);
+                if (should_swap) {
+                    s_similarities[i] = val_j;
+                    s_similarities[j] = val_i;
+                    s_sort_idx[i] = idx_j;
+                    s_sort_idx[j] = idx_i;
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    // END_BITONIC_SORT
+
+    // Thread 0: extract top-K from sorted array (index 0 = largest)
+    if (tid == 0u) {
+        var count: u32 = 0u;
+        for (var k: u32 = 0u; k < RECALL_K; k = k + 1u) {
+            if (s_similarities[k] <= -1.5) { break; }
+            let idx = s_sort_idx[k];
+            s_recall[k] = f32(idx);
+            count = count + 1u;
+            pattern_buf[p_base + O_PAT_META + idx * 3u + 1u] = tick;
+            pattern_buf[p_base + O_PAT_META + idx * 3u + 2u] += 1.0;
+        }
+        for (var k: u32 = count; k < RECALL_K; k = k + 1u) { s_recall[k] = 0.0; }
+        s_recall[RECALL_K] = f32(count);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -673,7 +709,7 @@ fn brain_tick(
     coop_recall_score(agent_id, tid);
     workgroupBarrier();
 
-    if (tid == 0u) { coop_recall_topk(agent_id); }
+    coop_recall_topk(agent_id, tid);
     storageBarrier(); workgroupBarrier();
 
     coop_predict_and_act(agent_id, tid);

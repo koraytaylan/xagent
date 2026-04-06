@@ -893,6 +893,76 @@ mod tests {
     }
 
     #[test]
+    fn bitonic_sort_top_k_matches_greedy_scan() {
+        fn greedy_top_k(sims: &[f32], k: usize) -> Vec<usize> {
+            let mut s = sims.to_vec();
+            let mut result = Vec::new();
+            for _ in 0..k {
+                let mut best_idx = 0;
+                let mut best_val = -3.0_f32;
+                for (j, &v) in s.iter().enumerate() {
+                    if v > best_val { best_val = v; best_idx = j; }
+                }
+                if best_val <= -1.5 { break; }
+                result.push(best_idx);
+                s[best_idx] = -3.0;
+            }
+            result
+        }
+
+        fn bitonic_top_k(sims: &[f32], k: usize) -> Vec<usize> {
+            let n = sims.len();
+            let mut vals = sims.to_vec();
+            let mut idxs: Vec<u32> = (0..n as u32).collect();
+
+            for stage in 0..7u32 {
+                for step in 0..=stage {
+                    let block_size = 1u32 << (stage + 1 - step);
+                    let half = block_size >> 1;
+                    for tid in 0..(n as u32 / 2) {
+                        let group = tid / half;
+                        let local = tid % half;
+                        let i = (group * block_size + local) as usize;
+                        let j = i + half as usize;
+                        let descending = ((i >> (stage as usize + 1)) & 1) == 0;
+                        let should_swap = (descending && vals[i] < vals[j])
+                            || (!descending && vals[i] > vals[j]);
+                        if should_swap {
+                            vals.swap(i, j);
+                            idxs.swap(i, j);
+                        }
+                    }
+                }
+            }
+
+            let mut result = Vec::new();
+            for i in 0..k {
+                if vals[i] <= -1.5 { break; }
+                result.push(idxs[i] as usize);
+            }
+            result
+        }
+
+        let mut sims = vec![-2.0_f32; 128];
+        sims[5] = 0.95; sims[10] = 0.80; sims[0] = 0.75; sims[127] = 0.70;
+        sims[64] = 0.65; sims[33] = 0.60; sims[99] = 0.55; sims[17] = 0.50;
+        sims[42] = 0.45; sims[88] = 0.40; sims[3] = 0.35; sims[111] = 0.30;
+        sims[50] = 0.25; sims[77] = 0.20; sims[22] = 0.15; sims[61] = 0.10;
+        sims[100] = 0.05;
+
+        let greedy = greedy_top_k(&sims, 16);
+        let bitonic = bitonic_top_k(&sims, 16);
+
+        assert_eq!(greedy.len(), bitonic.len(),
+            "top-K count mismatch: greedy={}, bitonic={}", greedy.len(), bitonic.len());
+        for idx in &greedy {
+            assert!(bitonic.contains(idx),
+                "greedy selected index {} (sim={}) but bitonic did not. bitonic={:?}",
+                idx, sims[*idx], bitonic);
+        }
+    }
+
+    #[test]
     fn phys_stride_covers_all_fields() {
         // Highest P_* offset + 1 must equal PHYS_STRIDE
         let max_field = *[

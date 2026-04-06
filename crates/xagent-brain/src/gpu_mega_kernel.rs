@@ -964,11 +964,11 @@ impl GpuMegaKernel {
         collected
     }
 
-    /// Dispatch all ticks via alternating physics → vision → brain passes.
-    /// Fully non-blocking: skips dispatch if the write-target staging buffer
-    /// is still in flight (GPU backpressure).
-    /// Returns true if dispatched, false if skipped due to backpressure.
-    /// Caller is responsible for poll/collect via `try_collect_state()`.
+    /// Dispatch ticks via mega-kernel + global + vision passes.
+    /// Each mega-batch runs `vision_stride` brain cycles in a single dispatch,
+    /// followed by one global (grid+collisions) and one vision (raycasting) pass.
+    /// Non-blocking: skips if staging buffer is in flight (GPU backpressure).
+    /// Returns true if dispatched, false if skipped.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         // Check if the write-target staging buffer is free.
         let widx = self.staging_idx;
@@ -983,7 +983,6 @@ impl GpuMegaKernel {
         let mega_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
 
-        let _ticks_per_mega = self.vision_stride * self.brain_tick_stride;
         let mut tick_cursor = start_tick;
 
         // Chunk mega-batches to avoid Metal command buffer limits

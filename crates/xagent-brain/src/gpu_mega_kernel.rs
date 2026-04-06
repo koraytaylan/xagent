@@ -847,6 +847,22 @@ impl GpuMegaKernel {
         self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));
     }
 
+    /// Write world config with explicit vision_stride override.
+    /// Used by mega dispatch to set the GPU loop count per batch.
+    fn upload_world_config_with_cycles(&self, start_tick: u64, ticks_to_run: u32, phase_mask: u32, vision_stride_override: u32) {
+        let mut wc = build_world_config(
+            &self.world_config,
+            self.food_count,
+            self.agent_count as usize,
+            start_tick,
+            ticks_to_run,
+            vision_stride_override,
+            self.brain_tick_stride,
+        );
+        wc[WC_PHASE_MASK] = phase_mask as f32;
+        self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));
+    }
+
     /// Dispatch with explicit phase mask (for profiling).
     /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
     pub fn dispatch_batch_masked(&mut self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
@@ -957,48 +973,66 @@ impl GpuMegaKernel {
         // Check if the write-target staging buffer is free.
         let widx = self.staging_idx;
         if self.staging_in_flight[widx] {
-            // GPU still busy — skip this dispatch to avoid blocking.
             return false;
         }
 
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
-        // Upload world config once (mask=1: physics enabled)
-        self.upload_world_config_masked(start_tick, self.brain_tick_stride, 0x1);
+        let brain_cycles = ticks_to_run / self.brain_tick_stride;
+        let mega_batches = brain_cycles / self.vision_stride;
+        let remainder_cycles = brain_cycles % self.vision_stride;
 
-        let num_cycles = ticks_to_run / self.brain_tick_stride;
-        let remainder = ticks_to_run % self.brain_tick_stride;
+        let _ticks_per_mega = self.vision_stride * self.brain_tick_stride;
+        let mut tick_cursor = start_tick;
 
-        // Chunk cycles to avoid Metal command buffer deadlock
-        const CYCLES_PER_CHUNK: u32 = 100;
-        let mut cycle = 0u32;
-        while cycle < num_cycles {
-            let chunk_end = (cycle + CYCLES_PER_CHUNK).min(num_cycles);
+        // Chunk mega-batches to avoid Metal command buffer limits
+        const MEGAS_PER_CHUNK: u32 = 50;
+        let total_megas = mega_batches + if remainder_cycles > 0 { 1 } else { 0 };
+        let mut mega_idx = 0u32;
+
+        while mega_idx < total_megas {
+            let chunk_end = (mega_idx + MEGAS_PER_CHUNK).min(total_megas);
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_batch"),
+                label: Some("dispatch_mega"),
             });
-            // Prepare indirect dispatch args (once per chunk)
+
+            // Prepare indirect dispatch args (once per chunk, for vision)
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.prepare_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            for c in cycle..chunk_end {
-                let base_tick = start_tick + (c as u64) * (self.brain_tick_stride as u64);
-                let pc: [u32; 2] = [base_tick as u32, self.brain_tick_stride];
 
-                // Physics
+            for m in mega_idx..chunk_end {
+                let is_remainder = m == mega_batches;
+                let cycles_this_batch = if is_remainder { remainder_cycles } else { self.vision_stride };
+                let ticks_this_batch = cycles_this_batch * self.brain_tick_stride;
+
+                // Upload world config with vision_stride override for this batch
+                self.upload_world_config_with_cycles(tick_cursor, ticks_this_batch, 0x7, cycles_this_batch);
+
+                // Mega-kernel: 1 pass, cycles_this_batch brain cycles
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.physics_pipeline);
+                    pass.set_pipeline(&self.mega_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
+
+                // Global pass: grid rebuild + collisions
+                {
+                    let tick_for_global = tick_cursor + ticks_this_batch as u64;
+                    let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.global_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                     pass.dispatch_workgroups(1, 1, 1);
                 }
 
-                // Vision (indirect: workgroup count from GPU)
+                // Vision pass: raycasting
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
@@ -1006,25 +1040,23 @@ impl GpuMegaKernel {
                     pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 0);
                 }
 
-                // Brain (indirect: workgroup count from GPU)
-                {
-                    let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.brain_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 12);
-                }
+                tick_cursor += ticks_this_batch as u64;
             }
+
             self.queue.submit(std::iter::once(encoder.finish()));
-            cycle = chunk_end;
+            mega_idx = chunk_end;
         }
 
-        // Final submit: remainder + async state readback
+        // Physics-only remainder (ticks that don't fill a brain cycle)
+        let physics_remainder = ticks_to_run % self.brain_tick_stride;
+
+        // Final submit: physics remainder + async state readback
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_batch_final"),
+            label: Some("dispatch_mega_final"),
         });
-        if remainder > 0 {
-            let rem_base = start_tick + (num_cycles as u64) * (self.brain_tick_stride as u64);
-            let pc: [u32; 2] = [rem_base as u32, remainder];
+        if physics_remainder > 0 {
+            self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
+            let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);

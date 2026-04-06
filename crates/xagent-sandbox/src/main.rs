@@ -1312,8 +1312,9 @@ impl ApplicationHandler for App {
                         self.ensure_mega_kernel();
 
                         if let Some(ref mut mk) = self.gpu_mega_kernel {
+                            let state_updated = mk.try_collect_state();
                             let t0 = Instant::now();
-                            let (dispatched, state_updated) = mk.dispatch_batch(self.tick, ticks_to_run);
+                            let dispatched = mk.dispatch_batch(self.tick, ticks_to_run);
                             let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
                             if dispatched {

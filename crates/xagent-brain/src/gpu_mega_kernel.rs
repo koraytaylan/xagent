@@ -28,7 +28,7 @@ pub struct GpuMegaKernel {
     decision_buf: wgpu::Buffer,
     heightmap_buf: wgpu::Buffer,
     biome_buf: wgpu::Buffer,
-    world_config_buf: wgpu::Buffer,
+    world_config_bufs: [wgpu::Buffer; 2],
     food_state_buf: wgpu::Buffer,
     food_flags_buf: wgpu::Buffer,
     food_grid_buf: wgpu::Buffer,
@@ -44,7 +44,8 @@ pub struct GpuMegaKernel {
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
+    bind_groups: [wgpu::BindGroup; 2],
+    active_config_idx: usize,
 
     // ── Async state readback (double-buffered, non-blocking) ──
     state_staging: [wgpu::Buffer; 2],
@@ -205,12 +206,20 @@ impl GpuMegaKernel {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let world_config_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_world_config"),
-            size: (WORLD_CONFIG_SIZE * 4) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let world_config_bufs = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mega_world_config_0"),
+                size: (WORLD_CONFIG_SIZE * 4) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mega_world_config_1"),
+                size: (WORLD_CONFIG_SIZE * 4) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
         let food_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mega_food_state"),
             size: ((f * FOOD_STATE_STRIDE * 4) as u64).max(4),
@@ -452,28 +461,34 @@ impl GpuMegaKernel {
             cache: None,
         });
 
-        // ── Create bind group ──
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mega_tick_bg"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0,  resource: agent_phys_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1,  resource: decision_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2,  resource: heightmap_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3,  resource: biome_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4,  resource: world_config_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5,  resource: food_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6,  resource: food_flags_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7,  resource: food_grid_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8,  resource: agent_grid_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9,  resource: collision_scratch_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: sensory_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: brain_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: pattern_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: history_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: brain_config_buf.as_entire_binding() },
-            ],
-        });
+        // ── Create bind groups (double-buffered on world_config) ──
+        let make_bind_group = |wc_buf: &wgpu::Buffer, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0,  resource: agent_phys_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1,  resource: decision_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2,  resource: heightmap_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3,  resource: biome_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4,  resource: wc_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5,  resource: food_state_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6,  resource: food_flags_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7,  resource: food_grid_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8,  resource: agent_grid_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9,  resource: collision_scratch_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: sensory_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: brain_state_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: pattern_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: history_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: brain_config_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_groups = [
+            make_bind_group(&world_config_bufs[0], "mega_tick_bg_0"),
+            make_bind_group(&world_config_bufs[1], "mega_tick_bg_1"),
+        ];
 
         Self {
             device,
@@ -484,7 +499,7 @@ impl GpuMegaKernel {
             decision_buf,
             heightmap_buf,
             biome_buf,
-            world_config_buf,
+            world_config_bufs,
             food_state_buf,
             food_flags_buf,
             food_grid_buf,
@@ -498,7 +513,8 @@ impl GpuMegaKernel {
             physics_pipeline,
             vision_pipeline,
             brain_pipeline,
-            bind_group,
+            bind_groups,
+            active_config_idx: 0,
             state_staging,
             staging_idx: 0,
             staging_in_flight: [false, false],
@@ -576,7 +592,7 @@ impl GpuMegaKernel {
             ticks_to_run,
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
-        self.queue.write_buffer(&self.world_config_buf, 0, bytemuck::cast_slice(&wc));
+        self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));
     }
 
     /// Dispatch with explicit phase mask (for profiling).
@@ -608,20 +624,20 @@ impl GpuMegaKernel {
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.physics_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                     pass.dispatch_workgroups(1, 1, 1);
                 }
                 if run_vision {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.dispatch_workgroups(self.agent_count, 1, 1);
                 }
                 if run_brain {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.dispatch_workgroups(self.agent_count, 1, 1);
                 }
             }
@@ -639,7 +655,7 @@ impl GpuMegaKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
@@ -647,6 +663,8 @@ impl GpuMegaKernel {
         encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[self.staging_idx], 0, buf_size);
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+
+        self.active_config_idx = 1 - self.active_config_idx;
     }
 
     /// Non-blocking: collect any ready staging buffers into state_cache.
@@ -674,18 +692,14 @@ impl GpuMegaKernel {
     /// Dispatch all ticks via alternating physics → vision → brain passes.
     /// Fully non-blocking: skips dispatch if the write-target staging buffer
     /// is still in flight (GPU backpressure).
-    /// Returns `(dispatched, state_updated)`.
-    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> (bool, bool) {
-        // Single non-blocking poll to advance GPU callbacks.
-        self.device.poll(wgpu::Maintain::Poll);
-
-        let collected = self.try_collect_staging();
-
+    /// Returns true if dispatched, false if skipped due to backpressure.
+    /// Caller is responsible for poll/collect via `try_collect_state()`.
+    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         // Check if the write-target staging buffer is free.
         let widx = self.staging_idx;
         if self.staging_in_flight[widx] {
             // GPU still busy — skip this dispatch to avoid blocking.
-            return (false, collected);
+            return false;
         }
 
         let n = self.agent_count as usize;
@@ -713,7 +727,7 @@ impl GpuMegaKernel {
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.physics_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                     pass.dispatch_workgroups(1, 1, 1);
                 }
@@ -722,7 +736,7 @@ impl GpuMegaKernel {
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.dispatch_workgroups(self.agent_count, 1, 1);
                 }
 
@@ -730,7 +744,7 @@ impl GpuMegaKernel {
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.dispatch_workgroups(self.agent_count, 1, 1);
                 }
             }
@@ -748,7 +762,7 @@ impl GpuMegaKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
@@ -769,7 +783,8 @@ impl GpuMegaKernel {
             });
         self.staging_in_flight[widx] = true;
         self.staging_idx = 1 - self.staging_idx;
-        (true, collected)
+        self.active_config_idx = 1 - self.active_config_idx;
+        true
     }
 
     /// Non-blocking poll + read staging. Returns true if new data was collected.

@@ -115,6 +115,8 @@ pub const P_MEMORY_CAP: usize = 21;
 pub const P_PROCESSING_SLOTS: usize = 22;
 pub const P_DEATH_COUNT: usize = 23;
 pub const PHYS_STRIDE: usize = 24;
+/// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
+pub const BRAIN_TICK_STRIDE: u32 = 4;
 
 // ── Food buffer layout (per food item) ───────────────────────────────
 

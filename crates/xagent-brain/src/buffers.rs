@@ -64,6 +64,10 @@ pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1;     // 8466
 pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1;         // 8467
 pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1;               // 8468
 
+/// Number of fixed-size fields from O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1.
+/// This tail is layout-independent: it doesn't change with feature_count / vision_rays.
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT;   // 468
+
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
 pub const O_PAT_STATES: usize = 0;
@@ -156,9 +160,9 @@ impl BrainLayout {
         let depth_count = vision_rays as usize;
         let feature_count = color_count + 25;
         let sensory_stride = color_count + depth_count + NON_VISUAL_COUNT;
-        // brain_stride = feature_count * DIM + DIM + DIM*DIM + 468
-        // (468 = fixed fields after O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1)
-        let brain_stride = feature_count * DIM + DIM + DIM * DIM + 468;
+        // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+        // (FIXED_TAIL_SIZE = fixed fields after O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1)
+        let brain_stride = feature_count * DIM + DIM + DIM * DIM + FIXED_TAIL_SIZE;
         Self {
             vision_w: w,
             vision_h: h,
@@ -750,7 +754,7 @@ mod tests {
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;
             let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
-            assert_eq!(layout.brain_stride, o_pred_ctx_wt + 468);
+            assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
         }
     }
 

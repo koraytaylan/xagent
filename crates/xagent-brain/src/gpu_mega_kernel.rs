@@ -513,6 +513,12 @@ impl GpuMegaKernel {
                 ", sgid",
             );
 
+            // Also replace brain_tick.wgsl's own markers (included via brain_fns_only)
+            mega_source = mega_source.replace(
+                "/* SUBGROUP_TOPK_PARAMS */",
+                ", sgid: u32",
+            );
+
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
             if let (Some(begin_pos), Some(end_pos)) = (mega_source.find(begin_marker), mega_source.find(end_marker)) {
@@ -526,6 +532,8 @@ impl GpuMegaKernel {
             mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_PARAMS */", "");
             mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_ARGS */", "");
             mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_INNER_ARGS */", "");
+            // Also strip brain_tick.wgsl's own markers
+            mega_source = mega_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
         }
 
         // ── Compose global-pass shader ──

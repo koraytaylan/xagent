@@ -147,6 +147,8 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with a fresh brain, assigned color, and zero death count.
     pub fn new(id: u32, position: Vec3, config: BrainConfig, tick: u64) -> Self {
+        let vw = config.vision_w;
+        let vh = config.vision_h;
         Self {
             id,
             body: AgentBody::new(position),
@@ -171,7 +173,7 @@ impl Agent {
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
             decision_log: std::collections::VecDeque::with_capacity(256),
-            cached_frame: SensoryFrame::new_blank(8, 6),
+            cached_frame: SensoryFrame::new_blank(vw, vh),
         }
     }
 
@@ -279,6 +281,8 @@ pub fn mutate_config_with_strength(
         max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
         fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
         fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
+        vision_w: parent.vision_w,
+        vision_h: parent.vision_h,
     }
 }
 
@@ -358,6 +362,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.fatigue_floor
         },
+        vision_w: a.vision_w,
+        vision_h: a.vision_h,
     }
 }
 

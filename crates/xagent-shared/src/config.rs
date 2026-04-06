@@ -41,6 +41,12 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
+    /// Visual field width in pixels. Default 8.
+    #[serde(default = "default_vision_w")]
+    pub vision_w: u32,
+    /// Visual field height in pixels. Default 6.
+    #[serde(default = "default_vision_h")]
+    pub vision_h: u32,
 }
 
 /// Configuration for the world simulation.
@@ -85,6 +91,14 @@ fn default_fatigue_recovery_sensitivity() -> f32 {
 
 fn default_fatigue_floor() -> f32 {
     0.1
+}
+
+fn default_vision_w() -> u32 {
+    8
+}
+
+fn default_vision_h() -> u32 {
+    6
 }
 
 fn default_seed() -> u64 {
@@ -201,6 +215,8 @@ impl Default for BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_w: 8,
+            vision_h: 6,
         }
     }
 }
@@ -220,6 +236,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_w: 8,
+            vision_h: 6,
         }
     }
 
@@ -237,6 +255,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_w: 8,
+            vision_h: 6,
         }
     }
 }
@@ -290,7 +310,7 @@ impl Default for AgentDescriptor {
             brain: BrainConfig::default(),
             max_energy: 100.0,
             max_integrity: 100.0,
-            visual_resolution: (16, 12),
+            visual_resolution: (8, 6),
             fov_degrees: 90.0,
         }
     }

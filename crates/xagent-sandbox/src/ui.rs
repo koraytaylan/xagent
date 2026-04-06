@@ -89,7 +89,7 @@ pub struct AgentSnapshot {
     pub motor_turn: f32,
     /// Current behavior phase label.
     pub phase: &'static str,
-    /// Agent's 8x6 visual field as RGBA floats (192 values: width*height*4).
+    /// Agent's visual field as RGBA floats (vision_w * vision_h * 4 values).
     pub vision_color: Vec<f32>,
     /// Visual field dimensions.
     pub vision_width: u32,
@@ -674,8 +674,8 @@ impl<'a> TabContext<'a> {
                         motor_turn: record.motor_turn,
                         phase: crate::replay::GenerationRecording::phase_label(record.phase),
                         vision_color: record.vision_color.clone().unwrap_or_default(),
-                        vision_width: 8,
-                        vision_height: 6,
+                        vision_width: rec.vision_w,
+                        vision_height: rec.vision_h,
                         position: record.position,
                         yaw: record.yaw,
                         mean_attenuation: record.mean_attenuation,
@@ -751,8 +751,8 @@ impl<'a> TabContext<'a> {
                             motor_turn: r.motor_turn,
                             phase: crate::replay::GenerationRecording::phase_label(r.phase),
                             vision_color: Vec::new(),
-                            vision_width: 8,
-                            vision_height: 6,
+                            vision_width: rec.vision_w,
+                            vision_height: rec.vision_h,
                             position: r.position,
                             yaw: r.yaw,
                             mean_attenuation: r.mean_attenuation,
@@ -1395,6 +1395,18 @@ impl<'a> TabContext<'a> {
                     ui.label("decay_rate");
                     ui.add(egui::DragValue::new(&mut b.decay_rate)
                         .range(0.0001..=1.0).speed(0.001).max_decimals(5));
+                    ui.end_row();
+
+                    ui.label("vision_w");
+                    let mut vw = b.vision_w as i32;
+                    ui.add(egui::DragValue::new(&mut vw).range(2..=32).speed(1));
+                    b.vision_w = vw.max(2) as u32;
+                    ui.end_row();
+
+                    ui.label("vision_h");
+                    let mut vh = b.vision_h as i32;
+                    ui.add(egui::DragValue::new(&mut vh).range(2..=32).speed(1));
+                    b.vision_h = vh.max(2) as u32;
                     ui.end_row();
                 });
         });

@@ -72,7 +72,7 @@ pub fn extract_senses_with_others(
 // ── vision ──────────────────────────────────────────────────────────────
 
 /// Low-resolution raycast sampling of terrain colors in front of the agent.
-/// Resolution is 8×6 (48 rays) with step size 1.0 for efficient marching.
+/// Resolution is driven by `vf.width × vf.height` with step size 1.0 for efficient marching.
 /// Also detects other agents along each ray. Writes into existing `vf` buffer.
 fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], vf: &mut VisualField) {
     let w = vf.width;

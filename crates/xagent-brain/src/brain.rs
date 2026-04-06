@@ -143,9 +143,10 @@ impl Brain {
         let homeostasis = HomeostaticMonitor::new(config.distress_exponent);
         let capacity = CapacityManager::new(config.processing_slots);
 
-        // Trigger encoder weight initialization with the standard 8×6 frame
-        // so feature_count() is available for GPU pipeline setup.
-        let blank = xagent_shared::SensoryFrame::new_blank(8, 6);
+        // Trigger encoder weight initialization with a frame matching the
+        // configured vision resolution so feature_count() is available for
+        // GPU pipeline setup.
+        let blank = xagent_shared::SensoryFrame::new_blank(config.vision_w, config.vision_h);
         let _ = encoder.encode(&blank);
 
         let repr_dim = config.representation_dim;
@@ -576,12 +577,15 @@ mod tests {
 
     #[test]
     fn encoder_feature_count_available_after_construction() {
-        let brain = Brain::new(BrainConfig::default());
+        let config = BrainConfig::default();
+        let vw = config.vision_w as usize;
+        let vh = config.vision_h as usize;
+        let brain = Brain::new(config);
         // feature_count must be > 0 immediately after construction
         // (GPU pipeline reads it before the first tick).
         let fc = brain.encoder.feature_count();
-        // 8×6 pixels × 4 channels (RGBD) + 25 non-visual (9 proprioceptive/interoceptive + 16 touch) = 217
-        assert_eq!(fc, 8 * 6 * 4 + 25, "feature_count should reflect 8×6 RGBD + non-visual features");
+        // vision_w × vision_h pixels × 4 channels (RGBD) + 25 non-visual (9 proprioceptive/interoceptive + 16 touch)
+        assert_eq!(fc, vw * vh * 4 + 25, "feature_count should reflect vision_w×vision_h RGBD + non-visual features");
     }
 
     #[test]
@@ -703,8 +707,10 @@ mod tests {
     #[test]
     fn tick_stores_motor_context_in_memory() {
         let config = BrainConfig::default();
+        let vw = config.vision_w;
+        let vh = config.vision_h;
         let mut brain = Brain::new(config);
-        let frame = SensoryFrame::new_blank(8, 6);
+        let frame = SensoryFrame::new_blank(vw, vh);
 
         // Tick a few times to build up state
         for _ in 0..10 {

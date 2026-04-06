@@ -1261,19 +1261,19 @@ impl<'a> TabContext<'a> {
                     ui.label("vision_rays");
                     let mut vr = b.vision_rays as i32;
                     ui.add(egui::DragValue::new(&mut vr).range(16..=96).speed(1));
-                    b.vision_rays = vr.max(16) as u32;
+                    b.vision_rays = vr.clamp(16, 96) as u32;
                     ui.end_row();
 
                     ui.label("brain_tick_stride");
                     let mut bts = b.brain_tick_stride as i32;
                     ui.add(egui::DragValue::new(&mut bts).range(1..=32).speed(1));
-                    b.brain_tick_stride = bts.max(1) as u32;
+                    b.brain_tick_stride = bts.clamp(1, 32) as u32;
                     ui.end_row();
 
                     ui.label("vision_stride");
                     let mut vs = b.vision_stride as i32;
                     ui.add(egui::DragValue::new(&mut vs).range(1..=50).speed(1));
-                    b.vision_stride = vs.max(1) as u32;
+                    b.vision_stride = vs.clamp(1, 50) as u32;
                     ui.end_row();
 
                     ui.label("metabolic_rate");

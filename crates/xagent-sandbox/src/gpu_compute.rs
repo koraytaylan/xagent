@@ -11,8 +11,7 @@
 //! # Performance
 //!
 //! For 50 agents × 48 rays each, one GPU dispatch is faster than CPU rayon.
-//! The caller uses `ComputeBackend::probe()` at startup to decide whether
-//! GPU is available.
+//! The caller probes for GPU availability at startup.
 
 use glam::Vec3;
 use wgpu::util::DeviceExt;
@@ -266,7 +265,7 @@ pub struct GpuVisionCompute {
 impl GpuVisionCompute {
     /// Create a new GPU vision compute pipeline.
     ///
-    /// Accepts device and queue from `ComputeBackend::GpuAccelerated`.
+    /// Accepts a pre-created wgpu device and queue.
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,

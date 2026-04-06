@@ -140,7 +140,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         let mut encoder: Option<wgpu::CommandEncoder> = None;
 
         while !governor.generation_complete() {
-            let brain_tick = (tick % 4) == 0;
+            let brain_tick = (tick % config.brain.brain_tick_stride as u64) == 0;
 
             let enc = encoder.get_or_insert_with(|| {
                 gpu_brain.device().create_command_encoder(&Default::default())

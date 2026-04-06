@@ -506,28 +506,39 @@ impl GpuMegaKernel {
         let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
         let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_masked"),
-        });
-
-        for cycle in 0..num_cycles {
-            let base_tick = start_tick + (cycle as u64) * (BRAIN_TICK_STRIDE as u64);
-            let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-                pass.dispatch_workgroups(1, 1, 1);
+        // Chunk cycles to avoid Metal command buffer deadlock (max ~200 passes per submit)
+        const CYCLES_PER_CHUNK: u32 = 100;
+        let mut cycle = 0u32;
+        while cycle < num_cycles {
+            let chunk_end = (cycle + CYCLES_PER_CHUNK).min(num_cycles);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dispatch_masked"),
+            });
+            for c in cycle..chunk_end {
+                let base_tick = start_tick + (c as u64) * (BRAIN_TICK_STRIDE as u64);
+                let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.physics_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                if run_brain {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.brain_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
             }
-            if run_brain {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.brain_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.dispatch_workgroups(self.agent_count, 1, 1);
-            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            cycle = chunk_end;
         }
 
+        // Remainder + readback in final submit
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dispatch_masked_final"),
+        });
         if remainder > 0 {
             let rem_base = start_tick + (num_cycles as u64) * (BRAIN_TICK_STRIDE as u64);
             let pc: [u32; 2] = [rem_base as u32, remainder];
@@ -539,7 +550,6 @@ impl GpuMegaKernel {
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }
-
         encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[self.staging_idx], 0, buf_size);
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
@@ -583,33 +593,43 @@ impl GpuMegaKernel {
         let num_cycles = ticks_to_run / BRAIN_TICK_STRIDE;
         let remainder = ticks_to_run % BRAIN_TICK_STRIDE;
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_batch"),
-        });
+        // Chunk cycles to avoid Metal command buffer deadlock (max ~200 passes per submit)
+        const CYCLES_PER_CHUNK: u32 = 100;
+        let mut cycle = 0u32;
+        while cycle < num_cycles {
+            let chunk_end = (cycle + CYCLES_PER_CHUNK).min(num_cycles);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dispatch_batch"),
+            });
+            for c in cycle..chunk_end {
+                let base_tick = start_tick + (c as u64) * (BRAIN_TICK_STRIDE as u64);
+                let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
 
-        for cycle in 0..num_cycles {
-            let base_tick = start_tick + (cycle as u64) * (BRAIN_TICK_STRIDE as u64);
-            let pc: [u32; 2] = [base_tick as u32, BRAIN_TICK_STRIDE];
+                // Physics + vision
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.physics_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
 
-            // Physics + vision
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-                pass.dispatch_workgroups(1, 1, 1);
+                // Brain (agent_count workgroups × 256 threads)
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.brain_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
             }
-
-            // Brain (agent_count workgroups × 256 threads)
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.brain_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.dispatch_workgroups(self.agent_count, 1, 1);
-            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            cycle = chunk_end;
         }
 
-        // Remainder: physics + vision only (no brain)
+        // Final submit: remainder + async state readback
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dispatch_batch_final"),
+        });
         if remainder > 0 {
             let rem_base = start_tick + (num_cycles as u64) * (BRAIN_TICK_STRIDE as u64);
             let pc: [u32; 2] = [rem_base as u32, remainder];

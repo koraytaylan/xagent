@@ -1318,14 +1318,17 @@ impl ApplicationHandler for App {
                             let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
                             if dispatched {
-                                // Adapt budget: keep dispatch under ~8ms.
-                                if wall_ms > 10.0 {
+                                // Grow budget aggressively — staging double-buffer
+                                // is the real throttle (dispatch_batch returns false
+                                // when both are in-flight). Only shrink if CPU
+                                // encoding takes so long it stalls the render loop.
+                                if wall_ms > 50.0 {
                                     self.gpu_tick_budget =
-                                        (self.gpu_tick_budget / 2).max(4);
-                                } else if wall_ms < 4.0 {
+                                        (self.gpu_tick_budget * 3 / 4).max(32);
+                                } else {
                                     self.gpu_tick_budget =
-                                        (self.gpu_tick_budget + self.gpu_tick_budget / 10 + 1)
-                                            .min(4000);
+                                        (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1)
+                                            .min(64_000);
                                 }
 
                                 self.tick += ticks_to_run as u64;

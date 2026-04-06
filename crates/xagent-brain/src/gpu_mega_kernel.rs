@@ -62,6 +62,7 @@ pub struct GpuMegaKernel {
     world_config: WorldConfig,
     layout: BrainLayout,
     brain_tick_stride: u32,
+    has_subgroup: bool, // retained for runtime diagnostics
 }
 
 impl GpuMegaKernel {
@@ -156,6 +157,13 @@ impl GpuMegaKernel {
 
         log::info!("[GpuMegaKernel] Adapter: {:?}", adapter.get_info());
 
+        let has_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if has_subgroup {
+            log::info!("[GpuMegaKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
+        } else {
+            log::info!("[GpuMegaKernel] No subgroup support — using shared-memory-only bitonic sort");
+        }
+
         let adapter_limits = adapter.limits();
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_storage_buffer_binding_size =
@@ -163,10 +171,16 @@ impl GpuMegaKernel {
         required_limits.max_storage_buffers_per_shader_stage =
             adapter_limits.max_storage_buffers_per_shader_stage.min(16);
 
+        let required_features = if has_subgroup {
+            wgpu::Features::PUSH_CONSTANTS | wgpu::Features::SUBGROUP
+        } else {
+            wgpu::Features::PUSH_CONSTANTS
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("gpu-mega-kernel"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features,
                 required_limits: {
                     required_limits.max_push_constant_size = 8;
                     required_limits
@@ -358,11 +372,110 @@ impl GpuMegaKernel {
         .join("\n");
 
         // ── Compose brain shader ──
-        let brain_source = [
-            &common_src,
-            include_str!("shaders/mega/brain_tick.wgsl"),
-        ]
-        .join("\n");
+        let mut brain_source = format!("{}\n{}", &common_src, include_str!("shaders/mega/brain_tick.wgsl"));
+
+        if has_subgroup {
+            // Add subgroup builtins to entry point
+            brain_source = brain_source.replace(
+                "// SUBGROUP_ENTRY_PARAMS",
+                "@builtin(subgroup_invocation_id) sgid: u32,",
+            );
+
+            // Add sgid to coop_recall_topk signature and call
+            brain_source = brain_source.replace(
+                "/* SUBGROUP_TOPK_PARAMS */",
+                ", sgid: u32",
+            );
+            brain_source = brain_source.replace(
+                "/* SUBGROUP_TOPK_ARGS */",
+                ", sgid",
+            );
+
+            // Replace bitonic sort with subgroup-accelerated version
+            let subgroup_sort = r#"
+    // ── Subgroup-accelerated stages 0–4 (15 barrier-free passes) ──
+    // Each of 128 threads holds one element in registers.
+    // subgroupShuffle exchanges values within 32-wide subgroups.
+    var my_val: f32 = -3.0;
+    var my_idx: u32 = 0u;
+    if (tid < MEMORY_CAP) {
+        my_val = s_similarities[tid];
+        my_idx = s_sort_idx[tid];
+    }
+
+    for (var stage: u32 = 0u; stage < 5u; stage = stage + 1u) {
+        for (var step: u32 = 0u; step <= stage; step = step + 1u) {
+            if (tid < MEMORY_CAP) {
+                let half = 1u << (stage - step);
+                let partner_tid = tid ^ half;
+                let partner_val = subgroupShuffle(my_val, sgid ^ half);
+                let partner_idx = subgroupShuffle(my_idx, sgid ^ half);
+
+                let i = min(tid, partner_tid);
+                let descending = ((i >> (stage + 1u)) & 1u) == 0u;
+                let i_am_low = tid < partner_tid;
+                let want_max = i_am_low == descending;
+                if ((my_val < partner_val) == want_max) {
+                    my_val = partner_val;
+                    my_idx = partner_idx;
+                }
+            }
+            // No barrier needed — subgroup ops are synchronous within subgroup
+        }
+    }
+
+    // Write back to shared memory for stages 5–6
+    if (tid < MEMORY_CAP) {
+        s_similarities[tid] = my_val;
+        s_sort_idx[tid] = my_idx;
+    }
+    workgroupBarrier();
+
+    // ── Shared-memory stages 5–6 (13 passes with barriers) ──
+    for (var stage: u32 = 5u; stage < 7u; stage = stage + 1u) {
+        for (var step: u32 = 0u; step <= stage; step = step + 1u) {
+            if (tid < 64u) {
+                let block_size = 1u << (stage + 1u - step);
+                let half = block_size >> 1u;
+                let group = tid / half;
+                let local_id = tid % half;
+                let i = group * block_size + local_id;
+                let j = i + half;
+                let descending = ((i >> (stage + 1u)) & 1u) == 0u;
+
+                let val_i = s_similarities[i];
+                let val_j = s_similarities[j];
+                let idx_i = s_sort_idx[i];
+                let idx_j = s_sort_idx[j];
+
+                let should_swap = (descending && val_i < val_j) || (!descending && val_i > val_j);
+                if (should_swap) {
+                    s_similarities[i] = val_j;
+                    s_similarities[j] = val_i;
+                    s_sort_idx[i] = idx_j;
+                    s_sort_idx[j] = idx_i;
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+"#;
+
+            // Find and replace the bitonic sort block
+            let begin_marker = "// BEGIN_BITONIC_SORT";
+            let end_marker = "// END_BITONIC_SORT";
+            if let (Some(begin_pos), Some(end_pos)) = (brain_source.find(begin_marker), brain_source.find(end_marker)) {
+                let end_pos = end_pos + end_marker.len();
+                brain_source.replace_range(begin_pos..end_pos, subgroup_sort);
+            } else {
+                log::error!("[GpuMegaKernel] Subgroup sort markers not found in brain shader — falling back to shared-memory sort");
+            }
+        } else {
+            // Remove placeholder comments for non-subgroup path
+            brain_source = brain_source.replace("// SUBGROUP_ENTRY_PARAMS\n", "");
+            brain_source = brain_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
+            brain_source = brain_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
+        }
 
         // ── Explicit bind group layout (all 16 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
@@ -555,6 +668,7 @@ impl GpuMegaKernel {
             world_config: world_config.clone(),
             layout,
             brain_tick_stride,
+            has_subgroup,
         }
     }
 

@@ -2,7 +2,7 @@
 // dispatch(agent_count, 1, 1) — one workgroup per agent.
 // 256 threads cooperate on the 7 brain passes via shared memory.
 
-// ── Shared memory (~2 KB) ──────────────────────────────────────────────────
+// ── Shared memory (~2.5 KB) ────────────────────────────────────────────────
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, 32>;
@@ -187,7 +187,7 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
 // Pass 5: Top-K selection (64 threads — parallel bitonic sort of 128 shared values)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn coop_recall_topk(agent_id: u32, tid: u32) {
+fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
     let p_base = agent_id * PATTERN_STRIDE;
     let b_base = agent_id * BRAIN_STRIDE;
     let tick = brain_state[b_base + O_TICK_COUNT];
@@ -690,6 +690,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
 fn brain_tick(
     @builtin(local_invocation_id) lid: vec3u,
     @builtin(workgroup_id) wgid: vec3u,
+    // SUBGROUP_ENTRY_PARAMS
 ) {
     let agent_id = wgid.x;
     let tid = lid.x;
@@ -709,7 +710,7 @@ fn brain_tick(
     coop_recall_score(agent_id, tid);
     workgroupBarrier();
 
-    coop_recall_topk(agent_id, tid);
+    coop_recall_topk(agent_id, tid /* SUBGROUP_TOPK_ARGS */);
     storageBarrier(); workgroupBarrier();
 
     coop_predict_and_act(agent_id, tid);

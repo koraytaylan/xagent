@@ -146,6 +146,12 @@ pub struct Agent {
     pub fatigue_history: std::collections::VecDeque<f32>,
     /// Pre-allocated sensory frame buffer, reused each tick to avoid heap churn.
     pub cached_frame: SensoryFrame,
+    /// Cached brain telemetry from GPU readback (updated periodically for selected agent).
+    pub cached_urgency: f32,
+    pub cached_gradient: f32,
+    pub cached_mean_attenuation: f32,
+    pub cached_curiosity_bonus: f32,
+    pub cached_motor_variance: f32,
 }
 
 impl Agent {
@@ -179,6 +185,11 @@ impl Agent {
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
             cached_frame: SensoryFrame::new_blank(8, 6),
+            cached_urgency: 0.0,
+            cached_gradient: 0.0,
+            cached_mean_attenuation: 0.0,
+            cached_curiosity_bonus: 0.0,
+            cached_motor_variance: 0.0,
         }
     }
 

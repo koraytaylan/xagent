@@ -1,6 +1,6 @@
 # Vision-Stride Fused Mega-Kernel Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace 3-passes-per-brain-cycle dispatch with a fused mega-kernel that runs N brain cycles in a single GPU dispatch, achieving 60k+ brain TPS at 10 agents.
 
@@ -19,7 +19,7 @@
 - Modify: `crates/xagent-brain/src/shaders/mega/common.wgsl:199-222` (WGSL WC_* constants)
 - Test: `crates/xagent-brain/src/buffers.rs` (existing test module)
 
-- [ ] **Step 1: Write test for vision_stride in BrainConfig**
+- [x] **Step 1: Write test for vision_stride in BrainConfig**
 
 In `crates/xagent-shared/src/config.rs`, add a test (at the bottom, inside the existing `#[cfg(test)]` module if one exists, or create one):
 
@@ -31,12 +31,12 @@ fn vision_stride_defaults_to_10() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p xagent-shared vision_stride_defaults`
 Expected: FAIL — `vision_stride` field doesn't exist yet.
 
-- [ ] **Step 3: Add vision_stride field to BrainConfig**
+- [x] **Step 3: Add vision_stride field to BrainConfig**
 
 In `crates/xagent-shared/src/config.rs`, add to `BrainConfig` struct after the `brain_tick_stride` field (line ~51):
 
@@ -56,12 +56,12 @@ fn default_vision_stride() -> u32 { 10 }
 
 Also add `vision_stride: 10,` to any preset constructors (e.g. `BrainConfig::default()` impl or `new()` methods) that exist in this file.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p xagent-shared vision_stride_defaults`
 Expected: PASS
 
-- [ ] **Step 5: Add WC_VISION_STRIDE constant to buffers.rs**
+- [x] **Step 5: Add WC_VISION_STRIDE constant to buffers.rs**
 
 In `crates/xagent-brain/src/buffers.rs`, after `WC_PHASE_MASK` (line 224):
 
@@ -71,7 +71,7 @@ pub const WC_VISION_STRIDE: usize = 22;
 
 `WORLD_CONFIG_SIZE` is already 24 (padded to 6 × vec4), so slot 22 fits without changing the size.
 
-- [ ] **Step 6: Populate WC_VISION_STRIDE in build_world_config**
+- [x] **Step 6: Populate WC_VISION_STRIDE in build_world_config**
 
 The function `build_world_config` at line 561 doesn't take `BrainConfig`. We need to add vision_stride as a parameter. Change the signature:
 
@@ -96,7 +96,7 @@ Then update all call sites of `build_world_config` to pass vision_stride. Search
 
 For now, to keep things compiling, pass `10` as a literal at existing call sites. Task 6 will replace these with the actual config value.
 
-- [ ] **Step 7: Add WC_VISION_STRIDE to common.wgsl**
+- [x] **Step 7: Add WC_VISION_STRIDE to common.wgsl**
 
 In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_PHASE_MASK` (line 222):
 
@@ -104,12 +104,12 @@ In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_PHASE_MASK` (li
 const WC_VISION_STRIDE: u32 = 22u;
 ```
 
-- [ ] **Step 8: Run full test suite**
+- [x] **Step 8: Run full test suite**
 
 Run: `cargo test -p xagent-brain`
 Expected: All existing tests pass. The new constant is unused in shaders for now.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/xagent-shared/src/config.rs crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/mega/common.wgsl
@@ -129,7 +129,7 @@ git commit -m "feat: add vision_stride config and WC_VISION_STRIDE uniform slot"
 
 This is the core shader. It composes per-agent physics + brute-force food detection + death/respawn + brain into one entry point with a vision_stride cycle loop. The shader file does NOT include `common.wgsl` or the brain functions — those are concatenated at compile time in Rust (Task 5).
 
-- [ ] **Step 1: Create mega_tick.wgsl with shared memory declarations**
+- [x] **Step 1: Create mega_tick.wgsl with shared memory declarations**
 
 Create `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`:
 
@@ -521,14 +521,14 @@ fn mega_tick(
 }
 ```
 
-- [ ] **Step 2: Verify the shader file is syntactically valid by checking it compiles**
+- [x] **Step 2: Verify the shader file is syntactically valid by checking it compiles**
 
 This file will be compiled as part of Task 5 (shader composition). For now, verify it's well-formed by checking no obvious syntax errors.
 
 Run: `wc -l crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`
 Expected: ~300 lines, file exists.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/xagent-brain/src/shaders/mega/mega_tick.wgsl
@@ -545,7 +545,7 @@ git commit -m "feat: add mega_tick.wgsl — fused per-agent physics+food+death+b
 
 The global pass contains only the phases that need cross-agent data: grid clearing, food grid build, food respawn, agent grid build, and collision (3× accumulate + apply). Dispatched as `(1, 1, 1)` — single workgroup, same as current physics.
 
-- [ ] **Step 1: Create global_tick.wgsl**
+- [x] **Step 1: Create global_tick.wgsl**
 
 Create `crates/xagent-brain/src/shaders/mega/global_tick.wgsl`:
 
@@ -588,12 +588,12 @@ fn global_tick(@builtin(local_invocation_id) lid: vec3u) {
 }
 ```
 
-- [ ] **Step 2: Verify file exists**
+- [x] **Step 2: Verify file exists**
 
 Run: `wc -l crates/xagent-brain/src/shaders/mega/global_tick.wgsl`
 Expected: ~35 lines, file exists.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/xagent-brain/src/shaders/mega/global_tick.wgsl
@@ -611,7 +611,7 @@ git commit -m "feat: add global_tick.wgsl — grid rebuild and collision pass"
 
 The mega-kernel shader reads `brain_tick_stride` from the world config uniform via `wc_u32(WC_BRAIN_TICK_STRIDE)`. Currently this value only lives on the Rust side. We need a uniform slot for it.
 
-- [ ] **Step 1: Add WC_BRAIN_TICK_STRIDE constant to buffers.rs**
+- [x] **Step 1: Add WC_BRAIN_TICK_STRIDE constant to buffers.rs**
 
 In `crates/xagent-brain/src/buffers.rs`, after `WC_VISION_STRIDE` (added in Task 1):
 
@@ -621,7 +621,7 @@ pub const WC_BRAIN_TICK_STRIDE: usize = 23;
 
 This uses the last slot in the 24-element (6 × vec4) uniform. No size change needed.
 
-- [ ] **Step 2: Populate WC_BRAIN_TICK_STRIDE in build_world_config**
+- [x] **Step 2: Populate WC_BRAIN_TICK_STRIDE in build_world_config**
 
 Add a `brain_tick_stride: u32` parameter to `build_world_config`:
 
@@ -645,7 +645,7 @@ Add before the return:
 
 Update all call sites to pass the brain_tick_stride value (same as Task 1 for vision_stride — pass `self.brain_tick_stride`). If Task 1 used a literal, update it here too.
 
-- [ ] **Step 3: Add WC_BRAIN_TICK_STRIDE to common.wgsl**
+- [x] **Step 3: Add WC_BRAIN_TICK_STRIDE to common.wgsl**
 
 In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_VISION_STRIDE`:
 
@@ -653,12 +653,12 @@ In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_VISION_STRIDE`:
 const WC_BRAIN_TICK_STRIDE: u32 = 23u;
 ```
 
-- [ ] **Step 4: Run full test suite**
+- [x] **Step 4: Run full test suite**
 
 Run: `cargo test -p xagent-brain`
 Expected: All tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/mega/common.wgsl
@@ -676,7 +676,7 @@ git commit -m "feat: add WC_BRAIN_TICK_STRIDE uniform slot for mega-kernel shade
 
 This task adds the `mega_pipeline` and `global_pipeline` to the struct, composes their shaders, creates their pipeline objects, and stores `vision_stride`. The old `physics_pipeline` and `brain_pipeline` are **kept** for now (Task 7 removes them). The dispatch loop is updated in Task 6.
 
-- [ ] **Step 1: Add new fields to GpuMegaKernel struct**
+- [x] **Step 1: Add new fields to GpuMegaKernel struct**
 
 In the struct definition (line ~20), add after `brain_pipeline`:
 
@@ -686,7 +686,7 @@ In the struct definition (line ~20), add after `brain_pipeline`:
     vision_stride: u32,
 ```
 
-- [ ] **Step 2: Compose mega-kernel shader source**
+- [x] **Step 2: Compose mega-kernel shader source**
 
 In the `new()` function, after the brain shader composition block (after line ~478), add:
 
@@ -749,7 +749,7 @@ In the `new()` function, after the brain shader composition block (after line ~4
 
 **Important:** The `subgroup_sort` variable used for the brain shader (line ~395-462) must be extracted into a local `let` binding BEFORE the brain shader block so it can be reused here. Move the `let subgroup_sort = r#"..."#;` declaration to before `if has_subgroup {` for the brain shader, so both blocks can reference it.
 
-- [ ] **Step 3: Compose global shader source**
+- [x] **Step 3: Compose global shader source**
 
 After the mega shader composition:
 
@@ -767,7 +767,7 @@ After the mega shader composition:
         .join("\n");
 ```
 
-- [ ] **Step 4: Create mega and global pipelines**
+- [x] **Step 4: Create mega and global pipelines**
 
 After the existing prepare_pipeline creation (line ~604):
 
@@ -811,7 +811,7 @@ After the existing prepare_pipeline creation (line ~604):
         });
 ```
 
-- [ ] **Step 5: Store new fields in the struct constructor return**
+- [x] **Step 5: Store new fields in the struct constructor return**
 
 In the `GpuMegaKernel { ... }` return at the end of `new()` (around line 670), add:
 
@@ -821,7 +821,7 @@ In the `GpuMegaKernel { ... }` return at the end of `new()` (around line 670), a
             vision_stride: brain_config.vision_stride,
 ```
 
-- [ ] **Step 6: Update upload_world_config_masked to pass vision_stride and brain_tick_stride**
+- [x] **Step 6: Update upload_world_config_masked to pass vision_stride and brain_tick_stride**
 
 In `upload_world_config_masked` (line ~732), update the `build_world_config` call:
 
@@ -837,12 +837,12 @@ In `upload_world_config_masked` (line ~732), update the `build_world_config` cal
         );
 ```
 
-- [ ] **Step 7: Run compile check**
+- [x] **Step 7: Run compile check**
 
 Run: `cargo check -p xagent-brain`
 Expected: Compiles without errors. The new pipelines exist but aren't dispatched yet.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/xagent-brain/src/gpu_mega_kernel.rs
@@ -858,7 +858,7 @@ git commit -m "feat: wire mega_pipeline and global_pipeline in GpuMegaKernel"
 
 Replace the per-cycle physics→vision→brain loop with mega-kernel + global pass dispatches.
 
-- [ ] **Step 1: Rewrite dispatch_batch**
+- [x] **Step 1: Rewrite dispatch_batch**
 
 Replace the body of `dispatch_batch` (lines 850-948) with:
 
@@ -987,7 +987,7 @@ Replace the body of `dispatch_batch` (lines 850-948) with:
 - `upload_world_config_masked` is called per mega-batch (not once) since the tick changes.
 - Physics remainder (ticks that don't fill a full brain cycle) still uses the old physics_pipeline.
 
-- [ ] **Step 2: Handle the vision_stride in the world config upload**
+- [x] **Step 2: Handle the vision_stride in the world config upload**
 
 The mega-kernel reads `WC_VISION_STRIDE` from the uniform, but we might be running a remainder batch with fewer cycles. We need to temporarily override vision_stride for remainder batches.
 
@@ -1017,17 +1017,17 @@ Then in dispatch_batch, replace the `self.upload_world_config_masked(tick_cursor
 
 This ensures the GPU shader loops exactly `cycles_this_batch` times (which equals `vision_stride` for full batches and `remainder_cycles` for the last batch).
 
-- [ ] **Step 3: Run compile check**
+- [x] **Step 3: Run compile check**
 
 Run: `cargo check -p xagent-brain`
 Expected: Compiles. The old dispatch code is replaced.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p xagent-brain`
 Expected: All existing tests pass.
 
-- [ ] **Step 5: Run the sandbox and verify it works**
+- [x] **Step 5: Run the sandbox and verify it works**
 
 Run: `cargo run -p xagent-sandbox --release`
 
@@ -1039,7 +1039,7 @@ Check the diagnostic log output for:
 - Brain TPS in the thousands
 - No GPU errors or panics
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/xagent-brain/src/gpu_mega_kernel.rs
@@ -1054,7 +1054,7 @@ git commit -m "feat: replace per-cycle dispatch with mega+global dispatch loop"
 - Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs` (remove dispatch_batch_masked if unused)
 - Modify: `crates/xagent-sandbox/src/main.rs` (remove diagnostic logging fields/code)
 
-- [ ] **Step 1: Remove diagnostic logging from main.rs**
+- [x] **Step 1: Remove diagnostic logging from main.rs**
 
 Remove the diagnostic fields added during performance investigation (lines ~297-301):
 - `diag_dispatch_count`
@@ -1065,23 +1065,23 @@ Remove the diagnostic fields added during performance investigation (lines ~297-
 
 Remove the diagnostic logging block (lines ~1331-1354) that prints every 2 seconds.
 
-- [ ] **Step 2: Evaluate dispatch_batch_masked**
+- [x] **Step 2: Evaluate dispatch_batch_masked**
 
 Check if `dispatch_batch_masked` is still called anywhere. If only used for profiling and not called in production code, leave it but mark it `#[allow(dead_code)]`. If it's actively used, keep it and update it to use the new mega dispatch pattern too.
 
 Run: `grep -rn "dispatch_batch_masked" crates/`
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p xagent-sandbox`
 Expected: All tests pass.
 
-- [ ] **Step 4: Run the sandbox end-to-end**
+- [x] **Step 4: Run the sandbox end-to-end**
 
 Run: `cargo run -p xagent-sandbox --release`
 Verify: normal operation at 1x and 1000x speed, no panics.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/xagent-sandbox/src/main.rs crates/xagent-brain/src/gpu_mega_kernel.rs

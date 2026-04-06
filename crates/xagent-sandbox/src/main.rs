@@ -1374,6 +1374,22 @@ impl ApplicationHandler for App {
                                 }
                             }
 
+                            // Telemetry readback for the selected agent (vision, motor, brain stats)
+                            if self.selected_agent_idx < self.agents.len() {
+                                let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
+                                let tel = mk.read_agent_telemetry(brain_idx);
+                                let a = &mut self.agents[self.selected_agent_idx];
+                                a.cached_motor.forward = tel.motor_fwd;
+                                a.cached_motor.turn = tel.motor_turn;
+                                a.cached_frame.vision.color = tel.vision_color;
+                                a.cached_urgency = tel.urgency;
+                                a.cached_gradient = tel.gradient;
+                                a.cached_mean_attenuation = tel.mean_attenuation;
+                                a.cached_curiosity_bonus = tel.curiosity_bonus;
+                                a.cached_fatigue_factor = tel.fatigue_factor;
+                                a.cached_motor_variance = tel.motor_variance;
+                            }
+
                             self.food_dirty = true;
                         }
 
@@ -1387,8 +1403,8 @@ impl ApplicationHandler for App {
                             }
                         }
 
-                        // Sparkline histories + CSV logging: only at 1x speed
-                        if self.speed_multiplier <= 1 {
+                        // Sparkline histories + CSV logging
+                        {
                             if let Some(world) = &self.world {
                                 for agent in &mut self.agents {
                                     record_agent_histories(agent);
@@ -1741,8 +1757,8 @@ impl ApplicationHandler for App {
                                         exploration_rate_history: tail(&a.exploration_rate_history),
                                         energy_history: tail(&a.energy_history),
                                         integrity_history: tail(&a.integrity_history),
-                                        gradient: 0.0,  // GPU telemetry TBD
-                                        urgency: 0.0,   // GPU telemetry TBD
+                                        gradient: a.cached_gradient,
+                                        urgency: a.cached_urgency,
                                         food_consumed: a.food_consumed,
                                         total_ticks_alive: a.total_ticks_alive,
                                         motor_forward: a.cached_motor.forward,
@@ -1757,10 +1773,10 @@ impl ApplicationHandler for App {
                                             a.body.body.position.z,
                                         ],
                                         yaw: a.body.yaw,
-                                        mean_attenuation: 0.0, // GPU telemetry TBD
-                                        curiosity_bonus: 0.0,  // GPU telemetry TBD
-                                        fatigue_factor: 1.0,   // GPU telemetry TBD
-                                        motor_variance: 0.0,   // GPU telemetry TBD
+                                        mean_attenuation: a.cached_mean_attenuation,
+                                        curiosity_bonus: a.cached_curiosity_bonus,
+                                        fatigue_factor: a.cached_fatigue_factor,
+                                        motor_variance: a.cached_motor_variance,
                                         fatigue_history: tail(&a.fatigue_history),
                                     }
                                 }).collect();

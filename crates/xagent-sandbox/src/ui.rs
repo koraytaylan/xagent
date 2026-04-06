@@ -1270,6 +1270,12 @@ impl<'a> TabContext<'a> {
                     b.brain_tick_stride = bts.max(1) as u32;
                     ui.end_row();
 
+                    ui.label("vision_stride");
+                    let mut vs = b.vision_stride as i32;
+                    ui.add(egui::DragValue::new(&mut vs).range(1..=50).speed(1));
+                    b.vision_stride = vs.max(1) as u32;
+                    ui.end_row();
+
                     ui.label("metabolic_rate");
                     ui.add(egui::DragValue::new(&mut b.metabolic_rate)
                         .range(0.01..=5.0).speed(0.01).max_decimals(2));

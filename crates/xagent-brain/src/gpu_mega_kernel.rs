@@ -11,6 +11,20 @@ use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::buffers::*;
 
+/// Lightweight telemetry for one agent's vision, motor, and brain-state readback.
+#[derive(Clone, Debug)]
+pub struct AgentTelemetry {
+    pub vision_color: Vec<f32>,
+    pub motor_fwd: f32,
+    pub motor_turn: f32,
+    pub mean_attenuation: f32,
+    pub curiosity_bonus: f32,
+    pub fatigue_factor: f32,
+    pub motor_variance: f32,
+    pub urgency: f32,
+    pub gradient: f32,
+}
+
 /// Terrain heightmap vertices per side.
 const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
@@ -1186,5 +1200,70 @@ impl GpuMegaKernel {
         out.extend_from_slice(floats);
         drop(data);
         staging.unmap();
+    }
+
+    /// Blocking readback of sensory, decision, and key brain-state data for one agent.
+    /// Returns (vision_rgba, motor_fwd, motor_turn, habituation_mean, curiosity, fatigue, motor_variance, urgency, gradient).
+    pub fn read_agent_telemetry(&self, index: u32) -> AgentTelemetry {
+        let i = index as usize;
+
+        // Sensory: read vision color portion (RGBA for each ray)
+        let sensory_offset = (i * SENSORY_STRIDE * 4) as u64;
+        let sensory_size = (SENSORY_STRIDE * 4) as u64;
+        let mut sensory = Vec::with_capacity(SENSORY_STRIDE);
+        self.read_buffer_range(&self.sensory_buf, sensory_offset, sensory_size, &mut sensory);
+        let vision_color: Vec<f32> = sensory[..VISION_COLOR_COUNT].to_vec();
+
+        // Decision: read motor outputs (last 4 floats of DECISION_STRIDE)
+        let dec_offset = (i * DECISION_STRIDE * 4) as u64;
+        let dec_size = (DECISION_STRIDE * 4) as u64;
+        let mut decision = Vec::with_capacity(DECISION_STRIDE);
+        self.read_buffer_range(&self.decision_buf, dec_offset, dec_size, &mut decision);
+        let motor_base = DIM + DIM; // prediction(32) + credit(32)
+        let motor_fwd = decision[motor_base];
+        let motor_turn = decision[motor_base + 1];
+
+        // Brain state: read key fields
+        let bs = self.layout.brain_stride;
+        let brain_offset = (i * bs * 4) as u64;
+        let brain_size = (bs * 4) as u64;
+        let mut brain = Vec::with_capacity(bs);
+        self.read_buffer_range(&self.brain_state_buf, brain_offset, brain_size, &mut brain);
+
+        // Habituation: mean of attenuation values (DIM floats at O_HAB_ATTEN)
+        let atten_sum: f32 = brain[O_HAB_ATTEN..O_HAB_ATTEN + DIM].iter().sum();
+        let mean_attenuation = atten_sum / DIM as f32;
+
+        // Curiosity bonus: 1.0 - mean_attenuation (higher attenuation = less curious)
+        let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
+
+        // Fatigue factor
+        let fatigue_factor = brain[O_FATIGUE_FACTOR];
+
+        // Motor variance: compute variance of recent motor commands from fatigue rings
+        let fwd_ring = &brain[O_FATIGUE_FWD_RING..O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN];
+        let turn_ring = &brain[O_FATIGUE_TURN_RING..O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN];
+        let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
+        let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
+        let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>() / ACTION_HISTORY_LEN as f32;
+        let turn_var: f32 = turn_ring.iter().map(|x| (x - turn_mean).powi(2)).sum::<f32>() / ACTION_HISTORY_LEN as f32;
+        let motor_variance = (fwd_var + turn_var) / 2.0;
+
+        // Homeostasis: urgency from EMA gradients
+        let homeo = &brain[O_HOMEO..O_HOMEO + 6];
+        let gradient = homeo[0]; // grad
+        let urgency = homeo[2];  // urgency
+
+        AgentTelemetry {
+            vision_color,
+            motor_fwd,
+            motor_turn,
+            mean_attenuation,
+            curiosity_bonus,
+            fatigue_factor,
+            motor_variance,
+            urgency,
+            gradient,
+        }
     }
 }

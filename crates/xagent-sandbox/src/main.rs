@@ -1291,7 +1291,11 @@ impl ApplicationHandler for App {
                                         state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
                                     a.food_consumed = state[base + P_FOOD_COUNT] as u32;
                                     a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
-                                    a.death_count = state[base + P_DEATH_COUNT] as u32;
+                                    let new_deaths = state[base + P_DEATH_COUNT] as u32;
+                                    if new_deaths > a.death_count {
+                                        a.reset_trail();
+                                    }
+                                    a.death_count = new_deaths;
                                     a.body.body.facing = Vec3::new(
                                         state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
                                 }

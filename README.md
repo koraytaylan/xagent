@@ -73,11 +73,20 @@ Sandbox                          Brain
 
 ## 3. The Cognitive Architecture
 
-Each tick, all agent brains execute simultaneously on GPU via 7 compute shader passes:
+Each agent brain is a 7-stage predictive processing pipeline running entirely on GPU:
 
 ```
 feature_extract → encode → habituate_homeo → recall_score → recall_topk → predict_and_act → learn_and_store
 ```
+
+### Dispatch Modes
+
+Two dispatch modes are available:
+
+- **GpuBrain (7-pass)**: One compute dispatch per pass per tick, one thread per agent (`@workgroup_size(1)`). Simple, inspectable, used for small-scale experiments.
+- **GpuMegaKernel (fused)**: All per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) fused into a single dispatch per `vision_stride` cycles. Each agent gets a 256-thread workgroup. A separate global pass handles grid rebuild, collisions, and vision raycasting. This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement over per-tick dispatch.
+
+The `vision_stride` parameter (default 10) controls how many brain+physics cycles run between global passes (grid rebuild, collision, vision). Higher values mean more brain throughput but less frequent sensory updates.
 
 ### Step-by-Step
 
@@ -274,6 +283,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `max_curiosity_bonus` | Exploration boost ceiling from monotony (default 0.6). Higher → stronger curiosity drive. Heritable. |
 | `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
 | `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
+| `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
+| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
+| `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
+| `metabolic_rate` | Multiplier for all energy costs (default 1.0). Lower → agents survive longer. |
+| `integrity_scale` | Multiplier for integrity damage and regen (default 1.0). Higher → deadlier hazards. |
 
 ### World Presets
 
@@ -300,7 +314,12 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "habituation_sensitivity": 20.0,
     "max_curiosity_bonus": 0.6,
     "fatigue_recovery_sensitivity": 8.0,
-    "fatigue_floor": 0.1
+    "fatigue_floor": 0.1,
+    "vision_rays": 48,
+    "brain_tick_stride": 4,
+    "vision_stride": 10,
+    "metabolic_rate": 1.0,
+    "integrity_scale": 1.0
   },
   "world": {
     "world_size": 256.0,
@@ -416,8 +435,9 @@ xagent/
 │   ├── xagent-brain/           # GPU-resident cognitive architecture
 │   │   ├── README.md           # Deep dive into brain internals
 │   │   └── src/
-│   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry
+│   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
 │   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
+│   │       ├── gpu_mega_kernel.rs  # GpuMegaKernel — fused dispatch, telemetry readback
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
 │   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
@@ -426,7 +446,11 @@ xagent/
 │   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
 │   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
 │   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
-│   │           └── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
+│   │           ├── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
+│   │           └── mega/
+│   │               ├── common.wgsl       # Shared constants for mega-kernel shaders
+│   │               ├── mega_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
+│   │               └── global_tick.wgsl  # Grid rebuild + collision pass (1,1,1)
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/
@@ -499,12 +523,13 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ### Test Coverage Summary
 
-**118 tests total** across the workspace:
+**134 tests total** across the workspace:
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 21 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling |
-| **xagent-sandbox** | 97 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
+| **xagent-brain** | 38 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling, mega-kernel tick loop, deterministic bench |
+| **xagent-shared** | 1 | Config defaults (vision_stride) |
+| **xagent-sandbox** | 95 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
 
 ---
 

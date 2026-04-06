@@ -64,6 +64,10 @@ pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1;     // 8466
 pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1;         // 8467
 pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1;               // 8468
 
+/// Fixed tail size: fields from O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1.
+/// This is layout-independent — the tail doesn't change when vision dimensions vary.
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT;   // 468
+
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
 pub const O_PAT_STATES: usize = 0;
@@ -138,14 +142,27 @@ pub struct BrainLayout {
 
 impl BrainLayout {
     pub fn new(vision_w: u32, vision_h: u32) -> Self {
-        let pixel_count = (vision_w * vision_h) as usize;
-        let color_count = pixel_count * 4;
+        let pixel_count = (vision_w as usize)
+            .checked_mul(vision_h as usize)
+            .expect("vision dimensions overflow pixel count");
+        let color_count = pixel_count
+            .checked_mul(4)
+            .expect("vision dimensions overflow color count");
         let depth_count = pixel_count;
-        let feature_count = color_count + 25;
-        let sensory_stride = color_count + depth_count + NON_VISUAL_COUNT;
-        // brain_stride = feature_count * DIM + DIM + DIM*DIM + 468
-        // (468 = fixed fields after O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1)
-        let brain_stride = feature_count * DIM + DIM + DIM * DIM + 468;
+        let feature_count = color_count
+            .checked_add(25)
+            .expect("vision dimensions overflow feature count");
+        let sensory_stride = color_count
+            .checked_add(depth_count)
+            .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
+            .expect("vision dimensions overflow sensory stride");
+        // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+        let brain_stride = feature_count
+            .checked_mul(DIM)
+            .and_then(|v| v.checked_add(DIM))
+            .and_then(|v| v.checked_add(DIM * DIM))
+            .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
+            .expect("vision dimensions overflow brain stride");
         Self {
             vision_w,
             vision_h,
@@ -739,7 +756,7 @@ mod tests {
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;
             let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
-            assert_eq!(layout.brain_stride, o_pred_ctx_wt + 468);
+            assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
         }
     }
 

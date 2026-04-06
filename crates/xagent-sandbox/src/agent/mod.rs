@@ -13,7 +13,7 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::buffers::{AgentBrainState, DIM, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
+use xagent_brain::buffers::{AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -316,8 +316,8 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut mutated = state.clone();
 
     // Derive layout from actual state length (supports dynamic vision_w × vision_h).
-    // brain_stride = fc * DIM + DIM + DIM*DIM + 468
-    let fc = (state.brain_state.len() - DIM - DIM * DIM - 468) / DIM;
+    // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+    let fc = (state.brain_state.len() - DIM - DIM * DIM - FIXED_TAIL_SIZE) / DIM;
     let o_pred_wts = fc * DIM + DIM;
     // Delta from the default compile-time O_PRED_CTX_WT to O_ACT_FWD_WTS is fixed
     let o_pred_ctx = o_pred_wts + DIM * DIM;

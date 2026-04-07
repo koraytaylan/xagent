@@ -287,17 +287,66 @@ pub fn mutate_config_with_strength(
     let mut rng = rand::rng();
 
     BrainConfig {
-        memory_capacity: momentum.biased_perturb_u(&mut rng, parent.memory_capacity, "memory_capacity", strength).min(MAX_MEMORY_CAPACITY),
-        processing_slots: momentum.biased_perturb_u(&mut rng, parent.processing_slots, "processing_slots", strength).min(MAX_PROCESSING_SLOTS),
+        memory_capacity: momentum
+            .biased_perturb_u(
+                &mut rng,
+                parent.memory_capacity,
+                "memory_capacity",
+                strength,
+            )
+            .min(MAX_MEMORY_CAPACITY),
+        processing_slots: momentum
+            .biased_perturb_u(
+                &mut rng,
+                parent.processing_slots,
+                "processing_slots",
+                strength,
+            )
+            .min(MAX_PROCESSING_SLOTS),
         visual_encoding_size: parent.visual_encoding_size,
         representation_dim: parent.representation_dim,
-        learning_rate: momentum.biased_perturb_f(&mut rng, parent.learning_rate, "learning_rate", strength),
+        learning_rate: momentum.biased_perturb_f(
+            &mut rng,
+            parent.learning_rate,
+            "learning_rate",
+            strength,
+        ),
         decay_rate: momentum.biased_perturb_f(&mut rng, parent.decay_rate, "decay_rate", strength),
-        distress_exponent: momentum.biased_perturb_f(&mut rng, parent.distress_exponent, "distress_exponent", strength).clamp(1.5, 5.0),
-        habituation_sensitivity: momentum.biased_perturb_f(&mut rng, parent.habituation_sensitivity, "habituation_sensitivity", strength).clamp(5.0, 50.0),
-        max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
-        fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
-        fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
+        distress_exponent: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.distress_exponent,
+                "distress_exponent",
+                strength,
+            )
+            .clamp(1.5, 5.0),
+        habituation_sensitivity: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.habituation_sensitivity,
+                "habituation_sensitivity",
+                strength,
+            )
+            .clamp(5.0, 50.0),
+        max_curiosity_bonus: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.max_curiosity_bonus,
+                "max_curiosity_bonus",
+                strength,
+            )
+            .clamp(0.1, 1.0),
+        fatigue_recovery_sensitivity: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.fatigue_recovery_sensitivity,
+                "fatigue_recovery_sensitivity",
+                strength,
+            )
+            .clamp(2.0, 20.0),
+        fatigue_floor: momentum
+            .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
+            .clamp(0.05, 0.4),
         vision_w: parent.vision_w,
         vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
@@ -327,20 +376,16 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     // Mutate encoder weights (small perturbation)
     for i in 0..(fc * DIM) {
         if rng.random::<f32>() < 0.1 {
-            mutated.brain_state[i] +=
-                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[i] =
-                mutated.brain_state[i].clamp(-2.0, 2.0);
+            mutated.brain_state[i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
+            mutated.brain_state[i] = mutated.brain_state[i].clamp(-2.0, 2.0);
         }
     }
 
     // Mutate action weights
     for i in 0..DIM {
         if rng.random::<f32>() < 0.2 {
-            mutated.brain_state[act_fwd + i] +=
-                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
-            mutated.brain_state[act_turn + i] +=
-                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
+            mutated.brain_state[act_fwd + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
+            mutated.brain_state[act_turn + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
         }
     }
 
@@ -476,10 +521,22 @@ pub fn generate_agent_mesh(position: Vec3, size: f32, color: [f32; 3]) -> Mesh {
         let base = (face_idx * 4) as u32;
         let col = face_colors[face_idx];
 
-        vertices.push(Vertex { position: positions[*a], color: col });
-        vertices.push(Vertex { position: positions[*b], color: col });
-        vertices.push(Vertex { position: positions[*c], color: col });
-        vertices.push(Vertex { position: positions[*d], color: col });
+        vertices.push(Vertex {
+            position: positions[*a],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: positions[*b],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: positions[*c],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: positions[*d],
+            color: col,
+        });
 
         indices.push(base);
         indices.push(base + 1);
@@ -546,8 +603,12 @@ mod tests {
         }
         let mutated = mutate_brain_state(&state, 0.1);
         // Action weights should differ (20% mutation rate per weight)
-        let fwd_same = (0..DIM)
-            .all(|i| mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]);
-        assert!(!fwd_same, "mutate_brain_state should perturb action weights");
+        let fwd_same = (0..DIM).all(|i| {
+            mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]
+        });
+        assert!(
+            !fwd_same,
+            "mutate_brain_state should perturb action weights"
+        );
     }
 }

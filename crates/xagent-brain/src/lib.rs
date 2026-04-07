@@ -17,7 +17,9 @@ pub use gpu_mega_kernel::{AgentTelemetry, GpuMegaKernel};
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
 #[inline(always)]
 pub fn fast_tanh(x: f32) -> f32 {
-    if x.abs() > 4.5 { return x.signum(); }
+    if x.abs() > 4.5 {
+        return x.signum();
+    }
     let x2 = x * x;
     x * (27.0 + x2) / (27.0 + 9.0 * x2)
 }
@@ -66,9 +68,8 @@ impl BrainTelemetry {
     /// Behavior phase label based on exploitation ratio.
     pub fn behavior_phase(&self) -> &'static str {
         let stability = 1.0 - self.homeostatic_urgency.clamp(0.0, 1.0);
-        let score = self.exploitation_ratio
-            * (1.0 - self.prediction_error.clamp(0.0, 1.0))
-            * stability;
+        let score =
+            self.exploitation_ratio * (1.0 - self.prediction_error.clamp(0.0, 1.0)) * stability;
         if score < 0.02 {
             "RANDOM"
         } else if score < 0.08 {

@@ -171,7 +171,9 @@ impl Renderer {
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).expect("Failed to create surface");
+        let surface = instance
+            .create_surface(window)
+            .expect("Failed to create surface");
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -414,11 +416,12 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(INSTANCED_SHADER_SRC.into()),
         });
 
-        let instanced_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("instanced_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let instanced_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("instanced_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let instance_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("instance_pipeline"),
@@ -598,14 +601,22 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, meshes: &[GpuMesh], view_proj: &glam::Mat4) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(
+        &mut self,
+        meshes: &[GpuMesh],
+        view_proj: &glam::Mat4,
+    ) -> Result<(), wgpu::SurfaceError> {
         let refs: Vec<&GpuMesh> = meshes.iter().collect();
         let ctx = self.render_frame(&refs, view_proj, None, 0)?;
         self.finish_frame(ctx);
         Ok(())
     }
 
-    pub fn render_refs(&mut self, meshes: &[&GpuMesh], view_proj: &glam::Mat4) -> Result<(), wgpu::SurfaceError> {
+    pub fn render_refs(
+        &mut self,
+        meshes: &[&GpuMesh],
+        view_proj: &glam::Mat4,
+    ) -> Result<(), wgpu::SurfaceError> {
         let ctx = self.render_frame(meshes, view_proj, None, 0)?;
         self.finish_frame(ctx);
         Ok(())
@@ -615,11 +626,19 @@ impl Renderer {
     /// Use this when you want to manually orchestrate render passes (3D offscreen → egui surface).
     pub fn begin_frame(&mut self) -> Result<FrameContext, wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame_encoder"),
-        });
-        Ok(FrameContext { encoder, surface_output: output, view })
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame_encoder"),
+            });
+        Ok(FrameContext {
+            encoder,
+            surface_output: output,
+            view,
+        })
     }
 
     /// Render the 3D scene + agents + HUD + text to an offscreen texture pair.
@@ -648,7 +667,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.12, g: 0.12, b: 0.14, a: 1.0,
+                            r: 0.12,
+                            g: 0.12,
+                            b: 0.14,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -681,7 +703,10 @@ impl Renderer {
                     pass.set_pipeline(&self.instance_pipeline);
                     pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.unit_cube_vb.slice(..));
-                    pass.set_vertex_buffer(1, inst_buf.slice(..agent_instance_count as u64 * inst_stride));
+                    pass.set_vertex_buffer(
+                        1,
+                        inst_buf.slice(..agent_instance_count as u64 * inst_stride),
+                    );
                     pass.set_index_buffer(self.unit_cube_ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..self.unit_cube_num_indices, 0, 0..agent_instance_count);
                 }
@@ -726,8 +751,10 @@ impl Renderer {
         }
 
         if !all_verts.is_empty() {
-            self.queue.write_buffer(&self.hud_vb, 0, bytemuck::cast_slice(&all_verts));
-            self.queue.write_buffer(&self.hud_ib, 0, bytemuck::cast_slice(&all_idxs));
+            self.queue
+                .write_buffer(&self.hud_vb, 0, bytemuck::cast_slice(&all_verts));
+            self.queue
+                .write_buffer(&self.hud_ib, 0, bytemuck::cast_slice(&all_idxs));
         }
         self.hud_num_indices = all_idxs.len() as u32;
     }
@@ -740,8 +767,10 @@ impl Renderer {
         }
         let (text_verts, text_idxs) = self.text_renderer.build_texts(items);
         if !text_verts.is_empty() {
-            self.queue.write_buffer(&self.text_vb, 0, bytemuck::cast_slice(&text_verts));
-            self.queue.write_buffer(&self.text_ib, 0, bytemuck::cast_slice(&text_idxs));
+            self.queue
+                .write_buffer(&self.text_vb, 0, bytemuck::cast_slice(&text_verts));
+            self.queue
+                .write_buffer(&self.text_ib, 0, bytemuck::cast_slice(&text_idxs));
         }
         self.text_num_indices = text_idxs.len() as u32;
     }
@@ -762,11 +791,15 @@ impl Renderer {
         );
 
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render_encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_encoder"),
+            });
 
         // Single render pass for everything: 3D scene → agents → HUD → text
         {
@@ -814,7 +847,10 @@ impl Renderer {
                     pass.set_pipeline(&self.instance_pipeline);
                     pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.unit_cube_vb.slice(..));
-                    pass.set_vertex_buffer(1, inst_buf.slice(..agent_instance_count as u64 * inst_stride));
+                    pass.set_vertex_buffer(
+                        1,
+                        inst_buf.slice(..agent_instance_count as u64 * inst_stride),
+                    );
                     pass.set_index_buffer(self.unit_cube_ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..self.unit_cube_num_indices, 0, 0..agent_instance_count);
                 }
@@ -944,10 +980,22 @@ fn generate_unit_cube() -> (Vec<InstancedVertex>, Vec<u32>) {
         let base = (fi * 4) as u32;
         let shade = shades[fi];
 
-        vertices.push(InstancedVertex { position: positions[a], shade });
-        vertices.push(InstancedVertex { position: positions[b], shade });
-        vertices.push(InstancedVertex { position: positions[c], shade });
-        vertices.push(InstancedVertex { position: positions[d], shade });
+        vertices.push(InstancedVertex {
+            position: positions[a],
+            shade,
+        });
+        vertices.push(InstancedVertex {
+            position: positions[b],
+            shade,
+        });
+        vertices.push(InstancedVertex {
+            position: positions[c],
+            shade,
+        });
+        vertices.push(InstancedVertex {
+            position: positions[d],
+            shade,
+        });
 
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }

@@ -26,7 +26,7 @@ pub const TOUCH_FEATURES: usize = 4; // dir_x, dir_z, intensity, tag/4
 pub const VISION_W: usize = 8;
 pub const VISION_H: usize = 6;
 pub const VISION_COLOR_COUNT: usize = VISION_W * VISION_H * 4; // 192 RGBA
-pub const VISION_DEPTH_COUNT: usize = VISION_W * VISION_H;     // 48
+pub const VISION_DEPTH_COUNT: usize = VISION_W * VISION_H; // 48
 pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTACTS * TOUCH_FEATURES;
 // velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16)
 pub const SENSORY_STRIDE: usize = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + NON_VISUAL_COUNT;
@@ -36,52 +36,52 @@ pub const SENSORY_STRIDE: usize = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + NON_
 
 pub const O_ENC_WEIGHTS: usize = 0;
 pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * DIM; // 6944
-pub const O_PRED_WEIGHTS: usize = O_ENC_BIASES + DIM;                // 6976
-pub const O_PRED_CTX_WT: usize = O_PRED_WEIGHTS + DIM * DIM;        // 8000
-pub const O_PRED_ERR_RING: usize = O_PRED_CTX_WT + 1;               // 8001
+pub const O_PRED_WEIGHTS: usize = O_ENC_BIASES + DIM; // 6976
+pub const O_PRED_CTX_WT: usize = O_PRED_WEIGHTS + DIM * DIM; // 8000
+pub const O_PRED_ERR_RING: usize = O_PRED_CTX_WT + 1; // 8001
 pub const O_PRED_ERR_CURSOR: usize = O_PRED_ERR_RING + ERROR_HISTORY_LEN; // 8129
-pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1;          // 8130
-pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1;                  // 8131
-pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM;                     // 8163
-pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM;                // 8195
-pub const O_HOMEO: usize = O_PREV_ENCODED + DIM;                    // 8227
-// homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
-pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6;                      // 8233
-pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM;             // 8265
-pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM;              // 8297
-// act_biases: [fwd_bias, turn_bias]
-pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2;            // 8299
-pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1;      // 8300
+pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 8130
+pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 8131
+pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 8163
+pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 8195
+pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 8227
+                                                 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
+pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 8233
+pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 8265
+pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 8297
+                                                      // act_biases: [fwd_bias, turn_bias]
+pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 8299
+pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 8300
 pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 8364
-pub const O_FATIGUE_CURSOR: usize = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN;   // 8428
-pub const O_FATIGUE_FACTOR: usize = O_FATIGUE_CURSOR + 1;          // 8429
-pub const O_FATIGUE_LEN: usize = O_FATIGUE_FACTOR + 1;             // 8430
-pub const O_PREV_PREDICTION: usize = O_FATIGUE_LEN + 1;            // 8431
-pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM;           // 8463
-pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1;             // 8464
-pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1;      // 8465
-pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1;     // 8466
-pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1;         // 8467
-pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1;               // 8468
+pub const O_FATIGUE_CURSOR: usize = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN; // 8428
+pub const O_FATIGUE_FACTOR: usize = O_FATIGUE_CURSOR + 1; // 8429
+pub const O_FATIGUE_LEN: usize = O_FATIGUE_FACTOR + 1; // 8430
+pub const O_PREV_PREDICTION: usize = O_FATIGUE_LEN + 1; // 8431
+pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 8463
+pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 8464
+pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 8465
+pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1; // 8466
+pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1; // 8467
+pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 8468
 
 /// Fixed tail size: fields from O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1.
 /// This is layout-independent — the tail doesn't change when vision dimensions vary.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT;   // 468
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 468
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
 pub const O_PAT_STATES: usize = 0;
-pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * DIM;    // 4096
-pub const O_PAT_REINF: usize = O_PAT_NORMS + MEMORY_CAP;           // 4224
-pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP;           // 4352
-// motor: [forward, turn, outcome_valence] × cap
-pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3;        // 4736
-// meta: [created_at, last_accessed, activation_count] × cap
-pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3;       // 5120
-pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP;       // 5248
-pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1;             // 5249
-pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1;          // 5250
-pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1;           // 5251
+pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * DIM; // 4096
+pub const O_PAT_REINF: usize = O_PAT_NORMS + MEMORY_CAP; // 4224
+pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP; // 4352
+                                                         // motor: [forward, turn, outcome_valence] × cap
+pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3; // 4736
+                                                            // meta: [created_at, last_accessed, activation_count] × cap
+pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3; // 5120
+pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP; // 5248
+pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1; // 5249
+pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1; // 5250
+pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1; // 5251
 
 // ── Action history buffer offsets (per agent) ─────────────────────────
 
@@ -89,8 +89,8 @@ pub const O_MOTOR_RING: usize = 0;
 // motor_ring: [forward, turn, tick, gradient, _pad] × ACTION_HISTORY_LEN
 pub const O_STATE_RING: usize = O_MOTOR_RING + ACTION_HISTORY_LEN * 5; // 320
 pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * DIM; // 2368
-pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1;                   // 2369
-pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1;                  // 2370
+pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1; // 2369
+pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1; // 2370
 
 // ── Agent physics buffer layout (per agent, GPU-resident) ─────────────
 
@@ -229,20 +229,20 @@ pub const WC_BIOME_GRID_RES: usize = 17;
 pub const WC_GRID_WIDTH: usize = 18;
 pub const WC_GRID_OFFSET: usize = 19;
 pub const WC_TICKS_TO_RUN: usize = 20;
-pub const WC_PHASE_MASK: usize = 21;  // bit0=physics, bit1=vision, bit2=brain
+pub const WC_PHASE_MASK: usize = 21; // bit0=physics, bit1=vision, bit2=brain
 pub const WC_VISION_STRIDE: usize = 22;
 pub const WC_BRAIN_TICK_STRIDE: usize = 23;
 pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
-pub const FEATURES_STRIDE: usize = FEATURE_COUNT;     // 217
-pub const ENCODED_STRIDE: usize = DIM;                 // 32
-pub const HABITUATED_STRIDE: usize = DIM;              // 32
-pub const HOMEO_OUT_STRIDE: usize = 6;                 // grad, raw_grad, urgency, grad_fast, grad_med, grad_slow
-pub const SIMILARITIES_STRIDE: usize = MEMORY_CAP;     // 128
-pub const RECALL_IDX_STRIDE: usize = RECALL_K + 1;     // 16 indices + 1 count
-pub const DECISION_STRIDE: usize = DIM + DIM + 4;      // prediction(32) + credit(32) + motor(4) = 68
+pub const FEATURES_STRIDE: usize = FEATURE_COUNT; // 217
+pub const ENCODED_STRIDE: usize = DIM; // 32
+pub const HABITUATED_STRIDE: usize = DIM; // 32
+pub const HOMEO_OUT_STRIDE: usize = 6; // grad, raw_grad, urgency, grad_fast, grad_med, grad_slow
+pub const SIMILARITIES_STRIDE: usize = MEMORY_CAP; // 128
+pub const RECALL_IDX_STRIDE: usize = RECALL_K + 1; // 16 indices + 1 count
+pub const DECISION_STRIDE: usize = DIM + DIM + 4; // prediction(32) + credit(32) + motor(4) = 68
 
 // ── Config buffer layout ──────────────────────────────────────────────
 
@@ -263,9 +263,9 @@ pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3
 /// Used for cross-generation inheritance, mutation, and DB persistence.
 #[derive(Clone, Debug)]
 pub struct AgentBrainState {
-    pub brain_state: Vec<f32>,   // BRAIN_STRIDE f32s
-    pub patterns: Vec<f32>,      // PATTERN_STRIDE f32s
-    pub history: Vec<f32>,       // HISTORY_STRIDE f32s
+    pub brain_state: Vec<f32>, // BRAIN_STRIDE f32s
+    pub patterns: Vec<f32>,    // PATTERN_STRIDE f32s
+    pub history: Vec<f32>,     // HISTORY_STRIDE f32s
 }
 
 impl AgentBrainState {
@@ -341,7 +341,11 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, out: &mut [f32]) {
 
     // Touch contacts: pick top 4 by intensity, zero-pad
     let mut sorted_contacts: Vec<&TouchContact> = frame.touch_contacts.iter().collect();
-    sorted_contacts.sort_by(|a, b| b.intensity.partial_cmp(&a.intensity).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_contacts.sort_by(|a, b| {
+        b.intensity
+            .partial_cmp(&a.intensity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     for slot in 0..MAX_TOUCH_CONTACTS {
         if slot < sorted_contacts.len() {
@@ -456,17 +460,13 @@ fn rand_normal(seed1: u32, seed2: u32) -> f32 {{
 
 /// Generate WGSL constants for physics/vision shaders.
 /// These are separate from brain constants to avoid name collisions.
-pub fn wgsl_physics_constants(
-    world_size: f32,
-    food_count: usize,
-    agent_count: usize,
-) -> String {
+pub fn wgsl_physics_constants(world_size: f32, food_count: usize, agent_count: usize) -> String {
     let gw = grid_width(world_size);
     let go = gw / 2;
     let terrain_vps: u32 = 129;
     let terrain_step = world_size / 128.0;
     format!(
-r#"// Auto-generated physics constants — do not edit manually
+        r#"// Auto-generated physics constants — do not edit manually
 const PHYS_STRIDE: u32 = {PHYS_STRIDE}u;
 const P_POS_X: u32 = {P_POS_X}u;
 const P_POS_Y: u32 = {P_POS_Y}u;
@@ -614,7 +614,11 @@ pub fn init_brain_state(config: &BrainConfig, rng: &mut impl rand::Rng) -> Vec<f
 }
 
 /// Layout-aware version for configurable vision dimensions.
-pub fn init_brain_state_for(config: &BrainConfig, layout: &BrainLayout, rng: &mut impl rand::Rng) -> Vec<f32> {
+pub fn init_brain_state_for(
+    config: &BrainConfig,
+    layout: &BrainLayout,
+    rng: &mut impl rand::Rng,
+) -> Vec<f32> {
     let fc = layout.feature_count;
     let mut state = vec![0.0_f32; layout.brain_stride];
 
@@ -777,7 +781,11 @@ mod tests {
 
     #[test]
     fn config_size_fits_vec4_alignment() {
-        assert_eq!(CONFIG_SIZE % 4, 0, "CONFIG_SIZE must be a multiple of 4 (vec4 alignment)");
+        assert_eq!(
+            CONFIG_SIZE % 4,
+            0,
+            "CONFIG_SIZE must be a multiple of 4 (vec4 alignment)"
+        );
     }
 
     #[test]
@@ -800,12 +808,18 @@ mod tests {
         config.integrity_scale = 0.02;
         let packed = build_config(&config);
         assert_eq!(packed.len(), CONFIG_SIZE);
-        assert!((packed[CFG_METABOLIC_RATE] - 0.01).abs() < 1e-7,
+        assert!(
+            (packed[CFG_METABOLIC_RATE] - 0.01).abs() < 1e-7,
             "metabolic_rate not packed at index {}: got {}",
-            CFG_METABOLIC_RATE, packed[CFG_METABOLIC_RATE]);
-        assert!((packed[CFG_INTEGRITY_SCALE] - 0.02).abs() < 1e-7,
+            CFG_METABOLIC_RATE,
+            packed[CFG_METABOLIC_RATE]
+        );
+        assert!(
+            (packed[CFG_INTEGRITY_SCALE] - 0.02).abs() < 1e-7,
             "integrity_scale not packed at index {}: got {}",
-            CFG_INTEGRITY_SCALE, packed[CFG_INTEGRITY_SCALE]);
+            CFG_INTEGRITY_SCALE,
+            packed[CFG_INTEGRITY_SCALE]
+        );
     }
 
     #[test]
@@ -836,7 +850,11 @@ mod tests {
                 // e.g. "P_ENERGY: u32 = 11u;"
                 if let Some((name, tail)) = rest.split_once(':') {
                     if let Some(val_part) = tail.split('=').nth(1) {
-                        let val_str = val_part.trim().trim_end_matches(';').trim_end_matches('u').trim();
+                        let val_str = val_part
+                            .trim()
+                            .trim_end_matches(';')
+                            .trim_end_matches('u')
+                            .trim();
                         if let Ok(v) = val_str.parse::<u32>() {
                             map.insert(name.trim().to_string(), v);
                         }
@@ -859,7 +877,10 @@ mod tests {
         }
         assert_eq!(aos_offsets.len(), MEMORY_CAP * DIM);
         assert_eq!(soa_offsets.len(), MEMORY_CAP * DIM);
-        assert_eq!(aos_offsets, soa_offsets, "SoA and AoS must cover identical offsets");
+        assert_eq!(
+            aos_offsets, soa_offsets,
+            "SoA and AoS must cover identical offsets"
+        );
         assert_eq!(*aos_offsets.iter().min().unwrap(), 0);
         assert_eq!(*aos_offsets.iter().max().unwrap(), MEMORY_CAP * DIM - 1);
     }
@@ -890,7 +911,10 @@ mod tests {
         assert_eq!(wgsl["P_PROCESSING_SLOTS"], P_PROCESSING_SLOTS as u32);
         assert_eq!(wgsl["P_DEATH_COUNT"], P_DEATH_COUNT as u32);
         assert_eq!(wgsl["P_PREDICTION_ERROR"], P_PREDICTION_ERROR as u32);
-        assert_eq!(wgsl["P_EXPLORATION_RATE_OUT"], P_EXPLORATION_RATE_OUT as u32);
+        assert_eq!(
+            wgsl["P_EXPLORATION_RATE_OUT"],
+            P_EXPLORATION_RATE_OUT as u32
+        );
         assert_eq!(wgsl["P_FATIGUE_FACTOR_OUT"], P_FATIGUE_FACTOR_OUT as u32);
     }
 
@@ -911,18 +935,31 @@ mod tests {
         let src = include_str!("shaders/mega/common.wgsl");
         // Find: brain_config: array<vec4<f32>, N>
         let needle = "brain_config:";
-        let line = src.lines().find(|l| l.contains(needle))
+        let line = src
+            .lines()
+            .find(|l| l.contains(needle))
             .expect("brain_config binding not found in shader");
         // Extract N from array<vec4<f32>, N>
-        let after_comma = line.split("array<vec4<f32>,").nth(1)
+        let after_comma = line
+            .split("array<vec4<f32>,")
+            .nth(1)
             .expect("unexpected brain_config type format");
-        let n_str = after_comma.trim().trim_end_matches(';').trim_end_matches('>')
+        let n_str = after_comma
+            .trim()
+            .trim_end_matches(';')
+            .trim_end_matches('>')
             .trim();
-        let shader_vec4_count: usize = n_str.parse()
+        let shader_vec4_count: usize = n_str
+            .parse()
             .expect("failed to parse brain_config array size");
-        assert_eq!(shader_vec4_count * 4, CONFIG_SIZE,
+        assert_eq!(
+            shader_vec4_count * 4,
+            CONFIG_SIZE,
             "shader brain_config has {} vec4s (={} floats) but CONFIG_SIZE={}",
-            shader_vec4_count, shader_vec4_count * 4, CONFIG_SIZE);
+            shader_vec4_count,
+            shader_vec4_count * 4,
+            CONFIG_SIZE
+        );
     }
 
     #[test]
@@ -934,9 +971,14 @@ mod tests {
                 let mut best_idx = 0;
                 let mut best_val = -3.0_f32;
                 for (j, &v) in s.iter().enumerate() {
-                    if v > best_val { best_val = v; best_idx = j; }
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = j;
+                    }
                 }
-                if best_val <= -1.5 { break; }
+                if best_val <= -1.5 {
+                    break;
+                }
                 result.push(best_idx);
                 s[best_idx] = -3.0;
             }
@@ -958,8 +1000,8 @@ mod tests {
                         let i = (group * block_size + local) as usize;
                         let j = i + half as usize;
                         let descending = ((i >> (stage as usize + 1)) & 1) == 0;
-                        let should_swap = (descending && vals[i] < vals[j])
-                            || (!descending && vals[i] > vals[j]);
+                        let should_swap =
+                            (descending && vals[i] < vals[j]) || (!descending && vals[i] > vals[j]);
                         if should_swap {
                             vals.swap(i, j);
                             idxs.swap(i, j);
@@ -970,28 +1012,51 @@ mod tests {
 
             let mut result = Vec::new();
             for i in 0..k {
-                if vals[i] <= -1.5 { break; }
+                if vals[i] <= -1.5 {
+                    break;
+                }
                 result.push(idxs[i] as usize);
             }
             result
         }
 
         let mut sims = vec![-2.0_f32; 128];
-        sims[5] = 0.95; sims[10] = 0.80; sims[0] = 0.75; sims[127] = 0.70;
-        sims[64] = 0.65; sims[33] = 0.60; sims[99] = 0.55; sims[17] = 0.50;
-        sims[42] = 0.45; sims[88] = 0.40; sims[3] = 0.35; sims[111] = 0.30;
-        sims[50] = 0.25; sims[77] = 0.20; sims[22] = 0.15; sims[61] = 0.10;
+        sims[5] = 0.95;
+        sims[10] = 0.80;
+        sims[0] = 0.75;
+        sims[127] = 0.70;
+        sims[64] = 0.65;
+        sims[33] = 0.60;
+        sims[99] = 0.55;
+        sims[17] = 0.50;
+        sims[42] = 0.45;
+        sims[88] = 0.40;
+        sims[3] = 0.35;
+        sims[111] = 0.30;
+        sims[50] = 0.25;
+        sims[77] = 0.20;
+        sims[22] = 0.15;
+        sims[61] = 0.10;
         sims[100] = 0.05;
 
         let greedy = greedy_top_k(&sims, 16);
         let bitonic = bitonic_top_k(&sims, 16);
 
-        assert_eq!(greedy.len(), bitonic.len(),
-            "top-K count mismatch: greedy={}, bitonic={}", greedy.len(), bitonic.len());
+        assert_eq!(
+            greedy.len(),
+            bitonic.len(),
+            "top-K count mismatch: greedy={}, bitonic={}",
+            greedy.len(),
+            bitonic.len()
+        );
         for idx in &greedy {
-            assert!(bitonic.contains(idx),
+            assert!(
+                bitonic.contains(idx),
                 "greedy selected index {} (sim={}) but bitonic did not. bitonic={:?}",
-                idx, sims[*idx], bitonic);
+                idx,
+                sims[*idx],
+                bitonic
+            );
         }
     }
 
@@ -999,29 +1064,61 @@ mod tests {
     fn phys_stride_covers_all_fields() {
         // Highest P_* offset + 1 must equal PHYS_STRIDE
         let max_field = *[
-            P_POS_X, P_POS_Y, P_POS_Z,
-            P_VEL_X, P_VEL_Y, P_VEL_Z,
-            P_FACING_X, P_FACING_Y, P_FACING_Z,
-            P_YAW, P_ANGULAR_VEL,
-            P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY,
-            P_PREV_ENERGY, P_PREV_INTEGRITY,
-            P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DIED_FLAG,
-            P_MEMORY_CAP, P_PROCESSING_SLOTS, P_DEATH_COUNT,
-            P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT,
-            P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_GRADIENT_OUT, P_URGENCY_OUT,
-        ].iter().max().unwrap();
-        assert_eq!(PHYS_STRIDE, max_field + 1,
+            P_POS_X,
+            P_POS_Y,
+            P_POS_Z,
+            P_VEL_X,
+            P_VEL_Y,
+            P_VEL_Z,
+            P_FACING_X,
+            P_FACING_Y,
+            P_FACING_Z,
+            P_YAW,
+            P_ANGULAR_VEL,
+            P_ENERGY,
+            P_MAX_ENERGY,
+            P_INTEGRITY,
+            P_MAX_INTEGRITY,
+            P_PREV_ENERGY,
+            P_PREV_INTEGRITY,
+            P_ALIVE,
+            P_FOOD_COUNT,
+            P_TICKS_ALIVE,
+            P_DIED_FLAG,
+            P_MEMORY_CAP,
+            P_PROCESSING_SLOTS,
+            P_DEATH_COUNT,
+            P_PREDICTION_ERROR,
+            P_EXPLORATION_RATE_OUT,
+            P_FATIGUE_FACTOR_OUT,
+            P_MOTOR_FWD_OUT,
+            P_MOTOR_TURN_OUT,
+            P_GRADIENT_OUT,
+            P_URGENCY_OUT,
+        ]
+        .iter()
+        .max()
+        .unwrap();
+        assert_eq!(
+            PHYS_STRIDE,
+            max_field + 1,
             "PHYS_STRIDE ({}) should be highest field offset ({}) + 1",
-            PHYS_STRIDE, max_field);
+            PHYS_STRIDE,
+            max_field
+        );
     }
 
     #[test]
     fn shader_has_16_bindings() {
         let src = include_str!("shaders/mega/common.wgsl");
-        let binding_count = src.lines()
+        let binding_count = src
+            .lines()
             .filter(|l| l.trim().starts_with("@group(0) @binding("))
             .count();
-        assert_eq!(binding_count, 16,
-            "Expected 16 bindings (0-14 existing + 15 dispatch_args), found {}", binding_count);
+        assert_eq!(
+            binding_count, 16,
+            "Expected 16 bindings (0-14 existing + 15 dispatch_args), found {}",
+            binding_count
+        );
     }
 }

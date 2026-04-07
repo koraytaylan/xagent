@@ -37,9 +37,7 @@ pub enum AdvanceResult {
         mutation_strength: f32,
     },
     /// Max generations reached — stop the simulation.
-    Finished {
-        messages: Vec<String>,
-    },
+    Finished { messages: Vec<String> },
 }
 
 /// An independent evolutionary lineage within the island model.
@@ -109,14 +107,20 @@ impl Governor {
 
     /// Active island's spawn parent (for tree display).
     pub fn spawn_parent_id(&self) -> Option<i64> {
-        self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id)
+        self.islands
+            .get(self.active_island)
+            .and_then(|i| i.spawn_parent_id)
     }
 
     /// Fitness of the active island's current spawn parent.
     /// This is the bar a new generation must beat (beat-the-parent model).
     /// Returns -1.0 for root nodes that haven't been evaluated yet.
     fn spawn_parent_fitness(&self) -> f32 {
-        let spawn_id = match self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id) {
+        let spawn_id = match self
+            .islands
+            .get(self.active_island)
+            .and_then(|i| i.spawn_parent_id)
+        {
             Some(id) => id,
             None => return -1.0,
         };
@@ -215,17 +219,20 @@ impl Governor {
         // Run migrations for any new columns (idempotent — silently ignores duplicates)
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
 
-        let (run_id, governor_json, spawn_parent_id, momentum_json): (i64, String, Option<i64>, String) =
-            db.query_row(
-                "SELECT id, governor_config, spawn_parent_id,
+        let (run_id, governor_json, spawn_parent_id, momentum_json): (
+            i64,
+            String,
+            Option<i64>,
+            String,
+        ) = db.query_row(
+            "SELECT id, governor_config, spawn_parent_id,
                         COALESCE(momentum_json, '[]')
                  FROM run ORDER BY id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
 
-        let config: GovernorConfig =
-            serde_json::from_str(&governor_json).unwrap_or_default();
+        let config: GovernorConfig = serde_json::from_str(&governor_json).unwrap_or_default();
 
         // Prefer an active node; fall back to the most recent node of any status
         // (covers the case where the app was stopped after evaluation but before breeding).
@@ -354,8 +361,7 @@ impl Governor {
 
         // Insert agent_result records
         for r in &results {
-            let config_json =
-                serde_json::to_string(&r.config).unwrap_or_default();
+            let config_json = serde_json::to_string(&r.config).unwrap_or_default();
             let _ = self.db.execute(
                 "INSERT INTO agent_result
                  (node_id, agent_index, config_json, total_ticks_alive,
@@ -375,8 +381,8 @@ impl Governor {
         }
 
         // Update node avg fitness (best_fitness is set by advance() after noise reduction)
-        let avg = results.iter().map(|r| r.composite_fitness).sum::<f32>()
-            / results.len().max(1) as f32;
+        let avg =
+            results.iter().map(|r| r.composite_fitness).sum::<f32>() / results.len().max(1) as f32;
 
         let _ = self.db.execute(
             "UPDATE node SET avg_fitness = ?1 WHERE id = ?2",
@@ -445,8 +451,7 @@ impl Governor {
         let gen_avg = if reduced.is_empty() {
             0.0
         } else {
-            reduced.iter().map(|f| f.composite_fitness).sum::<f32>()
-                / reduced.len() as f32
+            reduced.iter().map(|f| f.composite_fitness).sum::<f32>() / reduced.len() as f32
         };
 
         // Look up the spawn parent's fitness and config — this is the bar to beat.
@@ -534,32 +539,36 @@ impl Governor {
 
         // Log momentum trends only when there were winners (avoids noise)
         if had_winners {
-        let top = self.momentums[self.active_island].top_params(3);
-        if !top.is_empty() {
-            let trends: Vec<String> = top.iter()
-                .filter(|(_, val)| val.abs() > 0.001) // Only show meaningful trends
-                .map(|(name, val)| {
-                    let dir = if *val > 0.0 { "↑" } else { "↓" };
-                    let short = match *name {
-                        "memory_capacity" => "mem",
-                        "processing_slots" => "slots",
-                        "representation_dim" => "repr",
-                        "learning_rate" => "lr",
-                        "decay_rate" => "decay",
-                        "distress_exponent" => "distress",
-                        "habituation_sensitivity" => "hab",
-                        "max_curiosity_bonus" => "curiosity",
-                        "fatigue_recovery_sensitivity" => "fat_rec",
-                        "fatigue_floor" => "fat_fl",
-                        other => other,
-                    };
-                    format!("{}{}", short, dir)
-                })
-                .collect();
-            if !trends.is_empty() {
-                messages.push(format!("[EVOLUTION] Momentum trending: {}", trends.join(", ")));
+            let top = self.momentums[self.active_island].top_params(3);
+            if !top.is_empty() {
+                let trends: Vec<String> = top
+                    .iter()
+                    .filter(|(_, val)| val.abs() > 0.001) // Only show meaningful trends
+                    .map(|(name, val)| {
+                        let dir = if *val > 0.0 { "↑" } else { "↓" };
+                        let short = match *name {
+                            "memory_capacity" => "mem",
+                            "processing_slots" => "slots",
+                            "representation_dim" => "repr",
+                            "learning_rate" => "lr",
+                            "decay_rate" => "decay",
+                            "distress_exponent" => "distress",
+                            "habituation_sensitivity" => "hab",
+                            "max_curiosity_bonus" => "curiosity",
+                            "fatigue_recovery_sensitivity" => "fat_rec",
+                            "fatigue_floor" => "fat_fl",
+                            other => other,
+                        };
+                        format!("{}{}", short, dir)
+                    })
+                    .collect();
+                if !trends.is_empty() {
+                    messages.push(format!(
+                        "[EVOLUTION] Momentum trending: {}",
+                        trends.join(", ")
+                    ));
+                }
             }
-        }
         }
 
         // Check completion after scoring but before breeding
@@ -619,9 +628,7 @@ impl Governor {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
-            if let Some(best_elite) =
-                self.islands[best_island_idx].elite_configs.first().cloned()
-            {
+            if let Some(best_elite) = self.islands[best_island_idx].elite_configs.first().cloned() {
                 for (i, island) in self.islands.iter_mut().enumerate() {
                     if i != best_island_idx {
                         if island.elite_configs.len() >= self.config.elitism_count {
@@ -644,7 +651,11 @@ impl Governor {
 
         self.persist_state();
 
-        AdvanceResult::Continue { configs, messages, mutation_strength: effective_strength }
+        AdvanceResult::Continue {
+            configs,
+            messages,
+            mutation_strength: effective_strength,
+        }
     }
 
     /// Backtrack one level when the island exhausts patience at its current
@@ -737,7 +748,13 @@ impl Governor {
         let _ = self.db.execute(
             "INSERT INTO node (run_id, parent_id, generation, config_json, status, island_id)
              VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
-            params![self.run_id, Some(spawn_parent), self.generation, config_json, self.active_island as i64],
+            params![
+                self.run_id,
+                Some(spawn_parent),
+                self.generation,
+                config_json,
+                self.active_island as i64
+            ],
         );
         let new_node_id = self.db.last_insert_rowid();
         self.current_node_id = Some(new_node_id);
@@ -766,7 +783,10 @@ impl Governor {
         let pop_size = self.config.population_size;
         let repeats = self.config.eval_repeats.max(1);
         let unique_count = (pop_size / repeats).max(1);
-        let elite_count = self.config.elitism_count.min(unique_count.saturating_sub(1));
+        let elite_count = self
+            .config
+            .elitism_count
+            .min(unique_count.saturating_sub(1));
 
         // Population slot 0: unmutated champion (the spawn parent's exact config)
         let mut unique_configs = vec![parent_config.clone()];
@@ -777,7 +797,11 @@ impl Governor {
             if unique_configs.len() >= unique_count {
                 break;
             }
-            unique_configs.push(mutate_config_with_strength(elite, effective_strength, momentum));
+            unique_configs.push(mutate_config_with_strength(
+                elite,
+                effective_strength,
+                momentum,
+            ));
         }
 
         // Crossover offspring from elite pairs
@@ -790,17 +814,23 @@ impl Governor {
                 }
                 let idx_a = rng.random_range(0..island.elite_configs.len());
                 let idx_b = rng.random_range(0..island.elite_configs.len());
-                let child = crossover_config(
-                    &island.elite_configs[idx_a],
-                    &island.elite_configs[idx_b],
-                );
-                unique_configs.push(mutate_config_with_strength(&child, effective_strength, momentum));
+                let child =
+                    crossover_config(&island.elite_configs[idx_a], &island.elite_configs[idx_b]);
+                unique_configs.push(mutate_config_with_strength(
+                    &child,
+                    effective_strength,
+                    momentum,
+                ));
             }
         }
 
         // Fill remaining unique slots from the spawn parent's config
         while unique_configs.len() < unique_count {
-            unique_configs.push(mutate_config_with_strength(&parent_config, effective_strength, momentum));
+            unique_configs.push(mutate_config_with_strength(
+                &parent_config,
+                effective_strength,
+                momentum,
+            ));
         }
 
         // Repeat each config eval_repeats times to fill pop_size slots
@@ -820,7 +850,10 @@ impl Governor {
     /// Persist best_score, spawn_parent_id, and momentum for resume.
     fn persist_state(&self) {
         let best_score = self.best_score();
-        let spawn_parent = self.islands.get(self.active_island).and_then(|i| i.spawn_parent_id);
+        let spawn_parent = self
+            .islands
+            .get(self.active_island)
+            .and_then(|i| i.spawn_parent_id);
         let momentum_json = serde_json::to_string(&self.momentums).unwrap_or_else(|_| "[]".into());
         let _ = self.db.execute(
             "UPDATE run SET best_score = ?1, spawn_parent_id = ?2, momentum_json = ?3 WHERE id = ?4",
@@ -884,7 +917,7 @@ impl Governor {
         );
     }
 
-    /// Store a generation's recording as a compressed BLOB in the database.
+    /// Store a generation's recording as a raw f32 BLOB in the database.
     /// `recording` is the `GenerationRecording` to persist.
     pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
         let node_id = match self.current_node_id {
@@ -898,54 +931,77 @@ impl Governor {
         }
 
         // Serialize TickRecords into a compact binary format:
-        // 14 f32 fields per agent per tick (position[3], yaw, energy, integrity,
-        // alive, motor_fwd, motor_turn, prediction_error, exploration_rate,
-        // gradient, urgency, fatigue_factor)
+        // 14 f32 fields per agent per tick (position[3], yaw, energy,
+        // integrity, alive, motor_fwd, motor_turn, prediction_error,
+        // exploration_rate, gradient, urgency, fatigue_factor)
         let record_stride = 14usize;
-        let total_floats = tick_count as usize * recording.agent_count * record_stride;
-        let mut data = Vec::with_capacity(total_floats);
+        let expected_floats = tick_count as usize * recording.agent_count * record_stride;
+        let mut data = Vec::with_capacity(expected_floats);
         for tick in 0..recording.total_ticks {
-            if let Some(records) = recording.get_tick(tick) {
-                for r in records {
-                    data.push(r.position[0]);
-                    data.push(r.position[1]);
-                    data.push(r.position[2]);
-                    data.push(r.yaw);
-                    data.push(r.energy);
-                    data.push(r.integrity);
-                    data.push(if r.alive { 1.0f32 } else { 0.0 });
-                    data.push(r.motor_forward);
-                    data.push(r.motor_turn);
-                    data.push(r.prediction_error);
-                    data.push(r.exploration_rate);
-                    data.push(r.gradient);
-                    data.push(r.urgency);
-                    data.push(r.fatigue_factor);
-                }
+            let records = match recording.get_tick(tick) {
+                Some(records) => records,
+                None => return,
+            };
+            if records.len() != recording.agent_count {
+                return;
             }
+            for r in records {
+                data.push(r.position[0]);
+                data.push(r.position[1]);
+                data.push(r.position[2]);
+                data.push(r.yaw);
+                data.push(r.energy);
+                data.push(r.integrity);
+                data.push(if r.alive { 1.0f32 } else { 0.0 });
+                data.push(r.motor_forward);
+                data.push(r.motor_turn);
+                data.push(r.prediction_error);
+                data.push(r.exploration_rate);
+                data.push(r.gradient);
+                data.push(r.urgency);
+                data.push(r.fatigue_factor);
+            }
+        }
+
+        if data.len() != expected_floats {
+            return;
         }
 
         let bytes: &[u8] = bytemuck::cast_slice(&data);
         let _ = self.db.execute(
-            "INSERT OR REPLACE INTO generation_recording (node_id, agent_count, tick_count, data)
+            "INSERT OR REPLACE INTO generation_recording \
+             (node_id, agent_count, tick_count, data)
              VALUES (?1, ?2, ?3, ?4)",
             params![node_id, agent_count, tick_count, bytes],
         );
     }
 
     /// Load a generation's recording from the database.
-    /// Returns (agent_count, tick_count, Vec<f32>) or None if not found.
+    /// Returns `(agent_count, tick_count, Vec<f32>)` or `None` if not
+    /// found or the blob is malformed.
     pub fn load_recording(&self, node_id: i64) -> Option<(usize, u64, Vec<f32>)> {
         let row: (i64, i64, Vec<u8>) = self
             .db
             .query_row(
-                "SELECT agent_count, tick_count, data FROM generation_recording WHERE node_id = ?1",
+                "SELECT agent_count, tick_count, data \
+                 FROM generation_recording WHERE node_id = ?1",
                 params![node_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .ok()?;
         let (agent_count, tick_count, blob) = row;
-        let floats: Vec<f32> = bytemuck::cast_slice(&blob).to_vec();
+
+        let float_size = std::mem::size_of::<f32>();
+        if blob.len() % float_size != 0 {
+            return None;
+        }
+
+        let mut floats = Vec::with_capacity(blob.len() / float_size);
+        for chunk in blob.chunks_exact(float_size) {
+            let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            floats.push(f32::from_ne_bytes(bytes));
+        }
+
         Some((agent_count as usize, tick_count as u64, floats))
     }
 
@@ -971,23 +1027,21 @@ impl Governor {
             Err(_) => return Vec::new(),
         };
 
-        let mut nodes: Vec<TreeNode> = match stmt
-            .query_map(params![self.run_id], |row| {
-                let config_json: String = row.get(5)?;
-                let config: Option<BrainConfig> = serde_json::from_str(&config_json).ok();
-                Ok(TreeNode {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    generation: row.get(2)?,
-                    best_fitness: row.get::<_, Option<f64>>(3)?.map(|v| v as f32),
-                    avg_fitness: row.get::<_, Option<f64>>(4)?.map(|v| v as f32),
-                    status: row.get(6)?,
-                    island_id: row.get(7)?,
-                    config,
-                    mutations: Vec::new(),
-                })
+        let mut nodes: Vec<TreeNode> = match stmt.query_map(params![self.run_id], |row| {
+            let config_json: String = row.get(5)?;
+            let config: Option<BrainConfig> = serde_json::from_str(&config_json).ok();
+            Ok(TreeNode {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                generation: row.get(2)?,
+                best_fitness: row.get::<_, Option<f64>>(3)?.map(|v| v as f32),
+                avg_fitness: row.get::<_, Option<f64>>(4)?.map(|v| v as f32),
+                status: row.get(6)?,
+                island_id: row.get(7)?,
+                config,
+                mutations: Vec::new(),
             })
-        {
+        }) {
             Ok(r) => r.flatten().collect(),
             Err(_) => return Vec::new(),
         };
@@ -1034,7 +1088,9 @@ impl Governor {
 
     /// Per-island fitness history: island_id → Vec<(generation, best_fitness, avg_fitness)>.
     /// Nodes without an island_id (pre-migration data) are grouped under key -1.
-    pub fn fitness_history_by_island(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
+    pub fn fitness_history_by_island(
+        &self,
+    ) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
         let mut stmt = match self.db.prepare(
             "SELECT island_id, generation, best_fitness, avg_fitness FROM node
              WHERE run_id = ?1 AND best_fitness IS NOT NULL
@@ -1065,9 +1121,7 @@ impl Governor {
 
 /// Check whether a database file has an existing evolution session.
 /// Returns Some((generation, GovernorConfig, BrainConfig)) if a session exists.
-pub fn check_existing_session(
-    db_path: &str,
-) -> Option<(u32, GovernorConfig, BrainConfig)> {
+pub fn check_existing_session(db_path: &str) -> Option<(u32, GovernorConfig, BrainConfig)> {
     let db = Connection::open(db_path).ok()?;
     // Check if the run table even exists
     let table_count: i64 = db
@@ -1099,10 +1153,8 @@ pub fn check_existing_session(
             |row| row.get(0),
         )
         .ok()?;
-    let gov_config: GovernorConfig =
-        serde_json::from_str(&governor_json).unwrap_or_default();
-    let brain_config: BrainConfig =
-        serde_json::from_str(&brain_json).unwrap_or_default();
+    let gov_config: GovernorConfig = serde_json::from_str(&governor_json).unwrap_or_default();
+    let brain_config: BrainConfig = serde_json::from_str(&brain_json).unwrap_or_default();
     Some((generation, gov_config, brain_config))
 }
 
@@ -1191,14 +1243,10 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     )?;
 
     // Backwards-compatible migration: add momentum_json if missing
-    let _ = db.execute_batch(
-        "ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';"
-    );
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';");
 
     // Backwards-compatible migration: add island_id if missing
-    let _ = db.execute_batch(
-        "ALTER TABLE node ADD COLUMN island_id INTEGER;"
-    );
+    let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
 
     // Recording persistence: one compressed BLOB per generation
     db.execute_batch(
@@ -1207,7 +1255,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             agent_count INTEGER NOT NULL,
             tick_count  INTEGER NOT NULL,
             data        BLOB NOT NULL
-        );"
+        );",
     )?;
 
     Ok(())
@@ -1510,7 +1558,7 @@ mod tests {
         // 0.12 >= 0.1 → SUCCESS under beat-the-parent model
         gov.advance(&mock_fitness(0.12));
         assert_ne!(gov.spawn_parent_id(), Some(root_id)); // moved past root
-        // Global best is still 0.2
+                                                          // Global best is still 0.2
         assert!((gov.best_score() - 0.2).abs() < 0.001);
     }
 
@@ -1724,16 +1772,24 @@ mod tests {
         // With high patience and low mutation_strength, elite configs should
         // stay recognizable by their magnitude (5000 and 3000 vs default 128)
         let has_elite1_like = configs.iter().any(|c| c.memory_capacity > 4000);
-        let has_elite2_like = configs.iter().any(|c| (2000..=4000).contains(&c.memory_capacity));
+        let has_elite2_like = configs
+            .iter()
+            .any(|c| (2000..=4000).contains(&c.memory_capacity));
         assert!(
             has_elite1_like,
             "Expected a config near memory_capacity=5000 from elite1; got {:?}",
-            configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
+            configs
+                .iter()
+                .map(|c| c.memory_capacity)
+                .collect::<Vec<_>>()
         );
         assert!(
             has_elite2_like,
             "Expected a config near memory_capacity=3000 from elite2; got {:?}",
-            configs.iter().map(|c| c.memory_capacity).collect::<Vec<_>>()
+            configs
+                .iter()
+                .map(|c| c.memory_capacity)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1746,7 +1802,8 @@ mod tests {
         let spawn_id = gov.spawn_parent_id().unwrap();
 
         // Get the spawn parent's config from the DB (what breed uses)
-        let parent_json: String = gov.db
+        let parent_json: String = gov
+            .db
             .query_row(
                 "SELECT config_json FROM node WHERE id = ?1",
                 params![spawn_id],
@@ -1761,7 +1818,10 @@ mod tests {
         // configs[0] should be the EXACT spawn parent config (unmutated champion)
         assert_eq!(configs[0].memory_capacity, parent_config.memory_capacity);
         assert_eq!(configs[0].processing_slots, parent_config.processing_slots);
-        assert_eq!(configs[0].representation_dim, parent_config.representation_dim);
+        assert_eq!(
+            configs[0].representation_dim,
+            parent_config.representation_dim
+        );
         assert!((configs[0].learning_rate - parent_config.learning_rate).abs() < f32::EPSILON);
         assert!((configs[0].decay_rate - parent_config.decay_rate).abs() < f32::EPSILON);
     }
@@ -1787,7 +1847,10 @@ mod tests {
         let fitness = vec![
             AgentFitness {
                 agent_index: 0,
-                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                config: BrainConfig {
+                    memory_capacity: 100,
+                    ..BrainConfig::default()
+                },
                 total_ticks_alive: 100,
                 death_count: 0,
                 food_consumed: 10,
@@ -1796,7 +1859,10 @@ mod tests {
             },
             AgentFitness {
                 agent_index: 1,
-                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
+                config: BrainConfig {
+                    memory_capacity: 100,
+                    ..BrainConfig::default()
+                },
                 total_ticks_alive: 100,
                 death_count: 0,
                 food_consumed: 10,
@@ -1805,7 +1871,10 @@ mod tests {
             },
             AgentFitness {
                 agent_index: 2,
-                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                config: BrainConfig {
+                    memory_capacity: 200,
+                    ..BrainConfig::default()
+                },
                 total_ticks_alive: 100,
                 death_count: 0,
                 food_consumed: 10,
@@ -1814,7 +1883,10 @@ mod tests {
             },
             AgentFitness {
                 agent_index: 3,
-                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
+                config: BrainConfig {
+                    memory_capacity: 200,
+                    ..BrainConfig::default()
+                },
                 total_ticks_alive: 100,
                 death_count: 0,
                 food_consumed: 10,
@@ -1858,24 +1930,52 @@ mod tests {
         // Sorted by fitness descending (as evaluate returns):
         let fitness = vec![
             AgentFitness {
-                agent_index: 2, composite_fitness: 0.9,
-                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
-                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+                agent_index: 2,
+                composite_fitness: 0.9,
+                config: BrainConfig {
+                    memory_capacity: 200,
+                    ..BrainConfig::default()
+                },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
             },
             AgentFitness {
-                agent_index: 1, composite_fitness: 0.5,
-                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
-                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+                agent_index: 1,
+                composite_fitness: 0.5,
+                config: BrainConfig {
+                    memory_capacity: 100,
+                    ..BrainConfig::default()
+                },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
             },
             AgentFitness {
-                agent_index: 0, composite_fitness: 0.3,
-                config: BrainConfig { memory_capacity: 100, ..BrainConfig::default() },
-                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+                agent_index: 0,
+                composite_fitness: 0.3,
+                config: BrainConfig {
+                    memory_capacity: 100,
+                    ..BrainConfig::default()
+                },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
             },
             AgentFitness {
-                agent_index: 3, composite_fitness: 0.1,
-                config: BrainConfig { memory_capacity: 200, ..BrainConfig::default() },
-                total_ticks_alive: 100, death_count: 0, food_consumed: 10, cells_explored: 50,
+                agent_index: 3,
+                composite_fitness: 0.1,
+                config: BrainConfig {
+                    memory_capacity: 200,
+                    ..BrainConfig::default()
+                },
+                total_ticks_alive: 100,
+                death_count: 0,
+                food_consumed: 10,
+                cells_explored: 50,
             },
         ];
 
@@ -1946,8 +2046,8 @@ mod tests {
         // 3 rounds: island 0 always fails, islands 1 and 2 always succeed
         for _ in 0..3 {
             gov.advance(&mock_fitness(0.05)); // island 0: fail
-            gov.advance(&mock_fitness(0.2));  // island 1: success
-            gov.advance(&mock_fitness(0.2));  // island 2: success
+            gov.advance(&mock_fitness(0.2)); // island 1: success
+            gov.advance(&mock_fitness(0.2)); // island 2: success
         }
 
         // Island 0 exhausted at root and went through root exhaustion,
@@ -2033,26 +2133,29 @@ mod tests {
         let mut gov = test_governor(5);
 
         // Gen 0: avg = 0.3, succeeds (root = -1.0)
-        let gen0_fitness = mock_multi_fitness(&[
-            (0, 0.3), (1, 0.3), (2, 0.3), (3, 0.3),
-        ]);
+        let gen0_fitness = mock_multi_fitness(&[(0, 0.3), (1, 0.3), (2, 0.3), (3, 0.3)]);
         gov.advance(&gen0_fitness);
         // Root best_fitness is now the avg = 0.3
-        let root_bar: f64 = gov.db.query_row(
-            "SELECT best_fitness FROM node WHERE id = ?1",
-            params![gov.spawn_parent_id().unwrap()],
-            |row| row.get(0),
-        ).unwrap();
-        assert!((root_bar - 0.3).abs() < 0.01, "Bar should be gen_avg (0.3), got {root_bar}");
+        let root_bar: f64 = gov
+            .db
+            .query_row(
+                "SELECT best_fitness FROM node WHERE id = ?1",
+                params![gov.spawn_parent_id().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (root_bar - 0.3).abs() < 0.01,
+            "Bar should be gen_avg (0.3), got {root_bar}"
+        );
 
         // Gen 1: best agent = 0.5 but avg = 0.25 → should FAIL (0.25 < 0.3)
-        let gen1_fitness = mock_multi_fitness(&[
-            (0, 0.5), (1, 0.1), (2, 0.2), (3, 0.2),
-        ]);
+        let gen1_fitness = mock_multi_fitness(&[(0, 0.5), (1, 0.1), (2, 0.2), (3, 0.2)]);
         let gen1_id = gov.current_node_id.unwrap();
         gov.advance(&gen1_fitness);
         assert_eq!(
-            node_status(&gov, gen1_id), "failed",
+            node_status(&gov, gen1_id),
+            "failed",
             "High best but low avg should fail"
         );
     }
@@ -2062,28 +2165,32 @@ mod tests {
         let mut gov = test_governor(5);
 
         // Create a distinctive "elite" config
-        let elite_config = BrainConfig { memory_capacity: 999, ..BrainConfig::default() };
-        let gen0_fitness = vec![
-            AgentFitness {
-                agent_index: 0,
-                config: elite_config.clone(),
-                total_ticks_alive: 100,
-                death_count: 0,
-                food_consumed: 50,
-                cells_explored: 100,
-                composite_fitness: 0.5,
-            },
-        ];
+        let elite_config = BrainConfig {
+            memory_capacity: 999,
+            ..BrainConfig::default()
+        };
+        let gen0_fitness = vec![AgentFitness {
+            agent_index: 0,
+            config: elite_config.clone(),
+            total_ticks_alive: 100,
+            death_count: 0,
+            food_consumed: 50,
+            cells_explored: 100,
+            composite_fitness: 0.5,
+        }];
 
         // Gen 0: succeeds — node config should update to the best performer
         gov.advance(&gen0_fitness);
         let root_id = gov.spawn_parent_id().unwrap();
 
-        let stored_json: String = gov.db.query_row(
-            "SELECT config_json FROM node WHERE id = ?1",
-            params![root_id],
-            |row| row.get(0),
-        ).unwrap();
+        let stored_json: String = gov
+            .db
+            .query_row(
+                "SELECT config_json FROM node WHERE id = ?1",
+                params![root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         let stored_config: BrainConfig = serde_json::from_str(&stored_json).unwrap();
 
         assert_eq!(
@@ -2124,13 +2231,15 @@ mod tests {
                 configs[pair_start].memory_capacity,
                 configs[pair_start + 1].memory_capacity,
                 "Agents {} and {} should share config",
-                pair_start, pair_start + 1
+                pair_start,
+                pair_start + 1
             );
             assert!(
                 (configs[pair_start].learning_rate - configs[pair_start + 1].learning_rate).abs()
                     < f32::EPSILON,
                 "Agents {} and {} should share config",
-                pair_start, pair_start + 1
+                pair_start,
+                pair_start + 1
             );
         }
     }
@@ -2159,8 +2268,12 @@ mod tests {
         // Create governor, inject momentum, advance (which persists)
         {
             let mut gov = Governor::new(db_path, config.clone(), &brain, "{}").unwrap();
-            gov.momentums[0].momentum_mut().insert("learning_rate".into(), 0.05);
-            gov.momentums[1].momentum_mut().insert("decay_rate".into(), -0.03);
+            gov.momentums[0]
+                .momentum_mut()
+                .insert("learning_rate".into(), 0.05);
+            gov.momentums[1]
+                .momentum_mut()
+                .insert("decay_rate".into(), -0.03);
             gov.advance(&mock_fitness(0.1)); // triggers persist_state
         }
 
@@ -2217,8 +2330,13 @@ mod tests {
         let root_id = gov.current_node_id.unwrap();
 
         // Root node should have island_id NULL (created before islands assigned)
-        let root_island: Option<i64> = gov.db
-            .query_row("SELECT island_id FROM node WHERE id = ?1", params![root_id], |row| row.get(0))
+        let root_island: Option<i64> = gov
+            .db
+            .query_row(
+                "SELECT island_id FROM node WHERE id = ?1",
+                params![root_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(root_island, None);
 
@@ -2228,22 +2346,31 @@ mod tests {
         gov.advance(&mock_fitness(0.1)); // island 2 evaluates gen 2, breeds gen 3 for island 0
 
         // Check that bred nodes have island_id set
-        let mut stmt = gov.db.prepare(
-            "SELECT id, island_id FROM node WHERE run_id = ?1 AND id != ?2 ORDER BY id"
-        ).unwrap();
-        let rows: Vec<(i64, Option<i64>)> = stmt.query_map(
-            params![gov.run_id, root_id],
-            |row| Ok((row.get(0)?, row.get(1)?))
-        ).unwrap().flatten().collect();
+        let mut stmt = gov
+            .db
+            .prepare("SELECT id, island_id FROM node WHERE run_id = ?1 AND id != ?2 ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, Option<i64>)> = stmt
+            .query_map(params![gov.run_id, root_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
 
         // Each bred node should have a non-null island_id
         assert!(!rows.is_empty());
         for (node_id, island_id) in &rows {
-            assert!(island_id.is_some(), "node {} should have island_id set", node_id);
+            assert!(
+                island_id.is_some(),
+                "node {} should have island_id set",
+                node_id
+            );
         }
 
         // Three advances over 3 islands: should see each of 0, 1, 2 represented
-        let ids: Vec<i64> = rows.iter()
+        let ids: Vec<i64> = rows
+            .iter()
             .map(|(_, island_id)| island_id.unwrap())
             .collect();
         assert!(ids.contains(&0), "should have island 0");
@@ -2362,7 +2489,11 @@ mod tests {
         let non_root: Vec<&TreeNode> = nodes.iter().filter(|n| n.id != root_id).collect();
         assert!(!non_root.is_empty());
         for node in non_root {
-            assert!(node.island_id.is_some(), "node {} should have island_id", node.id);
+            assert!(
+                node.island_id.is_some(),
+                "node {} should have island_id",
+                node.id
+            );
         }
     }
 }

@@ -168,10 +168,22 @@ fn append_cube(
         let col = [color[0] * s, color[1] * s, color[2] * s];
         let fb = base + (fi as u32) * 4;
 
-        vertices.push(Vertex { position: p[a], color: col });
-        vertices.push(Vertex { position: p[b], color: col });
-        vertices.push(Vertex { position: p[c], color: col });
-        vertices.push(Vertex { position: p[d], color: col });
+        vertices.push(Vertex {
+            position: p[a],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[b],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[c],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[d],
+            color: col,
+        });
 
         indices.extend_from_slice(&[fb, fb + 1, fb + 2, fb, fb + 2, fb + 3]);
     }

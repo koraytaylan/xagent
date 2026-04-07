@@ -12,6 +12,6 @@ pub mod traits;
 
 pub use body::{BodyState, InternalState};
 pub use config::{AgentDescriptor, BrainConfig, FullConfig, GovernorConfig, WorldConfig};
-pub use motor::{MotorCommand, MotorAction};
-pub use sensory::{SensoryFrame, VisualField, TouchContact};
+pub use motor::{MotorAction, MotorCommand};
+pub use sensory::{SensoryFrame, TouchContact, VisualField};
 pub use traits::CognitiveArchitecture;

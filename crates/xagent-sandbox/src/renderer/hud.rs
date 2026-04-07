@@ -42,27 +42,63 @@ pub fn build_hud_vertices(bars: &[HudBar]) -> (Vec<Vertex>, Vec<u32>) {
         let by0 = y0 + border;
         let by1 = y1 - border;
         let base = verts.len() as u32;
-        verts.push(Vertex { position: [bx0, by0, 0.0], color: border_color });
-        verts.push(Vertex { position: [bx1, by0, 0.0], color: border_color });
-        verts.push(Vertex { position: [bx1, by1, 0.0], color: border_color });
-        verts.push(Vertex { position: [bx0, by1, 0.0], color: border_color });
+        verts.push(Vertex {
+            position: [bx0, by0, 0.0],
+            color: border_color,
+        });
+        verts.push(Vertex {
+            position: [bx1, by0, 0.0],
+            color: border_color,
+        });
+        verts.push(Vertex {
+            position: [bx1, by1, 0.0],
+            color: border_color,
+        });
+        verts.push(Vertex {
+            position: [bx0, by1, 0.0],
+            color: border_color,
+        });
         idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 
         // Background quad
         let base = verts.len() as u32;
-        verts.push(Vertex { position: [x0, y0, 0.0], color: bar.bg_color });
-        verts.push(Vertex { position: [x1, y0, 0.0], color: bar.bg_color });
-        verts.push(Vertex { position: [x1, y1, 0.0], color: bar.bg_color });
-        verts.push(Vertex { position: [x0, y1, 0.0], color: bar.bg_color });
+        verts.push(Vertex {
+            position: [x0, y0, 0.0],
+            color: bar.bg_color,
+        });
+        verts.push(Vertex {
+            position: [x1, y0, 0.0],
+            color: bar.bg_color,
+        });
+        verts.push(Vertex {
+            position: [x1, y1, 0.0],
+            color: bar.bg_color,
+        });
+        verts.push(Vertex {
+            position: [x0, y1, 0.0],
+            color: bar.bg_color,
+        });
         idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 
         // Foreground (filled) quad
         let fx1 = x0 + bar.fill.clamp(0.0, 1.0) * bar.width;
         let base = verts.len() as u32;
-        verts.push(Vertex { position: [x0, y0, 0.0], color: bar.color });
-        verts.push(Vertex { position: [fx1, y0, 0.0], color: bar.color });
-        verts.push(Vertex { position: [fx1, y1, 0.0], color: bar.color });
-        verts.push(Vertex { position: [x0, y1, 0.0], color: bar.color });
+        verts.push(Vertex {
+            position: [x0, y0, 0.0],
+            color: bar.color,
+        });
+        verts.push(Vertex {
+            position: [fx1, y0, 0.0],
+            color: bar.color,
+        });
+        verts.push(Vertex {
+            position: [fx1, y1, 0.0],
+            color: bar.color,
+        });
+        verts.push(Vertex {
+            position: [x0, y1, 0.0],
+            color: bar.color,
+        });
         idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
@@ -75,10 +111,22 @@ pub fn build_panel_vertices(x: f32, y: f32, w: f32, h: f32) -> (Vec<Vertex>, Vec
     let x1 = x + w;
     let y1 = y - h;
     let verts = vec![
-        Vertex { position: [x, y, 0.0], color },
-        Vertex { position: [x1, y, 0.0], color },
-        Vertex { position: [x1, y1, 0.0], color },
-        Vertex { position: [x, y1, 0.0], color },
+        Vertex {
+            position: [x, y, 0.0],
+            color,
+        },
+        Vertex {
+            position: [x1, y, 0.0],
+            color,
+        },
+        Vertex {
+            position: [x1, y1, 0.0],
+            color,
+        },
+        Vertex {
+            position: [x, y1, 0.0],
+            color,
+        },
     ];
     let idxs = vec![0, 1, 2, 0, 2, 3];
     (verts, idxs)

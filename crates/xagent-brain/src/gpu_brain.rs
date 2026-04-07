@@ -5,8 +5,8 @@
 //! 2. GPU runs 7 compute passes in a single queue.submit()
 //! 3. CPU reads back motor commands (~800 bytes for 50 agents)
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use wgpu;
 use xagent_shared::{BrainConfig, MotorCommand, SensoryFrame};
@@ -110,7 +110,11 @@ impl GpuBrain {
         &self.decision_buf
     }
 
-    pub(crate) fn create_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
+    pub(crate) fn create_pipeline(
+        device: &wgpu::Device,
+        label: &str,
+        source: &str,
+    ) -> wgpu::ComputePipeline {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -283,14 +287,25 @@ impl GpuBrain {
 
         // ── Compute pipelines ──
         let constants = crate::buffers::wgsl_constants();
-        let fe_source = format!("{}\n{}", constants, include_str!("shaders/feature_extract.wgsl"));
-        let feature_extract_pipeline = Self::create_pipeline(&device, "feature_extract", &fe_source);
+        let fe_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/feature_extract.wgsl")
+        );
+        let feature_extract_pipeline =
+            Self::create_pipeline(&device, "feature_extract", &fe_source);
         let feature_extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("feature_extract_bg"),
             layout: &feature_extract_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: sensory_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: features_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sensory_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: features_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -300,81 +315,192 @@ impl GpuBrain {
             label: Some("encode_bg"),
             layout: &encode_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: features_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: brain_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: encoded_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: features_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: brain_state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: encoded_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let hh_source = format!("{}\n{}", constants, include_str!("shaders/habituate_homeo.wgsl"));
-        let habituate_homeo_pipeline = Self::create_pipeline(&device, "habituate_homeo", &hh_source);
+        let hh_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/habituate_homeo.wgsl")
+        );
+        let habituate_homeo_pipeline =
+            Self::create_pipeline(&device, "habituate_homeo", &hh_source);
         let habituate_homeo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("habituate_homeo_bg"),
             layout: &habituate_homeo_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: encoded_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: sensory_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: brain_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: habituated_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: homeo_out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: config_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: encoded_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sensory_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: brain_state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: habituated_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: homeo_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: config_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let rs_source = format!("{}\n{}", constants, include_str!("shaders/recall_score.wgsl"));
+        let rs_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/recall_score.wgsl")
+        );
         let recall_score_pipeline = Self::create_pipeline(&device, "recall_score", &rs_source);
         let recall_score_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("recall_score_bg"),
             layout: &recall_score_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: pattern_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: similarities_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: habituated_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pattern_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: similarities_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let rt_source = format!("{}\n{}", constants, include_str!("shaders/recall_topk.wgsl"));
+        let rt_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/recall_topk.wgsl")
+        );
         let recall_topk_pipeline = Self::create_pipeline(&device, "recall_topk", &rt_source);
         let recall_topk_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("recall_topk_bg"),
             layout: &recall_topk_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: similarities_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: pattern_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: recall_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: brain_state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: similarities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pattern_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: recall_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: brain_state_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let pa_source = format!("{}\n{}", constants, include_str!("shaders/predict_and_act.wgsl"));
+        let pa_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/predict_and_act.wgsl")
+        );
         let predict_act_pipeline = Self::create_pipeline(&device, "predict_and_act", &pa_source);
         let predict_act_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("predict_act_bg"),
             layout: &predict_act_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: brain_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: pattern_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: recall_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: homeo_out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: history_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: decision_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: habituated_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: brain_state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: pattern_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: recall_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: homeo_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: history_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: decision_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let ls_source = format!("{}\n{}", constants, include_str!("shaders/learn_and_store.wgsl"));
+        let ls_source = format!(
+            "{}\n{}",
+            constants,
+            include_str!("shaders/learn_and_store.wgsl")
+        );
         let learn_store_pipeline = Self::create_pipeline(&device, "learn_and_store", &ls_source);
         let learn_store_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("learn_store_bg"),
             layout: &learn_store_pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: habituated_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: features_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: brain_state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: pattern_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: decision_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: homeo_out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: config_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: habituated_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: features_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: brain_state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pattern_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: decision_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: homeo_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: config_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -436,7 +562,10 @@ impl GpuBrain {
         assert_eq!(frames.len(), self.agent_count as usize);
         for (i, frame) in frames.iter().enumerate() {
             let offset = i * SENSORY_STRIDE;
-            pack_sensory_frame(frame, &mut self.sensory_scratch[offset..offset + SENSORY_STRIDE]);
+            pack_sensory_frame(
+                frame,
+                &mut self.sensory_scratch[offset..offset + SENSORY_STRIDE],
+            );
         }
         self.queue.write_buffer(
             &self.sensory_buf,
@@ -526,7 +655,12 @@ impl GpuBrain {
 
         let brain_offset = (i * BRAIN_STRIDE * 4) as u64;
         let brain_size = (BRAIN_STRIDE * 4) as u64;
-        self.read_buffer_range(&self.brain_state_buf, brain_offset, brain_size, &mut state.brain_state);
+        self.read_buffer_range(
+            &self.brain_state_buf,
+            brain_offset,
+            brain_size,
+            &mut state.brain_state,
+        );
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
         let pat_size = (PATTERN_STRIDE * 4) as u64;
@@ -534,7 +668,12 @@ impl GpuBrain {
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         let hist_size = (HISTORY_STRIDE * 4) as u64;
-        self.read_buffer_range(&self.history_buf, hist_offset, hist_size, &mut state.history);
+        self.read_buffer_range(
+            &self.history_buf,
+            hist_offset,
+            hist_size,
+            &mut state.history,
+        );
 
         state
     }
@@ -543,13 +682,25 @@ impl GpuBrain {
     pub fn write_agent_state(&mut self, index: u32, state: &AgentBrainState) {
         let i = index as usize;
         let brain_offset = (i * BRAIN_STRIDE * 4) as u64;
-        self.queue.write_buffer(&self.brain_state_buf, brain_offset, bytemuck::cast_slice(&state.brain_state));
+        self.queue.write_buffer(
+            &self.brain_state_buf,
+            brain_offset,
+            bytemuck::cast_slice(&state.brain_state),
+        );
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
-        self.queue.write_buffer(&self.pattern_buf, pat_offset, bytemuck::cast_slice(&state.patterns));
+        self.queue.write_buffer(
+            &self.pattern_buf,
+            pat_offset,
+            bytemuck::cast_slice(&state.patterns),
+        );
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
-        self.queue.write_buffer(&self.history_buf, hist_offset, bytemuck::cast_slice(&state.history));
+        self.queue.write_buffer(
+            &self.history_buf,
+            hist_offset,
+            bytemuck::cast_slice(&state.history),
+        );
     }
 
     /// Queue a death signal for deferred processing. Actual state modification
@@ -573,21 +724,32 @@ impl GpuBrain {
         let mut reinf_data: Vec<(u32, Vec<f32>)> = Vec::with_capacity(indices.len());
         {
             // Submit all copy commands in one encoder
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("death_read"),
-            });
-            let reinf_size = (MEMORY_CAP * 4) as u64;
-            let stagings: Vec<wgpu::Buffer> = indices.iter().map(|&idx| {
-                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("death_reinf_staging"),
-                    size: reinf_size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("death_read"),
                 });
-                let src_offset = (idx as usize * PATTERN_STRIDE + O_PAT_REINF) as u64 * 4;
-                encoder.copy_buffer_to_buffer(&self.pattern_buf, src_offset, &staging, 0, reinf_size);
-                staging
-            }).collect();
+            let reinf_size = (MEMORY_CAP * 4) as u64;
+            let stagings: Vec<wgpu::Buffer> = indices
+                .iter()
+                .map(|&idx| {
+                    let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("death_reinf_staging"),
+                        size: reinf_size,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let src_offset = (idx as usize * PATTERN_STRIDE + O_PAT_REINF) as u64 * 4;
+                    encoder.copy_buffer_to_buffer(
+                        &self.pattern_buf,
+                        src_offset,
+                        &staging,
+                        0,
+                        reinf_size,
+                    );
+                    staging
+                })
+                .collect();
             self.queue.submit(std::iter::once(encoder.finish()));
 
             // Map all staging buffers
@@ -613,22 +775,38 @@ impl GpuBrain {
 
             // Write halved reinforcements
             let reinf_offset = (i * PATTERN_STRIDE + O_PAT_REINF) as u64 * 4;
-            self.queue.write_buffer(&self.pattern_buf, reinf_offset, bytemuck::cast_slice(halved_reinf));
+            self.queue.write_buffer(
+                &self.pattern_buf,
+                reinf_offset,
+                bytemuck::cast_slice(halved_reinf),
+            );
 
             // Reset homeostasis EMAs (6 zeros)
             let homeo_offset = (i * BRAIN_STRIDE + O_HOMEO) as u64 * 4;
             let zeros = [0.0f32; 6];
-            self.queue.write_buffer(&self.brain_state_buf, homeo_offset, bytemuck::cast_slice(&zeros));
+            self.queue.write_buffer(
+                &self.brain_state_buf,
+                homeo_offset,
+                bytemuck::cast_slice(&zeros),
+            );
 
             // Reset exploration rate to 0.5
             let exp_offset = (i * BRAIN_STRIDE + O_EXPLORATION_RATE) as u64 * 4;
             let exp_val = [0.5f32];
-            self.queue.write_buffer(&self.brain_state_buf, exp_offset, bytemuck::cast_slice(&exp_val));
+            self.queue.write_buffer(
+                &self.brain_state_buf,
+                exp_offset,
+                bytemuck::cast_slice(&exp_val),
+            );
 
             // Reset action history
             let hist_offset = (i * HISTORY_STRIDE) as u64 * 4;
             let fresh_hist = init_action_history();
-            self.queue.write_buffer(&self.history_buf, hist_offset, bytemuck::cast_slice(&fresh_hist));
+            self.queue.write_buffer(
+                &self.history_buf,
+                hist_offset,
+                bytemuck::cast_slice(&fresh_hist),
+            );
         }
     }
 
@@ -650,9 +828,11 @@ impl GpuBrain {
             self.staging_mapped[widx] = false;
         }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("brain_tick"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("brain_tick"),
+            });
 
         // Pass 1: feature_extract
         {
@@ -727,13 +907,14 @@ impl GpuBrain {
         let seq = self.submit_seq + 1;
         self.submit_seq = seq;
         let flag = self.mapped_seq.clone();
-        self.motor_staging[widx]
-            .slice(..motor_size)
-            .map_async(wgpu::MapMode::Read, move |result| {
+        self.motor_staging[widx].slice(..motor_size).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
                 if result.is_ok() {
                     flag.store(seq, Ordering::Release);
                 }
-            });
+            },
+        );
         self.staging_mapped[widx] = true;
         self.staging_idx = 1 - self.staging_idx;
         self.has_in_flight = true;
@@ -743,9 +924,15 @@ impl GpuBrain {
     /// Use this for unified dispatch (physics + vision + brain in one submit).
     pub fn encode_brain_passes(&self, encoder: &mut wgpu::CommandEncoder) {
         let pipelines_and_groups: &[(&wgpu::ComputePipeline, &wgpu::BindGroup)] = &[
-            (&self.feature_extract_pipeline, &self.feature_extract_bind_group),
+            (
+                &self.feature_extract_pipeline,
+                &self.feature_extract_bind_group,
+            ),
             (&self.encode_pipeline, &self.encode_bind_group),
-            (&self.habituate_homeo_pipeline, &self.habituate_homeo_bind_group),
+            (
+                &self.habituate_homeo_pipeline,
+                &self.habituate_homeo_bind_group,
+            ),
             (&self.recall_score_pipeline, &self.recall_score_bind_group),
             (&self.recall_topk_pipeline, &self.recall_topk_bind_group),
             (&self.predict_act_pipeline, &self.predict_act_bind_group),
@@ -762,9 +949,11 @@ impl GpuBrain {
     /// Dispatch feature extraction pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_feature_extract(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_feature_extract"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_feature_extract"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("feature_extract"),
@@ -780,9 +969,11 @@ impl GpuBrain {
     /// Dispatch encode pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_encode(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_encode"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_encode"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("encode"),
@@ -798,9 +989,11 @@ impl GpuBrain {
     /// Dispatch habituate+homeo pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_habituate_homeo(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_habituate_homeo"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_habituate_homeo"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("habituate_homeo"),
@@ -816,9 +1009,11 @@ impl GpuBrain {
     /// Dispatch recall_score pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_recall_score(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_recall_score"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_recall_score"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("recall_score"),
@@ -834,9 +1029,11 @@ impl GpuBrain {
     /// Dispatch recall_topk pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_recall_topk(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_recall_topk"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_recall_topk"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("recall_topk"),
@@ -852,9 +1049,11 @@ impl GpuBrain {
     /// Dispatch predict_and_act pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_predict_and_act(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_predict_and_act"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_predict_and_act"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("predict_and_act"),
@@ -870,9 +1069,11 @@ impl GpuBrain {
     /// Dispatch learn_and_store pass (test-only).
     #[cfg(test)]
     pub(crate) fn run_learn_and_store(&mut self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_learn_and_store"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_learn_and_store"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("learn_and_store"),
@@ -886,16 +1087,24 @@ impl GpuBrain {
     }
 
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
-    pub(crate) fn read_buffer_range(&self, buffer: &wgpu::Buffer, offset: u64, size: u64, out: &mut Vec<f32>) {
+    pub(crate) fn read_buffer_range(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        out: &mut Vec<f32>,
+    ) {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("read_staging"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read_copy"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read_copy"),
+            });
         encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -960,7 +1169,12 @@ mod tests {
 
         // Read back features
         let mut features = vec![0.0_f32; FEATURES_STRIDE];
-        brain.read_buffer_range(&brain.features_buf, 0, (FEATURES_STRIDE * 4) as u64, &mut features);
+        brain.read_buffer_range(
+            &brain.features_buf,
+            0,
+            (FEATURES_STRIDE * 4) as u64,
+            &mut features,
+        );
 
         // Vision color should be copied directly
         assert!((features[0] - 0.5).abs() < 0.001, "pixel R");
@@ -1031,8 +1245,13 @@ mod tests {
         // All dims should be fast_tanh(0.5)
         let expected = crate::fast_tanh(0.5);
         for d in 0..DIM {
-            assert!((encoded[d] - expected).abs() < 0.01,
-                "dim {} expected {} got {}", d, expected, encoded[d]);
+            assert!(
+                (encoded[d] - expected).abs() < 0.01,
+                "dim {} expected {} got {}",
+                d,
+                expected,
+                encoded[d]
+            );
         }
     }
 
@@ -1060,7 +1279,11 @@ mod tests {
         mean_atten /= DIM as f32;
 
         // Constant input should drive attenuation down toward floor (0.1)
-        assert!(mean_atten < 0.5, "Constant input should reduce attenuation, got mean={}", mean_atten);
+        assert!(
+            mean_atten < 0.5,
+            "Constant input should reduce attenuation, got mean={}",
+            mean_atten
+        );
     }
 
     #[test]
@@ -1072,7 +1295,7 @@ mod tests {
         let mut state = brain.read_agent_state(0);
 
         // Set pattern slot 0 as active with a known state
-        state.patterns[O_PAT_ACTIVE] = 1.0;  // slot 0 active
+        state.patterns[O_PAT_ACTIVE] = 1.0; // slot 0 active
         state.patterns[O_ACTIVE_COUNT] = 1.0;
 
         // Pattern state: all 1.0 (norm = sqrt(32))
@@ -1086,19 +1309,34 @@ mod tests {
 
         // Upload habituated data directly: all 1.0 (same direction as pattern)
         let hab_data: Vec<f32> = vec![1.0; DIM];
-        brain.queue.write_buffer(&brain.habituated_buf, 0, bytemuck::cast_slice(&hab_data));
+        brain
+            .queue
+            .write_buffer(&brain.habituated_buf, 0, bytemuck::cast_slice(&hab_data));
 
         brain.run_recall_score();
 
         // Read similarities
         let mut sims = vec![0.0_f32; MEMORY_CAP];
-        brain.read_buffer_range(&brain.similarities_buf, 0, (MEMORY_CAP * 4) as u64, &mut sims);
+        brain.read_buffer_range(
+            &brain.similarities_buf,
+            0,
+            (MEMORY_CAP * 4) as u64,
+            &mut sims,
+        );
 
         // Slot 0 should have similarity ≈ 1.0 (identical direction)
-        assert!((sims[0] - 1.0).abs() < 0.01, "slot 0 sim should be ~1.0, got {}", sims[0]);
+        assert!(
+            (sims[0] - 1.0).abs() < 0.01,
+            "slot 0 sim should be ~1.0, got {}",
+            sims[0]
+        );
 
         // Slot 1 should be -2.0 (inactive)
-        assert!((sims[1] - (-2.0)).abs() < 0.01, "slot 1 should be -2.0, got {}", sims[1]);
+        assert!(
+            (sims[1] - (-2.0)).abs() < 0.01,
+            "slot 1 should be -2.0, got {}",
+            sims[1]
+        );
     }
 
     #[test]
@@ -1110,7 +1348,9 @@ mod tests {
         let mut sims = vec![-2.0_f32; MEMORY_CAP];
         sims[5] = 0.9;
         sims[10] = 0.7;
-        brain.queue.write_buffer(&brain.similarities_buf, 0, bytemuck::cast_slice(&sims));
+        brain
+            .queue
+            .write_buffer(&brain.similarities_buf, 0, bytemuck::cast_slice(&sims));
 
         // Mark slots 5 and 10 as active in patterns (needed for metadata update)
         let mut state = brain.read_agent_state(0);
@@ -1123,7 +1363,12 @@ mod tests {
 
         // Read recall buffer
         let mut recall = vec![0.0_f32; RECALL_IDX_STRIDE];
-        brain.read_buffer_range(&brain.recall_buf, 0, (RECALL_IDX_STRIDE * 4) as u64, &mut recall);
+        brain.read_buffer_range(
+            &brain.recall_buf,
+            0,
+            (RECALL_IDX_STRIDE * 4) as u64,
+            &mut recall,
+        );
 
         // Count should be 2
         let count = recall[RECALL_K] as u32;
@@ -1161,7 +1406,12 @@ mod tests {
             let base = agent * DECISION_STRIDE;
             let fwd = dec[base + DIM + DIM];
             let trn = dec[base + DIM + DIM + 1];
-            assert!(fwd.is_finite(), "agent {} forward not finite: {}", agent, fwd);
+            assert!(
+                fwd.is_finite(),
+                "agent {} forward not finite: {}",
+                agent,
+                fwd
+            );
             assert!(trn.is_finite(), "agent {} turn not finite: {}", agent, trn);
             assert!(
                 fwd >= -1.0 && fwd <= 1.0,
@@ -1198,11 +1448,19 @@ mod tests {
 
         // Pattern should have been stored (active_count should be > 0)
         let active = after.patterns[O_ACTIVE_COUNT];
-        assert!(active >= 1.0, "should have stored at least one pattern, active_count={}", active);
+        assert!(
+            active >= 1.0,
+            "should have stored at least one pattern, active_count={}",
+            active
+        );
 
         // Verify a pattern slot is active
         let stored_idx = after.patterns[O_LAST_STORED_IDX] as usize;
-        assert_eq!(after.patterns[O_PAT_ACTIVE + stored_idx], 1.0, "stored slot should be active");
+        assert_eq!(
+            after.patterns[O_PAT_ACTIVE + stored_idx],
+            1.0,
+            "stored slot should be active"
+        );
     }
 
     #[test]
@@ -1219,8 +1477,16 @@ mod tests {
             for cmd in &commands {
                 assert!(cmd.forward.is_finite(), "forward must be finite");
                 assert!(cmd.turn.is_finite(), "turn must be finite");
-                assert!(cmd.forward >= -1.0 && cmd.forward <= 1.0, "forward in range: {}", cmd.forward);
-                assert!(cmd.turn >= -1.0 && cmd.turn <= 1.0, "turn in range: {}", cmd.turn);
+                assert!(
+                    cmd.forward >= -1.0 && cmd.forward <= 1.0,
+                    "forward in range: {}",
+                    cmd.forward
+                );
+                assert!(
+                    cmd.turn >= -1.0 && cmd.turn <= 1.0,
+                    "turn in range: {}",
+                    cmd.turn
+                );
             }
         }
     }
@@ -1245,7 +1511,10 @@ mod tests {
             .zip(&after.brain_state[O_PRED_WEIGHTS..O_PRED_WEIGHTS + 100])
             .map(|(a, b)| (a - b).abs())
             .sum();
-        assert!(weight_delta > 0.0, "predictor weights should change after learning");
+        assert!(
+            weight_delta > 0.0,
+            "predictor weights should change after learning"
+        );
     }
 
     #[test]
@@ -1260,7 +1529,11 @@ mod tests {
 
         let state = brain.read_agent_state(0);
         let active = state.patterns[O_ACTIVE_COUNT];
-        assert!(active > 0.0, "memory should have stored patterns after 200 ticks, got active_count={}", active);
+        assert!(
+            active > 0.0,
+            "memory should have stored patterns after 200 ticks, got active_count={}",
+            active
+        );
     }
 
     #[test]
@@ -1289,6 +1562,9 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_same, "different agents should produce varied motor output");
+        assert!(
+            !all_same,
+            "different agents should produce varied motor output"
+        );
     }
 }

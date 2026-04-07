@@ -43,15 +43,24 @@ pub fn build_heatmap_mesh(
             let y = terrain.height_at(xm, zm) + 0.5;
 
             let base = vertices.len() as u32;
-            vertices.push(Vertex { position: [x0, y, z0], color });
-            vertices.push(Vertex { position: [x0 + cell, y, z0], color });
-            vertices.push(Vertex { position: [x0 + cell, y, z0 + cell], color });
-            vertices.push(Vertex { position: [x0, y, z0 + cell], color });
+            vertices.push(Vertex {
+                position: [x0, y, z0],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [x0 + cell, y, z0],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [x0 + cell, y, z0 + cell],
+                color,
+            });
+            vertices.push(Vertex {
+                position: [x0, y, z0 + cell],
+                color,
+            });
             // CCW winding from above (normal pointing +Y)
-            indices.extend_from_slice(&[
-                base, base + 2, base + 1,
-                base, base + 3, base + 2,
-            ]);
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
         }
     }
 
@@ -60,10 +69,7 @@ pub fn build_heatmap_mesh(
 
 /// Build a linear ribbon trail from the agent's distance-sampled control points.
 /// Only rebuilt when the trail dirty flag is set.
-pub fn build_trail_mesh(
-    points: &[[f32; 3]],
-    agent_color: &[f32; 3],
-) -> Mesh {
+pub fn build_trail_mesh(points: &[[f32; 3]], agent_color: &[f32; 3]) -> Mesh {
     let n = points.len();
     if n < 2 {
         return Mesh {
@@ -121,10 +127,7 @@ pub fn build_trail_mesh(
             color,
         });
 
-        indices.extend_from_slice(&[
-            base, base + 2, base + 1,
-            base, base + 3, base + 2,
-        ]);
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
 
     Mesh { vertices, indices }
@@ -235,18 +238,36 @@ pub fn build_marker_mesh(position: glam::Vec3) -> Mesh {
     let upper_faces = [(n, e), (e, s), (s, w), (w, n)];
     for (a, b) in &upper_faces {
         let base = vertices.len() as u32;
-        vertices.push(Vertex { position: top, color: shade_top });
-        vertices.push(Vertex { position: *a, color: shade_side });
-        vertices.push(Vertex { position: *b, color: shade_side });
+        vertices.push(Vertex {
+            position: top,
+            color: shade_top,
+        });
+        vertices.push(Vertex {
+            position: *a,
+            color: shade_side,
+        });
+        vertices.push(Vertex {
+            position: *b,
+            color: shade_side,
+        });
         indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 
     let lower_faces = [(e, n), (s, e), (w, s), (n, w)];
     for (a, b) in &lower_faces {
         let base = vertices.len() as u32;
-        vertices.push(Vertex { position: bot, color: shade_bot });
-        vertices.push(Vertex { position: *a, color: shade_side });
-        vertices.push(Vertex { position: *b, color: shade_side });
+        vertices.push(Vertex {
+            position: bot,
+            color: shade_bot,
+        });
+        vertices.push(Vertex {
+            position: *a,
+            color: shade_side,
+        });
+        vertices.push(Vertex {
+            position: *b,
+            color: shade_side,
+        });
         indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 
@@ -316,8 +337,7 @@ mod tests {
     fn all_trails_skips_dead_agents() {
         let trail = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         let c = white();
-        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
-            vec![(trail.as_slice(), &c, false)];
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> = vec![(trail.as_slice(), &c, false)];
         let m = build_all_trails_mesh(&agents);
         assert!(m.indices.is_empty());
     }
@@ -326,8 +346,7 @@ mod tests {
     fn all_trails_skips_short_trails() {
         let trail = vec![[0.0, 0.0, 0.0]]; // only 1 point
         let c = white();
-        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> =
-            vec![(trail.as_slice(), &c, true)];
+        let agents: Vec<(&[[f32; 3]], &[f32; 3], bool)> = vec![(trail.as_slice(), &c, true)];
         let m = build_all_trails_mesh(&agents);
         assert!(m.indices.is_empty());
     }

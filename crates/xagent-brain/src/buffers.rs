@@ -1008,6 +1008,7 @@ mod tests {
             P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DIED_FLAG,
             P_MEMORY_CAP, P_PROCESSING_SLOTS, P_DEATH_COUNT,
             P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT,
+            P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_GRADIENT_OUT, P_URGENCY_OUT,
         ].iter().max().unwrap();
         assert_eq!(PHYS_STRIDE, max_field + 1,
             "PHYS_STRIDE ({}) should be highest field offset ({}) + 1",

@@ -884,6 +884,71 @@ impl Governor {
         );
     }
 
+    /// Store a generation's recording as a compressed BLOB in the database.
+    /// `recording` is the `GenerationRecording` to persist.
+    pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
+        let node_id = match self.current_node_id {
+            Some(id) => id,
+            None => return,
+        };
+        let agent_count = recording.agent_count as i64;
+        let tick_count = recording.total_ticks as i64;
+        if tick_count == 0 {
+            return;
+        }
+
+        // Serialize TickRecords into a compact binary format:
+        // 14 f32 fields per agent per tick (position[3], yaw, energy, integrity,
+        // alive, motor_fwd, motor_turn, prediction_error, exploration_rate,
+        // gradient, urgency, fatigue_factor)
+        let record_stride = 14usize;
+        let total_floats = tick_count as usize * recording.agent_count * record_stride;
+        let mut data = Vec::with_capacity(total_floats);
+        for tick in 0..recording.total_ticks {
+            if let Some(records) = recording.get_tick(tick) {
+                for r in records {
+                    data.push(r.position[0]);
+                    data.push(r.position[1]);
+                    data.push(r.position[2]);
+                    data.push(r.yaw);
+                    data.push(r.energy);
+                    data.push(r.integrity);
+                    data.push(if r.alive { 1.0f32 } else { 0.0 });
+                    data.push(r.motor_forward);
+                    data.push(r.motor_turn);
+                    data.push(r.prediction_error);
+                    data.push(r.exploration_rate);
+                    data.push(r.gradient);
+                    data.push(r.urgency);
+                    data.push(r.fatigue_factor);
+                }
+            }
+        }
+
+        let bytes: &[u8] = bytemuck::cast_slice(&data);
+        let _ = self.db.execute(
+            "INSERT OR REPLACE INTO generation_recording (node_id, agent_count, tick_count, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, agent_count, tick_count, bytes],
+        );
+    }
+
+    /// Load a generation's recording from the database.
+    /// Returns (agent_count, tick_count, Vec<f32>) or None if not found.
+    pub fn load_recording(&self, node_id: i64) -> Option<(usize, u64, Vec<f32>)> {
+        let row: (i64, i64, Vec<u8>) = self
+            .db
+            .query_row(
+                "SELECT agent_count, tick_count, data FROM generation_recording WHERE node_id = ?1",
+                params![node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok()?;
+        let (agent_count, tick_count, blob) = row;
+        let floats: Vec<f32> = bytemuck::cast_slice(&blob).to_vec();
+        Some((agent_count as usize, tick_count as u64, floats))
+    }
+
     /// Get the evolution tree as a list of nodes for UI visualization.
     /// Returns a cached copy if the tree hasn't changed since last call.
     pub fn tree_nodes(&mut self) -> Vec<TreeNode> {
@@ -1134,6 +1199,16 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     let _ = db.execute_batch(
         "ALTER TABLE node ADD COLUMN island_id INTEGER;"
     );
+
+    // Recording persistence: one compressed BLOB per generation
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS generation_recording (
+            node_id     INTEGER PRIMARY KEY REFERENCES node(id),
+            agent_count INTEGER NOT NULL,
+            tick_count  INTEGER NOT NULL,
+            data        BLOB NOT NULL
+        );"
+    )?;
 
     Ok(())
 }

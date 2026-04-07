@@ -714,6 +714,10 @@ impl App {
 
     /// Evaluate the current generation, advance to the next (or finish).
     fn advance_generation(&mut self) {
+        // Persist the recording to SQLite before moving to the next generation
+        if let (Some(ref recording), Some(ref gov)) = (&self.recording, &self.governor) {
+            gov.store_recording(recording);
+        }
         self.last_recording = self.recording.take();
         let wall_secs = self.evo_wall_accumulated
             + self.evo_wall_segment_start

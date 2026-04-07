@@ -1248,7 +1248,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add island_id if missing
     let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
 
-    // Recording persistence: one compressed BLOB per generation
+    // Recording persistence: one raw f32 BLOB per generation
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS generation_recording (
             node_id     INTEGER PRIMARY KEY REFERENCES node(id),

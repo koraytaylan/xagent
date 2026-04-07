@@ -1016,7 +1016,7 @@ impl Governor {
             .ok()?;
         let (agent_count, tick_count, blob) = row;
         let agent_count = usize::try_from(agent_count).ok()?;
-        let tick_count = u64::try_from(tick_count).ok()?;
+        let tick_count = usize::try_from(tick_count).ok()?;
 
         let float_size = std::mem::size_of::<f32>();
         if blob.len() % float_size != 0 {
@@ -1027,7 +1027,7 @@ impl Governor {
         let record_stride = 14usize;
         let actual_float_count = blob.len() / float_size;
         let expected_float_count = agent_count
-            .checked_mul(usize::try_from(tick_count).ok()?)?
+            .checked_mul(tick_count)?
             .checked_mul(record_stride)?;
         if actual_float_count != expected_float_count {
             return None;
@@ -1039,7 +1039,7 @@ impl Governor {
             floats.push(f32::from_le_bytes(bytes));
         }
 
-        Some((agent_count, tick_count, floats))
+        Some((agent_count, tick_count as u64, floats))
     }
 
     /// Get the evolution tree as a list of nodes for UI visualization.

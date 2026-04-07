@@ -26,7 +26,7 @@ use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
 use xagent_brain::GpuMegaKernel;
-use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT, P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT};
+use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT, P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_GRADIENT_OUT, P_URGENCY_OUT};
 use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
@@ -1351,7 +1351,7 @@ impl ApplicationHandler for App {
                                 let state = mk.cached_state();
                                 for i in 0..self.agents.len() {
                                     let base = i * PHYS_STRIDE;
-                                    if base + P_FATIGUE_FACTOR_OUT >= state.len() { break; }
+                                    if base + P_URGENCY_OUT >= state.len() { break; }
                                     let a = &mut self.agents[i];
                                     a.body.body.position = Vec3::new(
                                         state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
@@ -1375,6 +1375,10 @@ impl ApplicationHandler for App {
                                     a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
                                     a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
                                     a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
+                                    a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
+                                    a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
+                                    a.cached_gradient = state[base + P_GRADIENT_OUT];
+                                    a.cached_urgency = state[base + P_URGENCY_OUT];
                                 }
                             }
 
@@ -1397,6 +1401,36 @@ impl ApplicationHandler for App {
                             }
 
                             self.food_dirty = true;
+
+                            // Record tick for replay
+                            if let Some(ref mut rec) = self.recording {
+                                let tick = self.governor.as_ref().map_or(0, |g| g.gen_tick);
+                                let records: Vec<xagent_sandbox::replay::TickRecord> = self.agents.iter().map(|a| {
+                                    xagent_sandbox::replay::TickRecord {
+                                        position: [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z],
+                                        yaw: a.body.yaw,
+                                        alive: a.body.body.alive,
+                                        energy: a.body.body.internal.energy,
+                                        integrity: a.body.body.internal.integrity,
+                                        motor_forward: a.cached_motor.forward,
+                                        motor_turn: a.cached_motor.turn,
+                                        exploration_rate: a.cached_exploration_rate,
+                                        prediction_error: a.cached_prediction_error,
+                                        gradient: a.cached_gradient,
+                                        raw_gradient: a.cached_gradient,
+                                        urgency: a.cached_urgency,
+                                        credit_magnitude: 0.0,
+                                        patterns_recalled: 0,
+                                        phase: xagent_sandbox::replay::GenerationRecording::phase_to_u8("RANDOM"),
+                                        mean_attenuation: a.cached_mean_attenuation,
+                                        curiosity_bonus: a.cached_curiosity_bonus,
+                                        fatigue_factor: a.cached_fatigue_factor,
+                                        motor_variance: a.cached_motor_variance,
+                                        vision_color: None,
+                                    }
+                                }).collect();
+                                rec.record_tick(tick, &records);
+                            }
                         }
 
                         // Heatmap + trail recording

@@ -965,7 +965,7 @@ impl App {
                 self.selected_agent_idx = idx;
                 self.agents[idx].trail_dirty = true;
                 let a = &self.agents[idx];
-                println!("[SELECT] Agent {} (gen {})", a.id, a.generation,);
+                println!("[SELECT] Agent {} (gen {})", a.id, a.generation);
                 self.hud_dirty = true;
             }
         }
@@ -2482,7 +2482,7 @@ fn main() {
         if let Some(ws) = cli.world_size {
             config.world.world_size = ws;
         }
-        println!("Benchmark: {} agents, {} ticks", agent_count, total_ticks,);
+        println!("Benchmark: {} agents, {} ticks", agent_count, total_ticks);
         let result =
             xagent_sandbox::bench::run_bench(config.brain, config.world, agent_count, total_ticks);
         println!(

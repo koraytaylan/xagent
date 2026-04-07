@@ -44,12 +44,14 @@ pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 8130
 pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 8131
 pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 8163
 pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 8195
+
+// homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
 pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 8227
-                                                 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
 pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 8233
 pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 8265
+
+// act_biases: [fwd_bias, turn_bias]
 pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 8297
-                                                      // act_biases: [fwd_bias, turn_bias]
 pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 8299
 pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 8300
 pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 8364
@@ -64,8 +66,9 @@ pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1; // 8466
 pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1; // 8467
 pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 8468
 
-/// Fixed tail size: fields from O_PRED_CTX_WT through O_FATIGUE_FLOOR + 1.
-/// This is layout-independent — the tail doesn't change when vision dimensions vary.
+/// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
+/// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
+/// doesn't change with feature_count / vision dimensions.
 pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 468
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
@@ -161,6 +164,7 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
             .expect("vision dimensions overflow sensory stride");
         // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR)
         let brain_stride = feature_count
             .checked_mul(DIM)
             .and_then(|v| v.checked_add(DIM))

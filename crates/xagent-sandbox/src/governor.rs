@@ -919,10 +919,7 @@ impl Governor {
 
     /// Store a generation's recording as a little-endian f32 BLOB in the
     /// database.  `recording` is the `GenerationRecording` to persist.
-    pub fn store_recording(
-        &self,
-        recording: &crate::replay::GenerationRecording,
-    ) {
+    pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
         let node_id = match self.current_node_id {
             Some(id) => id,
             None => return,
@@ -953,8 +950,7 @@ impl Governor {
             Some(v) => v,
             None => return,
         };
-        let mut bytes =
-            Vec::with_capacity(expected_floats * std::mem::size_of::<f32>());
+        let mut bytes = Vec::with_capacity(expected_floats * std::mem::size_of::<f32>());
         for tick in 0..recording.total_ticks {
             let records = match recording.get_tick(tick) {
                 Some(records) => records,
@@ -1001,10 +997,7 @@ impl Governor {
     /// Load a generation's recording from the database.
     /// Returns `(agent_count, tick_count, Vec<f32>)` or `None` if not
     /// found or the blob is malformed.
-    pub fn load_recording(
-        &self,
-        node_id: i64,
-    ) -> Option<(usize, u64, Vec<f32>)> {
+    pub fn load_recording(&self, node_id: i64) -> Option<(usize, u64, Vec<f32>)> {
         let row: (i64, i64, Vec<u8>) = self
             .db
             .query_row(

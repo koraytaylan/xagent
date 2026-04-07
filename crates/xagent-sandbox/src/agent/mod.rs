@@ -13,7 +13,9 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::buffers::{AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
+use xagent_brain::buffers::{
+    AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_ACT_TURN_WTS, O_PRED_CTX_WT,
+};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -343,10 +345,10 @@ pub fn mutate_config_with_strength(
                 "fatigue_recovery_sensitivity",
                 strength,
             )
-            .clamp(2.0, 20.0),
+            .clamp(2.0, 10.0),
         fatigue_floor: momentum
             .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
-            .clamp(0.05, 0.4),
+            .clamp(0.05, 0.15),
         vision_w: parent.vision_w,
         vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
@@ -366,12 +368,27 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
 
     // Derive layout from actual state length (supports dynamic vision_w × vision_h).
     // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-    let fc = (state.brain_state.len() - DIM - DIM * DIM - FIXED_TAIL_SIZE) / DIM;
+    let variable_part = state
+        .brain_state
+        .len()
+        .checked_sub(DIM + DIM * DIM + FIXED_TAIL_SIZE)
+        .expect("brain_state too short for layout");
+    assert!(
+        variable_part % DIM == 0,
+        "brain_state length not aligned to DIM"
+    );
+    let fc = variable_part / DIM;
+
     let o_pred_wts = fc * DIM + DIM;
-    // Delta from the default compile-time O_PRED_CTX_WT to O_ACT_FWD_WTS is fixed
     let o_pred_ctx = o_pred_wts + DIM * DIM;
-    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_WEIGHTS - DIM * DIM);
-    let act_turn = act_fwd + DIM;
+    // Fixed deltas from O_PRED_CTX_WT are layout-independent
+    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
+    let act_turn = o_pred_ctx + (O_ACT_TURN_WTS - O_PRED_CTX_WT);
+
+    assert!(
+        act_turn + DIM <= state.brain_state.len(),
+        "computed offsets exceed brain_state bounds"
+    );
 
     // Mutate encoder weights (small perturbation)
     for i in 0..(fc * DIM) {
@@ -610,5 +627,63 @@ mod tests {
             !fwd_same,
             "mutate_brain_state should perturb action weights"
         );
+    }
+
+    #[test]
+    fn mutate_config_respects_fatigue_bounds() {
+        let momentum = MutationMomentum::new(0.9);
+        // Push initial config to the old (now invalid) upper limits to verify
+        // the tighter clamps rein them back in.
+        let parent = BrainConfig {
+            fatigue_recovery_sensitivity: 20.0,
+            fatigue_floor: 0.4,
+            ..BrainConfig::default()
+        };
+        for _ in 0..50 {
+            let child = mutate_config_with_strength(&parent, 0.3, &momentum);
+            assert!(
+                child.fatigue_recovery_sensitivity <= 10.0,
+                "fatigue_recovery must be ≤ 10.0, got {}",
+                child.fatigue_recovery_sensitivity,
+            );
+            assert!(
+                child.fatigue_recovery_sensitivity >= 2.0,
+                "fatigue_recovery must be ≥ 2.0, got {}",
+                child.fatigue_recovery_sensitivity,
+            );
+            assert!(
+                child.fatigue_floor <= 0.15,
+                "fatigue_floor must be ≤ 0.15, got {}",
+                child.fatigue_floor,
+            );
+            assert!(
+                child.fatigue_floor >= 0.05,
+                "fatigue_floor must be ≥ 0.05, got {}",
+                child.fatigue_floor,
+            );
+        }
+    }
+
+    #[test]
+    fn mutate_brain_state_works_with_dynamic_layout() {
+        use xagent_brain::BrainLayout;
+        // Use non-default vision dimensions to exercise dynamic offset logic
+        let layout = BrainLayout::new(6, 4);
+        let mut state = AgentBrainState::new_for(layout.brain_stride);
+        let dyn_act_fwd =
+            layout.feature_count * DIM + DIM + DIM * DIM + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
+        for i in 0..DIM {
+            state.brain_state[dyn_act_fwd + i] = 0.5;
+        }
+        // Should not panic — validates checked arithmetic with non-default layout
+        let mutated = mutate_brain_state(&state, 0.1);
+        assert_eq!(mutated.brain_state.len(), layout.brain_stride);
+    }
+
+    #[test]
+    #[should_panic(expected = "brain_state too short for layout")]
+    fn mutate_brain_state_rejects_short_buffer() {
+        let state = AgentBrainState::new_for(10); // way too small
+        let _ = mutate_brain_state(&state, 0.1);
     }
 }

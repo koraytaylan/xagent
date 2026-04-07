@@ -3,6 +3,9 @@ name = "xagent-brain"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 xagent-shared = { path = "../xagent-shared" }
 glam = { workspace = true }

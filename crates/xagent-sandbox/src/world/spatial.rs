@@ -142,7 +142,11 @@ impl AgentGrid {
                 cells[(cx * width + cz) as usize].push(i);
             }
         }
-        AgentGrid { cells, width, offset }
+        AgentGrid {
+            cells,
+            width,
+            offset,
+        }
     }
 
     /// Clear and rebuild from current positions (reuses Vec allocations within cells).

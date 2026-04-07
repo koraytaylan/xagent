@@ -5,9 +5,9 @@
 
 use std::time::Instant;
 
-use xagent_shared::{BrainConfig, WorldConfig};
-use xagent_brain::GpuMegaKernel;
 use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z};
+use xagent_brain::GpuMegaKernel;
+use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::world::WorldState;
 
@@ -46,11 +46,21 @@ pub fn run_bench(
     let final_positions: Vec<[f32; 3]> = (0..agent_count)
         .map(|i| {
             let base = i * PHYS_STRIDE;
-            [state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]]
+            [
+                state[base + P_POS_X],
+                state[base + P_POS_Y],
+                state[base + P_POS_Z],
+            ]
         })
         .collect();
 
-    BenchResult { total_ticks, agent_count, elapsed_secs, ticks_per_sec, final_positions }
+    BenchResult {
+        total_ticks,
+        agent_count,
+        elapsed_secs,
+        ticks_per_sec,
+        final_positions,
+    }
 }
 
 /// Profile phase costs by running with different phase masks.
@@ -61,7 +71,10 @@ pub fn run_profile(
     agent_count: usize,
     total_ticks: u64,
 ) {
-    println!("[profile] {} agents, {} ticks — phase cost breakdown:", agent_count, total_ticks);
+    println!(
+        "[profile] {} agents, {} ticks — phase cost breakdown:",
+        agent_count, total_ticks
+    );
 
     let (mut mk, _world) = create_kernel(&brain, &world_config, agent_count);
 
@@ -89,9 +102,21 @@ pub fn run_profile(
     let full = t3.elapsed().as_secs_f64();
 
     println!("  barriers only:     {:.3}s", barriers_only);
-    println!("  + physics:         {:.3}s  (physics compute: {:.3}s)", physics, physics - barriers_only);
-    println!("  + vision:          {:.3}s  (vision compute:  {:.3}s)", phys_vision, phys_vision - physics);
-    println!("  + brain (full):    {:.3}s  (brain compute:   {:.3}s)", full, full - phys_vision);
+    println!(
+        "  + physics:         {:.3}s  (physics compute: {:.3}s)",
+        physics,
+        physics - barriers_only
+    );
+    println!(
+        "  + vision:          {:.3}s  (vision compute:  {:.3}s)",
+        phys_vision,
+        phys_vision - physics
+    );
+    println!(
+        "  + brain (full):    {:.3}s  (brain compute:   {:.3}s)",
+        full,
+        full - phys_vision
+    );
     println!("  total tps (full):  {:.0}", total_ticks as f64 / full);
 }
 
@@ -103,15 +128,16 @@ fn create_kernel(
     let world = WorldState::new(world_config.clone());
     let food_count = world.food_items.len();
 
-    let mk = GpuMegaKernel::new(
-        agent_count as u32, food_count, brain, world_config,
-    );
+    let mk = GpuMegaKernel::new(agent_count as u32, food_count, brain, world_config);
 
     // Upload world data
     let heights = world.terrain.heights.clone();
     let biomes = world.biome_map.grid_as_u32();
-    let food_pos: Vec<(f32, f32, f32)> = world.food_items.iter()
-        .map(|f| (f.position.x, f.position.y, f.position.z)).collect();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
     let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
     mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
@@ -120,7 +146,13 @@ fn create_kernel(
     let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = (0..agent_count)
         .map(|_| {
             let pos = world.safe_spawn_position();
-            (pos, 100.0, 100.0, brain.memory_capacity, brain.processing_slots)
+            (
+                pos,
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
         })
         .collect();
     mk.upload_agents(&agent_data);

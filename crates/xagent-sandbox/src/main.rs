@@ -15,22 +15,24 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
-use xagent_sandbox::agent::{
-    mutate_brain_state, mutate_config, Agent, MAX_AGENTS,
+use xagent_brain::buffers::{
+    PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y,
+    P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT, P_INTEGRITY, P_MAX_ENERGY, P_MAX_INTEGRITY,
+    P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
+use xagent_brain::GpuMegaKernel;
+use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
+use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
+use xagent_sandbox::headless;
+use xagent_sandbox::overlay;
 use xagent_sandbox::recording::MetricsLogger;
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
-use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
-use xagent_sandbox::headless;
-use xagent_brain::GpuMegaKernel;
-use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z, P_VEL_X, P_VEL_Y, P_VEL_Z, P_FACING_X, P_FACING_Y, P_FACING_Z, P_YAW, P_ENERGY, P_MAX_ENERGY, P_INTEGRITY, P_MAX_INTEGRITY, P_ALIVE, P_FOOD_COUNT, P_TICKS_ALIVE, P_DEATH_COUNT, P_PREDICTION_ERROR, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT};
-use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
-    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
-    SortMode, Tab, TabContext, WorldSnapshot,
+    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState,
+    ReplayState, SortMode, Tab, TabContext, WorldSnapshot,
 };
 
 use xagent_sandbox::world::WorldState;
@@ -125,7 +127,10 @@ fn resolve_config(cli: &Cli) -> FullConfig {
             "default" => BrainConfig::default(),
             "large" => BrainConfig::large(),
             other => {
-                eprintln!("Error: Unknown brain preset '{}'. Choose: tiny, default, large", other);
+                eprintln!(
+                    "Error: Unknown brain preset '{}'. Choose: tiny, default, large",
+                    other
+                );
                 std::process::exit(1);
             }
         };
@@ -134,11 +139,18 @@ fn resolve_config(cli: &Cli) -> FullConfig {
             "normal" => WorldConfig::default(),
             "hard" => WorldConfig::hard(),
             other => {
-                eprintln!("Error: Unknown world preset '{}'. Choose: easy, normal, hard", other);
+                eprintln!(
+                    "Error: Unknown world preset '{}'. Choose: easy, normal, hard",
+                    other
+                );
                 std::process::exit(1);
             }
         };
-        FullConfig { brain, world, governor: GovernorConfig::default() }
+        FullConfig {
+            brain,
+            world,
+            governor: GovernorConfig::default(),
+        }
     };
 
     // CLI overrides
@@ -199,17 +211,24 @@ fn record_agent_histories(agent: &mut Agent) {
     let cap = 10_000;
     macro_rules! push_hist {
         ($h:expr, $v:expr) => {
-            if $h.len() >= cap { $h.pop_front(); }
+            if $h.len() >= cap {
+                $h.pop_front();
+            }
             $h.push_back($v);
         };
     }
-    push_hist!(agent.prediction_error_history, agent.cached_prediction_error);
-    push_hist!(agent.exploration_rate_history, agent.cached_exploration_rate);
-    let ef = agent.body.body.internal.energy
-        / agent.body.body.internal.max_energy.max(0.001);
+    push_hist!(
+        agent.prediction_error_history,
+        agent.cached_prediction_error
+    );
+    push_hist!(
+        agent.exploration_rate_history,
+        agent.cached_exploration_rate
+    );
+    let ef = agent.body.body.internal.energy / agent.body.body.internal.max_energy.max(0.001);
     push_hist!(agent.energy_history, ef.clamp(0.0, 1.0));
-    let inf = agent.body.body.internal.integrity
-        / agent.body.body.internal.max_integrity.max(0.001);
+    let inf =
+        agent.body.body.internal.integrity / agent.body.body.internal.max_integrity.max(0.001);
     push_hist!(agent.integrity_history, inf.clamp(0.0, 1.0));
     push_hist!(agent.fatigue_history, agent.cached_fatigue_factor);
 }
@@ -468,8 +487,12 @@ impl App {
 
     /// Ensure GpuMegaKernel is initialized for the current population.
     fn ensure_mega_kernel(&mut self) {
-        if self.gpu_mega_kernel.is_some() { return; }
-        if self.agents.is_empty() { return; }
+        if self.gpu_mega_kernel.is_some() {
+            return;
+        }
+        if self.agents.is_empty() {
+            return;
+        }
         let world = match &self.world {
             Some(w) => w,
             None => return,
@@ -479,12 +502,17 @@ impl App {
         if let Some(ref handle) = self.pending_mega_kernel {
             if handle.is_finished() {
                 let handle = self.pending_mega_kernel.take().unwrap();
-                let mk = handle.join().expect("mega-kernel background thread panicked");
+                let mk = handle
+                    .join()
+                    .expect("mega-kernel background thread panicked");
                 // Upload world + agent data (fast, main thread).
                 if let Some(upload) = self.pending_upload.take() {
                     mk.upload_world(
-                        &upload.heights, &upload.biomes, &upload.food_pos,
-                        &upload.food_consumed, &upload.food_timers,
+                        &upload.heights,
+                        &upload.biomes,
+                        &upload.food_pos,
+                        &upload.food_consumed,
+                        &upload.food_timers,
                     );
                     mk.upload_agents(&upload.agent_data);
                 }
@@ -504,18 +532,25 @@ impl App {
         self.pending_upload = Some(PendingUpload {
             heights: world.terrain.heights.clone(),
             biomes: world.biome_map.grid_as_u32(),
-            food_pos: world.food_items.iter()
-                .map(|f| (f.position.x, f.position.y, f.position.z)).collect(),
+            food_pos: world
+                .food_items
+                .iter()
+                .map(|f| (f.position.x, f.position.y, f.position.z))
+                .collect(),
             food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
             food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
-            agent_data: self.agents.iter()
-                .map(|a| (
-                    a.body.body.position,
-                    a.body.body.internal.max_energy,
-                    a.body.body.internal.max_integrity,
-                    a.brain_config.memory_capacity,
-                    a.brain_config.processing_slots,
-                ))
+            agent_data: self
+                .agents
+                .iter()
+                .map(|a| {
+                    (
+                        a.body.body.position,
+                        a.body.body.internal.max_energy,
+                        a.body.body.internal.max_integrity,
+                        a.brain_config.memory_capacity,
+                        a.brain_config.processing_slots,
+                    )
+                })
                 .collect(),
         });
 
@@ -532,10 +567,13 @@ impl App {
             EvolutionAction::Start => {
                 let brain_config = self.evo_snapshot.edit_brain.clone();
                 let gov_config = self.evo_snapshot.edit_governor.clone();
-                let world_json =
-                    serde_json::to_string(&self.world_config).unwrap_or_default();
-                match Governor::new(&self.db_path, gov_config.clone(), &brain_config, &world_json)
-                {
+                let world_json = serde_json::to_string(&self.world_config).unwrap_or_default();
+                match Governor::new(
+                    &self.db_path,
+                    gov_config.clone(),
+                    &brain_config,
+                    &world_json,
+                ) {
                     Ok(gov) => {
                         self.governor = Some(gov);
                         self.governor_config = gov_config.clone();
@@ -567,35 +605,33 @@ impl App {
                     }
                 }
             }
-            EvolutionAction::Resume => {
-                match Governor::resume(&self.db_path) {
-                    Ok(gov) => {
-                        let cfg = gov.current_config();
-                        self.evo_snapshot.state = EvolutionState::Running;
-                        self.evo_snapshot.generation = gov.generation;
-                        self.governor_config = gov.config.clone();
-                        if let Some(c) = &cfg {
-                            self.brain_config = c.clone();
-                        }
-                        self.governor = Some(gov);
-                        self.evo_wall_accumulated = 0.0;
-                        self.evo_wall_segment_start = Some(Instant::now());
-                        self.tps_tick_count = 0;
-                        self.tps_last_reset = Instant::now();
-                        self.tps_display = 0.0;
-                        self.paused = false;
-                        self.gpu_mega_kernel = None;
-                        self.pending_mega_kernel = None;
-                        self.pending_upload = None;
-                        self.spawn_evolution_population();
-                        self.ensure_mega_kernel();
-                        self.log_msg("[EVOLUTION] Resumed from database".into());
+            EvolutionAction::Resume => match Governor::resume(&self.db_path) {
+                Ok(gov) => {
+                    let cfg = gov.current_config();
+                    self.evo_snapshot.state = EvolutionState::Running;
+                    self.evo_snapshot.generation = gov.generation;
+                    self.governor_config = gov.config.clone();
+                    if let Some(c) = &cfg {
+                        self.brain_config = c.clone();
                     }
-                    Err(e) => {
-                        self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
-                    }
+                    self.governor = Some(gov);
+                    self.evo_wall_accumulated = 0.0;
+                    self.evo_wall_segment_start = Some(Instant::now());
+                    self.tps_tick_count = 0;
+                    self.tps_last_reset = Instant::now();
+                    self.tps_display = 0.0;
+                    self.paused = false;
+                    self.gpu_mega_kernel = None;
+                    self.pending_mega_kernel = None;
+                    self.pending_upload = None;
+                    self.spawn_evolution_population();
+                    self.ensure_mega_kernel();
+                    self.log_msg("[EVOLUTION] Resumed from database".into());
                 }
-            }
+                Err(e) => {
+                    self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
+                }
+            },
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
@@ -666,10 +702,11 @@ impl App {
 
         // Start replay recording
         if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
-                .map(|a| (a.id, a.color))
-                .collect();
-            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+            let agent_info: Vec<(u32, [f32; 3])> =
+                self.agents.iter().map(|a| (a.id, a.color)).collect();
+            let initial_food: Vec<[f32; 3]> = world
+                .food_items
+                .iter()
                 .map(|f| [f.position.x, f.position.y, f.position.z])
                 .collect();
             let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
@@ -694,10 +731,11 @@ impl App {
 
         // Start replay recording
         if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
-                .map(|a| (a.id, a.color))
-                .collect();
-            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+            let agent_info: Vec<(u32, [f32; 3])> =
+                self.agents.iter().map(|a| (a.id, a.color)).collect();
+            let initial_food: Vec<[f32; 3]> = world
+                .food_items
+                .iter()
                 .map(|f| [f.position.x, f.position.y, f.position.z])
                 .collect();
             let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
@@ -716,7 +754,8 @@ impl App {
     fn advance_generation(&mut self) {
         self.last_recording = self.recording.take();
         let wall_secs = self.evo_wall_accumulated
-            + self.evo_wall_segment_start
+            + self
+                .evo_wall_segment_start
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
@@ -735,7 +774,9 @@ impl App {
             // fitness is sorted by descending composite_fitness — first entry is best
             let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
             let state = self.agents.get(best_idx).and_then(|a| {
-                self.gpu_mega_kernel.as_ref().map(|mk| mk.read_agent_state(a.brain_idx))
+                self.gpu_mega_kernel
+                    .as_ref()
+                    .map(|mk| mk.read_agent_state(a.brain_idx))
             });
 
             (gov.advance(&fitness), state)
@@ -743,7 +784,11 @@ impl App {
 
         // Governor borrow released — safe to call self methods
         match result {
-            AdvanceResult::Continue { configs, messages, mutation_strength } => {
+            AdvanceResult::Continue {
+                configs,
+                messages,
+                mutation_strength,
+            } => {
                 for msg in messages {
                     self.log_msg(msg);
                 }
@@ -752,20 +797,26 @@ impl App {
 
                 // Reuse existing kernel if population size matches,
                 // otherwise drop and recreate in background.
-                let can_reuse = self.gpu_mega_kernel.as_ref()
+                let can_reuse = self
+                    .gpu_mega_kernel
+                    .as_ref()
                     .is_some_and(|mk| mk.agent_count() == self.agents.len() as u32);
 
                 if can_reuse {
                     let mk = self.gpu_mega_kernel.as_mut().unwrap();
                     mk.reset_agents(&self.brain_config);
-                    let agent_data: Vec<_> = self.agents.iter()
-                        .map(|a| (
-                            a.body.body.position,
-                            a.body.body.internal.max_energy,
-                            a.body.body.internal.max_integrity,
-                            a.brain_config.memory_capacity,
-                            a.brain_config.processing_slots,
-                        ))
+                    let agent_data: Vec<_> = self
+                        .agents
+                        .iter()
+                        .map(|a| {
+                            (
+                                a.body.body.position,
+                                a.body.body.internal.max_energy,
+                                a.body.body.internal.max_integrity,
+                                a.brain_config.memory_capacity,
+                                a.brain_config.processing_slots,
+                            )
+                        })
                         .collect();
                     mk.upload_agents(&agent_data);
                 } else {
@@ -841,7 +892,13 @@ impl App {
         let cy = world.terrain.height_at(cx, cz) + 1.0;
 
         let brain_idx = self.agents.len() as u32;
-        let mut child = Agent::new(id, Vec3::new(cx, cy, cz), brain_idx, child_config, self.tick);
+        let mut child = Agent::new(
+            id,
+            Vec3::new(cx, cy, cz),
+            brain_idx,
+            child_config,
+            self.tick,
+        );
         child.generation = parent_gen + 1;
 
         println!(
@@ -862,10 +919,14 @@ impl App {
 
     /// Pick the agent closest to the cursor via screen-space projection.
     fn pick_agent_at_cursor(&mut self) {
-        let Some(renderer) = &self.renderer else { return };
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
         let w = renderer.config.width as f32;
         let h = renderer.config.height as f32;
-        if w < 1.0 || h < 1.0 { return; }
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
 
         // Normalized device coordinates [-1, 1]
         let ndc_x = (self.cursor_pos.0 as f32 / w) * 2.0 - 1.0;
@@ -876,10 +937,14 @@ impl App {
         let mut best_dist_sq = f32::MAX;
 
         for (i, agent) in self.agents.iter().enumerate() {
-            if !agent.body.body.alive { continue; }
+            if !agent.body.body.alive {
+                continue;
+            }
             let pos = agent.body.body.position;
             let clip = vp * glam::Vec4::new(pos.x, pos.y, pos.z, 1.0);
-            if clip.w <= 0.0 { continue; } // behind camera
+            if clip.w <= 0.0 {
+                continue;
+            } // behind camera
             let sx = clip.x / clip.w;
             let sy = clip.y / clip.w;
             let d = (sx - ndc_x).powi(2) + (sy - ndc_y).powi(2);
@@ -895,10 +960,7 @@ impl App {
                 self.selected_agent_idx = idx;
                 self.agents[idx].trail_dirty = true;
                 let a = &self.agents[idx];
-                println!(
-                    "[SELECT] Agent {} (gen {})",
-                    a.id, a.generation,
-                );
+                println!("[SELECT] Agent {} (gen {})", a.id, a.generation,);
                 self.hud_dirty = true;
             }
         }
@@ -1010,8 +1072,11 @@ impl ApplicationHandler for App {
             .with_title("xagent — Emergent Cognitive Agent Sandbox")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
 
-        let window =
-            Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        );
         let size = window.inner_size();
         self.camera.aspect = size.width as f32 / size.height.max(1) as f32;
 
@@ -1038,8 +1103,7 @@ impl ApplicationHandler for App {
 
         // Trail overlay: combined ribbons for ALL agents.
         // Each segment = 4 verts, 6 indices.
-        let max_trail_segs =
-            xagent_sandbox::agent::MAX_TRAIL_POINTS as u64 * MAX_AGENTS as u64;
+        let max_trail_segs = xagent_sandbox::agent::MAX_TRAIL_POINTS as u64 * MAX_AGENTS as u64;
         self.trail_gpu = Some(GpuMesh::new_dynamic(
             &renderer.device,
             max_trail_segs * 4,
@@ -1077,27 +1141,16 @@ impl ApplicationHandler for App {
         self.tick = 0;
         self.last_frame = Instant::now();
 
-        println!(
-            "[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D"
-        );
-        println!(
-            "[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry"
-        );
+        println!("[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D");
+        println!("[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry");
         info!("Renderer + world + brain initialized — agent is alive");
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Forward every event to egui first.
         // If egui consumed it (pointer over a panel, typing in a text field, etc.)
         // we skip our own camera/sim key handling for that event.
-        let egui_consumed = if let (Some(egui), Some(window)) =
-            (&mut self.egui, &self.window)
-        {
+        let egui_consumed = if let (Some(egui), Some(window)) = (&mut self.egui, &self.window) {
             egui.on_window_event(window, &event)
         } else {
             false
@@ -1118,8 +1171,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size.width, new_size.height);
-                    self.camera.aspect =
-                        new_size.width as f32 / new_size.height.max(1) as f32;
+                    self.camera.aspect = new_size.width as f32 / new_size.height.max(1) as f32;
                 }
             }
 
@@ -1140,7 +1192,6 @@ impl ApplicationHandler for App {
                     }
 
                     // ── simulation controls ─────────────────────────
-
                     PhysicalKey::Code(KeyCode::KeyP | KeyCode::Space) if pressed => {
                         match self.evo_snapshot.state {
                             EvolutionState::Running => {
@@ -1178,15 +1229,24 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::Digit7) if pressed => {
                         self.speed_multiplier = 10000;
-                        println!("[SIM] Speed: 10000x ({} ticks/sec)", SIM_RATE as u32 * 10000);
+                        println!(
+                            "[SIM] Speed: 10000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 10000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::Digit8) if pressed => {
                         self.speed_multiplier = 100000;
-                        println!("[SIM] Speed: 100000x ({} ticks/sec)", SIM_RATE as u32 * 100000);
+                        println!(
+                            "[SIM] Speed: 100000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 100000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::Digit9) if pressed => {
                         self.speed_multiplier = 1000000;
-                        println!("[SIM] Speed: 1000000x ({} ticks/sec)", SIM_RATE as u32 * 1000000);
+                        println!(
+                            "[SIM] Speed: 1000000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 1000000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
@@ -1200,7 +1260,11 @@ impl ApplicationHandler for App {
                         self.render_3d = !self.render_3d;
                         self.log_msg(format!(
                             "[SIM] 3D render: {}",
-                            if self.render_3d { "ON" } else { "OFF (fast mode)" }
+                            if self.render_3d {
+                                "ON"
+                            } else {
+                                "OFF (fast mode)"
+                            }
                         ));
                     }
 
@@ -1290,7 +1354,8 @@ impl ApplicationHandler for App {
                         let diff = self.camera.position - agent.body.body.position;
                         self.camera.orbit_distance = diff.length().clamp(5.0, 200.0);
                         self.camera.orbit_yaw = diff.z.atan2(diff.x);
-                        self.camera.orbit_pitch = (diff.y / diff.length()).asin().clamp(-1.4, -0.05);
+                        self.camera.orbit_pitch =
+                            (diff.y / diff.length()).asin().clamp(-1.4, -0.05);
                     }
                 }
                 self.camera.orbit_mode = self.orbit_mode;
@@ -1309,8 +1374,8 @@ impl ApplicationHandler for App {
                     // Cap accumulator to 2× budget so debt stays bounded.
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
                     self.sim_accumulator = self.sim_accumulator.min(max_acc);
-                    let ticks_to_run = ((self.sim_accumulator / SIM_DT) as u32)
-                        .min(self.gpu_tick_budget);
+                    let ticks_to_run =
+                        ((self.sim_accumulator / SIM_DT) as u32).min(self.gpu_tick_budget);
 
                     if ticks_to_run > 0 {
                         self.ensure_mega_kernel();
@@ -1327,8 +1392,7 @@ impl ApplicationHandler for App {
                                 // when both are in-flight). Only shrink if CPU
                                 // encoding takes so long it stalls the render loop.
                                 if wall_ms > 50.0 {
-                                    self.gpu_tick_budget =
-                                        (self.gpu_tick_budget * 3 / 4).max(32);
+                                    self.gpu_tick_budget = (self.gpu_tick_budget * 3 / 4).max(32);
                                 } else {
                                     self.gpu_tick_budget =
                                         (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1)
@@ -1351,18 +1415,27 @@ impl ApplicationHandler for App {
                                 let state = mk.cached_state();
                                 for i in 0..self.agents.len() {
                                     let base = i * PHYS_STRIDE;
-                                    if base + P_FATIGUE_FACTOR_OUT >= state.len() { break; }
+                                    if base + P_FATIGUE_FACTOR_OUT >= state.len() {
+                                        break;
+                                    }
                                     let a = &mut self.agents[i];
                                     a.body.body.position = Vec3::new(
-                                        state[base + P_POS_X], state[base + P_POS_Y], state[base + P_POS_Z]);
+                                        state[base + P_POS_X],
+                                        state[base + P_POS_Y],
+                                        state[base + P_POS_Z],
+                                    );
                                     a.body.body.alive = state[base + P_ALIVE] > 0.5;
                                     a.body.yaw = state[base + P_YAW];
                                     a.body.body.internal.energy = state[base + P_ENERGY];
                                     a.body.body.internal.integrity = state[base + P_INTEGRITY];
                                     a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
-                                    a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
+                                    a.body.body.internal.max_integrity =
+                                        state[base + P_MAX_INTEGRITY];
                                     a.body.body.velocity = Vec3::new(
-                                        state[base + P_VEL_X], state[base + P_VEL_Y], state[base + P_VEL_Z]);
+                                        state[base + P_VEL_X],
+                                        state[base + P_VEL_Y],
+                                        state[base + P_VEL_Z],
+                                    );
                                     a.food_consumed = state[base + P_FOOD_COUNT] as u32;
                                     a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                     let new_deaths = state[base + P_DEATH_COUNT] as u32;
@@ -1371,9 +1444,13 @@ impl ApplicationHandler for App {
                                     }
                                     a.death_count = new_deaths;
                                     a.body.body.facing = Vec3::new(
-                                        state[base + P_FACING_X], state[base + P_FACING_Y], state[base + P_FACING_Z]);
+                                        state[base + P_FACING_X],
+                                        state[base + P_FACING_Y],
+                                        state[base + P_FACING_Z],
+                                    );
                                     a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
-                                    a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
+                                    a.cached_exploration_rate =
+                                        state[base + P_EXPLORATION_RATE_OUT];
                                     a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
                                 }
                             }
@@ -1448,15 +1525,16 @@ impl ApplicationHandler for App {
                     let advance = (self.replay_state.speed as u64).max(1);
                     self.replay_state.current_tick = (self.replay_state.current_tick + advance)
                         .min(self.replay_state.total_ticks.saturating_sub(1));
-                    if self.replay_state.current_tick >= self.replay_state.total_ticks.saturating_sub(1) {
+                    if self.replay_state.current_tick
+                        >= self.replay_state.total_ticks.saturating_sub(1)
+                    {
                         self.replay_state.playing = false;
                     }
                 }
 
                 // Fix selected index if agents were removed
                 if !self.agents.is_empty() {
-                    self.selected_agent_idx =
-                        self.selected_agent_idx.min(self.agents.len() - 1);
+                    self.selected_agent_idx = self.selected_agent_idx.min(self.agents.len() - 1);
                 }
 
                 // ── rebuild dynamic meshes ─────────────────────────
@@ -1492,21 +1570,13 @@ impl ApplicationHandler for App {
                 }
 
                 // ── rebuild trail overlay for ALL agents (when any trail changed) ──
-                if let (Some(renderer), Some(trail_gpu)) =
-                    (&self.renderer, &mut self.trail_gpu)
-                {
+                if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu) {
                     let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
                     if any_dirty {
                         let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
                             .agents
                             .iter()
-                            .map(|a| {
-                                (
-                                    a.trail.as_slice(),
-                                    &a.color as &[f32; 3],
-                                    a.body.body.alive,
-                                )
-                            })
+                            .map(|a| (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive))
                             .collect();
                         let mesh = overlay::build_all_trails_mesh(&agent_data);
                         if mesh.indices.is_empty() {
@@ -1521,9 +1591,7 @@ impl ApplicationHandler for App {
                 }
 
                 // ── rebuild selection marker above focused agent ──────
-                if let (Some(renderer), Some(marker_gpu)) =
-                    (&self.renderer, &mut self.marker_gpu)
-                {
+                if let (Some(renderer), Some(marker_gpu)) = (&self.renderer, &mut self.marker_gpu) {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         if agent.body.body.alive {
                             let mesh = overlay::build_marker_mesh(agent.body.body.position);
@@ -1544,7 +1612,11 @@ impl ApplicationHandler for App {
                         .map(|a| {
                             let color = if !a.body.body.alive {
                                 use xagent_sandbox::agent::srgb_to_linear;
-                                [srgb_to_linear(0.25), srgb_to_linear(0.25), srgb_to_linear(0.25)]
+                                [
+                                    srgb_to_linear(0.25),
+                                    srgb_to_linear(0.25),
+                                    srgb_to_linear(0.25),
+                                ]
                             } else {
                                 // Use the agent's assigned palette color, converted
                                 // from sRGB to linear so the sRGB framebuffer
@@ -1688,11 +1760,21 @@ impl ApplicationHandler for App {
                     let tr = self.trail_gpu.as_ref().filter(|g| g.num_indices > 0);
                     let mk = self.marker_gpu.as_ref().filter(|g| g.num_indices > 0);
                     let mut mesh_vec: Vec<&GpuMesh> = Vec::with_capacity(5);
-                    if let Some(t) = t { mesh_vec.push(t); }
-                    if let Some(f) = f { mesh_vec.push(f); }
-                    if let Some(h) = h { mesh_vec.push(h); }
-                    if let Some(tr) = tr { mesh_vec.push(tr); }
-                    if let Some(mk) = mk { mesh_vec.push(mk); }
+                    if let Some(t) = t {
+                        mesh_vec.push(t);
+                    }
+                    if let Some(f) = f {
+                        mesh_vec.push(f);
+                    }
+                    if let Some(h) = h {
+                        mesh_vec.push(h);
+                    }
+                    if let Some(tr) = tr {
+                        mesh_vec.push(tr);
+                    }
+                    if let Some(mk) = mk {
+                        mesh_vec.push(mk);
+                    }
 
                     let vp = self.camera.view_projection_matrix();
 
@@ -1709,20 +1791,15 @@ impl ApplicationHandler for App {
                                         inst_count,
                                         &mut frame_ctx.encoder,
                                         &egui.viewport_color_view,
-                                    &egui.viewport_depth_view,
-                                );
-                            }
+                                        &egui.viewport_depth_view,
+                                    );
+                                }
                             }
 
                             // 2) Render egui UI to the surface (viewport texture embedded)
-                            if let (Some(egui), Some(window)) =
-                                (&mut self.egui, &self.window)
-                            {
+                            if let (Some(egui), Some(window)) = (&mut self.egui, &self.window) {
                                 let screen = egui_wgpu::ScreenDescriptor {
-                                    size_in_pixels: [
-                                        renderer.config.width,
-                                        renderer.config.height,
-                                    ],
+                                    size_in_pixels: [renderer.config.width, renderer.config.height],
                                     pixels_per_point: window.scale_factor() as f32,
                                 };
 
@@ -1739,53 +1816,62 @@ impl ApplicationHandler for App {
 
                                 // Snapshot agent data for the UI closure
                                 let snap_window = self.chart_window * 2;
-                                let agent_snaps: Vec<AgentSnapshot> = self.agents.iter().map(|a| {
-                                    let tail = |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
-                                        let skip = d.len().saturating_sub(snap_window);
-                                        d.iter().skip(skip).copied().collect()
-                                    };
-                                    AgentSnapshot {
-                                        id: a.id,
-                                        gen: a.generation,
-                                        energy: a.body.body.internal.energy,
-                                        max_energy: a.body.body.internal.max_energy,
-                                        integrity: a.body.body.internal.integrity,
-                                        max_integrity: a.body.body.internal.max_integrity,
-                                        alive: a.body.body.alive,
-                                        deaths: a.death_count,
-                                        color: a.color,
-                                        longest_life: a.longest_life,
-                                        exploration_rate: a.cached_exploration_rate,
-                                        prediction_error: a.cached_prediction_error,
-                                        forward_weight_norm: 0.0, // GPU telemetry TBD
-                                        turn_weight_norm: 0.0,    // GPU telemetry TBD
-                                        prediction_error_history: tail(&a.prediction_error_history),
-                                        exploration_rate_history: tail(&a.exploration_rate_history),
-                                        energy_history: tail(&a.energy_history),
-                                        integrity_history: tail(&a.integrity_history),
-                                        gradient: a.cached_gradient,
-                                        urgency: a.cached_urgency,
-                                        food_consumed: a.food_consumed,
-                                        total_ticks_alive: a.total_ticks_alive,
-                                        motor_forward: a.cached_motor.forward,
-                                        motor_turn: a.cached_motor.turn,
-                                        phase: "GPU",   // GPU telemetry TBD
-                                        vision_color: a.cached_frame.vision.color.clone(),
-                                        vision_width: a.cached_frame.vision.width,
-                                        vision_height: a.cached_frame.vision.height,
-                                        position: [
-                                            a.body.body.position.x,
-                                            a.body.body.position.y,
-                                            a.body.body.position.z,
-                                        ],
-                                        yaw: a.body.yaw,
-                                        mean_attenuation: a.cached_mean_attenuation,
-                                        curiosity_bonus: a.cached_curiosity_bonus,
-                                        fatigue_factor: a.cached_fatigue_factor,
-                                        motor_variance: a.cached_motor_variance,
-                                        fatigue_history: tail(&a.fatigue_history),
-                                    }
-                                }).collect();
+                                let agent_snaps: Vec<AgentSnapshot> = self
+                                    .agents
+                                    .iter()
+                                    .map(|a| {
+                                        let tail =
+                                            |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
+                                                let skip = d.len().saturating_sub(snap_window);
+                                                d.iter().skip(skip).copied().collect()
+                                            };
+                                        AgentSnapshot {
+                                            id: a.id,
+                                            gen: a.generation,
+                                            energy: a.body.body.internal.energy,
+                                            max_energy: a.body.body.internal.max_energy,
+                                            integrity: a.body.body.internal.integrity,
+                                            max_integrity: a.body.body.internal.max_integrity,
+                                            alive: a.body.body.alive,
+                                            deaths: a.death_count,
+                                            color: a.color,
+                                            longest_life: a.longest_life,
+                                            exploration_rate: a.cached_exploration_rate,
+                                            prediction_error: a.cached_prediction_error,
+                                            forward_weight_norm: 0.0, // GPU telemetry TBD
+                                            turn_weight_norm: 0.0,    // GPU telemetry TBD
+                                            prediction_error_history: tail(
+                                                &a.prediction_error_history,
+                                            ),
+                                            exploration_rate_history: tail(
+                                                &a.exploration_rate_history,
+                                            ),
+                                            energy_history: tail(&a.energy_history),
+                                            integrity_history: tail(&a.integrity_history),
+                                            gradient: a.cached_gradient,
+                                            urgency: a.cached_urgency,
+                                            food_consumed: a.food_consumed,
+                                            total_ticks_alive: a.total_ticks_alive,
+                                            motor_forward: a.cached_motor.forward,
+                                            motor_turn: a.cached_motor.turn,
+                                            phase: "GPU", // GPU telemetry TBD
+                                            vision_color: a.cached_frame.vision.color.clone(),
+                                            vision_width: a.cached_frame.vision.width,
+                                            vision_height: a.cached_frame.vision.height,
+                                            position: [
+                                                a.body.body.position.x,
+                                                a.body.body.position.y,
+                                                a.body.body.position.z,
+                                            ],
+                                            yaw: a.body.yaw,
+                                            mean_attenuation: a.cached_mean_attenuation,
+                                            curiosity_bonus: a.cached_curiosity_bonus,
+                                            fatigue_factor: a.cached_fatigue_factor,
+                                            motor_variance: a.cached_motor_variance,
+                                            fatigue_history: tail(&a.fatigue_history),
+                                        }
+                                    })
+                                    .collect();
 
                                 // Build evolution snapshot for the UI
                                 if let Some(gov) = &mut self.governor {
@@ -1793,11 +1879,13 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.generation = gov.generation;
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
-                                    self.evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                                    self.evo_snapshot.fitness_history =
+                                        gov.fitness_history_by_island();
                                     self.evo_snapshot.best_fitness = gov.best_score();
                                 }
                                 let wall = self.evo_wall_accumulated
-                                    + self.evo_wall_segment_start
+                                    + self
+                                        .evo_wall_segment_start
                                         .map(|s| s.elapsed().as_secs_f64())
                                         .unwrap_or(0.0);
                                 self.evo_snapshot.wall_time_secs = wall;
@@ -1818,7 +1906,9 @@ impl ApplicationHandler for App {
 
                                 // Build world snapshot for mini-map
                                 if let Some(world) = &self.world {
-                                    self.world_snapshot.food_positions = world.food_items.iter()
+                                    self.world_snapshot.food_positions = world
+                                        .food_items
+                                        .iter()
                                         .filter(|f| !f.consumed)
                                         .map(|f| [f.position.x, f.position.z])
                                         .collect();
@@ -1840,21 +1930,30 @@ impl ApplicationHandler for App {
                                                 let x = -half + (col as f32 + 0.5) * cell;
                                                 let biome = world.biome_map.biome_at(x, z);
                                                 let c = match biome {
-                                                    BiomeType::FoodRich => egui::Color32::from_rgb(25, 70, 20),
-                                                    BiomeType::Barren => egui::Color32::from_rgb(60, 50, 30),
-                                                    BiomeType::Danger => egui::Color32::from_rgb(80, 25, 15),
+                                                    BiomeType::FoodRich => {
+                                                        egui::Color32::from_rgb(25, 70, 20)
+                                                    }
+                                                    BiomeType::Barren => {
+                                                        egui::Color32::from_rgb(60, 50, 30)
+                                                    }
+                                                    BiomeType::Danger => {
+                                                        egui::Color32::from_rgb(80, 25, 15)
+                                                    }
                                                 };
                                                 pixels.push(c);
                                             }
                                         }
-                                        egui::ColorImage { size: [res, res], pixels }
+                                        egui::ColorImage {
+                                            size: [res, res],
+                                            pixels,
+                                        }
                                     })
                                 } else {
                                     None
                                 };
 
-                                let console_lines: Vec<&str> = self.console_log.iter()
-                                    .map(|s| s.as_str()).collect();
+                                let console_lines: Vec<&str> =
+                                    self.console_log.iter().map(|s| s.as_str()).collect();
 
                                 let mut clicked_agent_idx: Option<usize> = None;
                                 let mut open_agent_tab: Option<u32> = None;
@@ -2205,8 +2304,8 @@ impl ApplicationHandler for App {
                                 if let Some(agent_id) = open_agent_tab {
                                     let tab = Tab::AgentDetail(agent_id);
                                     // Check if tab already exists
-                                    let already_open = self.dock_state.iter_all_tabs()
-                                        .any(|(_, t)| *t == tab);
+                                    let already_open =
+                                        self.dock_state.iter_all_tabs().any(|(_, t)| *t == tab);
                                     if !already_open {
                                         self.dock_state.push_to_focused_leaf(tab);
                                     }
@@ -2308,8 +2407,7 @@ fn main() {
     }
 
     if cli.dump_config {
-        let json = serde_json::to_string_pretty(&config)
-            .expect("Failed to serialize config");
+        let json = serde_json::to_string_pretty(&config).expect("Failed to serialize config");
         println!("{}", json);
         return;
     }
@@ -2320,9 +2418,7 @@ fn main() {
         if let Some(ws) = cli.world_size {
             config.world.world_size = ws;
         }
-        xagent_sandbox::bench::run_profile(
-            config.brain, config.world, agent_count, total_ticks,
-        );
+        xagent_sandbox::bench::run_profile(config.brain, config.world, agent_count, total_ticks);
         return;
     }
 
@@ -2332,16 +2428,9 @@ fn main() {
         if let Some(ws) = cli.world_size {
             config.world.world_size = ws;
         }
-        println!(
-            "Benchmark: {} agents, {} ticks",
-            agent_count, total_ticks,
-        );
-        let result = xagent_sandbox::bench::run_bench(
-            config.brain,
-            config.world,
-            agent_count,
-            total_ticks,
-        );
+        println!("Benchmark: {} agents, {} ticks", agent_count, total_ticks,);
+        let result =
+            xagent_sandbox::bench::run_bench(config.brain, config.world, agent_count, total_ticks);
         println!(
             "Completed {} ticks in {:.2}s ({:.0} ticks/sec)",
             result.total_ticks, result.elapsed_secs, result.ticks_per_sec,

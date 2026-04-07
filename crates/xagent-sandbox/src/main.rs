@@ -1406,7 +1406,11 @@ impl ApplicationHandler for App {
 
                             self.food_dirty = true;
 
-                            // Record tick for replay
+                            // Record tick for replay (from async physics readback).
+                            // Fields not in the physics buffer (credit_magnitude, patterns_recalled,
+                            // phase, vision_color) require pattern/brain buffer readback and are
+                            // left as defaults. raw_gradient mirrors gradient (no separate raw
+                            // source in GPU readback).
                             if let Some(ref mut rec) = self.recording {
                                 let tick = self.governor.as_ref().map_or(0, |g| g.gen_tick);
                                 let records: Vec<xagent_sandbox::replay::TickRecord> = self.agents.iter().map(|a| {

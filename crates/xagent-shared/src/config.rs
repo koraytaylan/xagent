@@ -41,10 +41,12 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
-    /// Number of vision rays (W × H). Affects sensory buffer size and feature count.
-    /// Lower = faster vision dispatch. Default 48 (8×6).
-    #[serde(default = "default_vision_rays")]
-    pub vision_rays: u32,
+    /// Visual field width in pixels. Default 8.
+    #[serde(default = "default_vision_w")]
+    pub vision_w: u32,
+    /// Visual field height in pixels. Default 6.
+    #[serde(default = "default_vision_h")]
+    pub vision_h: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
     /// Default 4.
     #[serde(default = "default_brain_tick_stride")]
@@ -108,12 +110,16 @@ fn default_fatigue_floor() -> f32 {
     0.1
 }
 
-fn default_seed() -> u64 {
-    42
+fn default_vision_w() -> u32 {
+    8
 }
 
-fn default_vision_rays() -> u32 {
-    48
+fn default_vision_h() -> u32 {
+    6
+}
+
+fn default_seed() -> u64 {
+    42
 }
 
 fn default_brain_tick_stride() -> u32 {
@@ -242,7 +248,8 @@ impl Default for BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_rays: 48,
+            vision_w: 8,
+            vision_h: 6,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,
@@ -266,7 +273,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_rays: 24,
+            vision_w: 6,
+            vision_h: 4,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,
@@ -288,7 +296,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_rays: 96,
+            vision_w: 12,
+            vision_h: 8,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,
@@ -346,7 +355,7 @@ impl Default for AgentDescriptor {
             brain: BrainConfig::default(),
             max_energy: 100.0,
             max_integrity: 100.0,
-            visual_resolution: (16, 12),
+            visual_resolution: (8, 6),
             fov_degrees: 90.0,
         }
     }

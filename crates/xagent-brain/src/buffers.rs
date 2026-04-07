@@ -66,7 +66,7 @@ pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1;               // 8468
 
 /// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
-/// doesn't change with feature_count / vision_rays.
+/// doesn't change with feature_count / vision dimensions.
 pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT;   // 468
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
@@ -126,23 +126,10 @@ pub const PHYS_STRIDE: usize = 27;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
-// ── Runtime layout for configurable vision_rays ──────────────────────
+// ── Runtime layout for configurable vision dimensions ─────────────────
 
-/// Compute vision grid W×H from total ray count.
-/// Picks the largest H ≤ sqrt(rays) that divides evenly.
-pub fn vision_wh(rays: u32) -> (u32, u32) {
-    let s = (rays as f32).sqrt().floor() as u32;
-    let mut best_h = 1;
-    for i in 1..=s {
-        if rays % i == 0 {
-            best_h = i;
-        }
-    }
-    (rays / best_h, best_h)
-}
-
-/// Runtime-computed buffer layout that depends on vision_rays.
-/// All strides and offsets cascade from the ray count.
+/// Runtime-computed buffer layout that depends on vision_w × vision_h.
+/// All strides and offsets cascade from the pixel count.
 #[derive(Clone, Debug)]
 pub struct BrainLayout {
     pub vision_w: u32,
@@ -155,18 +142,32 @@ pub struct BrainLayout {
 }
 
 impl BrainLayout {
-    pub fn new(vision_rays: u32) -> Self {
-        let (w, h) = vision_wh(vision_rays);
-        let color_count = vision_rays as usize * 4;
-        let depth_count = vision_rays as usize;
-        let feature_count = color_count + 25;
-        let sensory_stride = color_count + depth_count + NON_VISUAL_COUNT;
+    pub fn new(vision_w: u32, vision_h: u32) -> Self {
+        let pixel_count = (vision_w as usize)
+            .checked_mul(vision_h as usize)
+            .expect("vision dimensions overflow pixel count");
+        let color_count = pixel_count
+            .checked_mul(4)
+            .expect("vision dimensions overflow color count");
+        let depth_count = pixel_count;
+        let feature_count = color_count
+            .checked_add(25)
+            .expect("vision dimensions overflow feature count");
+        let sensory_stride = color_count
+            .checked_add(depth_count)
+            .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
+            .expect("vision dimensions overflow sensory stride");
         // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
         // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR)
-        let brain_stride = feature_count * DIM + DIM + DIM * DIM + FIXED_TAIL_SIZE;
+        let brain_stride = feature_count
+            .checked_mul(DIM)
+            .and_then(|v| v.checked_add(DIM))
+            .and_then(|v| v.checked_add(DIM * DIM))
+            .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
+            .expect("vision dimensions overflow brain stride");
         Self {
-            vision_w: w,
-            vision_h: h,
+            vision_w,
+            vision_h,
             vision_color_count: color_count,
             vision_depth_count: depth_count,
             feature_count,
@@ -178,7 +179,7 @@ impl BrainLayout {
 
 impl Default for BrainLayout {
     fn default() -> Self {
-        Self::new(48)
+        Self::new(8, 6)
     }
 }
 
@@ -610,7 +611,7 @@ pub fn init_brain_state(config: &BrainConfig, rng: &mut impl rand::Rng) -> Vec<f
     init_brain_state_for(config, &BrainLayout::default(), rng)
 }
 
-/// Layout-aware version for configurable vision_rays.
+/// Layout-aware version for configurable vision dimensions.
 pub fn init_brain_state_for(config: &BrainConfig, layout: &BrainLayout, rng: &mut impl rand::Rng) -> Vec<f32> {
     let fc = layout.feature_count;
     let mut state = vec![0.0_f32; layout.brain_stride];
@@ -747,10 +748,12 @@ mod tests {
 
     #[test]
     fn brain_layout_dynamic_is_consistent() {
-        for rays in [16, 24, 32, 48, 64, 96] {
-            let layout = BrainLayout::new(rays);
-            assert_eq!(layout.vision_w * layout.vision_h, rays);
-            assert_eq!(layout.vision_color_count, rays as usize * 4);
+        for (w, h) in [(4, 4), (6, 4), (8, 4), (8, 6), (8, 8), (12, 8)] {
+            let layout = BrainLayout::new(w, h);
+            assert_eq!(layout.vision_w, w);
+            assert_eq!(layout.vision_h, h);
+            let pixels = (w * h) as usize;
+            assert_eq!(layout.vision_color_count, pixels * 4);
             assert_eq!(layout.feature_count, layout.vision_color_count + 25);
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;
@@ -762,7 +765,7 @@ mod tests {
     #[test]
     fn init_brain_state_for_dynamic_layout() {
         let config = BrainConfig::default();
-        let layout = BrainLayout::new(24);
+        let layout = BrainLayout::new(6, 4);
         let mut rng = rand::rng();
         let state = init_brain_state_for(&config, &layout, &mut rng);
         assert_eq!(state.len(), layout.brain_stride);

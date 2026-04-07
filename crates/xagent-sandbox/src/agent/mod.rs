@@ -157,6 +157,8 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with an assigned GPU brain index, color, and zero death count.
     pub fn new(id: u32, position: Vec3, brain_idx: u32, config: BrainConfig, tick: u64) -> Self {
+        let vw = config.vision_w;
+        let vh = config.vision_h;
         Self {
             id,
             body: AgentBody::new(position),
@@ -184,7 +186,7 @@ impl Agent {
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
-            cached_frame: SensoryFrame::new_blank(8, 6),
+            cached_frame: SensoryFrame::new_blank(vw, vh),
             cached_urgency: 0.0,
             cached_gradient: 0.0,
             cached_mean_attenuation: 0.0,
@@ -296,7 +298,8 @@ pub fn mutate_config_with_strength(
         max_curiosity_bonus: momentum.biased_perturb_f(&mut rng, parent.max_curiosity_bonus, "max_curiosity_bonus", strength).clamp(0.1, 1.0),
         fatigue_recovery_sensitivity: momentum.biased_perturb_f(&mut rng, parent.fatigue_recovery_sensitivity, "fatigue_recovery_sensitivity", strength).clamp(2.0, 20.0),
         fatigue_floor: momentum.biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength).clamp(0.05, 0.4),
-        vision_rays: parent.vision_rays,
+        vision_w: parent.vision_w,
+        vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
         vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
@@ -312,7 +315,7 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut rng = rand::rng();
     let mut mutated = state.clone();
 
-    // Derive layout from actual state length (supports dynamic vision_rays).
+    // Derive layout from actual state length (supports dynamic vision_w × vision_h).
     // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
     let variable_part = state
         .brain_state
@@ -420,7 +423,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.fatigue_floor
         },
-        vision_rays: a.vision_rays,
+        vision_w: a.vision_w,
+        vision_h: a.vision_h,
         brain_tick_stride: a.brain_tick_stride,
         vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,
@@ -565,8 +569,8 @@ mod tests {
     #[test]
     fn mutate_brain_state_works_with_dynamic_layout() {
         use xagent_brain::BrainLayout;
-        // Use a non-default vision ray count to exercise dynamic offset logic
-        let layout = BrainLayout::new(24);
+        // Use non-default vision dimensions to exercise dynamic offset logic
+        let layout = BrainLayout::new(6, 4);
         let mut state = AgentBrainState::new_for(layout.brain_stride);
         let dyn_act_fwd = layout.feature_count * DIM + DIM + DIM * DIM
             + (O_ACT_FWD_WTS - O_PRED_CTX_WT);

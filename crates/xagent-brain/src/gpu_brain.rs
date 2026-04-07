@@ -949,7 +949,7 @@ mod tests {
         let mut brain = GpuBrain::new(1, &config);
 
         // Create a frame with known values
-        let mut frame = SensoryFrame::new_blank(8, 6);
+        let mut frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
         frame.vision.color[0] = 0.5; // First pixel R
         frame.vision.color[1] = 0.3; // First pixel G
         frame.velocity = glam::Vec3::new(3.0, 4.0, 0.0); // magnitude = 5.0
@@ -1018,7 +1018,7 @@ mod tests {
         brain.write_agent_state(0, &state);
 
         // Create a frame with known first pixel
-        let mut frame = SensoryFrame::new_blank(8, 6);
+        let mut frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
         frame.vision.color[0] = 0.5; // features[0] = 0.5
         brain.upload_sensory(&[frame]);
         brain.run_feature_extract();
@@ -1041,7 +1041,7 @@ mod tests {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(1, &config);
 
-        let frame = SensoryFrame::new_blank(8, 6);
+        let frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
 
         // Run feature_extract + encode + habituate_homeo multiple times with constant input
         for _ in 0..100 {
@@ -1139,7 +1139,7 @@ mod tests {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(2, &config);
         let frames: Vec<SensoryFrame> = (0..2)
-            .map(|_| SensoryFrame::new_blank(8, 6))
+            .map(|_| SensoryFrame::new_blank(config.vision_w, config.vision_h))
             .collect();
 
         // Run full pipeline up to predict_and_act
@@ -1182,7 +1182,7 @@ mod tests {
     fn learn_and_store_modifies_weights_and_stores_pattern() {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(1, &config);
-        let frame = SensoryFrame::new_blank(8, 6);
+        let frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
 
         // Run full pipeline through all 7 passes
         brain.upload_sensory(&[frame.clone()]);
@@ -1210,7 +1210,7 @@ mod tests {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(4, &config);
         let frames: Vec<SensoryFrame> = (0..4)
-            .map(|_| SensoryFrame::new_blank(8, 6))
+            .map(|_| SensoryFrame::new_blank(config.vision_w, config.vision_h))
             .collect();
 
         for _ in 0..100 {
@@ -1229,7 +1229,7 @@ mod tests {
     fn learning_changes_weights() {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(1, &config);
-        let frame = SensoryFrame::new_blank(8, 6);
+        let frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
 
         let before = brain.read_agent_state(0);
 
@@ -1252,7 +1252,7 @@ mod tests {
     fn memory_fills_over_time() {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(1, &config);
-        let frame = SensoryFrame::new_blank(8, 6);
+        let frame = SensoryFrame::new_blank(config.vision_w, config.vision_h);
 
         for _ in 0..200 {
             brain.tick(&[frame.clone()]);
@@ -1277,7 +1277,7 @@ mod tests {
         let config = BrainConfig::default();
         let mut brain = GpuBrain::new(10, &config);
         let frames: Vec<SensoryFrame> = (0..10)
-            .map(|_| SensoryFrame::new_blank(8, 6))
+            .map(|_| SensoryFrame::new_blank(config.vision_w, config.vision_h))
             .collect();
 
         let mut all_same = true;

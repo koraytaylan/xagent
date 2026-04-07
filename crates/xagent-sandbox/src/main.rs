@@ -678,6 +678,8 @@ impl App {
                 &agent_info,
                 &initial_food,
                 self.governor_config.tick_budget as usize,
+                self.brain_config.vision_w,
+                self.brain_config.vision_h,
             ));
         }
     }
@@ -704,6 +706,8 @@ impl App {
                 &agent_info,
                 &initial_food,
                 self.governor_config.tick_budget as usize,
+                self.brain_config.vision_w,
+                self.brain_config.vision_h,
             ));
         }
     }

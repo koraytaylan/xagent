@@ -210,7 +210,7 @@ impl GpuMegaKernel {
         ))
         .expect("Failed to create GPU device");
 
-        let layout = BrainLayout::new(brain_config.vision_rays);
+        let layout = BrainLayout::new(brain_config.vision_w, brain_config.vision_h);
         let brain_tick_stride = brain_config.brain_tick_stride;
 
         let storage_rw = wgpu::BufferUsages::STORAGE

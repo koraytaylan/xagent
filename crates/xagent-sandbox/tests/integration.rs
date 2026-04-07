@@ -25,6 +25,12 @@ fn agent_at(pos: Vec3) -> AgentBody {
     AgentBody::new(pos)
 }
 
+/// Create a blank sensory frame using the default brain config's vision dimensions.
+fn default_frame() -> xagent_shared::SensoryFrame {
+    let cfg = xagent_shared::BrainConfig::default();
+    xagent_shared::SensoryFrame::new_blank(cfg.vision_w, cfg.vision_h)
+}
+
 // ── Physics Tests ──────────────────────────────────────────────────────
 
 #[test]
@@ -322,19 +328,22 @@ fn sensory_frame_has_correct_dimensions() {
     let spawn_y = world.terrain.height_at(0.0, 0.0) + 2.0;
     let agent = agent_at(Vec3::new(0.0, spawn_y, 0.0));
 
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let cfg = xagent_shared::BrainConfig::default();
+    let vw = cfg.vision_w;
+    let vh = cfg.vision_h;
+    let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
-    assert_eq!(frame.vision.width, 8, "Visual field width should be 8");
-    assert_eq!(frame.vision.height, 6, "Visual field height should be 6");
+    assert_eq!(frame.vision.width, vw, "Visual field width should match config");
+    assert_eq!(frame.vision.height, vh, "Visual field height should match config");
     assert_eq!(
         frame.vision.color.len(),
-        (8 * 6 * 4) as usize,
+        (vw * vh * 4) as usize,
         "Color buffer should have width*height*4 elements"
     );
     assert_eq!(
         frame.vision.depth.len(),
-        (8 * 6) as usize,
+        (vw * vh) as usize,
         "Depth buffer should have width*height elements"
     );
 }
@@ -349,7 +358,7 @@ fn interoception_matches_body_state() {
     agent.body.internal.energy = 75.0;
     agent.body.internal.integrity = 60.0;
 
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     let expected_energy = agent.body.internal.energy_signal();
@@ -387,7 +396,7 @@ fn vision_detects_food_items() {
     // Face toward the food
     agent.body.facing = to_food;
 
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     // Check if any pixel in the vision field has the food color (lime green: R≈0.70, G≈0.95)
@@ -413,7 +422,7 @@ fn vision_detects_food_items() {
     let mut close_agent = agent_at(Vec3::new(close_pos.x, close_y, close_pos.z));
     close_agent.body.facing = Vec3::X; // face toward food (food is +X from agent)
 
-    let mut close_frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let mut close_frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses(&close_agent, &world, 0, &mut close_frame);
 
     let mut close_found = false;
@@ -452,7 +461,7 @@ fn vision_with_positions_detects_food_items() {
     // Use the positions-based extraction (the path used during evolution)
     let all_positions: Vec<(Vec3, bool)> = vec![(agent.body.position, true)];
     let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses_with_positions(
         &agent, &world, 0, &all_positions, 0, &agent_grid, &mut frame,
     );
@@ -492,7 +501,7 @@ fn touch_contacts_populated_near_food() {
     let spawn_y = world.terrain.height_at(agent_pos.x, agent_pos.z) + 2.0;
     let agent = agent_at(Vec3::new(agent_pos.x, spawn_y, agent_pos.z));
 
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     let has_food_touch = frame.touch_contacts.iter().any(|c| c.surface_tag == 1 && c.intensity > 0.0);
@@ -986,13 +995,15 @@ fn cpu_vision_produces_correct_buffer_shape() {
         (Vec3::new(10.0, 5.0, 10.0), true),
     ];
 
-    let mut frame = xagent_shared::SensoryFrame::new_blank(8, 6);
+    let cfg = BrainConfig::default();
+    let vw = cfg.vision_w;
+    let vh = cfg.vision_h;
+    let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions, 256.0);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
         &agent, &world, 0, &positions, 0, &agent_grid, &mut frame,
     );
 
-    // 8×6 = 48 rays, 4 color channels each
-    assert_eq!(frame.vision.color.len(), 8 * 6 * 4);
-    assert_eq!(frame.vision.depth.len(), 8 * 6);
+    assert_eq!(frame.vision.color.len(), (vw * vh * 4) as usize);
+    assert_eq!(frame.vision.depth.len(), (vw * vh) as usize);
 }

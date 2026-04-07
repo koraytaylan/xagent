@@ -64,6 +64,13 @@ unreadable_literal = "allow"
 elidable_lifetime_names = "allow"
 stable_sort_primitive = "allow"
 pub_underscore_fields = "allow"
+# Non-pedantic lints allowed for existing test/bench code (--all-targets).
+# Remove these as the test code is cleaned up.
+assertions_on_constants = "allow"
+useless_vec = "allow"
+cloned_ref_to_slice_refs = "allow"
+manual_range_contains = "allow"
+erasing_op = "allow"
 # Correctness and suspicious lints stay at default (deny/warn).
 
 [workspace.dependencies]

@@ -452,9 +452,15 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         let f_len = u32(new_len);
         var mean_f: f32 = 0.0;
         var mean_t: f32 = 0.0;
+        var sum_turn: f32 = 0.0;
+        var sum_abs_turn: f32 = 0.0;
         for (var i: u32 = 0u; i < f_len; i = i + 1u) {
-            mean_f += brain_state[b + O_FATIGUE_FWD_RING + i];
-            mean_t += brain_state[b + O_FATIGUE_TURN_RING + i];
+            let fi = brain_state[b + O_FATIGUE_FWD_RING + i];
+            let ti = brain_state[b + O_FATIGUE_TURN_RING + i];
+            mean_f += fi;
+            mean_t += ti;
+            sum_turn += ti;
+            sum_abs_turn += abs(ti);
         }
         mean_f /= f32(f_len);
         mean_t /= f32(f_len);
@@ -468,11 +474,21 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         var_f /= f32(f_len);
         var_t /= f32(f_len);
+
+        // Turn-direction consistency: detect sustained same-direction turning
+        // (circling signature). turn_bias → 1 when all turns share the same
+        // sign, → 0 when turns are balanced left/right.
+        let turn_denom = max(sum_abs_turn, 0.01);
+        let turn_bias = abs(sum_turn) / turn_denom;
+        // Squared for gentle onset; suppresses variety when turning monotonically
+        let monotony = turn_bias * turn_bias;
+
         let recovery = brain_state[b + O_FATIGUE_RECOVERY];
         let floor_val = brain_state[b + O_FATIGUE_FLOOR];
         let motor_variety = sqrt(var_f + var_t) * recovery;
+        let effective_variety = motor_variety * (1.0 - monotony * 0.75);
         let fatigue_factor = clamp(
-            floor_val + (1.0 - floor_val) * clamp(motor_variety, 0.0, 1.0),
+            floor_val + (1.0 - floor_val) * clamp(effective_variety, 0.0, 1.0),
             floor_val, 1.0
         );
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;

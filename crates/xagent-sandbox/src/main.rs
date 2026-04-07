@@ -17,8 +17,9 @@ use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
 use xagent_brain::buffers::{
     PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y,
-    P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT, P_INTEGRITY, P_MAX_ENERGY, P_MAX_INTEGRITY,
-    P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
+    P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_MAX_ENERGY,
+    P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
+    P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
 use xagent_brain::GpuMegaKernel;
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
@@ -752,6 +753,10 @@ impl App {
 
     /// Evaluate the current generation, advance to the next (or finish).
     fn advance_generation(&mut self) {
+        // Persist the recording to SQLite before moving to the next generation
+        if let (Some(ref recording), Some(ref gov)) = (&self.recording, &self.governor) {
+            gov.store_recording(recording);
+        }
         self.last_recording = self.recording.take();
         let wall_secs = self.evo_wall_accumulated
             + self
@@ -1415,7 +1420,7 @@ impl ApplicationHandler for App {
                                 let state = mk.cached_state();
                                 for i in 0..self.agents.len() {
                                     let base = i * PHYS_STRIDE;
-                                    if base + P_FATIGUE_FACTOR_OUT >= state.len() {
+                                    if base + P_URGENCY_OUT >= state.len() {
                                         break;
                                     }
                                     let a = &mut self.agents[i];
@@ -1452,6 +1457,10 @@ impl ApplicationHandler for App {
                                     a.cached_exploration_rate =
                                         state[base + P_EXPLORATION_RATE_OUT];
                                     a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
+                                    a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
+                                    a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
+                                    a.cached_gradient = state[base + P_GRADIENT_OUT];
+                                    a.cached_urgency = state[base + P_URGENCY_OUT];
                                 }
                             }
 
@@ -1474,6 +1483,51 @@ impl ApplicationHandler for App {
                             }
 
                             self.food_dirty = true;
+
+                            // Record tick for replay using the latest async physics
+                            // readback plus per-agent cached telemetry. Position/yaw/
+                            // alive/energy/integrity come from the physics readback
+                            // stored on each agent body. Motor outputs, gradient/
+                            // urgency, and the exploration/prediction/attenuation/
+                            // curiosity/fatigue/motor-variance fields come from
+                            // `cached_*` telemetry; in this path only the selected
+                            // agent's cache is refreshed each frame.
+                            // `credit_magnitude`, `patterns_recalled`, `phase`, and
+                            // `vision_color` are not populated here and are left as
+                            // defaults. `raw_gradient` mirrors `gradient` because
+                            // there is no separate raw gradient source in this GPU
+                            // readback path.
+                            if let Some(ref mut rec) = self.recording {
+                                // Async readback snapshots arrive independently of
+                                // governor tick advancement, so record them at the
+                                // next dense replay index.
+                                let tick = rec.total_ticks;
+                                let records: Vec<xagent_sandbox::replay::TickRecord> = self.agents.iter().map(|a| {
+                                    xagent_sandbox::replay::TickRecord {
+                                        position: [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z],
+                                        yaw: a.body.yaw,
+                                        alive: a.body.body.alive,
+                                        energy: a.body.body.internal.energy,
+                                        integrity: a.body.body.internal.integrity,
+                                        motor_forward: a.cached_motor.forward,
+                                        motor_turn: a.cached_motor.turn,
+                                        exploration_rate: a.cached_exploration_rate,
+                                        prediction_error: a.cached_prediction_error,
+                                        gradient: a.cached_gradient,
+                                        raw_gradient: a.cached_gradient,
+                                        urgency: a.cached_urgency,
+                                        credit_magnitude: 0.0,
+                                        patterns_recalled: 0,
+                                        phase: xagent_sandbox::replay::GenerationRecording::phase_to_u8("RANDOM"),
+                                        mean_attenuation: a.cached_mean_attenuation,
+                                        curiosity_bonus: a.cached_curiosity_bonus,
+                                        fatigue_factor: a.cached_fatigue_factor,
+                                        motor_variance: a.cached_motor_variance,
+                                        vision_color: None,
+                                    }
+                                }).collect();
+                                rec.record_tick(tick, &records);
+                            }
                         }
 
                         // Heatmap + trail recording

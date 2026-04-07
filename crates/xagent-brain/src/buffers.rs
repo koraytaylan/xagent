@@ -124,7 +124,11 @@ pub const P_DEATH_COUNT: usize = 23;
 pub const P_PREDICTION_ERROR: usize = 24;
 pub const P_EXPLORATION_RATE_OUT: usize = 25;
 pub const P_FATIGUE_FACTOR_OUT: usize = 26;
-pub const PHYS_STRIDE: usize = 27;
+pub const P_MOTOR_FWD_OUT: usize = 27;
+pub const P_MOTOR_TURN_OUT: usize = 28;
+pub const P_GRADIENT_OUT: usize = 29;
+pub const P_URGENCY_OUT: usize = 30;
+pub const PHYS_STRIDE: usize = 31;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -1091,6 +1095,10 @@ mod tests {
             P_PREDICTION_ERROR,
             P_EXPLORATION_RATE_OUT,
             P_FATIGUE_FACTOR_OUT,
+            P_MOTOR_FWD_OUT,
+            P_MOTOR_TURN_OUT,
+            P_GRADIENT_OUT,
+            P_URGENCY_OUT,
         ]
         .iter()
         .max()

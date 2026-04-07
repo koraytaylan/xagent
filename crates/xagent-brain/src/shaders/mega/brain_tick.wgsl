@@ -548,6 +548,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         agent_phys[phys_base + P_PREDICTION_ERROR] = s_pred_error;
         agent_phys[phys_base + P_EXPLORATION_RATE_OUT] = exploration_rate;
         agent_phys[phys_base + P_FATIGUE_FACTOR_OUT] = fatigue_factor;
+        agent_phys[phys_base + P_MOTOR_FWD_OUT] = fwd;
+        agent_phys[phys_base + P_MOTOR_TURN_OUT] = trn;
+        agent_phys[phys_base + P_GRADIENT_OUT] = gradient;
+        agent_phys[phys_base + P_URGENCY_OUT] = urgency;
     }
 }
 

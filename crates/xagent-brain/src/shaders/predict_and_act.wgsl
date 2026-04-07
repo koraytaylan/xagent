@@ -266,18 +266,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     brain_state[b + O_EXPLORATION_RATE] = exploration_rate;
 
-    // Tanh squash + exploration noise (uniform [-1,1] scaled by exploration_rate)
+    // Tanh squash
     fwd = fast_tanh(fwd);
     trn = fast_tanh(trn);
-    let tick_u = u32(tick_count);
-    let seed_base = agent * 1000u + tick_u;
-    let noise_fwd = (rand_f32(seed_base) * 2.0 - 1.0) * 0.5;
-    let noise_trn = (rand_f32(seed_base + 1u) * 2.0 - 1.0) * 0.5;
-    fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
-    trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
 
     // ────────────────────────────────────────────────────────────────────
-    // 5. Motor fatigue
+    // 5. Motor fatigue — record PRE-NOISE commands so exploration noise
+    //    doesn't mask repetitive brain decisions (matches brain_tick.wgsl).
     // ────────────────────────────────────────────────────────────────────
     let fatigue_cursor = u32(brain_state[b + O_FATIGUE_CURSOR]);
     brain_state[b + O_FATIGUE_FWD_RING + fatigue_cursor] = fwd;
@@ -287,13 +282,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     brain_state[b + O_FATIGUE_LEN] = new_len;
     brain_state[b + O_FATIGUE_CURSOR] = f32((fatigue_cursor + 1u) % ACTION_HISTORY_LEN);
 
-    // Compute variance of fwd and turn over fatigue ring
+    // Compute variance of fwd and turn over fatigue ring,
+    // accumulating turn-direction sums in the same pass.
     let f_len = u32(new_len);
     var mean_f: f32 = 0.0;
     var mean_t: f32 = 0.0;
+    var sum_turn: f32 = 0.0;
+    var sum_abs_turn: f32 = 0.0;
     for (var i: u32 = 0u; i < f_len; i = i + 1u) {
-        mean_f += brain_state[b + O_FATIGUE_FWD_RING + i];
-        mean_t += brain_state[b + O_FATIGUE_TURN_RING + i];
+        let fi = brain_state[b + O_FATIGUE_FWD_RING + i];
+        let ti = brain_state[b + O_FATIGUE_TURN_RING + i];
+        mean_f += fi;
+        mean_t += ti;
+        sum_turn += ti;
+        sum_abs_turn += abs(ti);
     }
     mean_f /= f32(f_len);
     mean_t /= f32(f_len);
@@ -312,14 +314,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Turn-direction consistency: detect sustained same-direction turning
     // (circling signature). turn_bias → 1 when all turns share the same
     // sign, → 0 when turns are balanced left/right.
-    var sum_turn: f32 = 0.0;
-    var sum_abs_turn: f32 = 0.0;
-    for (var i: u32 = 0u; i < f_len; i = i + 1u) {
-        let t = brain_state[b + O_FATIGUE_TURN_RING + i];
-        sum_turn += t;
-        sum_abs_turn += abs(t);
-    }
-    let turn_bias = select(0.0, abs(sum_turn) / sum_abs_turn, sum_abs_turn > 0.01);
+    let turn_denom = max(sum_abs_turn, 0.01);
+    let turn_bias = abs(sum_turn) / turn_denom;
     // Squared for gentle onset; suppresses variety when turning monotonically
     let monotony = turn_bias * turn_bias;
 
@@ -335,6 +331,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     fwd *= fatigue_factor;
     trn *= fatigue_factor;
+
+    // Exploration noise (applied after fatigue ring to not pollute it)
+    let tick_u = u32(tick_count);
+    let seed_base = agent * 1000u + tick_u;
+    let noise_fwd = (rand_f32(seed_base) * 2.0 - 1.0) * 0.5;
+    let noise_trn = (rand_f32(seed_base + 1u) * 2.0 - 1.0) * 0.5;
+    fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
+    trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
 
     // ────────────────────────────────────────────────────────────────────
     // 6. Record motor output + update tick + write decision buffer

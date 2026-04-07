@@ -13,7 +13,7 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Upper bound for processing_slots to keep recall cost bounded.
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
-use xagent_brain::buffers::{AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_PRED_WEIGHTS};
+use xagent_brain::buffers::{AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_ACT_TURN_WTS, O_PRED_CTX_WT};
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -317,12 +317,27 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
 
     // Derive layout from actual state length (supports dynamic vision_w × vision_h).
     // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-    let fc = (state.brain_state.len() - DIM - DIM * DIM - FIXED_TAIL_SIZE) / DIM;
+    let variable_part = state
+        .brain_state
+        .len()
+        .checked_sub(DIM + DIM * DIM + FIXED_TAIL_SIZE)
+        .expect("brain_state too short for layout");
+    assert!(
+        variable_part % DIM == 0,
+        "brain_state length not aligned to DIM"
+    );
+    let fc = variable_part / DIM;
+
     let o_pred_wts = fc * DIM + DIM;
-    // Delta from the default compile-time O_PRED_CTX_WT to O_ACT_FWD_WTS is fixed
     let o_pred_ctx = o_pred_wts + DIM * DIM;
-    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_WEIGHTS - DIM * DIM);
-    let act_turn = act_fwd + DIM;
+    // Fixed deltas from O_PRED_CTX_WT are layout-independent
+    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
+    let act_turn = o_pred_ctx + (O_ACT_TURN_WTS - O_PRED_CTX_WT);
+
+    assert!(
+        act_turn + DIM <= state.brain_state.len(),
+        "computed offsets exceed brain_state bounds"
+    );
 
     // Mutate encoder weights (small perturbation)
     for i in 0..(fc * DIM) {
@@ -549,5 +564,28 @@ mod tests {
         let fwd_same = (0..DIM)
             .all(|i| mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]);
         assert!(!fwd_same, "mutate_brain_state should perturb action weights");
+    }
+
+    #[test]
+    fn mutate_brain_state_works_with_dynamic_layout() {
+        use xagent_brain::BrainLayout;
+        // Use non-default vision dimensions to exercise dynamic offset logic
+        let layout = BrainLayout::new(6, 4);
+        let mut state = AgentBrainState::new_for(layout.brain_stride);
+        let dyn_act_fwd = layout.feature_count * DIM + DIM + DIM * DIM
+            + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
+        for i in 0..DIM {
+            state.brain_state[dyn_act_fwd + i] = 0.5;
+        }
+        // Should not panic — validates checked arithmetic with non-default layout
+        let mutated = mutate_brain_state(&state, 0.1);
+        assert_eq!(mutated.brain_state.len(), layout.brain_stride);
+    }
+
+    #[test]
+    #[should_panic(expected = "brain_state too short for layout")]
+    fn mutate_brain_state_rejects_short_buffer() {
+        let state = AgentBrainState::new_for(10); // way too small
+        let _ = mutate_brain_state(&state, 0.1);
     }
 }

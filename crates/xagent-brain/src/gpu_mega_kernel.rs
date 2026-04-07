@@ -3,8 +3,8 @@
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use wgpu;
 use xagent_shared::{BrainConfig, WorldConfig};
@@ -72,9 +72,9 @@ pub struct GpuMegaKernel {
 
     // ── Async state readback (double-buffered, non-blocking) ──
     state_staging: [wgpu::Buffer; 2],
-    staging_idx: usize,                      // which buffer to write NEXT
-    staging_in_flight: [bool; 2],            // submitted, not yet collected
-    staging_ready: [Arc<AtomicBool>; 2],     // map_async callback fired
+    staging_idx: usize,                  // which buffer to write NEXT
+    staging_in_flight: [bool; 2],        // submitted, not yet collected
+    staging_ready: [Arc<AtomicBool>; 2], // map_async callback fired
     state_cache: Vec<f32>,
 
     // ── Config ──
@@ -129,15 +129,23 @@ impl GpuMegaKernel {
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
         let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
-            brain_data.extend_from_slice(&init_brain_state_for(brain_config, &self.layout, &mut rng));
+            brain_data.extend_from_slice(&init_brain_state_for(
+                brain_config,
+                &self.layout,
+                &mut rng,
+            ));
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        self.queue.write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
-        self.queue.write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue.write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
+        self.queue
+            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
+        self.queue
+            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
+        self.queue
+            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
         self.queue.write_buffer(
-            &self.brain_config_buf, 0,
+            &self.brain_config_buf,
+            0,
             bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
         );
     }
@@ -180,7 +188,9 @@ impl GpuMegaKernel {
         if has_subgroup {
             log::info!("[GpuMegaKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
         } else {
-            log::info!("[GpuMegaKernel] No subgroup support — using shared-memory-only bitonic sort");
+            log::info!(
+                "[GpuMegaKernel] No subgroup support — using shared-memory-only bitonic sort"
+            );
         }
 
         let adapter_limits = adapter.limits();
@@ -320,7 +330,9 @@ impl GpuMegaKernel {
         let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mega_dispatch_args"),
             size: 6 * 4, // 2 × (x, y, z) u32 triplets
-            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -354,7 +366,11 @@ impl GpuMegaKernel {
         queue.write_buffer(&brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
         queue.write_buffer(&pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
         queue.write_buffer(&history_buf, 0, bytemuck::cast_slice(&history_data));
-        queue.write_buffer(&brain_config_buf, 0, bytemuck::cast_slice(&build_config_for(brain_config, &layout)));
+        queue.write_buffer(
+            &brain_config_buf,
+            0,
+            bytemuck::cast_slice(&build_config_for(brain_config, &layout)),
+        );
 
         // ── String-replace vision grid dimensions in common shader ──
         let common_src = include_str!("shaders/mega/common.wgsl")
@@ -391,7 +407,11 @@ impl GpuMegaKernel {
         .join("\n");
 
         // ── Compose brain shader ──
-        let mut brain_source = format!("{}\n{}", &common_src, include_str!("shaders/mega/brain_tick.wgsl"));
+        let mut brain_source = format!(
+            "{}\n{}",
+            &common_src,
+            include_str!("shaders/mega/brain_tick.wgsl")
+        );
 
         // Subgroup-accelerated bitonic sort (shared between brain and mega shaders)
         let subgroup_sort = r#"
@@ -471,19 +491,16 @@ impl GpuMegaKernel {
             );
 
             // Add sgid to coop_recall_topk signature and call
-            brain_source = brain_source.replace(
-                "/* SUBGROUP_TOPK_PARAMS */",
-                ", sgid: u32",
-            );
-            brain_source = brain_source.replace(
-                "/* SUBGROUP_TOPK_ARGS */",
-                ", sgid",
-            );
+            brain_source = brain_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+            brain_source = brain_source.replace("/* SUBGROUP_TOPK_ARGS */", ", sgid");
 
             // Find and replace the bitonic sort block
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) = (brain_source.find(begin_marker), brain_source.find(end_marker)) {
+            if let (Some(begin_pos), Some(end_pos)) = (
+                brain_source.find(begin_marker),
+                brain_source.find(end_marker),
+            ) {
                 let end_pos = end_pos + end_marker.len();
                 brain_source.replace_range(begin_pos..end_pos, subgroup_sort);
             } else {
@@ -516,28 +533,18 @@ impl GpuMegaKernel {
                 "// MEGA_SUBGROUP_ENTRY_PARAMS",
                 "@builtin(subgroup_invocation_id) sgid: u32,",
             );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_PARAMS */",
-                ", sgid: u32",
-            );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_ARGS */",
-                ", sgid",
-            );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_INNER_ARGS */",
-                ", sgid",
-            );
+            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_ARGS */", ", sgid");
+            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_INNER_ARGS */", ", sgid");
 
             // Also replace brain_tick.wgsl's own markers (included via brain_fns_only)
-            mega_source = mega_source.replace(
-                "/* SUBGROUP_TOPK_PARAMS */",
-                ", sgid: u32",
-            );
+            mega_source = mega_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
 
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) = (mega_source.find(begin_marker), mega_source.find(end_marker)) {
+            if let (Some(begin_pos), Some(end_pos)) =
+                (mega_source.find(begin_marker), mega_source.find(end_marker))
+            {
                 let end_pos = end_pos + end_marker.len();
                 mega_source.replace_range(begin_pos..end_pos, subgroup_sort);
             } else {
@@ -572,7 +579,11 @@ impl GpuMegaKernel {
             BindGroupLayoutEntry {
                 binding,
                 visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
                 count: None,
             }
         };
@@ -580,7 +591,11 @@ impl GpuMegaKernel {
             BindGroupLayoutEntry {
                 binding,
                 visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
                 count: None,
             }
         };
@@ -588,29 +603,33 @@ impl GpuMegaKernel {
             BindGroupLayoutEntry {
                 binding,
                 visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
                 count: None,
             }
         };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mega_bgl"),
             entries: &[
-                storage_rw_entry(0),   // agent_phys
-                storage_rw_entry(1),   // decision
-                storage_ro_entry(2),   // heightmap
-                storage_ro_entry(3),   // biome
-                uniform_entry(4),      // world_config
-                storage_rw_entry(5),   // food_state
-                storage_rw_entry(6),   // food_flags
-                storage_rw_entry(7),   // food_grid
-                storage_rw_entry(8),   // agent_grid
-                storage_rw_entry(9),   // collision_scratch
-                storage_rw_entry(10),  // sensory
-                storage_rw_entry(11),  // brain_state
-                storage_rw_entry(12),  // pattern
-                storage_rw_entry(13),  // history
-                uniform_entry(14),     // brain_config
-                storage_rw_entry(15),  // dispatch_args
+                storage_rw_entry(0),  // agent_phys
+                storage_rw_entry(1),  // decision
+                storage_ro_entry(2),  // heightmap
+                storage_ro_entry(3),  // biome
+                uniform_entry(4),     // world_config
+                storage_rw_entry(5),  // food_state
+                storage_rw_entry(6),  // food_flags
+                storage_rw_entry(7),  // food_grid
+                storage_rw_entry(8),  // agent_grid
+                storage_rw_entry(9),  // collision_scratch
+                storage_rw_entry(10), // sensory
+                storage_rw_entry(11), // brain_state
+                storage_rw_entry(12), // pattern
+                storage_rw_entry(13), // history
+                uniform_entry(14),    // brain_config
+                storage_rw_entry(15), // dispatch_args
             ],
         });
         // ── Physics pipeline layout (has push constants) ──
@@ -676,7 +695,8 @@ impl GpuMegaKernel {
         let prepare_source = [
             &common_src,
             include_str!("shaders/mega/phase_prepare_dispatch.wgsl"),
-        ].join("\n");
+        ]
+        .join("\n");
         let prepare_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prepare_dispatch"),
             source: wgpu::ShaderSource::Wgsl(prepare_source.into()),
@@ -734,22 +754,70 @@ impl GpuMegaKernel {
                 label: Some(label),
                 layout: &bind_group_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0,  resource: agent_phys_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1,  resource: decision_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2,  resource: heightmap_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3,  resource: biome_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4,  resource: wc_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5,  resource: food_state_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6,  resource: food_flags_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7,  resource: food_grid_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8,  resource: agent_grid_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9,  resource: collision_scratch_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: sensory_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: brain_state_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 12, resource: pattern_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 13, resource: history_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 14, resource: brain_config_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 15, resource: dispatch_args_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: agent_phys_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: decision_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: heightmap_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: biome_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wc_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: food_state_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: food_flags_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: food_grid_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: agent_grid_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: collision_scratch_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: sensory_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: brain_state_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: pattern_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: history_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: brain_config_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: dispatch_args_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -791,7 +859,10 @@ impl GpuMegaKernel {
             state_staging,
             staging_idx: 0,
             staging_in_flight: [false, false],
-            staging_ready: [Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))],
+            staging_ready: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
             state_cache: vec![0.0; n * PHYS_STRIDE],
             world_config: world_config.clone(),
             layout,
@@ -809,8 +880,13 @@ impl GpuMegaKernel {
         food_consumed: &[bool],
         food_timers: &[f32],
     ) {
-        self.queue.write_buffer(&self.heightmap_buf, 0, bytemuck::cast_slice(terrain_heights));
-        self.queue.write_buffer(&self.biome_buf, 0, bytemuck::cast_slice(biome_grid));
+        self.queue.write_buffer(
+            &self.heightmap_buf,
+            0,
+            bytemuck::cast_slice(terrain_heights),
+        );
+        self.queue
+            .write_buffer(&self.biome_buf, 0, bytemuck::cast_slice(biome_grid));
 
         let mut food_data = Vec::with_capacity(food_positions.len() * FOOD_STATE_STRIDE);
         for (i, &(x, y, z)) in food_positions.iter().enumerate() {
@@ -819,10 +895,15 @@ impl GpuMegaKernel {
             food_data.push(z);
             food_data.push(food_timers[i]);
         }
-        self.queue.write_buffer(&self.food_state_buf, 0, bytemuck::cast_slice(&food_data));
+        self.queue
+            .write_buffer(&self.food_state_buf, 0, bytemuck::cast_slice(&food_data));
 
-        let flags: Vec<u32> = food_consumed.iter().map(|&c| if c { 1 } else { 0 }).collect();
-        self.queue.write_buffer(&self.food_flags_buf, 0, bytemuck::cast_slice(&flags));
+        let flags: Vec<u32> = food_consumed
+            .iter()
+            .map(|&c| if c { 1 } else { 0 })
+            .collect();
+        self.queue
+            .write_buffer(&self.food_flags_buf, 0, bytemuck::cast_slice(&flags));
     }
 
     /// Upload initial agent physics state.
@@ -847,7 +928,8 @@ impl GpuMegaKernel {
             data[base + P_MEMORY_CAP] = mem_cap as f32;
             data[base + P_PROCESSING_SLOTS] = proc_slots as f32;
         }
-        self.queue.write_buffer(&self.agent_phys_buf, 0, bytemuck::cast_slice(&data));
+        self.queue
+            .write_buffer(&self.agent_phys_buf, 0, bytemuck::cast_slice(&data));
     }
 
     /// Write world config uniform with batch parameters.
@@ -868,12 +950,22 @@ impl GpuMegaKernel {
             self.brain_tick_stride,
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
-        self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));
+        self.queue.write_buffer(
+            &self.world_config_bufs[self.active_config_idx],
+            0,
+            bytemuck::cast_slice(&wc),
+        );
     }
 
     /// Write world config with explicit vision_stride override.
     /// Used by mega dispatch to set the GPU loop count per batch.
-    fn upload_world_config_with_cycles(&self, start_tick: u64, ticks_to_run: u32, phase_mask: u32, vision_stride_override: u32) {
+    fn upload_world_config_with_cycles(
+        &self,
+        start_tick: u64,
+        ticks_to_run: u32,
+        phase_mask: u32,
+        vision_stride_override: u32,
+    ) {
         let mut wc = build_world_config(
             &self.world_config,
             self.food_count,
@@ -884,7 +976,11 @@ impl GpuMegaKernel {
             self.brain_tick_stride,
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
-        self.queue.write_buffer(&self.world_config_bufs[self.active_config_idx], 0, bytemuck::cast_slice(&wc));
+        self.queue.write_buffer(
+            &self.world_config_bufs[self.active_config_idx],
+            0,
+            bytemuck::cast_slice(&wc),
+        );
     }
 
     /// Dispatch with explicit phase mask (for profiling).
@@ -907,9 +1003,11 @@ impl GpuMegaKernel {
         let mut cycle = 0u32;
         while cycle < num_cycles {
             let chunk_end = (cycle + CYCLES_PER_CHUNK).min(num_cycles);
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_masked"),
-            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_masked"),
+                });
             // Prepare indirect dispatch args (once per chunk)
             if run_vision || run_brain {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -945,9 +1043,11 @@ impl GpuMegaKernel {
         }
 
         // Remainder: physics only (no vision/brain)
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_masked_final"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dispatch_masked_final"),
+            });
         if remainder > 0 {
             let rem_base = start_tick + (num_cycles as u64) * (self.brain_tick_stride as u64);
             let pc: [u32; 2] = [rem_base as u32, remainder];
@@ -959,7 +1059,13 @@ impl GpuMegaKernel {
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }
-        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[self.staging_idx], 0, buf_size);
+        encoder.copy_buffer_to_buffer(
+            &self.agent_phys_buf,
+            0,
+            &self.state_staging[self.staging_idx],
+            0,
+            buf_size,
+        );
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
 
@@ -1016,15 +1122,26 @@ impl GpuMegaKernel {
 
         for m in 0..total_megas {
             let is_remainder = m == mega_batches;
-            let cycles_this_batch = if is_remainder { remainder_cycles } else { self.vision_stride };
+            let cycles_this_batch = if is_remainder {
+                remainder_cycles
+            } else {
+                self.vision_stride
+            };
             let ticks_this_batch = cycles_this_batch * self.brain_tick_stride;
 
             // Upload world config with vision_stride override for this batch
-            self.upload_world_config_with_cycles(tick_cursor, ticks_this_batch, 0x7, cycles_this_batch);
+            self.upload_world_config_with_cycles(
+                tick_cursor,
+                ticks_this_batch,
+                0x7,
+                cycles_this_batch,
+            );
 
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_mega"),
-            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_mega"),
+                });
 
             // Prepare indirect dispatch args (for vision)
             {
@@ -1069,9 +1186,11 @@ impl GpuMegaKernel {
         let physics_remainder = ticks_to_run % self.brain_tick_stride;
 
         // Final submit: physics remainder + async state readback
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_mega_final"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dispatch_mega_final"),
+            });
         if physics_remainder > 0 {
             self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
             let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
@@ -1085,7 +1204,13 @@ impl GpuMegaKernel {
         }
 
         // Async state readback into staging[widx]
-        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &self.state_staging[widx], 0, buf_size);
+        encoder.copy_buffer_to_buffer(
+            &self.agent_phys_buf,
+            0,
+            &self.state_staging[widx],
+            0,
+            buf_size,
+        );
         self.queue.submit(std::iter::once(encoder.finish()));
 
         self.staging_ready[widx].store(false, Ordering::Release);
@@ -1150,7 +1275,12 @@ impl GpuMegaKernel {
 
         let brain_offset = (i * bs * 4) as u64;
         let brain_size = (bs * 4) as u64;
-        self.read_buffer_range(&self.brain_state_buf, brain_offset, brain_size, &mut state.brain_state);
+        self.read_buffer_range(
+            &self.brain_state_buf,
+            brain_offset,
+            brain_size,
+            &mut state.brain_state,
+        );
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
         let pat_size = (PATTERN_STRIDE * 4) as u64;
@@ -1158,7 +1288,12 @@ impl GpuMegaKernel {
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         let hist_size = (HISTORY_STRIDE * 4) as u64;
-        self.read_buffer_range(&self.history_buf, hist_offset, hist_size, &mut state.history);
+        self.read_buffer_range(
+            &self.history_buf,
+            hist_offset,
+            hist_size,
+            &mut state.history,
+        );
 
         state
     }
@@ -1169,13 +1304,25 @@ impl GpuMegaKernel {
         let bs = self.layout.brain_stride;
 
         let brain_offset = (i * bs * 4) as u64;
-        self.queue.write_buffer(&self.brain_state_buf, brain_offset, bytemuck::cast_slice(&state.brain_state));
+        self.queue.write_buffer(
+            &self.brain_state_buf,
+            brain_offset,
+            bytemuck::cast_slice(&state.brain_state),
+        );
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
-        self.queue.write_buffer(&self.pattern_buf, pat_offset, bytemuck::cast_slice(&state.patterns));
+        self.queue.write_buffer(
+            &self.pattern_buf,
+            pat_offset,
+            bytemuck::cast_slice(&state.patterns),
+        );
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
-        self.queue.write_buffer(&self.history_buf, hist_offset, bytemuck::cast_slice(&state.history));
+        self.queue.write_buffer(
+            &self.history_buf,
+            hist_offset,
+            bytemuck::cast_slice(&state.history),
+        );
     }
 
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
@@ -1186,9 +1333,11 @@ impl GpuMegaKernel {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mega_read_copy"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mega_read_copy"),
+            });
         encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -1213,7 +1362,12 @@ impl GpuMegaKernel {
         let sensory_offset = (i * SENSORY_STRIDE * 4) as u64;
         let sensory_size = (SENSORY_STRIDE * 4) as u64;
         let mut sensory = Vec::with_capacity(SENSORY_STRIDE);
-        self.read_buffer_range(&self.sensory_buf, sensory_offset, sensory_size, &mut sensory);
+        self.read_buffer_range(
+            &self.sensory_buf,
+            sensory_offset,
+            sensory_size,
+            &mut sensory,
+        );
         let vision_color: Vec<f32> = sensory[..VISION_COLOR_COUNT].to_vec();
 
         // Decision: read motor outputs (last 4 floats of DECISION_STRIDE)
@@ -1247,14 +1401,19 @@ impl GpuMegaKernel {
         let turn_ring = &brain[O_FATIGUE_TURN_RING..O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN];
         let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
         let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let turn_var: f32 = turn_ring.iter().map(|x| (x - turn_mean).powi(2)).sum::<f32>() / ACTION_HISTORY_LEN as f32;
+        let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>()
+            / ACTION_HISTORY_LEN as f32;
+        let turn_var: f32 = turn_ring
+            .iter()
+            .map(|x| (x - turn_mean).powi(2))
+            .sum::<f32>()
+            / ACTION_HISTORY_LEN as f32;
         let motor_variance = (fwd_var + turn_var) / 2.0;
 
         // Homeostasis: urgency from EMA gradients
         let homeo = &brain[O_HOMEO..O_HOMEO + 6];
         let gradient = homeo[0]; // grad
-        let urgency = homeo[2];  // urgency
+        let urgency = homeo[2]; // urgency
 
         // Physics buffer: prediction_error and exploration_rate (written by brain shader)
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;

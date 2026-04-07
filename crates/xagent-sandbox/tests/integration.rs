@@ -107,7 +107,9 @@ fn gravity_keeps_agent_on_terrain() {
         physics::step(&mut agent, &motor, &mut world, dt);
     }
 
-    let terrain_height = world.terrain.height_at(agent.body.position.x, agent.body.position.z);
+    let terrain_height = world
+        .terrain
+        .height_at(agent.body.position.x, agent.body.position.z);
     let diff = agent.body.position.y - terrain_height;
     assert!(
         diff < 2.0,
@@ -334,8 +336,14 @@ fn sensory_frame_has_correct_dimensions() {
     let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
-    assert_eq!(frame.vision.width, vw, "Visual field width should match config");
-    assert_eq!(frame.vision.height, vh, "Visual field height should match config");
+    assert_eq!(
+        frame.vision.width, vw,
+        "Visual field width should match config"
+    );
+    assert_eq!(
+        frame.vision.height, vh,
+        "Visual field height should match config"
+    );
     assert_eq!(
         frame.vision.color.len(),
         (vw * vh * 4) as usize,
@@ -389,7 +397,9 @@ fn vision_detects_food_items() {
     };
 
     // Place agent looking directly at the food, close enough to see it
-    let to_food = (food.position - Vec3::new(food.position.x - 10.0, food.position.y, food.position.z)).normalize();
+    let to_food = (food.position
+        - Vec3::new(food.position.x - 10.0, food.position.y, food.position.z))
+    .normalize();
     let agent_pos = food.position - to_food * 10.0;
     let spawn_y = world.terrain.height_at(agent_pos.x, agent_pos.z) + 2.0;
     let mut agent = agent_at(Vec3::new(agent_pos.x, spawn_y, agent_pos.z));
@@ -460,10 +470,19 @@ fn vision_with_positions_detects_food_items() {
 
     // Use the positions-based extraction (the path used during evolution)
     let all_positions: Vec<(Vec3, bool)> = vec![(agent.body.position, true)];
-    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&all_positions, world.config.world_size);
+    let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(
+        &all_positions,
+        world.config.world_size,
+    );
     let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses_with_positions(
-        &agent, &world, 0, &all_positions, 0, &agent_grid, &mut frame,
+        &agent,
+        &world,
+        0,
+        &all_positions,
+        0,
+        &agent_grid,
+        &mut frame,
     );
 
     let food_green_threshold_g = 0.90;
@@ -504,7 +523,10 @@ fn touch_contacts_populated_near_food() {
     let mut frame = default_frame();
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
-    let has_food_touch = frame.touch_contacts.iter().any(|c| c.surface_tag == 1 && c.intensity > 0.0);
+    let has_food_touch = frame
+        .touch_contacts
+        .iter()
+        .any(|c| c.surface_tag == 1 && c.intensity > 0.0);
     assert!(
         has_food_touch,
         "Agent within 3 units of food should have a TOUCH_FOOD contact (tag=1)"
@@ -518,8 +540,16 @@ fn metabolic_cost_drains_energy_proportional_to_capacity() {
     use xagent_shared::BrainConfig;
 
     // Two configs: tiny brain vs large brain
-    let small = BrainConfig { memory_capacity: 1, processing_slots: 1, ..BrainConfig::default() };
-    let large = BrainConfig { memory_capacity: 512, processing_slots: 32, ..BrainConfig::default() };
+    let small = BrainConfig {
+        memory_capacity: 1,
+        processing_slots: 1,
+        ..BrainConfig::default()
+    };
+    let large = BrainConfig {
+        memory_capacity: 512,
+        processing_slots: 32,
+        ..BrainConfig::default()
+    };
 
     let small_drain = xagent_sandbox::physics::metabolic_drain_per_tick(
         small.memory_capacity,
@@ -564,10 +594,19 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
 
     let result = bench::run_bench(brain, world, agent_count, total_ticks);
 
-    assert_eq!(result.total_ticks, total_ticks, "total_ticks should match requested");
-    assert_eq!(result.agent_count, agent_count, "agent_count should match requested");
+    assert_eq!(
+        result.total_ticks, total_ticks,
+        "total_ticks should match requested"
+    );
+    assert_eq!(
+        result.agent_count, agent_count,
+        "agent_count should match requested"
+    );
     assert!(result.elapsed_secs > 0.0, "elapsed_secs should be positive");
-    assert!(result.ticks_per_sec > 0.0, "ticks_per_sec should be positive");
+    assert!(
+        result.ticks_per_sec > 0.0,
+        "ticks_per_sec should be positive"
+    );
     assert!(
         (result.ticks_per_sec - (total_ticks as f64 / result.elapsed_secs)).abs() < 1e-6,
         "ticks_per_sec should equal total_ticks / elapsed_secs"
@@ -584,7 +623,10 @@ fn gpu_tick_loop_runs_without_crash() {
     }
 
     let brain = BrainConfig::default();
-    let world = WorldConfig { seed: 42, ..Default::default() };
+    let world = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
     let result = bench::run_bench(brain, world, 10, 100);
 
     assert_eq!(result.total_ticks, 100);
@@ -627,20 +669,23 @@ fn record_heatmap_populates_cells() {
     agent.body.body.position = Vec3::new(10.0, 0.0, 10.0);
     agent.record_heatmap(world.config.world_size);
 
-    assert!(agent.unique_cells_explored() >= 1, "should have explored at least 1 cell");
+    assert!(
+        agent.unique_cells_explored() >= 1,
+        "should have explored at least 1 cell"
+    );
 }
 
 // ── FoodGrid Tests ──────────────────────────────────────────────────
 
 #[test]
 fn food_grid_query_returns_nearby_food() {
-    use xagent_sandbox::world::spatial::FoodGrid;
     use xagent_sandbox::world::entity::FoodItem;
+    use xagent_sandbox::world::spatial::FoodGrid;
 
     let items = vec![
-        FoodItem::new(Vec3::new(0.0, 0.0, 0.0)),   // 0: at origin
-        FoodItem::new(Vec3::new(1.0, 0.0, 1.0)),    // 1: nearby origin
-        FoodItem::new(Vec3::new(100.0, 0.0, 100.0)),// 2: far away
+        FoodItem::new(Vec3::new(0.0, 0.0, 0.0)),     // 0: at origin
+        FoodItem::new(Vec3::new(1.0, 0.0, 1.0)),     // 1: nearby origin
+        FoodItem::new(Vec3::new(100.0, 0.0, 100.0)), // 2: far away
     ];
     let grid = FoodGrid::from_items(&items, 256.0);
 
@@ -659,14 +704,14 @@ fn food_grid_query_returns_nearby_food() {
 
 #[test]
 fn food_grid_skips_consumed_items() {
-    use xagent_sandbox::world::spatial::FoodGrid;
     use xagent_sandbox::world::entity::FoodItem;
+    use xagent_sandbox::world::spatial::FoodGrid;
 
     let mut item = FoodItem::new(Vec3::new(5.0, 0.0, 5.0));
     item.consumed = true;
     let items = vec![
         FoodItem::new(Vec3::new(0.0, 0.0, 0.0)), // 0: unconsumed
-        item,                                      // 1: consumed
+        item,                                    // 1: consumed
     ];
     let grid = FoodGrid::from_items(&items, 256.0);
 
@@ -677,8 +722,8 @@ fn food_grid_skips_consumed_items() {
 
 #[test]
 fn food_grid_remove_and_insert() {
-    use xagent_sandbox::world::spatial::FoodGrid;
     use xagent_sandbox::world::entity::FoodItem;
+    use xagent_sandbox::world::spatial::FoodGrid;
 
     let items = vec![
         FoodItem::new(Vec3::new(10.0, 0.0, 10.0)),
@@ -694,7 +739,10 @@ fn food_grid_remove_and_insert() {
     // Remove food 0
     grid.remove(0, 10.0, 10.0);
     let after_remove: Vec<usize> = grid.query_nearby(11.0, 11.0).collect();
-    assert!(!after_remove.contains(&0), "Food 0 should be gone after remove");
+    assert!(
+        !after_remove.contains(&0),
+        "Food 0 should be gone after remove"
+    );
     assert!(after_remove.contains(&1), "Food 1 should remain");
 
     // Insert food 0 at a new position
@@ -705,8 +753,8 @@ fn food_grid_remove_and_insert() {
 
 #[test]
 fn food_grid_rebuild_clears_and_repopulates() {
-    use xagent_sandbox::world::spatial::FoodGrid;
     use xagent_sandbox::world::entity::FoodItem;
+    use xagent_sandbox::world::spatial::FoodGrid;
 
     let items_a = vec![
         FoodItem::new(Vec3::new(0.0, 0.0, 0.0)),
@@ -714,13 +762,14 @@ fn food_grid_rebuild_clears_and_repopulates() {
     ];
     let mut grid = FoodGrid::from_items(&items_a, 256.0);
 
-    let items_b = vec![
-        FoodItem::new(Vec3::new(80.0, 0.0, 80.0)),
-    ];
+    let items_b = vec![FoodItem::new(Vec3::new(80.0, 0.0, 80.0))];
     grid.rebuild(&items_b);
 
     let near_origin: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
-    assert!(near_origin.is_empty(), "Old food at origin should be gone after rebuild");
+    assert!(
+        near_origin.is_empty(),
+        "Old food at origin should be gone after rebuild"
+    );
 
     let near_new: Vec<usize> = grid.query_nearby(80.0, 80.0).collect();
     assert!(near_new.contains(&0), "New food 0 should be at (80,80)");
@@ -733,10 +782,10 @@ fn agent_grid_query_returns_nearby_agents() {
     use xagent_sandbox::world::spatial::AgentGrid;
 
     let positions: Vec<(Vec3, bool)> = vec![
-        (Vec3::new(0.0, 0.0, 0.0), true),   // 0: at origin
-        (Vec3::new(1.0, 0.0, 1.0), true),    // 1: nearby origin (same cell)
+        (Vec3::new(0.0, 0.0, 0.0), true),     // 0: at origin
+        (Vec3::new(1.0, 0.0, 1.0), true),     // 1: nearby origin (same cell)
         (Vec3::new(100.0, 0.0, 100.0), true), // 2: far away
-        (Vec3::new(2.0, 0.0, 2.0), false),   // 3: dead, near origin
+        (Vec3::new(2.0, 0.0, 2.0), false),    // 3: dead, near origin
     ];
 
     let grid = AgentGrid::from_positions(&positions, 256.0);
@@ -750,8 +799,14 @@ fn agent_grid_query_returns_nearby_agents() {
 
     // Query near the far agent — should find only agent 2
     let far_nearby: Vec<usize> = grid.query_nearby(100.0, 100.0).collect();
-    assert!(far_nearby.contains(&2), "Should find agent 2 near (100,100)");
-    assert!(!far_nearby.contains(&0), "Should NOT find agent 0 near (100,100)");
+    assert!(
+        far_nearby.contains(&2),
+        "Should find agent 2 near (100,100)"
+    );
+    assert!(
+        !far_nearby.contains(&0),
+        "Should NOT find agent 0 near (100,100)"
+    );
 
     // Query in empty area — should return nothing
     let empty: Vec<usize> = grid.query_nearby(-500.0, -500.0).collect();
@@ -769,13 +824,14 @@ fn agent_grid_rebuild_reuses_allocation() {
     let mut grid = AgentGrid::from_positions(&positions_a, 512.0);
 
     // After rebuild with different positions, old indices should be gone
-    let positions_b: Vec<(Vec3, bool)> = vec![
-        (Vec3::new(200.0, 0.0, 200.0), true),
-    ];
+    let positions_b: Vec<(Vec3, bool)> = vec![(Vec3::new(200.0, 0.0, 200.0), true)];
     grid.rebuild(&positions_b);
 
     let near_origin: Vec<usize> = grid.query_nearby(0.0, 0.0).collect();
-    assert!(near_origin.is_empty(), "Old agent at origin should be gone after rebuild");
+    assert!(
+        near_origin.is_empty(),
+        "Old agent at origin should be gone after rebuild"
+    );
 
     let near_new: Vec<usize> = grid.query_nearby(200.0, 200.0).collect();
     assert!(near_new.contains(&0), "New agent 0 should be at (200,200)");
@@ -829,8 +885,7 @@ fn step_pure_matches_step_for_movement() {
         agent_b.body.internal.energy,
     );
     assert_eq!(
-        agent_a.body.alive,
-        agent_b.body.alive,
+        agent_a.body.alive, agent_b.body.alive,
         "Alive state diverges",
     );
 }
@@ -951,7 +1006,10 @@ fn deterministic_bench_produces_same_state_twice() {
     use xagent_shared::{BrainConfig, WorldConfig};
 
     // Pin rayon to 1 thread to eliminate any scheduling non-determinism.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
 
     let config_b = BrainConfig::default();
     let config_w = WorldConfig::default();
@@ -1001,7 +1059,13 @@ fn cpu_vision_produces_correct_buffer_shape() {
     let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions, 256.0);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
-        &agent, &world, 0, &positions, 0, &agent_grid, &mut frame,
+        &agent,
+        &world,
+        0,
+        &positions,
+        0,
+        &agent_grid,
+        &mut frame,
     );
 
     assert_eq!(frame.vision.color.len(), (vw * vh * 4) as usize);

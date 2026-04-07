@@ -8,8 +8,8 @@ use std::time::Instant;
 use log::info;
 use xagent_shared::{BrainConfig, FullConfig};
 
-use xagent_brain::GpuBrain;
 use xagent_brain::AgentBrainState;
+use xagent_brain::GpuBrain;
 
 use crate::agent::{mutate_brain_state, mutate_config, Agent};
 use crate::governor::{AdvanceResult, Governor};
@@ -71,7 +71,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
     loop {
         if governor.evolution_complete() {
-            println!("\n✓ Evolution complete after {} generations", governor.generation);
+            println!(
+                "\n✓ Evolution complete after {} generations",
+                governor.generation
+            );
             break;
         }
 
@@ -108,7 +111,9 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         let mut tick: u64 = 0;
 
         // ── GPU physics setup for this generation ──
-        let food_positions: Vec<(f32, f32, f32)> = world.food_items.iter()
+        let food_positions: Vec<(f32, f32, f32)> = world
+            .food_items
+            .iter()
             .map(|f| (f.position.x, f.position.y, f.position.z))
             .collect();
         let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
@@ -116,22 +121,34 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         let food_count = world.food_items.len();
 
         let mut gpu_physics = xagent_brain::gpu_physics::GpuPhysics::new(
-            &gpu_brain, pop_size as u32, food_count, &config.world,
+            &gpu_brain,
+            pop_size as u32,
+            food_count,
+            &config.world,
         );
 
         let heights: Vec<f32> = world.terrain.heights.clone();
         let biomes: Vec<u32> = world.biome_map.grid_as_u32();
-        gpu_physics.upload_world(gpu_brain.queue(), &heights, &biomes,
-            &food_positions, &food_consumed, &food_timers);
+        gpu_physics.upload_world(
+            gpu_brain.queue(),
+            &heights,
+            &biomes,
+            &food_positions,
+            &food_consumed,
+            &food_timers,
+        );
 
-        let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = agents.iter()
-            .map(|a| (
-                a.body.body.position,
-                a.body.body.internal.max_energy,
-                a.body.body.internal.max_integrity,
-                a.brain_config.memory_capacity,
-                a.brain_config.processing_slots,
-            ))
+        let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = agents
+            .iter()
+            .map(|a| {
+                (
+                    a.body.body.position,
+                    a.body.body.internal.max_energy,
+                    a.body.body.internal.max_integrity,
+                    a.brain_config.memory_capacity,
+                    a.brain_config.processing_slots,
+                )
+            })
             .collect();
         gpu_physics.upload_agents(gpu_brain.queue(), &agent_data);
         gpu_physics.upload_world_config(gpu_brain.queue(), &config.world, food_count, pop_size, 0);
@@ -143,7 +160,9 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             let brain_tick = (tick % config.brain.brain_tick_stride as u64) == 0;
 
             let enc = encoder.get_or_insert_with(|| {
-                gpu_brain.device().create_command_encoder(&Default::default())
+                gpu_brain
+                    .device()
+                    .create_command_encoder(&Default::default())
             });
 
             gpu_physics.update_tick(gpu_brain.queue(), tick);
@@ -160,7 +179,9 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             if tick % death_interval == 0 {
                 {
                     let enc = encoder.get_or_insert_with(|| {
-                        gpu_brain.device().create_command_encoder(&Default::default())
+                        gpu_brain
+                            .device()
+                            .create_command_encoder(&Default::default())
                     });
                     gpu_physics.encode_death_readback(enc);
                 }
@@ -174,7 +195,9 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                         for idx in dead {
                             let pos = world.safe_spawn_position();
                             gpu_physics.respawn_agent(
-                                gpu_brain.queue(), idx, pos,
+                                gpu_brain.queue(),
+                                idx,
+                                pos,
                                 agents[idx as usize].body.body.internal.max_energy,
                                 agents[idx as usize].body.body.internal.max_integrity,
                                 agents[idx as usize].brain_config.memory_capacity,
@@ -193,7 +216,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 if let Some(enc) = encoder.take() {
                     gpu_brain.queue().submit(std::iter::once(enc.finish()));
                 }
-                let state = gpu_physics.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
+                let state =
+                    gpu_physics.read_full_state_blocking(gpu_brain.device(), gpu_brain.queue());
                 for i in 0..agents.len() {
                     let base = i * xagent_brain::buffers::PHYS_STRIDE;
                     let alive = state[base + xagent_brain::buffers::P_ALIVE] > 0.5;
@@ -209,7 +233,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             }
 
             if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
-                let pct = (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
+                let pct =
+                    (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
                 print!("\rGen {} [{:>3}%]", governor.generation, pct);
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
@@ -236,7 +261,9 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         // Capture best agent's brain state using actual composite fitness.
         // fitness is sorted descending — first entry is the best performer.
         let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-        inherited_state = agents.get(best_idx).map(|a| gpu_brain.read_agent_state(a.brain_idx));
+        inherited_state = agents
+            .get(best_idx)
+            .map(|a| gpu_brain.read_agent_state(a.brain_idx));
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",
@@ -247,7 +274,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         governor.update_wall_time(start_time.elapsed().as_secs_f64());
 
         match governor.advance(&fitness) {
-            AdvanceResult::Continue { configs, messages, mutation_strength } => {
+            AdvanceResult::Continue {
+                configs,
+                messages,
+                mutation_strength,
+            } => {
                 for msg in &messages {
                     println!("{}", msg);
                 }

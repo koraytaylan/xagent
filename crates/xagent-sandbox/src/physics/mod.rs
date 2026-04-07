@@ -40,9 +40,21 @@ const FOOD_CONSUME_RADIUS: f32 = 2.5;
 /// Sanitize motor commands: replace NaN/Infinity with 0.0 and clamp to [-1, 1].
 fn sanitize_motor(motor: &MotorCommand) -> MotorCommand {
     MotorCommand {
-        forward: if motor.forward.is_finite() { motor.forward.clamp(-1.0, 1.0) } else { 0.0 },
-        strafe: if motor.strafe.is_finite() { motor.strafe.clamp(-1.0, 1.0) } else { 0.0 },
-        turn: if motor.turn.is_finite() { motor.turn.clamp(-1.0, 1.0) } else { 0.0 },
+        forward: if motor.forward.is_finite() {
+            motor.forward.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
+        strafe: if motor.strafe.is_finite() {
+            motor.strafe.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
+        turn: if motor.turn.is_finite() {
+            motor.turn.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        },
         action: motor.action,
     }
 }
@@ -94,7 +106,9 @@ pub fn step(
     agent.body.position.z = agent.body.position.z.clamp(-half, half);
 
     // ── ground collision ───────────────────────────────────────────
-    let ground = world.terrain.height_at(agent.body.position.x, agent.body.position.z);
+    let ground = world
+        .terrain
+        .height_at(agent.body.position.x, agent.body.position.z);
     if agent.body.position.y < ground + AGENT_HALF_HEIGHT {
         agent.body.position.y = ground + AGENT_HALF_HEIGHT;
         agent.body.velocity.y = 0.0;
@@ -122,7 +136,9 @@ pub fn step(
     agent.body.internal.energy -= movement_mag * world.config.movement_energy_cost;
 
     // ── biome effects ──────────────────────────────────────────────
-    let biome = world.biome_map.biome_at(agent.body.position.x, agent.body.position.z);
+    let biome = world
+        .biome_map
+        .biome_at(agent.body.position.x, agent.body.position.z);
     if biome == BiomeType::Danger {
         agent.body.internal.integrity -= world.config.hazard_damage_rate;
     }
@@ -209,7 +225,9 @@ pub fn step_pure(
     agent.body.position.z = agent.body.position.z.clamp(-half, half);
 
     // ── ground collision ───────────────────────────────────────────
-    let ground = world.terrain.height_at(agent.body.position.x, agent.body.position.z);
+    let ground = world
+        .terrain
+        .height_at(agent.body.position.x, agent.body.position.z);
     if agent.body.position.y < ground + AGENT_HALF_HEIGHT {
         agent.body.position.y = ground + AGENT_HALF_HEIGHT;
         agent.body.velocity.y = 0.0;
@@ -237,7 +255,9 @@ pub fn step_pure(
     agent.body.internal.energy -= movement_mag * world.config.movement_energy_cost;
 
     // ── biome effects ──────────────────────────────────────────────
-    let biome = world.biome_map.biome_at(agent.body.position.x, agent.body.position.z);
+    let biome = world
+        .biome_map
+        .biome_at(agent.body.position.x, agent.body.position.z);
     if biome == BiomeType::Danger {
         agent.body.internal.integrity -= world.config.hazard_damage_rate;
     }

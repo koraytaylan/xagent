@@ -295,19 +295,20 @@ impl EguiIntegration {
         let mut wgpu_renderer = egui_wgpu::Renderer::new(
             device,
             surface_format,
-            None, // no depth
-            1,    // msaa samples
+            None,  // no depth
+            1,     // msaa samples
             false, // dithering
         );
 
-        let (color_tex, color_view, depth_view) =
-            Self::create_offscreen_textures(device, viewport_width, viewport_height, surface_format);
-
-        let texture_id = wgpu_renderer.register_native_texture(
+        let (color_tex, color_view, depth_view) = Self::create_offscreen_textures(
             device,
-            &color_view,
-            wgpu::FilterMode::Linear,
+            viewport_width,
+            viewport_height,
+            surface_format,
         );
+
+        let texture_id =
+            wgpu_renderer.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
 
         Self {
             ctx,
@@ -334,7 +335,11 @@ impl EguiIntegration {
 
         let color_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewport_color"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -346,7 +351,11 @@ impl EguiIntegration {
 
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewport_depth"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -436,7 +445,10 @@ impl EguiIntegration {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.12, g: 0.12, b: 0.14, a: 1.0,
+                            r: 0.12,
+                            g: 0.12,
+                            b: 0.14,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -476,7 +488,9 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
             Tab::Sandbox => "🌍 Sandbox".into(),
             Tab::Evolution => "📊 Evolution".into(),
             Tab::AgentDetail(id) => {
-                let name = self.agents.iter()
+                let name = self
+                    .agents
+                    .iter()
                     .find(|a| a.id == *id)
                     .map(|a| format!("Agent {} (g{})", a.id, a.gen))
                     .unwrap_or_else(|| format!("Agent {} (?)", id));
@@ -490,7 +504,11 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
             Tab::Sandbox => {
                 // Toolbar
                 ui.horizontal(|ui| {
-                    let orbit_label = if *self.orbit_mode { "\u{1F3AF} Orbiting" } else { "\u{1F3AF} Orbit Agent" };
+                    let orbit_label = if *self.orbit_mode {
+                        "\u{1F3AF} Orbiting"
+                    } else {
+                        "\u{1F3AF} Orbit Agent"
+                    };
                     if ui.selectable_label(*self.orbit_mode, orbit_label).clicked() {
                         *self.orbit_mode = !*self.orbit_mode;
                     }
@@ -499,16 +517,10 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
 
                 // Viewport
                 let avail = ui.available_size();
-                *self.desired_vp = (
-                    (avail.x * self.ppp) as u32,
-                    (avail.y * self.ppp) as u32,
-                );
+                *self.desired_vp = ((avail.x * self.ppp) as u32, (avail.y * self.ppp) as u32);
                 let resp = ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(
-                        self.viewport_tex_id,
-                        avail,
-                    ))
-                    .sense(egui::Sense::click_and_drag()),
+                    egui::Image::new(egui::load::SizedTexture::new(self.viewport_tex_id, avail))
+                        .sense(egui::Sense::click_and_drag()),
                 );
                 *self.viewport_hovered = resp.hovered() || resp.dragged();
             }
@@ -523,7 +535,15 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                     egui::ScrollArea::vertical()
                         .id_salt(format!("agent_detail_scroll_{}", id))
                         .show(ui, |ui| {
-                            Self::render_agent_detail(ui, snap, self.chart_window, self.world, self.agents, self.replay, self.recording);
+                            Self::render_agent_detail(
+                                ui,
+                                snap,
+                                self.chart_window,
+                                self.world,
+                                self.agents,
+                                self.replay,
+                                self.recording,
+                            );
                         });
                 } else {
                     ui.label(format!("Agent {} no longer exists.", id));
@@ -585,12 +605,17 @@ impl<'a> TabContext<'a> {
                         replay.active = false;
                         replay.playing = false;
                     }
-                } else if ui.button(format!("Replay Gen {}", rec.generation)).clicked() {
+                } else if ui
+                    .button(format!("Replay Gen {}", rec.generation))
+                    .clicked()
+                {
                     replay.active = true;
                     replay.current_tick = 0;
                     replay.total_ticks = rec.total_ticks;
                     replay.playing = false;
-                    replay.selected_agent_idx = rec.agent_info.iter()
+                    replay.selected_agent_idx = rec
+                        .agent_info
+                        .iter()
                         .position(|(id, _)| *id == snap.id)
                         .unwrap_or(0);
                 }
@@ -612,8 +637,15 @@ impl<'a> TabContext<'a> {
                     ui.separator();
                     ui.label(egui::RichText::new("Speed:").small());
                     for &spd in &[0.5_f32, 1.0, 2.0, 4.0, 8.0] {
-                        let label = if spd == 1.0 { "1x".to_string() } else { format!("{}x", spd) };
-                        if ui.selectable_label((replay.speed - spd).abs() < 0.01, &label).clicked() {
+                        let label = if spd == 1.0 {
+                            "1x".to_string()
+                        } else {
+                            format!("{}x", spd)
+                        };
+                        if ui
+                            .selectable_label((replay.speed - spd).abs() < 0.01, &label)
+                            .clicked()
+                        {
                             replay.speed = spd;
                         }
                     }
@@ -621,7 +653,8 @@ impl<'a> TabContext<'a> {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!(
-                            "Tick {}/{}", replay.current_tick, replay.total_ticks
+                            "Tick {}/{}",
+                            replay.current_tick, replay.total_ticks
                         ))
                         .monospace()
                         .small(),
@@ -700,7 +733,8 @@ impl<'a> TabContext<'a> {
                 let food = rec.food_at_tick(replay.current_tick);
                 replay_world = WorldSnapshot {
                     world_size: world.world_size,
-                    food_positions: food.iter()
+                    food_positions: food
+                        .iter()
                         .filter(|(_, consumed)| !consumed)
                         .map(|(p, _)| [p[0], p[2]])
                         .collect(),
@@ -719,47 +753,51 @@ impl<'a> TabContext<'a> {
         let effective_agents = if replay.active {
             if let Some(rec) = recording {
                 if let Some(tick_records) = rec.get_tick(replay.current_tick) {
-                    replay_agents = tick_records.iter().enumerate().map(|(i, r)| {
-                        let (id, color) = rec.agent_info[i];
-                        AgentSnapshot {
-                            id,
-                            gen: rec.generation,
-                            energy: r.energy,
-                            max_energy: 1.0,
-                            integrity: r.integrity,
-                            max_integrity: 1.0,
-                            alive: r.alive,
-                            deaths: 0,
-                            color,
-                            longest_life: 0,
-                            exploration_rate: r.exploration_rate,
-                            prediction_error: r.prediction_error,
-                            forward_weight_norm: 0.0,
-                            turn_weight_norm: 0.0,
-                            prediction_error_history: Vec::new(),
-                            exploration_rate_history: Vec::new(),
-                            energy_history: Vec::new(),
-                            integrity_history: Vec::new(),
-    
-                            gradient: r.gradient,
-                            urgency: r.urgency,
-                            food_consumed: 0,
-                            total_ticks_alive: 0,
-                            motor_forward: r.motor_forward,
-                            motor_turn: r.motor_turn,
-                            phase: crate::replay::GenerationRecording::phase_label(r.phase),
-                            vision_color: Vec::new(),
-                            vision_width: rec.vision_w,
-                            vision_height: rec.vision_h,
-                            position: r.position,
-                            yaw: r.yaw,
-                            mean_attenuation: r.mean_attenuation,
-                            curiosity_bonus: r.curiosity_bonus,
-                            fatigue_factor: r.fatigue_factor,
-                            motor_variance: r.motor_variance,
-                            fatigue_history: Vec::new(),
-                        }
-                    }).collect::<Vec<_>>();
+                    replay_agents = tick_records
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            let (id, color) = rec.agent_info[i];
+                            AgentSnapshot {
+                                id,
+                                gen: rec.generation,
+                                energy: r.energy,
+                                max_energy: 1.0,
+                                integrity: r.integrity,
+                                max_integrity: 1.0,
+                                alive: r.alive,
+                                deaths: 0,
+                                color,
+                                longest_life: 0,
+                                exploration_rate: r.exploration_rate,
+                                prediction_error: r.prediction_error,
+                                forward_weight_norm: 0.0,
+                                turn_weight_norm: 0.0,
+                                prediction_error_history: Vec::new(),
+                                exploration_rate_history: Vec::new(),
+                                energy_history: Vec::new(),
+                                integrity_history: Vec::new(),
+
+                                gradient: r.gradient,
+                                urgency: r.urgency,
+                                food_consumed: 0,
+                                total_ticks_alive: 0,
+                                motor_forward: r.motor_forward,
+                                motor_turn: r.motor_turn,
+                                phase: crate::replay::GenerationRecording::phase_label(r.phase),
+                                vision_color: Vec::new(),
+                                vision_width: rec.vision_w,
+                                vision_height: rec.vision_h,
+                                position: r.position,
+                                yaw: r.yaw,
+                                mean_attenuation: r.mean_attenuation,
+                                curiosity_bonus: r.curiosity_bonus,
+                                fatigue_factor: r.fatigue_factor,
+                                motor_variance: r.motor_variance,
+                                fatigue_history: Vec::new(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     &replay_agents[..]
                 } else {
                     all_agents
@@ -779,28 +817,39 @@ impl<'a> TabContext<'a> {
                 cols[0].add_space(4.0);
 
                 let energy_frac = effective_snap.energy / effective_snap.max_energy.max(0.001);
-                let integrity_frac = effective_snap.integrity / effective_snap.max_integrity.max(0.001);
+                let integrity_frac =
+                    effective_snap.integrity / effective_snap.max_integrity.max(0.001);
 
                 egui::Grid::new("vitals_grid")
                     .num_columns(2)
                     .spacing([8.0, 4.0])
                     .show(&mut cols[0], |ui| {
                         ui.label("Energy:");
-                        ui.add(egui::ProgressBar::new(energy_frac)
-                            .text(format!("{:.1}/{:.0}", effective_snap.energy, effective_snap.max_energy))
-                            .fill(if energy_frac > 0.5 {
-                                egui::Color32::from_rgb(80, 200, 80)
-                            } else if energy_frac > 0.25 {
-                                egui::Color32::YELLOW
-                            } else {
-                                egui::Color32::from_rgb(220, 60, 60)
-                            }));
+                        ui.add(
+                            egui::ProgressBar::new(energy_frac)
+                                .text(format!(
+                                    "{:.1}/{:.0}",
+                                    effective_snap.energy, effective_snap.max_energy
+                                ))
+                                .fill(if energy_frac > 0.5 {
+                                    egui::Color32::from_rgb(80, 200, 80)
+                                } else if energy_frac > 0.25 {
+                                    egui::Color32::YELLOW
+                                } else {
+                                    egui::Color32::from_rgb(220, 60, 60)
+                                }),
+                        );
                         ui.end_row();
 
                         ui.label("Integrity:");
-                        ui.add(egui::ProgressBar::new(integrity_frac)
-                            .text(format!("{:.1}/{:.0}", effective_snap.integrity, effective_snap.max_integrity))
-                            .fill(egui::Color32::from_rgb(100, 150, 255)));
+                        ui.add(
+                            egui::ProgressBar::new(integrity_frac)
+                                .text(format!(
+                                    "{:.1}/{:.0}",
+                                    effective_snap.integrity, effective_snap.max_integrity
+                                ))
+                                .fill(egui::Color32::from_rgb(100, 150, 255)),
+                        );
                         ui.end_row();
                     });
 
@@ -809,14 +858,26 @@ impl<'a> TabContext<'a> {
                 cols[0].add_space(4.0);
                 cols[0].label(format!("Deaths: {}", effective_snap.deaths));
                 cols[0].label(format!("Food consumed: {}", effective_snap.food_consumed));
-                cols[0].label(format!("Longest life: {} ticks", effective_snap.longest_life));
-                cols[0].label(format!("Total alive: {} ticks", effective_snap.total_ticks_alive));
+                cols[0].label(format!(
+                    "Longest life: {} ticks",
+                    effective_snap.longest_life
+                ));
+                cols[0].label(format!(
+                    "Total alive: {} ticks",
+                    effective_snap.total_ticks_alive
+                ));
 
                 // Right column: brain + motor
                 cols[1].label(egui::RichText::new("Brain").strong());
                 cols[1].add_space(4.0);
-                cols[1].label(format!("Exploration: {:.1}%", effective_snap.exploration_rate * 100.0));
-                cols[1].label(format!("Pred. error: {:.4}", effective_snap.prediction_error));
+                cols[1].label(format!(
+                    "Exploration: {:.1}%",
+                    effective_snap.exploration_rate * 100.0
+                ));
+                cols[1].label(format!(
+                    "Pred. error: {:.4}",
+                    effective_snap.prediction_error
+                ));
                 cols[1].label(format!("Gradient: {:+.4}", effective_snap.gradient));
                 cols[1].label(format!("Urgency: {:.2}", effective_snap.urgency));
                 cols[1].add_space(4.0);
@@ -854,12 +915,9 @@ impl<'a> TabContext<'a> {
                     }),
                 );
                 cols[1].label(
-                    egui::RichText::new(format!(
-                        "Motor var: {:.4}",
-                        effective_snap.motor_variance
-                    ))
-                    .small()
-                    .color(egui::Color32::GRAY),
+                    egui::RichText::new(format!("Motor var: {:.4}", effective_snap.motor_variance))
+                        .small()
+                        .color(egui::Color32::GRAY),
                 );
 
                 cols[1].add_space(8.0);
@@ -877,10 +935,12 @@ impl<'a> TabContext<'a> {
                         } else {
                             egui::Color32::from_rgb(220, 60, 60)
                         };
-                        ui.add(egui::ProgressBar::new(fwd.abs())
-                            .text(format!("{:+.3}", fwd))
-                            .fill(fwd_color)
-                            .desired_width(120.0));
+                        ui.add(
+                            egui::ProgressBar::new(fwd.abs())
+                                .text(format!("{:+.3}", fwd))
+                                .fill(fwd_color)
+                                .desired_width(120.0),
+                        );
                         ui.end_row();
 
                         ui.label("Turn:");
@@ -890,10 +950,22 @@ impl<'a> TabContext<'a> {
                         } else {
                             egui::Color32::from_rgb(200, 100, 255)
                         };
-                        ui.add(egui::ProgressBar::new(trn.abs())
-                            .text(format!("{:+.3} {}", trn, if trn > 0.05 { "R" } else if trn < -0.05 { "L" } else { "" }))
-                            .fill(trn_color)
-                            .desired_width(120.0));
+                        ui.add(
+                            egui::ProgressBar::new(trn.abs())
+                                .text(format!(
+                                    "{:+.3} {}",
+                                    trn,
+                                    if trn > 0.05 {
+                                        "R"
+                                    } else if trn < -0.05 {
+                                        "L"
+                                    } else {
+                                        ""
+                                    }
+                                ))
+                                .fill(trn_color)
+                                .desired_width(120.0),
+                        );
                         ui.end_row();
 
                         ui.label("Fwd norm:");
@@ -913,7 +985,9 @@ impl<'a> TabContext<'a> {
                 cols[0].label(egui::RichText::new("Vision").strong());
                 cols[0].add_space(4.0);
 
-                if effective_snap.vision_color.len() >= (effective_snap.vision_width * effective_snap.vision_height * 4) as usize {
+                if effective_snap.vision_color.len()
+                    >= (effective_snap.vision_width * effective_snap.vision_height * 4) as usize
+                {
                     let vw = effective_snap.vision_width as usize;
                     let vh = effective_snap.vision_height as usize;
                     let display_w = cols[0].available_width().max(80.0);
@@ -934,9 +1008,12 @@ impl<'a> TabContext<'a> {
                     for row in 0..vh {
                         for col in 0..vw {
                             let idx = (row * vw + col) * 4;
-                            let r = (effective_snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
-                            let g = (effective_snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0) as u8;
-                            let b = (effective_snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0) as u8;
+                            let r =
+                                (effective_snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
+                            let g = (effective_snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0)
+                                as u8;
+                            let b = (effective_snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0)
+                                as u8;
                             let pixel_rect = egui::Rect::from_min_size(
                                 egui::pos2(
                                     rect.left() + col as f32 * cell_w,
@@ -983,10 +1060,8 @@ impl<'a> TabContext<'a> {
                 cols[1].add_space(4.0);
 
                 let map_size = cols[1].available_width().max(80.0);
-                let (map_rect, _) = cols[1].allocate_exact_size(
-                    egui::vec2(map_size, map_size),
-                    egui::Sense::hover(),
-                );
+                let (map_rect, _) = cols[1]
+                    .allocate_exact_size(egui::vec2(map_size, map_size), egui::Sense::hover());
                 let p = cols[1].painter();
 
                 // Draw biome texture as background
@@ -1063,7 +1138,12 @@ impl<'a> TabContext<'a> {
                 }
 
                 // Map border
-                p.rect_stroke(map_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Inside);
+                p.rect_stroke(
+                    map_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    egui::StrokeKind::Inside,
+                );
             });
 
             // -- History chart --
@@ -1072,9 +1152,12 @@ impl<'a> TabContext<'a> {
                 ui.label(egui::RichText::new("History").strong());
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(format!("Window: {} ticks  (scroll to zoom)", *chart_window))
-                        .small()
-                        .color(egui::Color32::GRAY),
+                    egui::RichText::new(format!(
+                        "Window: {} ticks  (scroll to zoom)",
+                        *chart_window
+                    ))
+                    .small()
+                    .color(egui::Color32::GRAY),
                 );
             });
             ui.add_space(4.0);
@@ -1087,9 +1170,14 @@ impl<'a> TabContext<'a> {
                     ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
                     ("Fatigue", egui::Color32::from_rgb(220, 120, 60)),
                 ] {
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
-                    ui.label(egui::RichText::new(label).small().color(egui::Color32::GRAY));
+                    ui.label(
+                        egui::RichText::new(label)
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
                     ui.add_space(6.0);
                 }
             });
@@ -1097,10 +1185,8 @@ impl<'a> TabContext<'a> {
 
             let chart_height = 120.0;
             let avail_w = ui.available_width().max(60.0);
-            let (rect, chart_resp) = ui.allocate_exact_size(
-                egui::vec2(avail_w, chart_height),
-                egui::Sense::hover(),
-            );
+            let (rect, chart_resp) =
+                ui.allocate_exact_size(egui::vec2(avail_w, chart_height), egui::Sense::hover());
 
             if chart_resp.hovered() {
                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
@@ -1123,11 +1209,26 @@ impl<'a> TabContext<'a> {
 
             let window = *chart_window;
             let series_data: [(&[f32], egui::Color32); 5] = [
-                (&effective_snap.energy_history, egui::Color32::from_rgb(80, 200, 80)),
-                (&effective_snap.integrity_history, egui::Color32::from_rgb(100, 150, 255)),
-                (&effective_snap.prediction_error_history, egui::Color32::from_rgb(200, 140, 60)),
-                (&effective_snap.exploration_rate_history, egui::Color32::from_rgb(180, 100, 220)),
-                (&effective_snap.fatigue_history, egui::Color32::from_rgb(220, 120, 60)),
+                (
+                    &effective_snap.energy_history,
+                    egui::Color32::from_rgb(80, 200, 80),
+                ),
+                (
+                    &effective_snap.integrity_history,
+                    egui::Color32::from_rgb(100, 150, 255),
+                ),
+                (
+                    &effective_snap.prediction_error_history,
+                    egui::Color32::from_rgb(200, 140, 60),
+                ),
+                (
+                    &effective_snap.exploration_rate_history,
+                    egui::Color32::from_rgb(180, 100, 220),
+                ),
+                (
+                    &effective_snap.fatigue_history,
+                    egui::Color32::from_rgb(220, 120, 60),
+                ),
             ];
             for &(full_data, color) in &series_data {
                 let start = full_data.len().saturating_sub(window);
@@ -1136,11 +1237,15 @@ impl<'a> TabContext<'a> {
                     continue;
                 }
                 let n = data.len();
-                let points: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
-                    let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
-                    let y = rect.bottom() - v.clamp(0.0, 1.0) * rect.height();
-                    egui::pos2(x, y)
-                }).collect();
+                let points: Vec<egui::Pos2> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+                        let y = rect.bottom() - v.clamp(0.0, 1.0) * rect.height();
+                        egui::pos2(x, y)
+                    })
+                    .collect();
                 let stroke = egui::Stroke::new(1.5, color);
                 for pair in points.windows(2) {
                     painter.line_segment([pair[0], pair[1]], stroke);
@@ -1152,9 +1257,11 @@ impl<'a> TabContext<'a> {
             ui.label(egui::RichText::new("Decision Stream").strong().size(14.0));
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Decision stream unavailable (GPU brain — telemetry readback TBD)")
-                    .italics()
-                    .color(egui::Color32::GRAY),
+                egui::RichText::new(
+                    "Decision stream unavailable (GPU brain — telemetry readback TBD)",
+                )
+                .italics()
+                .color(egui::Color32::GRAY),
             );
         });
     }
@@ -1173,9 +1280,13 @@ impl<'a> TabContext<'a> {
                 Self::render_config_editor(ui, evo);
                 ui.add_space(12.0);
 
-                if ui.add(egui::Button::new(
-                    egui::RichText::new("▶  Start Evolution").strong(),
-                ).min_size(egui::vec2(200.0, 36.0))).clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("▶  Start Evolution").strong())
+                            .min_size(egui::vec2(200.0, 36.0)),
+                    )
+                    .clicked()
+                {
                     action = EvolutionAction::Start;
                 }
             }
@@ -1193,16 +1304,26 @@ impl<'a> TabContext<'a> {
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("▶  Resume").strong(),
-                    ).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("▶  Resume").strong())
+                                .min_size(egui::vec2(140.0, 36.0)),
+                        )
+                        .clicked()
+                    {
                         action = EvolutionAction::Resume;
                     }
                     ui.add_space(16.0);
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("🗑  Reset & Start Fresh")
-                            .color(egui::Color32::from_rgb(220, 80, 80)),
-                    ).min_size(egui::vec2(180.0, 36.0))).clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("🗑  Reset & Start Fresh")
+                                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                            )
+                            .min_size(egui::vec2(180.0, 36.0)),
+                        )
+                        .clicked()
+                    {
                         action = EvolutionAction::Reset;
                     }
                 });
@@ -1249,13 +1370,21 @@ impl<'a> TabContext<'a> {
                     ui.end_row();
 
                     ui.label("learning_rate");
-                    ui.add(egui::DragValue::new(&mut b.learning_rate)
-                        .range(0.0001..=1.0).speed(0.001).max_decimals(5));
+                    ui.add(
+                        egui::DragValue::new(&mut b.learning_rate)
+                            .range(0.0001..=1.0)
+                            .speed(0.001)
+                            .max_decimals(5),
+                    );
                     ui.end_row();
 
                     ui.label("decay_rate");
-                    ui.add(egui::DragValue::new(&mut b.decay_rate)
-                        .range(0.0001..=1.0).speed(0.001).max_decimals(5));
+                    ui.add(
+                        egui::DragValue::new(&mut b.decay_rate)
+                            .range(0.0001..=1.0)
+                            .speed(0.001)
+                            .max_decimals(5),
+                    );
                     ui.end_row();
 
                     ui.label("vision_w");
@@ -1283,13 +1412,21 @@ impl<'a> TabContext<'a> {
                     ui.end_row();
 
                     ui.label("metabolic_rate");
-                    ui.add(egui::DragValue::new(&mut b.metabolic_rate)
-                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
+                    ui.add(
+                        egui::DragValue::new(&mut b.metabolic_rate)
+                            .range(0.01..=5.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
                     ui.end_row();
 
                     ui.label("integrity_scale");
-                    ui.add(egui::DragValue::new(&mut b.integrity_scale)
-                        .range(0.01..=5.0).speed(0.01).max_decimals(2));
+                    ui.add(
+                        egui::DragValue::new(&mut b.integrity_scale)
+                            .range(0.01..=5.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
                     ui.end_row();
                 });
         });
@@ -1309,7 +1446,11 @@ impl<'a> TabContext<'a> {
 
                     ui.label("tick_budget");
                     let mut tb = g.tick_budget as i64;
-                    ui.add(egui::DragValue::new(&mut tb).range(1000..=1_000_000).speed(1000));
+                    ui.add(
+                        egui::DragValue::new(&mut tb)
+                            .range(1000..=1_000_000)
+                            .speed(1000),
+                    );
                     g.tick_budget = tb.max(1000) as u64;
                     ui.end_row();
 
@@ -1419,15 +1560,17 @@ impl<'a> TabContext<'a> {
 
         if !evo.tree_nodes.is_empty() {
             ui.collapsing("Evolution Tree", |ui| {
-                Self::render_tree(ui, &evo.tree_nodes, evo.current_node_id, &mut evo.selected_node_id);
+                Self::render_tree(
+                    ui,
+                    &evo.tree_nodes,
+                    evo.current_node_id,
+                    &mut evo.selected_node_id,
+                );
             });
         }
     }
 
-    fn render_running_dashboard(
-        ui: &mut egui::Ui,
-        evo: &mut EvolutionSnapshot,
-    ) {
+    fn render_running_dashboard(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
         // ── Fitness chart at top of tab (always visible) ────────
         if !evo.fitness_history.is_empty() {
             Self::render_fitness_chart(ui, &evo.fitness_history);
@@ -1449,10 +1592,8 @@ impl<'a> TabContext<'a> {
             let sep_x = pane_rect.left() + pane_rect.width() * evo.tree_pane_fraction;
 
             // Draggable separator
-            let sep_interact_rect = egui::Rect::from_x_y_ranges(
-                (sep_x - gap)..=(sep_x + gap),
-                pane_rect.y_range(),
-            );
+            let sep_interact_rect =
+                egui::Rect::from_x_y_ranges((sep_x - gap)..=(sep_x + gap), pane_rect.y_range());
             let sep_id = ui.id().with("evo_pane_sep");
             let sep_sense = ui.interact(sep_interact_rect, sep_id, egui::Sense::drag());
             if sep_sense.dragged() {
@@ -1470,18 +1611,16 @@ impl<'a> TabContext<'a> {
             );
 
             // Left pane: tree
-            let left_rect = egui::Rect::from_x_y_ranges(
-                pane_rect.left()..=(sep_x - gap),
-                pane_rect.y_range(),
-            );
+            let left_rect =
+                egui::Rect::from_x_y_ranges(pane_rect.left()..=(sep_x - gap), pane_rect.y_range());
             let vertical = egui::Layout::top_down(egui::Align::LEFT);
-            let mut left_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(left_rect)
-                    .layout(vertical),
-            );
+            let mut left_ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(vertical));
             left_ui.group(|ui| {
-                ui.set_min_size(egui::vec2(left_rect.width() - 8.0, left_rect.height() - 8.0));
+                ui.set_min_size(egui::vec2(
+                    left_rect.width() - 8.0,
+                    left_rect.height() - 8.0,
+                ));
                 ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
                 ui.add_space(4.0);
                 let scroll_width = ui.available_width();
@@ -1500,19 +1639,18 @@ impl<'a> TabContext<'a> {
             });
 
             // Right pane: detail / overview
-            let right_rect = egui::Rect::from_x_y_ranges(
-                (sep_x + gap)..=pane_rect.right(),
-                pane_rect.y_range(),
-            );
-            let mut right_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(right_rect)
-                    .layout(vertical),
-            );
+            let right_rect =
+                egui::Rect::from_x_y_ranges((sep_x + gap)..=pane_rect.right(), pane_rect.y_range());
+            let mut right_ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(right_rect).layout(vertical));
             right_ui.group(|ui| {
-                ui.set_min_size(egui::vec2(right_rect.width() - 8.0, right_rect.height() - 8.0));
+                ui.set_min_size(egui::vec2(
+                    right_rect.width() - 8.0,
+                    right_rect.height() - 8.0,
+                ));
                 if let Some(sel_id) = selected_node_id {
-                    let heading_text = tree_nodes.iter()
+                    let heading_text = tree_nodes
+                        .iter()
                         .find(|n| n.id == sel_id)
                         .map(|n| format!("Generation {}", n.generation))
                         .unwrap_or_else(|| format!("Generation {}", generation));
@@ -1606,10 +1744,8 @@ impl<'a> TabContext<'a> {
             let ui = &mut *ui;
             let avail = ui.available_width().max(200.0);
             let chart_height = 150.0;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(avail, chart_height),
-                egui::Sense::hover(),
-            );
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(avail, chart_height), egui::Sense::hover());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
 
@@ -1620,13 +1756,13 @@ impl<'a> TabContext<'a> {
             // Per-island colors (up to 8 islands, wraps)
             let island_colors = [
                 egui::Color32::from_rgb(50, 200, 80),   // green
-                egui::Color32::from_rgb(80, 140, 255),   // blue
-                egui::Color32::from_rgb(255, 140, 50),    // orange
-                egui::Color32::from_rgb(200, 80, 200),    // purple
-                egui::Color32::from_rgb(255, 220, 50),    // yellow
-                egui::Color32::from_rgb(50, 220, 220),    // cyan
-                egui::Color32::from_rgb(255, 80, 80),     // red
-                egui::Color32::from_rgb(180, 180, 180),   // grey
+                egui::Color32::from_rgb(80, 140, 255),  // blue
+                egui::Color32::from_rgb(255, 140, 50),  // orange
+                egui::Color32::from_rgb(200, 80, 200),  // purple
+                egui::Color32::from_rgb(255, 220, 50),  // yellow
+                egui::Color32::from_rgb(50, 220, 220),  // cyan
+                egui::Color32::from_rgb(255, 80, 80),   // red
+                egui::Color32::from_rgb(180, 180, 180), // grey
             ];
 
             // Find global max fitness and generation range across all islands
@@ -1663,24 +1799,27 @@ impl<'a> TabContext<'a> {
                     .iter()
                     .map(|&(gen, best, _)| {
                         egui::pos2(
-                            rect.left() + ((gen - global_min_gen) as f32 / gen_range) * rect.width(),
+                            rect.left()
+                                + ((gen - global_min_gen) as f32 / gen_range) * rect.width(),
                             rect.bottom() - (best / global_max_fit) * rect.height(),
                         )
                     })
                     .collect();
                 for pair in pts.windows(2) {
-                    painter.line_segment(
-                        [pair[0], pair[1]],
-                        egui::Stroke::new(2.0, color),
-                    );
+                    painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, color));
                 }
             }
 
             // Legend
             ui.horizontal(|ui| {
                 for &island_id in &island_keys {
-                    let color = island_colors[island_id.unsigned_abs() as usize % island_colors.len()];
-                    let label = if island_id < 0 { "Global".to_string() } else { format!("Island {}", island_id) };
+                    let color =
+                        island_colors[island_id.unsigned_abs() as usize % island_colors.len()];
+                    let label = if island_id < 0 {
+                        "Global".to_string()
+                    } else {
+                        format!("Island {}", island_id)
+                    };
                     ui.colored_label(color, label);
                 }
                 ui.label(format!("Max: {:.4}", global_max_fit));
@@ -1802,8 +1941,10 @@ impl<'a> TabContext<'a> {
             return;
         }
 
-        let mut children_map: std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>> =
-            std::collections::HashMap::new();
+        let mut children_map: std::collections::HashMap<
+            Option<i64>,
+            Vec<&crate::governor::TreeNode>,
+        > = std::collections::HashMap::new();
         for node in nodes {
             children_map.entry(node.parent_id).or_default().push(node);
         }
@@ -1821,20 +1962,25 @@ impl<'a> TabContext<'a> {
 
         // Sort children: active/successful first, then exhausted, then failed
         for children in children_map.values_mut() {
-            children.sort_unstable_by_key(|node| {
-                match node.status.as_str() {
-                    "active" => 0,
-                    "successful" => 1,
-                    "exhausted" => 2,
-                    "failed" => 3,
-                    _ => 4,
-                }
+            children.sort_unstable_by_key(|node| match node.status.as_str() {
+                "active" => 0,
+                "successful" => 1,
+                "exhausted" => 2,
+                "failed" => 3,
+                _ => 4,
             });
         }
 
         if let Some(roots) = children_map.get(&None) {
             for root in roots {
-                Self::render_tree_node(ui, root, &children_map, &expanded_ids, current_id, selected_node_id);
+                Self::render_tree_node(
+                    ui,
+                    root,
+                    &children_map,
+                    &expanded_ids,
+                    current_id,
+                    selected_node_id,
+                );
             }
         }
     }
@@ -1847,7 +1993,9 @@ impl<'a> TabContext<'a> {
         current_id: Option<i64>,
         selected_node_id: &mut Option<i64>,
     ) {
-        let has_children = children_map.get(&Some(node.id)).map_or(false, |c| !c.is_empty());
+        let has_children = children_map
+            .get(&Some(node.id))
+            .map_or(false, |c| !c.is_empty());
         let is_current = Some(node.id) == current_id;
         let is_on_path = expanded_ids.contains(&node.id);
         let is_selected = *selected_node_id == Some(node.id);
@@ -1876,8 +2024,13 @@ impl<'a> TabContext<'a> {
             let header_resp = state.show_header(ui, |ui| {
                 let resp = ui.add(
                     egui::Label::new(
-                        egui::RichText::new(&label).color(color).monospace().size(11.0),
-                    ).selectable(false).sense(egui::Sense::click()),
+                        egui::RichText::new(&label)
+                            .color(color)
+                            .monospace()
+                            .size(11.0),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
                 );
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1891,7 +2044,14 @@ impl<'a> TabContext<'a> {
             header_resp.body(|ui| {
                 if let Some(children) = children_map.get(&Some(node.id)) {
                     for child in children {
-                        Self::render_tree_node(ui, child, children_map, expanded_ids, current_id, selected_node_id);
+                        Self::render_tree_node(
+                            ui,
+                            child,
+                            children_map,
+                            expanded_ids,
+                            current_id,
+                            selected_node_id,
+                        );
                     }
                 }
             });
@@ -1900,8 +2060,13 @@ impl<'a> TabContext<'a> {
                 ui.add_space(18.0);
                 let resp = ui.add(
                     egui::Label::new(
-                        egui::RichText::new(&label).color(color).monospace().size(11.0),
-                    ).selectable(false).sense(egui::Sense::click()),
+                        egui::RichText::new(&label)
+                            .color(color)
+                            .monospace()
+                            .size(11.0),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
                 );
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

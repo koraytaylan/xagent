@@ -84,10 +84,16 @@ impl MutationMomentum {
 
     /// Return the top N parameters by absolute momentum magnitude.
     pub fn top_params(&self, n: usize) -> Vec<(&str, f32)> {
-        let mut entries: Vec<(&str, f32)> = self.momentum.iter()
+        let mut entries: Vec<(&str, f32)> = self
+            .momentum
+            .iter()
             .map(|(k, v)| (k.as_str(), *v))
             .collect();
-        entries.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.1.abs()
+                .partial_cmp(&a.1.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         entries.truncate(n);
         entries
     }
@@ -121,7 +127,10 @@ impl MutationMomentum {
             ("distress_exponent", parent.distress_exponent),
             ("habituation_sensitivity", parent.habituation_sensitivity),
             ("max_curiosity_bonus", parent.max_curiosity_bonus),
-            ("fatigue_recovery_sensitivity", parent.fatigue_recovery_sensitivity),
+            (
+                "fatigue_recovery_sensitivity",
+                parent.fatigue_recovery_sensitivity,
+            ),
             ("fatigue_floor", parent.fatigue_floor),
         ];
 
@@ -334,8 +343,11 @@ mod tests {
             let result = m.biased_perturb_f(&mut rng, value, "learning_rate", 0.1);
             assert!(result >= 0.0001);
             // Without momentum, factor is in [0.9, 1.1], so result in [0.9, 1.1]
-            assert!(result >= 0.89 && result <= 1.11,
-                "result {} out of expected range", result);
+            assert!(
+                result >= 0.89 && result <= 1.11,
+                "result {} out of expected range",
+                result
+            );
         }
     }
 
@@ -355,7 +367,11 @@ mod tests {
         let avg = sum / n as f32;
 
         // Average should be above 1.0 (biased upward by momentum)
-        assert!(avg > 1.0, "avg {} should be > 1.0 with positive momentum", avg);
+        assert!(
+            avg > 1.0,
+            "avg {} should be > 1.0 with positive momentum",
+            avg
+        );
     }
 
     #[test]
@@ -367,8 +383,11 @@ mod tests {
         for _ in 0..100 {
             let result = m.biased_perturb_u(&mut rng, value, "memory_capacity", 0.1);
             assert!(result >= 1);
-            assert!(result >= 85 && result <= 115,
-                "result {} out of expected range", result);
+            assert!(
+                result >= 85 && result <= 115,
+                "result {} out of expected range",
+                result
+            );
         }
     }
 

@@ -139,20 +139,8 @@ fn terrain_color(x: f32, z: f32, height: f32, biome_map: &BiomeMap) -> [f32; 3] 
 
     let biome = biome_map.biome_at(x, z);
     match biome {
-        BiomeType::FoodRich => [
-            0.12 + t * 0.10,
-            0.40 + t * 0.05,
-            0.08 + t * 0.04,
-        ],
-        BiomeType::Barren => [
-            0.40 + t * 0.20,
-            0.32 + t * 0.05,
-            0.15 + t * 0.05,
-        ],
-        BiomeType::Danger => [
-            0.45 + t * 0.20,
-            0.15 + t * 0.05,
-            0.10 + t * 0.03,
-        ],
+        BiomeType::FoodRich => [0.12 + t * 0.10, 0.40 + t * 0.05, 0.08 + t * 0.04],
+        BiomeType::Barren => [0.40 + t * 0.20, 0.32 + t * 0.05, 0.15 + t * 0.05],
+        BiomeType::Danger => [0.45 + t * 0.20, 0.15 + t * 0.05, 0.10 + t * 0.03],
     }
 }

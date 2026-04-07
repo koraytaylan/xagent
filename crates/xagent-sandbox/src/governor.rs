@@ -917,26 +917,44 @@ impl Governor {
         );
     }
 
-    /// Store a generation's recording as a raw f32 BLOB in the database.
-    /// `recording` is the `GenerationRecording` to persist.
-    pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
+    /// Store a generation's recording as a little-endian f32 BLOB in the
+    /// database.  `recording` is the `GenerationRecording` to persist.
+    pub fn store_recording(
+        &self,
+        recording: &crate::replay::GenerationRecording,
+    ) {
         let node_id = match self.current_node_id {
             Some(id) => id,
             None => return,
         };
-        let agent_count = recording.agent_count as i64;
-        let tick_count = recording.total_ticks as i64;
-        if tick_count == 0 {
-            return;
-        }
+        let agent_count = match i64::try_from(recording.agent_count) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let tick_count = match i64::try_from(recording.total_ticks) {
+            Ok(v) if v > 0 => v,
+            _ => return,
+        };
 
-        // Serialize TickRecords into a compact binary format:
-        // 14 f32 fields per agent per tick (position[3], yaw, energy,
-        // integrity, alive, motor_fwd, motor_turn, prediction_error,
-        // exploration_rate, gradient, urgency, fatigue_factor)
+        // Serialize TickRecords into a compact little-endian binary
+        // format: 14 f32 fields per agent per tick (position[3], yaw,
+        // energy, integrity, alive, motor_fwd, motor_turn,
+        // prediction_error, exploration_rate, gradient, urgency,
+        // fatigue_factor).
         let record_stride = 14usize;
-        let expected_floats = tick_count as usize * recording.agent_count * record_stride;
-        let mut data = Vec::with_capacity(expected_floats);
+        let tick_count_usize = match usize::try_from(tick_count) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let expected_floats = match tick_count_usize
+            .checked_mul(recording.agent_count)
+            .and_then(|v| v.checked_mul(record_stride))
+        {
+            Some(v) => v,
+            None => return,
+        };
+        let mut bytes =
+            Vec::with_capacity(expected_floats * std::mem::size_of::<f32>());
         for tick in 0..recording.total_ticks {
             let records = match recording.get_tick(tick) {
                 Some(records) => records,
@@ -946,28 +964,32 @@ impl Governor {
                 return;
             }
             for r in records {
-                data.push(r.position[0]);
-                data.push(r.position[1]);
-                data.push(r.position[2]);
-                data.push(r.yaw);
-                data.push(r.energy);
-                data.push(r.integrity);
-                data.push(if r.alive { 1.0f32 } else { 0.0 });
-                data.push(r.motor_forward);
-                data.push(r.motor_turn);
-                data.push(r.prediction_error);
-                data.push(r.exploration_rate);
-                data.push(r.gradient);
-                data.push(r.urgency);
-                data.push(r.fatigue_factor);
+                for &val in &[
+                    r.position[0],
+                    r.position[1],
+                    r.position[2],
+                    r.yaw,
+                    r.energy,
+                    r.integrity,
+                    if r.alive { 1.0f32 } else { 0.0 },
+                    r.motor_forward,
+                    r.motor_turn,
+                    r.prediction_error,
+                    r.exploration_rate,
+                    r.gradient,
+                    r.urgency,
+                    r.fatigue_factor,
+                ] {
+                    bytes.extend_from_slice(&val.to_le_bytes());
+                }
             }
         }
 
-        if data.len() != expected_floats {
+        let float_size = std::mem::size_of::<f32>();
+        if bytes.len() != expected_floats * float_size {
             return;
         }
 
-        let bytes: &[u8] = bytemuck::cast_slice(&data);
         let _ = self.db.execute(
             "INSERT OR REPLACE INTO generation_recording \
              (node_id, agent_count, tick_count, data)
@@ -979,7 +1001,10 @@ impl Governor {
     /// Load a generation's recording from the database.
     /// Returns `(agent_count, tick_count, Vec<f32>)` or `None` if not
     /// found or the blob is malformed.
-    pub fn load_recording(&self, node_id: i64) -> Option<(usize, u64, Vec<f32>)> {
+    pub fn load_recording(
+        &self,
+        node_id: i64,
+    ) -> Option<(usize, u64, Vec<f32>)> {
         let row: (i64, i64, Vec<u8>) = self
             .db
             .query_row(
@@ -990,19 +1015,31 @@ impl Governor {
             )
             .ok()?;
         let (agent_count, tick_count, blob) = row;
+        let agent_count = usize::try_from(agent_count).ok()?;
+        let tick_count = u64::try_from(tick_count).ok()?;
 
         let float_size = std::mem::size_of::<f32>();
         if blob.len() % float_size != 0 {
             return None;
         }
 
-        let mut floats = Vec::with_capacity(blob.len() / float_size);
-        for chunk in blob.chunks_exact(float_size) {
-            let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            floats.push(f32::from_ne_bytes(bytes));
+        // Keep record_stride in sync with store_recording().
+        let record_stride = 14usize;
+        let actual_float_count = blob.len() / float_size;
+        let expected_float_count = agent_count
+            .checked_mul(usize::try_from(tick_count).ok()?)?
+            .checked_mul(record_stride)?;
+        if actual_float_count != expected_float_count {
+            return None;
         }
 
-        Some((agent_count as usize, tick_count as u64, floats))
+        let mut floats = Vec::with_capacity(actual_float_count);
+        for chunk in blob.chunks_exact(float_size) {
+            let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            floats.push(f32::from_le_bytes(bytes));
+        }
+
+        Some((agent_count, tick_count, floats))
     }
 
     /// Get the evolution tree as a list of nodes for UI visualization.
@@ -1248,7 +1285,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add island_id if missing
     let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
 
-    // Recording persistence: one raw f32 BLOB per generation
+    // Recording persistence: one little-endian f32 BLOB per generation
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS generation_recording (
             node_id     INTEGER PRIMARY KEY REFERENCES node(id),

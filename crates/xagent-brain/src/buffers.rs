@@ -44,12 +44,14 @@ pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 8130
 pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 8131
 pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 8163
 pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 8195
+
+// homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
 pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 8227
-                                                 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
 pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 8233
 pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 8265
+
+// act_biases: [fwd_bias, turn_bias]
 pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 8297
-                                                      // act_biases: [fwd_bias, turn_bias]
 pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 8299
 pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 8300
 pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 8364

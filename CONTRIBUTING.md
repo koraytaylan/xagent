@@ -6,7 +6,7 @@ All code must pass the following before merge:
 
 ```bash
 cargo fmt --all -- --check   # formatting
-cargo clippy --workspace -- -D warnings   # lints (pedantic enabled)
+cargo clippy --workspace --all-targets -- -D warnings   # lints (pedantic enabled)
 cargo test -p xagent-sandbox # tests
 ```
 

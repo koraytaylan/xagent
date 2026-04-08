@@ -536,6 +536,8 @@ const BIOME_GRID_RES: u32 = 256u;
 const FOOD_COUNT_VAL: u32 = {food_count}u;
 const AGENT_COUNT_VAL: u32 = {agent_count}u;
 
+const WC_FOOD_RADIUS: u32 = {WC_FOOD_RADIUS}u;
+
 const FOOD_RESPAWN_TIME: f32 = 10.0;
 const FOOD_HEIGHT_OFFSET: f32 = 0.35;
 const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;

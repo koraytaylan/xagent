@@ -27,7 +27,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let center_cx = cell_coord(ax) + GRID_OFFSET;
     let center_cz = cell_coord(az) + GRID_OFFSET;
 
-    let food_radius = wc(7u); // WC_FOOD_RADIUS
+    let food_radius = wc(WC_FOOD_RADIUS);
     let food_radius_sq = food_radius * food_radius;
 
     var best_idx: u32 = 0xFFFFFFFFu;

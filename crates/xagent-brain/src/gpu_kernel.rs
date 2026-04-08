@@ -3,7 +3,7 @@
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use wgpu;
@@ -25,6 +25,21 @@ pub struct AgentTelemetry {
     pub gradient: f32,
     pub prediction_error: f32,
     pub exploration_rate: f32,
+}
+
+/// In-flight async readback of a single agent's brain state.
+struct AgentStateReadback {
+    brain_staging: wgpu::Buffer,
+    pattern_staging: wgpu::Buffer,
+    history_staging: wgpu::Buffer,
+    brain_size: u64,
+    pattern_size: u64,
+    history_size: u64,
+    /// Counts how many of the 3 map_async callbacks have fired successfully.
+    mapped_count: Arc<AtomicU8>,
+    /// Set if any map_async callback reports an error.
+    had_error: Arc<AtomicBool>,
+    brain_stride: usize,
 }
 
 /// Terrain heightmap vertices per side.
@@ -76,6 +91,9 @@ pub struct GpuKernel {
     staging_in_flight: [bool; 2],        // submitted, not yet collected
     staging_ready: [Arc<AtomicBool>; 2], // map_async callback fired
     state_cache: Vec<f32>,
+
+    // ── Async agent-state readback (for non-blocking generation transitions) ──
+    agent_state_staging: Option<AgentStateReadback>,
 
     // ── Config ──
     world_config: WorldConfig,
@@ -867,6 +885,7 @@ impl GpuKernel {
             state_cache: vec![0.0; n * PHYS_STRIDE],
             world_config: world_config.clone(),
             layout,
+            agent_state_staging: None,
             brain_tick_stride,
             has_subgroup,
         }
@@ -1324,6 +1343,281 @@ impl GpuKernel {
             hist_offset,
             bytemuck::cast_slice(&state.history),
         );
+    }
+
+    /// Non-blocking: kick off async readback of one agent's brain state.
+    /// Results are collected via `try_collect_agent_state`.
+    pub fn request_agent_state(&mut self, index: u32) -> bool {
+        if index >= self.agent_count {
+            log::warn!(
+                "[GPU] request_agent_state: index {index} out of bounds (agent_count={})",
+                self.agent_count
+            );
+            return false;
+        }
+        if self.agent_state_staging.is_some() {
+            log::warn!("[GPU] request_agent_state: previous readback still in flight — skipping");
+            return false;
+        }
+        let i = index as usize;
+        let bs = self.layout.brain_stride;
+
+        let brain_size = (bs * 4) as u64;
+        let pat_size = (PATTERN_STRIDE * 4) as u64;
+        let hist_size = (HISTORY_STRIDE * 4) as u64;
+
+        let make_staging = |label, size| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+
+        let brain_staging = make_staging("agent_state_brain_staging", brain_size);
+        let pattern_staging = make_staging("agent_state_pattern_staging", pat_size);
+        let history_staging = make_staging("agent_state_history_staging", hist_size);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("agent_state_readback"),
+            });
+
+        let brain_offset = (i * bs * 4) as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.brain_state_buf,
+            brain_offset,
+            &brain_staging,
+            0,
+            brain_size,
+        );
+        let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.pattern_buf, pat_offset, &pattern_staging, 0, pat_size);
+        let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.history_buf,
+            hist_offset,
+            &history_staging,
+            0,
+            hist_size,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Set up map_async on all three staging buffers. Each callback
+        // increments a shared counter; we only consider the readback ready
+        // when all 3 have completed. If any fails, we set an error flag so
+        // the caller can abandon the readback instead of hanging forever.
+        let mapped_count = Arc::new(AtomicU8::new(0));
+        let had_error = Arc::new(AtomicBool::new(false));
+
+        let make_callback = |count: Arc<AtomicU8>, err: Arc<AtomicBool>| {
+            move |result: Result<(), wgpu::BufferAsyncError>| {
+                if result.is_ok() {
+                    count.fetch_add(1, Ordering::Release);
+                } else {
+                    err.store(true, Ordering::Release);
+                }
+            }
+        };
+
+        brain_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
+        pattern_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
+        history_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
+
+        self.agent_state_staging = Some(AgentStateReadback {
+            brain_staging,
+            pattern_staging,
+            history_staging,
+            brain_size,
+            pattern_size: pat_size,
+            history_size: hist_size,
+            mapped_count,
+            had_error,
+            brain_stride: bs,
+        });
+        true
+    }
+
+    /// Non-blocking poll: returns `Some(Some(state))` when ready,
+    /// `Some(None)` if a map_async error occurred (readback abandoned),
+    /// or `None` if still in flight or nothing was requested.
+    pub fn try_collect_agent_state(&mut self) -> Option<Option<AgentBrainState>> {
+        let readback = self.agent_state_staging.as_ref()?;
+        self.device.poll(wgpu::Maintain::Poll);
+
+        // If any mapping failed, abandon the readback.
+        if readback.had_error.load(Ordering::Acquire) {
+            log::error!("[GPU] agent-state map_async failed — abandoning readback");
+            let rb = self.agent_state_staging.take().unwrap();
+            // Unmap any buffers that did succeed to avoid leaking.
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rb.brain_staging.unmap()));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rb.pattern_staging.unmap()
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rb.history_staging.unmap()
+            }));
+            return Some(None);
+        }
+
+        if readback.mapped_count.load(Ordering::Acquire) < 3 {
+            return None; // not all 3 buffers mapped yet
+        }
+
+        let readback = self.agent_state_staging.take().unwrap();
+        let mut state = AgentBrainState::new_for(readback.brain_stride);
+
+        let brain_data = readback.brain_staging.slice(..readback.brain_size);
+        let mapped = brain_data.get_mapped_range();
+        state.brain_state.clear();
+        state
+            .brain_state
+            .extend_from_slice(bytemuck::cast_slice(&mapped));
+        drop(mapped);
+        readback.brain_staging.unmap();
+
+        let pat_data = readback.pattern_staging.slice(..readback.pattern_size);
+        let mapped = pat_data.get_mapped_range();
+        state.patterns.clear();
+        state
+            .patterns
+            .extend_from_slice(bytemuck::cast_slice(&mapped));
+        drop(mapped);
+        readback.pattern_staging.unmap();
+
+        let hist_data = readback.history_staging.slice(..readback.history_size);
+        let mapped = hist_data.get_mapped_range();
+        state.history.clear();
+        state
+            .history
+            .extend_from_slice(bytemuck::cast_slice(&mapped));
+        drop(mapped);
+        readback.history_staging.unmap();
+
+        Some(Some(state))
+    }
+
+    /// Batch-upload brain states for all agents in a single write per buffer.
+    /// `states` is a closure that returns the `AgentBrainState` for agent index `i`.
+    pub fn batch_write_agent_states<F>(&self, count: usize, states: F)
+    where
+        F: Fn(usize) -> AgentBrainState,
+    {
+        debug_assert_eq!(
+            count, self.agent_count as usize,
+            "batch_write_agent_states: count ({}) != agent_count ({})",
+            count, self.agent_count
+        );
+        let bs = self.layout.brain_stride;
+        let mut brain_data = Vec::with_capacity(count * bs);
+        let mut pattern_data = Vec::with_capacity(count * PATTERN_STRIDE);
+        let mut history_data = Vec::with_capacity(count * HISTORY_STRIDE);
+
+        for i in 0..count {
+            let s = states(i);
+            debug_assert_eq!(
+                s.brain_state.len(),
+                bs,
+                "agent {}: brain_state length {} != brain_stride {}",
+                i,
+                s.brain_state.len(),
+                bs
+            );
+            debug_assert_eq!(
+                s.patterns.len(),
+                PATTERN_STRIDE,
+                "agent {}: patterns length {} != PATTERN_STRIDE {}",
+                i,
+                s.patterns.len(),
+                PATTERN_STRIDE
+            );
+            debug_assert_eq!(
+                s.history.len(),
+                HISTORY_STRIDE,
+                "agent {}: history length {} != HISTORY_STRIDE {}",
+                i,
+                s.history.len(),
+                HISTORY_STRIDE
+            );
+            brain_data.extend_from_slice(&s.brain_state);
+            pattern_data.extend_from_slice(&s.patterns);
+            history_data.extend_from_slice(&s.history);
+        }
+
+        debug_assert_eq!(brain_data.len(), count * bs);
+        debug_assert_eq!(pattern_data.len(), count * PATTERN_STRIDE);
+        debug_assert_eq!(history_data.len(), count * HISTORY_STRIDE);
+
+        self.queue
+            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
+        self.queue
+            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
+        self.queue
+            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
+    }
+
+    /// Non-blocking version of `reset_agents`. Returns false if async staging
+    /// buffers are still in flight (caller should retry next frame).
+    pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
+        // Check if any staging buffer is still in flight.
+        for i in 0..2 {
+            if self.staging_in_flight[i] {
+                self.device.poll(wgpu::Maintain::Poll);
+                if !self.staging_ready[i].load(Ordering::Acquire) {
+                    return false; // not ready yet — caller retries next frame
+                }
+                let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
+                let slice = self.state_staging[i].slice(..buf_size);
+                let _data = slice.get_mapped_range();
+                drop(_data);
+                self.state_staging[i].unmap();
+                self.staging_in_flight[i] = false;
+            }
+            self.staging_ready[i].store(false, Ordering::Release);
+        }
+        self.staging_idx = 0;
+
+        let n = self.agent_count as usize;
+
+        // Fresh brain state, pattern memory, and action history.
+        let mut rng = rand::rng();
+        let mut brain_data = Vec::with_capacity(n * self.layout.brain_stride);
+        let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
+        let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
+        for _ in 0..n {
+            brain_data.extend_from_slice(&init_brain_state_for(
+                brain_config,
+                &self.layout,
+                &mut rng,
+            ));
+            pattern_data.extend_from_slice(&init_pattern_memory());
+            history_data.extend_from_slice(&init_action_history());
+        }
+        self.queue
+            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
+        self.queue
+            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
+        self.queue
+            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
+        self.queue.write_buffer(
+            &self.brain_config_buf,
+            0,
+            bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
+        );
+        true
     }
 
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.

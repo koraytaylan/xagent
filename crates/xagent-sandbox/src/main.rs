@@ -21,7 +21,7 @@ use xagent_brain::buffers::{
     P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
     P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
-use xagent_brain::GpuKernel;
+use xagent_brain::{AgentBrainState, GpuKernel};
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
@@ -238,6 +238,20 @@ fn record_agent_histories(agent: &mut Agent) {
     push_hist!(agent.fatigue_history, agent.cached_fatigue_factor);
 }
 
+/// State machine for non-blocking generation transitions.
+/// Each variant represents one phase of the multi-frame handoff.
+enum GenTransition {
+    /// Waiting for async readback of the best agent's brain state.
+    AwaitingReadback { result: AdvanceResult },
+    /// Readback collected; waiting for staging buffers to drain before reset.
+    AwaitingReset {
+        result: AdvanceResult,
+        inherited_state: Option<AgentBrainState>,
+        /// Whether population has already been spawned (prevents re-spawn on retry).
+        spawned: bool,
+    },
+}
+
 struct App {
     brain_config: BrainConfig,
     world_config: WorldConfig,
@@ -331,11 +345,18 @@ struct App {
     db_path: String,
     governor_config: GovernorConfig,
 
+    // Non-blocking generation transition state machine
+    gen_transition: Option<GenTransition>,
+
     // GPU fused kernel (all simulation computation in single dispatch)
     gpu_kernel: Option<GpuKernel>,
     pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
     /// Data collected for upload once the background kernel is ready.
     pending_upload: Option<PendingUpload>,
+    /// Inherited brain state + mutation strength deferred until a background
+    /// kernel finishes creation (when population size changes at generation
+    /// boundary and `can_reuse` is false).
+    deferred_inherited: Option<(AgentBrainState, f32)>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
@@ -471,9 +492,11 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
+            gen_transition: None,
             gpu_kernel: None,
             pending_kernel: None,
             pending_upload: None,
+            deferred_inherited: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
@@ -536,6 +559,22 @@ impl App {
                     mk.upload_agents(&upload.agent_data);
                 }
                 let ac = mk.agent_count();
+
+                // Apply deferred inherited state from a generation transition
+                // that occurred while the kernel was being recreated.
+                if let Some((ref state, mutation_strength)) = self.deferred_inherited.take() {
+                    let repeats = self.governor_config.eval_repeats.max(1);
+                    let n = self.agents.len();
+                    let champion = state.clone();
+                    mk.batch_write_agent_states(n, |i| {
+                        if i < repeats {
+                            champion.clone()
+                        } else {
+                            mutate_brain_state(state, mutation_strength)
+                        }
+                    });
+                }
+
                 self.gpu_kernel = Some(mk);
                 self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
             }
@@ -770,7 +809,9 @@ impl App {
         }
     }
 
-    /// Evaluate the current generation, advance to the next (or finish).
+    /// Evaluate the current generation and begin the async transition.
+    /// The actual GPU work (readback, reset, upload) spans multiple frames
+    /// via `poll_gen_transition`.
     fn advance_generation(&mut self) {
         // Persist the recording to SQLite before moving to the next generation
         if let (Some(ref recording), Some(ref gov)) = (&self.recording, &self.governor) {
@@ -783,9 +824,10 @@ impl App {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
-        // Evaluate fitness, then capture best agent's brain state using the
-        // actual composite fitness ranking (not the brain's internal metrics).
-        let (result, inherited_state) = {
+        // Evaluate fitness and decide whether evolution continues.
+        // Only kick off the async brain-state readback when the result is
+        // Continue — when Finished, no readback is needed.
+        let (result, readback_requested) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -795,29 +837,142 @@ impl App {
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
 
-            // fitness is sorted by descending composite_fitness — first entry is best
-            let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-            let state = self.agents.get(best_idx).and_then(|a| {
-                self.gpu_kernel
-                    .as_ref()
-                    .map(|mk| mk.read_agent_state(a.brain_idx))
-            });
+            let result = gov.advance(&fitness);
 
-            (gov.advance(&fitness), state)
+            // Only read back the best agent's brain state when evolution
+            // continues — Finished needs no inherited state.
+            let mut readback_requested = false;
+            if matches!(result, AdvanceResult::Continue { .. }) {
+                let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+                if let Some(a) = self.agents.get(best_idx) {
+                    if let Some(mk) = self.gpu_kernel.as_mut() {
+                        if mk.request_agent_state(a.brain_idx) {
+                            readback_requested = true;
+                        }
+                    }
+                }
+            }
+
+            (result, readback_requested)
         };
 
-        // Governor borrow released — safe to call self methods
+        match result {
+            AdvanceResult::Continue { .. } if readback_requested => {
+                self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+            }
+            AdvanceResult::Continue { .. } => {
+                // No readback was issued (no best agent or no GPU kernel) —
+                // skip directly to reset to avoid deadlocking in AwaitingReadback.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+            AdvanceResult::Finished { .. } => {
+                // Skip readback phase entirely — go straight to finish.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+        }
+    }
+
+    /// Drive the multi-frame generation transition state machine.
+    /// Called every frame; returns true while a transition is still in progress.
+    fn poll_gen_transition(&mut self) -> bool {
+        let transition = match self.gen_transition.take() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        match transition {
+            GenTransition::AwaitingReadback { result } => {
+                if self.gpu_kernel.is_none() {
+                    // No kernel — proceed without inherited state.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state: None,
+                        spawned: false,
+                    });
+                    return true;
+                }
+
+                // Poll for the async agent state readback.
+                let collected = self.gpu_kernel.as_mut().unwrap().try_collect_agent_state();
+
+                match collected {
+                    Some(Some(state)) => {
+                        // Readback complete — move to reset phase.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: Some(state),
+                            spawned: false,
+                        });
+                    }
+                    Some(None) => {
+                        // map_async error — proceed without inherited state
+                        // rather than hanging in AwaitingReadback forever.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: None,
+                            spawned: false,
+                        });
+                    }
+                    None => {
+                        // Still waiting — re-enqueue for next frame.
+                        self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+                    }
+                }
+                true
+            }
+            GenTransition::AwaitingReset {
+                result,
+                inherited_state,
+                spawned,
+            } => {
+                let (done, spawned) =
+                    self.try_finish_generation(&result, inherited_state.as_ref(), spawned);
+                if !done {
+                    // Reset not ready yet — re-enqueue for next frame.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state,
+                        spawned,
+                    });
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Try to complete a generation transition. Returns `(done, spawned)`
+    /// where `done` is false if the GPU staging buffers aren't ready yet
+    /// (caller should retry next frame), and `spawned` tracks whether
+    /// population has been spawned (to avoid re-spawning on retry).
+    fn try_finish_generation(
+        &mut self,
+        result: &AdvanceResult,
+        inherited_state: Option<&AgentBrainState>,
+        mut spawned: bool,
+    ) -> (bool, bool) {
         match result {
             AdvanceResult::Continue {
                 configs,
                 messages,
                 mutation_strength,
             } => {
-                for msg in messages {
-                    self.log_msg(msg);
+                if !spawned {
+                    for msg in messages {
+                        self.log_msg(msg.clone());
+                    }
+                    self.spawn_population_from_configs(configs);
+                    spawned = true;
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
-                self.spawn_population_from_configs(&configs);
 
                 // Reuse existing kernel if population size matches,
                 // otherwise drop and recreate in background.
@@ -828,7 +983,11 @@ impl App {
 
                 if can_reuse {
                     let mk = self.gpu_kernel.as_mut().unwrap();
-                    mk.reset_agents(&self.brain_config);
+                    // Non-blocking reset — return false to retry next frame
+                    // instead of falling back to a blocking busy-wait.
+                    if !mk.try_reset_agents(&self.brain_config) {
+                        return (false, spawned);
+                    }
                     let agent_data: Vec<_> = self
                         .agents
                         .iter()
@@ -848,33 +1007,46 @@ impl App {
                     self.pending_kernel = None;
                     self.pending_upload = None;
                     self.ensure_gpu_kernel();
+                    // Kernel is being recreated in the background —
+                    // keep the transition active until it's ready.
+                    if self.gpu_kernel.is_none() {
+                        return (false, spawned);
+                    }
                 }
 
-                // Inherit learned weights: champions get exact weights,
+                // Inherit learned weights: champions get exact brain state,
                 // mutants get perturbed weights for neuroevolution.
-                if let Some(ref state) = inherited_state {
+                if let Some(state) = inherited_state {
                     if let Some(ref mk) = self.gpu_kernel {
-                        for (i, agent) in self.agents.iter().enumerate() {
+                        let ms = *mutation_strength;
+                        let n = self.agents.len();
+                        // Pre-clone once for all champion slots to avoid
+                        // cloning inside the hot closure on every call.
+                        let champion = state.clone();
+                        mk.batch_write_agent_states(n, |i| {
                             if i < repeats {
-                                // Champion: exact inherited weights
-                                mk.write_agent_state(agent.brain_idx, state);
+                                champion.clone()
                             } else {
-                                // Mutant: inherited weights + small perturbation
-                                let mutated = mutate_brain_state(state, mutation_strength);
-                                mk.write_agent_state(agent.brain_idx, &mutated);
+                                mutate_brain_state(state, ms)
                             }
-                        }
+                        });
+                    } else {
+                        // Kernel is being recreated in the background
+                        // (population size changed). Stash inherited state
+                        // so it can be applied once the kernel is ready.
+                        self.deferred_inherited = Some((state.clone(), *mutation_strength));
                     }
                 }
             }
             AdvanceResult::Finished { messages } => {
                 for msg in messages {
-                    self.log_msg(msg);
+                    self.log_msg(msg.clone());
                 }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
             }
         }
+        (true, spawned)
     }
 
     fn log_msg(&mut self, msg: String) {
@@ -1393,7 +1565,11 @@ impl ApplicationHandler for App {
                 }
 
                 // ── simulation ticks (fixed timestep, adaptive budget) ──
-                if !self.paused {
+                // Skip ticks while a generation transition is in flight to
+                // avoid GPU contention with the async readback/reset.
+                // Also skip accumulation when the kernel is being recreated
+                // in the background to prevent catch-up hitch when it lands.
+                if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     // Cap accumulator to 2× budget so debt stays bounded.
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
@@ -1587,12 +1763,18 @@ impl ApplicationHandler for App {
                     }
 
                     // ── Generation completion check (after tick batch) ──
-                    if let Some(gov) = &self.governor {
-                        if gov.generation_complete() {
-                            self.advance_generation();
+                    if self.gen_transition.is_none() {
+                        if let Some(gov) = &self.governor {
+                            if gov.generation_complete() {
+                                self.advance_generation();
+                            }
                         }
                     }
                 }
+
+                // Drive the multi-frame generation transition state machine
+                // (runs even when sim ticks are paused/skipped due to transition).
+                self.poll_gen_transition();
 
                 // Advance replay playback
                 if self.replay_state.active && self.replay_state.playing {

@@ -655,7 +655,18 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
             let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
             motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
             motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else if (fatigue_len_u == 2u) {
+            // Use oldest available pre-noise command (1 tick ago).
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 2u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else if (fatigue_len_u == 1u) {
+            // Only current tick in ring; still pre-noise so prefer over decision.
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 1u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
         } else {
+            // Ring truly empty; fall back to decision buffer.
             motor_fwd = decision_buf[d_base + DIM + DIM];
             motor_trn = decision_buf[d_base + DIM + DIM + 1u];
         }

@@ -489,10 +489,15 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         // Turn-direction consistency: detect sustained same-direction turning
         // (circling signature). turn_bias → 1 when all turns share the same
         // sign, → 0 when turns are balanced left/right.
-        let turn_denom = max(sum_abs_turn, 0.01);
-        let turn_bias = abs(sum_turn) / turn_denom;
-        // Squared for gentle onset; suppresses variety when turning monotonically
-        let monotony = turn_bias * turn_bias;
+        // Require minimum 16 samples before engaging monotony detection to
+        // prevent early-life trapping on noisy small-sample estimates.
+        var monotony: f32 = 0.0;
+        if (f_len >= 16u) {
+            let turn_denom = max(sum_abs_turn, 0.01);
+            let turn_bias = abs(sum_turn) / turn_denom;
+            // Squared for gentle onset; suppresses variety when turning monotonically
+            monotony = turn_bias * turn_bias;
+        }
 
         let recovery = brain_state[b + O_FATIGUE_RECOVERY];
         let floor_val = brain_state[b + O_FATIGUE_FLOOR];

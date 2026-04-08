@@ -309,6 +309,7 @@ struct App {
     last_snapshot_rebuild: Instant,
     snap_dirty: bool,
     cached_agent_snaps: Vec<AgentSnapshot>,
+    last_snap_chart_window: usize,
 
     // Selection marker above focused agent
     marker_gpu: Option<GpuMesh>,
@@ -455,6 +456,7 @@ impl App {
             last_snapshot_rebuild: Instant::now(),
             snap_dirty: true,
             cached_agent_snaps: Vec::new(),
+            last_snap_chart_window: 120,
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
@@ -1901,6 +1903,12 @@ impl ApplicationHandler for App {
                                 let selected_idx = self.selected_agent_idx;
 
                                 // Snapshot agent data for the UI closure (throttled to ~10 Hz)
+                                // Force rebuild when agents changed size or chart window changed.
+                                if self.cached_agent_snaps.len() != self.agents.len()
+                                    || self.chart_window != self.last_snap_chart_window
+                                {
+                                    self.snap_dirty = true;
+                                }
                                 let snap_rebuild_due = self.snap_dirty
                                     && (self.paused
                                         || self.last_snapshot_rebuild.elapsed()
@@ -1964,6 +1972,7 @@ impl ApplicationHandler for App {
                                         })
                                         .collect();
                                     self.snap_dirty = false;
+                                    self.last_snap_chart_window = self.chart_window;
                                     if !self.paused {
                                         self.last_snapshot_rebuild = Instant::now();
                                     }

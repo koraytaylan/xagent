@@ -126,8 +126,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     //    consistent regardless of habituation level at storage time.
     // ────────────────────────────────────────────────────────────────────
     let min_idx = u32(patterns[p_base + O_MIN_REINF_IDX]);
-    let motor_fwd = decision[d_base + DIM + DIM];
-    let motor_trn = decision[d_base + DIM + DIM + 1u];
+
+    // Store the *approach action* (motor from ~2 ticks ago) instead of the
+    // current motor.  When this memory is later recalled with negative valence,
+    // negating the approach action produces "reverse the movement that led
+    // into danger" — directed escape rather than freezing.
+    let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
+    let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
+    var motor_fwd: f32;
+    var motor_trn: f32;
+    if (fatigue_len_u >= 3u) {
+        // cursor already advanced past current tick's write, so:
+        //   cursor-1 = this tick, cursor-2 = 1 ago, cursor-3 = 2 ago.
+        let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
+        motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+        motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+    } else if (fatigue_len_u == 2u) {
+        // Use oldest available pre-noise command (1 tick ago).
+        let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 2u) % ACTION_HISTORY_LEN;
+        motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+        motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+    } else if (fatigue_len_u == 1u) {
+        // Only current tick in ring; still pre-noise so prefer over decision.
+        let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 1u) % ACTION_HISTORY_LEN;
+        motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+        motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+    } else {
+        // Ring truly empty; fall back to decision buffer.
+        motor_fwd = decision[d_base + DIM + DIM];
+        motor_trn = decision[d_base + DIM + DIM + 1u];
+    }
 
     // Check if slot was previously empty before overwriting
     let was_active = patterns[p_base + O_PAT_ACTIVE + min_idx];

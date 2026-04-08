@@ -1071,3 +1071,100 @@ fn cpu_vision_produces_correct_buffer_shape() {
     assert_eq!(frame.vision.color.len(), (vw * vh * 4) as usize);
     assert_eq!(frame.vision.depth.len(), (vw * vh) as usize);
 }
+
+// ── Async Recording Persistence ───────────────────────────────────────
+
+#[test]
+fn async_recording_persists_and_round_trips() {
+    use xagent_sandbox::governor::Governor;
+    use xagent_sandbox::replay::{GenerationRecording, TickRecord};
+
+    // 1. Create a temp on-disk DB (NOT :memory: — that skips the background writer).
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    let db_path = tmp.path().to_str().expect("non-UTF-8 temp path").to_owned();
+    // Close the file handle so SQLite can use the path freely.
+    drop(tmp);
+
+    let gov_cfg = xagent_shared::GovernorConfig::default();
+    let brain_cfg = xagent_shared::BrainConfig::default();
+    let world_cfg_json = serde_json::to_string(&xagent_shared::WorldConfig::default()).unwrap();
+
+    // 2. Build a dummy GenerationRecording with 2 agents and 3 ticks.
+    let agent_count = 2;
+    let total_ticks = 3u64;
+    let agents: Vec<(u32, [f32; 3])> = (0..agent_count)
+        .map(|i| (i as u32, [1.0, 0.0, 0.0]))
+        .collect();
+    let mut recording = GenerationRecording::new(1, &agents, &[], total_ticks as usize, 8, 8);
+
+    for tick in 0..total_ticks {
+        let records: Vec<TickRecord> = (0..agent_count)
+            .map(|a| TickRecord {
+                position: [tick as f32, a as f32, 0.0],
+                yaw: 0.1 * tick as f32,
+                alive: true,
+                energy: 100.0 - tick as f32,
+                integrity: 1.0,
+                motor_forward: 0.5,
+                motor_turn: 0.0,
+                exploration_rate: 0.1,
+                prediction_error: 0.01,
+                gradient: 0.0,
+                raw_gradient: 0.0,
+                urgency: 0.0,
+                credit_magnitude: 0.0,
+                patterns_recalled: 0,
+                phase: 0,
+                mean_attenuation: 1.0,
+                curiosity_bonus: 0.0,
+                fatigue_factor: 1.0,
+                motor_variance: 0.0,
+                vision_color: None,
+            })
+            .collect();
+        recording.record_tick(tick, &records);
+    }
+
+    // Capture the node_id that Governor created for the root node.
+    let node_id;
+    {
+        let mut gov =
+            Governor::new(&db_path, gov_cfg, &brain_cfg, &world_cfg_json).expect("Governor::new");
+        node_id = gov.current_node_id.expect("no current_node_id");
+
+        // 3. Enqueue the recording for async persistence.
+        gov.store_recording(&recording);
+
+        // 4. Dropping gov joins the writer thread, flushing the pending write.
+    }
+
+    // 5. Reopen the DB via Governor::resume and verify round-trip.
+    let gov2 = Governor::resume(&db_path).expect("Governor::resume");
+    let (loaded_agents, loaded_ticks, floats) = gov2
+        .load_recording(node_id)
+        .expect("recording not found after async persistence");
+
+    assert_eq!(loaded_agents, agent_count);
+    assert_eq!(loaded_ticks, total_ticks);
+
+    // 14 f32 fields per agent per tick (the serialization stride).
+    let record_stride = 14;
+    assert_eq!(
+        floats.len(),
+        agent_count * total_ticks as usize * record_stride
+    );
+
+    // Spot-check: position[0] of agent 0 at each tick should equal the tick index.
+    for tick in 0..total_ticks as usize {
+        let base = tick * agent_count * record_stride;
+        assert!(
+            (floats[base] - tick as f32).abs() < f32::EPSILON,
+            "position.x mismatch at tick {tick}"
+        );
+    }
+
+    // Clean up the temp DB files.
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path}-shm"));
+}

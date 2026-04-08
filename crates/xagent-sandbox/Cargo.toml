@@ -31,3 +31,6 @@ egui-winit = "0.31"
 egui_dock = "0.16"
 rusqlite = { version = "0.34", features = ["bundled"] }
 rayon = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

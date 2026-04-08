@@ -307,6 +307,7 @@ struct App {
     // Throttle timers — limit expensive rebuilds to ~10 Hz
     last_mesh_rebuild: Instant,
     last_snapshot_rebuild: Instant,
+    snap_dirty: bool,
     cached_agent_snaps: Vec<AgentSnapshot>,
 
     // Selection marker above focused agent
@@ -452,6 +453,7 @@ impl App {
             trail_gpu: None,
             last_mesh_rebuild: Instant::now(),
             last_snapshot_rebuild: Instant::now(),
+            snap_dirty: true,
             cached_agent_snaps: Vec::new(),
             marker_gpu: None,
             egui: None,
@@ -648,6 +650,7 @@ impl App {
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
+                self.snap_dirty = true;
                 if let Some(start) = self.evo_wall_segment_start.take() {
                     self.evo_wall_accumulated += start.elapsed().as_secs_f64();
                 }
@@ -1419,6 +1422,7 @@ impl ApplicationHandler for App {
                                 self.tick += ticks_to_run as u64;
                                 self.tps_tick_count += ticks_to_run as u64;
                                 self.sim_accumulator -= SIM_DT * ticks_to_run as f32;
+                                self.snap_dirty = true;
 
                                 if let Some(gov) = &mut self.governor {
                                     for _ in 0..ticks_to_run {
@@ -1897,8 +1901,10 @@ impl ApplicationHandler for App {
                                 let selected_idx = self.selected_agent_idx;
 
                                 // Snapshot agent data for the UI closure (throttled to ~10 Hz)
-                                let snap_rebuild_due = self.paused
-                                    || self.last_snapshot_rebuild.elapsed() >= REBUILD_THROTTLE;
+                                let snap_rebuild_due = self.snap_dirty
+                                    && (self.paused
+                                        || self.last_snapshot_rebuild.elapsed()
+                                            >= REBUILD_THROTTLE);
                                 if snap_rebuild_due {
                                     let snap_window = self.chart_window * 2;
                                     self.cached_agent_snaps = self
@@ -1957,6 +1963,7 @@ impl ApplicationHandler for App {
                                             }
                                         })
                                         .collect();
+                                    self.snap_dirty = false;
                                     if !self.paused {
                                         self.last_snapshot_rebuild = Instant::now();
                                     }

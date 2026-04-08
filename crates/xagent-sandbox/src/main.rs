@@ -808,7 +808,7 @@ impl App {
         // Evaluate fitness and decide whether evolution continues.
         // Only kick off the async brain-state readback when the result is
         // Continue — when Finished, no readback is needed.
-        let result = {
+        let (result, readback_requested) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -822,21 +822,32 @@ impl App {
 
             // Only read back the best agent's brain state when evolution
             // continues — Finished needs no inherited state.
+            let mut readback_requested = false;
             if matches!(result, AdvanceResult::Continue { .. }) {
                 let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
                 if let Some(a) = self.agents.get(best_idx) {
                     if let Some(mk) = self.gpu_kernel.as_mut() {
                         mk.request_agent_state(a.brain_idx);
+                        readback_requested = true;
                     }
                 }
             }
 
-            result
+            (result, readback_requested)
         };
 
         match result {
-            AdvanceResult::Continue { .. } => {
+            AdvanceResult::Continue { .. } if readback_requested => {
                 self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+            }
+            AdvanceResult::Continue { .. } => {
+                // No readback was issued (no best agent or no GPU kernel) —
+                // skip directly to reset to avoid deadlocking in AwaitingReadback.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
             }
             AdvanceResult::Finished { .. } => {
                 // Skip readback phase entirely — go straight to finish.

@@ -814,7 +814,7 @@ impl App {
     /// via `poll_gen_transition`.
     fn advance_generation(&mut self) {
         // Persist the recording to SQLite before moving to the next generation
-        if let (Some(ref recording), Some(ref gov)) = (&self.recording, &self.governor) {
+        if let (Some(ref recording), Some(ref mut gov)) = (&self.recording, &mut self.governor) {
             gov.store_recording(recording);
         }
         self.last_recording = self.recording.take();

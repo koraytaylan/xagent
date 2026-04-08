@@ -5,12 +5,23 @@
 //! All state is persisted in a SQLite database (`xagent.db`), enabling resume
 //! and post-hoc analysis of the evolution tree.
 
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::JoinHandle;
+
 use rand::Rng;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
 use crate::momentum::MutationMomentum;
+
+/// Payload sent to the background recording-writer thread.
+struct RecordingPayload {
+    node_id: i64,
+    agent_count: i64,
+    tick_count: i64,
+    data: Vec<u8>,
+}
 
 use crate::agent::{crossover_config, mutate_config_with_strength, Agent, HEATMAP_RES};
 
@@ -87,6 +98,82 @@ pub struct Governor {
     cached_fitness_history: Option<std::collections::HashMap<i64, Vec<(u32, f32, f32)>>>,
     /// Per-island mutation momentum vectors.
     pub momentums: Vec<MutationMomentum>,
+    /// Channel sender for offloading recording writes to a background thread.
+    recording_sender: Option<SyncSender<RecordingPayload>>,
+    /// Handle to the background writer thread (joined on drop).
+    writer_thread: Option<JoinHandle<()>>,
+}
+
+/// Spawn a background thread that owns a dedicated SQLite connection and
+/// drains `RecordingPayload` messages from a bounded channel, writing each
+/// one to the `generation_recording` table.
+///
+/// Returns `None` if the thread cannot be spawned, allowing the caller to
+/// continue without recording support.
+fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>, JoinHandle<()>)> {
+    let (tx, rx) = mpsc::sync_channel::<RecordingPayload>(4);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
+    let path = db_path.to_owned();
+    let handle = std::thread::Builder::new()
+        .name("recording-writer".into())
+        .spawn(move || {
+            let db = match Connection::open(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("[recording-writer] failed to open DB: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            ) {
+                log::error!("[recording-writer] PRAGMA configuration failed: {e}");
+                return;
+            }
+            // Signal that DB setup succeeded before entering the receive loop.
+            let _ = ready_tx.send(());
+            for payload in rx {
+                if let Err(e) = db.execute(
+                    "INSERT OR REPLACE INTO generation_recording \
+                     (node_id, agent_count, tick_count, data) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        payload.node_id,
+                        payload.agent_count,
+                        payload.tick_count,
+                        payload.data
+                    ],
+                ) {
+                    log::error!("[recording-writer] DB write failed: {e}");
+                }
+            }
+        });
+    match handle {
+        Ok(h) => {
+            // Wait for the writer thread to confirm successful DB setup.
+            // If it exits early (DB open/config failure), the ready_tx is
+            // dropped and recv returns Err — disable recording in that case.
+            match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(()) => Some((tx, h)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    log::warn!(
+                        "[recording-writer] writer thread did not signal ready within 5 s — recording disabled"
+                    );
+                    None
+                }
+                Err(_) => {
+                    log::warn!(
+                        "[recording-writer] writer thread failed DB setup — recording disabled"
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("[recording-writer] failed to spawn thread: {e} — recording disabled");
+            None
+        }
+    }
 }
 
 impl Governor {
@@ -158,7 +245,9 @@ impl Governor {
         world_config_json: &str,
     ) -> SqlResult<Self> {
         let db = Connection::open(db_path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
         init_schema(&db)?;
 
         let governor_json = serde_json::to_string(&config).unwrap_or_default();
@@ -197,6 +286,17 @@ impl Governor {
             .map(|_| MutationMomentum::new(config.momentum_decay))
             .collect();
 
+        // Skip background writer for in-memory DBs — each Connection::open(":memory:")
+        // creates an independent database, so the writer thread would not see the schema.
+        let (recording_sender, writer_thread) = if db_path == ":memory:" {
+            (None, None)
+        } else {
+            match spawn_recording_writer(db_path) {
+                Some((tx, h)) => (Some(tx), Some(h)),
+                None => (None, None),
+            }
+        };
+
         Ok(Self {
             db,
             config,
@@ -210,6 +310,8 @@ impl Governor {
             cached_tree_nodes: None,
             cached_fitness_history: None,
             momentums,
+            recording_sender,
+            writer_thread,
         })
     }
 
@@ -217,7 +319,9 @@ impl Governor {
     /// for the most recent run.
     pub fn resume(db_path: &str) -> SqlResult<Self> {
         let db = Connection::open(db_path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
 
         // Run migrations for any new columns (idempotent — silently ignores duplicates)
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
@@ -274,6 +378,16 @@ impl Governor {
         }
         momentums.truncate(num_islands);
 
+        // Skip background writer for in-memory DBs (see Governor::new for rationale).
+        let (recording_sender, writer_thread) = if db_path == ":memory:" {
+            (None, None)
+        } else {
+            match spawn_recording_writer(db_path) {
+                Some((tx, h)) => (Some(tx), Some(h)),
+                None => (None, None),
+            }
+        };
+
         let mut gov = Self {
             db,
             config,
@@ -287,6 +401,8 @@ impl Governor {
             cached_tree_nodes: None,
             cached_fitness_history: None,
             momentums,
+            recording_sender,
+            writer_thread,
         };
         gov.refresh_best_score();
         Ok(gov)
@@ -923,9 +1039,15 @@ impl Governor {
         );
     }
 
-    /// Store a generation's recording as a little-endian f32 BLOB in the
-    /// database.  `recording` is the `GenerationRecording` to persist.
-    pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
+    /// Serialize a generation's recording (synchronous) and send the
+    /// resulting blob to the background writer thread for asynchronous
+    /// SQLite persistence.  The channel send is non-blocking — if the
+    /// channel is full a warning is logged and the recording is dropped.
+    pub fn store_recording(&mut self, recording: &crate::replay::GenerationRecording) {
+        let sender = match self.recording_sender.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
         let node_id = match self.current_node_id {
             Some(id) => id,
             None => return,
@@ -992,12 +1114,25 @@ impl Governor {
             return;
         }
 
-        let _ = self.db.execute(
-            "INSERT OR REPLACE INTO generation_recording \
-             (node_id, agent_count, tick_count, data)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![node_id, agent_count, tick_count, bytes],
-        );
+        let payload = RecordingPayload {
+            node_id,
+            agent_count,
+            tick_count,
+            data: bytes,
+        };
+
+        match sender.try_send(payload) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!(
+                    "[governor] recording channel full — dropping recording for node {node_id}"
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                log::warn!("[governor] recording writer thread died — disabling recording");
+                self.recording_sender = None;
+            }
+        }
     }
 
     /// Load a generation's recording from the database.
@@ -1161,6 +1296,26 @@ impl Governor {
             }
         }
         map
+    }
+}
+
+impl Drop for Governor {
+    fn drop(&mut self) {
+        // Drop the sender first so the writer thread's recv loop exits.
+        drop(self.recording_sender.take());
+        if let Some(handle) = self.writer_thread.take() {
+            match handle.join() {
+                Ok(()) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("(non-string panic)");
+                    log::error!("[recording-writer] thread panicked: {msg}");
+                }
+            }
+        }
     }
 }
 

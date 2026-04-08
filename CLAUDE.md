@@ -36,7 +36,7 @@
 - Per-tick simulation logic belongs in WGSL shaders, never in Rust
 - The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking)
 - Recording/telemetry/history functions run once per frame, sampling the latest state
-- No CPU-side work should scale with `ticks_to_run` — the GPU kernel processes up to 64,000 ticks per dispatch
+- No CPU-side work should scale with `ticks_to_run` — up to 64,000 ticks may be scheduled per frame/batch call, with GPU work dispatched in chunks
 
 ## Code Style
 - Specs: `docs/superpowers/specs/`, Plans: `docs/superpowers/plans/`

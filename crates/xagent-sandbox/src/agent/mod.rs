@@ -348,7 +348,7 @@ pub fn mutate_config_with_strength(
             .clamp(2.0, 10.0),
         fatigue_floor: momentum
             .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
-            .clamp(0.05, 0.15),
+            .clamp(0.05, 0.4),
         vision_w: parent.vision_w,
         vision_h: parent.vision_h,
         brain_tick_stride: parent.brain_tick_stride,
@@ -652,8 +652,8 @@ mod tests {
                 child.fatigue_recovery_sensitivity,
             );
             assert!(
-                child.fatigue_floor <= 0.15,
-                "fatigue_floor must be ≤ 0.15, got {}",
+                child.fatigue_floor <= 0.4,
+                "fatigue_floor must be ≤ 0.4, got {}",
                 child.fatigue_floor,
             );
             assert!(

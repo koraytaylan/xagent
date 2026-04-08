@@ -505,7 +505,18 @@ Minimal assumptions. A reward function encodes the designer's notion of what's "
 
 ---
 
-## 11. Testing
+## 11. Performance Invariants
+
+The simulation's throughput depends on keeping per-tick work on the GPU. These rules are non-negotiable:
+
+- **Per-tick simulation logic belongs in WGSL shaders, never in Rust.** Physics, brain passes, food detection, death/respawn -- all of it runs in compute shaders. Adding per-tick logic on the CPU side defeats the fused-kernel architecture.
+- **The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking).** The Rust side orchestrates dispatches, maps readback buffers, and feeds the UI. It never steps the simulation itself.
+- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** CSV logging, replay recording, and UI snapshot updates happen at frame cadence, not tick cadence.
+- **No CPU-side work should scale with `ticks_to_run`.** The GPU kernel processes up to 64,000 ticks per dispatch. If a proposed change adds a Rust loop that iterates `ticks_to_run` times, it violates this invariant.
+
+---
+
+## 12. Testing
 
 ```bash
 # Run all tests across the workspace
@@ -533,7 +544,7 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ---
 
-## 12. Future Directions
+## 13. Future Directions
 
 - **Multi-agent communication** — Agents could emit and perceive signals (sound, visual markers), enabling emergent social behaviors, cooperation, or competition.
 - **Dynamic memory growth** — Allow memory capacity to expand based on environmental complexity, simulating neuroplasticity.

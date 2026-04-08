@@ -110,6 +110,7 @@ pub struct Governor {
 /// continue without recording support.
 fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::sync_channel::<RecordingPayload>(4);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
     let path = db_path.to_owned();
     let handle = std::thread::Builder::new()
         .name("recording-writer".into())
@@ -127,6 +128,8 @@ fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>
                 log::error!("[recording-writer] PRAGMA configuration failed: {e}");
                 return;
             }
+            // Signal that DB setup succeeded before entering the receive loop.
+            let _ = ready_tx.send(());
             for payload in rx {
                 if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO generation_recording \
@@ -144,7 +147,20 @@ fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>
             }
         });
     match handle {
-        Ok(h) => Some((tx, h)),
+        Ok(h) => {
+            // Wait for the writer thread to confirm successful DB setup.
+            // If it exits early (DB open/config failure), the ready_tx is
+            // dropped and recv returns Err — disable recording in that case.
+            match ready_rx.recv() {
+                Ok(()) => Some((tx, h)),
+                Err(_) => {
+                    log::warn!(
+                        "[recording-writer] writer thread failed DB setup — recording disabled"
+                    );
+                    None
+                }
+            }
+        }
         Err(e) => {
             log::warn!("[recording-writer] failed to spawn thread: {e} — recording disabled");
             None
@@ -1015,7 +1031,7 @@ impl Governor {
     /// resulting blob to the background writer thread for asynchronous
     /// SQLite persistence.  The channel send is non-blocking — if the
     /// channel is full a warning is logged and the recording is dropped.
-    pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
+    pub fn store_recording(&mut self, recording: &crate::replay::GenerationRecording) {
         let sender = match self.recording_sender.as_ref() {
             Some(s) => s,
             None => return,
@@ -1093,10 +1109,18 @@ impl Governor {
             data: bytes,
         };
 
-        if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(payload) {
-            log::warn!("[governor] recording channel full — dropping recording for node {node_id}");
+        match sender.try_send(payload) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!(
+                    "[governor] recording channel full — dropping recording for node {node_id}"
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                log::warn!("[governor] recording writer thread died — disabling recording");
+                self.recording_sender = None;
+            }
         }
-        // TrySendError::Disconnected is silently ignored (writer thread died).
     }
 
     /// Load a generation's recording from the database.

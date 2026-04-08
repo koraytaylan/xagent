@@ -1564,6 +1564,11 @@ impl ApplicationHandler for App {
                     self.camera.update(dt);
                 }
 
+                // Ensure background kernel creation is started if needed and
+                // collected when ready, even while the tick gate below
+                // suppresses accumulation.
+                self.ensure_gpu_kernel();
+
                 // ── simulation ticks (fixed timestep, adaptive budget) ──
                 // Skip ticks while a generation transition is in flight to
                 // avoid GPU contention with the async readback/reset.
@@ -1578,8 +1583,6 @@ impl ApplicationHandler for App {
                         ((self.sim_accumulator / SIM_DT) as u32).min(self.gpu_tick_budget);
 
                     if ticks_to_run > 0 {
-                        self.ensure_gpu_kernel();
-
                         if let Some(ref mut mk) = self.gpu_kernel {
                             let state_updated = mk.try_collect_state();
                             let t0 = Instant::now();

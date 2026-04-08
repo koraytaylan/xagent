@@ -105,7 +105,10 @@ pub struct Governor {
 /// Spawn a background thread that owns a dedicated SQLite connection and
 /// drains `RecordingPayload` messages from a bounded channel, writing each
 /// one to the `generation_recording` table.
-fn spawn_recording_writer(db_path: &str) -> (SyncSender<RecordingPayload>, JoinHandle<()>) {
+///
+/// Returns `None` if the thread cannot be spawned, allowing the caller to
+/// continue without recording support.
+fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::sync_channel::<RecordingPayload>(4);
     let path = db_path.to_owned();
     let handle = std::thread::Builder::new()
@@ -114,11 +117,13 @@ fn spawn_recording_writer(db_path: &str) -> (SyncSender<RecordingPayload>, JoinH
             let db = match Connection::open(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[recording-writer] failed to open DB: {e}");
+                    log::error!("[recording-writer] failed to open DB: {e}");
                     return;
                 }
             };
-            let _ = db.execute_batch("PRAGMA journal_mode=WAL;");
+            let _ = db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            );
             for payload in rx {
                 if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO generation_recording \
@@ -131,12 +136,17 @@ fn spawn_recording_writer(db_path: &str) -> (SyncSender<RecordingPayload>, JoinH
                         payload.data
                     ],
                 ) {
-                    eprintln!("[recording-writer] DB write failed: {e}");
+                    log::error!("[recording-writer] DB write failed: {e}");
                 }
             }
-        })
-        .expect("failed to spawn recording-writer thread");
-    (tx, handle)
+        });
+    match handle {
+        Ok(h) => Some((tx, h)),
+        Err(e) => {
+            log::warn!("[recording-writer] failed to spawn thread: {e} — recording disabled");
+            None
+        }
+    }
 }
 
 impl Governor {
@@ -247,7 +257,10 @@ impl Governor {
             .map(|_| MutationMomentum::new(config.momentum_decay))
             .collect();
 
-        let (tx, handle) = spawn_recording_writer(db_path);
+        let (recording_sender, writer_thread) = match spawn_recording_writer(db_path) {
+            Some((tx, h)) => (Some(tx), Some(h)),
+            None => (None, None),
+        };
 
         Ok(Self {
             db,
@@ -261,8 +274,8 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             momentums,
-            recording_sender: Some(tx),
-            writer_thread: Some(handle),
+            recording_sender,
+            writer_thread,
         })
     }
 
@@ -327,7 +340,10 @@ impl Governor {
         }
         momentums.truncate(num_islands);
 
-        let (tx, handle) = spawn_recording_writer(db_path);
+        let (recording_sender, writer_thread) = match spawn_recording_writer(db_path) {
+            Some((tx, h)) => (Some(tx), Some(h)),
+            None => (None, None),
+        };
 
         let mut gov = Self {
             db,
@@ -341,8 +357,8 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             momentums,
-            recording_sender: Some(tx),
-            writer_thread: Some(handle),
+            recording_sender,
+            writer_thread,
         };
         gov.refresh_best_score();
         Ok(gov)
@@ -977,10 +993,10 @@ impl Governor {
         );
     }
 
-    /// Serialize a generation's recording and send it to the background
-    /// writer thread for asynchronous SQLite persistence.  Never blocks
-    /// the caller — if the channel is full a warning is logged and the
-    /// recording is dropped.
+    /// Serialize a generation's recording (synchronous) and send the
+    /// resulting blob to the background writer thread for asynchronous
+    /// SQLite persistence.  The channel send is non-blocking — if the
+    /// channel is full a warning is logged and the recording is dropped.
     pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
         let sender = match self.recording_sender.as_ref() {
             Some(s) => s,
@@ -1060,7 +1076,7 @@ impl Governor {
         };
 
         if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(payload) {
-            eprintln!("[governor] recording channel full — dropping recording for node {node_id}");
+            log::warn!("[governor] recording channel full — dropping recording for node {node_id}");
         }
         // TrySendError::Disconnected is silently ignored (writer thread died).
     }

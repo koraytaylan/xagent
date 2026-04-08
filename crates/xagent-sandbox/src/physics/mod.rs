@@ -32,10 +32,9 @@ pub fn metabolic_drain_per_tick(memory_capacity: usize, processing_slots: usize)
         + processing_slots as f32 * METABOLIC_PROCESSING_COST
 }
 
-/// Maximum distance (in world units) at which an agent can consume a food item.
-/// Slightly larger than the agent's body (2-unit cube) to provide a forgiving
-/// interaction radius without requiring pixel-perfect alignment.
-const FOOD_CONSUME_RADIUS: f32 = 2.5;
+/// Maximum squared 2D (XZ) distance at which an agent can consume a food item.
+/// Equal to (agent collision radius (1.0) + food visual radius (1.0))^2 = 4.0.
+const FOOD_CONSUME_RADIUS_SQ: f32 = 4.0;
 
 /// Sanitize motor commands: replace NaN/Infinity with 0.0 and clamp to [-1, 1].
 fn sanitize_motor(motor: &MotorCommand) -> MotorCommand {
@@ -300,10 +299,12 @@ fn try_detect_food(agent: &AgentBody, world: &WorldState) -> Option<usize> {
         if food.consumed {
             continue;
         }
-        let d = (food.position - pos).length();
-        if d < FOOD_CONSUME_RADIUS {
-            if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((idx, d));
+        let dx = food.position.x - pos.x;
+        let dz = food.position.z - pos.z;
+        let dist_sq = dx * dx + dz * dz;
+        if dist_sq < FOOD_CONSUME_RADIUS_SQ {
+            if best.map_or(true, |(_, bd)| dist_sq < bd) {
+                best = Some((idx, dist_sq));
             }
         }
     }
@@ -311,7 +312,7 @@ fn try_detect_food(agent: &AgentBody, world: &WorldState) -> Option<usize> {
     best.map(|(idx, _)| idx)
 }
 
-/// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS.
+/// Attempt to consume the nearest food item within FOOD_CONSUME_RADIUS_SQ.
 /// Uses the spatial grid for O(1) lookup instead of scanning all food items.
 /// Awards food_energy_value to the agent and marks the food as consumed
 /// with a 10-second respawn timer. Returns `Some(food_index)` if food was consumed.
@@ -324,10 +325,12 @@ fn try_consume(agent: &mut AgentBody, world: &mut WorldState) -> Option<usize> {
         if food.consumed {
             continue;
         }
-        let d = (food.position - pos).length();
-        if d < FOOD_CONSUME_RADIUS {
-            if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((idx, d));
+        let dx = food.position.x - pos.x;
+        let dz = food.position.z - pos.z;
+        let dist_sq = dx * dx + dz * dz;
+        if dist_sq < FOOD_CONSUME_RADIUS_SQ {
+            if best.map_or(true, |(_, bd)| dist_sq < bd) {
+                best = Some((idx, dist_sq));
             }
         }
     }

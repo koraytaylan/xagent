@@ -152,20 +152,19 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         agent_phys[b + P_POS_Z]);
     let food_count = wc_u32(WC_FOOD_COUNT);
     let eat_radius = wc_f32(WC_FOOD_RADIUS);
+    let eat_radius_sq = eat_radius * eat_radius;
 
     // Each thread scans a slice of food_state
     var local_best_idx = 0xFFFFFFFFu;
-    var local_best_dist = 1e12;
+    var local_best_dist_sq = 1e12;
     for (var f = tid; f < food_count; f += 256u) {
         if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
         let fbase = f * FOOD_STATE_STRIDE;
-        let fp = vec3f(
-            food_state[fbase + F_POS_X],
-            food_state[fbase + F_POS_Y],
-            food_state[fbase + F_POS_Z]);
-        let d = distance(pos, fp);
-        if (d < eat_radius && d < local_best_dist) {
-            local_best_dist = d;
+        let dx = pos.x - food_state[fbase + F_POS_X];
+        let dz = pos.z - food_state[fbase + F_POS_Z];
+        let d_sq = dx * dx + dz * dz;
+        if (d_sq < eat_radius_sq && d_sq < local_best_dist_sq) {
+            local_best_dist_sq = d_sq;
             local_best_idx = f;
         }
     }
@@ -173,7 +172,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     // Two-phase shared-memory reduction (s_similarities/s_sort_idx are 128 elements)
     // Phase 1: first 128 threads write directly
     if (tid < 128u) {
-        s_similarities[tid] = local_best_dist;
+        s_similarities[tid] = local_best_dist_sq;
         s_sort_idx[tid] = local_best_idx;
     }
     workgroupBarrier();
@@ -181,8 +180,8 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     // Phase 2: second 128 threads merge into first 128 slots
     if (tid >= 128u) {
         let slot = tid - 128u;
-        if (local_best_dist < s_similarities[slot]) {
-            s_similarities[slot] = local_best_dist;
+        if (local_best_dist_sq < s_similarities[slot]) {
+            s_similarities[slot] = local_best_dist_sq;
             s_sort_idx[slot] = local_best_idx;
         }
     }
@@ -190,10 +189,10 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
 
     if (tid == 0u) {
         var best_idx = 0xFFFFFFFFu;
-        var best_dist = 1e12;
+        var best_dist_sq = 1e12;
         for (var i = 0u; i < 128u; i++) {
-            if (s_similarities[i] < best_dist) {
-                best_dist = s_similarities[i];
+            if (s_similarities[i] < best_dist_sq) {
+                best_dist_sq = s_similarities[i];
                 best_idx = s_sort_idx[i];
             }
         }

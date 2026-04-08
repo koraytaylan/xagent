@@ -38,7 +38,7 @@ pub struct BrainConfig {
     #[serde(default = "default_fatigue_recovery_sensitivity")]
     pub fatigue_recovery_sensitivity: f32,
     /// Minimum motor output under fatigue. Lower = harsher dampening.
-    /// Heritable: mutated during breeding, clamped to [0.05, 0.15]. Default 0.1.
+    /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
     /// Visual field width in pixels. Default 8.

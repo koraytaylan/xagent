@@ -595,7 +595,7 @@ pub fn build_world_config(
     wc[WC_HAZARD_DAMAGE] = config.hazard_damage_rate;
     wc[WC_INTEGRITY_REGEN] = config.integrity_regen_rate;
     wc[WC_FOOD_ENERGY] = config.food_energy_value;
-    wc[WC_FOOD_RADIUS] = 2.5;
+    wc[WC_FOOD_RADIUS] = 2.0;
     wc[WC_TERRAIN_VPS] = 129.0;
     wc[WC_TERRAIN_INV_STEP] = 1.0 / terrain_step;
     wc[WC_TERRAIN_HALF] = config.world_size / 2.0;

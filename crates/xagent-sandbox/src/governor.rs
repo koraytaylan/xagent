@@ -151,8 +151,14 @@ fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>
             // Wait for the writer thread to confirm successful DB setup.
             // If it exits early (DB open/config failure), the ready_tx is
             // dropped and recv returns Err — disable recording in that case.
-            match ready_rx.recv() {
+            match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(()) => Some((tx, h)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    log::warn!(
+                        "[recording-writer] writer thread did not signal ready within 5 s — recording disabled"
+                    );
+                    None
+                }
                 Err(_) => {
                     log::warn!(
                         "[recording-writer] writer thread failed DB setup — recording disabled"
@@ -1283,7 +1289,17 @@ impl Drop for Governor {
         // Drop the sender first so the writer thread's recv loop exits.
         drop(self.recording_sender.take());
         if let Some(handle) = self.writer_thread.take() {
-            let _ = handle.join();
+            match handle.join() {
+                Ok(()) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("(non-string panic)");
+                    log::error!("[recording-writer] thread panicked: {msg}");
+                }
+            }
         }
     }
 }

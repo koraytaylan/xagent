@@ -375,6 +375,7 @@ pub fn wgsl_constants() -> String {
         "// Auto-generated constants — do not edit manually
 const DIM: u32 = {DIM}u;
 const FEATURE_COUNT: u32 = {FEATURE_COUNT}u;
+const VISION_COLOR_COUNT: u32 = {VISION_COLOR_COUNT}u;
 const VISION_DEPTH_COUNT: u32 = {VISION_DEPTH_COUNT}u;
 const MEMORY_CAP: u32 = {MEMORY_CAP}u;
 const RECALL_K: u32 = {RECALL_K}u;

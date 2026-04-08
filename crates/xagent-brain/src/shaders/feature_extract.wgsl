@@ -13,20 +13,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var fi: u32 = 0u;
 
-    // Vision color: 192 RGBA values (direct copy)
-    for (var i: u32 = 0u; i < 192u; i = i + 1u) {
+    // Vision color: RGBA values (direct copy)
+    for (var i: u32 = 0u; i < VISION_COLOR_COUNT; i = i + 1u) {
         features[f_base + fi] = sensory[s_base + i];
         fi = fi + 1u;
     }
 
-    // Vision depth: 48 values (direct copy)
+    // Vision depth (direct copy)
     for (var i: u32 = 0u; i < VISION_DEPTH_COUNT; i = i + 1u) {
-        features[f_base + fi] = sensory[s_base + 192u + i];
+        features[f_base + fi] = sensory[s_base + VISION_COLOR_COUNT + i];
         fi = fi + 1u;
     }
 
     // Proprioception: velocity magnitude (1)
-    let vel_offset = 192u + 48u; // after vision_color + vision_depth
+    let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
     let vx = sensory[s_base + vel_offset];
     let vy = sensory[s_base + vel_offset + 1u];
     let vz = sensory[s_base + vel_offset + 2u];

@@ -976,6 +976,11 @@ impl App {
                     self.pending_kernel = None;
                     self.pending_upload = None;
                     self.ensure_gpu_kernel();
+                    // Kernel is being recreated in the background —
+                    // keep the transition active until it's ready.
+                    if self.gpu_kernel.is_none() {
+                        return (false, spawned);
+                    }
                 }
 
                 // Inherit learned weights: champions get exact brain state,
@@ -1531,7 +1536,9 @@ impl ApplicationHandler for App {
                 // ── simulation ticks (fixed timestep, adaptive budget) ──
                 // Skip ticks while a generation transition is in flight to
                 // avoid GPU contention with the async readback/reset.
-                if !self.paused && self.gen_transition.is_none() {
+                // Also skip accumulation when the kernel is being recreated
+                // in the background to prevent catch-up hitch when it lands.
+                if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     // Cap accumulator to 2× budget so debt stays bounded.
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;

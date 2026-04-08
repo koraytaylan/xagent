@@ -1464,22 +1464,28 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Telemetry readback for the selected agent (vision, motor, brain stats)
+                            // Async telemetry readback for the selected agent
                             if self.selected_agent_idx < self.agents.len() {
                                 let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
-                                let tel = mk.read_agent_telemetry(brain_idx);
-                                let a = &mut self.agents[self.selected_agent_idx];
-                                a.cached_motor.forward = tel.motor_fwd;
-                                a.cached_motor.turn = tel.motor_turn;
-                                a.cached_frame.vision.color = tel.vision_color;
-                                a.cached_urgency = tel.urgency;
-                                a.cached_gradient = tel.gradient;
-                                a.cached_mean_attenuation = tel.mean_attenuation;
-                                a.cached_curiosity_bonus = tel.curiosity_bonus;
-                                a.cached_fatigue_factor = tel.fatigue_factor;
-                                a.cached_motor_variance = tel.motor_variance;
-                                a.cached_prediction_error = tel.prediction_error;
-                                a.cached_exploration_rate = tel.exploration_rate;
+
+                                // Kick off a new readback request each frame
+                                mk.request_agent_telemetry(brain_idx);
+
+                                // Collect any completed readback (non-blocking)
+                                if let Some(tel) = mk.try_collect_telemetry() {
+                                    let a = &mut self.agents[self.selected_agent_idx];
+                                    a.cached_motor.forward = tel.motor_fwd;
+                                    a.cached_motor.turn = tel.motor_turn;
+                                    a.cached_frame.vision.color = tel.vision_color;
+                                    a.cached_urgency = tel.urgency;
+                                    a.cached_gradient = tel.gradient;
+                                    a.cached_mean_attenuation = tel.mean_attenuation;
+                                    a.cached_curiosity_bonus = tel.curiosity_bonus;
+                                    a.cached_fatigue_factor = tel.fatigue_factor;
+                                    a.cached_motor_variance = tel.motor_variance;
+                                    a.cached_prediction_error = tel.prediction_error;
+                                    a.cached_exploration_rate = tel.exploration_rate;
+                                }
                             }
 
                             self.food_dirty = true;

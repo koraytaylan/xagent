@@ -19,7 +19,7 @@ const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
 const DIM: u32 = 32u;
-const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + 25u;
+const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
 const ACTION_HISTORY_LEN: u32 = 64u;
@@ -250,6 +250,7 @@ const PAIN_AMP: f32 = 3.0;
 const DEADZONE: f32 = 0.01;
 const MAX_WEIGHT_NORM: f32 = 2.0;
 const ANTICIPATION_WEIGHT: f32 = 0.5;
+const TONIC_CREDIT_SCALE: f32 = 0.1;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Buffer bindings — 15 storage + 2 uniform, single bind group

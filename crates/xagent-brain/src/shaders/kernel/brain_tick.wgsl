@@ -21,25 +21,27 @@ fn rand_f32_brain(seed: u32) -> f32 {
     return hash_to_float(pcg_hash(seed));
 }
 
-// Cosine similarity using shared habituated state
+// Cosine similarity using shared encoded state (pre-habituation)
+// for memory operations — avoids attenuation silencing recall.
 fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
     let p_base = agent_id * PATTERN_STRIDE;
     var dot_val: f32 = 0.0;
-    var h_norm_sq: f32 = 0.0;
+    var e_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-        let h = s_habituated[d];
+        let e = s_encoded[d];
         let p = pattern_buf[p_base + d * MEMORY_CAP + idx];
-        dot_val += h * p;
-        h_norm_sq += h * h;
+        dot_val += e * p;
+        e_norm_sq += e * e;
     }
-    let h_norm = sqrt(h_norm_sq);
+    let e_norm = sqrt(e_norm_sq);
     let p_norm = pattern_buf[p_base + O_PAT_NORMS + idx];
-    if (h_norm < 1e-8 || p_norm < 1e-8) { return 0.0; }
-    return clamp(dot_val / (h_norm * p_norm), -1.0, 1.0);
+    if (e_norm < 1e-8 || p_norm < 1e-8) { return 0.0; }
+    return clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 1: Feature extract (thread 0 — 217 reads, not a bottleneck)
+// Pass 1: Feature extract (thread 0 — reads scale with
+// VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25, not a bottleneck)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_feature_extract(agent_id: u32, tid: u32) {
@@ -48,6 +50,10 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         var fi: u32 = 0u;
         for (var i: u32 = 0u; i < VISION_COLOR_COUNT; i = i + 1u) {
             s_features[fi] = sensory_buf[s_base + i];
+            fi = fi + 1u;
+        }
+        for (var i: u32 = 0u; i < VISION_DEPTH_COUNT; i = i + 1u) {
+            s_features[fi] = sensory_buf[s_base + VISION_COLOR_COUNT + i];
             fi = fi + 1u;
         }
         let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
@@ -77,7 +83,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 2: Encode (threads 0..31 — 217 MADs each, coalesced access)
+// Pass 2: Encode (threads 0..31 — FEATURE_COUNT MADs each, coalesced access)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_encode(agent_id: u32, tid: u32) {
@@ -158,9 +164,10 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         let p_base = agent_id * PATTERN_STRIDE;
 
         // Each thread computes query norm independently (32 shared reads — fast)
+        // Uses encoded (pre-habituation) state for memory queries.
         var q_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            let v = s_habituated[d];
+            let v = s_encoded[d];
             q_norm_sq += v * v;
         }
         let q_norm = sqrt(q_norm_sq);
@@ -171,7 +178,7 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         } else {
             var dot: f32 = 0.0;
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                dot += s_habituated[d] * pattern_buf[p_base + d * MEMORY_CAP + tid];
+                dot += s_encoded[d] * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
             if (q_norm < 1e-8 || p_norm < 1e-8) {
@@ -272,6 +279,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     // ── Thread 0: rest of predict + act ────────────────────────────────
     if (tid == 0u) {
         let gradient = s_homeo[0u];
+        let urgency = s_homeo[2u];
 
         // Prediction error
         var err_sum: f32 = 0.0;
@@ -330,10 +338,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             let temporal = exp(-age * CREDIT_DECAY);
             if (temporal < 0.01) { continue; }
             let improvement = gradient - rec_grad;
-            if (abs(improvement) < DEADZONE) { continue; }
+            var credit_input = improvement;
+            if (abs(improvement) < DEADZONE) {
+                credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+            }
+            if (abs(credit_input) < DEADZONE) { continue; }
             var effective: f32;
-            if (improvement < 0.0) { effective = improvement * PAIN_AMP; }
-            else { effective = improvement; }
+            if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
+            else { effective = credit_input; }
             let credit = effective * temporal;
             credit_mag += abs(credit);
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
@@ -419,7 +431,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
 
         // Exploration
-        let urgency = s_homeo[2u];
         let max_curiosity = brain_state[b + O_HAB_MAX_CURIOSITY];
         var atten_sum: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
@@ -610,19 +621,20 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     }
 
     // ── 7c. Memory reinforcement: threads 0..127 ──────────────────────
+    // Uses encoded (pre-habituation) state for memory similarity.
     if (tid < MEMORY_CAP) {
         if (pattern_buf[p_base + O_PAT_ACTIVE + tid] >= 0.5) {
-            var h_norm_sq: f32 = 0.0;
+            var e_norm_sq: f32 = 0.0;
             var dot_val: f32 = 0.0;
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                let h = s_habituated[d];
-                h_norm_sq += h * h;
-                dot_val += h * pattern_buf[p_base + d * MEMORY_CAP + tid];
+                let e = s_encoded[d];
+                e_norm_sq += e * e;
+                dot_val += e * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
-            let h_norm = sqrt(h_norm_sq);
+            let e_norm = sqrt(e_norm_sq);
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
-            if (h_norm >= 1e-8 && p_norm >= 1e-8) {
-                let sim = clamp(dot_val / (h_norm * p_norm), -1.0, 1.0);
+            if (e_norm >= 1e-8 && p_norm >= 1e-8) {
+                let sim = clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
                 if (sim > 0.3) {
                     pattern_buf[p_base + O_PAT_REINF + tid] += sim * learning_rate * (1.0 - s_pred_error);
                     pattern_buf[p_base + O_PAT_REINF + tid] = clamp(
@@ -638,17 +650,46 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     storageBarrier(); workgroupBarrier();
 
     // ── 7d. Memory store: thread 0 ─────────────────────────────────────
+    // Stores encoded (pre-habituation) state for consistent memory keys.
     if (tid == 0u) {
         let min_idx = u32(pattern_buf[p_base + O_MIN_REINF_IDX]);
-        let motor_fwd = decision_buf[d_base + DIM + DIM];
-        let motor_trn = decision_buf[d_base + DIM + DIM + 1u];
-        var h_norm_sq: f32 = 0.0;
-        for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            let h = s_habituated[d];
-            h_norm_sq += h * h;
-            pattern_buf[p_base + d * MEMORY_CAP + min_idx] = h;
+
+        // Store the *approach action* (motor from ~2 ticks ago) instead of the
+        // current motor.  Negative-valence recall then negates the approach
+        // action → directed escape, not freeze.  (Fatigue ring was updated
+        // earlier in this kernel, same cursor state as standalone pass.)
+        let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
+        let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
+        var motor_fwd: f32;
+        var motor_trn: f32;
+        if (fatigue_len_u >= 3u) {
+            // cursor already advanced past current tick's write, so:
+            //   cursor-1 = this tick, cursor-2 = 1 ago, cursor-3 = 2 ago.
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else if (fatigue_len_u == 2u) {
+            // Use oldest available pre-noise command (1 tick ago).
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 2u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else if (fatigue_len_u == 1u) {
+            // Only current tick in ring; still pre-noise so prefer over decision.
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 1u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else {
+            // Ring truly empty; fall back to decision buffer.
+            motor_fwd = decision_buf[d_base + DIM + DIM];
+            motor_trn = decision_buf[d_base + DIM + DIM + 1u];
         }
-        pattern_buf[p_base + O_PAT_NORMS + min_idx] = sqrt(h_norm_sq);
+        var e_norm_sq: f32 = 0.0;
+        for (var d: u32 = 0u; d < DIM; d = d + 1u) {
+            let e = s_encoded[d];
+            e_norm_sq += e * e;
+            pattern_buf[p_base + d * MEMORY_CAP + min_idx] = e;
+        }
+        pattern_buf[p_base + O_PAT_NORMS + min_idx] = sqrt(e_norm_sq);
         pattern_buf[p_base + O_PAT_REINF + min_idx] = 1.0;
         pattern_buf[p_base + O_PAT_MOTOR + min_idx * 3u] = motor_fwd;
         pattern_buf[p_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_trn;

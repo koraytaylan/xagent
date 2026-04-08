@@ -391,7 +391,7 @@ impl App {
                 if let Ok(mut gov) = Governor::resume(db_path) {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
                     evo_snapshot.current_node_id = gov.current_node_id;
-                    evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                    evo_snapshot.fitness_history = gov.fitness_history_by_island().clone();
                     evo_snapshot.best_fitness = gov.best_score();
                 }
                 println!(
@@ -1934,7 +1934,7 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
                                     self.evo_snapshot.fitness_history =
-                                        gov.fitness_history_by_island();
+                                        gov.fitness_history_by_island().clone();
                                     self.evo_snapshot.best_fitness = gov.best_score();
                                 }
                                 let wall = self.evo_wall_accumulated

@@ -1660,22 +1660,29 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Telemetry readback for the selected agent (vision, motor, brain stats)
+                            // Async telemetry readback for the selected agent.
+                            // `request_agent_telemetry` is gated internally: it no-ops
+                            // if a readback for the same agent is already pending, and
+                            // clears the old pending if the agent changed.
                             if self.selected_agent_idx < self.agents.len() {
                                 let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
-                                let tel = mk.read_agent_telemetry(brain_idx);
-                                let a = &mut self.agents[self.selected_agent_idx];
-                                a.cached_motor.forward = tel.motor_fwd;
-                                a.cached_motor.turn = tel.motor_turn;
-                                a.cached_frame.vision.color = tel.vision_color;
-                                a.cached_urgency = tel.urgency;
-                                a.cached_gradient = tel.gradient;
-                                a.cached_mean_attenuation = tel.mean_attenuation;
-                                a.cached_curiosity_bonus = tel.curiosity_bonus;
-                                a.cached_fatigue_factor = tel.fatigue_factor;
-                                a.cached_motor_variance = tel.motor_variance;
-                                a.cached_prediction_error = tel.prediction_error;
-                                a.cached_exploration_rate = tel.exploration_rate;
+
+                                mk.request_agent_telemetry(brain_idx);
+
+                                // Collect any completed readback (non-blocking)
+                                if let Some(tel) = mk.try_collect_telemetry() {
+                                    let a = &mut self.agents[self.selected_agent_idx];
+                                    // Only update fields NOT already populated by
+                                    // the fresher async physics readback above.
+                                    // Phys readback already sets: cached_motor,
+                                    // cached_gradient, cached_urgency,
+                                    // cached_fatigue_factor, cached_prediction_error,
+                                    // cached_exploration_rate.
+                                    a.cached_frame.vision.color = tel.vision_color;
+                                    a.cached_mean_attenuation = tel.mean_attenuation;
+                                    a.cached_curiosity_bonus = tel.curiosity_bonus;
+                                    a.cached_motor_variance = tel.motor_variance;
+                                }
                             }
 
                             self.food_dirty = true;

@@ -1401,7 +1401,7 @@ impl GpuKernel {
 
     /// Blocking readback of sensory, decision, and key brain-state data for one agent.
     /// Returns (vision_rgba, motor_fwd, motor_turn, habituation_mean, curiosity, fatigue, motor_variance, urgency, gradient).
-    pub fn read_agent_telemetry(&self, index: u32) -> AgentTelemetry {
+    pub fn read_agent_telemetry_blocking(&self, index: u32) -> AgentTelemetry {
         let i = index as usize;
         let ss = self.layout.sensory_stride;
         let fc = self.layout.feature_count;

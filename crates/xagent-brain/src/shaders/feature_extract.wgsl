@@ -76,5 +76,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         features[f_base + fi] = sensory[s_base + to + 3u];  // surface_tag/4
         fi = fi + 1u;
     }
-    // fi should now be 192 + 48 + 1 + 3 + 1 + 1 + 1 + 1 + 1 + 16 = 265 = FEATURE_COUNT
+    // fi should now be VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 1 + 3 + 1 + 1 + 1 + 1 + 1 + 16 = FEATURE_COUNT
 }

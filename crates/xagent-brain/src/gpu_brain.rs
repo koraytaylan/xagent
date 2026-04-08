@@ -1180,11 +1180,13 @@ mod tests {
         assert!((features[0] - 0.5).abs() < 0.001, "pixel R");
         assert!((features[1] - 0.3).abs() < 0.001, "pixel G");
 
-        // Velocity magnitude at index 240 (192 color + 48 depth)
-        assert!((features[240] - 5.0).abs() < 0.01, "vel magnitude");
+        // Velocity magnitude after vision color + depth
+        let vel_idx = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
+        assert!((features[vel_idx] - 5.0).abs() < 0.01, "vel magnitude");
 
-        // Energy at index 245 (240 + vel_mag(1) + facing(3) + ang_vel(1) = 245)
-        assert!((features[245] - 0.8).abs() < 0.001, "energy");
+        // Energy: vel_mag(1) + facing(3) + ang_vel(1) past vel_idx
+        let energy_idx = vel_idx + 1 + 3 + 1;
+        assert!((features[energy_idx] - 0.8).abs() < 0.001, "energy");
     }
 
     #[test]

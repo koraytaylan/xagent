@@ -27,8 +27,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let center_cx = cell_coord(ax) + GRID_OFFSET;
     let center_cz = cell_coord(az) + GRID_OFFSET;
 
+    let food_radius = wc(7u); // WC_FOOD_RADIUS
+    let food_radius_sq = food_radius * food_radius;
+
     var best_idx: u32 = 0xFFFFFFFFu;
-    var best_dist_sq: f32 = FOOD_CONSUME_RADIUS_SQ;
+    var best_dist_sq: f32 = food_radius_sq;
 
     for (var di: i32 = -1; di <= 1; di++) {
         for (var dj: i32 = -1; dj <= 1; dj++) {

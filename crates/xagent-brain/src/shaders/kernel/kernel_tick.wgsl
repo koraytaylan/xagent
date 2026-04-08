@@ -3,8 +3,7 @@
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 
-// ── Eat radius constant (sqrt of FOOD_CONSUME_RADIUS_SQ) ─────────────────
-const EAT_RADIUS: f32 = 2.5;  // sqrt(6.25)
+// EAT_RADIUS removed — read from wconfig via wc_f32(WC_FOOD_RADIUS)
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
@@ -152,6 +151,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         agent_phys[b + P_POS_Y],
         agent_phys[b + P_POS_Z]);
     let food_count = wc_u32(WC_FOOD_COUNT);
+    let eat_radius = wc_f32(WC_FOOD_RADIUS);
 
     // Each thread scans a slice of food_state
     var local_best_idx = 0xFFFFFFFFu;
@@ -164,7 +164,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             food_state[fbase + F_POS_Y],
             food_state[fbase + F_POS_Z]);
         let d = distance(pos, fp);
-        if (d < EAT_RADIUS && d < local_best_dist) {
+        if (d < eat_radius && d < local_best_dist) {
             local_best_dist = d;
             local_best_idx = f;
         }

@@ -1464,11 +1464,13 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Async telemetry readback for the selected agent
+                            // Async telemetry readback for the selected agent.
+                            // `request_agent_telemetry` is gated internally: it no-ops
+                            // if a readback for the same agent is already pending, and
+                            // clears the old pending if the agent changed.
                             if self.selected_agent_idx < self.agents.len() {
                                 let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
 
-                                // Kick off a new readback request each frame
                                 mk.request_agent_telemetry(brain_idx);
 
                                 // Collect any completed readback (non-blocking)

@@ -3,7 +3,7 @@
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use wgpu;
@@ -13,14 +13,19 @@ use crate::buffers::*;
 
 /// Pending async readback of 4 staging buffers for telemetry.
 struct TelemetryReadback {
-    sensory_staging: wgpu::Buffer,
-    decision_staging: wgpu::Buffer,
-    brain_staging: wgpu::Buffer,
-    phys_staging: wgpu::Buffer,
-    ready: Arc<AtomicBool>,
-    #[allow(dead_code)] // retained for diagnostics
+    /// Number of map_async callbacks that have fired (need all 4).
+    completed: Arc<AtomicU32>,
+    /// Set if any map_async callback returned an error.
+    had_error: Arc<AtomicBool>,
     agent_index: u32,
-    brain_stride: usize,
+}
+
+/// Pre-allocated staging buffers reused across telemetry readback requests.
+struct TelemetryStagingBuffers {
+    sensory: wgpu::Buffer,
+    decision: wgpu::Buffer,
+    brain: wgpu::Buffer,
+    phys: wgpu::Buffer,
 }
 
 /// Lightweight telemetry for one agent's vision, motor, and brain-state readback.
@@ -90,6 +95,7 @@ pub struct GpuKernel {
     state_cache: Vec<f32>,
 
     // ── Async telemetry readback ──
+    telemetry_staging: TelemetryStagingBuffers,
     pending_telemetry: Option<TelemetryReadback>,
     cached_telemetry: Option<AgentTelemetry>,
 
@@ -366,6 +372,26 @@ impl GpuKernel {
                 mapped_at_creation: false,
             }),
         ];
+
+        // ── Pre-allocated telemetry staging buffers ──
+        let tel_sensory_size = (SENSORY_STRIDE * 4) as u64;
+        let tel_decision_size = (DECISION_STRIDE * 4) as u64;
+        let tel_brain_size = (layout.brain_stride * 4) as u64;
+        let tel_phys_size = (PHYS_STRIDE * 4) as u64;
+        let make_tel_staging = |label, size| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let telemetry_staging = TelemetryStagingBuffers {
+            sensory: make_tel_staging("telemetry_sensory", tel_sensory_size),
+            decision: make_tel_staging("telemetry_decision", tel_decision_size),
+            brain: make_tel_staging("telemetry_brain", tel_brain_size),
+            phys: make_tel_staging("telemetry_phys", tel_phys_size),
+        };
 
         // ── Initialize persistent brain state ──
         let mut rng = rand::rng();
@@ -881,6 +907,7 @@ impl GpuKernel {
                 Arc::new(AtomicBool::new(false)),
             ],
             state_cache: vec![0.0; n * PHYS_STRIDE],
+            telemetry_staging,
             pending_telemetry: None,
             cached_telemetry: None,
             world_config: world_config.clone(),
@@ -1458,9 +1485,20 @@ impl GpuKernel {
     }
 
     /// Kick off non-blocking telemetry readback for one agent.
-    /// Creates 4 staging buffers, submits copy commands, and starts map_async.
-    /// If a previous readback is still pending it is dropped (superseded).
+    ///
+    /// Reuses pre-allocated staging buffers. If a readback for the same agent
+    /// is already pending, this is a no-op. If a different agent is requested,
+    /// the old pending readback is cleared first.
     pub fn request_agent_telemetry(&mut self, index: u32) {
+        // Gate: skip if a readback for the same agent is already in flight.
+        if let Some(pending) = &self.pending_telemetry {
+            if pending.agent_index == index {
+                return; // same agent already pending — wait for it
+            }
+            // Different agent — clear old pending so we can reuse staging buffers.
+            self.pending_telemetry = None;
+        }
+
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
@@ -1468,20 +1506,6 @@ impl GpuKernel {
         let decision_size = (DECISION_STRIDE * 4) as u64;
         let brain_size = (bs * 4) as u64;
         let phys_size = (PHYS_STRIDE * 4) as u64;
-
-        let make_staging = |label, size| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-
-        let sensory_staging = make_staging("telemetry_sensory", sensory_size);
-        let decision_staging = make_staging("telemetry_decision", decision_size);
-        let brain_staging = make_staging("telemetry_brain", brain_size);
-        let phys_staging = make_staging("telemetry_phys", phys_size);
 
         let mut encoder = self
             .device
@@ -1493,7 +1517,7 @@ impl GpuKernel {
         encoder.copy_buffer_to_buffer(
             &self.sensory_buf,
             sensory_offset,
-            &sensory_staging,
+            &self.telemetry_staging.sensory,
             0,
             sensory_size,
         );
@@ -1502,7 +1526,7 @@ impl GpuKernel {
         encoder.copy_buffer_to_buffer(
             &self.decision_buf,
             dec_offset,
-            &decision_staging,
+            &self.telemetry_staging.decision,
             0,
             decision_size,
         );
@@ -1511,7 +1535,7 @@ impl GpuKernel {
         encoder.copy_buffer_to_buffer(
             &self.brain_state_buf,
             brain_offset,
-            &brain_staging,
+            &self.telemetry_staging.brain,
             0,
             brain_size,
         );
@@ -1520,77 +1544,85 @@ impl GpuKernel {
         encoder.copy_buffer_to_buffer(
             &self.agent_phys_buf,
             phys_offset,
-            &phys_staging,
+            &self.telemetry_staging.phys,
             0,
             phys_size,
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Track how many map_async callbacks have fired (need all 4).
-        let ready = Arc::new(AtomicBool::new(false));
-        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // Completion counter increments unconditionally (Ok or Err);
+        // error flag records whether any mapping failed.
+        let completed = Arc::new(AtomicU32::new(0));
+        let had_error = Arc::new(AtomicBool::new(false));
 
         for staging in [
-            &sensory_staging,
-            &decision_staging,
-            &brain_staging,
-            &phys_staging,
+            &self.telemetry_staging.sensory,
+            &self.telemetry_staging.decision,
+            &self.telemetry_staging.brain,
+            &self.telemetry_staging.phys,
         ] {
-            let cnt = counter.clone();
-            let flag = ready.clone();
+            let cnt = completed.clone();
+            let err = had_error.clone();
             staging
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, move |result| {
-                    if result.is_ok() && cnt.fetch_add(1, Ordering::AcqRel) == 3 {
-                        flag.store(true, Ordering::Release);
+                    if result.is_err() {
+                        err.store(true, Ordering::Release);
                     }
+                    cnt.fetch_add(1, Ordering::AcqRel);
                 });
         }
 
         self.pending_telemetry = Some(TelemetryReadback {
-            sensory_staging,
-            decision_staging,
-            brain_staging,
-            phys_staging,
-            ready,
+            completed,
+            had_error,
             agent_index: index,
-            brain_stride: bs,
         });
     }
 
     /// Non-blocking poll: if telemetry readback is complete, parse the results
     /// into `AgentTelemetry`, cache it, and return `Some`. Otherwise `None`.
+    ///
+    /// If any map_async callback reported an error, clears the pending state
+    /// so the next frame can retry.
     pub fn try_collect_telemetry(&mut self) -> Option<AgentTelemetry> {
         self.device.poll(wgpu::Maintain::Poll);
 
         let pending = self.pending_telemetry.as_ref()?;
-        if !pending.ready.load(Ordering::Acquire) {
+        let completed = pending.completed.load(Ordering::Acquire);
+        if completed < 4 {
             return None;
         }
 
-        // All 4 mappings complete — read data
-        let pending = self.pending_telemetry.take().unwrap();
-        let _bs = pending.brain_stride;
+        // All 4 callbacks fired. Check for errors.
+        if pending.had_error.load(Ordering::Acquire) {
+            // At least one mapping failed — discard and allow retry next frame.
+            self.pending_telemetry = None;
+            return None;
+        }
+
+        // All 4 mappings succeeded — consume pending state and read data.
+        let _pending = self.pending_telemetry.take().unwrap();
 
         // Sensory
-        let sensory_data = pending.sensory_staging.slice(..).get_mapped_range();
+        let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
         let vision_color: Vec<f32> = sensory[..VISION_COLOR_COUNT].to_vec();
         drop(sensory_data);
-        pending.sensory_staging.unmap();
+        self.telemetry_staging.sensory.unmap();
 
         // Decision
-        let decision_data = pending.decision_staging.slice(..).get_mapped_range();
+        let decision_data = self.telemetry_staging.decision.slice(..).get_mapped_range();
         let decision: &[f32] = bytemuck::cast_slice(&decision_data);
         let motor_base = DIM + DIM;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
         drop(decision_data);
-        pending.decision_staging.unmap();
+        self.telemetry_staging.decision.unmap();
 
         // Brain state
-        let brain_data = pending.brain_staging.slice(..).get_mapped_range();
+        let brain_data = self.telemetry_staging.brain.slice(..).get_mapped_range();
         let brain: &[f32] = bytemuck::cast_slice(&brain_data);
 
         let atten_sum: f32 = brain[O_HAB_ATTEN..O_HAB_ATTEN + DIM].iter().sum();
@@ -1615,15 +1647,15 @@ impl GpuKernel {
         let gradient = homeo[0];
         let urgency = homeo[2];
         drop(brain_data);
-        pending.brain_staging.unmap();
+        self.telemetry_staging.brain.unmap();
 
         // Physics
-        let phys_data = pending.phys_staging.slice(..).get_mapped_range();
+        let phys_data = self.telemetry_staging.phys.slice(..).get_mapped_range();
         let phys: &[f32] = bytemuck::cast_slice(&phys_data);
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
         drop(phys_data);
-        pending.phys_staging.unmap();
+        self.telemetry_staging.phys.unmap();
 
         let tel = AgentTelemetry {
             vision_color,

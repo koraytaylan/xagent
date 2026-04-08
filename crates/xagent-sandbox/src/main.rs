@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use egui_wgpu;
@@ -21,7 +21,7 @@ use xagent_brain::buffers::{
     P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
     P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
-use xagent_brain::GpuKernel;
+use xagent_brain::{AgentBrainState, GpuKernel};
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
@@ -207,6 +207,10 @@ struct PendingUpload {
 const SIM_RATE: f32 = 60.0;
 const SIM_DT: f32 = 1.0 / SIM_RATE;
 
+/// Minimum interval between expensive mesh rebuilds and snapshot copies.
+/// At 100 ms (10 Hz) the visual difference is indistinguishable from per-frame.
+const REBUILD_THROTTLE: Duration = Duration::from_millis(100);
+
 /// Record per-tick telemetry into agent sparkline histories.
 fn record_agent_histories(agent: &mut Agent) {
     let cap = 10_000;
@@ -232,6 +236,20 @@ fn record_agent_histories(agent: &mut Agent) {
         agent.body.body.internal.integrity / agent.body.body.internal.max_integrity.max(0.001);
     push_hist!(agent.integrity_history, inf.clamp(0.0, 1.0));
     push_hist!(agent.fatigue_history, agent.cached_fatigue_factor);
+}
+
+/// State machine for non-blocking generation transitions.
+/// Each variant represents one phase of the multi-frame handoff.
+enum GenTransition {
+    /// Waiting for async readback of the best agent's brain state.
+    AwaitingReadback { result: AdvanceResult },
+    /// Readback collected; waiting for staging buffers to drain before reset.
+    AwaitingReset {
+        result: AdvanceResult,
+        inherited_state: Option<AgentBrainState>,
+        /// Whether population has already been spawned (prevents re-spawn on retry).
+        spawned: bool,
+    },
 }
 
 struct App {
@@ -300,6 +318,13 @@ struct App {
     // Trail overlay for selected agent
     trail_gpu: Option<GpuMesh>,
 
+    // Throttle timers — limit expensive rebuilds to ~10 Hz
+    last_mesh_rebuild: Instant,
+    last_snapshot_rebuild: Instant,
+    snap_dirty: bool,
+    cached_agent_snaps: Vec<AgentSnapshot>,
+    last_snap_chart_window: usize,
+
     // Selection marker above focused agent
     marker_gpu: Option<GpuMesh>,
 
@@ -320,11 +345,18 @@ struct App {
     db_path: String,
     governor_config: GovernorConfig,
 
+    // Non-blocking generation transition state machine
+    gen_transition: Option<GenTransition>,
+
     // GPU fused kernel (all simulation computation in single dispatch)
     gpu_kernel: Option<GpuKernel>,
     pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
     /// Data collected for upload once the background kernel is ready.
     pending_upload: Option<PendingUpload>,
+    /// Inherited brain state + mutation strength deferred until a background
+    /// kernel finishes creation (when population size changes at generation
+    /// boundary and `can_reuse` is false).
+    deferred_inherited: Option<(AgentBrainState, f32)>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
@@ -391,7 +423,9 @@ impl App {
                 if let Ok(mut gov) = Governor::resume(db_path) {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
                     evo_snapshot.current_node_id = gov.current_node_id;
-                    evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                    evo_snapshot
+                        .fitness_history
+                        .clone_from(gov.fitness_history_by_island());
                     evo_snapshot.best_fitness = gov.best_score();
                 }
                 println!(
@@ -441,6 +475,11 @@ impl App {
             heatmap_gpu: None,
             heatmap_dirty: false,
             trail_gpu: None,
+            last_mesh_rebuild: Instant::now(),
+            last_snapshot_rebuild: Instant::now(),
+            snap_dirty: true,
+            cached_agent_snaps: Vec::new(),
+            last_snap_chart_window: 120,
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
@@ -453,9 +492,11 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
+            gen_transition: None,
             gpu_kernel: None,
             pending_kernel: None,
             pending_upload: None,
+            deferred_inherited: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
@@ -518,6 +559,22 @@ impl App {
                     mk.upload_agents(&upload.agent_data);
                 }
                 let ac = mk.agent_count();
+
+                // Apply deferred inherited state from a generation transition
+                // that occurred while the kernel was being recreated.
+                if let Some((ref state, mutation_strength)) = self.deferred_inherited.take() {
+                    let repeats = self.governor_config.eval_repeats.max(1);
+                    let n = self.agents.len();
+                    let champion = state.clone();
+                    mk.batch_write_agent_states(n, |i| {
+                        if i < repeats {
+                            champion.clone()
+                        } else {
+                            mutate_brain_state(state, mutation_strength)
+                        }
+                    });
+                }
+
                 self.gpu_kernel = Some(mk);
                 self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
             }
@@ -636,6 +693,7 @@ impl App {
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
+                self.snap_dirty = true;
                 if let Some(start) = self.evo_wall_segment_start.take() {
                     self.evo_wall_accumulated += start.elapsed().as_secs_f64();
                 }
@@ -751,7 +809,9 @@ impl App {
         }
     }
 
-    /// Evaluate the current generation, advance to the next (or finish).
+    /// Evaluate the current generation and begin the async transition.
+    /// The actual GPU work (readback, reset, upload) spans multiple frames
+    /// via `poll_gen_transition`.
     fn advance_generation(&mut self) {
         // Persist the recording to SQLite before moving to the next generation
         if let (Some(ref recording), Some(ref gov)) = (&self.recording, &self.governor) {
@@ -764,9 +824,10 @@ impl App {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
-        // Evaluate fitness, then capture best agent's brain state using the
-        // actual composite fitness ranking (not the brain's internal metrics).
-        let (result, inherited_state) = {
+        // Evaluate fitness and decide whether evolution continues.
+        // Only kick off the async brain-state readback when the result is
+        // Continue — when Finished, no readback is needed.
+        let (result, readback_requested) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -776,29 +837,142 @@ impl App {
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
 
-            // fitness is sorted by descending composite_fitness — first entry is best
-            let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-            let state = self.agents.get(best_idx).and_then(|a| {
-                self.gpu_kernel
-                    .as_ref()
-                    .map(|mk| mk.read_agent_state(a.brain_idx))
-            });
+            let result = gov.advance(&fitness);
 
-            (gov.advance(&fitness), state)
+            // Only read back the best agent's brain state when evolution
+            // continues — Finished needs no inherited state.
+            let mut readback_requested = false;
+            if matches!(result, AdvanceResult::Continue { .. }) {
+                let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+                if let Some(a) = self.agents.get(best_idx) {
+                    if let Some(mk) = self.gpu_kernel.as_mut() {
+                        if mk.request_agent_state(a.brain_idx) {
+                            readback_requested = true;
+                        }
+                    }
+                }
+            }
+
+            (result, readback_requested)
         };
 
-        // Governor borrow released — safe to call self methods
+        match result {
+            AdvanceResult::Continue { .. } if readback_requested => {
+                self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+            }
+            AdvanceResult::Continue { .. } => {
+                // No readback was issued (no best agent or no GPU kernel) —
+                // skip directly to reset to avoid deadlocking in AwaitingReadback.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+            AdvanceResult::Finished { .. } => {
+                // Skip readback phase entirely — go straight to finish.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+        }
+    }
+
+    /// Drive the multi-frame generation transition state machine.
+    /// Called every frame; returns true while a transition is still in progress.
+    fn poll_gen_transition(&mut self) -> bool {
+        let transition = match self.gen_transition.take() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        match transition {
+            GenTransition::AwaitingReadback { result } => {
+                if self.gpu_kernel.is_none() {
+                    // No kernel — proceed without inherited state.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state: None,
+                        spawned: false,
+                    });
+                    return true;
+                }
+
+                // Poll for the async agent state readback.
+                let collected = self.gpu_kernel.as_mut().unwrap().try_collect_agent_state();
+
+                match collected {
+                    Some(Some(state)) => {
+                        // Readback complete — move to reset phase.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: Some(state),
+                            spawned: false,
+                        });
+                    }
+                    Some(None) => {
+                        // map_async error — proceed without inherited state
+                        // rather than hanging in AwaitingReadback forever.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: None,
+                            spawned: false,
+                        });
+                    }
+                    None => {
+                        // Still waiting — re-enqueue for next frame.
+                        self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+                    }
+                }
+                true
+            }
+            GenTransition::AwaitingReset {
+                result,
+                inherited_state,
+                spawned,
+            } => {
+                let (done, spawned) =
+                    self.try_finish_generation(&result, inherited_state.as_ref(), spawned);
+                if !done {
+                    // Reset not ready yet — re-enqueue for next frame.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state,
+                        spawned,
+                    });
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Try to complete a generation transition. Returns `(done, spawned)`
+    /// where `done` is false if the GPU staging buffers aren't ready yet
+    /// (caller should retry next frame), and `spawned` tracks whether
+    /// population has been spawned (to avoid re-spawning on retry).
+    fn try_finish_generation(
+        &mut self,
+        result: &AdvanceResult,
+        inherited_state: Option<&AgentBrainState>,
+        mut spawned: bool,
+    ) -> (bool, bool) {
         match result {
             AdvanceResult::Continue {
                 configs,
                 messages,
                 mutation_strength,
             } => {
-                for msg in messages {
-                    self.log_msg(msg);
+                if !spawned {
+                    for msg in messages {
+                        self.log_msg(msg.clone());
+                    }
+                    self.spawn_population_from_configs(configs);
+                    spawned = true;
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
-                self.spawn_population_from_configs(&configs);
 
                 // Reuse existing kernel if population size matches,
                 // otherwise drop and recreate in background.
@@ -809,7 +983,11 @@ impl App {
 
                 if can_reuse {
                     let mk = self.gpu_kernel.as_mut().unwrap();
-                    mk.reset_agents(&self.brain_config);
+                    // Non-blocking reset — return false to retry next frame
+                    // instead of falling back to a blocking busy-wait.
+                    if !mk.try_reset_agents(&self.brain_config) {
+                        return (false, spawned);
+                    }
                     let agent_data: Vec<_> = self
                         .agents
                         .iter()
@@ -829,33 +1007,46 @@ impl App {
                     self.pending_kernel = None;
                     self.pending_upload = None;
                     self.ensure_gpu_kernel();
+                    // Kernel is being recreated in the background —
+                    // keep the transition active until it's ready.
+                    if self.gpu_kernel.is_none() {
+                        return (false, spawned);
+                    }
                 }
 
-                // Inherit learned weights: champions get exact weights,
+                // Inherit learned weights: champions get exact brain state,
                 // mutants get perturbed weights for neuroevolution.
-                if let Some(ref state) = inherited_state {
+                if let Some(state) = inherited_state {
                     if let Some(ref mk) = self.gpu_kernel {
-                        for (i, agent) in self.agents.iter().enumerate() {
+                        let ms = *mutation_strength;
+                        let n = self.agents.len();
+                        // Pre-clone once for all champion slots to avoid
+                        // cloning inside the hot closure on every call.
+                        let champion = state.clone();
+                        mk.batch_write_agent_states(n, |i| {
                             if i < repeats {
-                                // Champion: exact inherited weights
-                                mk.write_agent_state(agent.brain_idx, state);
+                                champion.clone()
                             } else {
-                                // Mutant: inherited weights + small perturbation
-                                let mutated = mutate_brain_state(state, mutation_strength);
-                                mk.write_agent_state(agent.brain_idx, &mutated);
+                                mutate_brain_state(state, ms)
                             }
-                        }
+                        });
+                    } else {
+                        // Kernel is being recreated in the background
+                        // (population size changed). Stash inherited state
+                        // so it can be applied once the kernel is ready.
+                        self.deferred_inherited = Some((state.clone(), *mutation_strength));
                     }
                 }
             }
             AdvanceResult::Finished { messages } => {
                 for msg in messages {
-                    self.log_msg(msg);
+                    self.log_msg(msg.clone());
                 }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
             }
         }
+        (true, spawned)
     }
 
     fn log_msg(&mut self, msg: String) {
@@ -1374,7 +1565,11 @@ impl ApplicationHandler for App {
                 }
 
                 // ── simulation ticks (fixed timestep, adaptive budget) ──
-                if !self.paused {
+                // Skip ticks while a generation transition is in flight to
+                // avoid GPU contention with the async readback/reset.
+                // Also skip accumulation when the kernel is being recreated
+                // in the background to prevent catch-up hitch when it lands.
+                if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     // Cap accumulator to 2× budget so debt stays bounded.
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
@@ -1407,6 +1602,7 @@ impl ApplicationHandler for App {
                                 self.tick += ticks_to_run as u64;
                                 self.tps_tick_count += ticks_to_run as u64;
                                 self.sim_accumulator -= SIM_DT * ticks_to_run as f32;
+                                self.snap_dirty = true;
 
                                 if let Some(gov) = &mut self.governor {
                                     for _ in 0..ticks_to_run {
@@ -1574,12 +1770,18 @@ impl ApplicationHandler for App {
                     }
 
                     // ── Generation completion check (after tick batch) ──
-                    if let Some(gov) = &self.governor {
-                        if gov.generation_complete() {
-                            self.advance_generation();
+                    if self.gen_transition.is_none() {
+                        if let Some(gov) = &self.governor {
+                            if gov.generation_complete() {
+                                self.advance_generation();
+                            }
                         }
                     }
                 }
+
+                // Drive the multi-frame generation transition state machine
+                // (runs even when sim ticks are paused/skipped due to transition).
+                self.poll_gen_transition();
 
                 // Advance replay playback
                 if self.replay_state.active && self.replay_state.playing {
@@ -1598,14 +1800,20 @@ impl ApplicationHandler for App {
                     self.selected_agent_idx = self.selected_agent_idx.min(self.agents.len() - 1);
                 }
 
-                // ── rebuild dynamic meshes ─────────────────────────
-                if self.food_dirty {
+                // ── rebuild dynamic meshes (throttled to ~10 Hz) ──────
+                let mesh_rebuild_due =
+                    self.paused || self.last_mesh_rebuild.elapsed() >= REBUILD_THROTTLE;
+
+                let mut did_rebuild = false;
+
+                if self.food_dirty && mesh_rebuild_due {
                     if let (Some(renderer), Some(world), Some(food_gpu)) =
                         (&self.renderer, &self.world, &mut self.food_gpu)
                     {
                         let fm = world.food_mesh();
                         food_gpu.update_from_mesh(&renderer.queue, &fm);
                         self.food_dirty = false;
+                        did_rebuild = true;
                     }
                 }
 
@@ -1630,25 +1838,35 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // ── rebuild trail overlay for ALL agents (when any trail changed) ──
-                if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu) {
-                    let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
-                    if any_dirty {
-                        let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
-                            .agents
-                            .iter()
-                            .map(|a| (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive))
-                            .collect();
-                        let mesh = overlay::build_all_trails_mesh(&agent_data);
-                        if mesh.indices.is_empty() {
-                            trail_gpu.num_indices = 0;
-                        } else {
-                            trail_gpu.update_from_mesh(&renderer.queue, &mesh);
-                        }
-                        for a in &mut self.agents {
-                            a.trail_dirty = false;
+                // ── rebuild trail overlay for ALL agents (throttled) ──
+                if mesh_rebuild_due {
+                    if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu)
+                    {
+                        let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
+                        if any_dirty {
+                            let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
+                                .agents
+                                .iter()
+                                .map(|a| {
+                                    (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive)
+                                })
+                                .collect();
+                            let mesh = overlay::build_all_trails_mesh(&agent_data);
+                            if mesh.indices.is_empty() {
+                                trail_gpu.num_indices = 0;
+                            } else {
+                                trail_gpu.update_from_mesh(&renderer.queue, &mesh);
+                            }
+                            for a in &mut self.agents {
+                                a.trail_dirty = false;
+                            }
+                            did_rebuild = true;
                         }
                     }
+                }
+
+                if did_rebuild && !self.paused {
+                    self.last_mesh_rebuild = Instant::now();
                 }
 
                 // ── rebuild selection marker above focused agent ──────
@@ -1875,64 +2093,82 @@ impl ApplicationHandler for App {
                                 let mut desired_vp = (0u32, 0u32);
                                 let selected_idx = self.selected_agent_idx;
 
-                                // Snapshot agent data for the UI closure
-                                let snap_window = self.chart_window * 2;
-                                let agent_snaps: Vec<AgentSnapshot> = self
-                                    .agents
-                                    .iter()
-                                    .map(|a| {
-                                        let tail =
-                                            |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
-                                                let skip = d.len().saturating_sub(snap_window);
-                                                d.iter().skip(skip).copied().collect()
-                                            };
-                                        AgentSnapshot {
-                                            id: a.id,
-                                            gen: a.generation,
-                                            energy: a.body.body.internal.energy,
-                                            max_energy: a.body.body.internal.max_energy,
-                                            integrity: a.body.body.internal.integrity,
-                                            max_integrity: a.body.body.internal.max_integrity,
-                                            alive: a.body.body.alive,
-                                            deaths: a.death_count,
-                                            color: a.color,
-                                            longest_life: a.longest_life,
-                                            exploration_rate: a.cached_exploration_rate,
-                                            prediction_error: a.cached_prediction_error,
-                                            forward_weight_norm: 0.0, // GPU telemetry TBD
-                                            turn_weight_norm: 0.0,    // GPU telemetry TBD
-                                            prediction_error_history: tail(
-                                                &a.prediction_error_history,
-                                            ),
-                                            exploration_rate_history: tail(
-                                                &a.exploration_rate_history,
-                                            ),
-                                            energy_history: tail(&a.energy_history),
-                                            integrity_history: tail(&a.integrity_history),
-                                            gradient: a.cached_gradient,
-                                            urgency: a.cached_urgency,
-                                            food_consumed: a.food_consumed,
-                                            total_ticks_alive: a.total_ticks_alive,
-                                            motor_forward: a.cached_motor.forward,
-                                            motor_turn: a.cached_motor.turn,
-                                            phase: "GPU", // GPU telemetry TBD
-                                            vision_color: a.cached_frame.vision.color.clone(),
-                                            vision_width: a.cached_frame.vision.width,
-                                            vision_height: a.cached_frame.vision.height,
-                                            position: [
-                                                a.body.body.position.x,
-                                                a.body.body.position.y,
-                                                a.body.body.position.z,
-                                            ],
-                                            yaw: a.body.yaw,
-                                            mean_attenuation: a.cached_mean_attenuation,
-                                            curiosity_bonus: a.cached_curiosity_bonus,
-                                            fatigue_factor: a.cached_fatigue_factor,
-                                            motor_variance: a.cached_motor_variance,
-                                            fatigue_history: tail(&a.fatigue_history),
-                                        }
-                                    })
-                                    .collect();
+                                // Snapshot agent data for the UI closure (throttled to ~10 Hz)
+                                // Force rebuild when agents changed size or chart window changed.
+                                if self.cached_agent_snaps.len() != self.agents.len()
+                                    || self.chart_window != self.last_snap_chart_window
+                                {
+                                    self.snap_dirty = true;
+                                }
+                                let snap_rebuild_due = self.snap_dirty
+                                    && (self.paused
+                                        || self.last_snapshot_rebuild.elapsed()
+                                            >= REBUILD_THROTTLE);
+                                if snap_rebuild_due {
+                                    let snap_window = self.chart_window * 2;
+                                    self.cached_agent_snaps = self
+                                        .agents
+                                        .iter()
+                                        .map(|a| {
+                                            let tail =
+                                                |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
+                                                    let skip = d.len().saturating_sub(snap_window);
+                                                    d.iter().skip(skip).copied().collect()
+                                                };
+                                            AgentSnapshot {
+                                                id: a.id,
+                                                gen: a.generation,
+                                                energy: a.body.body.internal.energy,
+                                                max_energy: a.body.body.internal.max_energy,
+                                                integrity: a.body.body.internal.integrity,
+                                                max_integrity: a.body.body.internal.max_integrity,
+                                                alive: a.body.body.alive,
+                                                deaths: a.death_count,
+                                                color: a.color,
+                                                longest_life: a.longest_life,
+                                                exploration_rate: a.cached_exploration_rate,
+                                                prediction_error: a.cached_prediction_error,
+                                                forward_weight_norm: 0.0, // GPU telemetry TBD
+                                                turn_weight_norm: 0.0,    // GPU telemetry TBD
+                                                prediction_error_history: tail(
+                                                    &a.prediction_error_history,
+                                                ),
+                                                exploration_rate_history: tail(
+                                                    &a.exploration_rate_history,
+                                                ),
+                                                energy_history: tail(&a.energy_history),
+                                                integrity_history: tail(&a.integrity_history),
+                                                gradient: a.cached_gradient,
+                                                urgency: a.cached_urgency,
+                                                food_consumed: a.food_consumed,
+                                                total_ticks_alive: a.total_ticks_alive,
+                                                motor_forward: a.cached_motor.forward,
+                                                motor_turn: a.cached_motor.turn,
+                                                phase: "GPU", // GPU telemetry TBD
+                                                vision_color: a.cached_frame.vision.color.clone(),
+                                                vision_width: a.cached_frame.vision.width,
+                                                vision_height: a.cached_frame.vision.height,
+                                                position: [
+                                                    a.body.body.position.x,
+                                                    a.body.body.position.y,
+                                                    a.body.body.position.z,
+                                                ],
+                                                yaw: a.body.yaw,
+                                                mean_attenuation: a.cached_mean_attenuation,
+                                                curiosity_bonus: a.cached_curiosity_bonus,
+                                                fatigue_factor: a.cached_fatigue_factor,
+                                                motor_variance: a.cached_motor_variance,
+                                                fatigue_history: tail(&a.fatigue_history),
+                                            }
+                                        })
+                                        .collect();
+                                    self.snap_dirty = false;
+                                    self.last_snap_chart_window = self.chart_window;
+                                    if !self.paused {
+                                        self.last_snapshot_rebuild = Instant::now();
+                                    }
+                                }
+                                let agent_snaps = self.cached_agent_snaps.as_slice();
 
                                 // Build evolution snapshot for the UI
                                 if let Some(gov) = &mut self.governor {
@@ -1940,8 +2176,9 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.generation = gov.generation;
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
-                                    self.evo_snapshot.fitness_history =
-                                        gov.fitness_history_by_island();
+                                    self.evo_snapshot
+                                        .fitness_history
+                                        .clone_from(gov.fitness_history_by_island());
                                     self.evo_snapshot.best_fitness = gov.best_score();
                                 }
                                 let wall = self.evo_wall_accumulated
@@ -2329,7 +2566,7 @@ impl ApplicationHandler for App {
                                                     desired_vp: &mut desired_vp,
                                                     viewport_hovered: &mut vp_hovered,
                                                     chart_window: &mut chart_win,
-                                                    agents: &agent_snaps,
+                                                    agents: agent_snaps,
                                                     evolution: &mut evo_snap,
                                                     evolution_action: &mut evo_action,
                                                     world: &world_snap,

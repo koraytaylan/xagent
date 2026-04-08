@@ -39,7 +39,8 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 1: Feature extract (thread 0 — 265 reads, not a bottleneck)
+// Pass 1: Feature extract (thread 0 — reads scale with
+// VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25, not a bottleneck)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_feature_extract(agent_id: u32, tid: u32) {
@@ -81,7 +82,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 2: Encode (threads 0..31 — 265 MADs each, coalesced access)
+// Pass 2: Encode (threads 0..31 — FEATURE_COUNT MADs each, coalesced access)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_encode(agent_id: u32, tid: u32) {

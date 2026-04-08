@@ -1180,11 +1180,11 @@ mod tests {
         assert!((features[0] - 0.5).abs() < 0.001, "pixel R");
         assert!((features[1] - 0.3).abs() < 0.001, "pixel G");
 
-        // Velocity magnitude at index 192
-        assert!((features[192] - 5.0).abs() < 0.01, "vel magnitude");
+        // Velocity magnitude at index 240 (192 color + 48 depth)
+        assert!((features[240] - 5.0).abs() < 0.01, "vel magnitude");
 
-        // Energy at index 197 (192 + vel_mag(1) + facing(3) + ang_vel(1) = 197)
-        assert!((features[197] - 0.8).abs() < 0.001, "energy");
+        // Energy at index 245 (240 + vel_mag(1) + facing(3) + ang_vel(1) = 245)
+        assert!((features[245] - 0.8).abs() < 0.001, "energy");
     }
 
     #[test]

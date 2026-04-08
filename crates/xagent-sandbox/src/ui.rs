@@ -52,6 +52,7 @@ impl SortMode {
 }
 
 /// Snapshot of a single agent's state, copied once per frame for the UI.
+#[derive(Clone)]
 pub struct AgentSnapshot {
     pub id: u32,
     pub gen: u32,

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use egui_wgpu;
@@ -207,6 +207,10 @@ struct PendingUpload {
 const SIM_RATE: f32 = 60.0;
 const SIM_DT: f32 = 1.0 / SIM_RATE;
 
+/// Minimum interval between expensive mesh rebuilds and snapshot copies.
+/// At 100 ms (10 Hz) the visual difference is indistinguishable from per-frame.
+const REBUILD_THROTTLE: Duration = Duration::from_millis(100);
+
 /// Record per-tick telemetry into agent sparkline histories.
 fn record_agent_histories(agent: &mut Agent) {
     let cap = 10_000;
@@ -299,6 +303,11 @@ struct App {
 
     // Trail overlay for selected agent
     trail_gpu: Option<GpuMesh>,
+
+    // Throttle timers — limit expensive rebuilds to ~10 Hz
+    last_mesh_rebuild: Instant,
+    last_snapshot_rebuild: Instant,
+    cached_agent_snaps: Vec<AgentSnapshot>,
 
     // Selection marker above focused agent
     marker_gpu: Option<GpuMesh>,
@@ -441,6 +450,9 @@ impl App {
             heatmap_gpu: None,
             heatmap_dirty: false,
             trail_gpu: None,
+            last_mesh_rebuild: Instant::now(),
+            last_snapshot_rebuild: Instant::now(),
+            cached_agent_snaps: Vec::new(),
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
@@ -1591,8 +1603,11 @@ impl ApplicationHandler for App {
                     self.selected_agent_idx = self.selected_agent_idx.min(self.agents.len() - 1);
                 }
 
-                // ── rebuild dynamic meshes ─────────────────────────
-                if self.food_dirty {
+                // ── rebuild dynamic meshes (throttled to ~10 Hz) ──────
+                let mesh_rebuild_due =
+                    self.paused || self.last_mesh_rebuild.elapsed() >= REBUILD_THROTTLE;
+
+                if self.food_dirty && mesh_rebuild_due {
                     if let (Some(renderer), Some(world), Some(food_gpu)) =
                         (&self.renderer, &self.world, &mut self.food_gpu)
                     {
@@ -1623,25 +1638,34 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // ── rebuild trail overlay for ALL agents (when any trail changed) ──
-                if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu) {
-                    let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
-                    if any_dirty {
-                        let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
-                            .agents
-                            .iter()
-                            .map(|a| (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive))
-                            .collect();
-                        let mesh = overlay::build_all_trails_mesh(&agent_data);
-                        if mesh.indices.is_empty() {
-                            trail_gpu.num_indices = 0;
-                        } else {
-                            trail_gpu.update_from_mesh(&renderer.queue, &mesh);
-                        }
-                        for a in &mut self.agents {
-                            a.trail_dirty = false;
+                // ── rebuild trail overlay for ALL agents (throttled) ──
+                if mesh_rebuild_due {
+                    if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu)
+                    {
+                        let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
+                        if any_dirty {
+                            let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
+                                .agents
+                                .iter()
+                                .map(|a| {
+                                    (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive)
+                                })
+                                .collect();
+                            let mesh = overlay::build_all_trails_mesh(&agent_data);
+                            if mesh.indices.is_empty() {
+                                trail_gpu.num_indices = 0;
+                            } else {
+                                trail_gpu.update_from_mesh(&renderer.queue, &mesh);
+                            }
+                            for a in &mut self.agents {
+                                a.trail_dirty = false;
+                            }
                         }
                     }
+                }
+
+                if mesh_rebuild_due && !self.paused {
+                    self.last_mesh_rebuild = Instant::now();
                 }
 
                 // ── rebuild selection marker above focused agent ──────
@@ -1868,64 +1892,72 @@ impl ApplicationHandler for App {
                                 let mut desired_vp = (0u32, 0u32);
                                 let selected_idx = self.selected_agent_idx;
 
-                                // Snapshot agent data for the UI closure
-                                let snap_window = self.chart_window * 2;
-                                let agent_snaps: Vec<AgentSnapshot> = self
-                                    .agents
-                                    .iter()
-                                    .map(|a| {
-                                        let tail =
-                                            |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
-                                                let skip = d.len().saturating_sub(snap_window);
-                                                d.iter().skip(skip).copied().collect()
-                                            };
-                                        AgentSnapshot {
-                                            id: a.id,
-                                            gen: a.generation,
-                                            energy: a.body.body.internal.energy,
-                                            max_energy: a.body.body.internal.max_energy,
-                                            integrity: a.body.body.internal.integrity,
-                                            max_integrity: a.body.body.internal.max_integrity,
-                                            alive: a.body.body.alive,
-                                            deaths: a.death_count,
-                                            color: a.color,
-                                            longest_life: a.longest_life,
-                                            exploration_rate: a.cached_exploration_rate,
-                                            prediction_error: a.cached_prediction_error,
-                                            forward_weight_norm: 0.0, // GPU telemetry TBD
-                                            turn_weight_norm: 0.0,    // GPU telemetry TBD
-                                            prediction_error_history: tail(
-                                                &a.prediction_error_history,
-                                            ),
-                                            exploration_rate_history: tail(
-                                                &a.exploration_rate_history,
-                                            ),
-                                            energy_history: tail(&a.energy_history),
-                                            integrity_history: tail(&a.integrity_history),
-                                            gradient: a.cached_gradient,
-                                            urgency: a.cached_urgency,
-                                            food_consumed: a.food_consumed,
-                                            total_ticks_alive: a.total_ticks_alive,
-                                            motor_forward: a.cached_motor.forward,
-                                            motor_turn: a.cached_motor.turn,
-                                            phase: "GPU", // GPU telemetry TBD
-                                            vision_color: a.cached_frame.vision.color.clone(),
-                                            vision_width: a.cached_frame.vision.width,
-                                            vision_height: a.cached_frame.vision.height,
-                                            position: [
-                                                a.body.body.position.x,
-                                                a.body.body.position.y,
-                                                a.body.body.position.z,
-                                            ],
-                                            yaw: a.body.yaw,
-                                            mean_attenuation: a.cached_mean_attenuation,
-                                            curiosity_bonus: a.cached_curiosity_bonus,
-                                            fatigue_factor: a.cached_fatigue_factor,
-                                            motor_variance: a.cached_motor_variance,
-                                            fatigue_history: tail(&a.fatigue_history),
-                                        }
-                                    })
-                                    .collect();
+                                // Snapshot agent data for the UI closure (throttled to ~10 Hz)
+                                let snap_rebuild_due = self.paused
+                                    || self.last_snapshot_rebuild.elapsed() >= REBUILD_THROTTLE;
+                                if snap_rebuild_due {
+                                    let snap_window = self.chart_window * 2;
+                                    self.cached_agent_snaps = self
+                                        .agents
+                                        .iter()
+                                        .map(|a| {
+                                            let tail =
+                                                |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
+                                                    let skip = d.len().saturating_sub(snap_window);
+                                                    d.iter().skip(skip).copied().collect()
+                                                };
+                                            AgentSnapshot {
+                                                id: a.id,
+                                                gen: a.generation,
+                                                energy: a.body.body.internal.energy,
+                                                max_energy: a.body.body.internal.max_energy,
+                                                integrity: a.body.body.internal.integrity,
+                                                max_integrity: a.body.body.internal.max_integrity,
+                                                alive: a.body.body.alive,
+                                                deaths: a.death_count,
+                                                color: a.color,
+                                                longest_life: a.longest_life,
+                                                exploration_rate: a.cached_exploration_rate,
+                                                prediction_error: a.cached_prediction_error,
+                                                forward_weight_norm: 0.0, // GPU telemetry TBD
+                                                turn_weight_norm: 0.0,    // GPU telemetry TBD
+                                                prediction_error_history: tail(
+                                                    &a.prediction_error_history,
+                                                ),
+                                                exploration_rate_history: tail(
+                                                    &a.exploration_rate_history,
+                                                ),
+                                                energy_history: tail(&a.energy_history),
+                                                integrity_history: tail(&a.integrity_history),
+                                                gradient: a.cached_gradient,
+                                                urgency: a.cached_urgency,
+                                                food_consumed: a.food_consumed,
+                                                total_ticks_alive: a.total_ticks_alive,
+                                                motor_forward: a.cached_motor.forward,
+                                                motor_turn: a.cached_motor.turn,
+                                                phase: "GPU", // GPU telemetry TBD
+                                                vision_color: a.cached_frame.vision.color.clone(),
+                                                vision_width: a.cached_frame.vision.width,
+                                                vision_height: a.cached_frame.vision.height,
+                                                position: [
+                                                    a.body.body.position.x,
+                                                    a.body.body.position.y,
+                                                    a.body.body.position.z,
+                                                ],
+                                                yaw: a.body.yaw,
+                                                mean_attenuation: a.cached_mean_attenuation,
+                                                curiosity_bonus: a.cached_curiosity_bonus,
+                                                fatigue_factor: a.cached_fatigue_factor,
+                                                motor_variance: a.cached_motor_variance,
+                                                fatigue_history: tail(&a.fatigue_history),
+                                            }
+                                        })
+                                        .collect();
+                                    if !self.paused {
+                                        self.last_snapshot_rebuild = Instant::now();
+                                    }
+                                }
+                                let agent_snaps = self.cached_agent_snaps.clone();
 
                                 // Build evolution snapshot for the UI
                                 if let Some(gov) = &mut self.governor {

@@ -83,6 +83,8 @@ pub struct Governor {
     cached_best_score: f32,
     /// Cached tree nodes (invalidated on advance).
     cached_tree_nodes: Option<Vec<TreeNode>>,
+    /// Cached fitness history by island (invalidated on advance).
+    cached_fitness_history: Option<std::collections::HashMap<i64, Vec<(u32, f32, f32)>>>,
     /// Per-island mutation momentum vectors.
     pub momentums: Vec<MutationMomentum>,
 }
@@ -206,6 +208,7 @@ impl Governor {
             active_island: 0,
             cached_best_score: -1.0,
             cached_tree_nodes: None,
+            cached_fitness_history: None,
             momentums,
         })
     }
@@ -282,6 +285,7 @@ impl Governor {
             active_island: 0,
             cached_best_score: -1.0,
             cached_tree_nodes: None,
+            cached_fitness_history: None,
             momentums,
         };
         gov.refresh_best_score();
@@ -575,6 +579,7 @@ impl Governor {
         if self.evolution_complete() {
             self.refresh_best_score();
             self.cached_tree_nodes = None;
+            self.cached_fitness_history = None;
             self.persist_state();
             messages.push(format!(
                 "[EVOLUTION] Finished after {} generations",
@@ -648,6 +653,7 @@ impl Governor {
         // Invalidate caches after DB changes
         self.refresh_best_score();
         self.cached_tree_nodes = None;
+        self.cached_fitness_history = None;
 
         self.persist_state();
 
@@ -1118,9 +1124,18 @@ impl Governor {
 
     /// Per-island fitness history: island_id → Vec<(generation, best_fitness, avg_fitness)>.
     /// Nodes without an island_id (pre-migration data) are grouped under key -1.
+    /// Returns a cached reference; the cache is invalidated on `advance()`.
     pub fn fitness_history_by_island(
-        &self,
-    ) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
+        &mut self,
+    ) -> &std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
+        if self.cached_fitness_history.is_none() {
+            self.cached_fitness_history = Some(self.fitness_history_from_db());
+        }
+        self.cached_fitness_history.as_ref().unwrap()
+    }
+
+    /// Fetch fitness history directly from the database.
+    fn fitness_history_from_db(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
         let mut stmt = match self.db.prepare(
             "SELECT island_id, generation, best_fitness, avg_fitness FROM node
              WHERE run_id = ?1 AND best_fitness IS NOT NULL
@@ -2485,6 +2500,51 @@ mod tests {
         // Each island should have at least 2 data points
         assert!(history[&0].len() >= 2);
         assert!(history[&1].len() >= 2);
+    }
+
+    #[test]
+    fn fitness_history_cache_invalidated_by_advance() {
+        let config = GovernorConfig {
+            population_size: 4,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 2,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        // Gen 0 (root): populate the cache
+        gov.advance(&mock_fitness(0.5));
+        let gen_before = gov.generation;
+        let count_before: usize = gov
+            .fitness_history_by_island()
+            .values()
+            .map(|v| v.len())
+            .sum();
+
+        // Advance again — should invalidate the cache
+        gov.advance(&mock_fitness(0.6));
+        assert!(
+            gov.generation > gen_before,
+            "generation should have advanced"
+        );
+
+        // The new call must reflect the freshly inserted generation
+        let count_after: usize = gov
+            .fitness_history_by_island()
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert!(
+            count_after > count_before,
+            "fitness history should include new generation after advance (before={count_before}, after={count_after})"
+        );
     }
 
     #[test]

@@ -218,7 +218,9 @@ impl Governor {
         world_config_json: &str,
     ) -> SqlResult<Self> {
         let db = Connection::open(db_path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
         init_schema(&db)?;
 
         let governor_json = serde_json::to_string(&config).unwrap_or_default();
@@ -257,9 +259,15 @@ impl Governor {
             .map(|_| MutationMomentum::new(config.momentum_decay))
             .collect();
 
-        let (recording_sender, writer_thread) = match spawn_recording_writer(db_path) {
-            Some((tx, h)) => (Some(tx), Some(h)),
-            None => (None, None),
+        // Skip background writer for in-memory DBs — each Connection::open(":memory:")
+        // creates an independent database, so the writer thread would not see the schema.
+        let (recording_sender, writer_thread) = if db_path == ":memory:" {
+            (None, None)
+        } else {
+            match spawn_recording_writer(db_path) {
+                Some((tx, h)) => (Some(tx), Some(h)),
+                None => (None, None),
+            }
         };
 
         Ok(Self {
@@ -283,7 +291,9 @@ impl Governor {
     /// for the most recent run.
     pub fn resume(db_path: &str) -> SqlResult<Self> {
         let db = Connection::open(db_path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
 
         // Run migrations for any new columns (idempotent — silently ignores duplicates)
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
@@ -340,9 +350,14 @@ impl Governor {
         }
         momentums.truncate(num_islands);
 
-        let (recording_sender, writer_thread) = match spawn_recording_writer(db_path) {
-            Some((tx, h)) => (Some(tx), Some(h)),
-            None => (None, None),
+        // Skip background writer for in-memory DBs (see Governor::new for rationale).
+        let (recording_sender, writer_thread) = if db_path == ":memory:" {
+            (None, None)
+        } else {
+            match spawn_recording_writer(db_path) {
+                Some((tx, h)) => (Some(tx), Some(h)),
+                None => (None, None),
+            }
         };
 
         let mut gov = Self {

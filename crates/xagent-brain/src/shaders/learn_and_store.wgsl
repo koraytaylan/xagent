@@ -120,8 +120,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 4. Memory store (new pattern to weakest slot)
     // ────────────────────────────────────────────────────────────────────
     let min_idx = u32(patterns[p_base + O_MIN_REINF_IDX]);
-    let motor_fwd = decision[d_base + DIM + DIM];
-    let motor_trn = decision[d_base + DIM + DIM + 1u];
+
+    // Store the *approach action* (motor from ~2 ticks ago) instead of the
+    // current motor.  When this memory is later recalled with negative valence,
+    // negating the approach action produces "reverse the movement that led
+    // into danger" — directed escape rather than freezing.
+    let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
+    let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
+    // cursor already advanced past the current tick's write in predict_and_act,
+    // so offset 3 = 2 ticks before current.
+    var motor_fwd: f32;
+    var motor_trn: f32;
+    if (fatigue_len_u >= 3u) {
+        let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
+        motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+        motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+    } else {
+        motor_fwd = decision[d_base + DIM + DIM];
+        motor_trn = decision[d_base + DIM + DIM + 1u];
+    }
 
     // Check if slot was previously empty before overwriting
     let was_active = patterns[p_base + O_PAT_ACTIVE + min_idx];

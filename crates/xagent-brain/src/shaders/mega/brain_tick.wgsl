@@ -640,8 +640,23 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     // ── 7d. Memory store: thread 0 ─────────────────────────────────────
     if (tid == 0u) {
         let min_idx = u32(pattern_buf[p_base + O_MIN_REINF_IDX]);
-        let motor_fwd = decision_buf[d_base + DIM + DIM];
-        let motor_trn = decision_buf[d_base + DIM + DIM + 1u];
+
+        // Store the *approach action* (motor from ~2 ticks ago) instead of the
+        // current motor.  Negative-valence recall then negates the approach
+        // action → directed escape, not freeze.  (Fatigue ring was updated
+        // earlier in this kernel, same cursor state as standalone pass.)
+        let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
+        let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
+        var motor_fwd: f32;
+        var motor_trn: f32;
+        if (fatigue_len_u >= 3u) {
+            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
+            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
+            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+        } else {
+            motor_fwd = decision_buf[d_base + DIM + DIM];
+            motor_trn = decision_buf[d_base + DIM + DIM + 1u];
+        }
         var h_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
             let h = s_habituated[d];

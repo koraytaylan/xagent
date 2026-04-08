@@ -250,6 +250,7 @@ const PAIN_AMP: f32 = 3.0;
 const DEADZONE: f32 = 0.01;
 const MAX_WEIGHT_NORM: f32 = 2.0;
 const ANTICIPATION_WEIGHT: f32 = 0.5;
+const TONIC_CREDIT_SCALE: f32 = 0.1;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Buffer bindings — 15 storage + 2 uniform, single bind group

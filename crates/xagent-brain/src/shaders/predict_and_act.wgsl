@@ -18,6 +18,7 @@ const PAIN_AMP: f32 = 3.0;
 const DEADZONE: f32 = 0.01;
 const MAX_WEIGHT_NORM: f32 = 2.0;
 const ANTICIPATION_WEIGHT: f32 = 0.5;
+const TONIC_CREDIT_SCALE: f32 = 0.1;
 
 // Recompute cosine similarity between encoded state and a stored pattern.
 // Uses encoded (pre-habituation) state so memory recall is not silenced
@@ -53,6 +54,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let tick_count = brain_state[b + O_TICK_COUNT];
     let gradient = homeo_out[ho_base + 0u];
+    let urgency = homeo_out[ho_base + 2u];
     let recall_count = u32(recall_buf[r_base + RECALL_K]);
 
     // ────────────────────────────────────────────────────────────────────
@@ -144,15 +146,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         let improvement = gradient - rec_grad;
+
+        // Tonic credit: when the gradient has stabilized (improvement ≈ 0)
+        // but urgency is high, use the signed gradient scaled by urgency
+        // and TONIC_CREDIT_SCALE as a persistent credit signal. This
+        // preserves direction during sustained pain or sustained recovery
+        // while in distress, preventing learning from freezing.
+        var credit_input = improvement;
         if (abs(improvement) < DEADZONE) {
+            credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+        }
+        if (abs(credit_input) < DEADZONE) {
             continue;
         }
 
         var effective: f32;
-        if (improvement < 0.0) {
-            effective = improvement * PAIN_AMP;
+        if (credit_input < 0.0) {
+            effective = credit_input * PAIN_AMP;
         } else {
-            effective = improvement;
+            effective = credit_input;
         }
         let credit = effective * temporal;
         credit_mag += abs(credit);
@@ -248,7 +260,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Exploration rate
-    let urgency = homeo_out[ho_base + 2u];
     let max_curiosity = brain_state[b + O_HAB_MAX_CURIOSITY];
 
     // Curiosity from habituation attenuation: (1 - mean_atten) * max_curiosity

@@ -274,6 +274,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     // ── Thread 0: rest of predict + act ────────────────────────────────
     if (tid == 0u) {
         let gradient = s_homeo[0u];
+        let urgency = s_homeo[2u];
 
         // Prediction error
         var err_sum: f32 = 0.0;
@@ -332,10 +333,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             let temporal = exp(-age * CREDIT_DECAY);
             if (temporal < 0.01) { continue; }
             let improvement = gradient - rec_grad;
-            if (abs(improvement) < DEADZONE) { continue; }
+            var credit_input = improvement;
+            if (abs(improvement) < DEADZONE) {
+                credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+            }
+            if (abs(credit_input) < DEADZONE) { continue; }
             var effective: f32;
-            if (improvement < 0.0) { effective = improvement * PAIN_AMP; }
-            else { effective = improvement; }
+            if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
+            else { effective = credit_input; }
             let credit = effective * temporal;
             credit_mag += abs(credit);
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
@@ -421,7 +426,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
 
         // Exploration
-        let urgency = s_homeo[2u];
         let max_curiosity = brain_state[b + O_HAB_MAX_CURIOSITY];
         var atten_sum: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {

@@ -1632,7 +1632,6 @@ impl ApplicationHandler for App {
                                 &world.terrain,
                             );
                             heatmap_gpu.update_from_mesh(&renderer.queue, &mesh);
-                            did_rebuild = true;
                         }
                     }
                     self.heatmap_dirty = false;

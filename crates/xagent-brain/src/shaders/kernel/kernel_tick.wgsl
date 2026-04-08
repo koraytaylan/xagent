@@ -3,9 +3,8 @@
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 
-// ── Eat radius constant (2D XZ, squared) ────────────────────────────────
-// agent_collision_radius (1.0) + food_visual_radius (1.0) = 2.0  →  4.0 sq
-const EAT_RADIUS_SQ: f32 = 4.0;
+// ── Eat radius constant (2D XZ, squared) — reuse shared threshold ───────
+const EAT_RADIUS_SQ: f32 = FOOD_CONSUME_RADIUS_SQ;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)

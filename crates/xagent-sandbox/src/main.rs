@@ -1564,6 +1564,10 @@ impl ApplicationHandler for App {
                     self.camera.update(dt);
                 }
 
+                // Poll background kernel creation so it gets collected
+                // even while the tick gate below suppresses accumulation.
+                self.ensure_gpu_kernel();
+
                 // ── simulation ticks (fixed timestep, adaptive budget) ──
                 // Skip ticks while a generation transition is in flight to
                 // avoid GPU contention with the async readback/reset.

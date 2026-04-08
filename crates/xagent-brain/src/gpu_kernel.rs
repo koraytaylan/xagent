@@ -3,7 +3,7 @@
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use wgpu;
@@ -35,7 +35,10 @@ struct AgentStateReadback {
     brain_size: u64,
     pattern_size: u64,
     history_size: u64,
-    ready: Arc<AtomicBool>,
+    /// Counts how many of the 3 map_async callbacks have fired successfully.
+    mapped_count: Arc<AtomicU8>,
+    /// Set if any map_async callback reports an error.
+    had_error: Arc<AtomicBool>,
     brain_stride: usize,
 }
 
@@ -1392,26 +1395,35 @@ impl GpuKernel {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Set up map_async on all three staging buffers. We use a single
-        // shared ready flag: the last map_async callback to fire sets it.
-        // Since all three copies are in the same command encoder submission,
-        // wgpu maps them in order; the history buffer (last) signals ready.
-        let ready = Arc::new(AtomicBool::new(false));
+        // Set up map_async on all three staging buffers. Each callback
+        // increments a shared counter; we only consider the readback ready
+        // when all 3 have completed. If any fails, we set an error flag so
+        // the caller can abandon the readback instead of hanging forever.
+        let mapped_count = Arc::new(AtomicU8::new(0));
+        let had_error = Arc::new(AtomicBool::new(false));
 
-        brain_staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        pattern_staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        let flag = ready.clone();
-        history_staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
+        let make_callback = |count: Arc<AtomicU8>, err: Arc<AtomicBool>| {
+            move |result: Result<(), wgpu::BufferAsyncError>| {
                 if result.is_ok() {
-                    flag.store(true, Ordering::Release);
+                    count.fetch_add(1, Ordering::Release);
+                } else {
+                    err.store(true, Ordering::Release);
                 }
-            });
+            }
+        };
+
+        brain_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
+        pattern_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
+        history_staging.slice(..).map_async(
+            wgpu::MapMode::Read,
+            make_callback(mapped_count.clone(), had_error.clone()),
+        );
 
         self.agent_state_staging = Some(AgentStateReadback {
             brain_staging,
@@ -1420,18 +1432,37 @@ impl GpuKernel {
             brain_size,
             pattern_size: pat_size,
             history_size: hist_size,
-            ready,
+            mapped_count,
+            had_error,
             brain_stride: bs,
         });
     }
 
-    /// Non-blocking poll: returns Some(state) when the async readback is
-    /// complete, None if still in flight or nothing was requested.
-    pub fn try_collect_agent_state(&mut self) -> Option<AgentBrainState> {
+    /// Non-blocking poll: returns `Some(Some(state))` when ready,
+    /// `Some(None)` if a map_async error occurred (readback abandoned),
+    /// or `None` if still in flight or nothing was requested.
+    pub fn try_collect_agent_state(&mut self) -> Option<Option<AgentBrainState>> {
         let readback = self.agent_state_staging.as_ref()?;
         self.device.poll(wgpu::Maintain::Poll);
-        if !readback.ready.load(Ordering::Acquire) {
-            return None;
+
+        // If any mapping failed, abandon the readback.
+        if readback.had_error.load(Ordering::Acquire) {
+            log::error!("[GPU] agent-state map_async failed — abandoning readback");
+            let rb = self.agent_state_staging.take().unwrap();
+            // Unmap any buffers that did succeed to avoid leaking.
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rb.brain_staging.unmap()));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rb.pattern_staging.unmap()
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rb.history_staging.unmap()
+            }));
+            return Some(None);
+        }
+
+        if readback.mapped_count.load(Ordering::Acquire) < 3 {
+            return None; // not all 3 buffers mapped yet
         }
 
         let readback = self.agent_state_staging.take().unwrap();
@@ -1464,7 +1495,7 @@ impl GpuKernel {
         drop(mapped);
         readback.history_staging.unmap();
 
-        Some(state)
+        Some(Some(state))
     }
 
     /// Batch-upload brain states for all agents in a single write per buffer.
@@ -1473,6 +1504,11 @@ impl GpuKernel {
     where
         F: Fn(usize) -> AgentBrainState,
     {
+        debug_assert_eq!(
+            count, self.agent_count as usize,
+            "batch_write_agent_states: count ({}) != agent_count ({})",
+            count, self.agent_count
+        );
         let bs = self.layout.brain_stride;
         let mut brain_data = Vec::with_capacity(count * bs);
         let mut pattern_data = Vec::with_capacity(count * PATTERN_STRIDE);

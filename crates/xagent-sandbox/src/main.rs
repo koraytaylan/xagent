@@ -243,6 +243,8 @@ enum GenTransition {
     AwaitingReset {
         result: AdvanceResult,
         inherited_state: Option<AgentBrainState>,
+        /// Whether population has already been spawned (prevents re-spawn on retry).
+        spawned: bool,
     },
 }
 
@@ -823,6 +825,7 @@ impl App {
                     self.gen_transition = Some(GenTransition::AwaitingReset {
                         result,
                         inherited_state: None,
+                        spawned: false,
                     });
                     return true;
                 }
@@ -831,11 +834,21 @@ impl App {
                 let collected = self.gpu_kernel.as_mut().unwrap().try_collect_agent_state();
 
                 match collected {
-                    Some(state) => {
+                    Some(Some(state)) => {
                         // Readback complete — move to reset phase.
                         self.gen_transition = Some(GenTransition::AwaitingReset {
                             result,
                             inherited_state: Some(state),
+                            spawned: false,
+                        });
+                    }
+                    Some(None) => {
+                        // map_async error — proceed without inherited state
+                        // rather than hanging in AwaitingReadback forever.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: None,
+                            spawned: false,
                         });
                     }
                     None => {
@@ -848,30 +861,48 @@ impl App {
             GenTransition::AwaitingReset {
                 result,
                 inherited_state,
+                spawned,
             } => {
-                self.finish_generation(result, inherited_state);
+                let (done, spawned) =
+                    self.try_finish_generation(&result, &inherited_state, spawned);
+                if !done {
+                    // Reset not ready yet — re-enqueue for next frame.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state,
+                        spawned,
+                    });
+                    return true;
+                }
                 false
             }
         }
     }
 
-    /// Complete a generation transition once readback data is available.
-    fn finish_generation(
+    /// Try to complete a generation transition. Returns `(done, spawned)`
+    /// where `done` is false if the GPU staging buffers aren't ready yet
+    /// (caller should retry next frame), and `spawned` tracks whether
+    /// population has been spawned (to avoid re-spawning on retry).
+    fn try_finish_generation(
         &mut self,
-        result: AdvanceResult,
-        inherited_state: Option<AgentBrainState>,
-    ) {
+        result: &AdvanceResult,
+        inherited_state: &Option<AgentBrainState>,
+        mut spawned: bool,
+    ) -> (bool, bool) {
         match result {
             AdvanceResult::Continue {
                 configs,
                 messages,
                 mutation_strength,
             } => {
-                for msg in messages {
-                    self.log_msg(msg);
+                if !spawned {
+                    for msg in messages {
+                        self.log_msg(msg.clone());
+                    }
+                    self.spawn_population_from_configs(configs);
+                    spawned = true;
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
-                self.spawn_population_from_configs(&configs);
 
                 // Reuse existing kernel if population size matches,
                 // otherwise drop and recreate in background.
@@ -882,11 +913,10 @@ impl App {
 
                 if can_reuse {
                     let mk = self.gpu_kernel.as_mut().unwrap();
-                    // Use non-blocking reset; if staging not ready yet we
-                    // fall back to the old blocking reset (rare edge case
-                    // at generation boundary where GPU is backed up).
+                    // Non-blocking reset — return false to retry next frame
+                    // instead of falling back to a blocking busy-wait.
                     if !mk.try_reset_agents(&self.brain_config) {
-                        mk.reset_agents(&self.brain_config);
+                        return (false, spawned);
                     }
                     let agent_data: Vec<_> = self
                         .agents
@@ -909,15 +939,18 @@ impl App {
                     self.ensure_gpu_kernel();
                 }
 
-                // Inherit learned weights: champions get exact weights,
+                // Inherit learned weights: champions get exact brain state,
                 // mutants get perturbed weights for neuroevolution.
-                if let Some(ref state) = inherited_state {
+                if let Some(state) = inherited_state {
                     if let Some(ref mk) = self.gpu_kernel {
-                        let ms = mutation_strength;
+                        let ms = *mutation_strength;
                         let n = self.agents.len();
+                        // Pre-clone once for all champion slots to avoid
+                        // cloning inside the hot closure on every call.
+                        let champion = state.clone();
                         mk.batch_write_agent_states(n, |i| {
                             if i < repeats {
-                                state.clone()
+                                champion.clone()
                             } else {
                                 mutate_brain_state(state, ms)
                             }
@@ -927,12 +960,13 @@ impl App {
             }
             AdvanceResult::Finished { messages } => {
                 for msg in messages {
-                    self.log_msg(msg);
+                    self.log_msg(msg.clone());
                 }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
             }
         }
+        (true, spawned)
     }
 
     fn log_msg(&mut self, msg: String) {

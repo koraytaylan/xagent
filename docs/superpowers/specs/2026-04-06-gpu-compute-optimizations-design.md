@@ -6,7 +6,7 @@ Reduce per-frame GPU latency for the brain compute pipeline through five targete
 
 ## Architecture
 
-The fused kernel dispatches three pipelines per cycle: physics (1 workgroup, 256 threads), vision (agent_count workgroups, 48/256 active), brain (agent_count workgroups, 256 threads). At 10 agents, GPU occupancy is low — the critical path is how fast a single brain workgroup completes.
+In the current main-loop code path, each cycle dispatches the per-agent fused kernel together with global and vision work. Standalone physics/brain pipeline dispatches are used mainly for remainder handling rather than the primary per-cycle path. At 10 agents, GPU occupancy is low — the critical path is how fast a single brain workgroup completes.
 
 The brain shader has 7 cooperative passes. Two are serial bottlenecks:
 - **Pass 5 (top-K)**: 2,048 serial comparisons on thread 0 (16 rounds × 128 candidates)

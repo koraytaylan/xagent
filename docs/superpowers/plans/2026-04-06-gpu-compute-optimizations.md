@@ -12,19 +12,19 @@
 
 **Dependency order:** Tasks 1–4 are independent. Task 5 depends on Task 1.
 
-**Execution order:** Execute tasks in listed order (1→2→3→4→5). While tasks 1–4 are logically independent, they share `gpu_mega_kernel.rs` — later tasks assume earlier changes are in place (e.g., Task 4 references `bind_groups[idx]` from Task 3's double-buffer).
+**Execution order:** Execute tasks in listed order (1→2→3→4→5). While tasks 1–4 are logically independent, they share `gpu_kernel.rs` — later tasks assume earlier changes are in place (e.g., Task 4 references `bind_groups[idx]` from Task 3's double-buffer).
 
 ---
 
 ## File Structure
 
 **Create:**
-- `crates/xagent-brain/src/shaders/mega/phase_prepare_dispatch.wgsl` — indirect dispatch argument writer (Task 4)
+- `crates/xagent-brain/src/shaders/kernel/phase_prepare_dispatch.wgsl` — indirect dispatch argument writer (Task 4)
 
 **Modify:**
-- `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — bitonic sort (Task 1), SoA indexing (Task 2), subgroup ops (Task 5)
-- `crates/xagent-brain/src/shaders/mega/common.wgsl` — dispatch_args binding 15 (Task 4), SoA layout comment (Task 2)
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — async overlap + double-buffer (Task 3), indirect dispatch (Task 4), subgroup feature (Task 5), SoA transpose in read_agent_state (Task 2)
+- `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — bitonic sort (Task 1), SoA indexing (Task 2), subgroup ops (Task 5)
+- `crates/xagent-brain/src/shaders/kernel/common.wgsl` — dispatch_args binding 15 (Task 4), SoA layout comment (Task 2)
+- `crates/xagent-brain/src/gpu_kernel.rs` — async overlap + double-buffer (Task 3), indirect dispatch (Task 4), subgroup feature (Task 5), SoA transpose in read_agent_state (Task 2)
 - `crates/xagent-brain/src/buffers.rs` — SoA documentation (Task 2)
 - `crates/xagent-sandbox/src/main.rs` — decouple poll_and_collect from dispatch (Task 3)
 - `crates/xagent-brain/src/gpu_brain.rs` — update test that indexes into O_PAT_STATES with SoA layout (Task 2)
@@ -36,7 +36,7 @@
 Replace the serial greedy scan in `coop_recall_topk` (2,048 comparisons on thread 0) with a full bitonic sort of 128 elements using 64 threads. All 256 threads participate in barriers.
 
 **Files:**
-- Modify: `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl:1-13` (shared memory), `brain_tick.wgsl:189-211` (coop_recall_topk), `brain_tick.wgsl:676-677` (entry point call)
+- Modify: `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl:1-13` (shared memory), `brain_tick.wgsl:189-211` (coop_recall_topk), `brain_tick.wgsl:676-677` (entry point call)
 - Modify: `crates/xagent-brain/src/buffers.rs:684` (tests)
 
 - [ ] **Step 1: Write CPU reference test for bitonic sort correctness**
@@ -139,7 +139,7 @@ Expected: PASS (both algorithms produce the same top-K set)
 
 - [ ] **Step 3: Add s_sort_idx shared memory and rewrite coop_recall_topk**
 
-In `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl`, add shared memory after line 11 (`s_similarities`):
+In `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl`, add shared memory after line 11 (`s_similarities`):
 
 ```wgsl
 var<workgroup> s_sort_idx: array<u32, 128>;   // tracks pattern index through bitonic sort
@@ -238,7 +238,7 @@ Expected: All tests pass (including the new bitonic sort test).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/brain_tick.wgsl crates/xagent-brain/src/buffers.rs
+git add crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl crates/xagent-brain/src/buffers.rs
 git commit -m "perf: parallel top-K via bitonic sort in brain shader
 
 Replace serial greedy scan (2048 ops on thread 0) with bitonic sort
@@ -258,8 +258,8 @@ Transpose the O_PAT_STATES region in pattern memory from AoS `[pattern][dim]` to
 Note: `O_PAT_STATES = 0`, so the offset is implicit. Region size unchanged: 128 × 32 = 4096 floats.
 
 **Files:**
-- Modify: `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — 5 access sites
-- Modify: `crates/xagent-brain/src/shaders/mega/common.wgsl` — add layout documentation comment
+- Modify: `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — 5 access sites
+- Modify: `crates/xagent-brain/src/shaders/kernel/common.wgsl` — add layout documentation comment
 - Modify: `crates/xagent-brain/src/gpu_brain.rs:1079-1081` — update test indexing
 - Modify: `crates/xagent-brain/src/buffers.rs` — add SoA documentation
 
@@ -341,7 +341,7 @@ pattern_buf[p_base + d * MEMORY_CAP + min_idx] = h;
 
 - [ ] **Step 4: Add SoA layout comment in common.wgsl**
 
-In `crates/xagent-brain/src/shaders/mega/common.wgsl`, update the pattern memory offsets comment block (around line 67):
+In `crates/xagent-brain/src/shaders/kernel/common.wgsl`, update the pattern memory offsets comment block (around line 67):
 
 ```wgsl
 // ── Pattern memory offsets ──────────────────────────────────────────────
@@ -374,7 +374,7 @@ Expected: All tests pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/brain_tick.wgsl crates/xagent-brain/src/shaders/mega/common.wgsl crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/gpu_brain.rs
+git add crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl crates/xagent-brain/src/shaders/kernel/common.wgsl crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/gpu_brain.rs
 git commit -m "perf: SoA pattern buffer layout for cache-coalesced reads
 
 Transpose O_PAT_STATES region from [pattern][dim] to [dim][pattern].
@@ -389,12 +389,12 @@ iteration instead of 128."
 Decouple GPU poll/collect from dispatch so the main loop can overlap result collection with the next dispatch. Double-buffer the world config uniform to prevent write-before-read hazards across overlapping submits.
 
 **Files:**
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs` — refactor dispatch_batch, add double-buffer
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs` — refactor dispatch_batch, add double-buffer
 - Modify: `crates/xagent-sandbox/src/main.rs:1314-1342` — call pattern change
 
 - [ ] **Step 1: Refactor dispatch_batch — remove internal poll/collect**
 
-In `crates/xagent-brain/src/gpu_mega_kernel.rs`, modify `dispatch_batch` (around line 678). Remove the poll and collect calls from the top of the method and change the return type:
+In `crates/xagent-brain/src/gpu_kernel.rs`, modify `dispatch_batch` (around line 678). Remove the poll and collect calls from the top of the method and change the return type:
 
 ```rust
 /// Dispatch all ticks. Fully non-blocking: skips dispatch if the
@@ -418,7 +418,7 @@ The body from `let n = self.agent_count as usize;` through the staging map_async
 
 - [ ] **Step 2: Double-buffer world_config_buf and bind_group**
 
-In `gpu_mega_kernel.rs`, change the struct fields:
+In `gpu_kernel.rs`, change the struct fields:
 
 ```rust
 // Replace:
@@ -438,13 +438,13 @@ In `new()`, create two world_config buffers:
 ```rust
 let world_config_bufs = [
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("mega_world_config_0"),
+        label: Some("kernel_world_config_0"),
         size: (WORLD_CONFIG_SIZE * 4) as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }),
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("mega_world_config_1"),
+        label: Some("kernel_world_config_1"),
         size: (WORLD_CONFIG_SIZE * 4) as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -479,8 +479,8 @@ let make_bind_group = |wc_buf: &wgpu::Buffer, label: &str| {
     })
 };
 let bind_groups = [
-    make_bind_group(&world_config_bufs[0], "mega_tick_bg_0"),
-    make_bind_group(&world_config_bufs[1], "mega_tick_bg_1"),
+    make_bind_group(&world_config_bufs[0], "kernel_tick_bg_0"),
+    make_bind_group(&world_config_bufs[1], "kernel_tick_bg_1"),
 ];
 ```
 
@@ -542,7 +542,7 @@ Expected: All tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/xagent-brain/src/gpu_mega_kernel.rs crates/xagent-sandbox/src/main.rs
+git add crates/xagent-brain/src/gpu_kernel.rs crates/xagent-sandbox/src/main.rs
 git commit -m "perf: async compute overlap with double-buffered world config
 
 Decouple GPU poll/collect from dispatch so result collection can overlap
@@ -557,9 +557,9 @@ to prevent write-before-read hazards across overlapping batches."
 Replace CPU-set `dispatch_workgroups(agent_count, 1, 1)` for vision and brain with GPU-driven `dispatch_workgroups_indirect`. A tiny 1-thread shader reads agent_count from the world config uniform and writes dispatch arguments to a storage buffer.
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/phase_prepare_dispatch.wgsl`
-- Modify: `crates/xagent-brain/src/shaders/mega/common.wgsl` — add binding 15
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs` — add buffer, pipeline, binding, indirect dispatch
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_prepare_dispatch.wgsl`
+- Modify: `crates/xagent-brain/src/shaders/kernel/common.wgsl` — add binding 15
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs` — add buffer, pipeline, binding, indirect dispatch
 - Modify: `crates/xagent-brain/src/buffers.rs` — test for binding count
 
 - [ ] **Step 1: Write test for binding count**
@@ -569,7 +569,7 @@ Add to `crates/xagent-brain/src/buffers.rs` tests:
 ```rust
 #[test]
 fn shader_has_16_bindings() {
-    let src = include_str!("shaders/mega/common.wgsl");
+    let src = include_str!("shaders/kernel/common.wgsl");
     let binding_count = src.lines()
         .filter(|l| l.trim().starts_with("@group(0) @binding("))
         .count();
@@ -585,7 +585,7 @@ Expected: FAIL — currently 15 bindings (0–14).
 
 - [ ] **Step 3: Add dispatch_args binding to common.wgsl**
 
-In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after binding 14 (brain_config, around line 262), add:
+In `crates/xagent-brain/src/shaders/kernel/common.wgsl`, after binding 14 (brain_config, around line 262), add:
 
 ```wgsl
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
@@ -593,7 +593,7 @@ In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after binding 14 (brain_c
 
 - [ ] **Step 4: Create phase_prepare_dispatch.wgsl**
 
-Create `crates/xagent-brain/src/shaders/mega/phase_prepare_dispatch.wgsl`:
+Create `crates/xagent-brain/src/shaders/kernel/phase_prepare_dispatch.wgsl`:
 
 ```wgsl
 // Phase: prepare indirect dispatch arguments.
@@ -614,7 +614,7 @@ fn prepare_dispatch() {
 }
 ```
 
-- [ ] **Step 5: Add buffer, pipeline, and binding in gpu_mega_kernel.rs**
+- [ ] **Step 5: Add buffer, pipeline, and binding in gpu_kernel.rs**
 
 In the struct definition, add:
 
@@ -627,7 +627,7 @@ In `new()`, create the buffer (after other buffer definitions):
 
 ```rust
 let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
-    label: Some("mega_dispatch_args"),
+    label: Some("kernel_dispatch_args"),
     size: 6 * 4, // 2 × (x, y, z) u32 triplets
     usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     mapped_at_creation: false,
@@ -652,7 +652,7 @@ Compose and create the prepare pipeline:
 // ── Compose prepare-dispatch shader ──
 let prepare_source = [
     &common_src,
-    include_str!("shaders/mega/phase_prepare_dispatch.wgsl"),
+    include_str!("shaders/kernel/phase_prepare_dispatch.wgsl"),
 ]
 .join("\n");
 
@@ -720,7 +720,7 @@ Expected: All pass.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/phase_prepare_dispatch.wgsl crates/xagent-brain/src/shaders/mega/common.wgsl crates/xagent-brain/src/gpu_mega_kernel.rs crates/xagent-brain/src/buffers.rs
+git add crates/xagent-brain/src/shaders/kernel/phase_prepare_dispatch.wgsl crates/xagent-brain/src/shaders/kernel/common.wgsl crates/xagent-brain/src/gpu_kernel.rs crates/xagent-brain/src/buffers.rs
 git commit -m "perf: GPU indirect dispatch for vision and brain pipelines
 
 Add phase_prepare_dispatch shader that writes dispatch args from
@@ -740,19 +740,19 @@ Accelerate the first 5 stages of the bitonic sort (from Task 1) using WGSL subgr
 **Fallback:** If the adapter doesn't support `Features::SUBGROUP`, the shared-memory-only bitonic sort from Task 1 is used unchanged.
 
 **Files:**
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs` — request SUBGROUP feature, compose shader variant
-- Modify: `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — subgroup sort stages via string markers
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs` — request SUBGROUP feature, compose shader variant
+- Modify: `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — subgroup sort stages via string markers
 
-- [ ] **Step 1: Add SUBGROUP feature detection in gpu_mega_kernel.rs**
+- [ ] **Step 1: Add SUBGROUP feature detection in gpu_kernel.rs**
 
 In `new()`, after adapter creation (around line 152), detect subgroup support:
 
 ```rust
 let has_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
 if has_subgroup {
-    log::info!("[GpuMegaKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
+    log::info!("[GpuKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
 } else {
-    log::info!("[GpuMegaKernel] No subgroup support — using shared-memory-only bitonic sort");
+    log::info!("[GpuKernel] No subgroup support — using shared-memory-only bitonic sort");
 }
 ```
 
@@ -767,7 +767,7 @@ let required_features = if has_subgroup {
 
 let (device, queue) = pollster::block_on(adapter.request_device(
     &wgpu::DeviceDescriptor {
-        label: Some("gpu-mega-kernel"),
+        label: Some("gpu-kernel"),
         required_features,
         required_limits: {
             required_limits.max_push_constant_size = 8;
@@ -815,12 +815,12 @@ And the call site:
     coop_recall_topk(agent_id, tid /* SUBGROUP_TOPK_ARGS */);
 ```
 
-- [ ] **Step 3: Compose subgroup shader variant in gpu_mega_kernel.rs**
+- [ ] **Step 3: Compose subgroup shader variant in gpu_kernel.rs**
 
 In `new()`, when composing the brain shader (around line 342), add subgroup string replacements:
 
 ```rust
-let mut brain_source = format!("{}\n{}", &common_src, include_str!("shaders/mega/brain_tick.wgsl"));
+let mut brain_source = format!("{}\n{}", &common_src, include_str!("shaders/kernel/brain_tick.wgsl"));
 
 if has_subgroup {
     // Prepend enable directive
@@ -940,7 +940,7 @@ Expected: All tests pass. On hardware without SUBGROUP support, the fallback pat
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/xagent-brain/src/gpu_mega_kernel.rs crates/xagent-brain/src/shaders/mega/brain_tick.wgsl
+git add crates/xagent-brain/src/gpu_kernel.rs crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl
 git commit -m "perf: subgroup intrinsics for bitonic sort stages 0-4
 
 Use subgroupShuffle for the first 5 stages (15 passes) of the bitonic

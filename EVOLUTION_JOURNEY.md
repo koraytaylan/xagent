@@ -188,22 +188,22 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 - Force-collapse (`header.open(Some(false))`) removed from dead-end branches
 - Progress bar renders in `TopBottomPanel::top("top_bar")` using captured `gen_tick`/`tick_budget`
 
-### Issue #18: GPU Mega-Kernel — 100× Throughput
+### Issue #18: GPU Fused Kernel — 100× Throughput
 
-**What changed:** Replaced the per-tick 7-pass dispatch loop with a fused mega-kernel. One dispatch per `vision_stride` cycles (default 10), 256 threads per agent workgroup, all per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) in a single shader.
+**What changed:** Replaced the per-tick 7-pass dispatch loop with a fused kernel. One dispatch per `vision_stride` cycles (default 10), 256 threads per agent workgroup, all per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) in a single shader.
 
-**Why it matters for evolution:** At ~600 ticks/second (old dispatch model), a 50,000-tick generation takes ~83 seconds wall time. At 60,000+ ticks/second (mega-kernel), the same generation takes < 1 second. This makes multi-island evolution with `eval_repeats > 1` practical — running 3 islands × 10 agents × 2 repeats previously took hours; now it takes minutes.
+**Why it matters for evolution:** At ~600 ticks/second (old dispatch model), a 50,000-tick generation takes ~83 seconds wall time. At 60,000+ ticks/second (fused kernel), the same generation takes < 1 second. This makes multi-island evolution with `eval_repeats > 1` practical — running 3 islands × 10 agents × 2 repeats previously took hours; now it takes minutes.
 
 **Technical details:**
-- `mega_tick.wgsl`: Fused per-agent kernel with cycle loop. Per cycle: physics (thread 0), brute-force food detection (all 256 threads, two-phase shared-memory reduction into 128-element arrays), death/respawn (thread 0), full brain pipeline (all 256 threads)
+- `kernel_tick.wgsl`: Fused per-agent kernel with cycle loop. Per cycle: physics (thread 0), brute-force food detection (all 256 threads, two-phase shared-memory reduction into 128-element arrays), death/respawn (thread 0), full brain pipeline (all 256 threads)
 - `global_tick.wgsl`: Grid rebuild + collision (dispatched as 1,1,1), runs once per vision_stride cycles
-- `gpu_mega_kernel.rs`: Shader composition from common + brain function bodies (entry point stripped) + mega_tick. Subgroup intrinsic support with marker-based substitution
+- `gpu_kernel.rs`: Shader composition from common + brain function bodies (entry point stripped) + kernel_tick. Subgroup intrinsic support with marker-based substitution
 - Async double-buffered state readback with backpressure throttle
 - Per-selected-agent telemetry readback (`read_agent_telemetry`) for UI: vision, motor, habituation, curiosity, fatigue, urgency, gradient
 
 **Key bugs encountered:**
-- `queue.write_buffer` race: Multiple writes to the same uniform buffer in one encoder — only the last survives at submit. Fixed by one encoder+submit per mega-batch.
-- Subgroup marker mismatch: Brain's `/* SUBGROUP_TOPK_PARAMS */` vs mega's `/* MEGA_SUBGROUP_TOPK_PARAMS */` — both need replacement when composing the fused shader.
+- `queue.write_buffer` race: Multiple writes to the same uniform buffer in one encoder — only the last survives at submit. Fixed by one encoder+submit per kernel batch.
+- Subgroup marker mismatch: Brain's `/* SUBGROUP_TOPK_PARAMS */` vs kernel's `/* KERNEL_SUBGROUP_TOPK_PARAMS */` — both need replacement when composing the fused shader.
 - 256-thread arrays with 128-element shared memory: Two-phase reduction (first 128 write directly, barrier, second 128 merge) resolves the bounds mismatch.
 
 **Lesson:** CPU↔GPU coordination overhead dominates at high tick rates. The simulation math was already fast — the bottleneck was 11–19 dispatches per tick, per-tick uniform writes, and blocking readback. Fusing passes and batching cycles eliminated the coordination cost. Also: when composing shaders from fragments, marker-based string replacement is fragile — every code path that uses the markers must be tested with subgroups both enabled and disabled.

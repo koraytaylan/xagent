@@ -7,12 +7,12 @@
 
 pub mod buffers;
 pub mod gpu_brain;
-pub mod gpu_mega_kernel;
+pub mod gpu_kernel;
 pub mod gpu_physics;
 
 pub use buffers::{AgentBrainState, BrainLayout};
 pub use gpu_brain::GpuBrain;
-pub use gpu_mega_kernel::{AgentTelemetry, GpuMegaKernel};
+pub use gpu_kernel::{AgentTelemetry, GpuKernel};
 
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
 #[inline(always)]

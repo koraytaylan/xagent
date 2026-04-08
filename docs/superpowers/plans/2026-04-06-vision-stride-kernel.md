@@ -1,10 +1,10 @@
-# Vision-Stride Fused Mega-Kernel Implementation Plan
+# Vision-Stride Fused Kernel Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-**Goal:** Replace 3-passes-per-brain-cycle dispatch with a fused mega-kernel that runs N brain cycles in a single GPU dispatch, achieving 60k+ brain TPS at 10 agents.
+**Goal:** Replace 3-passes-per-brain-cycle dispatch with a fused kernel that runs N brain cycles in a single GPU dispatch, achieving 60k+ brain TPS at 10 agents.
 
-**Architecture:** Single mega-kernel dispatch (agent_count workgroups × 256 threads) loops over `vision_stride` brain cycles internally — per-agent physics, brute-force food detection, death/respawn, and 7-pass brain. A separate global pass (grid rebuild + collisions + vision raycasting) runs once per vision_stride cycles as 2–3 dispatches. CPU encodes a fixed number of passes regardless of brain cycle count.
+**Architecture:** Single fused kernel dispatch (agent_count workgroups × 256 threads) loops over `vision_stride` brain cycles internally — per-agent physics, brute-force food detection, death/respawn, and 7-pass brain. A separate global pass (grid rebuild + collisions + vision raycasting) runs once per vision_stride cycles as 2–3 dispatches. CPU encodes a fixed number of passes regardless of brain cycle count.
 
 **Tech Stack:** Rust, wgpu 24, WGSL compute shaders
 
@@ -16,7 +16,7 @@
 - Modify: `crates/xagent-shared/src/config.rs:11-60` (BrainConfig struct)
 - Modify: `crates/xagent-brain/src/buffers.rs:203-225` (WC_* constants)
 - Modify: `crates/xagent-brain/src/buffers.rs:561-594` (build_world_config)
-- Modify: `crates/xagent-brain/src/shaders/mega/common.wgsl:199-222` (WGSL WC_* constants)
+- Modify: `crates/xagent-brain/src/shaders/kernel/common.wgsl:199-222` (WGSL WC_* constants)
 - Test: `crates/xagent-brain/src/buffers.rs` (existing test module)
 
 - [x] **Step 1: Write test for vision_stride in BrainConfig**
@@ -92,13 +92,13 @@ Add before the return:
     wc[WC_VISION_STRIDE] = vision_stride as f32;
 ```
 
-Then update all call sites of `build_world_config` to pass vision_stride. Search with `grep -rn "build_world_config"` in the crate. The main call site is in `gpu_mega_kernel.rs` inside `upload_world_config_masked` (line ~733). Pass `self.vision_stride` there (which we'll add to the struct in Task 6).
+Then update all call sites of `build_world_config` to pass vision_stride. Search with `grep -rn "build_world_config"` in the crate. The main call site is in `gpu_kernel.rs` inside `upload_world_config_masked` (line ~733). Pass `self.vision_stride` there (which we'll add to the struct in Task 6).
 
 For now, to keep things compiling, pass `10` as a literal at existing call sites. Task 6 will replace these with the actual config value.
 
 - [x] **Step 7: Add WC_VISION_STRIDE to common.wgsl**
 
-In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_PHASE_MASK` (line 222):
+In `crates/xagent-brain/src/shaders/kernel/common.wgsl`, after `WC_PHASE_MASK` (line 222):
 
 ```wgsl
 const WC_VISION_STRIDE: u32 = 22u;
@@ -112,29 +112,29 @@ Expected: All existing tests pass. The new constant is unused in shaders for now
 - [x] **Step 9: Commit**
 
 ```bash
-git add crates/xagent-shared/src/config.rs crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/mega/common.wgsl
+git add crates/xagent-shared/src/config.rs crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/kernel/common.wgsl
 git commit -m "feat: add vision_stride config and WC_VISION_STRIDE uniform slot"
 ```
 
 ---
 
-### Task 2: Create `mega_tick.wgsl` — fused per-agent kernel shader
+### Task 2: Create `kernel_tick.wgsl` — fused per-agent kernel shader
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`
-- Reference (read-only): `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl`
-- Reference (read-only): `crates/xagent-brain/src/shaders/mega/phase_physics.wgsl`
-- Reference (read-only): `crates/xagent-brain/src/shaders/mega/phase_death.wgsl`
-- Reference (read-only): `crates/xagent-brain/src/shaders/mega/phase_food_detect.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl`
+- Reference (read-only): `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl`
+- Reference (read-only): `crates/xagent-brain/src/shaders/kernel/phase_physics.wgsl`
+- Reference (read-only): `crates/xagent-brain/src/shaders/kernel/phase_death.wgsl`
+- Reference (read-only): `crates/xagent-brain/src/shaders/kernel/phase_food_detect.wgsl`
 
 This is the core shader. It composes per-agent physics + brute-force food detection + death/respawn + brain into one entry point with a vision_stride cycle loop. The shader file does NOT include `common.wgsl` or the brain functions — those are concatenated at compile time in Rust (Task 5).
 
-- [x] **Step 1: Create mega_tick.wgsl with shared memory declarations**
+- [x] **Step 1: Create kernel_tick.wgsl with shared memory declarations**
 
-Create `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`:
+Create `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl`:
 
 ```wgsl
-// ── Fused mega-kernel: per-agent physics + food + death + brain ─────────────
+// ── Fused kernel: per-agent physics + food + death + brain ─────────────
 // dispatch(agent_count, 1, 1) — one workgroup per agent, 256 threads each.
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
@@ -452,7 +452,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // Brain tick inner — delegates to the 7 cooperative passes from brain_tick.wgsl
 // ══════════════════════════════════════════════════════════════════════════
 
-fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
+fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     // Skip dead agents (uniform control flow — all threads agree)
     if (agent_phys[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
@@ -468,7 +468,7 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
     coop_recall_score(agent_id, tid);
     workgroupBarrier();
 
-    coop_recall_topk(agent_id, tid /* MEGA_SUBGROUP_TOPK_ARGS */);
+    coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */);
     storageBarrier(); workgroupBarrier();
 
     coop_predict_and_act(agent_id, tid);
@@ -482,10 +482,10 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
 // ══════════════════════════════════════════════════════════════════════════
 
 @compute @workgroup_size(256)
-fn mega_tick(
+fn kernel_tick(
     @builtin(local_invocation_id) lid: vec3u,
     @builtin(workgroup_id) wgid: vec3u,
-    // MEGA_SUBGROUP_ENTRY_PARAMS
+    // KERNEL_SUBGROUP_ENTRY_PARAMS
 ) {
     let agent_id = wgid.x;
     let tid = lid.x;
@@ -515,7 +515,7 @@ fn mega_tick(
         workgroupBarrier();
 
         // Brain: all 256 threads, 7 cooperative passes
-        brain_tick_inner(agent_id, tid /* MEGA_SUBGROUP_TOPK_INNER_ARGS */);
+        brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
         workgroupBarrier();
     }
 }
@@ -525,14 +525,14 @@ fn mega_tick(
 
 This file will be compiled as part of Task 5 (shader composition). For now, verify it's well-formed by checking no obvious syntax errors.
 
-Run: `wc -l crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`
+Run: `wc -l crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl`
 Expected: ~300 lines, file exists.
 
 - [x] **Step 3: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/mega_tick.wgsl
-git commit -m "feat: add mega_tick.wgsl — fused per-agent physics+food+death+brain shader"
+git add crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
+git commit -m "feat: add kernel_tick.wgsl — fused per-agent physics+food+death+brain shader"
 ```
 
 ---
@@ -540,19 +540,19 @@ git commit -m "feat: add mega_tick.wgsl — fused per-agent physics+food+death+b
 ### Task 3: Create `global_tick.wgsl` — grid rebuild + collision shader
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/global_tick.wgsl`
-- Reference (read-only): `crates/xagent-brain/src/shaders/mega/physics_tick.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/global_tick.wgsl`
+- Reference (read-only): `crates/xagent-brain/src/shaders/kernel/physics_tick.wgsl`
 
 The global pass contains only the phases that need cross-agent data: grid clearing, food grid build, food respawn, agent grid build, and collision (3× accumulate + apply). Dispatched as `(1, 1, 1)` — single workgroup, same as current physics.
 
 - [x] **Step 1: Create global_tick.wgsl**
 
-Create `crates/xagent-brain/src/shaders/mega/global_tick.wgsl`:
+Create `crates/xagent-brain/src/shaders/kernel/global_tick.wgsl`:
 
 ```wgsl
 // ── Global pass: grid rebuild, food respawn, collisions ─────────────────────
 // dispatch(1, 1, 1) — single workgroup of 256 threads.
-// Runs once per vision_stride mega-kernel cycles.
+// Runs once per vision_stride fused kernel cycles.
 // Requires: common.wgsl + phase_clear + phase_food_grid + phase_food_respawn
 //           + phase_agent_grid + phase_collision (concatenated by Rust).
 
@@ -590,13 +590,13 @@ fn global_tick(@builtin(local_invocation_id) lid: vec3u) {
 
 - [x] **Step 2: Verify file exists**
 
-Run: `wc -l crates/xagent-brain/src/shaders/mega/global_tick.wgsl`
+Run: `wc -l crates/xagent-brain/src/shaders/kernel/global_tick.wgsl`
 Expected: ~35 lines, file exists.
 
 - [x] **Step 3: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/global_tick.wgsl
+git add crates/xagent-brain/src/shaders/kernel/global_tick.wgsl
 git commit -m "feat: add global_tick.wgsl — grid rebuild and collision pass"
 ```
 
@@ -607,9 +607,9 @@ git commit -m "feat: add global_tick.wgsl — grid rebuild and collision pass"
 **Files:**
 - Modify: `crates/xagent-brain/src/buffers.rs:203-225`
 - Modify: `crates/xagent-brain/src/buffers.rs:561-594`
-- Modify: `crates/xagent-brain/src/shaders/mega/common.wgsl:199-222`
+- Modify: `crates/xagent-brain/src/shaders/kernel/common.wgsl:199-222`
 
-The mega-kernel shader reads `brain_tick_stride` from the world config uniform via `wc_u32(WC_BRAIN_TICK_STRIDE)`. Currently this value only lives on the Rust side. We need a uniform slot for it.
+The fused kernel shader reads `brain_tick_stride` from the world config uniform via `wc_u32(WC_BRAIN_TICK_STRIDE)`. Currently this value only lives on the Rust side. We need a uniform slot for it.
 
 - [x] **Step 1: Add WC_BRAIN_TICK_STRIDE constant to buffers.rs**
 
@@ -647,7 +647,7 @@ Update all call sites to pass the brain_tick_stride value (same as Task 1 for vi
 
 - [x] **Step 3: Add WC_BRAIN_TICK_STRIDE to common.wgsl**
 
-In `crates/xagent-brain/src/shaders/mega/common.wgsl`, after `WC_VISION_STRIDE`:
+In `crates/xagent-brain/src/shaders/kernel/common.wgsl`, after `WC_VISION_STRIDE`:
 
 ```wgsl
 const WC_BRAIN_TICK_STRIDE: u32 = 23u;
@@ -661,41 +661,41 @@ Expected: All tests pass.
 - [x] **Step 5: Commit**
 
 ```bash
-git add crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/mega/common.wgsl
-git commit -m "feat: add WC_BRAIN_TICK_STRIDE uniform slot for mega-kernel shader"
+git add crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/kernel/common.wgsl
+git commit -m "feat: add WC_BRAIN_TICK_STRIDE uniform slot for fused kernel shader"
 ```
 
 ---
 
-### Task 5: Wire up mega and global pipelines in `gpu_mega_kernel.rs`
+### Task 5: Wire up kernel and global pipelines in `gpu_kernel.rs`
 
 **Files:**
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs:20-66` (struct fields)
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs:340-604` (shader composition + pipeline creation)
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs:725-742` (upload_world_config_masked)
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs:20-66` (struct fields)
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs:340-604` (shader composition + pipeline creation)
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs:725-742` (upload_world_config_masked)
 
-This task adds the `mega_pipeline` and `global_pipeline` to the struct, composes their shaders, creates their pipeline objects, and stores `vision_stride`. The old `physics_pipeline` and `brain_pipeline` are **kept** for now (Task 7 removes them). The dispatch loop is updated in Task 6.
+This task adds the `kernel_pipeline` and `global_pipeline` to the struct, composes their shaders, creates their pipeline objects, and stores `vision_stride`. The old `physics_pipeline` and `brain_pipeline` are **kept** for now (Task 7 removes them). The dispatch loop is updated in Task 6.
 
-- [x] **Step 1: Add new fields to GpuMegaKernel struct**
+- [x] **Step 1: Add new fields to GpuKernel struct**
 
 In the struct definition (line ~20), add after `brain_pipeline`:
 
 ```rust
-    mega_pipeline: wgpu::ComputePipeline,
+    kernel_pipeline: wgpu::ComputePipeline,
     global_pipeline: wgpu::ComputePipeline,
     vision_stride: u32,
 ```
 
-- [x] **Step 2: Compose mega-kernel shader source**
+- [x] **Step 2: Compose fused kernel shader source**
 
 In the `new()` function, after the brain shader composition block (after line ~478), add:
 
 ```rust
-        // ── Compose mega-kernel shader ──
-        // mega_tick.wgsl calls brain functions from brain_tick.wgsl.
+        // ── Compose fused kernel shader ──
+        // kernel_tick.wgsl calls brain functions from brain_tick.wgsl.
         // brain_tick.wgsl has its own entry point `brain_tick` which we strip
         // by only including the function bodies (everything before the entry point).
-        let brain_functions_src = include_str!("shaders/mega/brain_tick.wgsl");
+        let brain_functions_src = include_str!("shaders/kernel/brain_tick.wgsl");
         // Strip the entry point — take everything up to (but not including) the
         // `@compute @workgroup_size(256)` line for `fn brain_tick`.
         let brain_fn_end = brain_functions_src
@@ -703,47 +703,47 @@ In the `new()` function, after the brain shader composition block (after line ~4
             .unwrap_or(brain_functions_src.len());
         let brain_fns_only = &brain_functions_src[..brain_fn_end];
 
-        let mut mega_source = format!(
+        let mut kernel_source = format!(
             "{}\n{}\n{}",
             &common_src,
             brain_fns_only,
-            include_str!("shaders/mega/mega_tick.wgsl"),
+            include_str!("shaders/kernel/kernel_tick.wgsl"),
         );
 
-        // Apply subgroup intrinsics to mega shader (same markers, MEGA_ prefix)
+        // Apply subgroup intrinsics to kernel shader (same markers, KERNEL_ prefix)
         if has_subgroup {
-            mega_source = mega_source.replace(
-                "// MEGA_SUBGROUP_ENTRY_PARAMS",
+            kernel_source = kernel_source.replace(
+                "// KERNEL_SUBGROUP_ENTRY_PARAMS",
                 "@builtin(subgroup_invocation_id) sgid: u32,",
             );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_PARAMS */",
+            kernel_source = kernel_source.replace(
+                "/* KERNEL_SUBGROUP_TOPK_PARAMS */",
                 ", sgid: u32",
             );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_ARGS */",
+            kernel_source = kernel_source.replace(
+                "/* KERNEL_SUBGROUP_TOPK_ARGS */",
                 ", sgid",
             );
-            mega_source = mega_source.replace(
-                "/* MEGA_SUBGROUP_TOPK_INNER_ARGS */",
+            kernel_source = kernel_source.replace(
+                "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
                 ", sgid",
             );
 
             // Apply same bitonic sort replacement as brain shader
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) = (mega_source.find(begin_marker), mega_source.find(end_marker)) {
+            if let (Some(begin_pos), Some(end_pos)) = (kernel_source.find(begin_marker), kernel_source.find(end_marker)) {
                 let end_pos = end_pos + end_marker.len();
                 // Reuse the same subgroup_sort string from the brain shader block
-                mega_source.replace_range(begin_pos..end_pos, subgroup_sort);
+                kernel_source.replace_range(begin_pos..end_pos, subgroup_sort);
             } else {
-                log::error!("[GpuMegaKernel] Subgroup sort markers not found in mega shader");
+                log::error!("[GpuKernel] Subgroup sort markers not found in kernel shader");
             }
         } else {
-            mega_source = mega_source.replace("// MEGA_SUBGROUP_ENTRY_PARAMS\n", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_PARAMS */", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_ARGS */", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_INNER_ARGS */", "");
+            kernel_source = kernel_source.replace("// KERNEL_SUBGROUP_ENTRY_PARAMS\n", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_PARAMS */", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_ARGS */", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", "");
         }
 ```
 
@@ -751,23 +751,23 @@ In the `new()` function, after the brain shader composition block (after line ~4
 
 - [x] **Step 3: Compose global shader source**
 
-After the mega shader composition:
+After the kernel shader composition:
 
 ```rust
         // ── Compose global-pass shader ──
         let global_source = [
             &common_src,
-            include_str!("shaders/mega/phase_clear.wgsl"),
-            include_str!("shaders/mega/phase_food_grid.wgsl"),
-            include_str!("shaders/mega/phase_food_respawn.wgsl"),
-            include_str!("shaders/mega/phase_agent_grid.wgsl"),
-            include_str!("shaders/mega/phase_collision.wgsl"),
-            include_str!("shaders/mega/global_tick.wgsl"),
+            include_str!("shaders/kernel/phase_clear.wgsl"),
+            include_str!("shaders/kernel/phase_food_grid.wgsl"),
+            include_str!("shaders/kernel/phase_food_respawn.wgsl"),
+            include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+            include_str!("shaders/kernel/phase_collision.wgsl"),
+            include_str!("shaders/kernel/global_tick.wgsl"),
         ]
         .join("\n");
 ```
 
-- [x] **Step 4: Create mega and global pipelines**
+- [x] **Step 4: Create kernel and global pipelines**
 
 After the existing prepare_pipeline creation (line ~604):
 
@@ -782,16 +782,16 @@ After the existing prepare_pipeline creation (line ~604):
             }],
         });
 
-        // ── Create mega-kernel pipeline (no push constants — reads from uniform) ──
-        let mega_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mega_tick"),
-            source: wgpu::ShaderSource::Wgsl(mega_source.into()),
+        // ── Create fused kernel pipeline (no push constants — reads from uniform) ──
+        let kernel_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kernel_tick"),
+            source: wgpu::ShaderSource::Wgsl(kernel_source.into()),
         });
-        let mega_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mega_tick"),
+        let kernel_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("kernel_tick"),
             layout: Some(&brain_layout), // no push constants
-            module: &mega_module,
-            entry_point: Some("mega_tick"),
+            module: &kernel_module,
+            entry_point: Some("kernel_tick"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -813,10 +813,10 @@ After the existing prepare_pipeline creation (line ~604):
 
 - [x] **Step 5: Store new fields in the struct constructor return**
 
-In the `GpuMegaKernel { ... }` return at the end of `new()` (around line 670), add:
+In the `GpuKernel { ... }` return at the end of `new()` (around line 670), add:
 
 ```rust
-            mega_pipeline,
+            kernel_pipeline,
             global_pipeline,
             vision_stride: brain_config.vision_stride,
 ```
@@ -845,18 +845,18 @@ Expected: Compiles without errors. The new pipelines exist but aren't dispatched
 - [x] **Step 8: Commit**
 
 ```bash
-git add crates/xagent-brain/src/gpu_mega_kernel.rs
-git commit -m "feat: wire mega_pipeline and global_pipeline in GpuMegaKernel"
+git add crates/xagent-brain/src/gpu_kernel.rs
+git commit -m "feat: wire kernel_pipeline and global_pipeline in GpuKernel"
 ```
 
 ---
 
-### Task 6: Replace dispatch loop with mega + global dispatches
+### Task 6: Replace dispatch loop with kernel + global dispatches
 
 **Files:**
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs:850-948` (dispatch_batch)
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs:850-948` (dispatch_batch)
 
-Replace the per-cycle physics→vision→brain loop with mega-kernel + global pass dispatches.
+Replace the per-cycle physics→vision→brain loop with fused kernel + global pass dispatches.
 
 - [x] **Step 1: Rewrite dispatch_batch**
 
@@ -874,21 +874,21 @@ Replace the body of `dispatch_batch` (lines 850-948) with:
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
-        let mega_batches = brain_cycles / self.vision_stride;
+        let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
 
-        let ticks_per_mega = self.vision_stride * self.brain_tick_stride;
+        let ticks_per_batch = self.vision_stride * self.brain_tick_stride;
         let mut tick_cursor = start_tick;
 
-        // Chunk mega-batches to avoid Metal command buffer limits
-        const MEGAS_PER_CHUNK: u32 = 50;
-        let total_megas = mega_batches + if remainder_cycles > 0 { 1 } else { 0 };
-        let mut mega_idx = 0u32;
+        // Chunk kernel batches to avoid Metal command buffer limits
+        const BATCHES_PER_CHUNK: u32 = 50;
+        let total_batches = kernel_batches + if remainder_cycles > 0 { 1 } else { 0 };
+        let mut batch_idx = 0u32;
 
-        while mega_idx < total_megas {
-            let chunk_end = (mega_idx + MEGAS_PER_CHUNK).min(total_megas);
+        while batch_idx < total_batches {
+            let chunk_end = (batch_idx + BATCHES_PER_CHUNK).min(total_batches);
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_mega"),
+                label: Some("dispatch_kernel"),
             });
 
             // Prepare indirect dispatch args (once per chunk, for vision)
@@ -899,18 +899,18 @@ Replace the body of `dispatch_batch` (lines 850-948) with:
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
-            for m in mega_idx..chunk_end {
-                let is_remainder = m == mega_batches;
+            for m in batch_idx..chunk_end {
+                let is_remainder = m == kernel_batches;
                 let cycles_this_batch = if is_remainder { remainder_cycles } else { self.vision_stride };
                 let ticks_this_batch = cycles_this_batch * self.brain_tick_stride;
 
                 // Upload world config with current tick cursor and vision_stride for this batch
                 self.upload_world_config_masked(tick_cursor, ticks_this_batch, 0x7);
 
-                // Mega-kernel: 1 pass, cycles_this_batch brain cycles
+                // Fused kernel: 1 pass, cycles_this_batch brain cycles
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.mega_pipeline);
+                    pass.set_pipeline(&self.kernel_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                     pass.dispatch_workgroups(self.agent_count, 1, 1);
                 }
@@ -938,16 +938,16 @@ Replace the body of `dispatch_batch` (lines 850-948) with:
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
-            mega_idx = chunk_end;
+            batch_idx = chunk_end;
         }
 
-        // Handle physics-only remainder (brain cycles that don't fill a single mega batch
+        // Handle physics-only remainder (brain cycles that don't fill a single kernel batch
         // are already handled above via remainder_cycles)
         let physics_remainder = ticks_to_run % self.brain_tick_stride;
 
         // Final submit: physics remainder + async state readback
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dispatch_mega_final"),
+            label: Some("dispatch_kernel_final"),
         });
         if physics_remainder > 0 {
             self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
@@ -982,14 +982,14 @@ Replace the body of `dispatch_batch` (lines 850-948) with:
 ```
 
 **Key changes from old dispatch_batch:**
-- Instead of 3 passes per brain cycle (physics → vision → brain), we now do 3 passes per `vision_stride` brain cycles (mega → global → vision).
-- The mega-kernel runs `vision_stride` brain cycles in a single dispatch.
-- `upload_world_config_masked` is called per mega-batch (not once) since the tick changes.
+- Instead of 3 passes per brain cycle (physics → vision → brain), we now do 3 passes per `vision_stride` brain cycles (kernel → global → vision).
+- The fused kernel runs `vision_stride` brain cycles in a single dispatch.
+- `upload_world_config_masked` is called per kernel batch (not once) since the tick changes.
 - Physics remainder (ticks that don't fill a full brain cycle) still uses the old physics_pipeline.
 
 - [x] **Step 2: Handle the vision_stride in the world config upload**
 
-The mega-kernel reads `WC_VISION_STRIDE` from the uniform, but we might be running a remainder batch with fewer cycles. We need to temporarily override vision_stride for remainder batches.
+The fused kernel reads `WC_VISION_STRIDE` from the uniform, but we might be running a remainder batch with fewer cycles. We need to temporarily override vision_stride for remainder batches.
 
 Add a helper method:
 
@@ -1042,8 +1042,8 @@ Check the diagnostic log output for:
 - [x] **Step 6: Commit**
 
 ```bash
-git add crates/xagent-brain/src/gpu_mega_kernel.rs
-git commit -m "feat: replace per-cycle dispatch with mega+global dispatch loop"
+git add crates/xagent-brain/src/gpu_kernel.rs
+git commit -m "feat: replace per-cycle dispatch with kernel+global dispatch loop"
 ```
 
 ---
@@ -1051,7 +1051,7 @@ git commit -m "feat: replace per-cycle dispatch with mega+global dispatch loop"
 ### Task 7: Clean up old dispatch code and diagnostic logging
 
 **Files:**
-- Modify: `crates/xagent-brain/src/gpu_mega_kernel.rs` (remove dispatch_batch_masked if unused)
+- Modify: `crates/xagent-brain/src/gpu_kernel.rs` (remove dispatch_batch_masked if unused)
 - Modify: `crates/xagent-sandbox/src/main.rs` (remove diagnostic logging fields/code)
 
 - [x] **Step 1: Remove diagnostic logging from main.rs**
@@ -1067,7 +1067,7 @@ Remove the diagnostic logging block (lines ~1331-1354) that prints every 2 secon
 
 - [x] **Step 2: Evaluate dispatch_batch_masked**
 
-Check if `dispatch_batch_masked` is still called anywhere. If only used for profiling and not called in production code, leave it but mark it `#[allow(dead_code)]`. If it's actively used, keep it and update it to use the new mega dispatch pattern too.
+Check if `dispatch_batch_masked` is still called anywhere. If only used for profiling and not called in production code, leave it but mark it `#[allow(dead_code)]`. If it's actively used, keep it and update it to use the new kernel dispatch pattern too.
 
 Run: `grep -rn "dispatch_batch_masked" crates/`
 
@@ -1084,6 +1084,6 @@ Verify: normal operation at 1x and 1000x speed, no panics.
 - [x] **Step 5: Commit**
 
 ```bash
-git add crates/xagent-sandbox/src/main.rs crates/xagent-brain/src/gpu_mega_kernel.rs
+git add crates/xagent-sandbox/src/main.rs crates/xagent-brain/src/gpu_kernel.rs
 git commit -m "fix: remove diagnostic logging and clean up old dispatch code"
 ```

@@ -84,7 +84,7 @@ feature_extract → encode → habituate_homeo → recall_score → recall_topk 
 Two dispatch modes are available:
 
 - **GpuBrain (7-pass)**: One compute dispatch per pass per tick, one thread per agent (`@workgroup_size(1)`). Simple, inspectable, used for small-scale experiments.
-- **GpuMegaKernel (fused)**: All per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) fused into a single dispatch per `vision_stride` cycles. Each agent gets a 256-thread workgroup. A separate global pass handles grid rebuild, collisions, and vision raycasting. This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement over per-tick dispatch.
+- **GpuKernel (fused)**: All per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) fused into a single dispatch per `vision_stride` cycles. Each agent gets a 256-thread workgroup. A separate global pass handles grid rebuild, collisions, and vision raycasting. This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement over per-tick dispatch.
 
 The `vision_stride` parameter (default 10) controls how many brain+physics cycles run between global passes (grid rebuild, collision, vision). Higher values mean more brain throughput but less frequent sensory updates.
 
@@ -437,7 +437,7 @@ xagent/
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
 │   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
-│   │       ├── gpu_mega_kernel.rs  # GpuMegaKernel — fused dispatch, telemetry readback
+│   │       ├── gpu_kernel.rs  # GpuKernel — fused dispatch, telemetry readback
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
 │   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
@@ -447,9 +447,9 @@ xagent/
 │   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
 │   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
 │   │           ├── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
-│   │           └── mega/
-│   │               ├── common.wgsl       # Shared constants for mega-kernel shaders
-│   │               ├── mega_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
+│   │           └── kernel/
+│   │               ├── common.wgsl       # Shared constants for fused kernel shaders
+│   │               ├── kernel_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
 │   │               └── global_tick.wgsl  # Grid rebuild + collision pass (1,1,1)
 │   │
 │   └── xagent-sandbox/         # World simulation + application
@@ -527,7 +527,7 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 38 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling, mega-kernel tick loop, deterministic bench |
+| **xagent-brain** | 38 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling, fused kernel tick loop, deterministic bench |
 | **xagent-shared** | 1 | Config defaults (vision_stride) |
 | **xagent-sandbox** | 95 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
 

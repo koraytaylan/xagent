@@ -1,4 +1,4 @@
-// ── Mega-kernel common definitions ──────────────────────────────────────────
+// ── Kernel common definitions ──────────────────────────────────────────
 // Shared constants, buffer bindings, and helper functions for all phases.
 // Values MUST match buffers.rs and the per-shader constants injected by
 // wgsl_constants() / wgsl_physics_constants().

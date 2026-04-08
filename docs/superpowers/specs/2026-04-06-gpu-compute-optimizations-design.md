@@ -6,7 +6,7 @@ Reduce per-frame GPU latency for the brain compute pipeline through five targete
 
 ## Architecture
 
-The mega-kernel dispatches three pipelines per cycle: physics (1 workgroup, 256 threads), vision (agent_count workgroups, 48/256 active), brain (agent_count workgroups, 256 threads). At 10 agents, GPU occupancy is low — the critical path is how fast a single brain workgroup completes.
+In the current main-loop code path, each cycle dispatches the per-agent fused kernel together with global and vision work. Standalone physics/brain pipeline dispatches are used mainly for remainder handling rather than the primary per-cycle path. At 10 agents, GPU occupancy is low — the critical path is how fast a single brain workgroup completes.
 
 The brain shader has 7 cooperative passes. Two are serial bottlenecks:
 - **Pass 5 (top-K)**: 2,048 serial comparisons on thread 0 (16 rounds × 128 candidates)
@@ -17,7 +17,7 @@ This spec addresses Pass 5 directly (optimizations 1, 5) and improves memory thr
 ## Tech Stack
 
 - wgpu 24, WGSL compute shaders
-- Rust (gpu_mega_kernel.rs, buffers.rs)
+- Rust (gpu_kernel.rs, buffers.rs)
 - Apple Silicon / NVIDIA / AMD GPU targets
 - New wgpu feature: `Features::SUBGROUP` (optimization 5)
 
@@ -82,7 +82,7 @@ let descending = ((i >> (stage + 1u)) & 1u) == 0u;
 
 ### Files Changed
 
-- `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — rewrite `coop_recall_topk`
+- `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — rewrite `coop_recall_topk`
 
 ---
 
@@ -136,9 +136,9 @@ Write pattern changes from contiguous (stride 1) to strided (stride 128). This i
 ### Files Changed
 
 - `crates/xagent-brain/src/buffers.rs` — `init_pattern_memory()` uses transposed layout
-- `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — Pass 4 (`coop_recall_score`) and Pass 7 (`coop_learn_and_store`) index transposed
-- `crates/xagent-brain/src/shaders/mega/common.wgsl` — add comment documenting SoA layout for O_PAT_STATES
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — `read_agent_state()` transposes on CPU read for state inheritance
+- `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — Pass 4 (`coop_recall_score`) and Pass 7 (`coop_learn_and_store`) index transposed
+- `crates/xagent-brain/src/shaders/kernel/common.wgsl` — add comment documenting SoA layout for O_PAT_STATES
+- `crates/xagent-brain/src/gpu_kernel.rs` — `read_agent_state()` transposes on CPU read for state inheritance
 
 ---
 
@@ -146,7 +146,7 @@ Write pattern changes from contiguous (stride 1) to strided (stride 128). This i
 
 ### Current State
 
-`dispatch_batch` in `gpu_mega_kernel.rs`:
+`dispatch_batch` in `gpu_kernel.rs`:
 1. `device.poll(Maintain::Poll)` + `try_collect_staging()`
 2. `upload_world_config_masked()` — writes to `world_config_buf`
 3. Encode cycles (chunked by 100): physics + vision + brain per cycle
@@ -177,7 +177,7 @@ This eliminates the poll-before-dispatch coupling. The main loop can collect res
 Two `world_config_buf` instances and two corresponding bind groups. Alternate which is written/active each batch:
 
 ```rust
-struct GpuMegaKernel {
+struct GpuKernel {
     world_config_bufs: [wgpu::Buffer; 2],
     bind_groups: [wgpu::BindGroup; 2],
     active_bind_group: usize,  // 0 or 1
@@ -189,7 +189,7 @@ struct GpuMegaKernel {
 
 ### Files Changed
 
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — split poll/collect, double-buffer world config + bind groups
+- `crates/xagent-brain/src/gpu_kernel.rs` — split poll/collect, double-buffer world config + bind groups
 - `crates/xagent-sandbox/src/main.rs` — call `poll_and_collect()` before `dispatch_batch()`
 
 ---
@@ -204,7 +204,7 @@ pass.dispatch_workgroups(self.agent_count, 1, 1);  // vision
 pass.dispatch_workgroups(self.agent_count, 1, 1);  // brain
 ```
 
-`agent_count` is fixed for the lifetime of a `GpuMegaKernel` instance.
+`agent_count` is fixed for the lifetime of a `GpuKernel` instance.
 
 ### Design
 
@@ -213,7 +213,7 @@ A small compute shader writes dispatch arguments to an indirect buffer. Vision a
 **New buffer**:
 ```rust
 let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
-    label: Some("mega_dispatch_args"),
+    label: Some("kernel_dispatch_args"),
     size: 6 * 4,  // 2 × (x, y, z) u32 triplets: [vision_x, 1, 1, brain_x, 1, 1]
     usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
     mapped_at_creation: false,
@@ -260,9 +260,9 @@ pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 12);  // offset to se
 
 ### Files Changed
 
-- `crates/xagent-brain/src/shaders/mega/phase_prepare_dispatch.wgsl` — new file
-- `crates/xagent-brain/src/shaders/mega/common.wgsl` — add dispatch_args binding 15
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — add buffer, pipeline, binding; change dispatch calls to indirect
+- `crates/xagent-brain/src/shaders/kernel/phase_prepare_dispatch.wgsl` — new file
+- `crates/xagent-brain/src/shaders/kernel/common.wgsl` — add dispatch_args binding 15
+- `crates/xagent-brain/src/gpu_kernel.rs` — add buffer, pipeline, binding; change dispatch calls to indirect
 - `crates/xagent-brain/src/buffers.rs` — document dispatch_args layout
 
 ---
@@ -326,8 +326,8 @@ The Rust side checks `adapter.features().contains(Features::SUBGROUP)` and compo
 
 ### Files Changed
 
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — request SUBGROUP feature (with fallback), compose shader variant
-- `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — bitonic sort uses subgroup ops for stages 1–5
+- `crates/xagent-brain/src/gpu_kernel.rs` — request SUBGROUP feature (with fallback), compose shader variant
+- `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — bitonic sort uses subgroup ops for stages 1–5
 
 ---
 

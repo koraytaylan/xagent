@@ -1,6 +1,6 @@
 // ── Global pass: grid rebuild, food respawn, collisions ─────────────────────
 // dispatch(1, 1, 1) — single workgroup of 256 threads.
-// Runs once per vision_stride mega-kernel cycles.
+// Runs once per vision_stride kernel cycles.
 // Requires: common.wgsl + phase_clear + phase_food_grid + phase_food_respawn
 //           + phase_agent_grid + phase_collision (concatenated by Rust).
 

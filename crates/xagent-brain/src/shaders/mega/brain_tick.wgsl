@@ -21,21 +21,22 @@ fn rand_f32_brain(seed: u32) -> f32 {
     return hash_to_float(pcg_hash(seed));
 }
 
-// Cosine similarity using shared habituated state
+// Cosine similarity using shared encoded state (pre-habituation)
+// for memory operations — avoids attenuation silencing recall.
 fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
     let p_base = agent_id * PATTERN_STRIDE;
     var dot_val: f32 = 0.0;
-    var h_norm_sq: f32 = 0.0;
+    var e_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-        let h = s_habituated[d];
+        let e = s_encoded[d];
         let p = pattern_buf[p_base + d * MEMORY_CAP + idx];
-        dot_val += h * p;
-        h_norm_sq += h * h;
+        dot_val += e * p;
+        e_norm_sq += e * e;
     }
-    let h_norm = sqrt(h_norm_sq);
+    let e_norm = sqrt(e_norm_sq);
     let p_norm = pattern_buf[p_base + O_PAT_NORMS + idx];
-    if (h_norm < 1e-8 || p_norm < 1e-8) { return 0.0; }
-    return clamp(dot_val / (h_norm * p_norm), -1.0, 1.0);
+    if (e_norm < 1e-8 || p_norm < 1e-8) { return 0.0; }
+    return clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -158,9 +159,10 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         let p_base = agent_id * PATTERN_STRIDE;
 
         // Each thread computes query norm independently (32 shared reads — fast)
+        // Uses encoded (pre-habituation) state for memory queries.
         var q_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            let v = s_habituated[d];
+            let v = s_encoded[d];
             q_norm_sq += v * v;
         }
         let q_norm = sqrt(q_norm_sq);
@@ -171,7 +173,7 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         } else {
             var dot: f32 = 0.0;
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                dot += s_habituated[d] * pattern_buf[p_base + d * MEMORY_CAP + tid];
+                dot += s_encoded[d] * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
             if (q_norm < 1e-8 || p_norm < 1e-8) {
@@ -610,19 +612,20 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     }
 
     // ── 7c. Memory reinforcement: threads 0..127 ──────────────────────
+    // Uses encoded (pre-habituation) state for memory similarity.
     if (tid < MEMORY_CAP) {
         if (pattern_buf[p_base + O_PAT_ACTIVE + tid] >= 0.5) {
-            var h_norm_sq: f32 = 0.0;
+            var e_norm_sq: f32 = 0.0;
             var dot_val: f32 = 0.0;
             for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                let h = s_habituated[d];
-                h_norm_sq += h * h;
-                dot_val += h * pattern_buf[p_base + d * MEMORY_CAP + tid];
+                let e = s_encoded[d];
+                e_norm_sq += e * e;
+                dot_val += e * pattern_buf[p_base + d * MEMORY_CAP + tid];
             }
-            let h_norm = sqrt(h_norm_sq);
+            let e_norm = sqrt(e_norm_sq);
             let p_norm = pattern_buf[p_base + O_PAT_NORMS + tid];
-            if (h_norm >= 1e-8 && p_norm >= 1e-8) {
-                let sim = clamp(dot_val / (h_norm * p_norm), -1.0, 1.0);
+            if (e_norm >= 1e-8 && p_norm >= 1e-8) {
+                let sim = clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
                 if (sim > 0.3) {
                     pattern_buf[p_base + O_PAT_REINF + tid] += sim * learning_rate * (1.0 - s_pred_error);
                     pattern_buf[p_base + O_PAT_REINF + tid] = clamp(
@@ -638,17 +641,18 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     storageBarrier(); workgroupBarrier();
 
     // ── 7d. Memory store: thread 0 ─────────────────────────────────────
+    // Stores encoded (pre-habituation) state for consistent memory keys.
     if (tid == 0u) {
         let min_idx = u32(pattern_buf[p_base + O_MIN_REINF_IDX]);
         let motor_fwd = decision_buf[d_base + DIM + DIM];
         let motor_trn = decision_buf[d_base + DIM + DIM + 1u];
-        var h_norm_sq: f32 = 0.0;
+        var e_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            let h = s_habituated[d];
-            h_norm_sq += h * h;
-            pattern_buf[p_base + d * MEMORY_CAP + min_idx] = h;
+            let e = s_encoded[d];
+            e_norm_sq += e * e;
+            pattern_buf[p_base + d * MEMORY_CAP + min_idx] = e;
         }
-        pattern_buf[p_base + O_PAT_NORMS + min_idx] = sqrt(h_norm_sq);
+        pattern_buf[p_base + O_PAT_NORMS + min_idx] = sqrt(e_norm_sq);
         pattern_buf[p_base + O_PAT_REINF + min_idx] = 1.0;
         pattern_buf[p_base + O_PAT_MOTOR + min_idx * 3u] = motor_fwd;
         pattern_buf[p_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_trn;

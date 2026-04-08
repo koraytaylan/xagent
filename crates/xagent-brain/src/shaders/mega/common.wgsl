@@ -19,7 +19,7 @@ const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
 const DIM: u32 = 32u;
-const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + 25u;
+const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
 const ACTION_HISTORY_LEN: u32 = 64u;

@@ -1,6 +1,6 @@
 // Pass 1: Sensory input -> feature vector
-// Reads packed sensory data (267 f32 per agent), produces features (217 f32 per agent).
-// Feature layout matches the CPU SensoryEncoder: vision RGBA (192), then non-visual (25).
+// Reads packed sensory data (267 f32 per agent), produces features (265 f32 per agent).
+// Feature layout: vision RGBA (192), vision depth (48), then non-visual (25).
 
 @group(0) @binding(0) var<storage, read> sensory: array<f32>;
 @group(0) @binding(1) var<storage, read_write> features: array<f32>;
@@ -19,7 +19,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         fi = fi + 1u;
     }
 
-    // Skip vision depth (48 values at offset 192) -- not used as features
+    // Vision depth: 48 values (direct copy)
+    for (var i: u32 = 0u; i < VISION_DEPTH_COUNT; i = i + 1u) {
+        features[f_base + fi] = sensory[s_base + 192u + i];
+        fi = fi + 1u;
+    }
 
     // Proprioception: velocity magnitude (1)
     let vel_offset = 192u + 48u; // after vision_color + vision_depth
@@ -72,5 +76,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         features[f_base + fi] = sensory[s_base + to + 3u];  // surface_tag/4
         fi = fi + 1u;
     }
-    // fi should now be 192 + 1 + 3 + 1 + 1 + 1 + 1 + 1 + 16 = 217 = FEATURE_COUNT
+    // fi should now be 192 + 48 + 1 + 3 + 1 + 1 + 1 + 1 + 1 + 16 = 265 = FEATURE_COUNT
 }

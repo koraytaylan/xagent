@@ -39,7 +39,7 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 1: Feature extract (thread 0 — 217 reads, not a bottleneck)
+// Pass 1: Feature extract (thread 0 — 265 reads, not a bottleneck)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_feature_extract(agent_id: u32, tid: u32) {
@@ -48,6 +48,10 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         var fi: u32 = 0u;
         for (var i: u32 = 0u; i < VISION_COLOR_COUNT; i = i + 1u) {
             s_features[fi] = sensory_buf[s_base + i];
+            fi = fi + 1u;
+        }
+        for (var i: u32 = 0u; i < VISION_DEPTH_COUNT; i = i + 1u) {
+            s_features[fi] = sensory_buf[s_base + VISION_COLOR_COUNT + i];
             fi = fi + 1u;
         }
         let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
@@ -77,7 +81,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 2: Encode (threads 0..31 — 217 MADs each, coalesced access)
+// Pass 2: Encode (threads 0..31 — 265 MADs each, coalesced access)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_encode(agent_id: u32, tid: u32) {

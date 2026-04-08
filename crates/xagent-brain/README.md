@@ -114,7 +114,7 @@ xagent-brain/src/
   gpu_brain.rs        -- GpuBrain struct, wgpu device/queue, 12 GPU buffers,
                          7 compute pipelines, tick/submit/collect API,
                          state read/write, death_signal, resize
-  gpu_mega_kernel.rs  -- GpuMegaKernel: fused dispatch, physics+brain in one kernel,
+  gpu_kernel.rs  -- GpuKernel: fused dispatch, physics+brain in one kernel,
                          async state readback, per-agent telemetry readback
   buffers.rs          -- All buffer layout constants, sensory packing,
                          initialization functions, AgentBrainState type
@@ -128,9 +128,9 @@ xagent-brain/src/shaders/        -- 7-pass individual shaders (used by GpuBrain)
   predict_and_act.wgsl   -- Pass 6: prediction, credit, policy, fatigue
   learn_and_store.wgsl   -- Pass 7: weight updates, memory store, decay
 
-xagent-brain/src/shaders/mega/   -- Fused mega-kernel shaders (used by GpuMegaKernel)
+xagent-brain/src/shaders/kernel/   -- Fused kernel shaders (used by GpuKernel)
   common.wgsl            -- Shared constants and world-config layout
-  mega_tick.wgsl         -- Fused per-agent kernel: physics + food detect +
+  kernel_tick.wgsl         -- Fused per-agent kernel: physics + food detect +
                             death/respawn + all 7 brain passes, looped over
                             vision_stride cycles (dispatch: agent_count,1,1)
   global_tick.wgsl       -- Grid rebuild + collision pass (dispatch: 1,1,1)
@@ -139,9 +139,9 @@ xagent-brain/src/shaders/mega/   -- Fused mega-kernel shaders (used by GpuMegaKe
 Two dispatch modes are available:
 
 - **GpuBrain** orchestrates the 7 individual shader dispatches per tick, one thread per agent. Simple and inspectable.
-- **GpuMegaKernel** fuses all per-agent computation into a single dispatch with 256 threads per agent workgroup. A separate global pass handles grid rebuild, collisions, and vision. The `vision_stride` parameter controls how many brain+physics cycles run between global passes (default 10). This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement.
+- **GpuKernel** fuses all per-agent computation into a single dispatch with 256 threads per agent workgroup. A separate global pass handles grid rebuild, collisions, and vision. The `vision_stride` parameter controls how many brain+physics cycles run between global passes (default 10). This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement.
 
-Both modes produce identical simulation results — the mega-kernel is a performance optimization, not a behavioral change.
+Both modes produce identical simulation results — the fused kernel is a performance optimization, not a behavioral change.
 
 ---
 
@@ -711,9 +711,9 @@ Used for cross-generation inheritance (the governor reads parent state, mutates 
 
 Stub telemetry struct for UI/recording compatibility. Key fields: `prediction_error`, `memory_utilization`, `exploration_rate`, `homeostatic_gradient`, `homeostatic_urgency`, `fatigue_factor`, etc.
 
-### AgentTelemetry (GpuMegaKernel)
+### AgentTelemetry (GpuKernel)
 
-`GpuMegaKernel::read_agent_telemetry(index)` performs a blocking readback of one agent's sensory, decision, and brain-state buffers, returning an `AgentTelemetry` struct with: vision color (192 RGBA floats), motor forward/turn, mean habituation attenuation, curiosity bonus, fatigue factor, motor variance, urgency, and homeostatic gradient. Called once per frame for the selected agent — not per-tick for all agents, which would negate performance gains.
+`GpuKernel::read_agent_telemetry(index)` performs a blocking readback of one agent's sensory, decision, and brain-state buffers, returning an `AgentTelemetry` struct with: vision color (192 RGBA floats), motor forward/turn, mean habituation attenuation, curiosity bonus, fatigue factor, motor variance, urgency, and homeostatic gradient. Called once per frame for the selected agent — not per-tick for all agents, which would negate performance gains.
 
 The `behavior_phase()` method classifies agent state:
 
@@ -809,11 +809,11 @@ The previous CPU implementation had one `Brain` struct per agent with heap-alloc
 
 Moving to GPU makes all 50 agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. The CPU's only job is packing sensory frames and reading motor commands.
 
-### Why 7 Passes (GpuBrain) and Why a Fused Kernel (GpuMegaKernel)
+### Why 7 Passes (GpuBrain) and Why a Fused Kernel (GpuKernel)
 
 **GpuBrain uses 7 passes** because each shader reads from and writes to global storage buffers, keeping the working set per invocation small. The pipeline barriers between passes are cheap (all dispatches go into a single command encoder), and the data locality benefits of specialized shaders make the code inspectable and testable.
 
-**GpuMegaKernel fuses everything** because CPU↔GPU coordination overhead dominates at high tick rates. The 7-pass model achieved ~600 ticks/second due to 11–19 dispatches per tick, per-tick `write_buffer` calls, and blocking readback. The fused kernel runs N brain cycles in a single dispatch — 256 threads per agent, workgroup barriers between phases, shared memory for cooperative food detection. The CPU encodes a fixed number of passes regardless of brain cycle count, achieving 60,000+ ticks/second. The brain function code is composed from the same WGSL source files, so both modes execute identical math.
+**GpuKernel fuses everything** because CPU↔GPU coordination overhead dominates at high tick rates. The 7-pass model achieved ~600 ticks/second due to 11–19 dispatches per tick, per-tick `write_buffer` calls, and blocking readback. The fused kernel runs N brain cycles in a single dispatch — 256 threads per agent, workgroup barriers between phases, shared memory for cooperative food detection. The CPU encodes a fixed number of passes regardless of brain cycle count, achieving 60,000+ ticks/second. The brain function code is composed from the same WGSL source files, so both modes execute identical math.
 
 ### Why Flat array<f32> Instead of Structured Buffers
 
@@ -863,7 +863,7 @@ Backpropagating prediction error through the predictor and into the encoder weig
 
 ### Current Limitations
 
-- **GpuBrain uses single-threaded workgroups**: The 7-pass `GpuBrain` dispatches one thread per agent (`@workgroup_size(1)`). The `GpuMegaKernel` addresses this with 256-thread workgroups and fused passes, but the 7-pass mode is retained for inspectability and testing.
+- **GpuBrain uses single-threaded workgroups**: The 7-pass `GpuBrain` dispatches one thread per agent (`@workgroup_size(1)`). The `GpuKernel` addresses this with 256-thread workgroups and fused passes, but the 7-pass mode is retained for inspectability and testing.
 
 - **No hierarchical pattern abstraction**: All 128 patterns are stored at the same level of abstraction. There is no mechanism for forming higher-order patterns ("I'm in a corridor" from a sequence of wall-patterns) or chunking temporal sequences into reusable units.
 
@@ -873,7 +873,7 @@ Backpropagating prediction error through the predictor and into the encoder weig
 
 - **No sleep/consolidation**: Biological brains consolidate memories during sleep, replaying and strengthening important patterns. The current system has no offline consolidation phase -- all learning happens online during ticks.
 
-- **Telemetry is per-selected-agent only**: `GpuMegaKernel::read_agent_telemetry()` reads vision, motor, and brain-state data for one agent per frame. Full telemetry for all agents simultaneously would still negate performance benefits.
+- **Telemetry is per-selected-agent only**: `GpuKernel::read_agent_telemetry()` reads vision, motor, and brain-state data for one agent per frame. Full telemetry for all agents simultaneously would still negate performance benefits.
 
 - **Depth features unused**: The 48 depth values from the sensory frame are uploaded but not extracted as features. Adding depth as a feature channel would improve spatial reasoning at the cost of a larger encoder weight matrix.
 

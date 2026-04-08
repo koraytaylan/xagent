@@ -1,4 +1,4 @@
-// ── Fused mega-kernel: per-agent physics + food + death + brain ─────────────
+// ── Fused kernel: per-agent physics + food + death + brain ─────────────
 // dispatch(agent_count, 1, 1) — one workgroup per agent, 256 threads each.
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
@@ -312,7 +312,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // Brain tick inner — delegates to the 7 cooperative passes from brain_tick.wgsl
 // ══════════════════════════════════════════════════════════════════════════
 
-fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
+fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     // Skip dead agents (uniform control flow — all threads agree)
     if (agent_phys[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
@@ -328,7 +328,7 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
     coop_recall_score(agent_id, tid);
     workgroupBarrier();
 
-    coop_recall_topk(agent_id, tid /* MEGA_SUBGROUP_TOPK_ARGS */);
+    coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */);
     storageBarrier(); workgroupBarrier();
 
     coop_predict_and_act(agent_id, tid);
@@ -342,10 +342,10 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* MEGA_SUBGROUP_TOPK_PARAMS */) {
 // ══════════════════════════════════════════════════════════════════════════
 
 @compute @workgroup_size(256)
-fn mega_tick(
+fn kernel_tick(
     @builtin(local_invocation_id) lid: vec3u,
     @builtin(workgroup_id) wgid: vec3u,
-    // MEGA_SUBGROUP_ENTRY_PARAMS
+    // KERNEL_SUBGROUP_ENTRY_PARAMS
 ) {
     let agent_id = wgid.x;
     let tid = lid.x;
@@ -375,7 +375,7 @@ fn mega_tick(
         workgroupBarrier();
 
         // Brain: all 256 threads, 7 cooperative passes
-        brain_tick_inner(agent_id, tid /* MEGA_SUBGROUP_TOPK_INNER_ARGS */);
+        brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
         workgroupBarrier();
     }
 }

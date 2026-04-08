@@ -1,4 +1,4 @@
-//! Mega-kernel: single-dispatch GPU simulation.
+//! Fused kernel: single-dispatch GPU simulation.
 //!
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
@@ -33,7 +33,7 @@ const TERRAIN_VPS: usize = 129;
 const BIOME_GRID_RES: usize = 256;
 
 #[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
-pub struct GpuMegaKernel {
+pub struct GpuKernel {
     device: wgpu::Device,
     queue: wgpu::Queue,
     agent_count: u32,
@@ -64,7 +64,7 @@ pub struct GpuMegaKernel {
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
-    mega_pipeline: wgpu::ComputePipeline,
+    kernel_pipeline: wgpu::ComputePipeline,
     global_pipeline: wgpu::ComputePipeline,
     vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
@@ -84,7 +84,7 @@ pub struct GpuMegaKernel {
     has_subgroup: bool, // retained for runtime diagnostics
 }
 
-impl GpuMegaKernel {
+impl GpuKernel {
     /// Expose the wgpu device.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
@@ -150,7 +150,7 @@ impl GpuMegaKernel {
         );
     }
 
-    /// Create the mega-kernel: device, buffers, composed shader, pipeline, bind group.
+    /// Create the fused kernel: device, buffers, composed shader, pipeline, bind group.
     pub fn new(
         agent_count: u32,
         food_count: usize,
@@ -173,7 +173,7 @@ impl GpuMegaKernel {
             force_fallback_adapter: false,
         }))
         .or_else(|| {
-            log::warn!("[GpuMegaKernel] No GPU adapter found, trying fallback (CPU) adapter");
+            log::warn!("[GpuKernel] No GPU adapter found, trying fallback (CPU) adapter");
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
@@ -182,15 +182,13 @@ impl GpuMegaKernel {
         })
         .expect("No GPU or fallback adapter found");
 
-        log::info!("[GpuMegaKernel] Adapter: {:?}", adapter.get_info());
+        log::info!("[GpuKernel] Adapter: {:?}", adapter.get_info());
 
         let has_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         if has_subgroup {
-            log::info!("[GpuMegaKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
+            log::info!("[GpuKernel] Subgroup support detected — enabling subgroup intrinsics for brain shader");
         } else {
-            log::info!(
-                "[GpuMegaKernel] No subgroup support — using shared-memory-only bitonic sort"
-            );
+            log::info!("[GpuKernel] No subgroup support — using shared-memory-only bitonic sort");
         }
 
         let adapter_limits = adapter.limits();
@@ -208,7 +206,7 @@ impl GpuMegaKernel {
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("gpu-mega-kernel"),
+                label: Some("gpu-kernel"),
                 required_features,
                 required_limits: {
                     required_limits.max_push_constant_size = 8;
@@ -230,105 +228,105 @@ impl GpuMegaKernel {
         // ── Storage buffers (13 read-write + 2 read-only) ──
 
         let agent_phys_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_agent_phys"),
+            label: Some("kernel_agent_phys"),
             size: (n * PHYS_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let decision_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_decision"),
+            label: Some("kernel_decision"),
             size: (n * DECISION_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let heightmap_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_heightmap"),
+            label: Some("kernel_heightmap"),
             size: (TERRAIN_VPS * TERRAIN_VPS * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let biome_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_biome"),
+            label: Some("kernel_biome"),
             size: (BIOME_GRID_RES * BIOME_GRID_RES * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let world_config_bufs = [
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mega_world_config_0"),
+                label: Some("kernel_world_config_0"),
                 size: (WORLD_CONFIG_SIZE * 4) as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mega_world_config_1"),
+                label: Some("kernel_world_config_1"),
                 size: (WORLD_CONFIG_SIZE * 4) as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
         ];
         let food_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_food_state"),
+            label: Some("kernel_food_state"),
             size: ((f * FOOD_STATE_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let food_flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_food_flags"),
+            label: Some("kernel_food_flags"),
             size: ((f * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let food_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_food_grid"),
+            label: Some("kernel_food_grid"),
             size: ((grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let agent_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_agent_grid"),
+            label: Some("kernel_agent_grid"),
             size: (grid_cells * AGENT_GRID_CELL_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let collision_scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_collision_scratch"),
+            label: Some("kernel_collision_scratch"),
             size: (n * 3 * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let sensory_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_sensory"),
+            label: Some("kernel_sensory"),
             size: (n * layout.sensory_stride * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let brain_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_brain_state"),
+            label: Some("kernel_brain_state"),
             size: (n * layout.brain_stride * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let pattern_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_pattern"),
+            label: Some("kernel_pattern"),
             size: (n * PATTERN_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let history_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_history"),
+            label: Some("kernel_history"),
             size: (n * HISTORY_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
         let brain_config_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_brain_config"),
+            label: Some("kernel_brain_config"),
             size: (CONFIG_SIZE * 4) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_dispatch_args"),
+            label: Some("kernel_dispatch_args"),
             size: 6 * 4, // 2 × (x, y, z) u32 triplets
             usage: wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
@@ -340,13 +338,13 @@ impl GpuMegaKernel {
         let state_size = (n * PHYS_STRIDE * 4) as u64;
         let state_staging = [
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mega_state_staging_0"),
+                label: Some("kernel_state_staging_0"),
                 size: state_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mega_state_staging_1"),
+                label: Some("kernel_state_staging_1"),
                 size: state_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -373,7 +371,7 @@ impl GpuMegaKernel {
         );
 
         // ── String-replace vision grid dimensions in common shader ──
-        let common_src = include_str!("shaders/mega/common.wgsl")
+        let common_src = include_str!("shaders/kernel/common.wgsl")
             .replace(
                 "const VISION_W: u32 = 8u;",
                 &format!("const VISION_W: u32 = {}u;", layout.vision_w),
@@ -386,23 +384,23 @@ impl GpuMegaKernel {
         // ── Compose physics shader ──
         let physics_source = [
             &common_src,
-            include_str!("shaders/mega/phase_clear.wgsl"),
-            include_str!("shaders/mega/phase_food_grid.wgsl"),
-            include_str!("shaders/mega/phase_physics.wgsl"),
-            include_str!("shaders/mega/phase_death.wgsl"),
-            include_str!("shaders/mega/phase_food_detect.wgsl"),
-            include_str!("shaders/mega/phase_food_respawn.wgsl"),
-            include_str!("shaders/mega/phase_agent_grid.wgsl"),
-            include_str!("shaders/mega/phase_collision.wgsl"),
-            include_str!("shaders/mega/physics_tick.wgsl"),
+            include_str!("shaders/kernel/phase_clear.wgsl"),
+            include_str!("shaders/kernel/phase_food_grid.wgsl"),
+            include_str!("shaders/kernel/phase_physics.wgsl"),
+            include_str!("shaders/kernel/phase_death.wgsl"),
+            include_str!("shaders/kernel/phase_food_detect.wgsl"),
+            include_str!("shaders/kernel/phase_food_respawn.wgsl"),
+            include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+            include_str!("shaders/kernel/phase_collision.wgsl"),
+            include_str!("shaders/kernel/physics_tick.wgsl"),
         ]
         .join("\n");
 
         // ── Compose vision shader ──
         let vision_source = [
             &common_src,
-            include_str!("shaders/mega/phase_vision.wgsl"),
-            include_str!("shaders/mega/vision_tick.wgsl"),
+            include_str!("shaders/kernel/phase_vision.wgsl"),
+            include_str!("shaders/kernel/vision_tick.wgsl"),
         ]
         .join("\n");
 
@@ -410,10 +408,10 @@ impl GpuMegaKernel {
         let mut brain_source = format!(
             "{}\n{}",
             &common_src,
-            include_str!("shaders/mega/brain_tick.wgsl")
+            include_str!("shaders/kernel/brain_tick.wgsl")
         );
 
-        // Subgroup-accelerated bitonic sort (shared between brain and mega shaders)
+        // Subgroup-accelerated bitonic sort (shared between brain and kernel shaders)
         let subgroup_sort = r#"
     // ── Subgroup-accelerated stages 0–4 (15 barrier-free passes) ──
     // Each of 128 threads holds one element in registers.
@@ -504,7 +502,7 @@ impl GpuMegaKernel {
                 let end_pos = end_pos + end_marker.len();
                 brain_source.replace_range(begin_pos..end_pos, subgroup_sort);
             } else {
-                log::error!("[GpuMegaKernel] Subgroup sort markers not found in brain shader — falling back to shared-memory sort");
+                log::error!("[GpuKernel] Subgroup sort markers not found in brain shader — falling back to shared-memory sort");
             }
         } else {
             // Remove placeholder comments for non-subgroup path
@@ -513,61 +511,64 @@ impl GpuMegaKernel {
             brain_source = brain_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
         }
 
-        // ── Compose mega-kernel shader ──
-        // brain_tick.wgsl functions (strip entry point) + mega_tick.wgsl
-        let brain_functions_src = include_str!("shaders/mega/brain_tick.wgsl");
+        // ── Compose fused kernel shader ──
+        // brain_tick.wgsl functions (strip entry point) + kernel_tick.wgsl
+        let brain_functions_src = include_str!("shaders/kernel/brain_tick.wgsl");
         let brain_fn_end = brain_functions_src
             .find("@compute @workgroup_size(256)\nfn brain_tick(")
             .unwrap_or(brain_functions_src.len());
         let brain_fns_only = &brain_functions_src[..brain_fn_end];
 
-        let mut mega_source = format!(
+        let mut kernel_source = format!(
             "{}\n{}\n{}",
             &common_src,
             brain_fns_only,
-            include_str!("shaders/mega/mega_tick.wgsl"),
+            include_str!("shaders/kernel/kernel_tick.wgsl"),
         );
 
         if has_subgroup {
-            mega_source = mega_source.replace(
-                "// MEGA_SUBGROUP_ENTRY_PARAMS",
+            kernel_source = kernel_source.replace(
+                "// KERNEL_SUBGROUP_ENTRY_PARAMS",
                 "@builtin(subgroup_invocation_id) sgid: u32,",
             );
-            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
-            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_ARGS */", ", sgid");
-            mega_source = mega_source.replace("/* MEGA_SUBGROUP_TOPK_INNER_ARGS */", ", sgid");
+            kernel_source =
+                kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+            kernel_source = kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_ARGS */", ", sgid");
+            kernel_source =
+                kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", ", sgid");
 
             // Also replace brain_tick.wgsl's own markers (included via brain_fns_only)
-            mega_source = mega_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+            kernel_source = kernel_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
 
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) =
-                (mega_source.find(begin_marker), mega_source.find(end_marker))
-            {
+            if let (Some(begin_pos), Some(end_pos)) = (
+                kernel_source.find(begin_marker),
+                kernel_source.find(end_marker),
+            ) {
                 let end_pos = end_pos + end_marker.len();
-                mega_source.replace_range(begin_pos..end_pos, subgroup_sort);
+                kernel_source.replace_range(begin_pos..end_pos, subgroup_sort);
             } else {
-                log::error!("[GpuMegaKernel] Subgroup sort markers not found in mega shader");
+                log::error!("[GpuKernel] Subgroup sort markers not found in kernel shader");
             }
         } else {
-            mega_source = mega_source.replace("// MEGA_SUBGROUP_ENTRY_PARAMS\n", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_PARAMS */", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_ARGS */", "");
-            mega_source = mega_source.replace(" /* MEGA_SUBGROUP_TOPK_INNER_ARGS */", "");
+            kernel_source = kernel_source.replace("// KERNEL_SUBGROUP_ENTRY_PARAMS\n", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_PARAMS */", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_ARGS */", "");
+            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", "");
             // Also strip brain_tick.wgsl's own markers
-            mega_source = mega_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
+            kernel_source = kernel_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
         }
 
         // ── Compose global-pass shader ──
         let global_source = [
             &common_src,
-            include_str!("shaders/mega/phase_clear.wgsl"),
-            include_str!("shaders/mega/phase_food_grid.wgsl"),
-            include_str!("shaders/mega/phase_food_respawn.wgsl"),
-            include_str!("shaders/mega/phase_agent_grid.wgsl"),
-            include_str!("shaders/mega/phase_collision.wgsl"),
-            include_str!("shaders/mega/global_tick.wgsl"),
+            include_str!("shaders/kernel/phase_clear.wgsl"),
+            include_str!("shaders/kernel/phase_food_grid.wgsl"),
+            include_str!("shaders/kernel/phase_food_respawn.wgsl"),
+            include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+            include_str!("shaders/kernel/phase_collision.wgsl"),
+            include_str!("shaders/kernel/global_tick.wgsl"),
         ]
         .join("\n");
 
@@ -612,7 +613,7 @@ impl GpuMegaKernel {
             }
         };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mega_bgl"),
+            label: Some("kernel_bgl"),
             entries: &[
                 storage_rw_entry(0),  // agent_phys
                 storage_rw_entry(1),  // decision
@@ -694,7 +695,7 @@ impl GpuMegaKernel {
         // ── Create prepare_dispatch pipeline (indirect dispatch args) ──
         let prepare_source = [
             &common_src,
-            include_str!("shaders/mega/phase_prepare_dispatch.wgsl"),
+            include_str!("shaders/kernel/phase_prepare_dispatch.wgsl"),
         ]
         .join("\n");
         let prepare_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -720,16 +721,16 @@ impl GpuMegaKernel {
             }],
         });
 
-        // ── Create mega-kernel pipeline (no push constants) ──
-        let mega_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mega_tick"),
-            source: wgpu::ShaderSource::Wgsl(mega_source.into()),
+        // ── Create fused kernel pipeline (no push constants) ──
+        let kernel_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kernel_tick"),
+            source: wgpu::ShaderSource::Wgsl(kernel_source.into()),
         });
-        let mega_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mega_tick"),
+        let kernel_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("kernel_tick"),
             layout: Some(&brain_layout),
-            module: &mega_module,
-            entry_point: Some("mega_tick"),
+            module: &kernel_module,
+            entry_point: Some("kernel_tick"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -822,8 +823,8 @@ impl GpuMegaKernel {
             })
         };
         let bind_groups = [
-            make_bind_group(&world_config_bufs[0], "mega_tick_bg_0"),
-            make_bind_group(&world_config_bufs[1], "mega_tick_bg_1"),
+            make_bind_group(&world_config_bufs[0], "kernel_tick_bg_0"),
+            make_bind_group(&world_config_bufs[1], "kernel_tick_bg_1"),
         ];
 
         Self {
@@ -851,7 +852,7 @@ impl GpuMegaKernel {
             physics_pipeline,
             vision_pipeline,
             brain_pipeline,
-            mega_pipeline,
+            kernel_pipeline,
             global_pipeline,
             vision_stride: brain_config.vision_stride,
             bind_groups,
@@ -958,7 +959,7 @@ impl GpuMegaKernel {
     }
 
     /// Write world config with explicit vision_stride override.
-    /// Used by mega dispatch to set the GPU loop count per batch.
+    /// Used by kernel dispatch to set the GPU loop count per batch.
     fn upload_world_config_with_cycles(
         &self,
         start_tick: u64,
@@ -1094,8 +1095,8 @@ impl GpuMegaKernel {
         collected
     }
 
-    /// Dispatch ticks via mega-kernel + global + vision passes.
-    /// Each mega-batch runs `vision_stride` brain cycles in a single dispatch,
+    /// Dispatch ticks via fused kernel + global + vision passes.
+    /// Each kernel-batch runs `vision_stride` brain cycles in a single dispatch,
     /// followed by one global (grid+collisions) and one vision (raycasting) pass.
     /// Non-blocking: skips if staging buffer is in flight (GPU backpressure).
     /// Returns true if dispatched, false if skipped.
@@ -1110,18 +1111,18 @@ impl GpuMegaKernel {
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
-        let mega_batches = brain_cycles / self.vision_stride;
+        let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
 
         let mut tick_cursor = start_tick;
 
-        // Each mega-batch gets its own encoder+submit to ensure the uniform
+        // Each kernel-batch gets its own encoder+submit to ensure the uniform
         // write (world config with tick/vision_stride) is visible to its dispatches.
-        // Each batch is only 4 passes (prepare + mega + global + vision).
-        let total_megas = mega_batches + if remainder_cycles > 0 { 1 } else { 0 };
+        // Each batch is only 4 passes (prepare + kernel + global + vision).
+        let total_batches = kernel_batches + if remainder_cycles > 0 { 1 } else { 0 };
 
-        for m in 0..total_megas {
-            let is_remainder = m == mega_batches;
+        for m in 0..total_batches {
+            let is_remainder = m == kernel_batches;
             let cycles_this_batch = if is_remainder {
                 remainder_cycles
             } else {
@@ -1140,7 +1141,7 @@ impl GpuMegaKernel {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dispatch_mega"),
+                    label: Some("dispatch_kernel"),
                 });
 
             // Prepare indirect dispatch args (for vision)
@@ -1151,10 +1152,10 @@ impl GpuMegaKernel {
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
-            // Mega-kernel: 1 pass, cycles_this_batch brain cycles
+            // Fused kernel: 1 pass, cycles_this_batch brain cycles
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.mega_pipeline);
+                pass.set_pipeline(&self.kernel_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
             }
@@ -1189,7 +1190,7 @@ impl GpuMegaKernel {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_mega_final"),
+                label: Some("dispatch_kernel_final"),
             });
         if physics_remainder > 0 {
             self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
@@ -1244,7 +1245,7 @@ impl GpuMegaKernel {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_blocking_readback"),
+            label: Some("kernel_blocking_readback"),
             size: buf_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1328,7 +1329,7 @@ impl GpuMegaKernel {
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
     fn read_buffer_range(&self, buffer: &wgpu::Buffer, offset: u64, size: u64, out: &mut Vec<f32>) {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mega_read_staging"),
+            label: Some("kernel_read_staging"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1336,7 +1337,7 @@ impl GpuMegaKernel {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mega_read_copy"),
+                label: Some("kernel_read_copy"),
             });
         encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -1,4 +1,4 @@
-# GPU Mega-Kernel Design Spec
+# GPU Fused Kernel Design Spec
 
 ## Problem
 
@@ -8,7 +8,7 @@ Target: 60,000+ ticks/second — a 100× improvement.
 
 ## Solution
 
-Replace the CPU-driven per-tick dispatch loop with a single GPU mega-kernel that runs N ticks autonomously. One dispatch, one workgroup of 256 threads, internal tick loop with barrier synchronization between phases. CPU becomes an observer/supervisor.
+Replace the CPU-driven per-tick dispatch loop with a single GPU fused kernel that runs N ticks autonomously. One dispatch, one workgroup of 256 threads, internal tick loop with barrier synchronization between phases. CPU becomes an observer/supervisor.
 
 ## Constraints
 
@@ -24,7 +24,7 @@ Replace the CPU-driven per-tick dispatch loop with a single GPU mega-kernel that
 CPU                              GPU
  │                                │
  ├─ write world_config ──────────►│  (start_tick, ticks_to_run, 96 bytes)
- ├─ dispatch(1,1,1) ────────────►│  mega_tick kernel
+ ├─ dispatch(1,1,1) ────────────►│  kernel_tick kernel
  │                                │    256 threads, 1 workgroup
  │   (CPU free: event loop,      │    tick loop runs N ticks internally
  │    rendering, UI)              │    all physics + vision + brain
@@ -45,7 +45,7 @@ Batch size: configurable, default ~2000 ticks. At 60K+ tps each batch takes ~33m
 
 ```wgsl
 @compute @workgroup_size(256)
-fn mega_tick(@builtin(local_invocation_id) lid: vec3u) {
+fn kernel_tick(@builtin(local_invocation_id) lid: vec3u) {
     let tid = lid.x;
 
     for (var t = 0u; t < ticks_to_run; t++) {
@@ -194,8 +194,8 @@ fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) {
     let mut encoder = device.create_command_encoder(&Default::default());
     {
         let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&self.mega_tick_pipeline);
-        pass.set_bind_group(0, &self.mega_tick_bind_group, &[]);
+        pass.set_pipeline(&self.kernel_tick_pipeline);
+        pass.set_bind_group(0, &self.kernel_tick_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
 
@@ -251,11 +251,11 @@ fn evolve_generation(&mut self) {
 
 ## Shader Source Organization
 
-The mega-kernel is composed from WGSL fragments via Rust-side `include_str!` concatenation. Each phase remains a separate source file for editability:
+The fused kernel is composed from WGSL fragments via Rust-side `include_str!` concatenation. Each phase remains a separate source file for editability:
 
 ```
 shaders/
-  mega_tick.wgsl          # entry point, tick loop, phase dispatch
+  kernel_tick.wgsl          # entry point, tick loop, phase dispatch
   common.wgsl             # pcg_hash, grid helpers, constants, buffer declarations
   phase_clear.wgsl        # Phase 0: grid clears
   phase_food_grid.wgsl    # Phase 1: food grid build
@@ -284,7 +284,7 @@ let source = [
     include_str!("shaders/phase_collision.wgsl"),
     include_str!("shaders/phase_vision.wgsl"),
     include_str!("shaders/phase_brain.wgsl"),
-    include_str!("shaders/mega_tick.wgsl"),
+    include_str!("shaders/kernel_tick.wgsl"),
 ].join("\n");
 ```
 

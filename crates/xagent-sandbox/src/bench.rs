@@ -1,12 +1,12 @@
 //! Headless benchmark runner for measuring raw simulation throughput.
 //!
-//! Runs the full tick loop via a single GPU mega-kernel dispatch without
+//! Runs the full tick loop via a single GPU fused kernel dispatch without
 //! any UI, database, recording, or evolution overhead.
 
 use std::time::Instant;
 
 use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z};
-use xagent_brain::GpuMegaKernel;
+use xagent_brain::GpuKernel;
 use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::world::WorldState;
@@ -29,7 +29,7 @@ pub fn run_bench(
     agent_count: usize,
     total_ticks: u64,
 ) -> BenchResult {
-    println!("[bench] Using GpuMegaKernel ({} agents)", agent_count);
+    println!("[bench] Using GpuKernel ({} agents)", agent_count);
 
     let (mut mk, _world) = create_kernel(&brain, &world_config, agent_count);
 
@@ -124,11 +124,11 @@ fn create_kernel(
     brain: &BrainConfig,
     world_config: &WorldConfig,
     agent_count: usize,
-) -> (GpuMegaKernel, WorldState) {
+) -> (GpuKernel, WorldState) {
     let world = WorldState::new(world_config.clone());
     let food_count = world.food_items.len();
 
-    let mk = GpuMegaKernel::new(agent_count as u32, food_count, brain, world_config);
+    let mk = GpuKernel::new(agent_count as u32, food_count, brain, world_config);
 
     // Upload world data
     let heights = world.terrain.heights.clone();

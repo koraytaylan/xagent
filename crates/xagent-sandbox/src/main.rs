@@ -21,7 +21,7 @@ use xagent_brain::buffers::{
     P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
     P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
-use xagent_brain::GpuMegaKernel;
+use xagent_brain::GpuKernel;
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
@@ -192,7 +192,7 @@ fn print_config(config: &FullConfig) {
 }
 
 /// Data collected on the main thread for upload once the background-created
-/// mega-kernel is ready.  Avoids passing world/agent refs across threads.
+/// fused kernel is ready.  Avoids passing world/agent refs across threads.
 struct PendingUpload {
     heights: Vec<f32>,
     biomes: Vec<u32>,
@@ -320,9 +320,9 @@ struct App {
     db_path: String,
     governor_config: GovernorConfig,
 
-    // GPU mega-kernel (all simulation computation in single dispatch)
-    gpu_mega_kernel: Option<GpuMegaKernel>,
-    pending_mega_kernel: Option<std::thread::JoinHandle<GpuMegaKernel>>,
+    // GPU fused kernel (all simulation computation in single dispatch)
+    gpu_kernel: Option<GpuKernel>,
+    pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
     /// Data collected for upload once the background kernel is ready.
     pending_upload: Option<PendingUpload>,
 
@@ -453,8 +453,8 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            gpu_mega_kernel: None,
-            pending_mega_kernel: None,
+            gpu_kernel: None,
+            pending_kernel: None,
             pending_upload: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             gpu_tick_budget: 32,
@@ -486,9 +486,9 @@ impl App {
         self.agents.push(agent);
     }
 
-    /// Ensure GpuMegaKernel is initialized for the current population.
-    fn ensure_mega_kernel(&mut self) {
-        if self.gpu_mega_kernel.is_some() {
+    /// Ensure GpuKernel is initialized for the current population.
+    fn ensure_gpu_kernel(&mut self) {
+        if self.gpu_kernel.is_some() {
             return;
         }
         if self.agents.is_empty() {
@@ -500,12 +500,12 @@ impl App {
         };
 
         // Check if background creation finished.
-        if let Some(ref handle) = self.pending_mega_kernel {
+        if let Some(ref handle) = self.pending_kernel {
             if handle.is_finished() {
-                let handle = self.pending_mega_kernel.take().unwrap();
+                let handle = self.pending_kernel.take().unwrap();
                 let mk = handle
                     .join()
-                    .expect("mega-kernel background thread panicked");
+                    .expect("fused kernel background thread panicked");
                 // Upload world + agent data (fast, main thread).
                 if let Some(upload) = self.pending_upload.take() {
                     mk.upload_world(
@@ -518,8 +518,8 @@ impl App {
                     mk.upload_agents(&upload.agent_data);
                 }
                 let ac = mk.agent_count();
-                self.gpu_mega_kernel = Some(mk);
-                self.log_msg(format!("[GPU] MegaKernel ready ({} agents)", ac));
+                self.gpu_kernel = Some(mk);
+                self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
             }
             return; // still creating
         }
@@ -556,10 +556,10 @@ impl App {
         });
 
         // Spawn background thread for device + shader compilation.
-        self.pending_mega_kernel = Some(std::thread::spawn(move || {
-            GpuMegaKernel::new(agent_count, food_count, &brain_config, &world_config)
+        self.pending_kernel = Some(std::thread::spawn(move || {
+            GpuKernel::new(agent_count, food_count, &brain_config, &world_config)
         }));
-        self.log_msg("[GPU] Creating MegaKernel (background)...".into());
+        self.log_msg("[GPU] Creating GpuKernel (background)...".into());
     }
 
     fn handle_evolution_action(&mut self, action: EvolutionAction) {
@@ -594,11 +594,11 @@ impl App {
                         self.tps_last_reset = Instant::now();
                         self.tps_display = 0.0;
                         self.paused = false;
-                        self.gpu_mega_kernel = None;
-                        self.pending_mega_kernel = None;
+                        self.gpu_kernel = None;
+                        self.pending_kernel = None;
                         self.pending_upload = None;
                         self.spawn_evolution_population();
-                        self.ensure_mega_kernel();
+                        self.ensure_gpu_kernel();
                         self.log_msg("[EVOLUTION] Started new run".into());
                     }
                     Err(e) => {
@@ -622,11 +622,11 @@ impl App {
                     self.tps_last_reset = Instant::now();
                     self.tps_display = 0.0;
                     self.paused = false;
-                    self.gpu_mega_kernel = None;
-                    self.pending_mega_kernel = None;
+                    self.gpu_kernel = None;
+                    self.pending_kernel = None;
                     self.pending_upload = None;
                     self.spawn_evolution_population();
-                    self.ensure_mega_kernel();
+                    self.ensure_gpu_kernel();
                     self.log_msg("[EVOLUTION] Resumed from database".into());
                 }
                 Err(e) => {
@@ -652,8 +652,8 @@ impl App {
             }
             EvolutionAction::Reset => {
                 self.governor = None;
-                self.gpu_mega_kernel = None;
-                self.pending_mega_kernel = None;
+                self.gpu_kernel = None;
+                self.pending_kernel = None;
                 self.pending_upload = None;
                 self.agents.clear();
                 self.next_agent_id = 0;
@@ -779,7 +779,7 @@ impl App {
             // fitness is sorted by descending composite_fitness — first entry is best
             let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
             let state = self.agents.get(best_idx).and_then(|a| {
-                self.gpu_mega_kernel
+                self.gpu_kernel
                     .as_ref()
                     .map(|mk| mk.read_agent_state(a.brain_idx))
             });
@@ -803,12 +803,12 @@ impl App {
                 // Reuse existing kernel if population size matches,
                 // otherwise drop and recreate in background.
                 let can_reuse = self
-                    .gpu_mega_kernel
+                    .gpu_kernel
                     .as_ref()
                     .is_some_and(|mk| mk.agent_count() == self.agents.len() as u32);
 
                 if can_reuse {
-                    let mk = self.gpu_mega_kernel.as_mut().unwrap();
+                    let mk = self.gpu_kernel.as_mut().unwrap();
                     mk.reset_agents(&self.brain_config);
                     let agent_data: Vec<_> = self
                         .agents
@@ -825,16 +825,16 @@ impl App {
                         .collect();
                     mk.upload_agents(&agent_data);
                 } else {
-                    self.gpu_mega_kernel = None;
-                    self.pending_mega_kernel = None;
+                    self.gpu_kernel = None;
+                    self.pending_kernel = None;
                     self.pending_upload = None;
-                    self.ensure_mega_kernel();
+                    self.ensure_gpu_kernel();
                 }
 
                 // Inherit learned weights: champions get exact weights,
                 // mutants get perturbed weights for neuroevolution.
                 if let Some(ref state) = inherited_state {
-                    if let Some(ref mk) = self.gpu_mega_kernel {
+                    if let Some(ref mk) = self.gpu_kernel {
                         for (i, agent) in self.agents.iter().enumerate() {
                             if i < repeats {
                                 // Champion: exact inherited weights
@@ -1383,9 +1383,9 @@ impl ApplicationHandler for App {
                         ((self.sim_accumulator / SIM_DT) as u32).min(self.gpu_tick_budget);
 
                     if ticks_to_run > 0 {
-                        self.ensure_mega_kernel();
+                        self.ensure_gpu_kernel();
 
-                        if let Some(ref mut mk) = self.gpu_mega_kernel {
+                        if let Some(ref mut mk) = self.gpu_kernel {
                             let state_updated = mk.try_collect_state();
                             let t0 = Instant::now();
                             let dispatched = mk.dispatch_batch(self.tick, ticks_to_run);

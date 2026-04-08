@@ -1,14 +1,14 @@
-# GPU Mega-Kernel Implementation Plan
+# GPU Fused Kernel Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the CPU-driven per-tick dispatch loop with a single GPU mega-kernel that runs N ticks autonomously, targeting 100× throughput improvement.
+**Goal:** Replace the CPU-driven per-tick dispatch loop with a single GPU fused kernel that runs N ticks autonomously, targeting 100× throughput improvement.
 
-**Architecture:** Single WGSL mega-kernel (`@workgroup_size(256)`, `dispatch(1,1,1)`) with internal tick loop. All physics, vision, and brain phases run inside the kernel with `storageBarrier()`+`workgroupBarrier()` between phases. CPU becomes an observer that dispatches batches and reads back state asynchronously.
+**Architecture:** Single WGSL fused kernel (`@workgroup_size(256)`, `dispatch(1,1,1)`) with internal tick loop. All physics, vision, and brain phases run inside the kernel with `storageBarrier()`+`workgroupBarrier()` between phases. CPU becomes an observer that dispatches batches and reads back state asynchronously.
 
 **Tech Stack:** Rust, wgpu 24, WGSL compute shaders, egui 0.31
 
-**Spec:** `docs/superpowers/specs/2026-04-05-gpu-mega-kernel-design.md`
+**Spec:** `docs/superpowers/specs/2026-04-05-gpu-kernel-design.md`
 
 ---
 
@@ -24,7 +24,7 @@ Task 1: Foundation (common.wgsl + buffers.rs)
 │  Task 5: Brain phase     (PARALLEL)          │
 └──────────────────────────────────────────────┘
    ↓
-Task 6: mega_tick.wgsl entry point + gpu_mega_kernel.rs Rust module
+Task 6: kernel_tick.wgsl entry point + gpu_kernel.rs Rust module
    ↓
 Task 7: Integration (main.rs + bench.rs)
    ↓
@@ -37,7 +37,7 @@ Tasks 2, 3, 4, 5 are **fully independent** and should be dispatched in parallel.
 
 ## Critical Porting Note: Atomic Buffer Types
 
-In the existing shaders, some buffers are declared `array<u32>` (plain) in read-only contexts and `array<atomic<u32>>` in atomic-write contexts. In the mega-kernel, each buffer has ONE declaration shared across all phases. The following buffers are declared atomic:
+In the existing shaders, some buffers are declared `array<u32>` (plain) in read-only contexts and `array<atomic<u32>>` in atomic-write contexts. In the fused kernel, each buffer has ONE declaration shared across all phases. The following buffers are declared atomic:
 
 - `food_flags: array<atomic<u32>>` — atomic CAS in food_detect, atomic store in food_respawn
 - `food_grid: array<atomic<u32>>` — atomic add in food_grid_build and food_respawn
@@ -55,34 +55,34 @@ Similarly, for writes: use `atomicStore(&buffer[i], value)` instead of `buffer[i
 ### New Files
 | File | Purpose |
 |---|---|
-| `crates/xagent-brain/src/shaders/mega/common.wgsl` | Buffer declarations, constants, shared helpers (RNG, grid, heightmap) |
-| `crates/xagent-brain/src/shaders/mega/phase_clear.wgsl` | Phase 0: cooperative grid clearing |
-| `crates/xagent-brain/src/shaders/mega/phase_food_grid.wgsl` | Phase 1: food spatial grid build |
-| `crates/xagent-brain/src/shaders/mega/phase_physics.wgsl` | Phase 2: agent physics integration |
-| `crates/xagent-brain/src/shaders/mega/phase_death.wgsl` | Phase 3: death detection + respawn + brain reset |
-| `crates/xagent-brain/src/shaders/mega/phase_food_detect.wgsl` | Phase 4: food consumption |
-| `crates/xagent-brain/src/shaders/mega/phase_food_respawn.wgsl` | Phase 5: food timer + respawn |
-| `crates/xagent-brain/src/shaders/mega/phase_agent_grid.wgsl` | Phase 6: agent spatial grid build |
-| `crates/xagent-brain/src/shaders/mega/phase_collision.wgsl` | Phases 7-9: collision accumulate + apply |
-| `crates/xagent-brain/src/shaders/mega/phase_vision.wgsl` | Phase 10a: 48-ray vision (serialized per thread) |
-| `crates/xagent-brain/src/shaders/mega/phase_brain.wgsl` | Phase 10b: all 7 brain passes merged |
-| `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl` | Entry point: tick loop calling all phases |
-| `crates/xagent-brain/src/gpu_mega_kernel.rs` | Rust struct: pipeline, bind group, dispatch, readback |
+| `crates/xagent-brain/src/shaders/kernel/common.wgsl` | Buffer declarations, constants, shared helpers (RNG, grid, heightmap) |
+| `crates/xagent-brain/src/shaders/kernel/phase_clear.wgsl` | Phase 0: cooperative grid clearing |
+| `crates/xagent-brain/src/shaders/kernel/phase_food_grid.wgsl` | Phase 1: food spatial grid build |
+| `crates/xagent-brain/src/shaders/kernel/phase_physics.wgsl` | Phase 2: agent physics integration |
+| `crates/xagent-brain/src/shaders/kernel/phase_death.wgsl` | Phase 3: death detection + respawn + brain reset |
+| `crates/xagent-brain/src/shaders/kernel/phase_food_detect.wgsl` | Phase 4: food consumption |
+| `crates/xagent-brain/src/shaders/kernel/phase_food_respawn.wgsl` | Phase 5: food timer + respawn |
+| `crates/xagent-brain/src/shaders/kernel/phase_agent_grid.wgsl` | Phase 6: agent spatial grid build |
+| `crates/xagent-brain/src/shaders/kernel/phase_collision.wgsl` | Phases 7-9: collision accumulate + apply |
+| `crates/xagent-brain/src/shaders/kernel/phase_vision.wgsl` | Phase 10a: 48-ray vision (serialized per thread) |
+| `crates/xagent-brain/src/shaders/kernel/phase_brain.wgsl` | Phase 10b: all 7 brain passes merged |
+| `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl` | Entry point: tick loop calling all phases |
+| `crates/xagent-brain/src/gpu_kernel.rs` | Rust struct: pipeline, bind group, dispatch, readback |
 
 ### Modified Files
 | File | Change |
 |---|---|
 | `crates/xagent-brain/src/buffers.rs` | Add `WC_TICKS_TO_RUN` constant, update `build_world_config` |
-| `crates/xagent-brain/src/lib.rs` | Add `pub mod gpu_mega_kernel;` |
-| `crates/xagent-sandbox/src/main.rs` | Replace tick loop with mega-kernel dispatch |
-| `crates/xagent-sandbox/src/bench.rs` | Use mega-kernel for benchmark |
+| `crates/xagent-brain/src/lib.rs` | Add `pub mod gpu_kernel;` |
+| `crates/xagent-sandbox/src/main.rs` | Replace tick loop with fused kernel dispatch |
+| `crates/xagent-sandbox/src/bench.rs` | Use fused kernel for benchmark |
 
 ---
 
 ### Task 1: Foundation — common.wgsl + buffer constants
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/common.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/common.wgsl`
 - Modify: `crates/xagent-brain/src/buffers.rs:156-161`
 
 This task creates the shared WGSL foundation that all phase fragments depend on. Every buffer declaration, constant, and helper function lives here.
@@ -118,7 +118,7 @@ Fix all existing callers of `build_world_config` to pass `ticks_to_run: 1` (pres
 
 - [ ] **Step 2: Create common.wgsl with all buffer declarations and helpers**
 
-Create `crates/xagent-brain/src/shaders/mega/common.wgsl`:
+Create `crates/xagent-brain/src/shaders/kernel/common.wgsl`:
 
 ```wgsl
 // ── Constants ──────────────────────────────────────────────
@@ -258,7 +258,7 @@ const BIOME_NEUTRAL: u32 = 1u;
 const BIOME_DANGER: u32 = 2u;
 
 // ── Buffer Bindings ────────────────────────────────────────
-// All 17 bindings for the mega-kernel in one bind group.
+// All 17 bindings for the fused kernel in one bind group.
 @group(0) @binding(0) var<storage, read_write> agent_phys: array<f32>;
 @group(0) @binding(1) var<storage, read_write> decision_buf: array<f32>;
 @group(0) @binding(2) var<storage, read> heightmap: array<f32>;
@@ -368,8 +368,8 @@ The `build_world_config` signature change will cause errors in callers. Fix each
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/mega/
-git commit -m "feat: add mega-kernel foundation — common.wgsl + WC_TICKS_TO_RUN"
+git add crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/kernel/
+git commit -m "feat: add fused kernel foundation — common.wgsl + WC_TICKS_TO_RUN"
 ```
 
 ---
@@ -377,18 +377,18 @@ git commit -m "feat: add mega-kernel foundation — common.wgsl + WC_TICKS_TO_RU
 ### Task 2: Physics Phase Fragments (PARALLEL with Tasks 3, 4, 5)
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/phase_clear.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_food_grid.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_physics.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_food_detect.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_food_respawn.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_agent_grid.wgsl`
-- Create: `crates/xagent-brain/src/shaders/mega/phase_collision.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_clear.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_food_grid.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_physics.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_food_detect.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_food_respawn.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_agent_grid.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_collision.wgsl`
 - Read (reference): `crates/xagent-brain/src/shaders/physics.wgsl`, `food_grid_build.wgsl`, `food_detect.wgsl`, `food_respawn.wgsl`, `agent_grid_build.wgsl`, `collision_accumulate.wgsl`, `collision_apply.wgsl`
 
 Each phase fragment defines functions (no entry point). They rely on buffer variables and helpers from `common.wgsl`.
 
-**Porting pattern for every shader:** The existing shader has `@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) gid: vec3<u32>)` which uses `gid.x` as the entity index. In the mega-kernel, the entity index comes from a `tid` parameter. The port transforms: `gid.x` → function parameter `tid` (or a loop index for food operations).
+**Porting pattern for every shader:** The existing shader has `@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) gid: vec3<u32>)` which uses `gid.x` as the entity index. In the fused kernel, the entity index comes from a `tid` parameter. The port transforms: `gid.x` → function parameter `tid` (or a loop index for food operations).
 
 - [ ] **Step 1: Create phase_clear.wgsl**
 
@@ -396,7 +396,7 @@ This is NEW code — no existing shader equivalent. All 256 threads cooperate to
 
 Read the existing `food_grid_build.wgsl`, `agent_grid_build.wgsl` to understand the grid buffer sizes. The food grid has `grid_width * grid_width * FOOD_CELL_STRIDE` u32 entries. The agent grid has `grid_width * grid_width * AGENT_CELL_STRIDE` u32 entries. The collision scratch has `agent_count * 3` i32 entries.
 
-Write `crates/xagent-brain/src/shaders/mega/phase_clear.wgsl`:
+Write `crates/xagent-brain/src/shaders/kernel/phase_clear.wgsl`:
 
 ```wgsl
 // Phase 0: Cooperative grid clearing.
@@ -491,14 +491,14 @@ fn phase_collision_apply(tid: u32) {
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/phase_clear.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_food_grid.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_physics.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_food_detect.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_food_respawn.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_agent_grid.wgsl \
-        crates/xagent-brain/src/shaders/mega/phase_collision.wgsl
-git commit -m "feat: add mega-kernel physics phase WGSL fragments"
+git add crates/xagent-brain/src/shaders/kernel/phase_clear.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_food_grid.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_physics.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_food_detect.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_food_respawn.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_agent_grid.wgsl \
+        crates/xagent-brain/src/shaders/kernel/phase_collision.wgsl
+git commit -m "feat: add fused kernel physics phase WGSL fragments"
 ```
 
 ---
@@ -506,7 +506,7 @@ git commit -m "feat: add mega-kernel physics phase WGSL fragments"
 ### Task 3: Death Phase Fragment (PARALLEL with Tasks 2, 4, 5)
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/phase_death.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_death.wgsl`
 - Read (reference): `crates/xagent-brain/src/gpu_brain.rs:565-633` (flush_death_signals logic)
 
 This is entirely NEW code. No existing shader equivalent. The logic is ported from the Rust `flush_death_signals` method.
@@ -566,7 +566,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // food_count and ticks_alive intentionally preserved for fitness tracking
 
     // ── 3. Reset brain state ──
-    // In the mega-kernel, brain_idx == tid (1:1 mapping)
+    // In the fused kernel, brain_idx == tid (1:1 mapping)
     let brain_base = tid * BRAIN_STRIDE;
     let pat_base = tid * PATTERN_STRIDE;
     let hist_base = tid * HISTORY_STRIDE;
@@ -600,8 +600,8 @@ fn phase_death_respawn(tid: u32, tick: u32) {
 - [ ] **Step 2: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/phase_death.wgsl
-git commit -m "feat: add mega-kernel death/respawn phase — GPU-side brain reset"
+git add crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
+git commit -m "feat: add fused kernel death/respawn phase — GPU-side brain reset"
 ```
 
 ---
@@ -609,10 +609,10 @@ git commit -m "feat: add mega-kernel death/respawn phase — GPU-side brain rese
 ### Task 4: Vision Phase Fragment (PARALLEL with Tasks 2, 3, 5)
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/phase_vision.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_vision.wgsl`
 - Read (reference): `crates/xagent-brain/src/shaders/vision.wgsl` (362 lines)
 
-Major rewrite: original uses `@workgroup_size(48)` with 48 threads per agent (1 per ray). The mega-kernel version serializes all 48 rays in a single thread using a loop.
+Major rewrite: original uses `@workgroup_size(48)` with 48 threads per agent (1 per ray). The fused kernel version serializes all 48 rays in a single thread using a loop.
 
 - [ ] **Step 1: Create phase_vision.wgsl**
 
@@ -664,8 +664,8 @@ The ray marching loop and non-visual data packing are the bulk of vision.wgsl. P
 - [ ] **Step 2: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/phase_vision.wgsl
-git commit -m "feat: add mega-kernel vision phase — serialized 48-ray marching"
+git add crates/xagent-brain/src/shaders/kernel/phase_vision.wgsl
+git commit -m "feat: add fused kernel vision phase — serialized 48-ray marching"
 ```
 
 ---
@@ -673,7 +673,7 @@ git commit -m "feat: add mega-kernel vision phase — serialized 48-ray marching
 ### Task 5: Brain Phase Fragment (PARALLEL with Tasks 2, 3, 4)
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/phase_brain.wgsl`
+- Create: `crates/xagent-brain/src/shaders/kernel/phase_brain.wgsl`
 - Read (reference): All 7 brain shaders in `crates/xagent-brain/src/shaders/`: `feature_extract.wgsl` (76 lines), `encode.wgsl` (22 lines), `habituate_homeo.wgsl` (106 lines), `recall_score.wgsl` (44 lines), `recall_topk.wgsl` (53 lines), `predict_and_act.wgsl` (362 lines), `learn_and_store.wgsl` (185 lines)
 
 This merges all 7 brain passes into a single function. Key change: intermediate results (features, encoded, habituated, homeo_out, similarities, recall) become local arrays instead of global buffers.
@@ -848,8 +848,8 @@ fn brain_learn_and_store(
 - [ ] **Step 2: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/phase_brain.wgsl
-git commit -m "feat: add mega-kernel brain phase — 7 passes merged with local arrays"
+git add crates/xagent-brain/src/shaders/kernel/phase_brain.wgsl
+git commit -m "feat: add fused kernel brain phase — 7 passes merged with local arrays"
 ```
 
 ---
@@ -857,22 +857,22 @@ git commit -m "feat: add mega-kernel brain phase — 7 passes merged with local 
 ### Task 6: Entry Point + Rust Module
 
 **Files:**
-- Create: `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl`
-- Create: `crates/xagent-brain/src/gpu_mega_kernel.rs`
+- Create: `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl`
+- Create: `crates/xagent-brain/src/gpu_kernel.rs`
 - Modify: `crates/xagent-brain/src/lib.rs`
 
 **Depends on:** Tasks 1-5 (all shader fragments must exist)
 
-- [ ] **Step 1: Create mega_tick.wgsl entry point**
+- [ ] **Step 1: Create kernel_tick.wgsl entry point**
 
 ```wgsl
-// GPU Mega-Kernel Entry Point
+// GPU Fused Kernel Entry Point
 // Runs N simulation ticks in a single dispatch.
 // All physics, vision, and brain phases execute inside the tick loop
 // with barrier synchronization between phases.
 
 @compute @workgroup_size(256)
-fn mega_tick(@builtin(local_invocation_id) lid: vec3u) {
+fn kernel_tick(@builtin(local_invocation_id) lid: vec3u) {
     let tid = lid.x;
     let agent_count = wc_u32(WC_AGENT_COUNT);
     let start_tick = wc_u32(WC_TICK);
@@ -927,12 +927,12 @@ fn mega_tick(@builtin(local_invocation_id) lid: vec3u) {
 }
 ```
 
-- [ ] **Step 2: Create gpu_mega_kernel.rs**
+- [ ] **Step 2: Create gpu_kernel.rs**
 
-Read `crates/xagent-brain/src/gpu_brain.rs` and `crates/xagent-brain/src/gpu_physics.rs` to understand how they create buffers, bind groups, and pipelines. The mega-kernel reuses ALL existing buffers from both structs and adds a single pipeline + bind group.
+Read `crates/xagent-brain/src/gpu_brain.rs` and `crates/xagent-brain/src/gpu_physics.rs` to understand how they create buffers, bind groups, and pipelines. The fused kernel reuses ALL existing buffers from both structs and adds a single pipeline + bind group.
 
 ```rust
-//! GPU Mega-Kernel: single-dispatch simulation engine.
+//! GPU Fused Kernel: single-dispatch simulation engine.
 //!
 //! Runs N simulation ticks in one `dispatch_workgroups(1,1,1)` call.
 //! Replaces the per-tick CPU encoding loop with a GPU-internal tick loop.
@@ -946,26 +946,26 @@ use crate::buffers::*;
 use crate::gpu_brain::GpuBrain;
 use crate::gpu_physics::GpuPhysics;
 
-/// Composes the mega-kernel WGSL source from fragments.
-fn mega_kernel_source() -> String {
+/// Composes the fused kernel WGSL source from fragments.
+fn kernel_source() -> String {
     [
-        include_str!("shaders/mega/common.wgsl"),
-        include_str!("shaders/mega/phase_clear.wgsl"),
-        include_str!("shaders/mega/phase_food_grid.wgsl"),
-        include_str!("shaders/mega/phase_physics.wgsl"),
-        include_str!("shaders/mega/phase_death.wgsl"),
-        include_str!("shaders/mega/phase_food_detect.wgsl"),
-        include_str!("shaders/mega/phase_food_respawn.wgsl"),
-        include_str!("shaders/mega/phase_agent_grid.wgsl"),
-        include_str!("shaders/mega/phase_collision.wgsl"),
-        include_str!("shaders/mega/phase_vision.wgsl"),
-        include_str!("shaders/mega/phase_brain.wgsl"),
-        include_str!("shaders/mega/mega_tick.wgsl"),
+        include_str!("shaders/kernel/common.wgsl"),
+        include_str!("shaders/kernel/phase_clear.wgsl"),
+        include_str!("shaders/kernel/phase_food_grid.wgsl"),
+        include_str!("shaders/kernel/phase_physics.wgsl"),
+        include_str!("shaders/kernel/phase_death.wgsl"),
+        include_str!("shaders/kernel/phase_food_detect.wgsl"),
+        include_str!("shaders/kernel/phase_food_respawn.wgsl"),
+        include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+        include_str!("shaders/kernel/phase_collision.wgsl"),
+        include_str!("shaders/kernel/phase_vision.wgsl"),
+        include_str!("shaders/kernel/phase_brain.wgsl"),
+        include_str!("shaders/kernel/kernel_tick.wgsl"),
     ]
     .join("\n")
 }
 
-pub struct GpuMegaKernel {
+pub struct GpuKernel {
     device: wgpu::Device,
     queue: wgpu::Queue,
     agent_count: u32,
@@ -1004,20 +1004,20 @@ pub struct GpuMegaKernel {
 }
 ```
 
-The `new()` constructor creates ALL buffers (same sizes/usages as current GpuBrain + GpuPhysics), creates the pipeline from `mega_kernel_source()`, and builds the bind group with all 15 storage + 2 uniform bindings.
+The `new()` constructor creates ALL buffers (same sizes/usages as current GpuBrain + GpuPhysics), creates the pipeline from `kernel_source()`, and builds the bind group with all 15 storage + 2 uniform bindings.
 
-**How to build it:** Study `GpuBrain::new()` (gpu_brain.rs ~line 72-430) and `GpuPhysics::new()` (gpu_physics.rs ~line 90-430). The mega-kernel `new()` combines both:
+**How to build it:** Study `GpuBrain::new()` (gpu_brain.rs ~line 72-430) and `GpuPhysics::new()` (gpu_physics.rs ~line 90-430). The fused kernel `new()` combines both:
 1. Create device/queue (same as GpuBrain::new does via wgpu adapter request)
 2. Create all physics buffers (same as GpuPhysics::new)
 3. Create all brain buffers (same as GpuBrain::new, but skip transient buffers: features_buf, encoded_buf, habituated_buf, homeo_out_buf, similarities_buf, recall_buf)
-4. Create the mega-kernel pipeline from composed WGSL source
+4. Create the fused kernel pipeline from composed WGSL source
 5. Create one bind group with all 15+2 bindings
 6. Create state_staging double buffers for async readback
 
 **Public methods to implement:**
 
 ```rust
-impl GpuMegaKernel {
+impl GpuKernel {
     pub fn new(agent_count: u32, food_count: usize, brain_config: &BrainConfig, world_config: &WorldConfig) -> Self { ... }
     pub fn device(&self) -> &wgpu::Device { &self.device }
     pub fn queue(&self) -> &wgpu::Queue { &self.queue }
@@ -1101,13 +1101,13 @@ Port `read_agent_state` and `write_agent_state` from `GpuBrain` (gpu_brain.rs ~l
 In `crates/xagent-brain/src/lib.rs`, after `pub mod gpu_physics;` (line 10), add:
 
 ```rust
-pub mod gpu_mega_kernel;
+pub mod gpu_kernel;
 ```
 
 And add the public re-export:
 
 ```rust
-pub use gpu_mega_kernel::GpuMegaKernel;
+pub use gpu_kernel::GpuKernel;
 ```
 
 - [ ] **Step 4: Compile check**
@@ -1127,10 +1127,10 @@ If WGSL fails to compile, check for:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/xagent-brain/src/shaders/mega/mega_tick.wgsl \
-        crates/xagent-brain/src/gpu_mega_kernel.rs \
+git add crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl \
+        crates/xagent-brain/src/gpu_kernel.rs \
         crates/xagent-brain/src/lib.rs
-git commit -m "feat: add GpuMegaKernel — single-dispatch simulation engine"
+git commit -m "feat: add GpuKernel — single-dispatch simulation engine"
 ```
 
 ---
@@ -1143,29 +1143,29 @@ git commit -m "feat: add GpuMegaKernel — single-dispatch simulation engine"
 
 **Depends on:** Task 6
 
-- [ ] **Step 1: Add GpuMegaKernel field to App struct**
+- [ ] **Step 1: Add GpuKernel field to App struct**
 
 In `crates/xagent-sandbox/src/main.rs`, in the App struct (around line 307-310), add:
 
 ```rust
-gpu_mega_kernel: Option<xagent_brain::GpuMegaKernel>,
+gpu_kernel: Option<xagent_brain::GpuKernel>,
 ```
 
 Initialize to `None` in `App::new()` (around line 436).
 
-- [ ] **Step 2: Create ensure_mega_kernel method**
+- [ ] **Step 2: Create ensure_gpu_kernel method**
 
 Model this on the existing `ensure_gpu_brain` (lines 468-512). The new method:
 
 ```rust
-fn ensure_mega_kernel(&mut self) {
-    if self.gpu_mega_kernel.is_some() { return; }
+fn ensure_gpu_kernel(&mut self) {
+    if self.gpu_kernel.is_some() { return; }
     let world = self.world.as_ref().expect("world must exist");
     let agent_count = self.agents.len();
     let brain_config = &self.agents[0].brain_config;
     let food_count = world.food_items.len();
 
-    let mut mk = xagent_brain::GpuMegaKernel::new(
+    let mut mk = xagent_brain::GpuKernel::new(
         agent_count as u32, food_count, brain_config, &world.config,
     );
 
@@ -1186,16 +1186,16 @@ fn ensure_mega_kernel(&mut self) {
         .collect();
     mk.upload_agents(&agent_data);
 
-    self.gpu_mega_kernel = Some(mk);
+    self.gpu_kernel = Some(mk);
 }
 ```
 
 - [ ] **Step 3: Replace the tick loop**
 
-Replace the simulation tick region (`main.rs:1262-1430`) with the mega-kernel batch dispatch pattern:
+Replace the simulation tick region (`main.rs:1262-1430`) with the fused kernel batch dispatch pattern:
 
 ```rust
-// ── simulation ticks (mega-kernel batched) ──────────
+// ── simulation ticks (fused kernel batched) ──────────
 if !self.paused {
     self.sim_accumulator += dt * self.speed_multiplier as f32;
     let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
@@ -1204,9 +1204,9 @@ if !self.paused {
     let ticks_to_run = (self.sim_accumulator / SIM_DT) as u32;
 
     if ticks_to_run > 0 {
-        self.ensure_mega_kernel();
+        self.ensure_gpu_kernel();
 
-        if let Some(ref mut mk) = self.gpu_mega_kernel {
+        if let Some(ref mut mk) = self.gpu_kernel {
             // Dispatch the batch
             mk.dispatch_batch(self.tick, ticks_to_run);
 
@@ -1263,21 +1263,21 @@ if !self.paused {
 
 - [ ] **Step 4: Update evolution boundary**
 
-In the generation boundary code (around line 700-758), replace `gpu_brain` usage with `gpu_mega_kernel`:
+In the generation boundary code (around line 700-758), replace `gpu_brain` usage with `gpu_kernel`:
 
-- Line 716: `self.gpu_brain.as_mut().map(|gb| gb.read_agent_state(a.brain_idx))` → `self.gpu_mega_kernel.as_ref().map(|mk| mk.read_agent_state(a.brain_idx as u32))`
-- Lines 731-732: `self.gpu_brain = None; self.gpu_physics = None;` → `self.gpu_mega_kernel = None;`
-- Line 733: `self.ensure_gpu_brain();` → `self.ensure_mega_kernel();`
-- Lines 741, 745: `gpu_brain.write_agent_state(...)` → `gpu_mega_kernel.write_agent_state(...)`
+- Line 716: `self.gpu_brain.as_mut().map(|gb| gb.read_agent_state(a.brain_idx))` → `self.gpu_kernel.as_ref().map(|mk| mk.read_agent_state(a.brain_idx as u32))`
+- Lines 731-732: `self.gpu_brain = None; self.gpu_physics = None;` → `self.gpu_kernel = None;`
+- Line 733: `self.ensure_gpu_brain();` → `self.ensure_gpu_kernel();`
+- Lines 741, 745: `gpu_brain.write_agent_state(...)` → `gpu_kernel.write_agent_state(...)`
 
-Note: In the mega-kernel, `brain_idx == agent_index` (1:1 mapping, no indirection). Verify `a.brain_idx` is equal to the agent's index. If it's a separate field, the mega-kernel needs to maintain this mapping or the field should be set to the agent index.
+Note: In the fused kernel, `brain_idx == agent_index` (1:1 mapping, no indirection). Verify `a.brain_idx` is equal to the agent's index. If it's a separate field, the fused kernel needs to maintain this mapping or the field should be set to the agent index.
 
 - [ ] **Step 5: Update bench.rs**
 
-Rewrite `crates/xagent-sandbox/src/bench.rs` to use `GpuMegaKernel`:
+Rewrite `crates/xagent-sandbox/src/bench.rs` to use `GpuKernel`:
 
 ```rust
-use xagent_brain::GpuMegaKernel;
+use xagent_brain::GpuKernel;
 
 pub fn run_bench(
     brain: BrainConfig,
@@ -1285,12 +1285,12 @@ pub fn run_bench(
     agent_count: usize,
     total_ticks: u64,
 ) -> BenchResult {
-    println!("[bench] Using GpuMegaKernel ({} agents)", agent_count);
+    println!("[bench] Using GpuKernel ({} agents)", agent_count);
 
     let world = WorldState::new(world_config.clone());
     let food_count = world.food_items.len();
 
-    let mut mk = GpuMegaKernel::new(
+    let mut mk = GpuKernel::new(
         agent_count as u32, food_count, &brain, &world_config,
     );
 
@@ -1338,7 +1338,7 @@ pub fn run_bench(
 Run: `cargo check -p xagent-sandbox`
 
 Fix compilation errors. Key areas:
-- Import paths for `GpuMegaKernel`
+- Import paths for `GpuKernel`
 - Field access patterns (the App struct may reference `gpu_brain` or `gpu_physics` in other places — search for all usages and update)
 - The `brain_idx` vs agent index mapping
 
@@ -1346,7 +1346,7 @@ Fix compilation errors. Key areas:
 
 ```bash
 git add crates/xagent-sandbox/src/main.rs crates/xagent-sandbox/src/bench.rs
-git commit -m "feat: wire GpuMegaKernel into main loop and benchmark"
+git commit -m "feat: wire GpuKernel into main loop and benchmark"
 ```
 
 ---
@@ -1391,27 +1391,27 @@ Verify:
 cargo test -p xagent-sandbox
 ```
 
-Fix any failing tests. Tests that directly use `GpuBrain` or `GpuPhysics` will need updates if those types changed. The mega-kernel doesn't replace them entirely — they may still be used by tests.
+Fix any failing tests. Tests that directly use `GpuBrain` or `GpuPhysics` will need updates if those types changed. The fused kernel doesn't replace them entirely — they may still be used by tests.
 
 - [ ] **Step 4: Clean up dead code**
 
 After validating everything works, remove old dispatch code that's no longer used:
 
 In `main.rs`:
-- Remove `ensure_gpu_brain` method (replaced by `ensure_mega_kernel`)
+- Remove `ensure_gpu_brain` method (replaced by `ensure_gpu_kernel`)
 - Remove the old `gpu_brain` and `gpu_physics` fields from App struct if nothing else uses them
 - Remove old tick loop code (now replaced)
 - Remove old death handling code
 
 Do NOT remove `GpuBrain` or `GpuPhysics` structs yet — they may be used by tests or as reference. Mark them with a `#[deprecated]` attribute if desired.
 
-Do NOT remove old shader files yet — keep them as reference until the mega-kernel is validated in production.
+Do NOT remove old shader files yet — keep them as reference until the fused kernel is validated in production.
 
 - [ ] **Step 5: Final commit**
 
 ```bash
 git add -u
-git commit -m "refactor: remove old per-tick dispatch loop, wire mega-kernel throughout"
+git commit -m "refactor: remove old per-tick dispatch loop, wire fused kernel throughout"
 ```
 
 - [ ] **Step 6: Benchmark comparison**

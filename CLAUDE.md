@@ -9,11 +9,11 @@
 - `crates/xagent-sandbox/src/ui.rs` — egui 0.31 immediate-mode UI, `EvolutionSnapshot` bridges governor↔UI
 - `crates/xagent-sandbox/src/main.rs` — app loop, pipes governor data to snapshot before paint closure
 - DB migrations are idempotent: `let _ = db.execute_batch("ALTER TABLE ... ADD COLUMN ...");`
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — fused mega-kernel: single dispatch(agent_count,1,1) per vision-stride cycle, replaces 3-pass-per-brain-cycle pattern
+- `crates/xagent-brain/src/gpu_kernel.rs` — fused kernel: single dispatch(agent_count,1,1) per vision-stride cycle, replaces 3-pass-per-brain-cycle pattern
 - `crates/xagent-brain/src/gpu_brain.rs` — GPU-resident brain, 7-pass WGSL compute pipeline, state read/write, resize
 - `crates/xagent-brain/src/buffers.rs` — GPU buffer layout constants, sensory packing, AgentBrainState, AgentTelemetry
-- `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl` — fused per-agent kernel (physics + food detect + death/respawn + brain, looped over vision_stride cycles)
-- `crates/xagent-brain/src/shaders/mega/global_tick.wgsl` — grid rebuild + collision pass (dispatched as (1,1,1))
+- `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl` — fused per-agent kernel (physics + food detect + death/respawn + brain, looped over vision_stride cycles)
+- `crates/xagent-brain/src/shaders/kernel/global_tick.wgsl` — grid rebuild + collision pass (dispatched as (1,1,1))
 - `crates/xagent-brain/src/shaders/*.wgsl` — 7 WGSL compute shaders (feature_extract, encode, habituate_homeo, recall_score, recall_topk, predict_and_act, learn_and_store)
 
 ## egui Gotchas

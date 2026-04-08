@@ -1,8 +1,8 @@
-# Vision-Stride Fused Mega-Kernel Design
+# Vision-Stride Fused Kernel Design
 
 ## Goal
 
-Achieve 60k+ brain ticks/sec at 10 agents by eliminating GPU compute pass boundaries. Replace the current 3-passes-per-cycle dispatch loop with a fused mega-kernel that runs N brain cycles in a single GPU dispatch, combined with a less-frequent global pass for inter-agent physics and vision.
+Achieve 60k+ brain ticks/sec at 10 agents by eliminating GPU compute pass boundaries. Replace the current 3-passes-per-cycle dispatch loop with a fused kernel that runs N brain cycles in a single GPU dispatch, combined with a less-frequent global pass for inter-agent physics and vision.
 
 ## Problem
 
@@ -14,18 +14,18 @@ The CPU must encode each pass via wgpu API calls (~16µs each). At high budgets 
 
 Two-phase dispatch system:
 
-**Phase 1 — Mega-kernel** (1 dispatch, `agent_count` workgroups, 256 threads each):
+**Phase 1 — Fused kernel** (1 dispatch, `agent_count` workgroups, 256 threads each):
 Loops over `vision_stride` brain cycles internally. Each iteration runs per-agent physics (movement, energy, heightmap clamping), brute-force food detection, death/respawn, and the full 7-pass brain. All synchronization via `workgroupBarrier()` within each workgroup.
 
-**Phase 2 — Global pass** (2-3 dispatches, runs once per `vision_stride` mega-kernel calls):
-Rebuilds spatial grids, handles collisions and food respawn, then runs vision raycasting. Writes fresh `sensory_buf` for the next mega-kernel batch.
+**Phase 2 — Global pass** (2-3 dispatches, runs once per `vision_stride` fused kernel calls):
+Rebuilds spatial grids, handles collisions and food respawn, then runs vision raycasting. Writes fresh `sensory_buf` for the next fused kernel batch.
 
-Per `vision_stride` brain cycles: 3 GPU passes total (1 mega + 2 global/vision). CPU encodes a fixed number of passes regardless of brain cycle count.
+Per `vision_stride` brain cycles: 3 GPU passes total (1 kernel + 2 global/vision). CPU encodes a fixed number of passes regardless of brain cycle count.
 
 ## Tech Stack
 
 - wgpu 24, WGSL compute shaders
-- Rust (gpu_mega_kernel.rs, buffers.rs)
+- Rust (gpu_kernel.rs, buffers.rs)
 - Existing shader phases recomposed into new pipelines
 
 ---
@@ -34,7 +34,7 @@ Per `vision_stride` brain cycles: 3 GPU passes total (1 mega + 2 global/vision).
 
 Current physics has 8 phases. They split cleanly:
 
-### Per-Agent (move to mega-kernel)
+### Per-Agent (move to fused kernel)
 
 | Phase | What it does | Why per-agent |
 |-------|-------------|---------------|
@@ -54,7 +54,7 @@ Current physics has 8 phases. They split cleanly:
 
 ### Food Detection: Grid → Brute-Force
 
-`phase_food_detect` currently reads `food_grid` (a global spatial index). In the mega-kernel, `food_grid` is stale between global passes. Replace with a brute-force cooperative scan:
+`phase_food_detect` currently reads `food_grid` (a global spatial index). In the fused kernel, `food_grid` is stale between global passes. Replace with a brute-force cooperative scan:
 
 - 256 threads per workgroup scan `food_state` (327 items at food_density=0.005, world_size=256)
 - Each thread checks ~2 items for proximity to its agent
@@ -73,13 +73,13 @@ Between global passes (up to `vision_stride` brain cycles):
 
 ---
 
-## Mega-Kernel Shader
+## Fused Kernel Shader
 
 ### Entry Point
 
 ```wgsl
 @compute @workgroup_size(256)
-fn mega_tick(
+fn kernel_tick(
     @builtin(local_invocation_id) lid: vec3u,
     @builtin(workgroup_id) wgid: vec3u,
     // SUBGROUP_ENTRY_PARAMS (for subgroup intrinsics, if available)
@@ -261,24 +261,24 @@ pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
     if self.staging_in_flight[self.staging_idx] { return false; }
 
     let brain_cycles = ticks_to_run / self.brain_tick_stride;
-    let mega_batches = brain_cycles / self.vision_stride;
+    let kernel_batches = brain_cycles / self.vision_stride;
     let remainder = brain_cycles % self.vision_stride;
 
     let mut encoder = self.device.create_command_encoder(&Default::default());
 
     let mut tick_cursor = start_tick;
-    let ticks_per_mega = self.vision_stride * self.brain_tick_stride;
+    let ticks_per_batch = self.vision_stride * self.brain_tick_stride;
 
-    for _ in 0..mega_batches {
-        // Mega-kernel: 1 pass, vision_stride brain cycles
-        self.upload_mega_tick(tick_cursor, self.vision_stride);
+    for _ in 0..kernel_batches {
+        // Fused kernel: 1 pass, vision_stride brain cycles
+        self.upload_kernel_tick(tick_cursor, self.vision_stride);
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.mega_pipeline);
+            pass.set_pipeline(&self.kernel_pipeline);
             pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
-        tick_cursor += ticks_per_mega as u64;
+        tick_cursor += ticks_per_batch as u64;
 
         // Global + vision: 2 passes
         {
@@ -295,12 +295,12 @@ pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         }
     }
 
-    // Remainder: partial mega-kernel + global + vision
+    // Remainder: partial fused kernel + global + vision
     if remainder > 0 {
-        self.upload_mega_tick(tick_cursor, remainder);
+        self.upload_kernel_tick(tick_cursor, remainder);
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.mega_pipeline);
+            pass.set_pipeline(&self.kernel_pipeline);
             pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
             pass.dispatch_workgroups(self.agent_count, 1, 1);
         }
@@ -332,11 +332,11 @@ Three pipelines instead of four:
 
 | Pipeline | Shader | Workgroups | Push Constants |
 |----------|--------|-----------|----------------|
-| `mega_pipeline` | common + mega_tick.wgsl | agent_count | start_tick (via world_config) |
+| `kernel_pipeline` | common + kernel_tick.wgsl | agent_count | start_tick (via world_config) |
 | `global_pipeline` | common + global_tick.wgsl | 1 | tick (via push constants) |
 | `vision_pipeline` | common + vision_tick.wgsl (unchanged) | agent_count (indirect) | none |
 
-The current `physics_pipeline` and `brain_pipeline` are replaced by `mega_pipeline` and `global_pipeline`. The old `physics_tick.wgsl` and `brain_tick.wgsl` entry points are no longer dispatched in the main loop but are retained for standalone test harnesses. The `prepare_pipeline` (indirect dispatch) is retained for vision.
+The current `physics_pipeline` and `brain_pipeline` are replaced by `kernel_pipeline` and `global_pipeline`. The old `physics_tick.wgsl` and `brain_tick.wgsl` entry points are no longer dispatched in the main loop but are retained for standalone test harnesses. The `prepare_pipeline` (indirect dispatch) is retained for vision.
 
 ### Budget Adapter
 
@@ -359,7 +359,7 @@ Default: 10. Runtime-configurable.
 
 ### World Config Uniform
 
-Add `WC_VISION_STRIDE` to the world config buffer. The mega-kernel reads it via `wc_u32(WC_VISION_STRIDE)`. Added alongside existing `WC_BRAIN_TICK_STRIDE`.
+Add `WC_VISION_STRIDE` to the world config buffer. The fused kernel reads it via `wc_u32(WC_VISION_STRIDE)`. Added alongside existing `WC_BRAIN_TICK_STRIDE`.
 
 ---
 
@@ -367,8 +367,8 @@ Add `WC_VISION_STRIDE` to the world config buffer. The mega-kernel reads it via 
 
 At 10 agents, `brain_tick_stride=4`, `vision_stride=10`:
 
-Per mega-batch (10 brain cycles = 40 physics ticks):
-- Mega-kernel: 1 pass, ~880µs GPU time (10 × 88µs per brain cycle at 10 parallel workgroups)
+Per kernel batch (10 brain cycles = 40 physics ticks):
+- Fused kernel: 1 pass, ~880µs GPU time (10 × 88µs per brain cycle at 10 parallel workgroups)
 - Global pass: 1 pass, ~300µs GPU time (grid rebuild + collisions)
 - Vision pass: 1 pass, ~300µs GPU time (raycasting)
 - Total: 3 passes, ~1,480µs per 10 brain cycles
@@ -378,7 +378,7 @@ TPS (physics ticks): 6,756 × 4 = 27,024
 
 With double-buffered staging overlap (~1.5x): ~40k TPS.
 
-CPU encoding: 3 passes per mega-batch. At budget=4000, stride=4, vision_stride=10: 4000/40 = 100 mega-batches × 3 = 300 passes. Encoding: 300 × 16µs = 4.8ms. Well under 50ms threshold.
+CPU encoding: 3 passes per kernel batch. At budget=4000, stride=4, vision_stride=10: 4000/40 = 100 kernel batches × 3 = 300 passes. Encoding: 300 × 16µs = 4.8ms. Well under 50ms threshold.
 
 To reach 60k TPS: increase `vision_stride` to 15-20 (reduces global pass frequency) or the brain shader optimizations (bitonic sort, SoA, subgroups) reduce the 88µs per brain cycle further.
 
@@ -387,29 +387,29 @@ To reach 60k TPS: increase `vision_stride` to 15-20 (reduces global pass frequen
 ## Files Changed
 
 ### New Files
-- `crates/xagent-brain/src/shaders/mega/mega_tick.wgsl` — fused per-agent physics + brain shader
-- `crates/xagent-brain/src/shaders/mega/global_tick.wgsl` — grid rebuild + collision shader
+- `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl` — fused per-agent physics + brain shader
+- `crates/xagent-brain/src/shaders/kernel/global_tick.wgsl` — grid rebuild + collision shader
 
 ### Modified Files
-- `crates/xagent-brain/src/gpu_mega_kernel.rs` — new pipelines, new dispatch loop, vision_stride config
+- `crates/xagent-brain/src/gpu_kernel.rs` — new pipelines, new dispatch loop, vision_stride config
 - `crates/xagent-brain/src/buffers.rs` — WC_VISION_STRIDE constant, food brute-force constants
-- `crates/xagent-brain/src/shaders/mega/common.wgsl` — WC_VISION_STRIDE slot
+- `crates/xagent-brain/src/shaders/kernel/common.wgsl` — WC_VISION_STRIDE slot
 - `crates/xagent-shared/src/config.rs` — vision_stride field on BrainConfig
 - `crates/xagent-sandbox/src/main.rs` — pass vision_stride to kernel, UI control
 
 ### Unchanged Files
-- `crates/xagent-brain/src/shaders/mega/vision_tick.wgsl` — no changes
-- `crates/xagent-brain/src/shaders/mega/brain_tick.wgsl` — logic extracted into mega_tick, original kept for standalone tests
+- `crates/xagent-brain/src/shaders/kernel/vision_tick.wgsl` — no changes
+- `crates/xagent-brain/src/shaders/kernel/brain_tick.wgsl` — logic extracted into kernel_tick, original kept for standalone tests
 
 ---
 
 ## Testing Strategy
 
 - **Brute-force food detection correctness**: Unit test comparing brute-force scan results with grid-based results for known food/agent configurations.
-- **Mega-kernel state equivalence**: Run N ticks with old dispatch (3 passes/cycle) and new dispatch (mega + global), compare `agent_phys` output. Allow small float divergence from food detection order differences.
+- **Fused kernel state equivalence**: Run N ticks with old dispatch (3 passes/cycle) and new dispatch (kernel + global), compare `agent_phys` output. Allow small float divergence from food detection order differences.
 - **Vision stride behavior**: Verify `sensory_buf` only updates every `vision_stride` brain cycles. Check that brain reads cached data between updates.
 - **Double-eating prevention**: Test that two adjacent agents competing for the same food item results in exactly one consumption (atomic flag).
-- **Death/respawn correctness**: Verify brain state resets on death within mega-kernel, identical to current behavior.
+- **Death/respawn correctness**: Verify brain state resets on death within fused kernel, identical to current behavior.
 - **Performance regression**: Benchmark script comparing TPS before/after at 10 agents, 1000x speed.
 
 ---
@@ -419,10 +419,10 @@ To reach 60k TPS: increase `vision_stride` to 15-20 (reduces global pass frequen
 ```
 1. Extract per-agent physics functions (standalone)
 2. Implement brute-force food detection (standalone)
-3. Create mega_tick.wgsl shader (depends on 1, 2)
+3. Create kernel_tick.wgsl shader (depends on 1, 2)
 4. Create global_tick.wgsl shader (standalone)
 5. Add vision_stride config (standalone)
-6. New dispatch loop in gpu_mega_kernel.rs (depends on 3, 4, 5)
+6. New dispatch loop in gpu_kernel.rs (depends on 3, 4, 5)
 7. Remove diagnostic logging, clean up old dispatch code
 ```
 

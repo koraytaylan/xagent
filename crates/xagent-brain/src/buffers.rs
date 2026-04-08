@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn shader_phys_constants_match_rust() {
-        let src = include_str!("shaders/mega/common.wgsl");
+        let src = include_str!("shaders/kernel/common.wgsl");
         let wgsl = parse_wgsl_u32_constants(src);
 
         assert_eq!(wgsl["PHYS_STRIDE"], PHYS_STRIDE as u32);
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn shader_config_constants_match_rust() {
-        let src = include_str!("shaders/mega/common.wgsl");
+        let src = include_str!("shaders/kernel/common.wgsl");
         let wgsl = parse_wgsl_u32_constants(src);
 
         assert_eq!(wgsl["CFG_LEARNING_RATE"], CFG_LEARNING_RATE as u32);
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn shader_brain_config_array_size_matches_config_size() {
-        let src = include_str!("shaders/mega/common.wgsl");
+        let src = include_str!("shaders/kernel/common.wgsl");
         // Find: brain_config: array<vec4<f32>, N>
         let needle = "brain_config:";
         let line = src
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn shader_has_16_bindings() {
-        let src = include_str!("shaders/mega/common.wgsl");
+        let src = include_str!("shaders/kernel/common.wgsl");
         let binding_count = src
             .lines()
             .filter(|l| l.trim().starts_with("@group(0) @binding("))

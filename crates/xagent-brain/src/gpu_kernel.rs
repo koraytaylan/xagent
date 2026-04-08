@@ -374,7 +374,7 @@ impl GpuKernel {
         ];
 
         // ── Pre-allocated telemetry staging buffers ──
-        let tel_sensory_size = (SENSORY_STRIDE * 4) as u64;
+        let tel_sensory_size = (layout.sensory_stride * 4) as u64;
         let tel_decision_size = (DECISION_STRIDE * 4) as u64;
         let tel_brain_size = (layout.brain_stride * 4) as u64;
         let tel_phys_size = (PHYS_STRIDE * 4) as u64;
@@ -1403,18 +1403,20 @@ impl GpuKernel {
     /// Returns (vision_rgba, motor_fwd, motor_turn, habituation_mean, curiosity, fatigue, motor_variance, urgency, gradient).
     pub fn read_agent_telemetry(&self, index: u32) -> AgentTelemetry {
         let i = index as usize;
+        let ss = self.layout.sensory_stride;
+        let fc = self.layout.feature_count;
 
         // Sensory: read vision color portion (RGBA for each ray)
-        let sensory_offset = (i * SENSORY_STRIDE * 4) as u64;
-        let sensory_size = (SENSORY_STRIDE * 4) as u64;
-        let mut sensory = Vec::with_capacity(SENSORY_STRIDE);
+        let sensory_offset = (i * ss * 4) as u64;
+        let sensory_size = (ss * 4) as u64;
+        let mut sensory = Vec::with_capacity(ss);
         self.read_buffer_range(
             &self.sensory_buf,
             sensory_offset,
             sensory_size,
             &mut sensory,
         );
-        let vision_color: Vec<f32> = sensory[..VISION_COLOR_COUNT].to_vec();
+        let vision_color: Vec<f32> = sensory[..self.layout.vision_color_count].to_vec();
 
         // Decision: read motor outputs (last 4 floats of DECISION_STRIDE)
         let dec_offset = (i * DECISION_STRIDE * 4) as u64;
@@ -1432,19 +1434,26 @@ impl GpuKernel {
         let mut brain = Vec::with_capacity(bs);
         self.read_buffer_range(&self.brain_state_buf, brain_offset, brain_size, &mut brain);
 
-        // Habituation: mean of attenuation values (DIM floats at O_HAB_ATTEN)
-        let atten_sum: f32 = brain[O_HAB_ATTEN..O_HAB_ATTEN + DIM].iter().sum();
+        // Compute dynamic brain-state offsets from layout's feature_count
+        let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
+        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
+        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
+        let dyn_fatigue_fwd_ring = dyn_pred_ctx_wt + (O_FATIGUE_FWD_RING - O_PRED_CTX_WT);
+        let dyn_fatigue_turn_ring = dyn_pred_ctx_wt + (O_FATIGUE_TURN_RING - O_PRED_CTX_WT);
+
+        // Habituation: mean of attenuation values (DIM floats)
+        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
         let mean_attenuation = atten_sum / DIM as f32;
 
         // Curiosity bonus: 1.0 - mean_attenuation (higher attenuation = less curious)
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
 
         // Fatigue factor
-        let fatigue_factor = brain[O_FATIGUE_FACTOR];
+        let fatigue_factor = brain[dyn_fatigue_factor];
 
         // Motor variance: compute variance of recent motor commands from fatigue rings
-        let fwd_ring = &brain[O_FATIGUE_FWD_RING..O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN];
-        let turn_ring = &brain[O_FATIGUE_TURN_RING..O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN];
+        let fwd_ring = &brain[dyn_fatigue_fwd_ring..dyn_fatigue_fwd_ring + ACTION_HISTORY_LEN];
+        let turn_ring = &brain[dyn_fatigue_turn_ring..dyn_fatigue_turn_ring + ACTION_HISTORY_LEN];
         let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
         let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
         let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>()
@@ -1456,16 +1465,13 @@ impl GpuKernel {
             / ACTION_HISTORY_LEN as f32;
         let motor_variance = (fwd_var + turn_var) / 2.0;
 
-        // Homeostasis: urgency from EMA gradients
-        let homeo = &brain[O_HOMEO..O_HOMEO + 6];
-        let gradient = homeo[0]; // grad
-        let urgency = homeo[2]; // urgency
-
-        // Physics buffer: prediction_error and exploration_rate (written by brain shader)
+        // Physics buffer: gradient, urgency, prediction_error, exploration_rate
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
         let phys_size = (PHYS_STRIDE * 4) as u64;
         let mut phys = Vec::with_capacity(PHYS_STRIDE);
         self.read_buffer_range(&self.agent_phys_buf, phys_offset, phys_size, &mut phys);
+        let gradient = phys[P_GRADIENT_OUT];
+        let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
 
@@ -1484,6 +1490,15 @@ impl GpuKernel {
         }
     }
 
+    /// Unmap all pre-allocated telemetry staging buffers.
+    /// Safe to call even when buffers are not currently mapped.
+    fn unmap_telemetry_staging(&self) {
+        self.telemetry_staging.sensory.unmap();
+        self.telemetry_staging.decision.unmap();
+        self.telemetry_staging.brain.unmap();
+        self.telemetry_staging.phys.unmap();
+    }
+
     /// Kick off non-blocking telemetry readback for one agent.
     ///
     /// Reuses pre-allocated staging buffers. If a readback for the same agent
@@ -1495,14 +1510,16 @@ impl GpuKernel {
             if pending.agent_index == index {
                 return; // same agent already pending — wait for it
             }
-            // Different agent — clear old pending so we can reuse staging buffers.
+            // Different agent — unmap staging buffers before reusing them.
+            self.unmap_telemetry_staging();
             self.pending_telemetry = None;
         }
 
         let i = index as usize;
         let bs = self.layout.brain_stride;
+        let ss = self.layout.sensory_stride;
 
-        let sensory_size = (SENSORY_STRIDE * 4) as u64;
+        let sensory_size = (ss * 4) as u64;
         let decision_size = (DECISION_STRIDE * 4) as u64;
         let brain_size = (bs * 4) as u64;
         let phys_size = (PHYS_STRIDE * 4) as u64;
@@ -1513,7 +1530,7 @@ impl GpuKernel {
                 label: Some("telemetry_readback_copy"),
             });
 
-        let sensory_offset = (i * SENSORY_STRIDE * 4) as u64;
+        let sensory_offset = (i * ss * 4) as u64;
         encoder.copy_buffer_to_buffer(
             &self.sensory_buf,
             sensory_offset,
@@ -1597,7 +1614,8 @@ impl GpuKernel {
 
         // All 4 callbacks fired. Check for errors.
         if pending.had_error.load(Ordering::Acquire) {
-            // At least one mapping failed — discard and allow retry next frame.
+            // At least one mapping failed — unmap staging buffers and allow retry.
+            self.unmap_telemetry_staging();
             self.pending_telemetry = None;
             return None;
         }
@@ -1605,10 +1623,19 @@ impl GpuKernel {
         // All 4 mappings succeeded — consume pending state and read data.
         let _pending = self.pending_telemetry.take().unwrap();
 
+        // Compute dynamic brain-state offsets from layout's feature_count.
+        // All offsets past O_PRED_CTX_WT have a fixed delta from that anchor.
+        let fc = self.layout.feature_count;
+        let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
+        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
+        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
+        let dyn_fatigue_fwd_ring = dyn_pred_ctx_wt + (O_FATIGUE_FWD_RING - O_PRED_CTX_WT);
+        let dyn_fatigue_turn_ring = dyn_pred_ctx_wt + (O_FATIGUE_TURN_RING - O_PRED_CTX_WT);
+
         // Sensory
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
-        let vision_color: Vec<f32> = sensory[..VISION_COLOR_COUNT].to_vec();
+        let vision_color: Vec<f32> = sensory[..self.layout.vision_color_count].to_vec();
         drop(sensory_data);
         self.telemetry_staging.sensory.unmap();
 
@@ -1625,13 +1652,13 @@ impl GpuKernel {
         let brain_data = self.telemetry_staging.brain.slice(..).get_mapped_range();
         let brain: &[f32] = bytemuck::cast_slice(&brain_data);
 
-        let atten_sum: f32 = brain[O_HAB_ATTEN..O_HAB_ATTEN + DIM].iter().sum();
+        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
         let mean_attenuation = atten_sum / DIM as f32;
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
-        let fatigue_factor = brain[O_FATIGUE_FACTOR];
+        let fatigue_factor = brain[dyn_fatigue_factor];
 
-        let fwd_ring = &brain[O_FATIGUE_FWD_RING..O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN];
-        let turn_ring = &brain[O_FATIGUE_TURN_RING..O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN];
+        let fwd_ring = &brain[dyn_fatigue_fwd_ring..dyn_fatigue_fwd_ring + ACTION_HISTORY_LEN];
+        let turn_ring = &brain[dyn_fatigue_turn_ring..dyn_fatigue_turn_ring + ACTION_HISTORY_LEN];
         let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
         let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
         let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>()
@@ -1643,15 +1670,14 @@ impl GpuKernel {
             / ACTION_HISTORY_LEN as f32;
         let motor_variance = (fwd_var + turn_var) / 2.0;
 
-        let homeo = &brain[O_HOMEO..O_HOMEO + 6];
-        let gradient = homeo[0];
-        let urgency = homeo[2];
         drop(brain_data);
         self.telemetry_staging.brain.unmap();
 
-        // Physics
+        // Physics — gradient and urgency sourced from phys buffer (authoritative)
         let phys_data = self.telemetry_staging.phys.slice(..).get_mapped_range();
         let phys: &[f32] = bytemuck::cast_slice(&phys_data);
+        let gradient = phys[P_GRADIENT_OUT];
+        let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
         drop(phys_data);

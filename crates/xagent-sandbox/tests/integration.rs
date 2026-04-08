@@ -1080,10 +1080,12 @@ fn async_recording_persists_and_round_trips() {
     use xagent_sandbox::replay::{GenerationRecording, TickRecord};
 
     // 1. Create a temp on-disk DB (NOT :memory: — that skips the background writer).
-    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
-    let db_path = tmp.path().to_str().expect("non-UTF-8 temp path").to_owned();
-    // Close the file handle so SQLite can use the path freely.
-    drop(tmp);
+    //    `into_temp_path()` closes the file handle (so SQLite can use it) while
+    //    keeping the path reserved — automatic cleanup when `_tmp` drops at scope end.
+    let _tmp = tempfile::NamedTempFile::new()
+        .expect("failed to create temp file")
+        .into_temp_path();
+    let db_path = _tmp.to_str().expect("non-UTF-8 temp path").to_owned();
 
     let gov_cfg = xagent_shared::GovernorConfig::default();
     let brain_cfg = xagent_shared::BrainConfig::default();
@@ -1163,8 +1165,10 @@ fn async_recording_persists_and_round_trips() {
         );
     }
 
-    // Clean up the temp DB files.
-    let _ = std::fs::remove_file(&db_path);
+    // Drop the governor (and its DB connection) before `_tmp` cleans up the file.
+    drop(gov2);
+    // Also remove WAL/SHM sidecars that SQLite may have created.
     let _ = std::fs::remove_file(format!("{db_path}-wal"));
     let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    // `_tmp` drops here, removing the main DB file automatically.
 }

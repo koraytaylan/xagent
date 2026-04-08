@@ -76,27 +76,38 @@ impl AgentBody {
     }
 }
 
-// ── Color palette for multi-agent rendering ────────────────────────────
+// ── Color generation for multi-agent rendering ──────────────────────────
 
-/// Eight-color palette for distinguishing agents in multi-agent mode.
-/// Colors are chosen for maximum visual contrast on the terrain.
-const AGENT_COLORS: [[f32; 3]; 8] = [
-    [0.85, 0.20, 0.20], // red
-    [0.20, 0.40, 0.90], // blue
-    [0.20, 0.80, 0.25], // green
-    [0.90, 0.85, 0.15], // yellow
-    [0.70, 0.25, 0.85], // purple
-    [0.95, 0.55, 0.10], // orange
-    [0.10, 0.80, 0.80], // cyan
-    [0.90, 0.40, 0.70], // pink
-];
+/// Golden angle in degrees (~137.508°). Successive multiples of this angle
+/// produce maximally spread hues for any population size, avoiding the
+/// clustering that a fixed-size palette causes when `agent_count > palette_len`.
+const GOLDEN_ANGLE_DEG: f32 = 137.508;
 
 /// Gray color applied to dead agent cubes.
 const DEAD_COLOR: [f32; 3] = [0.3, 0.3, 0.3];
 
-/// Get the display color for agent at the given index (wraps around the 8-color palette).
+/// Convert an HSV color (h in 0..360, s/v in 0..1) to sRGB [r, g, b] in 0..1.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let c = v * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r1 + m, g1 + m, b1 + m]
+}
+
+/// Deterministic, visually distinct color for the agent at `index`.
+/// Uses golden-angle hue stepping so any population size gets well-separated colors.
 pub fn agent_color(index: usize) -> [f32; 3] {
-    AGENT_COLORS[index % AGENT_COLORS.len()]
+    let hue = (index as f32 * GOLDEN_ANGLE_DEG) % 360.0;
+    hsv_to_rgb(hue, 0.8, 0.9)
 }
 
 /// Maximum number of agents for performance.

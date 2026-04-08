@@ -1357,9 +1357,10 @@ impl ApplicationHandler for App {
                 if self.orbit_mode && !self.camera.orbit_mode {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         let diff = self.camera.position - agent.body.body.position;
-                        self.camera.orbit_distance = diff.length().clamp(5.0, 200.0);
+                        let len = diff.length().max(0.001);
+                        self.camera.orbit_distance = len.clamp(5.0, 200.0);
                         self.camera.orbit_yaw = diff.z.atan2(diff.x);
-                        self.camera.orbit_pitch = (diff.y / diff.length()).asin().clamp(0.05, 1.4);
+                        self.camera.orbit_pitch = (diff.y / len).asin().clamp(0.05, 1.4);
                     }
                 }
                 self.camera.orbit_mode = self.orbit_mode;

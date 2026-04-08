@@ -380,7 +380,7 @@ impl GpuBrain {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: habituated_buf.as_entire_binding(),
+                    resource: encoded_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -460,6 +460,10 @@ impl GpuBrain {
                     binding: 6,
                     resource: decision_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: encoded_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -500,6 +504,10 @@ impl GpuBrain {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: config_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: encoded_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1307,11 +1315,12 @@ mod tests {
 
         brain.write_agent_state(0, &state);
 
-        // Upload habituated data directly: all 1.0 (same direction as pattern)
-        let hab_data: Vec<f32> = vec![1.0; DIM];
+        // Upload encoded data directly: all 1.0 (same direction as pattern)
+        // recall_score now uses encoded (pre-habituation) state as query.
+        let enc_data: Vec<f32> = vec![1.0; DIM];
         brain
             .queue
-            .write_buffer(&brain.habituated_buf, 0, bytemuck::cast_slice(&hab_data));
+            .write_buffer(&brain.encoded_buf, 0, bytemuck::cast_slice(&enc_data));
 
         brain.run_recall_score();
 

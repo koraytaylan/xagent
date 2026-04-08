@@ -10,6 +10,7 @@
 @group(0) @binding(4) var<storage, read> homeo_out: array<f32>;
 @group(0) @binding(5) var<storage, read_write> history: array<f32>;
 @group(0) @binding(6) var<storage, read_write> decision: array<f32>;
+@group(0) @binding(7) var<storage, read> encoded: array<f32>;
 
 const CREDIT_DECAY: f32 = 0.04;
 const WEIGHT_LR: f32 = 0.10;
@@ -18,23 +19,24 @@ const DEADZONE: f32 = 0.01;
 const MAX_WEIGHT_NORM: f32 = 2.0;
 const ANTICIPATION_WEIGHT: f32 = 0.5;
 
-// Recompute cosine similarity between habituated and a stored pattern.
-// Needed because the similarities buffer was clobbered by topk.
-fn cosine_sim(h_base: u32, p_base: u32, idx: u32) -> f32 {
+// Recompute cosine similarity between encoded state and a stored pattern.
+// Uses encoded (pre-habituation) state so memory recall is not silenced
+// by habituation attenuation during sustained stimuli.
+fn cosine_sim(e_base: u32, p_base: u32, idx: u32) -> f32 {
     var dot_val: f32 = 0.0;
-    var h_norm_sq: f32 = 0.0;
+    var e_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-        let h = habituated[h_base + d];
+        let e = encoded[e_base + d];
         let p = patterns[p_base + d * MEMORY_CAP + idx];
-        dot_val += h * p;
-        h_norm_sq += h * h;
+        dot_val += e * p;
+        e_norm_sq += e * e;
     }
-    let h_norm = sqrt(h_norm_sq);
+    let e_norm = sqrt(e_norm_sq);
     let p_norm = patterns[p_base + O_PAT_NORMS + idx];
-    if (h_norm < 1e-8 || p_norm < 1e-8) {
+    if (e_norm < 1e-8 || p_norm < 1e-8) {
         return 0.0;
     }
-    return clamp(dot_val / (h_norm * p_norm), -1.0, 1.0);
+    return clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
 }
 
 @compute @workgroup_size(1)
@@ -42,6 +44,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let agent = gid.x;
     let b = agent * BRAIN_STRIDE;
     let h_base = agent * DIM;
+    let e_base = agent * DIM;
     let p_base = agent * PATTERN_STRIDE;
     let r_base = agent * RECALL_IDX_STRIDE;
     let ho_base = agent * HOMEO_OUT_STRIDE;
@@ -95,14 +98,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var total_sim: f32 = 0.0;
         for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
             let idx = u32(recall_buf[r_base + k]);
-            let sim = cosine_sim(h_base, p_base, idx);
+            let sim = cosine_sim(e_base, p_base, idx);
             total_sim += max(sim, 0.0);
         }
 
         if (total_sim > 1e-8) {
             for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
                 let idx = u32(recall_buf[r_base + k]);
-                let sim = cosine_sim(h_base, p_base, idx);
+                let sim = cosine_sim(e_base, p_base, idx);
                 let w = context_weight * max(sim, 0.0) / total_sim;
                 for (var d: u32 = 0u; d < DIM; d = d + 1u) {
                     prediction[d] += patterns[p_base + d * MEMORY_CAP + idx] * w;
@@ -226,7 +229,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var total_w: f32 = 0.0;
         for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
             let idx = u32(recall_buf[r_base + k]);
-            let sim = cosine_sim(h_base, p_base, idx);
+            let sim = cosine_sim(e_base, p_base, idx);
             let motor_base = p_base + O_PAT_MOTOR + idx * 3u;
             let valence = patterns[motor_base + 2u];
             let w = sim * valence;

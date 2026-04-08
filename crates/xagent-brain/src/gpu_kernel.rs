@@ -1347,7 +1347,18 @@ impl GpuKernel {
 
     /// Non-blocking: kick off async readback of one agent's brain state.
     /// Results are collected via `try_collect_agent_state`.
-    pub fn request_agent_state(&mut self, index: u32) {
+    pub fn request_agent_state(&mut self, index: u32) -> bool {
+        if index >= self.agent_count {
+            log::warn!(
+                "[GPU] request_agent_state: index {index} out of bounds (agent_count={})",
+                self.agent_count
+            );
+            return false;
+        }
+        if self.agent_state_staging.is_some() {
+            log::warn!("[GPU] request_agent_state: previous readback still in flight — skipping");
+            return false;
+        }
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
@@ -1436,6 +1447,7 @@ impl GpuKernel {
             had_error,
             brain_stride: bs,
         });
+        true
     }
 
     /// Non-blocking poll: returns `Some(Some(state))` when ready,

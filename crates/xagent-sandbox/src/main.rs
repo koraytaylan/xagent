@@ -827,8 +827,9 @@ impl App {
                 let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
                 if let Some(a) = self.agents.get(best_idx) {
                     if let Some(mk) = self.gpu_kernel.as_mut() {
-                        mk.request_agent_state(a.brain_idx);
-                        readback_requested = true;
+                        if mk.request_agent_state(a.brain_idx) {
+                            readback_requested = true;
+                        }
                     }
                 }
             }

@@ -121,9 +121,12 @@ fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>
                     return;
                 }
             };
-            let _ = db.execute_batch(
+            if let Err(e) = db.execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-            );
+            ) {
+                log::error!("[recording-writer] PRAGMA configuration failed: {e}");
+                return;
+            }
             for payload in rx {
                 if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO generation_recording \

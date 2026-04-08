@@ -143,6 +143,12 @@ impl GpuKernel {
         }
         self.staging_idx = 0;
 
+        // Clear async telemetry state so stale readbacks from the
+        // previous generation don't leak into the new one.
+        self.unmap_telemetry_staging();
+        self.pending_telemetry = None;
+        self.cached_telemetry = None;
+
         let n = self.agent_count as usize;
 
         // Fresh brain state, pattern memory, and action history.

@@ -145,9 +145,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let improvement = gradient - rec_grad;
 
         // Tonic credit: when the gradient has stabilized (improvement ≈ 0)
-        // but urgency is high, use absolute gradient × urgency as a
-        // persistent credit signal. Prevents learning from freezing
-        // during sustained pain or sustained recovery while in distress.
+        // but urgency is high, use the signed gradient scaled by urgency
+        // and TONIC_CREDIT_SCALE as a persistent credit signal. This
+        // preserves direction during sustained pain or sustained recovery
+        // while in distress, preventing learning from freezing.
         var credit_input = improvement;
         if (abs(improvement) < DEADZONE) {
             credit_input = gradient * urgency * TONIC_CREDIT_SCALE;

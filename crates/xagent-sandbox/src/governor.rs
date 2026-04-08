@@ -5,12 +5,23 @@
 //! All state is persisted in a SQLite database (`xagent.db`), enabling resume
 //! and post-hoc analysis of the evolution tree.
 
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::JoinHandle;
+
 use rand::Rng;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
 use crate::momentum::MutationMomentum;
+
+/// Payload sent to the background recording-writer thread.
+struct RecordingPayload {
+    node_id: i64,
+    agent_count: i64,
+    tick_count: i64,
+    data: Vec<u8>,
+}
 
 use crate::agent::{crossover_config, mutate_config_with_strength, Agent, HEATMAP_RES};
 
@@ -85,6 +96,47 @@ pub struct Governor {
     cached_tree_nodes: Option<Vec<TreeNode>>,
     /// Per-island mutation momentum vectors.
     pub momentums: Vec<MutationMomentum>,
+    /// Channel sender for offloading recording writes to a background thread.
+    recording_sender: Option<SyncSender<RecordingPayload>>,
+    /// Handle to the background writer thread (joined on drop).
+    writer_thread: Option<JoinHandle<()>>,
+}
+
+/// Spawn a background thread that owns a dedicated SQLite connection and
+/// drains `RecordingPayload` messages from a bounded channel, writing each
+/// one to the `generation_recording` table.
+fn spawn_recording_writer(db_path: &str) -> (SyncSender<RecordingPayload>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel::<RecordingPayload>(4);
+    let path = db_path.to_owned();
+    let handle = std::thread::Builder::new()
+        .name("recording-writer".into())
+        .spawn(move || {
+            let db = match Connection::open(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[recording-writer] failed to open DB: {e}");
+                    return;
+                }
+            };
+            let _ = db.execute_batch("PRAGMA journal_mode=WAL;");
+            for payload in rx {
+                if let Err(e) = db.execute(
+                    "INSERT OR REPLACE INTO generation_recording \
+                     (node_id, agent_count, tick_count, data) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        payload.node_id,
+                        payload.agent_count,
+                        payload.tick_count,
+                        payload.data
+                    ],
+                ) {
+                    eprintln!("[recording-writer] DB write failed: {e}");
+                }
+            }
+        })
+        .expect("failed to spawn recording-writer thread");
+    (tx, handle)
 }
 
 impl Governor {
@@ -195,6 +247,8 @@ impl Governor {
             .map(|_| MutationMomentum::new(config.momentum_decay))
             .collect();
 
+        let (tx, handle) = spawn_recording_writer(db_path);
+
         Ok(Self {
             db,
             config,
@@ -207,6 +261,8 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             momentums,
+            recording_sender: Some(tx),
+            writer_thread: Some(handle),
         })
     }
 
@@ -271,6 +327,8 @@ impl Governor {
         }
         momentums.truncate(num_islands);
 
+        let (tx, handle) = spawn_recording_writer(db_path);
+
         let mut gov = Self {
             db,
             config,
@@ -283,6 +341,8 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             momentums,
+            recording_sender: Some(tx),
+            writer_thread: Some(handle),
         };
         gov.refresh_best_score();
         Ok(gov)
@@ -917,9 +977,15 @@ impl Governor {
         );
     }
 
-    /// Store a generation's recording as a little-endian f32 BLOB in the
-    /// database.  `recording` is the `GenerationRecording` to persist.
+    /// Serialize a generation's recording and send it to the background
+    /// writer thread for asynchronous SQLite persistence.  Never blocks
+    /// the caller — if the channel is full a warning is logged and the
+    /// recording is dropped.
     pub fn store_recording(&self, recording: &crate::replay::GenerationRecording) {
+        let sender = match self.recording_sender.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
         let node_id = match self.current_node_id {
             Some(id) => id,
             None => return,
@@ -986,12 +1052,17 @@ impl Governor {
             return;
         }
 
-        let _ = self.db.execute(
-            "INSERT OR REPLACE INTO generation_recording \
-             (node_id, agent_count, tick_count, data)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![node_id, agent_count, tick_count, bytes],
-        );
+        let payload = RecordingPayload {
+            node_id,
+            agent_count,
+            tick_count,
+            data: bytes,
+        };
+
+        if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(payload) {
+            eprintln!("[governor] recording channel full — dropping recording for node {node_id}");
+        }
+        // TrySendError::Disconnected is silently ignored (writer thread died).
     }
 
     /// Load a generation's recording from the database.
@@ -1146,6 +1217,16 @@ impl Governor {
             }
         }
         map
+    }
+}
+
+impl Drop for Governor {
+    fn drop(&mut self) {
+        // Drop the sender first so the writer thread's recv loop exits.
+        drop(self.recording_sender.take());
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

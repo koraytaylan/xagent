@@ -13,7 +13,7 @@ use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 // ── Dimensions (fixed for default config) ─────────────────────────────
 
 pub const DIM: usize = 32;
-pub const FEATURE_COUNT: usize = 217;
+pub const FEATURE_COUNT: usize = 265;
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const ACTION_HISTORY_LEN: usize = 64;
@@ -35,36 +35,36 @@ pub const SENSORY_STRIDE: usize = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + NON_
 // ── Brain state buffer offsets (per agent) ────────────────────────────
 
 pub const O_ENC_WEIGHTS: usize = 0;
-pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * DIM; // 6944
-pub const O_PRED_WEIGHTS: usize = O_ENC_BIASES + DIM; // 6976
-pub const O_PRED_CTX_WT: usize = O_PRED_WEIGHTS + DIM * DIM; // 8000
-pub const O_PRED_ERR_RING: usize = O_PRED_CTX_WT + 1; // 8001
-pub const O_PRED_ERR_CURSOR: usize = O_PRED_ERR_RING + ERROR_HISTORY_LEN; // 8129
-pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 8130
-pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 8131
-pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 8163
-pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 8195
+pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * DIM; // 8480
+pub const O_PRED_WEIGHTS: usize = O_ENC_BIASES + DIM; // 8512
+pub const O_PRED_CTX_WT: usize = O_PRED_WEIGHTS + DIM * DIM; // 9536
+pub const O_PRED_ERR_RING: usize = O_PRED_CTX_WT + 1; // 9537
+pub const O_PRED_ERR_CURSOR: usize = O_PRED_ERR_RING + ERROR_HISTORY_LEN; // 9665
+pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 9666
+pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 9667
+pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 9699
+pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 9731
 
 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
-pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 8227
-pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 8233
-pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 8265
+pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 9763
+pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 9769
+pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 9801
 
 // act_biases: [fwd_bias, turn_bias]
-pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 8297
-pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 8299
-pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 8300
-pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 8364
-pub const O_FATIGUE_CURSOR: usize = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN; // 8428
-pub const O_FATIGUE_FACTOR: usize = O_FATIGUE_CURSOR + 1; // 8429
-pub const O_FATIGUE_LEN: usize = O_FATIGUE_FACTOR + 1; // 8430
-pub const O_PREV_PREDICTION: usize = O_FATIGUE_LEN + 1; // 8431
-pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 8463
-pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 8464
-pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 8465
-pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1; // 8466
-pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1; // 8467
-pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 8468
+pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 9833
+pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 9835
+pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 9836
+pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 9900
+pub const O_FATIGUE_CURSOR: usize = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN; // 9964
+pub const O_FATIGUE_FACTOR: usize = O_FATIGUE_CURSOR + 1; // 9965
+pub const O_FATIGUE_LEN: usize = O_FATIGUE_FACTOR + 1; // 9966
+pub const O_PREV_PREDICTION: usize = O_FATIGUE_LEN + 1; // 9967
+pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 9999
+pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 10000
+pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 10001
+pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1; // 10002
+pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1; // 10003
+pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 10004
 
 /// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
@@ -157,7 +157,8 @@ impl BrainLayout {
             .expect("vision dimensions overflow color count");
         let depth_count = pixel_count;
         let feature_count = color_count
-            .checked_add(25)
+            .checked_add(depth_count)
+            .and_then(|v| v.checked_add(25))
             .expect("vision dimensions overflow feature count");
         let sensory_stride = color_count
             .checked_add(depth_count)
@@ -240,7 +241,7 @@ pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
-pub const FEATURES_STRIDE: usize = FEATURE_COUNT; // 217
+pub const FEATURES_STRIDE: usize = FEATURE_COUNT; // 265
 pub const ENCODED_STRIDE: usize = DIM; // 32
 pub const HABITUATED_STRIDE: usize = DIM; // 32
 pub const HOMEO_OUT_STRIDE: usize = 6; // grad, raw_grad, urgency, grad_fast, grad_med, grad_slow
@@ -374,6 +375,8 @@ pub fn wgsl_constants() -> String {
         "// Auto-generated constants — do not edit manually
 const DIM: u32 = {DIM}u;
 const FEATURE_COUNT: u32 = {FEATURE_COUNT}u;
+const VISION_COLOR_COUNT: u32 = {VISION_COLOR_COUNT}u;
+const VISION_DEPTH_COUNT: u32 = {VISION_DEPTH_COUNT}u;
 const MEMORY_CAP: u32 = {MEMORY_CAP}u;
 const RECALL_K: u32 = {RECALL_K}u;
 const ACTION_HISTORY_LEN: u32 = {ACTION_HISTORY_LEN}u;
@@ -544,8 +547,6 @@ const VISION_NUM_STEPS: u32 = 25u;
 const VISION_RAYS: u32 = 48u;
 const VISION_W: u32 = 8u;
 const VISION_H: u32 = 6u;
-const VISION_COLOR_COUNT: u32 = 192u;  // 48 rays × 4 RGBA
-const VISION_DEPTH_COUNT: u32 = 48u;
 const MAX_TOUCH_CONTACTS: u32 = 4u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
 const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
@@ -711,7 +712,7 @@ mod tests {
     #[test]
     fn sensory_stride_matches_feature_count() {
         assert_eq!(SENSORY_STRIDE, 267);
-        assert_eq!(FEATURE_COUNT, 217);
+        assert_eq!(FEATURE_COUNT, 265);
         assert!(SENSORY_STRIDE >= FEATURE_COUNT);
     }
 
@@ -764,7 +765,10 @@ mod tests {
             assert_eq!(layout.vision_h, h);
             let pixels = (w * h) as usize;
             assert_eq!(layout.vision_color_count, pixels * 4);
-            assert_eq!(layout.feature_count, layout.vision_color_count + 25);
+            assert_eq!(
+                layout.feature_count,
+                layout.vision_color_count + layout.vision_depth_count + 25
+            );
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;
             let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;

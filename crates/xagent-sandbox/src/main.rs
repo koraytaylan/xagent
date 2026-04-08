@@ -342,6 +342,10 @@ struct App {
     pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
     /// Data collected for upload once the background kernel is ready.
     pending_upload: Option<PendingUpload>,
+    /// Inherited brain state + mutation strength deferred until a background
+    /// kernel finishes creation (when population size changes at generation
+    /// boundary and `can_reuse` is false).
+    deferred_inherited: Option<(AgentBrainState, f32)>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
@@ -474,6 +478,7 @@ impl App {
             gpu_kernel: None,
             pending_kernel: None,
             pending_upload: None,
+            deferred_inherited: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
@@ -536,6 +541,22 @@ impl App {
                     mk.upload_agents(&upload.agent_data);
                 }
                 let ac = mk.agent_count();
+
+                // Apply deferred inherited state from a generation transition
+                // that occurred while the kernel was being recreated.
+                if let Some((ref state, mutation_strength)) = self.deferred_inherited.take() {
+                    let repeats = self.governor_config.eval_repeats.max(1);
+                    let n = self.agents.len();
+                    let champion = state.clone();
+                    mk.batch_write_agent_states(n, |i| {
+                        if i < repeats {
+                            champion.clone()
+                        } else {
+                            mutate_brain_state(state, mutation_strength)
+                        }
+                    });
+                }
+
                 self.gpu_kernel = Some(mk);
                 self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
             }
@@ -784,8 +805,9 @@ impl App {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
-        // Evaluate fitness and kick off async readback of the best agent's
-        // brain state (replaces the old blocking read_agent_state call).
+        // Evaluate fitness and decide whether evolution continues.
+        // Only kick off the async brain-state readback when the result is
+        // Continue — when Finished, no readback is needed.
         let result = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
@@ -796,18 +818,35 @@ impl App {
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
 
-            // fitness is sorted by descending composite_fitness — first entry is best
-            let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-            if let Some(a) = self.agents.get(best_idx) {
-                if let Some(mk) = self.gpu_kernel.as_mut() {
-                    mk.request_agent_state(a.brain_idx);
+            let result = gov.advance(&fitness);
+
+            // Only read back the best agent's brain state when evolution
+            // continues — Finished needs no inherited state.
+            if matches!(result, AdvanceResult::Continue { .. }) {
+                let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+                if let Some(a) = self.agents.get(best_idx) {
+                    if let Some(mk) = self.gpu_kernel.as_mut() {
+                        mk.request_agent_state(a.brain_idx);
+                    }
                 }
             }
 
-            gov.advance(&fitness)
+            result
         };
 
-        self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+        match result {
+            AdvanceResult::Continue { .. } => {
+                self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+            }
+            AdvanceResult::Finished { .. } => {
+                // Skip readback phase entirely — go straight to finish.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+        }
     }
 
     /// Drive the multi-frame generation transition state machine.
@@ -955,6 +994,11 @@ impl App {
                                 mutate_brain_state(state, ms)
                             }
                         });
+                    } else {
+                        // Kernel is being recreated in the background
+                        // (population size changed). Stash inherited state
+                        // so it can be applied once the kernel is ready.
+                        self.deferred_inherited = Some((state.clone(), *mutation_strength));
                     }
                 }
             }

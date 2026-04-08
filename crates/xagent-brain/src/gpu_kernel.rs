@@ -1516,10 +1516,38 @@ impl GpuKernel {
 
         for i in 0..count {
             let s = states(i);
+            debug_assert_eq!(
+                s.brain_state.len(),
+                bs,
+                "agent {}: brain_state length {} != brain_stride {}",
+                i,
+                s.brain_state.len(),
+                bs
+            );
+            debug_assert_eq!(
+                s.patterns.len(),
+                PATTERN_STRIDE,
+                "agent {}: patterns length {} != PATTERN_STRIDE {}",
+                i,
+                s.patterns.len(),
+                PATTERN_STRIDE
+            );
+            debug_assert_eq!(
+                s.history.len(),
+                HISTORY_STRIDE,
+                "agent {}: history length {} != HISTORY_STRIDE {}",
+                i,
+                s.history.len(),
+                HISTORY_STRIDE
+            );
             brain_data.extend_from_slice(&s.brain_state);
             pattern_data.extend_from_slice(&s.patterns);
             history_data.extend_from_slice(&s.history);
         }
+
+        debug_assert_eq!(brain_data.len(), count * bs);
+        debug_assert_eq!(pattern_data.len(), count * PATTERN_STRIDE);
+        debug_assert_eq!(history_data.len(), count * HISTORY_STRIDE);
 
         self.queue
             .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));

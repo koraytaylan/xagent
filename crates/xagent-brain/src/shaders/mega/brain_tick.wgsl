@@ -650,6 +650,8 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
         var motor_fwd: f32;
         var motor_trn: f32;
         if (fatigue_len_u >= 3u) {
+            // cursor already advanced past current tick's write, so:
+            //   cursor-1 = this tick, cursor-2 = 1 ago, cursor-3 = 2 ago.
             let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
             motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
             motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];

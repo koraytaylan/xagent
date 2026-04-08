@@ -127,11 +127,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // into danger" — directed escape rather than freezing.
     let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
     let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
-    // cursor already advanced past the current tick's write in predict_and_act,
-    // so offset 3 = 2 ticks before current.
     var motor_fwd: f32;
     var motor_trn: f32;
     if (fatigue_len_u >= 3u) {
+        // cursor already advanced past current tick's write, so:
+        //   cursor-1 = this tick, cursor-2 = 1 ago, cursor-3 = 2 ago.
         let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
         motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
         motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];

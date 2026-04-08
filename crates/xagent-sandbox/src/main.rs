@@ -864,7 +864,7 @@ impl App {
                 spawned,
             } => {
                 let (done, spawned) =
-                    self.try_finish_generation(&result, &inherited_state, spawned);
+                    self.try_finish_generation(&result, inherited_state.as_ref(), spawned);
                 if !done {
                     // Reset not ready yet — re-enqueue for next frame.
                     self.gen_transition = Some(GenTransition::AwaitingReset {
@@ -886,7 +886,7 @@ impl App {
     fn try_finish_generation(
         &mut self,
         result: &AdvanceResult,
-        inherited_state: &Option<AgentBrainState>,
+        inherited_state: Option<&AgentBrainState>,
         mut spawned: bool,
     ) -> (bool, bool) {
         match result {

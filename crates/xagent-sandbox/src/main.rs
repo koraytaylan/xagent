@@ -1360,7 +1360,7 @@ impl ApplicationHandler for App {
                         self.camera.orbit_distance = diff.length().clamp(5.0, 200.0);
                         self.camera.orbit_yaw = diff.z.atan2(diff.x);
                         self.camera.orbit_pitch =
-                            (diff.y / diff.length()).asin().clamp(-1.4, -0.05);
+                            (diff.y / diff.length()).asin().clamp(0.05, 1.4);
                     }
                 }
                 self.camera.orbit_mode = self.orbit_mode;

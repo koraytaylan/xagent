@@ -1607,6 +1607,8 @@ impl ApplicationHandler for App {
                 let mesh_rebuild_due =
                     self.paused || self.last_mesh_rebuild.elapsed() >= REBUILD_THROTTLE;
 
+                let mut did_rebuild = false;
+
                 if self.food_dirty && mesh_rebuild_due {
                     if let (Some(renderer), Some(world), Some(food_gpu)) =
                         (&self.renderer, &self.world, &mut self.food_gpu)
@@ -1614,6 +1616,7 @@ impl ApplicationHandler for App {
                         let fm = world.food_mesh();
                         food_gpu.update_from_mesh(&renderer.queue, &fm);
                         self.food_dirty = false;
+                        did_rebuild = true;
                     }
                 }
 
@@ -1629,6 +1632,7 @@ impl ApplicationHandler for App {
                                 &world.terrain,
                             );
                             heatmap_gpu.update_from_mesh(&renderer.queue, &mesh);
+                            did_rebuild = true;
                         }
                     }
                     self.heatmap_dirty = false;
@@ -1660,11 +1664,12 @@ impl ApplicationHandler for App {
                             for a in &mut self.agents {
                                 a.trail_dirty = false;
                             }
+                            did_rebuild = true;
                         }
                     }
                 }
 
-                if mesh_rebuild_due && !self.paused {
+                if did_rebuild && !self.paused {
                     self.last_mesh_rebuild = Instant::now();
                 }
 
@@ -1957,7 +1962,7 @@ impl ApplicationHandler for App {
                                         self.last_snapshot_rebuild = Instant::now();
                                     }
                                 }
-                                let agent_snaps = self.cached_agent_snaps.clone();
+                                let agent_snaps = self.cached_agent_snaps.as_slice();
 
                                 // Build evolution snapshot for the UI
                                 if let Some(gov) = &mut self.governor {
@@ -2354,7 +2359,7 @@ impl ApplicationHandler for App {
                                                     desired_vp: &mut desired_vp,
                                                     viewport_hovered: &mut vp_hovered,
                                                     chart_window: &mut chart_win,
-                                                    agents: &agent_snaps,
+                                                    agents: agent_snaps,
                                                     evolution: &mut evo_snap,
                                                     evolution_action: &mut evo_action,
                                                     world: &world_snap,

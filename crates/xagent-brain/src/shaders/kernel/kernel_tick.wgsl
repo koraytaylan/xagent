@@ -3,8 +3,7 @@
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 
-// ── Eat radius constant (2D XZ, squared) — reuse shared threshold ───────
-const EAT_RADIUS_SQ: f32 = FOOD_CONSUME_RADIUS_SQ;
+// EAT_RADIUS removed — read from wconfig via wc_f32(WC_FOOD_RADIUS)
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
@@ -152,6 +151,8 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         agent_phys[b + P_POS_Y],
         agent_phys[b + P_POS_Z]);
     let food_count = wc_u32(WC_FOOD_COUNT);
+    let eat_radius = wc_f32(WC_FOOD_RADIUS);
+    let eat_radius_sq = eat_radius * eat_radius;
 
     // Each thread scans a slice of food_state
     var local_best_idx = 0xFFFFFFFFu;
@@ -162,7 +163,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         let dx = pos.x - food_state[fbase + F_POS_X];
         let dz = pos.z - food_state[fbase + F_POS_Z];
         let d_sq = dx * dx + dz * dz;
-        if (d_sq < EAT_RADIUS_SQ && d_sq < local_best_dist_sq) {
+        if (d_sq < eat_radius_sq && d_sq < local_best_dist_sq) {
             local_best_dist_sq = d_sq;
             local_best_idx = f;
         }

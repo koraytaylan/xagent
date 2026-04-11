@@ -1417,6 +1417,34 @@ impl GpuKernel {
         );
     }
 
+    /// Patch per-agent heritable config values in brain_state buffer.
+    ///
+    /// Writes habituation_sensitivity, max_curiosity_bonus,
+    /// fatigue_recovery_sensitivity, and fatigue_floor from the given
+    /// BrainConfig into the agent's brain_state slots. Use this after
+    /// `reset_agents()` to apply per-agent config variation.
+    pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
+        let i = index as usize;
+        let bs = self.layout.brain_stride;
+
+        // The heritable slots sit at fixed offsets from the start of
+        // each agent's brain_state region.
+        let vals = [
+            (O_HAB_SENSITIVITY, config.habituation_sensitivity),
+            (O_HAB_MAX_CURIOSITY, config.max_curiosity_bonus),
+            (O_FATIGUE_RECOVERY, config.fatigue_recovery_sensitivity),
+            (O_FATIGUE_FLOOR, config.fatigue_floor),
+        ];
+        for (slot, value) in &vals {
+            let byte_offset = ((i * bs + *slot) * 4) as u64;
+            self.queue.write_buffer(
+                &self.brain_state_buf,
+                byte_offset,
+                bytemuck::cast_slice(&[*value]),
+            );
+        }
+    }
+
     /// Non-blocking: kick off async readback of one agent's brain state.
     /// Results are collected via `try_collect_agent_state`.
     pub fn request_agent_state(&mut self, index: u32) -> bool {

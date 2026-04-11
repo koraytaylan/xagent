@@ -154,6 +154,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             }
         }
 
+        // Patch per-agent heritable config values so each agent's
+        // brain_state reflects its own BrainConfig genome (not just
+        // config[0] from reset_agents or the champion's values).
+        for (i, agent) in agents.iter().enumerate() {
+            kernel.write_agent_heritable_config(agent.brain_idx, &current_configs[i]);
+        }
+
         governor.gen_tick = 0;
 
         // Run generation in chunks

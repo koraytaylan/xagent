@@ -1466,14 +1466,14 @@ fn gpu_agents_follow_terrain_height() {
     }
 
     let brain = BrainConfig::default();
-    let wc = WorldConfig {
+    let world_config = WorldConfig {
         seed: 42,
         ..Default::default()
     };
     let agent_count = 10;
 
-    let result = bench::run_bench(brain, wc.clone(), agent_count, 200);
-    let world = WorldState::new(wc);
+    let result = bench::run_bench(brain, world_config.clone(), agent_count, 200);
+    let world = WorldState::new(world_config);
 
     for (i, pos) in result.final_positions.iter().enumerate() {
         let x = pos[0];
@@ -1496,7 +1496,7 @@ fn gpu_agents_follow_terrain_height() {
         // allow small float tolerance (0.99) but reject agents sunk into the ground.
         assert!(
             diff >= 0.99 && diff < 5.0,
-            "Agent {} at ({:.2}, {:.2}, {:.2}): Y should be near terrain height {:.2}, but diff={:.2}",
+            "Agent {} at ({:.2}, {:.2}, {:.2}): expected Y to be 0.99..5.0 above terrain height {:.2}, but y - terrain_y = {:.2}",
             i, x, y, z, terrain_y, diff
         );
     }
@@ -1513,15 +1513,15 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
     }
 
     let brain = BrainConfig::default();
-    let wc = WorldConfig {
+    let world_config = WorldConfig {
         seed: 42,
         ..Default::default()
     };
     let agent_count = 10;
-    let world = WorldState::new(wc.clone());
+    let world = WorldState::new(world_config.clone());
     let food_count = world.food_items.len();
 
-    let mut mk = GpuKernel::new(agent_count as u32, food_count, &brain, &wc);
+    let mut kernel = GpuKernel::new(agent_count as u32, food_count, &brain, &world_config);
 
     let heights = world.terrain.heights.clone();
     let biomes = world.biome_map.grid_as_u32();
@@ -1532,7 +1532,7 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
         .collect();
     let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
-    mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
 
     let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
         .map(|_| world.safe_spawn_position())
@@ -1549,10 +1549,10 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
             )
         })
         .collect();
-    mk.upload_agents(&agent_data);
+    kernel.upload_agents(&agent_data);
 
     // Read state before any ticks (should match uploaded positions)
-    let state_before = mk.read_full_state_blocking();
+    let state_before = kernel.read_full_state_blocking();
     for i in 0..agent_count {
         let base = i * PHYS_STRIDE;
         let y = state_before[base + P_POS_Y];
@@ -1567,13 +1567,13 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
     }
 
     // Run 1 tick on the same kernel and verify agents stay near terrain.
-    // Using `mk` directly (not bench::run_bench) so the pre- and post-tick
+    // Using `kernel` directly (not bench::run_bench) so the pre- and post-tick
     // states come from the same kernel instance.
     assert!(
-        mk.dispatch_batch(0, 1),
+        kernel.dispatch_batch(0, 1),
         "dispatch_batch should return true indicating ticks were submitted"
     );
-    let state_after = mk.read_full_state_blocking();
+    let state_after = kernel.read_full_state_blocking();
     for i in 0..agent_count {
         let base = i * PHYS_STRIDE;
         let x = state_after[base + P_POS_X];

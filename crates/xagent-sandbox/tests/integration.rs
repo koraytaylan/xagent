@@ -1488,10 +1488,10 @@ fn gpu_agents_follow_terrain_height() {
         let terrain_y = world.terrain.height_at(x, z);
         let diff = y - terrain_y;
 
-        // Agents should be above terrain (within AGENT_HALF_HEIGHT = 1.0,
-        // plus tolerance for gravity/movement dynamics)
+        // Agents should be at least AGENT_HALF_HEIGHT (1.0) above terrain;
+        // allow small float tolerance (0.99) but reject agents sunk into the ground.
         assert!(
-            diff >= 0.5 && diff < 5.0,
+            diff >= 0.99 && diff < 5.0,
             "Agent {} at ({:.2}, {:.2}, {:.2}): Y should be near terrain height {:.2}, but diff={:.2}",
             i, x, y, z, terrain_y, diff
         );
@@ -1574,8 +1574,10 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
         let z = state_after[base + P_POS_Z];
         let terrain_y = world.terrain.height_at(x, z);
         let diff = y - terrain_y;
+        // Agents should be at least AGENT_HALF_HEIGHT (1.0) above terrain;
+        // allow small float tolerance (0.99) but reject agents sunk into the ground.
         assert!(
-            diff >= 0.5 && diff < 5.0,
+            diff >= 0.99 && diff < 5.0,
             "Agent {} after 1 tick at ({:.2}, {:.2}, {:.2}): terrain_y={:.2}, diff={:.2}",
             i,
             x,

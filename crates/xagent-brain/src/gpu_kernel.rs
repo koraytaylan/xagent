@@ -1453,8 +1453,8 @@ impl GpuKernel {
 
     /// Patch per-agent heritable config values in brain_state buffer.
     ///
-    /// Writes habituation_sensitivity, max_curiosity_bonus, and
-    /// fatigue_floor from the given BrainConfig into the agent's
+    /// Writes habituation_sensitivity, max_curiosity_bonus, fatigue_floor,
+    /// and movement_speed from the given BrainConfig into the agent's
     /// brain_state slots. Use this after `reset_agents()` to apply
     /// per-agent config variation.
     pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
@@ -1468,11 +1468,13 @@ impl GpuKernel {
         let first_delta = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
         debug_assert_eq!(O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT, first_delta + 1);
         debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 2);
+        debug_assert_eq!(O_MOVEMENT_SPEED - O_PRED_CTX_WT, first_delta + 3);
 
         let values = [
             config.habituation_sensitivity,
             config.max_curiosity_bonus,
             config.fatigue_floor,
+            config.movement_speed,
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(

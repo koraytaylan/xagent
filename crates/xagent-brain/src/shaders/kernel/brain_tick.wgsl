@@ -482,8 +482,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         let floor_val = brain_state[b + O_FATIGUE_FLOOR];
         var fatigue_factor: f32 = 1.0;
         if (p_len >= 4u) {
-            // Oldest entry in ring
-            let oldest_idx = (pos_cursor + 1u) % POS_RING_LEN;
+            // Oldest valid entry in the ring. When the ring is not yet full,
+            // (pos_cursor + 1) points at the next write slot rather than the
+            // oldest sample, so compute from the current valid length instead.
+            let cursor_new = (pos_cursor + 1u) % POS_RING_LEN;
+            let oldest_idx = (cursor_new + POS_RING_LEN - p_len) % POS_RING_LEN;
             let old_x = brain_state[b + O_POS_RING_X + oldest_idx];
             let old_z = brain_state[b + O_POS_RING_Z + oldest_idx];
             let dx = cur_x - old_x;

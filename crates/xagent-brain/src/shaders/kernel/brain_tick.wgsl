@@ -465,13 +465,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         brain_state[b + O_POS_RING_LEN] = new_pos_len;
         brain_state[b + O_POS_RING_CURSOR] = f32((pos_cursor + 1u) % POS_RING_LEN);
 
-        // Accumulate forward motor output (pre-noise) for expected displacement
+        // Accumulate forward motor output (pre-noise) for expected displacement.
+        // This is an approximate running total: when the position ring is full,
+        // we do not subtract the overwritten slot's exact forward contribution.
         let old_accum = brain_state[b + O_ACCUM_FWD];
-        // Subtract the oldest entry's contribution when the ring is full
         var new_accum = old_accum + max(fwd, 0.0);
         if (new_pos_len >= f32(POS_RING_LEN)) {
-            // The slot we just overwrote was the oldest; we don't track per-slot
-            // fwd, so decay the accumulator proportionally instead.
+            // We do not track per-slot forward values, so approximate a bounded
+            // window by decaying the accumulator proportionally each overwrite.
             new_accum *= (f32(POS_RING_LEN) - 1.0) / f32(POS_RING_LEN);
         }
         brain_state[b + O_ACCUM_FWD] = new_accum;

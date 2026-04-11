@@ -1441,13 +1441,11 @@ impl GpuKernel {
         let tail_base = bs - FIXED_TAIL_SIZE;
         let first_delta = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
         debug_assert_eq!(O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT, first_delta + 1);
-        debug_assert_eq!(O_FATIGUE_RECOVERY - O_PRED_CTX_WT, first_delta + 2);
-        debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 3);
+        debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 2);
 
         let values = [
             config.habituation_sensitivity,
             config.max_curiosity_bonus,
-            config.fatigue_recovery_sensitivity,
             config.fatigue_floor,
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;

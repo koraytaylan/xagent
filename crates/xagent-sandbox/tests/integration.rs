@@ -1455,3 +1455,128 @@ fn gpu_non_multiple_ticks_matching_strides_no_crash() {
         assert!(pos[2].is_finite(), "NaN/inf z after non-multiple ticks");
     }
 }
+
+// ── GPU Terrain Height Tests ────────────────────────────────────────
+
+#[test]
+fn gpu_agents_follow_terrain_height() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let wc = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let agent_count = 10;
+
+    let result = bench::run_bench(brain, wc.clone(), agent_count, 200);
+    let world = WorldState::new(wc);
+
+    for (i, pos) in result.final_positions.iter().enumerate() {
+        let x = pos[0];
+        let y = pos[1];
+        let z = pos[2];
+
+        // Skip NaN positions (shouldn't happen but guard)
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
+
+        let terrain_y = world.terrain.height_at(x, z);
+        let diff = y - terrain_y;
+
+        // Agents should be above terrain (within AGENT_HALF_HEIGHT = 1.0,
+        // plus tolerance for gravity/movement dynamics)
+        assert!(
+            diff >= 0.5 && diff < 5.0,
+            "Agent {} at ({:.2}, {:.2}, {:.2}): Y should be near terrain height {:.2}, but diff={:.2}",
+            i, x, y, z, terrain_y, diff
+        );
+    }
+}
+
+#[test]
+fn gpu_agents_y_matches_terrain_after_single_tick() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_POS_Y};
+    use xagent_brain::GpuKernel;
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let wc = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let agent_count = 10;
+    let world = WorldState::new(wc.clone());
+    let food_count = world.food_items.len();
+
+    let mut mk = GpuKernel::new(agent_count as u32, food_count, &brain, &wc);
+
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+
+    let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
+        .map(|_| world.safe_spawn_position())
+        .collect();
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = spawn_positions
+        .iter()
+        .map(|&pos| {
+            (
+                pos,
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+    mk.upload_agents(&agent_data);
+
+    // Read state before any ticks (should match uploaded positions)
+    let state_before = mk.read_full_state_blocking();
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+        let y = state_before[base + P_POS_Y];
+        let expected_y = spawn_positions[i].y;
+        assert!(
+            (y - expected_y).abs() < 0.01,
+            "Agent {} pre-tick Y={:.3} should match spawn Y={:.3}",
+            i,
+            y,
+            expected_y
+        );
+    }
+
+    // Run 1 tick and verify agents stay near terrain
+    let result = bench::run_bench(brain, wc.clone(), agent_count, 1);
+    let world2 = WorldState::new(wc);
+    for (i, pos) in result.final_positions.iter().enumerate() {
+        let terrain_y = world2.terrain.height_at(pos[0], pos[2]);
+        let diff = pos[1] - terrain_y;
+        assert!(
+            diff >= 0.5 && diff < 5.0,
+            "Agent {} after 1 tick at ({:.2}, {:.2}, {:.2}): terrain_y={:.2}, diff={:.2}",
+            i,
+            pos[0],
+            pos[1],
+            pos[2],
+            terrain_y,
+            diff
+        );
+    }
+}

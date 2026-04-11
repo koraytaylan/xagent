@@ -1178,3 +1178,280 @@ fn async_recording_persists_and_round_trips() {
     let _ = std::fs::remove_file(format!("{db_path}-shm"));
     // `_tmp` drops here, removing the main DB file automatically.
 }
+
+// ── Vision-stride / Brain-tick-stride dispatch arithmetic sanity checks ──
+//
+// Background (not verified by these tests):
+//   Within the fused kernel each inner cycle runs in this order:
+//     physics → food_detect → death_respawn → brain
+//   The barriers/orderings only establish phase sequencing within that
+//   kernel cycle; they do not, by themselves, mean every brain input is
+//   sourced from same-cycle data.
+//
+//   In particular, the vision pass (raycasting → sensory_buf) runs at the
+//   end of each batch, AFTER the kernel dispatch. The brain in batch N
+//   reads sensory_buf written by batch N-1's vision pass — a one-batch
+//   lag for sensory/proprioceptive/interoceptive features sourced there.
+//
+//   When brain_tick_stride == vision_stride there is exactly one vision
+//   pass per `vision_stride` brain cycles. The sensory lag is then:
+//     one batch = vision_stride × brain_tick_stride physics ticks.
+//
+//   The tests below validate dispatch-related arithmetic formulas and, where
+//   applicable elsewhere in this file, GPU pipeline behavior for matching
+//   stride values.
+
+/// Sanity-check the cycle/batch-count arithmetic for matching strides.
+/// brain_cycles = ticks / brain_tick_stride
+/// kernel_batches = brain_cycles / vision_stride
+/// When strides are equal S: kernel_batches = ticks / S^2
+#[test]
+fn stride_batch_count_formula_when_strides_match() {
+    // Sanity-check the arithmetic used by dispatch_batch for equal strides.
+    // This test intentionally re-derives the expected values locally; it does
+    // not call bench::run_bench or the real dispatch path.
+
+    // stride = 1: every tick runs vision + brain.
+    // 10 ticks → brain_cycles=10, kernel_batches=10, each with 1 cycle.
+    {
+        let ticks_to_run: u32 = 10;
+        let brain_tick_stride: u32 = 1;
+        let vision_stride: u32 = 1;
+        let brain_cycles = ticks_to_run / brain_tick_stride;
+        let kernel_batches = brain_cycles / vision_stride;
+        let remainder_cycles = brain_cycles % vision_stride;
+        assert_eq!(kernel_batches, 10, "stride=1: should have 10 batches");
+        assert_eq!(remainder_cycles, 0, "stride=1: no remainder cycles");
+    }
+
+    // stride = 10: matching defaults.
+    // 100 ticks → brain_cycles=10, kernel_batches=1, no remainder.
+    {
+        let ticks_to_run: u32 = 100;
+        let brain_tick_stride: u32 = 10;
+        let vision_stride: u32 = 10;
+        let brain_cycles = ticks_to_run / brain_tick_stride;
+        let kernel_batches = brain_cycles / vision_stride;
+        let remainder_cycles = brain_cycles % vision_stride;
+        assert_eq!(kernel_batches, 1, "stride=10: should have 1 batch");
+        assert_eq!(remainder_cycles, 0, "stride=10: no remainder cycles");
+    }
+
+    // stride = 10, non-multiple ticks.
+    // 150 ticks → brain_cycles=15, kernel_batches=1, remainder=5 cycles.
+    {
+        let ticks_to_run: u32 = 150;
+        let brain_tick_stride: u32 = 10;
+        let vision_stride: u32 = 10;
+        let brain_cycles = ticks_to_run / brain_tick_stride;
+        let kernel_batches = brain_cycles / vision_stride;
+        let remainder_cycles = brain_cycles % vision_stride;
+        assert_eq!(
+            kernel_batches, 1,
+            "stride=10, 150 ticks: should have 1 full batch"
+        );
+        assert_eq!(
+            remainder_cycles, 5,
+            "stride=10, 150 ticks: 5 remainder cycles"
+        );
+        // Total batches = kernel_batches + (remainder > 0)
+        let total_batches = kernel_batches + if remainder_cycles > 0 { 1 } else { 0 };
+        assert_eq!(total_batches, 2, "stride=10, 150 ticks: 2 total batches");
+    }
+
+    // Large stride = 64.
+    // 64*64=4096 ticks → brain_cycles=64, kernel_batches=1, no remainder.
+    {
+        let ticks_to_run: u32 = 64 * 64;
+        let brain_tick_stride: u32 = 64;
+        let vision_stride: u32 = 64;
+        let brain_cycles = ticks_to_run / brain_tick_stride;
+        let kernel_batches = brain_cycles / vision_stride;
+        let remainder_cycles = brain_cycles % vision_stride;
+        assert_eq!(kernel_batches, 1, "stride=64: should have 1 batch");
+        assert_eq!(remainder_cycles, 0, "stride=64: no remainder cycles");
+    }
+}
+
+/// Verify the tick coverage: all ticks in a batch are accounted for.
+/// total ticks covered = kernel_batches * vision_stride * brain_tick_stride
+///                       + remainder_cycles * brain_tick_stride
+///                       + physics_remainder
+///
+/// The expected decomposition is precomputed so the test can catch
+/// regressions instead of only re-deriving `total_ticks` from itself.
+#[test]
+fn stride_tick_coverage_is_complete_when_strides_match() {
+    // (stride, total_ticks, (kernel_batches, remainder_cycles, physics_remainder))
+    let cases = [
+        (1u32, 1u32, (1u32, 0u32, 0u32)),
+        (1, 10, (10, 0, 0)),
+        (1, 100, (100, 0, 0)),
+        (1, 500, (500, 0, 0)),
+        (1, 1000, (1000, 0, 0)),
+        (4, 1, (0, 0, 1)),
+        (4, 10, (0, 2, 2)),
+        (4, 100, (6, 1, 0)),
+        (4, 500, (31, 1, 0)),
+        (4, 1000, (62, 2, 0)),
+        (10, 1, (0, 0, 1)),
+        (10, 10, (0, 1, 0)),
+        (10, 100, (1, 0, 0)),
+        (10, 500, (5, 0, 0)),
+        (10, 1000, (10, 0, 0)),
+        (16, 1, (0, 0, 1)),
+        (16, 10, (0, 0, 10)),
+        (16, 100, (0, 6, 4)),
+        (16, 500, (1, 15, 4)),
+        (16, 1000, (3, 14, 8)),
+    ];
+
+    for (stride, total_ticks, expected) in cases {
+        let brain_tick_stride = stride;
+        let vision_stride = stride;
+
+        let brain_cycles = total_ticks / brain_tick_stride;
+        let actual = (
+            brain_cycles / vision_stride,
+            brain_cycles % vision_stride,
+            total_ticks % brain_tick_stride,
+        );
+
+        assert_eq!(
+            actual, expected,
+            "stride={stride}, ticks={total_ticks}: expected {:?}, got {:?}",
+            expected, actual
+        );
+
+        let covered = expected.0 * vision_stride * brain_tick_stride
+            + expected.1 * brain_tick_stride
+            + expected.2;
+
+        assert_eq!(
+            covered, total_ticks,
+            "stride={stride}, ticks={total_ticks}: covered={covered} != total={total_ticks}"
+        );
+    }
+}
+
+/// GPU smoke test: dispatch with brain_tick_stride == vision_stride == 1.
+/// Every tick runs vision + brain; verifies no crash and valid positions.
+#[test]
+fn gpu_stride_1_matching_no_crash() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig {
+        brain_tick_stride: 1,
+        vision_stride: 1,
+        ..BrainConfig::default()
+    };
+    let world = WorldConfig {
+        seed: 1,
+        ..WorldConfig::default()
+    };
+
+    let result = xagent_sandbox::bench::run_bench(brain, world, 2, 10);
+
+    assert_eq!(result.total_ticks, 10);
+    assert_eq!(result.agent_count, 2);
+    for pos in &result.final_positions {
+        assert!(pos[0].is_finite(), "NaN/inf x after stride=1");
+        assert!(pos[1].is_finite(), "NaN/inf y after stride=1");
+        assert!(pos[2].is_finite(), "NaN/inf z after stride=1");
+    }
+}
+
+/// GPU smoke test: dispatch with brain_tick_stride == vision_stride == 10.
+/// Tests the common production case where both strides match at 10.
+#[test]
+fn gpu_stride_10_matching_no_crash() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig {
+        brain_tick_stride: 10,
+        vision_stride: 10,
+        ..BrainConfig::default()
+    };
+    let world = WorldConfig {
+        seed: 2,
+        ..WorldConfig::default()
+    };
+
+    // 200 ticks: 2 full batches of 100 ticks each (10 brain cycles × 10 physics ticks)
+    let result = xagent_sandbox::bench::run_bench(brain, world, 2, 200);
+
+    assert_eq!(result.total_ticks, 200);
+    assert_eq!(result.agent_count, 2);
+    for pos in &result.final_positions {
+        assert!(pos[0].is_finite(), "NaN/inf x after stride=10");
+        assert!(pos[1].is_finite(), "NaN/inf y after stride=10");
+        assert!(pos[2].is_finite(), "NaN/inf z after stride=10");
+    }
+}
+
+/// GPU smoke test: large matching strides (stride=32).
+/// Each batch covers 32×32=1024 physics ticks with one vision pass.
+#[test]
+fn gpu_large_stride_matching_no_crash() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig {
+        brain_tick_stride: 32,
+        vision_stride: 32,
+        ..BrainConfig::default()
+    };
+    let world = WorldConfig {
+        seed: 3,
+        ..WorldConfig::default()
+    };
+
+    // 1024 ticks: exactly one full batch (32 brain cycles × 32 physics ticks)
+    let result = xagent_sandbox::bench::run_bench(brain, world, 2, 1024);
+
+    assert_eq!(result.total_ticks, 1024);
+    assert_eq!(result.agent_count, 2);
+    for pos in &result.final_positions {
+        assert!(pos[0].is_finite(), "NaN/inf x after large stride");
+        assert!(pos[1].is_finite(), "NaN/inf y after large stride");
+        assert!(pos[2].is_finite(), "NaN/inf z after large stride");
+    }
+}
+
+/// GPU smoke test: non-multiple ticks with matching strides.
+/// 150 ticks with stride=10: 1 full batch (100 ticks) + 1 remainder batch (50 ticks).
+#[test]
+fn gpu_non_multiple_ticks_matching_strides_no_crash() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig {
+        brain_tick_stride: 10,
+        vision_stride: 10,
+        ..BrainConfig::default()
+    };
+    let world = WorldConfig {
+        seed: 4,
+        ..WorldConfig::default()
+    };
+
+    let result = xagent_sandbox::bench::run_bench(brain, world, 2, 150);
+
+    assert_eq!(result.total_ticks, 150);
+    assert_eq!(result.agent_count, 2);
+    for pos in &result.final_positions {
+        assert!(pos[0].is_finite(), "NaN/inf x after non-multiple ticks");
+        assert!(pos[1].is_finite(), "NaN/inf y after non-multiple ticks");
+        assert!(pos[2].is_finite(), "NaN/inf z after non-multiple ticks");
+    }
+}

@@ -174,8 +174,8 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with an assigned GPU brain index, color, and zero death count.
     pub fn new(id: u32, position: Vec3, brain_idx: u32, config: BrainConfig, tick: u64) -> Self {
-        let vw = config.vision_w;
-        let vh = config.vision_h;
+        let vw = config.vision_width;
+        let vh = config.vision_height;
         Self {
             id,
             body: AgentBody::new(position),
@@ -364,8 +364,8 @@ pub fn mutate_config_with_strength(
         fatigue_floor: momentum
             .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
             .clamp(0.05, 0.4),
-        vision_w: parent.vision_w,
-        vision_h: parent.vision_h,
+        vision_width: parent.vision_width,
+        vision_height: parent.vision_height,
         brain_tick_stride: parent.brain_tick_stride,
         vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
@@ -381,7 +381,7 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut rng = rand::rng();
     let mut mutated = state.clone();
 
-    // Derive layout from actual state length (supports dynamic vision_w × vision_h).
+    // Derive layout from actual state length (supports dynamic vision_width × vision_height).
     // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
     let variable_part = state
         .brain_state
@@ -485,8 +485,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.fatigue_floor
         },
-        vision_w: a.vision_w,
-        vision_h: a.vision_h,
+        vision_width: a.vision_width,
+        vision_height: a.vision_height,
         brain_tick_stride: a.brain_tick_stride,
         vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,

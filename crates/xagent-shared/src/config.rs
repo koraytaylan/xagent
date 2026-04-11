@@ -42,11 +42,11 @@ pub struct BrainConfig {
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
     /// Visual field width in pixels. Default 8.
-    #[serde(default = "default_vision_w")]
-    pub vision_w: u32,
+    #[serde(default = "default_vision_width")]
+    pub vision_width: u32,
     /// Visual field height in pixels. Default 6.
-    #[serde(default = "default_vision_h")]
-    pub vision_h: u32,
+    #[serde(default = "default_vision_height")]
+    pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
     /// Default 4.
     #[serde(default = "default_brain_tick_stride")]
@@ -110,11 +110,11 @@ fn default_fatigue_floor() -> f32 {
     0.1
 }
 
-fn default_vision_w() -> u32 {
+fn default_vision_width() -> u32 {
     8
 }
 
-fn default_vision_h() -> u32 {
+fn default_vision_height() -> u32 {
     6
 }
 
@@ -248,8 +248,8 @@ impl Default for BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_w: 8,
-            vision_h: 6,
+            vision_width: 8,
+            vision_height: 6,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,
@@ -273,8 +273,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_w: 6,
-            vision_h: 4,
+            vision_width: 6,
+            vision_height: 4,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,
@@ -296,8 +296,8 @@ impl BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_w: 12,
-            vision_h: 8,
+            vision_width: 12,
+            vision_height: 8,
             brain_tick_stride: 4,
             vision_stride: 10,
             metabolic_rate: 1.0,

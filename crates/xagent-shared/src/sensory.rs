@@ -70,9 +70,9 @@ pub struct SensoryFrame {
 
 impl SensoryFrame {
     /// Create a blank sensory frame with pre-allocated vision buffers.
-    pub fn new_blank(vision_w: u32, vision_h: u32) -> Self {
+    pub fn new_blank(vision_width: u32, vision_height: u32) -> Self {
         Self {
-            vision: VisualField::new(vision_w, vision_h),
+            vision: VisualField::new(vision_width, vision_height),
             velocity: Vec3::ZERO,
             facing: Vec3::Z,
             angular_velocity: 0.0,

@@ -66,3 +66,4 @@
 - Commit prefixes: `feat:`, `fix:`, `perf:`
 - Docstrings must match implementation — "non-blocking" means non-blocking, "pre-allocates" means pre-allocates
 - Distinguish "start operation" from "poll/collect operation" in API naming
+- Avoid abbreviations in identifiers — use full words (e.g. `vision_width` not `vision_w`, `position` not `pos`). Exceptions: buffer layout constants (O_*, P_*, CFG_*), loop variables, external API types.

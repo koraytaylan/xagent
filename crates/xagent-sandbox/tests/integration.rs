@@ -28,7 +28,7 @@ fn agent_at(pos: Vec3) -> AgentBody {
 /// Create a blank sensory frame using the default brain config's vision dimensions.
 fn default_frame() -> xagent_shared::SensoryFrame {
     let cfg = xagent_shared::BrainConfig::default();
-    xagent_shared::SensoryFrame::new_blank(cfg.vision_w, cfg.vision_h)
+    xagent_shared::SensoryFrame::new_blank(cfg.vision_width, cfg.vision_height)
 }
 
 // ── Physics Tests ──────────────────────────────────────────────────────
@@ -331,8 +331,8 @@ fn sensory_frame_has_correct_dimensions() {
     let agent = agent_at(Vec3::new(0.0, spawn_y, 0.0));
 
     let cfg = xagent_shared::BrainConfig::default();
-    let vw = cfg.vision_w;
-    let vh = cfg.vision_h;
+    let vw = cfg.vision_width;
+    let vh = cfg.vision_height;
     let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
@@ -1054,8 +1054,8 @@ fn cpu_vision_produces_correct_buffer_shape() {
     ];
 
     let cfg = BrainConfig::default();
-    let vw = cfg.vision_w;
-    let vh = cfg.vision_h;
+    let vw = cfg.vision_width;
+    let vh = cfg.vision_height;
     let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
     let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions, 256.0);
     xagent_sandbox::agent::senses::extract_senses_with_positions(

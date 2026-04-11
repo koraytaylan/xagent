@@ -9,7 +9,7 @@ use log::info;
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
-    PHYS_STRIDE, P_ALIVE, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
+    PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
@@ -122,11 +122,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
         kernel.upload_agents(&agent_data);
 
-        // Reset brain state for new generation.
-        // BrainConfig is population-wide: heritable params (hab_sensitivity,
-        // fatigue_floor, etc.) are stored per-agent in the brain_state buffer
-        // via AgentBrainState, not in the config uniform. The config passed
-        // here only sets structural parameters (DIM, memory_cap, etc.).
+        // `reset_agents()` rebuilds the shader config uniform from this
+        // BrainConfig, so it applies both structural fields (e.g. DIM,
+        // memory_capacity, processing_slots) and population-wide tuning
+        // values (learning_rate, decay_rate, distress_exponent,
+        // metabolic_rate, integrity_scale). Per-agent learned state that
+        // should vary by individual comes from AgentBrainState via
+        // `write_agent_state()` below.
         kernel.reset_agents(&current_configs[0]);
 
         // Inherit learned weights for champions and mutants
@@ -145,22 +147,22 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         // Run generation in chunks
         let gen_start = Instant::now();
-        let tick_budget = governor.config.tick_budget as u32;
-        let mut ticks_done: u32 = 0;
+        let tick_budget = governor.config.tick_budget;
+        let mut ticks_done: u64 = 0;
 
         while ticks_done < tick_budget {
-            let chunk = HEATMAP_INTERVAL.min(tick_budget - ticks_done);
+            let remaining = (tick_budget - ticks_done).min(HEATMAP_INTERVAL as u64) as u32;
             // dispatch_batch is non-blocking and returns false under
             // backpressure — drain staging buffers and retry.
-            while !kernel.dispatch_batch(ticks_done as u64, chunk) {
+            while !kernel.dispatch_batch(ticks_done, remaining) {
                 while !kernel.try_collect_state() {
                     std::thread::yield_now();
                 }
             }
-            ticks_done += chunk;
+            ticks_done += remaining as u64;
 
             // Advance governor tick counter
-            for _ in 0..chunk {
+            for _ in 0..remaining {
                 governor.tick();
             }
 
@@ -197,6 +199,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             let base = i * PHYS_STRIDE;
             agents[i].food_consumed = state[base + P_FOOD_COUNT] as u32;
             agents[i].total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+            agents[i].death_count = state[base + P_DEATH_COUNT] as u32;
         }
 
         println!();

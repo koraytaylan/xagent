@@ -362,6 +362,9 @@ pub fn mutate_config_with_strength(
         vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
         integrity_scale: parent.integrity_scale,
+        movement_speed: momentum
+            .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
+            .clamp(2.0, 20.0),
     }
 }
 
@@ -478,6 +481,11 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,
         integrity_scale: a.integrity_scale,
+        movement_speed: if rng.random::<f32>() < 0.5 {
+            a.movement_speed
+        } else {
+            b.movement_speed
+        },
     }
 }
 

@@ -60,6 +60,10 @@ pub struct BrainConfig {
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
+    /// Base movement speed (units per second). Default 8.0.
+    /// Heritable: mutated during breeding, clamped to [2.0, 20.0].
+    #[serde(default = "default_movement_speed")]
+    pub movement_speed: f32,
 }
 
 /// Configuration for the world simulation.
@@ -128,6 +132,10 @@ fn default_metabolic_rate() -> f32 {
 
 fn default_integrity_scale() -> f32 {
     0.01
+}
+
+fn default_movement_speed() -> f32 {
+    8.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -245,6 +253,7 @@ impl Default for BrainConfig {
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 }
@@ -269,6 +278,7 @@ impl BrainConfig {
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 
@@ -291,6 +301,7 @@ impl BrainConfig {
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 }

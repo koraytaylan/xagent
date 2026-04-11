@@ -55,8 +55,9 @@ fn phase_physics(tid: u32, tick: u32) {
     if desired_sq > 1.0 {
         desired = desired / sqrt(desired_sq);
     }
-    agent_phys[b + P_VEL_X] = desired.x * MOVE_SPEED;
-    agent_phys[b + P_VEL_Z] = desired.z * MOVE_SPEED;
+    let move_speed = brain_state[agent * BRAIN_STRIDE + O_MOVEMENT_SPEED];
+    agent_phys[b + P_VEL_X] = desired.x * move_speed;
+    agent_phys[b + P_VEL_Z] = desired.z * move_speed;
 
     // Gravity
     agent_phys[b + P_VEL_Y] = agent_phys[b + P_VEL_Y] - GRAVITY * dt;

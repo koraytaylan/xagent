@@ -65,12 +65,13 @@ pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 9904
 pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 9905
 pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 9906
 pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1; // 9907
-pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 9908
+pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1; // 9908
+pub const BRAIN_STRIDE: usize = O_MOVEMENT_SPEED + 1; // 9909
 
 /// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
 /// doesn't change with feature_count / vision dimensions.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 372
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 373
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
@@ -419,6 +420,7 @@ const O_TICK_COUNT: u32 = {O_TICK_COUNT}u;
 const O_HAB_SENSITIVITY: u32 = {O_HAB_SENSITIVITY}u;
 const O_HAB_MAX_CURIOSITY: u32 = {O_HAB_MAX_CURIOSITY}u;
 const O_FATIGUE_FLOOR: u32 = {O_FATIGUE_FLOOR}u;
+const O_MOVEMENT_SPEED: u32 = {O_MOVEMENT_SPEED}u;
 
 // Pattern memory offsets
 const O_PAT_STATES: u32 = {O_PAT_STATES}u;
@@ -656,6 +658,7 @@ pub fn init_brain_state_for(
     let delta_hab_sens = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
     let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT;
     let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PRED_CTX_WT;
+    let delta_movement_speed = O_MOVEMENT_SPEED - O_PRED_CTX_WT;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
     for i in 0..DIM {
@@ -672,6 +675,7 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_hab_sens] = config.habituation_sensitivity;
     state[o_pred_ctx_wt + delta_hab_curiosity] = config.max_curiosity_bonus;
     state[o_pred_ctx_wt + delta_fatigue_floor] = config.fatigue_floor;
+    state[o_pred_ctx_wt + delta_movement_speed] = config.movement_speed;
 
     state
 }
@@ -720,7 +724,7 @@ mod tests {
 
     #[test]
     fn brain_stride_is_consistent() {
-        assert_eq!(BRAIN_STRIDE, O_FATIGUE_FLOOR + 1);
+        assert_eq!(BRAIN_STRIDE, O_MOVEMENT_SPEED + 1);
     }
 
     #[test]

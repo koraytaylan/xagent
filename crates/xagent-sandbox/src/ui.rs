@@ -1932,6 +1932,9 @@ impl<'a> TabContext<'a> {
                         ui.label("fatigue_floor");
                         ui.monospace(format!("{:.2}", cfg.fatigue_floor));
                         ui.end_row();
+                        ui.label("movement_speed");
+                        ui.monospace(format!("{:.1}", cfg.movement_speed));
+                        ui.end_row();
                     });
             });
         }

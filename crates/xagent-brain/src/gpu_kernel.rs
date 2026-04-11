@@ -288,7 +288,7 @@ impl GpuKernel {
         ))
         .expect("Failed to create GPU device");
 
-        let layout = BrainLayout::new(brain_config.vision_w, brain_config.vision_h);
+        let layout = BrainLayout::new(brain_config.vision_width, brain_config.vision_height);
         let brain_tick_stride = brain_config.brain_tick_stride;
 
         let storage_rw = wgpu::BufferUsages::STORAGE
@@ -464,11 +464,11 @@ impl GpuKernel {
         let common_src = include_str!("shaders/kernel/common.wgsl")
             .replace(
                 "const VISION_W: u32 = 8u;",
-                &format!("const VISION_W: u32 = {}u;", layout.vision_w),
+                &format!("const VISION_W: u32 = {}u;", layout.vision_width),
             )
             .replace(
                 "const VISION_H: u32 = 6u;",
-                &format!("const VISION_H: u32 = {}u;", layout.vision_h),
+                &format!("const VISION_H: u32 = {}u;", layout.vision_height),
             );
 
         // ── Compose physics shader ──

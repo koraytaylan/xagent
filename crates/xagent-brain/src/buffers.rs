@@ -134,12 +134,12 @@ pub const BRAIN_TICK_STRIDE: u32 = 4;
 
 // ── Runtime layout for configurable vision dimensions ─────────────────
 
-/// Runtime-computed buffer layout that depends on vision_w × vision_h.
+/// Runtime-computed buffer layout that depends on vision_width × vision_height.
 /// All strides and offsets cascade from the pixel count.
 #[derive(Clone, Debug)]
 pub struct BrainLayout {
-    pub vision_w: u32,
-    pub vision_h: u32,
+    pub vision_width: u32,
+    pub vision_height: u32,
     pub vision_color_count: usize,
     pub vision_depth_count: usize,
     pub feature_count: usize,
@@ -148,9 +148,9 @@ pub struct BrainLayout {
 }
 
 impl BrainLayout {
-    pub fn new(vision_w: u32, vision_h: u32) -> Self {
-        let pixel_count = (vision_w as usize)
-            .checked_mul(vision_h as usize)
+    pub fn new(vision_width: u32, vision_height: u32) -> Self {
+        let pixel_count = (vision_width as usize)
+            .checked_mul(vision_height as usize)
             .expect("vision dimensions overflow pixel count");
         let color_count = pixel_count
             .checked_mul(4)
@@ -173,8 +173,8 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
             .expect("vision dimensions overflow brain stride");
         Self {
-            vision_w,
-            vision_h,
+            vision_width,
+            vision_height,
             vision_color_count: color_count,
             vision_depth_count: depth_count,
             feature_count,
@@ -752,8 +752,8 @@ mod tests {
     #[test]
     fn brain_layout_default_matches_constants() {
         let layout = BrainLayout::default();
-        assert_eq!(layout.vision_w, 8);
-        assert_eq!(layout.vision_h, 6);
+        assert_eq!(layout.vision_width, 8);
+        assert_eq!(layout.vision_height, 6);
         assert_eq!(layout.feature_count, FEATURE_COUNT);
         assert_eq!(layout.sensory_stride, SENSORY_STRIDE);
         assert_eq!(layout.brain_stride, BRAIN_STRIDE);
@@ -763,8 +763,8 @@ mod tests {
     fn brain_layout_dynamic_is_consistent() {
         for (w, h) in [(4, 4), (6, 4), (8, 4), (8, 6), (8, 8), (12, 8)] {
             let layout = BrainLayout::new(w, h);
-            assert_eq!(layout.vision_w, w);
-            assert_eq!(layout.vision_h, h);
+            assert_eq!(layout.vision_width, w);
+            assert_eq!(layout.vision_height, h);
             let pixels = (w * h) as usize;
             assert_eq!(layout.vision_color_count, pixels * 4);
             assert_eq!(

@@ -30,7 +30,7 @@ pub struct TickRecord {
     pub fatigue_factor: f32,
     /// Motor output variance.
     pub motor_variance: f32,
-    /// Vision color data (vision_w * vision_h * 4 f32 values). Only stored at keyframes
+    /// Vision color data (vision_width * vision_height * 4 f32 values). Only stored at keyframes
     /// (every VISION_KEYFRAME_INTERVAL ticks) to save memory.
     pub vision_color: Option<Vec<f32>>,
 }
@@ -55,10 +55,10 @@ pub struct GenerationRecording {
     pub agent_count: usize,
     /// (agent_id, color) for each agent slot.
     pub agent_info: Vec<(u32, [f32; 3])>,
-    /// Visual field dimensions used during this generation.
-    pub vision_w: u32,
+    /// Visual field width used during this generation.
+    pub vision_width: u32,
     /// Visual field height used during this generation.
-    pub vision_h: u32,
+    pub vision_height: u32,
     /// Flat array indexed as `tick_records[tick * agent_count + agent_idx]`.
     pub tick_records: Vec<TickRecord>,
     /// Sparse food events (consumption + respawn).
@@ -74,8 +74,8 @@ impl GenerationRecording {
         agents: &[(u32, [f32; 3])],
         initial_food: &[[f32; 3]],
         estimated_ticks: usize,
-        vision_w: u32,
-        vision_h: u32,
+        vision_width: u32,
+        vision_height: u32,
     ) -> Self {
         let agent_count = agents.len();
         Self {
@@ -83,8 +83,8 @@ impl GenerationRecording {
             total_ticks: 0,
             agent_count,
             agent_info: agents.to_vec(),
-            vision_w,
-            vision_h,
+            vision_width,
+            vision_height,
             tick_records: Vec::with_capacity(estimated_ticks * agent_count),
             food_events: Vec::new(),
             initial_food_positions: initial_food.to_vec(),

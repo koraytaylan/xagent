@@ -28,7 +28,7 @@ fn agent_at(position: Vec3) -> AgentBody {
 /// Create a blank sensory frame using the default brain config's vision dimensions.
 fn default_frame() -> xagent_shared::SensoryFrame {
     let cfg = xagent_shared::BrainConfig::default();
-    xagent_shared::SensoryFrame::new_blank(cfg.vision_w, cfg.vision_h)
+    xagent_shared::SensoryFrame::new_blank(cfg.vision_width, cfg.vision_height)
 }
 
 // ── Physics Tests ──────────────────────────────────────────────────────
@@ -331,27 +331,27 @@ fn sensory_frame_has_correct_dimensions() {
     let agent = agent_at(Vec3::new(0.0, spawn_y, 0.0));
 
     let cfg = xagent_shared::BrainConfig::default();
-    let vw = cfg.vision_w;
-    let vh = cfg.vision_h;
-    let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
+    let vision_width = cfg.vision_width;
+    let vision_height = cfg.vision_height;
+    let mut frame = xagent_shared::SensoryFrame::new_blank(vision_width, vision_height);
     xagent_sandbox::agent::senses::extract_senses(&agent, &world, 0, &mut frame);
 
     assert_eq!(
-        frame.vision.width, vw,
+        frame.vision.width, vision_width,
         "Visual field width should match config"
     );
     assert_eq!(
-        frame.vision.height, vh,
+        frame.vision.height, vision_height,
         "Visual field height should match config"
     );
     assert_eq!(
         frame.vision.color.len(),
-        (vw * vh * 4) as usize,
+        (vision_width * vision_height * 4) as usize,
         "Color buffer should have width*height*4 elements"
     );
     assert_eq!(
         frame.vision.depth.len(),
-        (vw * vh) as usize,
+        (vision_width * vision_height) as usize,
         "Depth buffer should have width*height elements"
     );
 }
@@ -1054,9 +1054,9 @@ fn cpu_vision_produces_correct_buffer_shape() {
     ];
 
     let cfg = BrainConfig::default();
-    let vw = cfg.vision_w;
-    let vh = cfg.vision_h;
-    let mut frame = xagent_shared::SensoryFrame::new_blank(vw, vh);
+    let vision_width = cfg.vision_width;
+    let vision_height = cfg.vision_height;
+    let mut frame = xagent_shared::SensoryFrame::new_blank(vision_width, vision_height);
     let agent_grid = xagent_sandbox::world::spatial::AgentGrid::from_positions(&positions, 256.0);
     xagent_sandbox::agent::senses::extract_senses_with_positions(
         &agent,
@@ -1068,8 +1068,14 @@ fn cpu_vision_produces_correct_buffer_shape() {
         &mut frame,
     );
 
-    assert_eq!(frame.vision.color.len(), (vw * vh * 4) as usize);
-    assert_eq!(frame.vision.depth.len(), (vw * vh) as usize);
+    assert_eq!(
+        frame.vision.color.len(),
+        (vision_width * vision_height * 4) as usize
+    );
+    assert_eq!(
+        frame.vision.depth.len(),
+        (vision_width * vision_height) as usize
+    );
 }
 
 // ── Async Recording Persistence ───────────────────────────────────────

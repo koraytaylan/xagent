@@ -96,7 +96,6 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
 
         // Upload world data
-        let heights = world.terrain.heights.clone();
         let biomes = world.biome_map.grid_as_u32();
         let food_pos: Vec<(f32, f32, f32)> = world
             .food_items
@@ -105,7 +104,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
         let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
         let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
-        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_world(
+            &world.terrain.heights,
+            &biomes,
+            &food_pos,
+            &food_consumed,
+            &food_timers,
+        );
 
         // Upload agent physics state
         let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = agents
@@ -122,13 +127,19 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
         kernel.upload_agents(&agent_data);
 
-        // `reset_agents()` rebuilds the shader config uniform from this
-        // BrainConfig, so it applies both structural fields (e.g. DIM,
-        // memory_capacity, processing_slots) and population-wide tuning
-        // values (learning_rate, decay_rate, distress_exponent,
-        // metabolic_rate, integrity_scale). Per-agent learned state that
-        // should vary by individual comes from AgentBrainState via
-        // `write_agent_state()` below.
+        // `reset_agents()` does two things:
+        // 1. Writes the shader config uniform — population-wide brain
+        //    tuning values (learning_rate, decay_rate, distress_exponent,
+        //    metabolic_rate, integrity_scale) plus layout constants
+        //    (DIM, feature_count, memory_cap, recall_k).
+        // 2. Seeds per-agent brain_state with initial heritable values
+        //    from this BrainConfig (habituation_sensitivity,
+        //    max_curiosity_bonus, fatigue_recovery_sensitivity,
+        //    fatigue_floor).
+        // Per-agent physical fields (memory_capacity, processing_slots)
+        // come from `upload_agents()` above. Any inherited or mutated
+        // AgentBrainState written via `write_agent_state()` below
+        // overrides the reset-seeded brain_state values.
         kernel.reset_agents(&current_configs[0]);
 
         // Inherit learned weights for champions and mutants

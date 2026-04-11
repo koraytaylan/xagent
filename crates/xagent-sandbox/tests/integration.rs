@@ -1480,10 +1480,14 @@ fn gpu_agents_follow_terrain_height() {
         let y = pos[1];
         let z = pos[2];
 
-        // Skip NaN positions (shouldn't happen but guard)
-        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
-            continue;
-        }
+        assert!(
+            x.is_finite() && y.is_finite() && z.is_finite(),
+            "Agent {} has non-finite final position: ({:?}, {:?}, {:?})",
+            i,
+            x,
+            y,
+            z
+        );
 
         let terrain_y = world.terrain.height_at(x, z);
         let diff = y - terrain_y;

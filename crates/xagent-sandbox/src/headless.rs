@@ -8,7 +8,9 @@ use std::time::Instant;
 use log::info;
 use xagent_shared::{BrainConfig, FullConfig};
 
-use xagent_brain::buffers::{PHYS_STRIDE, P_ALIVE, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE};
+use xagent_brain::buffers::{
+    PHYS_STRIDE, P_ALIVE, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
+};
 use xagent_brain::{AgentBrainState, GpuKernel};
 
 use crate::agent::{mutate_brain_state, mutate_config, Agent};
@@ -120,7 +122,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
         kernel.upload_agents(&agent_data);
 
-        // Reset brain state for new generation
+        // Reset brain state for new generation.
+        // BrainConfig is population-wide: heritable params (hab_sensitivity,
+        // fatigue_floor, etc.) are stored per-agent in the brain_state buffer
+        // via AgentBrainState, not in the config uniform. The config passed
+        // here only sets structural parameters (DIM, memory_cap, etc.).
         kernel.reset_agents(&current_configs[0]);
 
         // Inherit learned weights for champions and mutants
@@ -144,7 +150,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         while ticks_done < tick_budget {
             let chunk = HEATMAP_INTERVAL.min(tick_budget - ticks_done);
-            kernel.dispatch_batch(ticks_done as u64, chunk);
+            // dispatch_batch is non-blocking and returns false under
+            // backpressure — drain staging buffers and retry.
+            while !kernel.dispatch_batch(ticks_done as u64, chunk) {
+                while !kernel.try_collect_state() {
+                    std::thread::yield_now();
+                }
+            }
             ticks_done += chunk;
 
             // Advance governor tick counter
@@ -152,8 +164,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 governor.tick();
             }
 
-            // Read back positions for heatmap
-            let state = kernel.read_full_state_blocking();
+            // Drain async readback, then sample cached state for heatmap
+            while !kernel.try_collect_state() {
+                std::thread::yield_now();
+            }
+            let state = kernel.cached_state();
             for i in 0..agents.len() {
                 let base = i * PHYS_STRIDE;
                 let alive = state[base + P_ALIVE] > 0.5;

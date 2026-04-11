@@ -55,7 +55,7 @@ impl SortMode {
 #[derive(Clone)]
 pub struct AgentSnapshot {
     pub id: u32,
-    pub gen: u32,
+    pub generation: u32,
     pub energy: f32,
     pub max_energy: f32,
     pub integrity: f32,
@@ -259,7 +259,7 @@ pub struct TabContext<'a> {
 /// Holds egui state needed across frames: context, winit integration, wgpu renderer,
 /// and the offscreen texture used to embed the 3D viewport inside an egui panel.
 pub struct EguiIntegration {
-    pub ctx: egui::Context,
+    pub context: egui::Context,
     winit_state: egui_winit::State,
     wgpu_renderer: egui_wgpu::Renderer,
 
@@ -282,10 +282,10 @@ impl EguiIntegration {
         viewport_width: u32,
         viewport_height: u32,
     ) -> Self {
-        let ctx = egui::Context::default();
+        let context = egui::Context::default();
 
         let winit_state = egui_winit::State::new(
-            ctx.clone(),
+            context.clone(),
             egui::ViewportId::ROOT,
             window,
             None, // native_pixels_per_point — let egui auto-detect
@@ -312,7 +312,7 @@ impl EguiIntegration {
             wgpu_renderer.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
 
         Self {
-            ctx,
+            context,
             winit_state,
             wgpu_renderer,
             viewport_color_format: surface_format,
@@ -419,13 +419,13 @@ impl EguiIntegration {
         ui_fn: impl FnMut(&egui::Context),
     ) {
         let raw_input = self.winit_state.take_egui_input(window);
-        let full_output = self.ctx.run(raw_input, ui_fn);
+        let full_output = self.context.run(raw_input, ui_fn);
 
         self.winit_state
             .handle_platform_output(window, full_output.platform_output);
 
         let tris = self
-            .ctx
+            .context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
 
         // Upload changed textures (font atlas on first frame, etc.)
@@ -493,7 +493,7 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                     .agents
                     .iter()
                     .find(|a| a.id == *id)
-                    .map(|a| format!("Agent {} (g{})", a.id, a.gen))
+                    .map(|a| format!("Agent {} (g{})", a.id, a.generation))
                     .unwrap_or_else(|| format!("Agent {} (?)", id));
                 format!("🧠 {}", name).into()
             }
@@ -578,7 +578,7 @@ impl<'a> TabContext<'a> {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 7.0, color);
-            ui.heading(format!("Agent {} (Gen {})", snap.id, snap.gen));
+            ui.heading(format!("Agent {} (Gen {})", snap.id, snap.generation));
             if !snap.alive {
                 ui.label(egui::RichText::new("DEAD").color(egui::Color32::RED));
             }
@@ -680,7 +680,7 @@ impl<'a> TabContext<'a> {
                     let (id, color) = rec.agent_info[replay.selected_agent_idx];
                     replay_snap = AgentSnapshot {
                         id,
-                        gen: rec.generation,
+                        generation: rec.generation,
                         energy: record.energy,
                         max_energy: 1.0,
                         integrity: record.integrity,
@@ -761,7 +761,7 @@ impl<'a> TabContext<'a> {
                             let (id, color) = rec.agent_info[i];
                             AgentSnapshot {
                                 id,
-                                gen: rec.generation,
+                                generation: rec.generation,
                                 energy: r.energy,
                                 max_energy: 1.0,
                                 integrity: r.integrity,

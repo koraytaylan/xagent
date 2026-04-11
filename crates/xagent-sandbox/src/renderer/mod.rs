@@ -882,10 +882,10 @@ impl Renderer {
     }
 
     /// Submit the command buffer and present the surface.
-    /// Call this after appending any additional render passes (e.g. egui) to `ctx.encoder`.
-    pub fn finish_frame(&self, ctx: FrameContext) {
-        self.queue.submit(std::iter::once(ctx.encoder.finish()));
-        ctx.surface_output.present();
+    /// Call this after appending any additional render passes (e.g. egui) to `context.encoder`.
+    pub fn finish_frame(&self, context: FrameContext) {
+        self.queue.submit(std::iter::once(context.encoder.finish()));
+        context.surface_output.present();
     }
 }
 

@@ -1815,6 +1815,7 @@ impl GpuKernel {
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
+        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PRED_CTX_WT);
         // Habituation: mean of attenuation values (DIM floats)
         let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
         let mean_attenuation = atten_sum / DIM as f32;
@@ -1822,11 +1823,16 @@ impl GpuKernel {
         // Curiosity bonus: 1.0 - mean_attenuation (higher attenuation = less curious)
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
 
-        // Fatigue factor
+        // Fatigue factor and floor
         let fatigue_factor = brain[dyn_fatigue_factor];
+        let fatigue_floor = brain[dyn_fatigue_floor];
 
-        // Staleness: 1.0 - fatigue_factor (higher = more stuck in place)
-        let staleness = 1.0 - fatigue_factor;
+        // Staleness: raw spatial stagnation [0.0, 1.0] recovered by inverting the
+        // shader formula: fatigue_factor = 1.0 - staleness * (1.0 - fatigue_floor).
+        // Dividing by max_penalty undoes the clamping so this spans the full [0,1]
+        // range regardless of fatigue_floor.
+        let max_penalty = (1.0 - fatigue_floor).max(1e-6);
+        let staleness = ((1.0 - fatigue_factor) / max_penalty).clamp(0.0, 1.0);
 
         // Physics buffer: gradient, urgency, prediction_error, exploration_rate
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
@@ -1992,6 +1998,7 @@ impl GpuKernel {
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
+        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PRED_CTX_WT);
         // Sensory
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
@@ -2016,7 +2023,13 @@ impl GpuKernel {
         let mean_attenuation = atten_sum / DIM as f32;
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
         let fatigue_factor = brain[dyn_fatigue_factor];
-        let staleness = 1.0 - fatigue_factor;
+        let fatigue_floor = brain[dyn_fatigue_floor];
+        // Staleness: raw spatial stagnation [0.0, 1.0] recovered by inverting the
+        // shader formula: fatigue_factor = 1.0 - staleness * (1.0 - fatigue_floor).
+        // Dividing by max_penalty undoes the clamping so this spans the full [0,1]
+        // range regardless of fatigue_floor.
+        let max_penalty = (1.0 - fatigue_floor).max(1e-6);
+        let staleness = ((1.0 - fatigue_factor) / max_penalty).clamp(0.0, 1.0);
 
         drop(brain_data);
         self.telemetry_staging.brain.unmap();

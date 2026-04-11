@@ -248,10 +248,10 @@ impl Default for BrainConfig {
             max_curiosity_bonus: 0.6,
             fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
-            vision_width: 8,
-            vision_height: 6,
+            vision_width: default_vision_width(),
+            vision_height: default_vision_height(),
             brain_tick_stride: default_brain_tick_stride(),
-            vision_stride: 10,
+            vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
         }
@@ -276,7 +276,7 @@ impl BrainConfig {
             vision_width: 6,
             vision_height: 4,
             brain_tick_stride: default_brain_tick_stride(),
-            vision_stride: 10,
+            vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
         }
@@ -299,7 +299,7 @@ impl BrainConfig {
             vision_width: 12,
             vision_height: 8,
             brain_tick_stride: default_brain_tick_stride(),
-            vision_stride: 10,
+            vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
         }
@@ -366,8 +366,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vision_stride_defaults_to_10() {
+    fn brain_config_tuned_defaults() {
         let config = BrainConfig::default();
+        assert_eq!(config.brain_tick_stride, 10);
         assert_eq!(config.vision_stride, 10);
+        assert_eq!(config.vision_width, 8);
+        assert_eq!(config.vision_height, 6);
+        assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
+        assert!((config.integrity_scale - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn governor_config_tuned_defaults() {
+        let config = GovernorConfig::default();
+        assert_eq!(config.tick_budget, 1_000_000);
     }
 }

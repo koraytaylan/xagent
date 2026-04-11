@@ -1668,17 +1668,19 @@ impl ApplicationHandler for App {
 
                                 // Diagnostic: log first readback Y vs terrain height
                                 if !self.readback_logged {
-                                    self.readback_logged = true;
                                     if let Some(world) = &self.world {
                                         let n = self.agents.len().min(5);
-                                        for i in 0..n {
-                                            let a = &self.agents[i];
-                                            let p = a.body.body.position;
-                                            let terrain_y = world.terrain.height_at(p.x, p.z);
-                                            log::info!(
-                                                "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
-                                                i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
-                                            );
+                                        if n > 0 {
+                                            for i in 0..n {
+                                                let a = &self.agents[i];
+                                                let p = a.body.body.position;
+                                                let terrain_y = world.terrain.height_at(p.x, p.z);
+                                                log::info!(
+                                                    "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
+                                                    i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
+                                                );
+                                            }
+                                            self.readback_logged = true;
                                         }
                                     }
                                 }

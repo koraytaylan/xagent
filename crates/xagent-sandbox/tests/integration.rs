@@ -1565,7 +1565,10 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
     // Run 1 tick on the same kernel and verify agents stay near terrain.
     // Using `mk` directly (not bench::run_bench) so the pre- and post-tick
     // states come from the same kernel instance.
-    mk.dispatch_batch(0, 1);
+    assert!(
+        mk.dispatch_batch(0, 1),
+        "dispatch_batch should return true indicating ticks were submitted"
+    );
     let state_after = mk.read_full_state_blocking();
     for i in 0..agent_count {
         let base = i * PHYS_STRIDE;

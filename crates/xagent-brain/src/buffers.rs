@@ -167,7 +167,7 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
             .expect("vision dimensions overflow sensory stride");
         // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR, incl. position ring)
+        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_MOVEMENT_SPEED, incl. position ring)
         let brain_stride = feature_count
             .checked_mul(DIM)
             .and_then(|v| v.checked_add(DIM))

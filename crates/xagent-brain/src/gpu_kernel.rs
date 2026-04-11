@@ -104,7 +104,7 @@ pub struct GpuKernel {
 
     // ── Async state readback (double-buffered, non-blocking) ──
     state_staging: [wgpu::Buffer; 2],
-    staging_index: usize,                  // which buffer to write NEXT
+    staging_index: usize,                // which buffer to write NEXT
     staging_in_flight: [bool; 2],        // submitted, not yet collected
     staging_ready: [Arc<AtomicBool>; 2], // map_async callback fired
     state_cache: Vec<f32>,
@@ -204,8 +204,11 @@ impl GpuKernel {
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        self.queue
-            .write_buffer(&self.brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
+        self.queue.write_buffer(
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
         self.queue
@@ -1376,7 +1379,12 @@ impl GpuKernel {
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
         let pat_size = (PATTERN_STRIDE * 4) as u64;
-        self.read_buffer_range(&self.pattern_buffer, pat_offset, pat_size, &mut state.patterns);
+        self.read_buffer_range(
+            &self.pattern_buffer,
+            pat_offset,
+            pat_size,
+            &mut state.patterns,
+        );
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         let hist_size = (HISTORY_STRIDE * 4) as u64;
@@ -1499,7 +1507,13 @@ impl GpuKernel {
             brain_size,
         );
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.pattern_buffer, pat_offset, &pattern_staging, 0, pat_size);
+        encoder.copy_buffer_to_buffer(
+            &self.pattern_buffer,
+            pat_offset,
+            &pattern_staging,
+            0,
+            pat_size,
+        );
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         encoder.copy_buffer_to_buffer(
             &self.history_buffer,
@@ -1666,8 +1680,11 @@ impl GpuKernel {
         debug_assert_eq!(pattern_data.len(), count * PATTERN_STRIDE);
         debug_assert_eq!(history_data.len(), count * HISTORY_STRIDE);
 
-        self.queue
-            .write_buffer(&self.brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
+        self.queue.write_buffer(
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
         self.queue
@@ -1711,8 +1728,11 @@ impl GpuKernel {
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        self.queue
-            .write_buffer(&self.brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
+        self.queue.write_buffer(
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
         self.queue
@@ -1786,7 +1806,12 @@ impl GpuKernel {
         let brain_offset = (i * bs * 4) as u64;
         let brain_size = (bs * 4) as u64;
         let mut brain = Vec::with_capacity(bs);
-        self.read_buffer_range(&self.brain_state_buffer, brain_offset, brain_size, &mut brain);
+        self.read_buffer_range(
+            &self.brain_state_buffer,
+            brain_offset,
+            brain_size,
+            &mut brain,
+        );
 
         // Compute dynamic brain-state offsets from layout's feature_count
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;

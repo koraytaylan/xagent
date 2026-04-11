@@ -168,7 +168,7 @@ enum AgentSlice<'a> {
 
 /// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
-/// Advances a ray from `origin` in direction `dir` in increments of `step` units,
+/// Advances a ray from `origin` in direction `direction` in increments of `step` units,
 /// checking for food items, other agents, and terrain at each step. Returns the
 /// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///

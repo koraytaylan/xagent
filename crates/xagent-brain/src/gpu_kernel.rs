@@ -1427,16 +1427,27 @@ impl GpuKernel {
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
-        // The heritable slots sit at fixed offsets from the start of
-        // each agent's brain_state region.
+        // Heritable slots live in the fixed tail of brain_state.
+        // Use dynamic base so this works with any BrainLayout, not
+        // just the default FEATURE_COUNT (see init_brain_state_for).
+        let tail_base = bs - FIXED_TAIL_SIZE;
         let vals = [
-            (O_HAB_SENSITIVITY, config.habituation_sensitivity),
-            (O_HAB_MAX_CURIOSITY, config.max_curiosity_bonus),
-            (O_FATIGUE_RECOVERY, config.fatigue_recovery_sensitivity),
-            (O_FATIGUE_FLOOR, config.fatigue_floor),
+            (
+                O_HAB_SENSITIVITY - O_PRED_CTX_WT,
+                config.habituation_sensitivity,
+            ),
+            (
+                O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT,
+                config.max_curiosity_bonus,
+            ),
+            (
+                O_FATIGUE_RECOVERY - O_PRED_CTX_WT,
+                config.fatigue_recovery_sensitivity,
+            ),
+            (O_FATIGUE_FLOOR - O_PRED_CTX_WT, config.fatigue_floor),
         ];
-        for (slot, value) in &vals {
-            let byte_offset = ((i * bs + *slot) * 4) as u64;
+        for (delta, value) in &vals {
+            let byte_offset = ((i * bs + tail_base + *delta) * 4) as u64;
             self.queue.write_buffer(
                 &self.brain_state_buf,
                 byte_offset,

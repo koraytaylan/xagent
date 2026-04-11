@@ -1201,18 +1201,22 @@ impl GpuKernel {
     ///   3. `global`   — grid rebuild + collisions
     ///   4. `vision`   — raycasting writes `sensory_buf`
     ///
-    /// The brain (step 2) therefore reads `sensory_buf` written by the vision
-    /// pass of the **previous** batch — a one-batch lag that is intentional and
-    /// consistent regardless of stride settings.
+    /// The brain work in step 2 consumes features from `sensory_buf`, so it reads
+    /// the values produced by the vision pass of the **previous** batch. That
+    /// one-batch sensory lag is intentional and consistent regardless of stride
+    /// settings.
     ///
-    /// Within the kernel's inner cycle, physics always runs before brain
-    /// (enforced by `workgroupBarrier()`).  So the brain always reads the
-    /// physics state produced earlier in the **same** cycle.
+    /// Within each kernel inner cycle, the fused shader executes its physics
+    /// phases before its brain phase in program order. However, this comment
+    /// should not be read as a claim that `workgroupBarrier()` alone makes
+    /// `agent_phys` storage-buffer writes visible across invocations; the brain's
+    /// feature inputs come from `sensory_buf`, not from same-batch vision output.
     ///
     /// When `brain_tick_stride == vision_stride` there is exactly one vision
-    /// pass per brain cycle (at the end of the batch).  The batch covers
-    /// `vision_stride × brain_tick_stride` physics ticks and the sensory lag
-    /// is one batch = `vision_stride × brain_tick_stride` physics ticks.
+    /// pass per batch, i.e. one vision pass per `vision_stride` brain cycles
+    /// (at the end of the batch). The batch covers
+    /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
+    /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         // Check if the write-target staging buffer is free.
         let widx = self.staging_idx;

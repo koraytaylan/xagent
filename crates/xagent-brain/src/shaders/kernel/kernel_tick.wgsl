@@ -342,17 +342,18 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // Ordering guarantee within each inner cycle:
 //   physics → food_detect → death_respawn → brain
 //
-// All steps are separated by workgroupBarrier() so every thread in the
-// workgroup observes the writes from the prior step before proceeding.
-// This means the brain ALWAYS reads physics state from the same cycle —
-// including when brain_tick_stride == vision_stride.
+// This guarantees same-dispatch ordering/visibility for data written in the
+// earlier kernel phases, but it does NOT mean all brain inputs are from the
+// same cycle.
 //
 // Vision data (sensory_buf) is written by the external vision pass, which
 // runs in the same GPU command encoder AFTER this kernel dispatch.  The
 // brain therefore reads sensory_buf written by the *previous* batch's vision
 // pass — a one-batch lag that is consistent regardless of stride values.
 // Non-visual proprioception (velocity, energy, etc.) follows the same lag
-// because it is also packed into sensory_buf by that vision pass.
+// because it is also packed into sensory_buf by that vision pass.  In this
+// function, the only physics state read directly from agent_phys before
+// feature extraction is the same-cycle P_ALIVE flag used for the early-out.
 //
 // When brain_tick_stride == vision_stride the batch covers exactly
 // (vision_stride * brain_tick_stride) physics ticks and vision runs once

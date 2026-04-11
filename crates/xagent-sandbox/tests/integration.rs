@@ -1178,29 +1178,32 @@ fn async_recording_persists_and_round_trips() {
 // Ordering guarantee (verified here):
 //   Within the fused kernel each inner cycle runs in this order:
 //     physics → food_detect → death_respawn → brain
-//   All steps are separated by workgroupBarrier(), so brain always reads
-//   physics state from the *same* cycle.
+//   The barriers/orderings only establish phase sequencing within that
+//   kernel cycle; they do not, by themselves, mean every brain input is
+//   sourced from same-cycle data.
 //
-//   The vision pass (raycasting → sensory_buf) runs at the end of each
-//   batch, AFTER the kernel dispatch.  The brain in batch N reads
-//   sensory_buf written by batch N-1's vision pass — a one-batch lag.
+//   In particular, the vision pass (raycasting → sensory_buf) runs at the
+//   end of each batch, AFTER the kernel dispatch. The brain in batch N
+//   reads sensory_buf written by batch N-1's vision pass — a one-batch
+//   lag for sensory/proprioceptive/interoceptive features sourced there.
 //
 //   When brain_tick_stride == vision_stride there is exactly one vision
-//   pass per `vision_stride` brain cycles.  The sensory lag is then:
+//   pass per `vision_stride` brain cycles. The sensory lag is then:
 //     one batch = vision_stride × brain_tick_stride physics ticks.
 //
-//   The tests below exercise the Rust-side dispatch arithmetic and the
-//   GPU pipeline with various matching stride values.
+//   The tests below validate dispatch-related arithmetic formulas and, where
+//   applicable elsewhere in this file, GPU pipeline behavior for matching
+//   stride values.
 
-/// Verify the dispatch_batch cycle/batch count arithmetic when strides match.
+/// Sanity-check the cycle/batch-count arithmetic for matching strides.
 /// brain_cycles = ticks / brain_tick_stride
 /// kernel_batches = brain_cycles / vision_stride
 /// When strides are equal S: kernel_batches = ticks / S^2
 #[test]
-fn stride_batch_count_arithmetic_when_strides_match() {
-    // Simulate the arithmetic in dispatch_batch for equal strides.
-    // We can't call the private fields directly, so we exercise them via
-    // bench::run_bench which internally calls dispatch_batch.
+fn stride_batch_count_formula_when_strides_match() {
+    // Sanity-check the arithmetic used by dispatch_batch for equal strides.
+    // This test intentionally re-derives the expected values locally; it does
+    // not call bench::run_bench or the real dispatch path.
 
     // stride = 1: every tick runs vision + brain.
     // 10 ticks → brain_cycles=10, kernel_batches=10, each with 1 cycle.

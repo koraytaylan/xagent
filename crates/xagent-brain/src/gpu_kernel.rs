@@ -1427,33 +1427,27 @@ impl GpuKernel {
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
-        // Heritable slots live in the fixed tail of brain_state.
+        // Heritable slots are contiguous in the fixed tail of brain_state.
         // Use dynamic base so this works with any BrainLayout, not
         // just the default FEATURE_COUNT (see init_brain_state_for).
         let tail_base = bs - FIXED_TAIL_SIZE;
-        let vals = [
-            (
-                O_HAB_SENSITIVITY - O_PRED_CTX_WT,
-                config.habituation_sensitivity,
-            ),
-            (
-                O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT,
-                config.max_curiosity_bonus,
-            ),
-            (
-                O_FATIGUE_RECOVERY - O_PRED_CTX_WT,
-                config.fatigue_recovery_sensitivity,
-            ),
-            (O_FATIGUE_FLOOR - O_PRED_CTX_WT, config.fatigue_floor),
+        let first_delta = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
+        debug_assert_eq!(O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT, first_delta + 1);
+        debug_assert_eq!(O_FATIGUE_RECOVERY - O_PRED_CTX_WT, first_delta + 2);
+        debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 3);
+
+        let values = [
+            config.habituation_sensitivity,
+            config.max_curiosity_bonus,
+            config.fatigue_recovery_sensitivity,
+            config.fatigue_floor,
         ];
-        for (delta, value) in &vals {
-            let byte_offset = ((i * bs + tail_base + *delta) * 4) as u64;
-            self.queue.write_buffer(
-                &self.brain_state_buf,
-                byte_offset,
-                bytemuck::cast_slice(&[*value]),
-            );
-        }
+        let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
+        self.queue.write_buffer(
+            &self.brain_state_buf,
+            byte_offset,
+            bytemuck::cast_slice(&values),
+        );
     }
 
     /// Non-blocking: kick off async readback of one agent's brain state.

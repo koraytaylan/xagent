@@ -123,7 +123,7 @@ fn default_seed() -> u64 {
 }
 
 fn default_brain_tick_stride() -> u32 {
-    4
+    10
 }
 
 fn default_vision_stride() -> u32 {
@@ -131,11 +131,11 @@ fn default_vision_stride() -> u32 {
 }
 
 fn default_metabolic_rate() -> f32 {
-    1.0
+    0.01
 }
 
 fn default_integrity_scale() -> f32 {
-    1.0
+    0.01
 }
 
 /// Describes an agent to be spawned into the world.
@@ -221,7 +221,7 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             population_size: 10,
-            tick_budget: 50_000,
+            tick_budget: 1_000_000,
             elitism_count: 3,
             max_generations: 0,
             patience: 5,
@@ -250,10 +250,10 @@ impl Default for BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 8,
             vision_height: 6,
-            brain_tick_stride: 4,
+            brain_tick_stride: default_brain_tick_stride(),
             vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 }
@@ -275,10 +275,10 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 6,
             vision_height: 4,
-            brain_tick_stride: 4,
+            brain_tick_stride: default_brain_tick_stride(),
             vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            metabolic_rate: 0.01,
+            integrity_scale: 0.01,
         }
     }
 
@@ -298,10 +298,10 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 12,
             vision_height: 8,
-            brain_tick_stride: 4,
+            brain_tick_stride: default_brain_tick_stride(),
             vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            metabolic_rate: 0.01,
+            integrity_scale: 0.01,
         }
     }
 }

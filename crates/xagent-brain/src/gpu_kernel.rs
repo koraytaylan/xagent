@@ -1452,7 +1452,7 @@ impl GpuKernel {
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             byte_offset,
             bytemuck::cast_slice(&values),
         );

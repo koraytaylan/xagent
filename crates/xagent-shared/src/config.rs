@@ -48,7 +48,7 @@ pub struct BrainConfig {
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
-    /// Default 4.
+    /// Default 10.
     #[serde(default = "default_brain_tick_stride")]
     pub brain_tick_stride: u32,
     /// Brain cycles between global passes (grid rebuild, collisions, vision).
@@ -56,11 +56,11 @@ pub struct BrainConfig {
     /// Default 10.
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
-    /// Multiplier for all energy costs (metabolic + movement). Default 1.0.
+    /// Multiplier for all energy costs (metabolic + movement). Default 0.01.
     /// Lower = agents survive longer. Higher = harsher energy pressure.
     #[serde(default = "default_metabolic_rate")]
     pub metabolic_rate: f32,
-    /// Multiplier for integrity damage and regen. Default 1.0.
+    /// Multiplier for integrity damage and regen. Default 0.01.
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,

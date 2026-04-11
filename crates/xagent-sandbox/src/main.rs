@@ -1675,7 +1675,7 @@ impl ApplicationHandler for App {
                                             let a = &self.agents[i];
                                             let p = a.body.body.position;
                                             let terrain_y = world.terrain.height_at(p.x, p.z);
-                                            println!(
+                                            log::info!(
                                                 "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
                                                 i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
                                             );

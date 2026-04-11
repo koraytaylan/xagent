@@ -1500,7 +1500,7 @@ fn gpu_agents_follow_terrain_height() {
 
 #[test]
 fn gpu_agents_y_matches_terrain_after_single_tick() {
-    use xagent_brain::buffers::{PHYS_STRIDE, P_POS_Y};
+    use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z};
     use xagent_brain::GpuKernel;
 
     if !xagent_brain::GpuKernel::is_available() {
@@ -1562,19 +1562,25 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
         );
     }
 
-    // Run 1 tick and verify agents stay near terrain
-    let result = bench::run_bench(brain, wc.clone(), agent_count, 1);
-    let world2 = WorldState::new(wc);
-    for (i, pos) in result.final_positions.iter().enumerate() {
-        let terrain_y = world2.terrain.height_at(pos[0], pos[2]);
-        let diff = pos[1] - terrain_y;
+    // Run 1 tick on the same kernel and verify agents stay near terrain.
+    // Using `mk` directly (not bench::run_bench) so the pre- and post-tick
+    // states come from the same kernel instance.
+    mk.dispatch_batch(0, 1);
+    let state_after = mk.read_full_state_blocking();
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+        let x = state_after[base + P_POS_X];
+        let y = state_after[base + P_POS_Y];
+        let z = state_after[base + P_POS_Z];
+        let terrain_y = world.terrain.height_at(x, z);
+        let diff = y - terrain_y;
         assert!(
             diff >= 0.5 && diff < 5.0,
             "Agent {} after 1 tick at ({:.2}, {:.2}, {:.2}): terrain_y={:.2}, diff={:.2}",
             i,
-            pos[0],
-            pos[1],
-            pos[2],
+            x,
+            y,
+            z,
             terrain_y,
             diff
         );

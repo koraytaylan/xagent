@@ -686,6 +686,45 @@ mod tests {
     }
 
     #[test]
+    fn mutate_config_respects_movement_speed_bounds() {
+        let momentum = MutationMomentum::new(0.9);
+        // Push initial config to extreme values to verify clamps.
+        let too_fast = BrainConfig {
+            movement_speed: 100.0,
+            ..BrainConfig::default()
+        };
+        let too_slow = BrainConfig {
+            movement_speed: 0.1,
+            ..BrainConfig::default()
+        };
+        for _ in 0..50 {
+            let child = mutate_config_with_strength(&too_fast, 0.3, &momentum);
+            assert!(
+                child.movement_speed <= 20.0,
+                "movement_speed must be <= 20.0, got {}",
+                child.movement_speed,
+            );
+            assert!(
+                child.movement_speed >= 2.0,
+                "movement_speed must be >= 2.0, got {}",
+                child.movement_speed,
+            );
+
+            let child = mutate_config_with_strength(&too_slow, 0.3, &momentum);
+            assert!(
+                child.movement_speed <= 20.0,
+                "movement_speed must be <= 20.0, got {}",
+                child.movement_speed,
+            );
+            assert!(
+                child.movement_speed >= 2.0,
+                "movement_speed must be >= 2.0, got {}",
+                child.movement_speed,
+            );
+        }
+    }
+
+    #[test]
     fn hsv_to_rgb_outputs_in_unit_range() {
         let hues = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 359.999];
         for &h in &hues {

@@ -672,6 +672,9 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_fatigue_factor] = 1.0;
 
     // Heritable config values (stored per-agent for GPU access)
+    // TODO: once PR #52 merges, update `write_agent_heritable_config()` in
+    // gpu_kernel.rs to also write movement_speed so mid-generation config
+    // changes propagate to the GPU.
     state[o_pred_ctx_wt + delta_hab_sens] = config.habituation_sensitivity;
     state[o_pred_ctx_wt + delta_hab_curiosity] = config.max_curiosity_bonus;
     state[o_pred_ctx_wt + delta_fatigue_floor] = config.fatigue_floor;

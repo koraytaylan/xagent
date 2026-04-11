@@ -1126,7 +1126,7 @@ fn async_recording_persists_and_round_trips() {
                 mean_attenuation: 1.0,
                 curiosity_bonus: 0.0,
                 fatigue_factor: 1.0,
-                motor_variance: 0.0,
+                staleness: 0.0,
                 vision_color: None,
             })
             .collect();

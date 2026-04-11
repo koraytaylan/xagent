@@ -675,7 +675,6 @@ impl Governor {
                             "distress_exponent" => "distress",
                             "habituation_sensitivity" => "hab",
                             "max_curiosity_bonus" => "curiosity",
-                            "fatigue_recovery_sensitivity" => "fat_rec",
                             "fatigue_floor" => "fat_fl",
                             other => other,
                         };
@@ -1509,11 +1508,6 @@ fn record_mutations(
             "max_curiosity_bonus",
             parent.max_curiosity_bonus as f64,
             child.max_curiosity_bonus as f64,
-        ),
-        (
-            "fatigue_recovery_sensitivity",
-            parent.fatigue_recovery_sensitivity as f64,
-            child.fatigue_recovery_sensitivity as f64,
         ),
         (
             "fatigue_floor",

@@ -1,7 +1,7 @@
 //! GPU buffer layout constants, AgentBrainState, and packing utilities.
 //!
 //! All persistent brain state is stored in three flat f32 arrays on GPU:
-//! - brain_state_buf: encoder weights, predictor, habituation, homeostasis, action, fatigue
+//! - brain_state_buf: encoder weights, predictor, habituation, homeostasis, action, staleness
 //! - pattern_buf: pattern memory (states, norms, reinforcement, motor, meta, active)
 //! - history_buf: action history ring buffer
 //!
@@ -53,23 +53,24 @@ pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 9801
 // act_biases: [fwd_bias, turn_bias]
 pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 9833
 pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 9835
-pub const O_FATIGUE_FWD_RING: usize = O_EXPLORATION_RATE + 1; // 9836
-pub const O_FATIGUE_TURN_RING: usize = O_FATIGUE_FWD_RING + ACTION_HISTORY_LEN; // 9900
-pub const O_FATIGUE_CURSOR: usize = O_FATIGUE_TURN_RING + ACTION_HISTORY_LEN; // 9964
-pub const O_FATIGUE_FACTOR: usize = O_FATIGUE_CURSOR + 1; // 9965
-pub const O_FATIGUE_LEN: usize = O_FATIGUE_FACTOR + 1; // 9966
-pub const O_PREV_PREDICTION: usize = O_FATIGUE_LEN + 1; // 9967
-pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 9999
-pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 10000
-pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 10001
-pub const O_FATIGUE_RECOVERY: usize = O_HAB_MAX_CURIOSITY + 1; // 10002
-pub const O_FATIGUE_FLOOR: usize = O_FATIGUE_RECOVERY + 1; // 10003
-pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 10004
+pub const POS_RING_LEN: usize = 16;
+pub const O_POS_RING_X: usize = O_EXPLORATION_RATE + 1; // 9836
+pub const O_POS_RING_Z: usize = O_POS_RING_X + POS_RING_LEN; // 9852
+pub const O_POS_RING_CURSOR: usize = O_POS_RING_Z + POS_RING_LEN; // 9868
+pub const O_POS_RING_LEN: usize = O_POS_RING_CURSOR + 1; // 9869
+pub const O_ACCUM_FWD: usize = O_POS_RING_LEN + 1; // 9870
+pub const O_FATIGUE_FACTOR: usize = O_ACCUM_FWD + 1; // 9871
+pub const O_PREV_PREDICTION: usize = O_FATIGUE_FACTOR + 1; // 9872
+pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 9904
+pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 9905
+pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 9906
+pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1; // 9907
+pub const BRAIN_STRIDE: usize = O_FATIGUE_FLOOR + 1; // 9908
 
 /// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
 /// doesn't change with feature_count / vision dimensions.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 468
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 372
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
@@ -165,7 +166,7 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
             .expect("vision dimensions overflow sensory stride");
         // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR)
+        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_FATIGUE_FLOOR, incl. position ring)
         let brain_stride = feature_count
             .checked_mul(DIM)
             .and_then(|v| v.checked_add(DIM))
@@ -406,16 +407,17 @@ const O_ACT_FWD_WTS: u32 = {O_ACT_FWD_WTS}u;
 const O_ACT_TURN_WTS: u32 = {O_ACT_TURN_WTS}u;
 const O_ACT_BIASES: u32 = {O_ACT_BIASES}u;
 const O_EXPLORATION_RATE: u32 = {O_EXPLORATION_RATE}u;
-const O_FATIGUE_FWD_RING: u32 = {O_FATIGUE_FWD_RING}u;
-const O_FATIGUE_TURN_RING: u32 = {O_FATIGUE_TURN_RING}u;
-const O_FATIGUE_CURSOR: u32 = {O_FATIGUE_CURSOR}u;
+const POS_RING_LEN: u32 = {POS_RING_LEN}u;
+const O_POS_RING_X: u32 = {O_POS_RING_X}u;
+const O_POS_RING_Z: u32 = {O_POS_RING_Z}u;
+const O_POS_RING_CURSOR: u32 = {O_POS_RING_CURSOR}u;
+const O_POS_RING_LEN: u32 = {O_POS_RING_LEN}u;
+const O_ACCUM_FWD: u32 = {O_ACCUM_FWD}u;
 const O_FATIGUE_FACTOR: u32 = {O_FATIGUE_FACTOR}u;
-const O_FATIGUE_LEN: u32 = {O_FATIGUE_LEN}u;
 const O_PREV_PREDICTION: u32 = {O_PREV_PREDICTION}u;
 const O_TICK_COUNT: u32 = {O_TICK_COUNT}u;
 const O_HAB_SENSITIVITY: u32 = {O_HAB_SENSITIVITY}u;
 const O_HAB_MAX_CURIOSITY: u32 = {O_HAB_MAX_CURIOSITY}u;
-const O_FATIGUE_RECOVERY: u32 = {O_FATIGUE_RECOVERY}u;
 const O_FATIGUE_FLOOR: u32 = {O_FATIGUE_FLOOR}u;
 
 // Pattern memory offsets
@@ -653,7 +655,6 @@ pub fn init_brain_state_for(
     let delta_fatigue_factor = O_FATIGUE_FACTOR - O_PRED_CTX_WT;
     let delta_hab_sens = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
     let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT;
-    let delta_fatigue_rec = O_FATIGUE_RECOVERY - O_PRED_CTX_WT;
     let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PRED_CTX_WT;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
@@ -670,7 +671,6 @@ pub fn init_brain_state_for(
     // Heritable config values (stored per-agent for GPU access)
     state[o_pred_ctx_wt + delta_hab_sens] = config.habituation_sensitivity;
     state[o_pred_ctx_wt + delta_hab_curiosity] = config.max_curiosity_bonus;
-    state[o_pred_ctx_wt + delta_fatigue_rec] = config.fatigue_recovery_sensitivity;
     state[o_pred_ctx_wt + delta_fatigue_floor] = config.fatigue_floor;
 
     state

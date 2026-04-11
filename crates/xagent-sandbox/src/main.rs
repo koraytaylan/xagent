@@ -1684,7 +1684,7 @@ impl ApplicationHandler for App {
                                     a.cached_frame.vision.color = tel.vision_color;
                                     a.cached_mean_attenuation = tel.mean_attenuation;
                                     a.cached_curiosity_bonus = tel.curiosity_bonus;
-                                    a.cached_motor_variance = tel.motor_variance;
+                                    a.cached_staleness = tel.staleness;
                                 }
                             }
 
@@ -1728,7 +1728,7 @@ impl ApplicationHandler for App {
                                         mean_attenuation: a.cached_mean_attenuation,
                                         curiosity_bonus: a.cached_curiosity_bonus,
                                         fatigue_factor: a.cached_fatigue_factor,
-                                        motor_variance: a.cached_motor_variance,
+                                        staleness: a.cached_staleness,
                                         vision_color: None,
                                     }
                                 }).collect();
@@ -2160,7 +2160,7 @@ impl ApplicationHandler for App {
                                                 mean_attenuation: a.cached_mean_attenuation,
                                                 curiosity_bonus: a.cached_curiosity_bonus,
                                                 fatigue_factor: a.cached_fatigue_factor,
-                                                motor_variance: a.cached_motor_variance,
+                                                staleness: a.cached_staleness,
                                                 fatigue_history: tail(&a.fatigue_history),
                                             }
                                         })

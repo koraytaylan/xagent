@@ -28,8 +28,8 @@ pub struct TickRecord {
     pub curiosity_bonus: f32,
     /// Motor fatigue factor [fatigue_floor, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,
-    /// Motor output variance.
-    pub motor_variance: f32,
+    /// Position-based staleness [0.0, 1.0]. High = stuck in place.
+    pub staleness: f32,
     /// Vision color data (vision_width * vision_height * 4 f32 values). Only stored at keyframes
     /// (every VISION_KEYFRAME_INTERVAL ticks) to save memory.
     pub vision_color: Option<Vec<f32>>,

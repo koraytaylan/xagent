@@ -33,10 +33,6 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.1, 1.0]. Default 0.6.
     #[serde(default = "default_max_curiosity_bonus")]
     pub max_curiosity_bonus: f32,
-    /// Scales motor variance into fatigue relief. Higher = easier recovery from fatigue.
-    /// Heritable: mutated during breeding, clamped to [2.0, 10.0]. Default 8.0.
-    #[serde(default = "default_fatigue_recovery_sensitivity")]
-    pub fatigue_recovery_sensitivity: f32,
     /// Minimum motor output under fatigue. Lower = harsher dampening.
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
@@ -100,10 +96,6 @@ fn default_habituation_sensitivity() -> f32 {
 
 fn default_max_curiosity_bonus() -> f32 {
     0.6
-}
-
-fn default_fatigue_recovery_sensitivity() -> f32 {
-    8.0
 }
 
 fn default_fatigue_floor() -> f32 {
@@ -246,7 +238,6 @@ impl Default for BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
             vision_width: 8,
             vision_height: 6,
@@ -271,7 +262,6 @@ impl BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
             vision_width: 6,
             vision_height: 4,
@@ -294,7 +284,6 @@ impl BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
             vision_width: 12,
             vision_height: 8,

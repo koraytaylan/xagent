@@ -37,7 +37,7 @@ pub struct AgentTelemetry {
     pub mean_attenuation: f32,
     pub curiosity_bonus: f32,
     pub fatigue_factor: f32,
-    pub motor_variance: f32,
+    pub staleness: f32,
     pub urgency: f32,
     pub gradient: f32,
     pub prediction_error: f32,
@@ -1774,7 +1774,7 @@ impl GpuKernel {
     }
 
     /// Blocking readback of sensory, decision, and key brain-state data for one agent.
-    /// Returns (vision_rgba, motor_fwd, motor_turn, habituation_mean, curiosity, fatigue, motor_variance, urgency, gradient).
+    /// Returns (vision_rgba, motor_fwd, motor_turn, habituation_mean, curiosity, fatigue, staleness, urgency, gradient).
     pub fn read_agent_telemetry_blocking(&self, index: u32) -> AgentTelemetry {
         let i = index as usize;
         let ss = self.layout.sensory_stride;
@@ -1817,9 +1817,6 @@ impl GpuKernel {
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
-        let dyn_fatigue_fwd_ring = dyn_pred_ctx_wt + (O_FATIGUE_FWD_RING - O_PRED_CTX_WT);
-        let dyn_fatigue_turn_ring = dyn_pred_ctx_wt + (O_FATIGUE_TURN_RING - O_PRED_CTX_WT);
-
         // Habituation: mean of attenuation values (DIM floats)
         let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
         let mean_attenuation = atten_sum / DIM as f32;
@@ -1830,19 +1827,8 @@ impl GpuKernel {
         // Fatigue factor
         let fatigue_factor = brain[dyn_fatigue_factor];
 
-        // Motor variance: compute variance of recent motor commands from fatigue rings
-        let fwd_ring = &brain[dyn_fatigue_fwd_ring..dyn_fatigue_fwd_ring + ACTION_HISTORY_LEN];
-        let turn_ring = &brain[dyn_fatigue_turn_ring..dyn_fatigue_turn_ring + ACTION_HISTORY_LEN];
-        let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>()
-            / ACTION_HISTORY_LEN as f32;
-        let turn_var: f32 = turn_ring
-            .iter()
-            .map(|x| (x - turn_mean).powi(2))
-            .sum::<f32>()
-            / ACTION_HISTORY_LEN as f32;
-        let motor_variance = (fwd_var + turn_var) / 2.0;
+        // Staleness: 1.0 - fatigue_factor (higher = more stuck in place)
+        let staleness = 1.0 - fatigue_factor;
 
         // Physics buffer: gradient, urgency, prediction_error, exploration_rate
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
@@ -1861,7 +1847,7 @@ impl GpuKernel {
             mean_attenuation,
             curiosity_bonus,
             fatigue_factor,
-            motor_variance,
+            staleness,
             urgency,
             gradient,
             prediction_error,
@@ -2008,9 +1994,6 @@ impl GpuKernel {
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
-        let dyn_fatigue_fwd_ring = dyn_pred_ctx_wt + (O_FATIGUE_FWD_RING - O_PRED_CTX_WT);
-        let dyn_fatigue_turn_ring = dyn_pred_ctx_wt + (O_FATIGUE_TURN_RING - O_PRED_CTX_WT);
-
         // Sensory
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
@@ -2035,19 +2018,7 @@ impl GpuKernel {
         let mean_attenuation = atten_sum / DIM as f32;
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
         let fatigue_factor = brain[dyn_fatigue_factor];
-
-        let fwd_ring = &brain[dyn_fatigue_fwd_ring..dyn_fatigue_fwd_ring + ACTION_HISTORY_LEN];
-        let turn_ring = &brain[dyn_fatigue_turn_ring..dyn_fatigue_turn_ring + ACTION_HISTORY_LEN];
-        let fwd_mean: f32 = fwd_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let turn_mean: f32 = turn_ring.iter().sum::<f32>() / ACTION_HISTORY_LEN as f32;
-        let fwd_var: f32 = fwd_ring.iter().map(|x| (x - fwd_mean).powi(2)).sum::<f32>()
-            / ACTION_HISTORY_LEN as f32;
-        let turn_var: f32 = turn_ring
-            .iter()
-            .map(|x| (x - turn_mean).powi(2))
-            .sum::<f32>()
-            / ACTION_HISTORY_LEN as f32;
-        let motor_variance = (fwd_var + turn_var) / 2.0;
+        let staleness = 1.0 - fatigue_factor;
 
         drop(brain_data);
         self.telemetry_staging.brain.unmap();
@@ -2069,7 +2040,7 @@ impl GpuKernel {
             mean_attenuation,
             curiosity_bonus,
             fatigue_factor,
-            motor_variance,
+            staleness,
             urgency,
             gradient,
             prediction_error,

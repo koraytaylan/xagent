@@ -1455,3 +1455,148 @@ fn gpu_non_multiple_ticks_matching_strides_no_crash() {
         assert!(pos[2].is_finite(), "NaN/inf z after non-multiple ticks");
     }
 }
+
+// ── GPU Terrain Height Tests ────────────────────────────────────────
+
+#[test]
+fn gpu_agents_follow_terrain_height() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let agent_count = 10;
+
+    let result = bench::run_bench(brain, world_config.clone(), agent_count, 200);
+    let world = WorldState::new(world_config);
+
+    for (i, pos) in result.final_positions.iter().enumerate() {
+        let x = pos[0];
+        let y = pos[1];
+        let z = pos[2];
+
+        assert!(
+            x.is_finite() && y.is_finite() && z.is_finite(),
+            "Agent {} has non-finite final position: ({:?}, {:?}, {:?})",
+            i,
+            x,
+            y,
+            z
+        );
+
+        let terrain_y = world.terrain.height_at(x, z);
+        let diff = y - terrain_y;
+
+        // Agents should be at least AGENT_HALF_HEIGHT (1.0) above terrain;
+        // allow small float tolerance (0.99) but reject agents sunk into the ground.
+        assert!(
+            diff >= 0.99 && diff < 5.0,
+            "Agent {} at ({:.2}, {:.2}, {:.2}): expected Y to be 0.99..5.0 above terrain height {:.2}, but y - terrain_y = {:.2}",
+            i, x, y, z, terrain_y, diff
+        );
+    }
+}
+
+#[test]
+fn gpu_agents_y_matches_terrain_after_single_tick() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Y, P_POS_Z};
+    use xagent_brain::GpuKernel;
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let agent_count = 10;
+    let world = WorldState::new(world_config.clone());
+    let food_count = world.food_items.len();
+
+    let mut kernel = GpuKernel::new(agent_count as u32, food_count, &brain, &world_config);
+
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
+        .map(|_| world.safe_spawn_position())
+        .collect();
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = spawn_positions
+        .iter()
+        .map(|&pos| {
+            (
+                pos,
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+    kernel.upload_agents(&agent_data);
+
+    // Read state before any ticks (should match uploaded positions)
+    let state_before = kernel.read_full_state_blocking();
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+        let y = state_before[base + P_POS_Y];
+        let expected_y = spawn_positions[i].y;
+        assert!(
+            (y - expected_y).abs() < 0.01,
+            "Agent {} pre-tick Y={:.3} should match spawn Y={:.3}",
+            i,
+            y,
+            expected_y
+        );
+    }
+
+    // Run 1 tick on the same kernel and verify agents stay near terrain.
+    // Using `kernel` directly (not bench::run_bench) so the pre- and post-tick
+    // states come from the same kernel instance.
+    assert!(
+        kernel.dispatch_batch(0, 1),
+        "dispatch_batch should return true indicating ticks were submitted"
+    );
+    let state_after = kernel.read_full_state_blocking();
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+        let x = state_after[base + P_POS_X];
+        let y = state_after[base + P_POS_Y];
+        let z = state_after[base + P_POS_Z];
+        let terrain_y = world.terrain.height_at(x, z);
+        let diff = y - terrain_y;
+        // Agents should be at least AGENT_HALF_HEIGHT (1.0) above terrain;
+        // allow small float tolerance (0.99) but reject agents sunk into the ground.
+        assert!(
+            diff >= 0.99 && diff < 5.0,
+            "Agent {} after 1 tick at ({:.2}, {:.2}, {:.2}): terrain_y={:.2}, diff={:.2}",
+            i,
+            x,
+            y,
+            z,
+            terrain_y,
+            diff
+        );
+    }
+}

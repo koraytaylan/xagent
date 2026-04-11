@@ -364,6 +364,9 @@ struct App {
     // Adaptive GPU tick budget — keeps dispatch under ~8ms wall time
     gpu_tick_budget: u32,
 
+    // Diagnostic: log first readback Y vs terrain height
+    readback_logged: bool,
+
     // Sidebar sort mode
     sort_mode: SortMode,
 
@@ -463,6 +466,7 @@ impl App {
             viewport_hovered: false,
             chart_window: 120,
             orbit_mode: false,
+            readback_logged: false,
             logger,
             agent_instance_buffer: None,
             agent_instance_count: 0,
@@ -1660,6 +1664,25 @@ impl ApplicationHandler for App {
                                     a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
                                     a.cached_gradient = state[base + P_GRADIENT_OUT];
                                     a.cached_urgency = state[base + P_URGENCY_OUT];
+                                }
+
+                                // Diagnostic: log first readback Y vs terrain height
+                                if !self.readback_logged {
+                                    if let Some(world) = &self.world {
+                                        let n = self.agents.len().min(5);
+                                        if n > 0 {
+                                            for i in 0..n {
+                                                let a = &self.agents[i];
+                                                let p = a.body.body.position;
+                                                let terrain_y = world.terrain.height_at(p.x, p.z);
+                                                log::info!(
+                                                    "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
+                                                    i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
+                                                );
+                                            }
+                                            self.readback_logged = true;
+                                        }
+                                    }
                                 }
                             }
 

@@ -1531,7 +1531,13 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
         .collect();
     let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
-    kernel.upload_world(&world.terrain.heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
 
     let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
         .map(|_| world.safe_spawn_position())

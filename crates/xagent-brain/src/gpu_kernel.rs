@@ -125,6 +125,27 @@ pub struct GpuKernel {
 }
 
 impl GpuKernel {
+    /// Check whether a GPU (or fallback CPU) adapter is available.
+    pub fn is_available() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
+        .is_some()
+    }
+
     /// Expose the wgpu device.
     pub fn device(&self) -> &wgpu::Device {
         &self.device

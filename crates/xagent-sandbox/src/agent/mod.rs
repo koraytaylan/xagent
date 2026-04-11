@@ -123,7 +123,7 @@ pub const REPRODUCTION_THRESHOLD: u64 = 5000;
 // ── Agent: bundles body + brain + metadata ─────────────────────────────
 
 /// A complete agent with body, brain index, and metadata.
-/// The brain itself lives on GPU via GpuBrain; Agent only stores its index
+/// The brain itself lives on GPU via GpuKernel; Agent only stores its index
 /// and a copy of BrainConfig for metabolic drain and evolution.
 pub struct Agent {
     pub id: u32,
@@ -267,7 +267,7 @@ impl Agent {
 
     /// Reset per-generation stats for evolution. Keeps BrainConfig (the "genome")
     /// but zeroes cumulative fitness counters and resets the body.
-    /// Note: brain state reset must be done externally via GpuBrain.
+    /// Note: brain state reset must be done externally via GpuKernel.
     pub fn reset_for_new_life(&mut self, position: Vec3, tick: u64) {
         self.body = AgentBody::new(position);
         self.death_count = 0;

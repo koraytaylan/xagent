@@ -583,7 +583,7 @@ fn evolution_snapshot_default_tree_pane_fraction() {
 
 #[test]
 fn bench_runner_completes_and_reports_ticks_per_sec() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -617,7 +617,7 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
 
 #[test]
 fn gpu_tick_loop_runs_without_crash() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -999,7 +999,7 @@ fn deferred_consumption_awards_energy_to_only_one_agent() {
 
 #[test]
 fn deterministic_bench_produces_same_state_twice() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -1027,7 +1027,7 @@ fn deterministic_bench_produces_same_state_twice() {
     assert_eq!(r1.final_positions.len(), r2.final_positions.len());
 
     // NOTE: Exact or approximate position equality is NOT asserted.
-    // GpuBrain uses GPU floating point which is not bitwise deterministic
+    // GpuKernel uses GPU floating point which is not bitwise deterministic
     // across runs. Small per-tick rounding differences compound chaotically
     // (different food consumed, different collisions) so final positions
     // can diverge arbitrarily over 500 ticks.

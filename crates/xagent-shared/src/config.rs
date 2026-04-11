@@ -277,8 +277,8 @@ impl BrainConfig {
             vision_height: 4,
             brain_tick_stride: default_brain_tick_stride(),
             vision_stride: 10,
-            metabolic_rate: 0.01,
-            integrity_scale: 0.01,
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 
@@ -300,8 +300,8 @@ impl BrainConfig {
             vision_height: 8,
             brain_tick_stride: default_brain_tick_stride(),
             vision_stride: 10,
-            metabolic_rate: 0.01,
-            integrity_scale: 0.01,
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 }

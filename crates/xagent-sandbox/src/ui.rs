@@ -1389,15 +1389,15 @@ impl<'a> TabContext<'a> {
                     ui.end_row();
 
                     ui.label("vision_width");
-                    let mut vw = b.vision_width as i32;
-                    ui.add(egui::DragValue::new(&mut vw).range(2..=32).speed(1));
-                    b.vision_width = vw.max(2) as u32;
+                    let mut vision_width = b.vision_width as i32;
+                    ui.add(egui::DragValue::new(&mut vision_width).range(2..=32).speed(1));
+                    b.vision_width = vision_width.max(2) as u32;
                     ui.end_row();
 
                     ui.label("vision_height");
-                    let mut vh = b.vision_height as i32;
-                    ui.add(egui::DragValue::new(&mut vh).range(2..=32).speed(1));
-                    b.vision_height = vh.max(2) as u32;
+                    let mut vision_height = b.vision_height as i32;
+                    ui.add(egui::DragValue::new(&mut vision_height).range(2..=32).speed(1));
+                    b.vision_height = vision_height.max(2) as u32;
                     ui.end_row();
 
                     ui.label("brain_tick_stride");

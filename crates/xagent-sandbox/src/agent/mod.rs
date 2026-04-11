@@ -174,8 +174,8 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with an assigned GPU brain index, color, and zero death count.
     pub fn new(id: u32, position: Vec3, brain_idx: u32, config: BrainConfig, tick: u64) -> Self {
-        let vw = config.vision_width;
-        let vh = config.vision_height;
+        let vision_width = config.vision_width;
+        let vision_height = config.vision_height;
         Self {
             id,
             body: AgentBody::new(position),
@@ -203,7 +203,7 @@ impl Agent {
             energy_history: std::collections::VecDeque::with_capacity(128),
             integrity_history: std::collections::VecDeque::with_capacity(128),
             fatigue_history: std::collections::VecDeque::with_capacity(128),
-            cached_frame: SensoryFrame::new_blank(vw, vh),
+            cached_frame: SensoryFrame::new_blank(vision_width, vision_height),
             cached_urgency: 0.0,
             cached_gradient: 0.0,
             cached_mean_attenuation: 0.0,

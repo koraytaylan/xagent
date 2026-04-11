@@ -42,10 +42,10 @@ pub struct BrainConfig {
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
     /// Visual field width in pixels. Default 8.
-    #[serde(default = "default_vision_width")]
+    #[serde(default = "default_vision_width", alias = "vision_w")]
     pub vision_width: u32,
     /// Visual field height in pixels. Default 6.
-    #[serde(default = "default_vision_height")]
+    #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
     /// Default 4.

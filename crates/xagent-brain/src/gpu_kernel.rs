@@ -125,6 +125,27 @@ pub struct GpuKernel {
 }
 
 impl GpuKernel {
+    /// Check whether a GPU (or fallback CPU) adapter is available.
+    pub fn is_available() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
+        .is_some()
+    }
+
     /// Expose the wgpu device.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
@@ -1393,6 +1414,39 @@ impl GpuKernel {
             &self.history_buf,
             hist_offset,
             bytemuck::cast_slice(&state.history),
+        );
+    }
+
+    /// Patch per-agent heritable config values in brain_state buffer.
+    ///
+    /// Writes habituation_sensitivity, max_curiosity_bonus,
+    /// fatigue_recovery_sensitivity, and fatigue_floor from the given
+    /// BrainConfig into the agent's brain_state slots. Use this after
+    /// `reset_agents()` to apply per-agent config variation.
+    pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
+        let i = index as usize;
+        let bs = self.layout.brain_stride;
+
+        // Heritable slots are contiguous in the fixed tail of brain_state.
+        // Use dynamic base so this works with any BrainLayout, not
+        // just the default FEATURE_COUNT (see init_brain_state_for).
+        let tail_base = bs - FIXED_TAIL_SIZE;
+        let first_delta = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
+        debug_assert_eq!(O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT, first_delta + 1);
+        debug_assert_eq!(O_FATIGUE_RECOVERY - O_PRED_CTX_WT, first_delta + 2);
+        debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 3);
+
+        let values = [
+            config.habituation_sensitivity,
+            config.max_curiosity_bonus,
+            config.fatigue_recovery_sensitivity,
+            config.fatigue_floor,
+        ];
+        let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
+        self.queue.write_buffer(
+            &self.brain_state_buf,
+            byte_offset,
+            bytemuck::cast_slice(&values),
         );
     }
 

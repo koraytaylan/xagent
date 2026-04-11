@@ -496,11 +496,16 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             // Expected displacement: accumulated forward * MOVE_SPEED * DT * stride
             // Each brain tick, the agent moves fwd * MOVE_SPEED * DT * stride units
             let expected = new_accum * MOVE_SPEED * wc_f32(WC_DT) * f32(wc_u32(WC_BRAIN_TICK_STRIDE));
-            let ratio = displacement / max(expected, 0.1);
-            let staleness = 1.0 - clamp(ratio, 0.0, 1.0);
-            let max_penalty = 1.0 - floor_val;
-            fatigue_factor = 1.0 - staleness * max_penalty;
-            fatigue_factor = clamp(fatigue_factor, floor_val, 1.0);
+            // Only penalize when the agent is actually trying to move;
+            // idle agents (expected ≈ 0) keep fatigue_factor = 1.0.
+            let expected_epsilon = 0.001;
+            if (expected > expected_epsilon) {
+                let ratio = displacement / expected;
+                let staleness = 1.0 - clamp(ratio, 0.0, 1.0);
+                let max_penalty = 1.0 - floor_val;
+                fatigue_factor = 1.0 - staleness * max_penalty;
+                fatigue_factor = clamp(fatigue_factor, floor_val, 1.0);
+            }
         }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 

@@ -1187,10 +1187,32 @@ impl GpuKernel {
     }
 
     /// Dispatch ticks via fused kernel + global + vision passes.
+    ///
     /// Each kernel-batch runs `vision_stride` brain cycles in a single dispatch,
     /// followed by one global (grid+collisions) and one vision (raycasting) pass.
     /// Non-blocking: skips if staging buffer is in flight (GPU backpressure).
     /// Returns true if dispatched, false if skipped.
+    ///
+    /// # Vision ordering guarantee
+    ///
+    /// Within a single batch the pass order is:
+    ///   1. `prepare`  — set up indirect dispatch args
+    ///   2. `kernel`   — fused physics → food → death → brain (loops `vision_stride` times)
+    ///   3. `global`   — grid rebuild + collisions
+    ///   4. `vision`   — raycasting writes `sensory_buf`
+    ///
+    /// The brain (step 2) therefore reads `sensory_buf` written by the vision
+    /// pass of the **previous** batch — a one-batch lag that is intentional and
+    /// consistent regardless of stride settings.
+    ///
+    /// Within the kernel's inner cycle, physics always runs before brain
+    /// (enforced by `workgroupBarrier()`).  So the brain always reads the
+    /// physics state produced earlier in the **same** cycle.
+    ///
+    /// When `brain_tick_stride == vision_stride` there is exactly one vision
+    /// pass per brain cycle (at the end of the batch).  The batch covers
+    /// `vision_stride × brain_tick_stride` physics ticks and the sensory lag
+    /// is one batch = `vision_stride × brain_tick_stride` physics ticks.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         // Check if the write-target staging buffer is free.
         let widx = self.staging_idx;

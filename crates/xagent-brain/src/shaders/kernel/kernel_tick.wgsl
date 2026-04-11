@@ -338,6 +338,25 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // Entry point
+//
+// Ordering guarantee within each inner cycle:
+//   physics → food_detect → death_respawn → brain
+//
+// All steps are separated by workgroupBarrier() so every thread in the
+// workgroup observes the writes from the prior step before proceeding.
+// This means the brain ALWAYS reads physics state from the same cycle —
+// including when brain_tick_stride == vision_stride.
+//
+// Vision data (sensory_buf) is written by the external vision pass, which
+// runs in the same GPU command encoder AFTER this kernel dispatch.  The
+// brain therefore reads sensory_buf written by the *previous* batch's vision
+// pass — a one-batch lag that is consistent regardless of stride values.
+// Non-visual proprioception (velocity, energy, etc.) follows the same lag
+// because it is also packed into sensory_buf by that vision pass.
+//
+// When brain_tick_stride == vision_stride the batch covers exactly
+// (vision_stride * brain_tick_stride) physics ticks and vision runs once
+// at the end of the batch, ready for the next batch's kernel.
 // ══════════════════════════════════════════════════════════════════════════
 
 @compute @workgroup_size(256)
@@ -355,7 +374,8 @@ fn kernel_tick(
     for (var cycle = 0u; cycle < vision_stride; cycle++) {
         let base_tick = start_tick + cycle * stride;
 
-        // Per-agent physics: thread 0 loops over brain_tick_stride sub-ticks
+        // Per-agent physics: thread 0 loops over brain_tick_stride sub-ticks.
+        // Physics always precedes brain within the same cycle (barrier below).
         if (tid == 0u) {
             for (var t = 0u; t < stride; t++) {
                 agent_physics(agent_id, base_tick + t);
@@ -373,7 +393,11 @@ fn kernel_tick(
         }
         workgroupBarrier();
 
-        // Brain: all 256 threads, 7 cooperative passes
+        // Brain: all 256 threads, 7 cooperative passes.
+        // Reads sensory_buf (vision + proprioception) from the previous batch's
+        // vision pass.  Physics state updated in this cycle is NOT yet in
+        // sensory_buf — that update happens in the vision pass at the end of
+        // this batch, making it available for the following batch.
         brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
         workgroupBarrier();
     }

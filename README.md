@@ -518,12 +518,12 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 ## 12. Contributing Guidelines
 
-These rules are distilled from 88 review comments across PRs #33-49. They represent the project's hard-won invariants.
+These rules are distilled from 88 review comments across PRs #33–#49. They represent the project's hard-won invariants.
 
 ### GPU & Buffer Safety
 - **All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants.** Hardcoded strides like `SENSORY_STRIDE` break when `BrainLayout` uses non-default vision dimensions.
 - **Validate index and count inputs against kernel state before computing buffer offsets.** Out-of-bounds offsets trigger wgpu validation errors or silent corruption.
-- **Constants shared between Rust and WGSL must have a single canonical source.** Either the `wgsl_physics_constants()` template or the `wconfig` uniform buffer — never both. Use named constants, not magic indices (e.g., `WC_FOOD_RADIUS`, not `wc(7u)`).
+- **Constants shared between Rust and WGSL must have a single canonical source within a given shader pipeline / concatenated header set.** A pipeline may use either the `wgsl_physics_constants()` template or the `wconfig` uniform buffer for a given constant, but do not define the same constant from both sources when headers are combined. Use named constants, not magic indices (e.g., `WC_FOOD_RADIUS`, not `wc(7u)`).
 
 ### Async Readback
 - **Track in-flight state explicitly.** Never overwrite a pending `map_async` operation without unmapping/cleaning up the previous one first.

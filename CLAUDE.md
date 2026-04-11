@@ -43,8 +43,8 @@
 ## GPU & Buffer Rules
 - All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants
 - Validate index/count inputs against kernel state before computing buffer offsets
-- Constants shared between Rust and WGSL must have a single canonical source (either `wgsl_physics_constants()` template or `wconfig` uniform buffer)
-- Never introduce a second copy of a constant — import or reference the canonical one
+- Constants shared between Rust and WGSL must have a single canonical source for each constant in each shader/pipeline; use whichever source that shader already treats as authoritative (e.g., `wgsl_physics_constants()` or `wconfig`)
+- Never define the same constant in multiple headers that get concatenated — import or reference the canonical one for that shader/pipeline
 
 ## Async Readback Rules
 - Track in-flight state explicitly: never overwrite pending async operations without cleanup

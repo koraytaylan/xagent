@@ -37,7 +37,34 @@
 - The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking)
 - Recording/telemetry/history functions run once per frame, sampling the latest state
 - No CPU-side work should scale with `ticks_to_run` — up to 64,000 ticks may be scheduled per frame/batch call, with GPU work dispatched in chunks
+- Never clone large collections (`Vec`, `HashMap`) in per-frame hot paths — use `clone_from()` or borrow
+- Use squared-distance comparisons to avoid `sqrt()` in loops
+
+## GPU & Buffer Rules
+- All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants
+- Validate index/count inputs against kernel state before computing buffer offsets
+- Constants shared between Rust and WGSL must have a single canonical source for each constant in each shader/pipeline; use whichever source that shader already treats as authoritative (e.g., `wgsl_physics_constants()` or `wconfig`)
+- Never define the same constant in multiple headers that get concatenated — import or reference the canonical one for that shader/pipeline
+
+## Async Readback Rules
+- Track in-flight state explicitly: never overwrite pending async operations without cleanup
+- Always handle both success and failure paths for `map_async` — stuck-forever states are bugs
+- When multiple sources provide the same field (e.g., phys readback vs telemetry), document which is authoritative and never overwrite fresher data with stale
+- Unmap staging buffers on all paths: success, error, agent switch, and generation reset
+
+## Concurrency Rules
+- All SQLite connections must set `busy_timeout` — default is 0 (instant fail)
+- Background threads must have a shutdown path: drop sender → recv returns Disconnected → thread exits
+- `Drop` impls must join threads and log panics, never silently discard
+- Never use `.expect()` for fallible I/O/GPU/thread operations — return `Result` or `Option`
+
+## Testing Rules
+- New concurrency-sensitive code paths require end-to-end tests exercising failure modes
+- Cache invalidation logic must be tested: populate → invalidate → verify fresh
+- Non-trivial algorithms (color generation, distance checks) need unit tests with boundary cases
 
 ## Code Style
 - Specs: `docs/superpowers/specs/`, Plans: `docs/superpowers/plans/`
 - Commit prefixes: `feat:`, `fix:`, `perf:`
+- Docstrings must match implementation — "non-blocking" means non-blocking, "pre-allocates" means pre-allocates
+- Distinguish "start operation" from "poll/collect operation" in API naming

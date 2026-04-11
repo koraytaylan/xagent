@@ -374,6 +374,7 @@ mod tests {
         assert_eq!(config.vision_height, 6);
         assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
         assert!((config.integrity_scale - 0.01).abs() < 1e-6);
+        assert!((config.movement_speed - 8.0).abs() < 1e-6);
     }
 
     #[test]

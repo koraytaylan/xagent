@@ -1390,13 +1390,21 @@ impl<'a> TabContext<'a> {
 
                     ui.label("vision_width");
                     let mut vision_width = b.vision_width as i32;
-                    ui.add(egui::DragValue::new(&mut vision_width).range(2..=32).speed(1));
+                    ui.add(
+                        egui::DragValue::new(&mut vision_width)
+                            .range(2..=32)
+                            .speed(1),
+                    );
                     b.vision_width = vision_width.max(2) as u32;
                     ui.end_row();
 
                     ui.label("vision_height");
                     let mut vision_height = b.vision_height as i32;
-                    ui.add(egui::DragValue::new(&mut vision_height).range(2..=32).speed(1));
+                    ui.add(
+                        egui::DragValue::new(&mut vision_height)
+                            .range(2..=32)
+                            .speed(1),
+                    );
                     b.vision_height = vision_height.max(2) as u32;
                     ui.end_row();
 

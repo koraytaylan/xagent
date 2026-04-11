@@ -1068,8 +1068,14 @@ fn cpu_vision_produces_correct_buffer_shape() {
         &mut frame,
     );
 
-    assert_eq!(frame.vision.color.len(), (vision_width * vision_height * 4) as usize);
-    assert_eq!(frame.vision.depth.len(), (vision_width * vision_height) as usize);
+    assert_eq!(
+        frame.vision.color.len(),
+        (vision_width * vision_height * 4) as usize
+    );
+    assert_eq!(
+        frame.vision.depth.len(),
+        (vision_width * vision_height) as usize
+    );
 }
 
 // ── Async Recording Persistence ───────────────────────────────────────

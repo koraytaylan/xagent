@@ -1299,7 +1299,7 @@ fn stride_tick_coverage_is_complete_when_strides_match() {
 /// Every tick runs vision + brain; verifies no crash and valid positions.
 #[test]
 fn gpu_stride_1_matching_no_crash() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -1329,7 +1329,7 @@ fn gpu_stride_1_matching_no_crash() {
 /// Tests the common production case where both strides match at 10.
 #[test]
 fn gpu_stride_10_matching_no_crash() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -1360,7 +1360,7 @@ fn gpu_stride_10_matching_no_crash() {
 /// Each batch covers 32×32=1024 physics ticks with one vision pass.
 #[test]
 fn gpu_large_stride_matching_no_crash() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
@@ -1391,7 +1391,7 @@ fn gpu_large_stride_matching_no_crash() {
 /// 150 ticks with stride=10: 1 full batch (100 ticks) + 1 remainder batch (50 ticks).
 #[test]
 fn gpu_non_multiple_ticks_matching_strides_no_crash() {
-    if !xagent_brain::GpuBrain::is_available() {
+    if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }

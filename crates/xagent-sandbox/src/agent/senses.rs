@@ -168,7 +168,7 @@ enum AgentSlice<'a> {
 
 /// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
-/// Advances a ray from `origin` in direction `dir` in increments of `step` units,
+/// Advances a ray from `origin` in direction `direction` in increments of `step` units,
 /// checking for food items, other agents, and terrain at each step. Returns the
 /// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///
@@ -178,7 +178,7 @@ enum AgentSlice<'a> {
 /// zero directional signal for food.
 fn march_ray_unified(
     origin: Vec3,
-    dir: Vec3,
+    direction: Vec3,
     world: &WorldState,
     max_dist: f32,
     step: f32,
@@ -191,7 +191,7 @@ fn march_ray_unified(
     let food_radius_sq: f32 = 1.0 * 1.0;
 
     // Early-out: upward-pointing rays above terrain are almost certainly sky.
-    if dir.y > 0.3 {
+    if direction.y > 0.3 {
         let origin_h = world.terrain.height_at(origin.x, origin.z);
         if origin.y > origin_h {
             return (sky, max_dist);
@@ -199,7 +199,7 @@ fn march_ray_unified(
     }
 
     let num_steps = (max_dist / step) as u32;
-    let dir_step = dir * step;
+    let dir_step = direction * step;
     let mut p = origin;
     for s in 0..num_steps {
         // Check food items via spatial grid (O(1) per step)

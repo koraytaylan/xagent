@@ -9,7 +9,7 @@ var<workgroup> s_encoded: array<f32, 32>;
 var<workgroup> s_habituated: array<f32, 32>;
 var<workgroup> s_homeo: array<f32, 6>;
 var<workgroup> s_similarities: array<f32, 128>;  // reused for decay tracking in pass 7
-var<workgroup> s_sort_idx: array<u32, 128>;   // tracks pattern index through bitonic sort
+var<workgroup> shared_sort_indices: array<u32, 128>;   // tracks pattern index through bitonic sort
 var<workgroup> s_recall: array<f32, 17>;
 var<workgroup> s_prediction: array<f32, 32>;
 var<workgroup> s_credit: array<f32, 32>;
@@ -201,7 +201,7 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 
     // Initialize sort index: threads 0..127
     if (tid < MEMORY_CAP) {
-        s_sort_idx[tid] = tid;
+        shared_sort_indices[tid] = tid;
     }
     workgroupBarrier();
 
@@ -221,15 +221,15 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 
                 let val_i = s_similarities[i];
                 let val_j = s_similarities[j];
-                let idx_i = s_sort_idx[i];
-                let idx_j = s_sort_idx[j];
+                let idx_i = shared_sort_indices[i];
+                let idx_j = shared_sort_indices[j];
 
                 let should_swap = (descending && val_i < val_j) || (!descending && val_i > val_j);
                 if (should_swap) {
                     s_similarities[i] = val_j;
                     s_similarities[j] = val_i;
-                    s_sort_idx[i] = idx_j;
-                    s_sort_idx[j] = idx_i;
+                    shared_sort_indices[i] = idx_j;
+                    shared_sort_indices[j] = idx_i;
                 }
             }
             workgroupBarrier();
@@ -242,7 +242,7 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
         var count: u32 = 0u;
         for (var k: u32 = 0u; k < RECALL_K; k = k + 1u) {
             if (s_similarities[k] <= -1.5) { break; }
-            let idx = s_sort_idx[k];
+            let idx = shared_sort_indices[k];
             s_recall[k] = f32(idx);
             count = count + 1u;
             pattern_buf[p_base + O_PAT_META + idx * 3u + 1u] = tick;

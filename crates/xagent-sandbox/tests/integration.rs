@@ -21,8 +21,8 @@ fn test_world_with_seed(seed: u64) -> WorldState {
     })
 }
 
-fn agent_at(pos: Vec3) -> AgentBody {
-    AgentBody::new(pos)
+fn agent_at(position: Vec3) -> AgentBody {
+    AgentBody::new(position)
 }
 
 /// Create a blank sensory frame using the default brain config's vision dimensions.

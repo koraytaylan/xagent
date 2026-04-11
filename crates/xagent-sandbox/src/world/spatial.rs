@@ -80,16 +80,16 @@ impl FoodGrid {
     }
 
     /// Mark a food item as consumed (remove from its cell).
-    pub fn remove(&mut self, idx: usize, x: f32, z: f32) {
+    pub fn remove(&mut self, index: usize, x: f32, z: f32) {
         if let Some(flat) = self.flat_index(x, z) {
-            self.cells[flat].retain(|&i| i != idx);
+            self.cells[flat].retain(|&i| i != index);
         }
     }
 
     /// Insert a food item into the grid at position (x, z).
-    pub fn insert(&mut self, idx: usize, x: f32, z: f32) {
+    pub fn insert(&mut self, index: usize, x: f32, z: f32) {
         if let Some(flat) = self.flat_index(x, z) {
-            self.cells[flat].push(idx);
+            self.cells[flat].push(index);
         }
     }
 

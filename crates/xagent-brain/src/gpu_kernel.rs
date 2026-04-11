@@ -72,24 +72,24 @@ pub struct GpuKernel {
     food_count: usize,
 
     // ── Shared buffers (14 storage + 2 uniform + 1 indirect) ──
-    agent_phys_buf: wgpu::Buffer,
-    decision_buf: wgpu::Buffer,
-    heightmap_buf: wgpu::Buffer,
-    biome_buf: wgpu::Buffer,
+    agent_phys_buffer: wgpu::Buffer,
+    decision_buffer: wgpu::Buffer,
+    heightmap_buffer: wgpu::Buffer,
+    biome_buffer: wgpu::Buffer,
     world_config_bufs: [wgpu::Buffer; 2],
-    food_state_buf: wgpu::Buffer,
-    food_flags_buf: wgpu::Buffer,
-    food_grid_buf: wgpu::Buffer,
-    agent_grid_buf: wgpu::Buffer,
-    collision_scratch_buf: wgpu::Buffer,
-    sensory_buf: wgpu::Buffer,
-    brain_state_buf: wgpu::Buffer,
-    pattern_buf: wgpu::Buffer,
-    history_buf: wgpu::Buffer,
-    brain_config_buf: wgpu::Buffer,
+    food_state_buffer: wgpu::Buffer,
+    food_flags_buffer: wgpu::Buffer,
+    food_grid_buffer: wgpu::Buffer,
+    agent_grid_buffer: wgpu::Buffer,
+    collision_scratch_buffer: wgpu::Buffer,
+    sensory_buffer: wgpu::Buffer,
+    brain_state_buffer: wgpu::Buffer,
+    pattern_buffer: wgpu::Buffer,
+    history_buffer: wgpu::Buffer,
+    brain_config_buffer: wgpu::Buffer,
 
     // ── Indirect dispatch ──
-    dispatch_args_buf: wgpu::Buffer,
+    dispatch_args_buffer: wgpu::Buffer,
 
     // ── Pipelines ──
     prepare_pipeline: wgpu::ComputePipeline,
@@ -100,11 +100,11 @@ pub struct GpuKernel {
     global_pipeline: wgpu::ComputePipeline,
     vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
-    active_config_idx: usize,
+    active_config_index: usize,
 
     // ── Async state readback (double-buffered, non-blocking) ──
     state_staging: [wgpu::Buffer; 2],
-    staging_idx: usize,                  // which buffer to write NEXT
+    staging_index: usize,                // which buffer to write NEXT
     staging_in_flight: [bool; 2],        // submitted, not yet collected
     staging_ready: [Arc<AtomicBool>; 2], // map_async callback fired
     state_cache: Vec<f32>,
@@ -180,7 +180,7 @@ impl GpuKernel {
             }
             self.staging_ready[i].store(false, Ordering::Release);
         }
-        self.staging_idx = 0;
+        self.staging_index = 0;
 
         // Clear async telemetry state so stale readbacks from the
         // previous generation don't leak into the new one.
@@ -204,14 +204,17 @@ impl GpuKernel {
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        self.queue
-            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
-        self.queue
-            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
         self.queue.write_buffer(
-            &self.brain_config_buf,
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
+        self.queue
+            .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
+        self.queue
+            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
+        self.queue.write_buffer(
+            &self.brain_config_buffer,
             0,
             bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
         );
@@ -294,25 +297,25 @@ impl GpuKernel {
 
         // ── Storage buffers (13 read-write + 2 read-only) ──
 
-        let agent_phys_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let agent_phys_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_agent_phys"),
             size: (n * PHYS_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let decision_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let decision_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_decision"),
             size: (n * DECISION_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let heightmap_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let heightmap_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_heightmap"),
             size: (TERRAIN_VPS * TERRAIN_VPS * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let biome_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let biome_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_biome"),
             size: (BIOME_GRID_RES * BIOME_GRID_RES * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -332,67 +335,67 @@ impl GpuKernel {
                 mapped_at_creation: false,
             }),
         ];
-        let food_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let food_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_food_state"),
             size: ((f * FOOD_STATE_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let food_flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let food_flags_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_food_flags"),
             size: ((f * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let food_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let food_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_food_grid"),
             size: ((grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let agent_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let agent_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_agent_grid"),
             size: (grid_cells * AGENT_GRID_CELL_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let collision_scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let collision_scratch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_collision_scratch"),
             size: (n * 3 * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let sensory_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let sensory_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_sensory"),
             size: (n * layout.sensory_stride * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let brain_state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let brain_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_brain_state"),
             size: (n * layout.brain_stride * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let pattern_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let pattern_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_pattern"),
             size: (n * PATTERN_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let history_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let history_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_history"),
             size: (n * HISTORY_STRIDE * 4) as u64,
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let brain_config_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let brain_config_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_brain_config"),
             size: (CONFIG_SIZE * 4) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let dispatch_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let dispatch_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_dispatch_args"),
             size: 6 * 4, // 2 × (x, y, z) u32 triplets
             usage: wgpu::BufferUsages::INDIRECT
@@ -448,11 +451,11 @@ impl GpuKernel {
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        queue.write_buffer(&brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
-        queue.write_buffer(&pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
-        queue.write_buffer(&history_buf, 0, bytemuck::cast_slice(&history_data));
+        queue.write_buffer(&brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
+        queue.write_buffer(&pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
+        queue.write_buffer(&history_buffer, 0, bytemuck::cast_slice(&history_data));
         queue.write_buffer(
-            &brain_config_buf,
+            &brain_config_buffer,
             0,
             bytemuck::cast_slice(&build_config_for(brain_config, &layout)),
         );
@@ -504,10 +507,10 @@ impl GpuKernel {
     // Each of 128 threads holds one element in registers.
     // subgroupShuffle exchanges values within 32-wide subgroups.
     var my_val: f32 = -3.0;
-    var my_idx: u32 = 0u;
+    var my_index: u32 = 0u;
     if (tid < MEMORY_CAP) {
         my_val = s_similarities[tid];
-        my_idx = s_sort_idx[tid];
+        my_index = shared_sort_indices[tid];
     }
 
     for (var stage: u32 = 0u; stage < 5u; stage = stage + 1u) {
@@ -516,7 +519,7 @@ impl GpuKernel {
                 let half = 1u << (stage - step);
                 let partner_tid = tid ^ half;
                 let partner_val = subgroupShuffle(my_val, sgid ^ half);
-                let partner_idx = subgroupShuffle(my_idx, sgid ^ half);
+                let partner_idx = subgroupShuffle(my_index, sgid ^ half);
 
                 let i = min(tid, partner_tid);
                 let descending = ((i >> (stage + 1u)) & 1u) == 0u;
@@ -524,7 +527,7 @@ impl GpuKernel {
                 let want_max = i_am_low == descending;
                 if ((my_val < partner_val) == want_max) {
                     my_val = partner_val;
-                    my_idx = partner_idx;
+                    my_index = partner_idx;
                 }
             }
             // No barrier needed — subgroup ops are synchronous within subgroup
@@ -534,7 +537,7 @@ impl GpuKernel {
     // Write back to shared memory for stages 5–6
     if (tid < MEMORY_CAP) {
         s_similarities[tid] = my_val;
-        s_sort_idx[tid] = my_idx;
+        shared_sort_indices[tid] = my_index;
     }
     workgroupBarrier();
 
@@ -552,15 +555,15 @@ impl GpuKernel {
 
                 let val_i = s_similarities[i];
                 let val_j = s_similarities[j];
-                let idx_i = s_sort_idx[i];
-                let idx_j = s_sort_idx[j];
+                let idx_i = shared_sort_indices[i];
+                let idx_j = shared_sort_indices[j];
 
                 let should_swap = (descending && val_i < val_j) || (!descending && val_i > val_j);
                 if (should_swap) {
                     s_similarities[i] = val_j;
                     s_similarities[j] = val_i;
-                    s_sort_idx[i] = idx_j;
-                    s_sort_idx[j] = idx_i;
+                    shared_sort_indices[i] = idx_j;
+                    shared_sort_indices[j] = idx_i;
                 }
             }
             workgroupBarrier();
@@ -844,19 +847,19 @@ impl GpuKernel {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: agent_phys_buf.as_entire_binding(),
+                        resource: agent_phys_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: decision_buf.as_entire_binding(),
+                        resource: decision_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: heightmap_buf.as_entire_binding(),
+                        resource: heightmap_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: biome_buf.as_entire_binding(),
+                        resource: biome_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -864,47 +867,47 @@ impl GpuKernel {
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: food_state_buf.as_entire_binding(),
+                        resource: food_state_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: food_flags_buf.as_entire_binding(),
+                        resource: food_flags_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: food_grid_buf.as_entire_binding(),
+                        resource: food_grid_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 8,
-                        resource: agent_grid_buf.as_entire_binding(),
+                        resource: agent_grid_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
-                        resource: collision_scratch_buf.as_entire_binding(),
+                        resource: collision_scratch_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 10,
-                        resource: sensory_buf.as_entire_binding(),
+                        resource: sensory_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 11,
-                        resource: brain_state_buf.as_entire_binding(),
+                        resource: brain_state_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 12,
-                        resource: pattern_buf.as_entire_binding(),
+                        resource: pattern_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 13,
-                        resource: history_buf.as_entire_binding(),
+                        resource: history_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 14,
-                        resource: brain_config_buf.as_entire_binding(),
+                        resource: brain_config_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 15,
-                        resource: dispatch_args_buf.as_entire_binding(),
+                        resource: dispatch_args_buffer.as_entire_binding(),
                     },
                 ],
             })
@@ -919,22 +922,22 @@ impl GpuKernel {
             queue,
             agent_count,
             food_count,
-            agent_phys_buf,
-            decision_buf,
-            heightmap_buf,
-            biome_buf,
+            agent_phys_buffer,
+            decision_buffer,
+            heightmap_buffer,
+            biome_buffer,
             world_config_bufs,
-            food_state_buf,
-            food_flags_buf,
-            food_grid_buf,
-            agent_grid_buf,
-            collision_scratch_buf,
-            sensory_buf,
-            brain_state_buf,
-            pattern_buf,
-            history_buf,
-            brain_config_buf,
-            dispatch_args_buf,
+            food_state_buffer,
+            food_flags_buffer,
+            food_grid_buffer,
+            agent_grid_buffer,
+            collision_scratch_buffer,
+            sensory_buffer,
+            brain_state_buffer,
+            pattern_buffer,
+            history_buffer,
+            brain_config_buffer,
+            dispatch_args_buffer,
             prepare_pipeline,
             physics_pipeline,
             vision_pipeline,
@@ -943,9 +946,9 @@ impl GpuKernel {
             global_pipeline,
             vision_stride: brain_config.vision_stride,
             bind_groups,
-            active_config_idx: 0,
+            active_config_index: 0,
             state_staging,
-            staging_idx: 0,
+            staging_index: 0,
             staging_in_flight: [false, false],
             staging_ready: [
                 Arc::new(AtomicBool::new(false)),
@@ -973,12 +976,12 @@ impl GpuKernel {
         food_timers: &[f32],
     ) {
         self.queue.write_buffer(
-            &self.heightmap_buf,
+            &self.heightmap_buffer,
             0,
             bytemuck::cast_slice(terrain_heights),
         );
         self.queue
-            .write_buffer(&self.biome_buf, 0, bytemuck::cast_slice(biome_grid));
+            .write_buffer(&self.biome_buffer, 0, bytemuck::cast_slice(biome_grid));
 
         let mut food_data = Vec::with_capacity(food_positions.len() * FOOD_STATE_STRIDE);
         for (i, &(x, y, z)) in food_positions.iter().enumerate() {
@@ -988,14 +991,14 @@ impl GpuKernel {
             food_data.push(food_timers[i]);
         }
         self.queue
-            .write_buffer(&self.food_state_buf, 0, bytemuck::cast_slice(&food_data));
+            .write_buffer(&self.food_state_buffer, 0, bytemuck::cast_slice(&food_data));
 
         let flags: Vec<u32> = food_consumed
             .iter()
             .map(|&c| if c { 1 } else { 0 })
             .collect();
         self.queue
-            .write_buffer(&self.food_flags_buf, 0, bytemuck::cast_slice(&flags));
+            .write_buffer(&self.food_flags_buffer, 0, bytemuck::cast_slice(&flags));
     }
 
     /// Upload initial agent physics state.
@@ -1021,7 +1024,7 @@ impl GpuKernel {
             data[base + P_PROCESSING_SLOTS] = proc_slots as f32;
         }
         self.queue
-            .write_buffer(&self.agent_phys_buf, 0, bytemuck::cast_slice(&data));
+            .write_buffer(&self.agent_phys_buffer, 0, bytemuck::cast_slice(&data));
     }
 
     /// Write world config uniform with batch parameters.
@@ -1043,7 +1046,7 @@ impl GpuKernel {
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(
-            &self.world_config_bufs[self.active_config_idx],
+            &self.world_config_bufs[self.active_config_index],
             0,
             bytemuck::cast_slice(&wc),
         );
@@ -1069,7 +1072,7 @@ impl GpuKernel {
         );
         wc[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(
-            &self.world_config_bufs[self.active_config_idx],
+            &self.world_config_bufs[self.active_config_index],
             0,
             bytemuck::cast_slice(&wc),
         );
@@ -1104,7 +1107,7 @@ impl GpuKernel {
             if run_vision || run_brain {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.prepare_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
             for c in cycle..chunk_end {
@@ -1113,21 +1116,21 @@ impl GpuKernel {
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.physics_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                     pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                     pass.dispatch_workgroups(1, 1, 1);
                 }
                 if run_vision {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.vision_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 0);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
                 }
                 if run_brain {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&self.brain_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 12);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 12);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -1146,22 +1149,22 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }
         encoder.copy_buffer_to_buffer(
-            &self.agent_phys_buf,
+            &self.agent_phys_buffer,
             0,
-            &self.state_staging[self.staging_idx],
+            &self.state_staging[self.staging_index],
             0,
             buf_size,
         );
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
 
-        self.active_config_idx = 1 - self.active_config_idx;
+        self.active_config_index = 1 - self.active_config_index;
     }
 
     /// Non-blocking: collect any ready staging buffers into state_cache.
@@ -1193,7 +1196,7 @@ impl GpuKernel {
     /// Returns true if dispatched, false if skipped.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         // Check if the write-target staging buffer is free.
-        let widx = self.staging_idx;
+        let widx = self.staging_index;
         if self.staging_in_flight[widx] {
             return false;
         }
@@ -1239,7 +1242,7 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.prepare_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
@@ -1247,7 +1250,7 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
             }
 
@@ -1257,7 +1260,7 @@ impl GpuKernel {
                 let gpc: [u32; 2] = [tick_for_global as u32, 0];
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.global_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
@@ -1266,8 +1269,8 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.vision_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
-                pass.dispatch_workgroups_indirect(&self.dispatch_args_buf, 0);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -1289,7 +1292,7 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_idx], &[]);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
@@ -1297,7 +1300,7 @@ impl GpuKernel {
 
         // Async state readback into staging[widx]
         encoder.copy_buffer_to_buffer(
-            &self.agent_phys_buf,
+            &self.agent_phys_buffer,
             0,
             &self.state_staging[widx],
             0,
@@ -1315,8 +1318,8 @@ impl GpuKernel {
                 }
             });
         self.staging_in_flight[widx] = true;
-        self.staging_idx = 1 - self.staging_idx;
-        self.active_config_idx = 1 - self.active_config_idx;
+        self.staging_index = 1 - self.staging_index;
+        self.active_config_index = 1 - self.active_config_index;
         true
     }
 
@@ -1343,7 +1346,7 @@ impl GpuKernel {
         });
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(&self.agent_phys_buf, 0, &staging, 0, buf_size);
+        encoder.copy_buffer_to_buffer(&self.agent_phys_buffer, 0, &staging, 0, buf_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = staging.slice(..);
@@ -1368,7 +1371,7 @@ impl GpuKernel {
         let brain_offset = (i * bs * 4) as u64;
         let brain_size = (bs * 4) as u64;
         self.read_buffer_range(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             brain_offset,
             brain_size,
             &mut state.brain_state,
@@ -1376,12 +1379,17 @@ impl GpuKernel {
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
         let pat_size = (PATTERN_STRIDE * 4) as u64;
-        self.read_buffer_range(&self.pattern_buf, pat_offset, pat_size, &mut state.patterns);
+        self.read_buffer_range(
+            &self.pattern_buffer,
+            pat_offset,
+            pat_size,
+            &mut state.patterns,
+        );
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         let hist_size = (HISTORY_STRIDE * 4) as u64;
         self.read_buffer_range(
-            &self.history_buf,
+            &self.history_buffer,
             hist_offset,
             hist_size,
             &mut state.history,
@@ -1397,21 +1405,21 @@ impl GpuKernel {
 
         let brain_offset = (i * bs * 4) as u64;
         self.queue.write_buffer(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             brain_offset,
             bytemuck::cast_slice(&state.brain_state),
         );
 
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
         self.queue.write_buffer(
-            &self.pattern_buf,
+            &self.pattern_buffer,
             pat_offset,
             bytemuck::cast_slice(&state.patterns),
         );
 
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         self.queue.write_buffer(
-            &self.history_buf,
+            &self.history_buffer,
             hist_offset,
             bytemuck::cast_slice(&state.history),
         );
@@ -1444,7 +1452,7 @@ impl GpuKernel {
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             byte_offset,
             bytemuck::cast_slice(&values),
         );
@@ -1492,17 +1500,23 @@ impl GpuKernel {
 
         let brain_offset = (i * bs * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             brain_offset,
             &brain_staging,
             0,
             brain_size,
         );
         let pat_offset = (i * PATTERN_STRIDE * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.pattern_buf, pat_offset, &pattern_staging, 0, pat_size);
+        encoder.copy_buffer_to_buffer(
+            &self.pattern_buffer,
+            pat_offset,
+            &pattern_staging,
+            0,
+            pat_size,
+        );
         let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.history_buf,
+            &self.history_buffer,
             hist_offset,
             &history_staging,
             0,
@@ -1666,12 +1680,15 @@ impl GpuKernel {
         debug_assert_eq!(pattern_data.len(), count * PATTERN_STRIDE);
         debug_assert_eq!(history_data.len(), count * HISTORY_STRIDE);
 
+        self.queue.write_buffer(
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
         self.queue
-            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
+            .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
         self.queue
-            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
+            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
     }
 
     /// Non-blocking version of `reset_agents`. Returns false if async staging
@@ -1693,7 +1710,7 @@ impl GpuKernel {
             }
             self.staging_ready[i].store(false, Ordering::Release);
         }
-        self.staging_idx = 0;
+        self.staging_index = 0;
 
         let n = self.agent_count as usize;
 
@@ -1711,14 +1728,17 @@ impl GpuKernel {
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
-        self.queue
-            .write_buffer(&self.brain_state_buf, 0, bytemuck::cast_slice(&brain_data));
-        self.queue
-            .write_buffer(&self.pattern_buf, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buf, 0, bytemuck::cast_slice(&history_data));
         self.queue.write_buffer(
-            &self.brain_config_buf,
+            &self.brain_state_buffer,
+            0,
+            bytemuck::cast_slice(&brain_data),
+        );
+        self.queue
+            .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
+        self.queue
+            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
+        self.queue.write_buffer(
+            &self.brain_config_buffer,
             0,
             bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
         );
@@ -1765,7 +1785,7 @@ impl GpuKernel {
         let sensory_size = (ss * 4) as u64;
         let mut sensory = Vec::with_capacity(ss);
         self.read_buffer_range(
-            &self.sensory_buf,
+            &self.sensory_buffer,
             sensory_offset,
             sensory_size,
             &mut sensory,
@@ -1776,7 +1796,7 @@ impl GpuKernel {
         let dec_offset = (i * DECISION_STRIDE * 4) as u64;
         let dec_size = (DECISION_STRIDE * 4) as u64;
         let mut decision = Vec::with_capacity(DECISION_STRIDE);
-        self.read_buffer_range(&self.decision_buf, dec_offset, dec_size, &mut decision);
+        self.read_buffer_range(&self.decision_buffer, dec_offset, dec_size, &mut decision);
         let motor_base = DIM + DIM; // prediction(32) + credit(32)
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
@@ -1786,7 +1806,12 @@ impl GpuKernel {
         let brain_offset = (i * bs * 4) as u64;
         let brain_size = (bs * 4) as u64;
         let mut brain = Vec::with_capacity(bs);
-        self.read_buffer_range(&self.brain_state_buf, brain_offset, brain_size, &mut brain);
+        self.read_buffer_range(
+            &self.brain_state_buffer,
+            brain_offset,
+            brain_size,
+            &mut brain,
+        );
 
         // Compute dynamic brain-state offsets from layout's feature_count
         let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
@@ -1823,7 +1848,7 @@ impl GpuKernel {
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
         let phys_size = (PHYS_STRIDE * 4) as u64;
         let mut phys = Vec::with_capacity(PHYS_STRIDE);
-        self.read_buffer_range(&self.agent_phys_buf, phys_offset, phys_size, &mut phys);
+        self.read_buffer_range(&self.agent_phys_buffer, phys_offset, phys_size, &mut phys);
         let gradient = phys[P_GRADIENT_OUT];
         let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
@@ -1886,7 +1911,7 @@ impl GpuKernel {
 
         let sensory_offset = (i * ss * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.sensory_buf,
+            &self.sensory_buffer,
             sensory_offset,
             &self.telemetry_staging.sensory,
             0,
@@ -1895,7 +1920,7 @@ impl GpuKernel {
 
         let dec_offset = (i * DECISION_STRIDE * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.decision_buf,
+            &self.decision_buffer,
             dec_offset,
             &self.telemetry_staging.decision,
             0,
@@ -1904,7 +1929,7 @@ impl GpuKernel {
 
         let brain_offset = (i * bs * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.brain_state_buf,
+            &self.brain_state_buffer,
             brain_offset,
             &self.telemetry_staging.brain,
             0,
@@ -1913,7 +1938,7 @@ impl GpuKernel {
 
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
         encoder.copy_buffer_to_buffer(
-            &self.agent_phys_buf,
+            &self.agent_phys_buffer,
             phys_offset,
             &self.telemetry_staging.phys,
             0,

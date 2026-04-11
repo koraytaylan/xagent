@@ -1049,9 +1049,9 @@ impl App {
         (true, spawned)
     }
 
-    fn log_msg(&mut self, msg: String) {
-        println!("{}", msg);
-        self.console_log.push_back(msg);
+    fn log_msg(&mut self, message: String) {
+        println!("{}", message);
+        self.console_log.push_back(message);
         if self.console_log.len() > 200 {
             self.console_log.pop_front();
         }
@@ -2120,7 +2120,7 @@ impl ApplicationHandler for App {
                                                 };
                                             AgentSnapshot {
                                                 id: a.id,
-                                                gen: a.generation,
+                                                generation: a.generation,
                                                 energy: a.body.body.internal.energy,
                                                 max_energy: a.body.body.internal.max_energy,
                                                 integrity: a.body.body.internal.integrity,
@@ -2523,7 +2523,7 @@ impl ApplicationHandler for App {
                                                                 let status = if !snap.alive { "💀" } else { "" };
                                                                 ui.label(format!(
                                                                     "Agent {} (g{}) {}",
-                                                                    snap.id, snap.gen, status
+                                                                    snap.id, snap.generation, status
                                                                 ));
                                                             });
                                                             ui.horizontal(|ui| {

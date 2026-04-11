@@ -137,7 +137,7 @@ pub fn update_food(
 fn append_cube(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    pos: Vec3,
+    position: Vec3,
     size: f32,
     color: [f32; 3],
 ) {
@@ -146,14 +146,14 @@ fn append_cube(
 
     #[rustfmt::skip]
     let p: [[f32; 3]; 8] = [
-        [pos.x - h, pos.y - h, pos.z + h],
-        [pos.x + h, pos.y - h, pos.z + h],
-        [pos.x + h, pos.y + h, pos.z + h],
-        [pos.x - h, pos.y + h, pos.z + h],
-        [pos.x - h, pos.y - h, pos.z - h],
-        [pos.x + h, pos.y - h, pos.z - h],
-        [pos.x + h, pos.y + h, pos.z - h],
-        [pos.x - h, pos.y + h, pos.z - h],
+        [position.x - h, position.y - h, position.z + h],
+        [position.x + h, position.y - h, position.z + h],
+        [position.x + h, position.y + h, position.z + h],
+        [position.x - h, position.y + h, position.z + h],
+        [position.x - h, position.y - h, position.z - h],
+        [position.x + h, position.y - h, position.z - h],
+        [position.x + h, position.y + h, position.z - h],
+        [position.x - h, position.y + h, position.z - h],
     ];
 
     let shades = [1.0_f32, 0.9, 0.85, 0.7, 0.8, 0.75];

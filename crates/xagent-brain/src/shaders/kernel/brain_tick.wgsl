@@ -451,65 +451,65 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         fwd = fast_tanh(fwd);
         trn = fast_tanh(trn);
 
-        // Motor fatigue: record PRE-NOISE commands so exploration noise
-        // doesn't mask repetitive brain decisions.
-        let fatigue_cursor = u32(brain_state[b + O_FATIGUE_CURSOR]);
-        brain_state[b + O_FATIGUE_FWD_RING + fatigue_cursor] = fwd;
-        brain_state[b + O_FATIGUE_TURN_RING + fatigue_cursor] = trn;
-        let fatigue_len_val = brain_state[b + O_FATIGUE_LEN];
-        let new_len = min(fatigue_len_val + 1.0, f32(ACTION_HISTORY_LEN));
-        brain_state[b + O_FATIGUE_LEN] = new_len;
-        brain_state[b + O_FATIGUE_CURSOR] = f32((fatigue_cursor + 1u) % ACTION_HISTORY_LEN);
-        let f_len = u32(new_len);
-        var mean_f: f32 = 0.0;
-        var mean_t: f32 = 0.0;
-        var sum_turn: f32 = 0.0;
-        var sum_abs_turn: f32 = 0.0;
-        for (var i: u32 = 0u; i < f_len; i = i + 1u) {
-            let fi = brain_state[b + O_FATIGUE_FWD_RING + i];
-            let ti = brain_state[b + O_FATIGUE_TURN_RING + i];
-            mean_f += fi;
-            mean_t += ti;
-            sum_turn += ti;
-            sum_abs_turn += abs(ti);
-        }
-        mean_f /= f32(f_len);
-        mean_t /= f32(f_len);
-        var var_f: f32 = 0.0;
-        var var_t: f32 = 0.0;
-        for (var i: u32 = 0u; i < f_len; i = i + 1u) {
-            let df = brain_state[b + O_FATIGUE_FWD_RING + i] - mean_f;
-            let dt = brain_state[b + O_FATIGUE_TURN_RING + i] - mean_t;
-            var_f += df * df;
-            var_t += dt * dt;
-        }
-        var_f /= f32(f_len);
-        var_t /= f32(f_len);
+        // Position-based staleness: record current XZ position and
+        // accumulated forward output, then compare displacement against
+        // expected travel to detect agents that aren't making progress.
+        let phys_base_fat = agent_id * PHYS_STRIDE;
+        let cur_x = agent_phys[phys_base_fat + P_POS_X];
+        let cur_z = agent_phys[phys_base_fat + P_POS_Z];
+        let pos_cursor = u32(brain_state[b + O_POS_RING_CURSOR]);
+        brain_state[b + O_POS_RING_X + pos_cursor] = cur_x;
+        brain_state[b + O_POS_RING_Z + pos_cursor] = cur_z;
+        let pos_len_val = brain_state[b + O_POS_RING_LEN];
+        let new_pos_len = min(pos_len_val + 1.0, f32(POS_RING_LEN));
+        brain_state[b + O_POS_RING_LEN] = new_pos_len;
+        brain_state[b + O_POS_RING_CURSOR] = f32((pos_cursor + 1u) % POS_RING_LEN);
 
-        // Turn-direction consistency: detect sustained same-direction turning
-        // (circling signature). turn_bias → 1 when all turns share the same
-        // sign, → 0 when turns are balanced left/right.
-        // Require minimum 16 samples before engaging monotony detection to
-        // prevent early-life trapping on noisy small-sample estimates.
-        var monotony: f32 = 0.0;
-        if (f_len >= 16u) {
-            let turn_denom = max(sum_abs_turn, 0.01);
-            let turn_bias = abs(sum_turn) / turn_denom;
-            // Squared for gentle onset; suppresses variety when turning monotonically
-            monotony = turn_bias * turn_bias;
+        // Accumulate forward motor output (pre-noise) for expected displacement.
+        // This is an approximate running total: when the position ring is full,
+        // we do not subtract the overwritten slot's exact forward contribution.
+        let old_accum = brain_state[b + O_ACCUM_FWD];
+        var new_accum = old_accum + max(fwd, 0.0);
+        if (new_pos_len >= f32(POS_RING_LEN)) {
+            // We do not track per-slot forward values, so approximate a bounded
+            // window by decaying the accumulator proportionally each overwrite.
+            new_accum *= (f32(POS_RING_LEN) - 1.0) / f32(POS_RING_LEN);
         }
+        brain_state[b + O_ACCUM_FWD] = new_accum;
 
-        let recovery = brain_state[b + O_FATIGUE_RECOVERY];
+        // Compute staleness: compare actual displacement to expected
+        let p_len = u32(new_pos_len);
         let floor_val = brain_state[b + O_FATIGUE_FLOOR];
-        let motor_variety = sqrt(var_f + var_t) * recovery;
-        let effective_variety = motor_variety * (1.0 - monotony * 0.75);
-        let fatigue_factor = clamp(
-            floor_val + (1.0 - floor_val) * clamp(effective_variety, 0.0, 1.0),
-            floor_val, 1.0
-        );
+        var fatigue_factor: f32 = 1.0;
+        if (p_len >= 4u) {
+            // Oldest valid entry in the ring. When the ring is not yet full,
+            // (pos_cursor + 1) points at the next write slot rather than the
+            // oldest sample, so compute from the current valid length instead.
+            let cursor_new = (pos_cursor + 1u) % POS_RING_LEN;
+            let oldest_idx = (cursor_new + POS_RING_LEN - p_len) % POS_RING_LEN;
+            let old_x = brain_state[b + O_POS_RING_X + oldest_idx];
+            let old_z = brain_state[b + O_POS_RING_Z + oldest_idx];
+            let dx = cur_x - old_x;
+            let dz = cur_z - old_z;
+            let displacement = sqrt(dx * dx + dz * dz);
+
+            // Expected displacement: accumulated forward * MOVE_SPEED * DT * stride
+            // Each brain tick, the agent moves fwd * MOVE_SPEED * DT * stride units
+            let expected = new_accum * MOVE_SPEED * wc_f32(WC_DT) * f32(wc_u32(WC_BRAIN_TICK_STRIDE));
+            // Only penalize when the agent is actually trying to move;
+            // idle agents (expected ≈ 0) keep fatigue_factor = 1.0.
+            let expected_epsilon = 0.001;
+            if (expected > expected_epsilon) {
+                let ratio = displacement / expected;
+                let staleness = 1.0 - clamp(ratio, 0.0, 1.0);
+                let max_penalty = 1.0 - floor_val;
+                fatigue_factor = 1.0 - staleness * max_penalty;
+                fatigue_factor = clamp(fatigue_factor, floor_val, 1.0);
+            }
+        }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 
-        // Exploration noise (applied after fatigue ring to not pollute it)
+        // Exploration noise
         let tick_u = u32(tick_count);
         let seed_base = agent_id * 1000u + tick_u;
         let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5;
@@ -517,7 +517,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
         trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
 
-        // Apply fatigue to final output
+        // Apply staleness-based fatigue to final output
         fwd *= fatigue_factor;
         trn *= fatigue_factor;
 
@@ -661,30 +661,28 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
 
         // Store the *approach action* (motor from ~2 ticks ago) instead of the
         // current motor.  Negative-valence recall then negates the approach
-        // action → directed escape, not freeze.  (Fatigue ring was updated
-        // earlier in this kernel, same cursor state as standalone pass.)
-        let fatigue_len_u = u32(brain_state[b + O_FATIGUE_LEN]);
-        let fatigue_cur  = u32(brain_state[b + O_FATIGUE_CURSOR]);
+        // action → directed escape, not freeze.  Uses the history ring buffer
+        // which records post-noise commands; acceptable since staleness-based
+        // fatigue doesn't distort the motor signal like variance-based did.
+        let hi_base_mem = agent_id * HISTORY_STRIDE;
+        let hist_len_u = u32(history_buf[hi_base_mem + O_HIST_LEN]);
+        let hist_cur_u = u32(history_buf[hi_base_mem + O_HIST_CURSOR]);
         var motor_fwd: f32;
         var motor_trn: f32;
-        if (fatigue_len_u >= 3u) {
+        if (hist_len_u >= 3u) {
             // cursor already advanced past current tick's write, so:
             //   cursor-1 = this tick, cursor-2 = 1 ago, cursor-3 = 2 ago.
-            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
-            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
-            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
-        } else if (fatigue_len_u == 2u) {
-            // Use oldest available pre-noise command (1 tick ago).
-            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 2u) % ACTION_HISTORY_LEN;
-            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
-            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
-        } else if (fatigue_len_u == 1u) {
-            // Only current tick in ring; still pre-noise so prefer over decision.
-            let ring_idx = (fatigue_cur + ACTION_HISTORY_LEN - 1u) % ACTION_HISTORY_LEN;
-            motor_fwd = brain_state[b + O_FATIGUE_FWD_RING + ring_idx];
-            motor_trn = brain_state[b + O_FATIGUE_TURN_RING + ring_idx];
+            let ring_idx = (hist_cur_u + ACTION_HISTORY_LEN - 3u) % ACTION_HISTORY_LEN;
+            motor_fwd = history_buf[hi_base_mem + O_MOTOR_RING + ring_idx * 5u];
+            motor_trn = history_buf[hi_base_mem + O_MOTOR_RING + ring_idx * 5u + 1u];
+        } else if (hist_len_u >= 1u) {
+            // Use oldest available entry.
+            let lookback = min(hist_len_u, 2u);
+            let ring_idx = (hist_cur_u + ACTION_HISTORY_LEN - lookback) % ACTION_HISTORY_LEN;
+            motor_fwd = history_buf[hi_base_mem + O_MOTOR_RING + ring_idx * 5u];
+            motor_trn = history_buf[hi_base_mem + O_MOTOR_RING + ring_idx * 5u + 1u];
         } else {
-            // Ring truly empty; fall back to decision buffer.
+            // History empty; fall back to decision buffer.
             motor_fwd = decision_buf[d_base + DIM + DIM];
             motor_trn = decision_buf[d_base + DIM + DIM + 1u];
         }

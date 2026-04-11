@@ -168,7 +168,7 @@ pub struct Agent {
     pub cached_gradient: f32,
     pub cached_mean_attenuation: f32,
     pub cached_curiosity_bonus: f32,
-    pub cached_motor_variance: f32,
+    pub cached_staleness: f32,
 }
 
 impl Agent {
@@ -208,7 +208,7 @@ impl Agent {
             cached_gradient: 0.0,
             cached_mean_attenuation: 0.0,
             cached_curiosity_bonus: 0.0,
-            cached_motor_variance: 0.0,
+            cached_staleness: 0.0,
         }
     }
 
@@ -353,14 +353,6 @@ pub fn mutate_config_with_strength(
                 strength,
             )
             .clamp(0.1, 1.0),
-        fatigue_recovery_sensitivity: momentum
-            .biased_perturb_f(
-                &mut rng,
-                parent.fatigue_recovery_sensitivity,
-                "fatigue_recovery_sensitivity",
-                strength,
-            )
-            .clamp(2.0, 10.0),
         fatigue_floor: momentum
             .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
             .clamp(0.05, 0.4),
@@ -474,11 +466,6 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.max_curiosity_bonus
         } else {
             b.max_curiosity_bonus
-        },
-        fatigue_recovery_sensitivity: if rng.random::<f32>() < 0.5 {
-            a.fatigue_recovery_sensitivity
-        } else {
-            b.fatigue_recovery_sensitivity
         },
         fatigue_floor: if rng.random::<f32>() < 0.5 {
             a.fatigue_floor
@@ -647,33 +634,21 @@ mod tests {
     #[test]
     fn mutate_config_respects_fatigue_bounds() {
         let momentum = MutationMomentum::new(0.9);
-        // Push initial config to the old (now invalid) upper limits to verify
-        // the tighter clamps rein them back in.
+        // Push initial config to extreme values to verify the clamps rein them in.
         let parent = BrainConfig {
-            fatigue_recovery_sensitivity: 20.0,
             fatigue_floor: 0.4,
             ..BrainConfig::default()
         };
         for _ in 0..50 {
             let child = mutate_config_with_strength(&parent, 0.3, &momentum);
             assert!(
-                child.fatigue_recovery_sensitivity <= 10.0,
-                "fatigue_recovery must be ≤ 10.0, got {}",
-                child.fatigue_recovery_sensitivity,
-            );
-            assert!(
-                child.fatigue_recovery_sensitivity >= 2.0,
-                "fatigue_recovery must be ≥ 2.0, got {}",
-                child.fatigue_recovery_sensitivity,
-            );
-            assert!(
                 child.fatigue_floor <= 0.4,
-                "fatigue_floor must be ≤ 0.4, got {}",
+                "fatigue_floor must be <= 0.4, got {}",
                 child.fatigue_floor,
             );
             assert!(
                 child.fatigue_floor >= 0.05,
-                "fatigue_floor must be ≥ 0.05, got {}",
+                "fatigue_floor must be >= 0.05, got {}",
                 child.fatigue_floor,
             );
         }

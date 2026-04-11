@@ -675,7 +675,6 @@ impl Governor {
                             "distress_exponent" => "distress",
                             "habituation_sensitivity" => "hab",
                             "max_curiosity_bonus" => "curiosity",
-                            "fatigue_recovery_sensitivity" => "fat_rec",
                             "fatigue_floor" => "fat_fl",
                             other => other,
                         };
@@ -1062,11 +1061,11 @@ impl Governor {
         };
 
         // Serialize TickRecords into a compact little-endian binary
-        // format: 14 f32 fields per agent per tick (position[3], yaw,
+        // format: 15 f32 fields per agent per tick (position[3], yaw,
         // energy, integrity, alive, motor_fwd, motor_turn,
         // prediction_error, exploration_rate, gradient, urgency,
-        // fatigue_factor).
-        let record_stride = 14usize;
+        // fatigue_factor, staleness).
+        let record_stride = 15usize;
         let tick_count_usize = match usize::try_from(tick_count) {
             Ok(v) => v,
             Err(_) => return,
@@ -1103,6 +1102,7 @@ impl Governor {
                     r.gradient,
                     r.urgency,
                     r.fatigue_factor,
+                    r.staleness,
                 ] {
                     bytes.extend_from_slice(&val.to_le_bytes());
                 }
@@ -1158,7 +1158,7 @@ impl Governor {
         }
 
         // Keep record_stride in sync with store_recording().
-        let record_stride = 14usize;
+        let record_stride = 15usize;
         let actual_float_count = blob.len() / float_size;
         let expected_float_count = agent_count
             .checked_mul(tick_count)?
@@ -1509,11 +1509,6 @@ fn record_mutations(
             "max_curiosity_bonus",
             parent.max_curiosity_bonus as f64,
             child.max_curiosity_bonus as f64,
-        ),
-        (
-            "fatigue_recovery_sensitivity",
-            parent.fatigue_recovery_sensitivity as f64,
-            child.fatigue_recovery_sensitivity as f64,
         ),
         (
             "fatigue_floor",

@@ -57,8 +57,8 @@ pub struct BrainTelemetry {
     pub curiosity_bonus: f32,
     /// Motor fatigue factor [fatigue_floor, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,
-    /// Recent motor output variance (higher = more diverse).
-    pub motor_variance: f32,
+    /// Position-based staleness [0.0, 1.0]. High = stuck in place.
+    pub staleness: f32,
 }
 
 impl BrainTelemetry {

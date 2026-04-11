@@ -103,8 +103,8 @@ pub struct AgentSnapshot {
     pub curiosity_bonus: f32,
     /// Motor fatigue factor [fatigue_floor, 1.0]. Low = fatigued.
     pub fatigue_factor: f32,
-    /// Motor output variance.
-    pub motor_variance: f32,
+    /// Position-based staleness [0.0, 1.0]. High = stuck in place.
+    pub staleness: f32,
     /// Fatigue factor history for the chart.
     pub fatigue_history: Vec<f32>,
 }
@@ -713,7 +713,7 @@ impl<'a> TabContext<'a> {
                         mean_attenuation: record.mean_attenuation,
                         curiosity_bonus: record.curiosity_bonus,
                         fatigue_factor: record.fatigue_factor,
-                        motor_variance: record.motor_variance,
+                        staleness: record.staleness,
                         fatigue_history: Vec::new(),
                     };
                     &replay_snap
@@ -794,7 +794,7 @@ impl<'a> TabContext<'a> {
                                 mean_attenuation: r.mean_attenuation,
                                 curiosity_bonus: r.curiosity_bonus,
                                 fatigue_factor: r.fatigue_factor,
-                                motor_variance: r.motor_variance,
+                                staleness: r.staleness,
                                 fatigue_history: Vec::new(),
                             }
                         })
@@ -916,7 +916,7 @@ impl<'a> TabContext<'a> {
                     }),
                 );
                 cols[1].label(
-                    egui::RichText::new(format!("Motor var: {:.4}", effective_snap.motor_variance))
+                    egui::RichText::new(format!("Staleness: {:.4}", effective_snap.staleness))
                         .small()
                         .color(egui::Color32::GRAY),
                 );
@@ -1928,9 +1928,6 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("max_curiosity_bonus");
                         ui.monospace(format!("{:.2}", cfg.max_curiosity_bonus));
-                        ui.end_row();
-                        ui.label("fatigue_recovery_sensitivity");
-                        ui.monospace(format!("{:.1}", cfg.fatigue_recovery_sensitivity));
                         ui.end_row();
                         ui.label("fatigue_floor");
                         ui.monospace(format!("{:.2}", cfg.fatigue_floor));

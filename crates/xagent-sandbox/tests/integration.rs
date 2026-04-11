@@ -1126,7 +1126,7 @@ fn async_recording_persists_and_round_trips() {
                 mean_attenuation: 1.0,
                 curiosity_bonus: 0.0,
                 fatigue_factor: 1.0,
-                motor_variance: 0.0,
+                staleness: 0.0,
                 vision_color: None,
             })
             .collect();
@@ -1155,8 +1155,8 @@ fn async_recording_persists_and_round_trips() {
     assert_eq!(loaded_agents, agent_count);
     assert_eq!(loaded_ticks, total_ticks);
 
-    // 14 f32 fields per agent per tick (the serialization stride).
-    let record_stride = 14;
+    // 15 f32 fields per agent per tick (the serialization stride).
+    let record_stride = 15;
     assert_eq!(
         floats.len(),
         agent_count * total_ticks as usize * record_stride

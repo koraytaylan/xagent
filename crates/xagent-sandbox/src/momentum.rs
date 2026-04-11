@@ -127,10 +127,6 @@ impl MutationMomentum {
             ("distress_exponent", parent.distress_exponent),
             ("habituation_sensitivity", parent.habituation_sensitivity),
             ("max_curiosity_bonus", parent.max_curiosity_bonus),
-            (
-                "fatigue_recovery_sensitivity",
-                parent.fatigue_recovery_sensitivity,
-            ),
             ("fatigue_floor", parent.fatigue_floor),
         ];
 
@@ -147,7 +143,6 @@ impl MutationMomentum {
                         "distress_exponent" => w.distress_exponent,
                         "habituation_sensitivity" => w.habituation_sensitivity,
                         "max_curiosity_bonus" => w.max_curiosity_bonus,
-                        "fatigue_recovery_sensitivity" => w.fatigue_recovery_sensitivity,
                         "fatigue_floor" => w.fatigue_floor,
                         _ => *parent_val,
                     };

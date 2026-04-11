@@ -287,12 +287,13 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 
     brain_state[brain_base + O_EXPLORATION_RATE] = 0.5;
 
-    for (var i = 0u; i < ACTION_HISTORY_LEN; i++) {
-        brain_state[brain_base + O_FATIGUE_FWD_RING + i] = 0.0;
-        brain_state[brain_base + O_FATIGUE_TURN_RING + i] = 0.0;
+    for (var i = 0u; i < POS_RING_LEN; i++) {
+        brain_state[brain_base + O_POS_RING_X + i] = 0.0;
+        brain_state[brain_base + O_POS_RING_Z + i] = 0.0;
     }
-    brain_state[brain_base + O_FATIGUE_CURSOR] = 0.0;
-    brain_state[brain_base + O_FATIGUE_LEN] = 0.0;
+    brain_state[brain_base + O_POS_RING_CURSOR] = 0.0;
+    brain_state[brain_base + O_POS_RING_LEN] = 0.0;
+    brain_state[brain_base + O_ACCUM_FWD] = 0.0;
     brain_state[brain_base + O_FATIGUE_FACTOR] = 1.0;
 
     for (var i = 0u; i < DIM; i++) {

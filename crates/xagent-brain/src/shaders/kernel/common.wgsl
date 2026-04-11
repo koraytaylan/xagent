@@ -143,7 +143,6 @@ const F_RESPAWN_TIMER: u32 = 3u;
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
-const MOVE_SPEED: f32 = 8.0;
 const TURN_SPEED: f32 = 3.0;
 const AGENT_HALF_HEIGHT: f32 = 1.0;
 const METABOLIC_BASE_COST: f32 = 0.0001;

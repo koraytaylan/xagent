@@ -1173,9 +1173,9 @@ fn async_recording_persists_and_round_trips() {
     // `_tmp` drops here, removing the main DB file automatically.
 }
 
-// ── Vision-stride / Brain-tick-stride ordering tests ─────────────────
+// ── Vision-stride / Brain-tick-stride dispatch arithmetic sanity checks ──
 //
-// Ordering guarantee (verified here):
+// Background (not verified by these tests):
 //   Within the fused kernel each inner cycle runs in this order:
 //     physics → food_detect → death_respawn → brain
 //   The barriers/orderings only establish phase sequencing within that
@@ -1271,27 +1271,60 @@ fn stride_batch_count_formula_when_strides_match() {
 /// total ticks covered = kernel_batches * vision_stride * brain_tick_stride
 ///                       + remainder_cycles * brain_tick_stride
 ///                       + physics_remainder
+///
+/// The expected decomposition is precomputed so the test can catch
+/// regressions instead of only re-deriving `total_ticks` from itself.
 #[test]
 fn stride_tick_coverage_is_complete_when_strides_match() {
-    for stride in [1u32, 4, 10, 16] {
-        for total_ticks in [1u32, 10, 100, 500, 1000] {
-            let brain_tick_stride = stride;
-            let vision_stride = stride;
+    // (stride, total_ticks, (kernel_batches, remainder_cycles, physics_remainder))
+    let cases = [
+        (1u32, 1u32, (1u32, 0u32, 0u32)),
+        (1, 10, (10, 0, 0)),
+        (1, 100, (100, 0, 0)),
+        (1, 500, (500, 0, 0)),
+        (1, 1000, (1000, 0, 0)),
+        (4, 1, (0, 0, 1)),
+        (4, 10, (0, 2, 2)),
+        (4, 100, (6, 1, 0)),
+        (4, 500, (31, 1, 0)),
+        (4, 1000, (62, 2, 0)),
+        (10, 1, (0, 0, 1)),
+        (10, 10, (0, 1, 0)),
+        (10, 100, (1, 0, 0)),
+        (10, 500, (5, 0, 0)),
+        (10, 1000, (10, 0, 0)),
+        (16, 1, (0, 0, 1)),
+        (16, 10, (0, 0, 10)),
+        (16, 100, (0, 6, 4)),
+        (16, 500, (1, 15, 4)),
+        (16, 1000, (3, 14, 8)),
+    ];
 
-            let brain_cycles = total_ticks / brain_tick_stride;
-            let kernel_batches = brain_cycles / vision_stride;
-            let remainder_cycles = brain_cycles % vision_stride;
-            let physics_remainder = total_ticks % brain_tick_stride;
+    for (stride, total_ticks, expected) in cases {
+        let brain_tick_stride = stride;
+        let vision_stride = stride;
 
-            let covered = kernel_batches * vision_stride * brain_tick_stride
-                + remainder_cycles * brain_tick_stride
-                + physics_remainder;
+        let brain_cycles = total_ticks / brain_tick_stride;
+        let actual = (
+            brain_cycles / vision_stride,
+            brain_cycles % vision_stride,
+            total_ticks % brain_tick_stride,
+        );
 
-            assert_eq!(
-                covered, total_ticks,
-                "stride={stride}, ticks={total_ticks}: covered={covered} != total={total_ticks}"
-            );
-        }
+        assert_eq!(
+            actual, expected,
+            "stride={stride}, ticks={total_ticks}: expected {:?}, got {:?}",
+            expected, actual
+        );
+
+        let covered = expected.0 * vision_stride * brain_tick_stride
+            + expected.1 * brain_tick_stride
+            + expected.2;
+
+        assert_eq!(
+            covered, total_ticks,
+            "stride={stride}, ticks={total_ticks}: covered={covered} != total={total_ticks}"
+        );
     }
 }
 

@@ -54,10 +54,11 @@ const O_TICK_COUNT: u32 = O_PREV_PREDICTION + DIM;
 const O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
 const O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
 const O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
+const O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-const BRAIN_STRIDE: u32 = O_FATIGUE_FLOOR + 1u;
+const BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
 const PATTERN_STRIDE: u32 = 5251u;
 const HISTORY_STRIDE: u32 = 2370u;
 const FEATURES_STRIDE: u32 = FEATURE_COUNT;
@@ -142,7 +143,6 @@ const F_RESPAWN_TIMER: u32 = 3u;
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
-const MOVE_SPEED: f32 = 8.0;
 const TURN_SPEED: f32 = 3.0;
 const AGENT_HALF_HEIGHT: f32 = 1.0;
 const METABOLIC_BASE_COST: f32 = 0.0001;

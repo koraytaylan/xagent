@@ -55,8 +55,9 @@ fn phase_physics(tid: u32, tick: u32) {
     if desired_sq > 1.0 {
         desired = desired / sqrt(desired_sq);
     }
-    agent_phys[b + P_VEL_X] = desired.x * MOVE_SPEED;
-    agent_phys[b + P_VEL_Z] = desired.z * MOVE_SPEED;
+    let move_speed = brain_state[agent * BRAIN_STRIDE + O_MOVEMENT_SPEED];
+    agent_phys[b + P_VEL_X] = desired.x * move_speed;
+    agent_phys[b + P_VEL_Z] = desired.z * move_speed;
 
     // Gravity
     agent_phys[b + P_VEL_Y] = agent_phys[b + P_VEL_Y] - GRAVITY * dt;
@@ -93,7 +94,9 @@ fn phase_physics(tid: u32, tick: u32) {
 
     // Energy depletion (scaled by metabolic_rate from brain config)
     let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
-    let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414);
+    // Normalize by default speed (8.0) so baseline energy drain is unchanged;
+    // faster agents pay proportionally more, slower agents pay less.
+    let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414) * (move_speed / 8.0);
     var energy = agent_phys[b + P_ENERGY];
     energy -= wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
     energy -= movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;

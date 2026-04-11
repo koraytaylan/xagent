@@ -128,6 +128,7 @@ impl MutationMomentum {
             ("habituation_sensitivity", parent.habituation_sensitivity),
             ("max_curiosity_bonus", parent.max_curiosity_bonus),
             ("fatigue_floor", parent.fatigue_floor),
+            ("movement_speed", parent.movement_speed),
         ];
 
         for (name, parent_val) in &params {
@@ -144,6 +145,7 @@ impl MutationMomentum {
                         "habituation_sensitivity" => w.habituation_sensitivity,
                         "max_curiosity_bonus" => w.max_curiosity_bonus,
                         "fatigue_floor" => w.fatigue_floor,
+                        "movement_speed" => w.movement_speed,
                         _ => *parent_val,
                     };
                     w_val - parent_val

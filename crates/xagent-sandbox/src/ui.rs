@@ -167,7 +167,7 @@ impl Default for EvolutionSnapshot {
             state: EvolutionState::Idle,
             generation: 0,
             gen_tick: 0,
-            tick_budget: 50_000,
+            tick_budget: xagent_shared::GovernorConfig::default().tick_budget,
             population_size: 10,
             elitism_count: 3,
             patience: 5,

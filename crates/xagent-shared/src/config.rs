@@ -44,7 +44,7 @@ pub struct BrainConfig {
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
-    /// Default 4.
+    /// Default 10.
     #[serde(default = "default_brain_tick_stride")]
     pub brain_tick_stride: u32,
     /// Brain cycles between global passes (grid rebuild, collisions, vision).
@@ -52,11 +52,11 @@ pub struct BrainConfig {
     /// Default 10.
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
-    /// Multiplier for all energy costs (metabolic + movement). Default 1.0.
+    /// Multiplier for all energy costs (metabolic + movement). Default 0.01.
     /// Lower = agents survive longer. Higher = harsher energy pressure.
     #[serde(default = "default_metabolic_rate")]
     pub metabolic_rate: f32,
-    /// Multiplier for integrity damage and regen. Default 1.0.
+    /// Multiplier for integrity damage and regen. Default 0.01.
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
@@ -115,7 +115,7 @@ fn default_seed() -> u64 {
 }
 
 fn default_brain_tick_stride() -> u32 {
-    4
+    10
 }
 
 fn default_vision_stride() -> u32 {
@@ -123,11 +123,11 @@ fn default_vision_stride() -> u32 {
 }
 
 fn default_metabolic_rate() -> f32 {
-    1.0
+    0.01
 }
 
 fn default_integrity_scale() -> f32 {
-    1.0
+    0.01
 }
 
 /// Describes an agent to be spawned into the world.
@@ -213,7 +213,7 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             population_size: 10,
-            tick_budget: 50_000,
+            tick_budget: 1_000_000,
             elitism_count: 3,
             max_generations: 0,
             patience: 5,
@@ -239,12 +239,12 @@ impl Default for BrainConfig {
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
             fatigue_floor: 0.1,
-            vision_width: 8,
-            vision_height: 6,
-            brain_tick_stride: 4,
-            vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            vision_width: default_vision_width(),
+            vision_height: default_vision_height(),
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 }
@@ -265,10 +265,10 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 6,
             vision_height: 4,
-            brain_tick_stride: 4,
-            vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 
@@ -287,10 +287,10 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 12,
             vision_height: 8,
-            brain_tick_stride: 4,
-            vision_stride: 10,
-            metabolic_rate: 1.0,
-            integrity_scale: 1.0,
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
         }
     }
 }
@@ -355,8 +355,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vision_stride_defaults_to_10() {
+    fn brain_config_tuned_defaults() {
         let config = BrainConfig::default();
+        assert_eq!(config.brain_tick_stride, 10);
         assert_eq!(config.vision_stride, 10);
+        assert_eq!(config.vision_width, 8);
+        assert_eq!(config.vision_height, 6);
+        assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
+        assert!((config.integrity_scale - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn governor_config_tuned_defaults() {
+        let config = GovernorConfig::default();
+        assert_eq!(config.tick_budget, 1_000_000);
     }
 }

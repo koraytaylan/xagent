@@ -296,7 +296,12 @@ impl AgentBrainState {
 /// Pack a SensoryFrame into a flat f32 slice for GPU upload.
 /// Selects up to 4 highest-intensity touch contacts, zero-pads the rest.
 pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut [f32]) {
-    debug_assert!(out.len() >= layout.sensory_stride);
+    assert!(
+        out.len() >= layout.sensory_stride,
+        "output buffer too short: {} < {}",
+        out.len(),
+        layout.sensory_stride,
+    );
 
     let mut offset = 0;
 
@@ -494,7 +499,10 @@ pub fn init_action_history() -> Vec<f32> {
 /// Build config buffer values from BrainConfig.
 /// Layout is derived from config's `vision_width`/`vision_height`.
 pub fn build_config(config: &BrainConfig) -> Vec<f32> {
-    build_config_for(config, &BrainLayout::new(config.vision_width, config.vision_height))
+    build_config_for(
+        config,
+        &BrainLayout::new(config.vision_width, config.vision_height),
+    )
 }
 
 /// Build config buffer values with explicit layout.

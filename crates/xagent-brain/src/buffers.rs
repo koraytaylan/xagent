@@ -10,10 +10,13 @@
 
 use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 
-// ── Dimensions (fixed for default config) ─────────────────────────────
+// ── Dimensions ───────────────────────────────────────────────────────
 
 pub const DIM: usize = 32;
-pub const FEATURE_COUNT: usize = 265;
+/// Feature count for the default 8×6 vision layout.
+/// Used only to compute default brain state offsets and `FIXED_TAIL_SIZE`.
+/// For other vision dimensions, use `BrainLayout::feature_count`.
+const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25; // 265
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const ACTION_HISTORY_LEN: usize = 64;
@@ -23,16 +26,15 @@ pub const TOUCH_FEATURES: usize = 4; // dir_x, dir_z, intensity, tag/4
 
 // ── Sensory input layout (CPU → GPU upload) ───────────────────────────
 
-pub const VISION_W: usize = 8;
-pub const VISION_H: usize = 6;
-pub const VISION_COLOR_COUNT: usize = VISION_W * VISION_H * 4; // 192 RGBA
-pub const VISION_DEPTH_COUNT: usize = VISION_W * VISION_H; // 48
+/// Non-visual sensory channels (vision-independent).
+/// velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16)
 pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTACTS * TOUCH_FEATURES;
-// velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16)
-pub const SENSORY_STRIDE: usize = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + NON_VISUAL_COUNT;
-// 192 + 48 + 27 = 267
 
-// ── Brain state buffer offsets (per agent) ────────────────────────────
+// ── Brain state buffer offsets (default 8×6 layout) ──────────────────
+// These constants are valid for the default vision dimensions (8×6).
+// For other dimensions, use `BrainLayout` to compute dynamic offsets.
+// The *tail* offsets (from `O_PRED_CTX_WT` onward) are vision-independent:
+// `O_FOO - O_PRED_CTX_WT` is the same regardless of vision size.
 
 pub const O_ENC_WEIGHTS: usize = 0;
 pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * DIM; // 8480
@@ -293,26 +295,26 @@ impl AgentBrainState {
 
 /// Pack a SensoryFrame into a flat f32 slice for GPU upload.
 /// Selects up to 4 highest-intensity touch contacts, zero-pads the rest.
-pub fn pack_sensory_frame(frame: &SensoryFrame, out: &mut [f32]) {
-    debug_assert!(out.len() >= SENSORY_STRIDE);
+pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut [f32]) {
+    debug_assert!(out.len() >= layout.sensory_stride);
 
     let mut offset = 0;
 
-    // Vision color (192 f32)
-    let color_len = frame.vision.color.len().min(VISION_COLOR_COUNT);
+    // Vision color (RGBA per pixel)
+    let color_len = frame.vision.color.len().min(layout.vision_color_count);
     out[offset..offset + color_len].copy_from_slice(&frame.vision.color[..color_len]);
-    for i in color_len..VISION_COLOR_COUNT {
+    for i in color_len..layout.vision_color_count {
         out[offset + i] = 0.0;
     }
-    offset += VISION_COLOR_COUNT;
+    offset += layout.vision_color_count;
 
-    // Vision depth (48 f32)
-    let depth_len = frame.vision.depth.len().min(VISION_DEPTH_COUNT);
+    // Vision depth (one per pixel)
+    let depth_len = frame.vision.depth.len().min(layout.vision_depth_count);
     out[offset..offset + depth_len].copy_from_slice(&frame.vision.depth[..depth_len]);
-    for i in depth_len..VISION_DEPTH_COUNT {
+    for i in depth_len..layout.vision_depth_count {
         out[offset + i] = 0.0;
     }
-    offset += VISION_DEPTH_COUNT;
+    offset += layout.vision_depth_count;
 
     // Velocity (3)
     out[offset] = frame.velocity.x;
@@ -371,213 +373,6 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, out: &mut [f32]) {
     }
 }
 
-/// Generate WGSL constants header shared by all shaders.
-pub fn wgsl_constants() -> String {
-    format!(
-        "// Auto-generated constants — do not edit manually
-const DIM: u32 = {DIM}u;
-const FEATURE_COUNT: u32 = {FEATURE_COUNT}u;
-const VISION_COLOR_COUNT: u32 = {VISION_COLOR_COUNT}u;
-const VISION_DEPTH_COUNT: u32 = {VISION_DEPTH_COUNT}u;
-const MEMORY_CAP: u32 = {MEMORY_CAP}u;
-const RECALL_K: u32 = {RECALL_K}u;
-const ACTION_HISTORY_LEN: u32 = {ACTION_HISTORY_LEN}u;
-const ERROR_HISTORY_LEN: u32 = {ERROR_HISTORY_LEN}u;
-const SENSORY_STRIDE: u32 = {SENSORY_STRIDE}u;
-const BRAIN_STRIDE: u32 = {BRAIN_STRIDE}u;
-const PATTERN_STRIDE: u32 = {PATTERN_STRIDE}u;
-const HISTORY_STRIDE: u32 = {HISTORY_STRIDE}u;
-const FEATURES_STRIDE: u32 = {FEATURES_STRIDE}u;
-const DECISION_STRIDE: u32 = {DECISION_STRIDE}u;
-const HOMEO_OUT_STRIDE: u32 = {HOMEO_OUT_STRIDE}u;
-const RECALL_IDX_STRIDE: u32 = {RECALL_IDX_STRIDE}u;
-
-// Brain state offsets
-const O_ENC_WEIGHTS: u32 = {O_ENC_WEIGHTS}u;
-const O_ENC_BIASES: u32 = {O_ENC_BIASES}u;
-const O_PRED_WEIGHTS: u32 = {O_PRED_WEIGHTS}u;
-const O_PRED_CTX_WT: u32 = {O_PRED_CTX_WT}u;
-const O_PRED_ERR_RING: u32 = {O_PRED_ERR_RING}u;
-const O_PRED_ERR_CURSOR: u32 = {O_PRED_ERR_CURSOR}u;
-const O_PRED_ERR_COUNT: u32 = {O_PRED_ERR_COUNT}u;
-const O_HAB_EMA: u32 = {O_HAB_EMA}u;
-const O_HAB_ATTEN: u32 = {O_HAB_ATTEN}u;
-const O_PREV_ENCODED: u32 = {O_PREV_ENCODED}u;
-const O_HOMEO: u32 = {O_HOMEO}u;
-const O_ACT_FWD_WTS: u32 = {O_ACT_FWD_WTS}u;
-const O_ACT_TURN_WTS: u32 = {O_ACT_TURN_WTS}u;
-const O_ACT_BIASES: u32 = {O_ACT_BIASES}u;
-const O_EXPLORATION_RATE: u32 = {O_EXPLORATION_RATE}u;
-const POS_RING_LEN: u32 = {POS_RING_LEN}u;
-const O_POS_RING_X: u32 = {O_POS_RING_X}u;
-const O_POS_RING_Z: u32 = {O_POS_RING_Z}u;
-const O_POS_RING_CURSOR: u32 = {O_POS_RING_CURSOR}u;
-const O_POS_RING_LEN: u32 = {O_POS_RING_LEN}u;
-const O_ACCUM_FWD: u32 = {O_ACCUM_FWD}u;
-const O_FATIGUE_FACTOR: u32 = {O_FATIGUE_FACTOR}u;
-const O_PREV_PREDICTION: u32 = {O_PREV_PREDICTION}u;
-const O_TICK_COUNT: u32 = {O_TICK_COUNT}u;
-const O_HAB_SENSITIVITY: u32 = {O_HAB_SENSITIVITY}u;
-const O_HAB_MAX_CURIOSITY: u32 = {O_HAB_MAX_CURIOSITY}u;
-const O_FATIGUE_FLOOR: u32 = {O_FATIGUE_FLOOR}u;
-const O_MOVEMENT_SPEED: u32 = {O_MOVEMENT_SPEED}u;
-
-// Pattern memory offsets
-const O_PAT_STATES: u32 = {O_PAT_STATES}u;
-const O_PAT_NORMS: u32 = {O_PAT_NORMS}u;
-const O_PAT_REINF: u32 = {O_PAT_REINF}u;
-const O_PAT_MOTOR: u32 = {O_PAT_MOTOR}u;
-const O_PAT_META: u32 = {O_PAT_META}u;
-const O_PAT_ACTIVE: u32 = {O_PAT_ACTIVE}u;
-const O_ACTIVE_COUNT: u32 = {O_ACTIVE_COUNT}u;
-const O_MIN_REINF_IDX: u32 = {O_MIN_REINF_IDX}u;
-const O_LAST_STORED_IDX: u32 = {O_LAST_STORED_IDX}u;
-
-// Action history offsets
-const O_MOTOR_RING: u32 = {O_MOTOR_RING}u;
-const O_STATE_RING: u32 = {O_STATE_RING}u;
-const O_HIST_CURSOR: u32 = {O_HIST_CURSOR}u;
-const O_HIST_LEN: u32 = {O_HIST_LEN}u;
-
-// Config offsets
-const CFG_LEARNING_RATE: u32 = {CFG_LEARNING_RATE}u;
-const CFG_DECAY_RATE: u32 = {CFG_DECAY_RATE}u;
-const CFG_DISTRESS_EXP: u32 = {CFG_DISTRESS_EXP}u;
-
-fn fast_tanh(x: f32) -> f32 {{
-    if (abs(x) > 4.5) {{ return sign(x); }}
-    let x2 = x * x;
-    return x * (27.0 + x2) / (27.0 + 9.0 * x2);
-}}
-
-fn pcg_hash(input: u32) -> u32 {{
-    let state = input * 747796405u + 2891336453u;
-    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}}
-
-fn rand_f32(seed: u32) -> f32 {{
-    return f32(pcg_hash(seed)) / 4294967295.0;
-}}
-
-fn rand_normal(seed1: u32, seed2: u32) -> f32 {{
-    let u1 = max(rand_f32(seed1), 0.0001);
-    let u2 = rand_f32(seed2);
-    return sqrt(-2.0 * log(u1)) * cos(6.2831853 * u2);
-}}
-",
-    )
-}
-
-/// Generate WGSL constants for physics/vision shaders.
-/// These are separate from brain constants to avoid name collisions.
-pub fn wgsl_physics_constants(world_size: f32, food_count: usize, agent_count: usize) -> String {
-    let gw = grid_width(world_size);
-    let go = gw / 2;
-    let terrain_vps: u32 = 129;
-    let terrain_step = world_size / 128.0;
-    format!(
-        r#"// Auto-generated physics constants — do not edit manually
-const PHYS_STRIDE: u32 = {PHYS_STRIDE}u;
-const P_POS_X: u32 = {P_POS_X}u;
-const P_POS_Y: u32 = {P_POS_Y}u;
-const P_POS_Z: u32 = {P_POS_Z}u;
-const P_VEL_X: u32 = {P_VEL_X}u;
-const P_VEL_Y: u32 = {P_VEL_Y}u;
-const P_VEL_Z: u32 = {P_VEL_Z}u;
-const P_FACING_X: u32 = {P_FACING_X}u;
-const P_FACING_Y: u32 = {P_FACING_Y}u;
-const P_FACING_Z: u32 = {P_FACING_Z}u;
-const P_YAW: u32 = {P_YAW}u;
-const P_ANGULAR_VEL: u32 = {P_ANGULAR_VEL}u;
-const P_ENERGY: u32 = {P_ENERGY}u;
-const P_MAX_ENERGY: u32 = {P_MAX_ENERGY}u;
-const P_INTEGRITY: u32 = {P_INTEGRITY}u;
-const P_MAX_INTEGRITY: u32 = {P_MAX_INTEGRITY}u;
-const P_PREV_ENERGY: u32 = {P_PREV_ENERGY}u;
-const P_PREV_INTEGRITY: u32 = {P_PREV_INTEGRITY}u;
-const P_ALIVE: u32 = {P_ALIVE}u;
-const P_FOOD_COUNT: u32 = {P_FOOD_COUNT}u;
-const P_TICKS_ALIVE: u32 = {P_TICKS_ALIVE}u;
-const P_DIED_FLAG: u32 = {P_DIED_FLAG}u;
-const P_MEMORY_CAP: u32 = {P_MEMORY_CAP}u;
-const P_PROCESSING_SLOTS: u32 = {P_PROCESSING_SLOTS}u;
-
-const FOOD_STATE_STRIDE: u32 = {FOOD_STATE_STRIDE}u;
-const F_POS_X: u32 = {F_POS_X}u;
-const F_POS_Y: u32 = {F_POS_Y}u;
-const F_POS_Z: u32 = {F_POS_Z}u;
-const F_RESPAWN_TIMER: u32 = {F_RESPAWN_TIMER}u;
-
-const GRAVITY: f32 = 20.0;
-const MOVE_SPEED: f32 = 8.0;
-const TURN_SPEED: f32 = 3.0;
-const AGENT_HALF_HEIGHT: f32 = 1.0;
-const METABOLIC_BASE_COST: f32 = 0.0001;
-const METABOLIC_MEMORY_COST: f32 = 0.00003;
-const METABOLIC_PROCESSING_COST: f32 = 0.0001;
-// FOOD_CONSUME_RADIUS_SQ removed — shaders read from wconfig[WC_FOOD_RADIUS]
-const JUMP_VELOCITY: f32 = 8.0;
-const COLLISION_MIN_DIST: f32 = 2.0;
-const COLLISION_MIN_DIST_SQ: f32 = 4.0;
-const COLLISION_FIXED_SCALE: f32 = 1024.0;
-
-const CELL_SIZE: f32 = {GRID_CELL_SIZE};
-const GRID_WIDTH: u32 = {gw}u;
-const GRID_OFFSET: i32 = {go};
-const FOOD_GRID_MAX_PER_CELL: u32 = {FOOD_GRID_MAX_PER_CELL}u;
-const FOOD_GRID_CELL_STRIDE: u32 = {FOOD_GRID_CELL_STRIDE}u;
-const AGENT_GRID_MAX_PER_CELL: u32 = {AGENT_GRID_MAX_PER_CELL}u;
-const AGENT_GRID_CELL_STRIDE: u32 = {AGENT_GRID_CELL_STRIDE}u;
-
-const TERRAIN_VPS: u32 = {terrain_vps}u;
-const TERRAIN_MAX_IDX: u32 = {max_idx}u;
-const TERRAIN_INV_STEP: f32 = {inv_step};
-const TERRAIN_HALF: f32 = {half};
-const TERRAIN_MAX_COORD: f32 = {max_coord};
-const BIOME_GRID_RES: u32 = 256u;
-
-const FOOD_COUNT_VAL: u32 = {food_count}u;
-const AGENT_COUNT_VAL: u32 = {agent_count}u;
-
-const WC_FOOD_RADIUS: u32 = {WC_FOOD_RADIUS}u;
-
-const FOOD_RESPAWN_TIME: f32 = 10.0;
-const FOOD_HEIGHT_OFFSET: f32 = 0.35;
-const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
-
-const VISION_FOV_HALF: f32 = 0.7853982;  // PI/4 = 45 degrees (half of 90)
-const VISION_MAX_DIST: f32 = 30.0;
-const VISION_STEP_SIZE: f32 = 1.2;
-const VISION_NUM_STEPS: u32 = 25u;
-const VISION_RAYS: u32 = 48u;
-const VISION_W: u32 = 8u;
-const VISION_H: u32 = 6u;
-const MAX_TOUCH_CONTACTS: u32 = 4u;
-const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
-const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
-
-const TOUCH_FOOD: u32 = 1u;
-const TOUCH_TERRAIN_EDGE: u32 = 2u;
-const TOUCH_HAZARD: u32 = 3u;
-const TOUCH_AGENT: u32 = 4u;
-const TOUCH_FOOD_RANGE: f32 = 3.0;
-const TOUCH_AGENT_RANGE: f32 = 5.0;
-const TOUCH_EDGE_RANGE: f32 = 3.0;
-
-fn cell_coord(v: f32) -> i32 {{
-    return i32(floor(v / CELL_SIZE));
-}}
-"#,
-        gw = gw,
-        go = go,
-        half = world_size / 2.0,
-        inv_step = 1.0 / terrain_step,
-        max_idx = terrain_vps - 2,
-        max_coord = (terrain_vps - 1) as f32,
-    )
-}
-
 /// Build the world config uniform data.
 pub fn build_world_config(
     config: &xagent_shared::WorldConfig,
@@ -620,8 +415,13 @@ pub fn build_world_config(
 
 /// Initialize brain_state buffer data for one agent from BrainConfig.
 /// Xavier init for encoder, small random for predictor, zero for rest.
+/// Layout is derived from config's `vision_width`/`vision_height`.
 pub fn init_brain_state(config: &BrainConfig, rng: &mut impl rand::Rng) -> Vec<f32> {
-    init_brain_state_for(config, &BrainLayout::default(), rng)
+    init_brain_state_for(
+        config,
+        &BrainLayout::new(config.vision_width, config.vision_height),
+        rng,
+    )
 }
 
 /// Layout-aware version for configurable vision dimensions.
@@ -691,9 +491,10 @@ pub fn init_action_history() -> Vec<f32> {
     vec![0.0_f32; HISTORY_STRIDE]
 }
 
-/// Build config buffer values from BrainConfig (default layout).
+/// Build config buffer values from BrainConfig.
+/// Layout is derived from config's `vision_width`/`vision_height`.
 pub fn build_config(config: &BrainConfig) -> Vec<f32> {
-    build_config_for(config, &BrainLayout::default())
+    build_config_for(config, &BrainLayout::new(config.vision_width, config.vision_height))
 }
 
 /// Build config buffer values with explicit layout.
@@ -717,10 +518,13 @@ mod tests {
     use xagent_shared::SensoryFrame;
 
     #[test]
-    fn sensory_stride_matches_feature_count() {
-        assert_eq!(SENSORY_STRIDE, 267);
-        assert_eq!(FEATURE_COUNT, 265);
-        assert!(SENSORY_STRIDE >= FEATURE_COUNT);
+    fn default_layout_sensory_and_feature_counts() {
+        let layout = BrainLayout::default();
+        // Default 8x6: 192 color + 48 depth + 27 non-visual = 267 sensory
+        assert_eq!(layout.sensory_stride, 267);
+        // Feature count excludes 2 non-visual fields (energy_delta, integrity_delta)
+        assert_eq!(layout.feature_count, 265);
+        assert!(layout.sensory_stride >= layout.feature_count);
     }
 
     #[test]
@@ -740,33 +544,46 @@ mod tests {
 
     #[test]
     fn pack_sensory_frame_fills_buffer() {
-        let frame = SensoryFrame::new_blank(VISION_W as u32, VISION_H as u32);
-        let mut buf = vec![0.0_f32; SENSORY_STRIDE];
-        pack_sensory_frame(&frame, &mut buf);
+        let layout = BrainLayout::default();
+        let frame = SensoryFrame::new_blank(layout.vision_width, layout.vision_height);
+        let mut buf = vec![0.0_f32; layout.sensory_stride];
+        pack_sensory_frame(&frame, &layout, &mut buf);
+        assert!(buf.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn pack_sensory_frame_dynamic_layout() {
+        let layout = BrainLayout::new(12, 8);
+        let frame = SensoryFrame::new_blank(layout.vision_width, layout.vision_height);
+        let mut buf = vec![0.0_f32; layout.sensory_stride];
+        pack_sensory_frame(&frame, &layout, &mut buf);
         assert!(buf.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn init_brain_state_has_correct_length() {
         let config = BrainConfig::default();
+        let layout = BrainLayout::new(config.vision_width, config.vision_height);
         let mut rng = rand::rng();
         let state = init_brain_state(&config, &mut rng);
-        assert_eq!(state.len(), BRAIN_STRIDE);
+        assert_eq!(state.len(), layout.brain_stride);
     }
 
     #[test]
-    fn brain_layout_default_matches_constants() {
+    fn brain_layout_default_values() {
         let layout = BrainLayout::default();
         assert_eq!(layout.vision_width, 8);
         assert_eq!(layout.vision_height, 6);
-        assert_eq!(layout.feature_count, FEATURE_COUNT);
-        assert_eq!(layout.sensory_stride, SENSORY_STRIDE);
+        assert_eq!(layout.vision_color_count, 192);
+        assert_eq!(layout.vision_depth_count, 48);
+        assert_eq!(layout.sensory_stride, 267);
+        assert_eq!(layout.feature_count, 265);
         assert_eq!(layout.brain_stride, BRAIN_STRIDE);
     }
 
     #[test]
     fn brain_layout_dynamic_is_consistent() {
-        for (w, h) in [(4, 4), (6, 4), (8, 4), (8, 6), (8, 8), (12, 8)] {
+        for (w, h) in [(4, 4), (6, 4), (8, 4), (8, 6), (8, 8), (12, 8), (32, 24)] {
             let layout = BrainLayout::new(w, h);
             assert_eq!(layout.vision_width, w);
             assert_eq!(layout.vision_height, h);
@@ -781,6 +598,16 @@ mod tests {
             let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
             assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
         }
+    }
+
+    #[test]
+    fn brain_layout_large_vision() {
+        let layout = BrainLayout::new(32, 24);
+        assert_eq!(layout.vision_color_count, 32 * 24 * 4);
+        assert_eq!(layout.vision_depth_count, 32 * 24);
+        assert_eq!(layout.sensory_stride, 32 * 24 * 5 + NON_VISUAL_COUNT);
+        let expected = layout.feature_count * DIM + DIM + DIM * DIM + FIXED_TAIL_SIZE;
+        assert_eq!(layout.brain_stride, expected);
     }
 
     #[test]

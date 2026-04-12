@@ -29,7 +29,7 @@ pub const MAX_TRAIL_POINTS: usize = 4000;
 
 /// Minimum distance (squared) between consecutive trail samples.
 /// Only record a new point when the agent has moved at least this far.
-const MIN_TRAIL_DIST_SQ: f32 = 9.0; // 3.0²
+pub(crate) const MIN_TRAIL_DIST_SQ: f32 = 9.0; // 3.0²
 
 /// Runtime agent body extending shared [`BodyState`] with simulation bookkeeping.
 ///

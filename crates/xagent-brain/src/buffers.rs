@@ -14,7 +14,8 @@ use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 
 pub const DIM: usize = 32;
 /// Feature count for the default 8×6 vision layout.
-/// Used only to compute default brain state offsets and `FIXED_TAIL_SIZE`.
+/// Used to compute default brain state offsets (`O_ENC_BIASES`),
+/// `FEATURES_STRIDE`, and `FIXED_TAIL_SIZE`.
 /// For other vision dimensions, use `BrainLayout::feature_count`.
 const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25; // 265
 pub const MEMORY_CAP: usize = 128;

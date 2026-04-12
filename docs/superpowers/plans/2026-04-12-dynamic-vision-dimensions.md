@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make vision dimensions fully dynamic so changing `vision_w`/`vision_h` in `BrainConfig` works end-to-end without breaking the vision display or simulation.
+**Goal:** Make vision dimensions fully dynamic so changing `vision_width`/`vision_height` in `BrainConfig` works end-to-end without breaking the vision display or simulation.
 
 **Architecture:** The WGSL shader side already derives all vision constants from `VISION_W`/`VISION_H` (string-replaced at compile time). The GPU readback and buffer sizing already use the dynamic `BrainLayout`. The fix targets two areas: (1) the vision dispatch shader's workgroup limit of 256 threads that caps ray count, and (2) dead/stale Rust code that hardcodes 8x6 constants.
 
@@ -136,7 +136,7 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut 
 #[test]
 fn pack_sensory_frame_fills_buffer() {
     let layout = BrainLayout::default();
-    let frame = SensoryFrame::new_blank(layout.vision_w, layout.vision_h);
+    let frame = SensoryFrame::new_blank(layout.vision_width, layout.vision_height);
     let mut buf = vec![0.0_f32; layout.sensory_stride];
     pack_sensory_frame(&frame, &layout, &mut buf);
     assert!(buf.iter().all(|v| v.is_finite()));
@@ -187,15 +187,15 @@ Keep `NON_VISUAL_COUNT` — it's used by `BrainLayout::new()` and is vision-inde
 
 - [ ] **Step 4: Update convenience wrappers to derive layout from config**
 
-`init_brain_state()` and `build_config()` use `BrainLayout::default()`. Update them to derive layout from the config's `vision_w`/`vision_h`:
+`init_brain_state()` and `build_config()` use `BrainLayout::default()`. Update them to derive layout from the config's `vision_width`/`vision_height`:
 
 ```rust
 pub fn init_brain_state(config: &BrainConfig, rng: &mut impl rand::Rng) -> Vec<f32> {
-    init_brain_state_for(config, &BrainLayout::new(config.vision_w, config.vision_h), rng)
+    init_brain_state_for(config, &BrainLayout::new(config.vision_width, config.vision_height), rng)
 }
 
 pub fn build_config(config: &BrainConfig) -> Vec<f32> {
-    build_config_for(config, &BrainLayout::new(config.vision_w, config.vision_h))
+    build_config_for(config, &BrainLayout::new(config.vision_width, config.vision_height))
 }
 ```
 
@@ -274,8 +274,8 @@ Remove assertions against deleted constants. The test already checks internal co
 #[test]
 fn brain_layout_default_matches_constants() {
     let layout = BrainLayout::default();
-    assert_eq!(layout.vision_w, 8);
-    assert_eq!(layout.vision_h, 6);
+    assert_eq!(layout.vision_width, 8);
+    assert_eq!(layout.vision_height, 6);
     // Verify default layout values for 8x6 vision
     assert_eq!(layout.vision_color_count, 192);
     assert_eq!(layout.vision_depth_count, 48);
@@ -290,7 +290,7 @@ fn brain_layout_default_matches_constants() {
 #[test]
 fn init_brain_state_has_correct_length() {
     let config = BrainConfig::default();
-    let layout = BrainLayout::new(config.vision_w, config.vision_h);
+    let layout = BrainLayout::new(config.vision_width, config.vision_height);
     let mut rng = rand::rng();
     let state = init_brain_state(&config, &mut rng);
     assert_eq!(state.len(), layout.brain_stride);

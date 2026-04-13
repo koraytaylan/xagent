@@ -648,9 +648,7 @@ impl GpuKernel {
         let brain_functions_src = include_str!("shaders/kernel/brain_tick.wgsl");
         let brain_fn_end = brain_functions_src
             .find("@compute @workgroup_size(256)\nfn brain_tick(")
-            .or_else(|| {
-                brain_functions_src.find("@compute @workgroup_size(256)\r\nfn brain_tick(")
-            })
+            .or_else(|| brain_functions_src.find("@compute @workgroup_size(256)\r\nfn brain_tick("))
             .unwrap_or(brain_functions_src.len());
         let brain_fns_only = &brain_functions_src[..brain_fn_end];
 

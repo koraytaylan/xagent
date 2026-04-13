@@ -1633,8 +1633,8 @@ impl ApplicationHandler for App {
                                 if let Some(tel) = kernel.try_collect_telemetry() {
                                     let a = &mut self.agents[self.selected_agent_idx];
                                     // Only update fields NOT already populated by
-                                    // the fresher async physics readback above.
-                                    // Phys readback already sets: cached_motor,
+                                    // the every-frame physics readback (below).
+                                    // Physics readback sets: cached_motor,
                                     // cached_gradient, cached_urgency,
                                     // cached_fatigue_factor, cached_prediction_error,
                                     // cached_exploration_rate.

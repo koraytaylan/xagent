@@ -1582,12 +1582,16 @@ impl ApplicationHandler for App {
                 if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
                     // Cap accumulator to 2× budget so debt stays bounded.
-                    // This is a generous safety net; burst prevention during
-                    // GPU backpressure is handled in the `else` branch below.
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
                     self.sim_accumulator = self.sim_accumulator.min(max_acc);
-                    let ticks_to_run =
-                        ((self.sim_accumulator / SIM_DT) as u32).min(self.gpu_tick_budget);
+                    // Limit ticks dispatched per frame to what the speed
+                    // multiplier demands, with 2× headroom for frame-time
+                    // variance. Fractional accumulator is preserved for the
+                    // next frame, avoiding precision loss at low render FPS.
+                    let speed_tick_cap = (self.speed_multiplier * 2).max(2);
+                    let ticks_to_run = ((self.sim_accumulator / SIM_DT) as u32)
+                        .min(self.gpu_tick_budget)
+                        .min(speed_tick_cap);
 
                     if ticks_to_run > 0 {
                         if let Some(ref mut mk) = self.gpu_kernel {

@@ -120,6 +120,116 @@ pub fn run_profile(
     println!("  total tps (full):  {:.0}", total_ticks as f64 / full);
 }
 
+/// Simulate the real tick loop with accumulator, staging backpressure,
+/// and per-frame dispatch — no rendering. Prints DIAG lines every second
+/// and returns the result.
+pub fn run_tick_loop_bench(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+    speed_multiplier: f32,
+    timeout_secs: f64,
+) -> BenchResult {
+    const SIM_DT: f64 = 1.0 / 60.0;
+
+    let (mut mk, _world) = create_kernel(&brain, &world_config, agent_count);
+
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    let mut accumulator: f64 = 0.0;
+    let mut gpu_tick_budget: u32 = 32;
+    let mut last_diag = Instant::now();
+    let mut diag_ticks_since: u64 = 0;
+    let mut bp_count: u64 = 0;
+    let mut dispatch_count: u64 = 0;
+
+    // Simulate 120fps frame rate (8.33ms per frame)
+    let frame_dt: f64 = 1.0 / 120.0;
+
+    while tick < total_ticks {
+        let wall_elapsed = start.elapsed().as_secs_f64();
+        if wall_elapsed > timeout_secs {
+            eprintln!(
+                "[BENCH] TIMEOUT after {:.1}s — only {}/{} ticks ({:.0} tps)",
+                wall_elapsed,
+                tick,
+                total_ticks,
+                tick as f64 / wall_elapsed
+            );
+            break;
+        }
+
+        // Accumulate
+        accumulator += frame_dt * speed_multiplier as f64;
+        let max_acc = SIM_DT * speed_multiplier as f64 * 3.0;
+        accumulator = accumulator.min(max_acc);
+
+        let remaining = (total_ticks - tick) as u32;
+        let ticks_to_run = ((accumulator / SIM_DT) as u32)
+            .min(gpu_tick_budget)
+            .min(500)
+            .min(remaining);
+
+        if ticks_to_run > 0 {
+            mk.try_collect_state();
+            let dispatched = mk.dispatch_batch(tick, ticks_to_run);
+
+            if dispatched {
+                accumulator -= ticks_to_run as f64 * SIM_DT;
+                gpu_tick_budget = (gpu_tick_budget + gpu_tick_budget / 4 + 1).min(64_000);
+                tick += ticks_to_run as u64;
+                diag_ticks_since += ticks_to_run as u64;
+                dispatch_count += 1;
+            } else {
+                bp_count += 1;
+            }
+        }
+
+        // DIAG every second
+        if last_diag.elapsed().as_secs_f64() >= 1.0 {
+            let tps = diag_ticks_since as f64 / last_diag.elapsed().as_secs_f64();
+            eprintln!(
+                "[BENCH-DIAG] tick={}/{} tps={:.0} budget={} bp={} dispatches={} acc={:.4}",
+                tick, total_ticks, tps, gpu_tick_budget, bp_count, dispatch_count, accumulator
+            );
+            diag_ticks_since = 0;
+            bp_count = 0;
+            dispatch_count = 0;
+            last_diag = Instant::now();
+        }
+    }
+
+    // Final readback
+    let state = mk.read_full_state_blocking();
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    let ticks_per_sec = tick as f64 / elapsed_secs;
+
+    eprintln!(
+        "[BENCH] Done: {} ticks in {:.2}s = {:.0} tps",
+        tick, elapsed_secs, ticks_per_sec
+    );
+
+    let final_positions: Vec<[f32; 3]> = (0..agent_count)
+        .map(|i| {
+            let base = i * PHYS_STRIDE;
+            [
+                state[base + P_POS_X],
+                state[base + P_POS_Y],
+                state[base + P_POS_Z],
+            ]
+        })
+        .collect();
+
+    BenchResult {
+        total_ticks: tick,
+        agent_count,
+        elapsed_secs,
+        ticks_per_sec,
+        final_positions,
+    }
+}
+
 fn create_kernel(
     brain: &BrainConfig,
     world_config: &WorldConfig,

@@ -107,10 +107,10 @@ pub struct GpuKernel {
     bind_groups: [wgpu::BindGroup; 2],
     active_config_index: usize,
 
-    // ── Async state readback (triple-buffered, non-blocking) ──
-    // Three staging slots give readback 3 frames to complete before
-    // backpressure stalls dispatch — enough for 10x+ with 1 agent.
-    // Each slot contains phys + food buffers, mapped together.
+    // ── Async state readback (STAGING_SLOTS ring, non-blocking) ──
+    // Staging is decoupled from dispatch: in-flight readbacks do not
+    // block new dispatches. Each slot contains state + food staging
+    // buffers for one readback.
     // staging_ready counts completed map_async callbacks (need expected_staging_callbacks).
     state_staging: [wgpu::Buffer; STAGING_SLOTS],
     food_staging: [wgpu::Buffer; STAGING_SLOTS],
@@ -1294,8 +1294,9 @@ impl GpuKernel {
     ///
     /// Each kernel-batch runs `vision_stride` brain cycles in a single dispatch,
     /// followed by one global (grid+collisions) and one vision (raycasting) pass.
-    /// Non-blocking: skips if staging buffer is in flight (GPU backpressure).
-    /// Returns true if dispatched, false if skipped.
+    /// Always dispatches — compute is decoupled from staging readback.
+    /// Staging copy is opportunistic (skipped when all slots are in-flight).
+    /// Always returns `true` (kept for API compatibility).
     ///
     /// # Vision ordering guarantee
     ///

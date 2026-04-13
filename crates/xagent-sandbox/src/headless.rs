@@ -170,13 +170,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         while ticks_done < tick_budget {
             let remaining = (tick_budget - ticks_done).min(HEATMAP_INTERVAL as u64) as u32;
-            // dispatch_batch is non-blocking and returns false under
-            // backpressure — drain staging buffers and retry.
-            while !kernel.dispatch_batch(ticks_done, remaining) {
-                while !kernel.try_collect_state() {
-                    std::thread::yield_now();
-                }
-            }
+            kernel.dispatch_batch(ticks_done, remaining);
             ticks_done += remaining as u64;
 
             // Advance governor tick counter

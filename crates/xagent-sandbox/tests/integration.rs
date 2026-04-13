@@ -651,7 +651,13 @@ fn deterministic_across_batch_sizes() {
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
     let spawn_pos = world.safe_spawn_position();
     let food_count = world.food_items.len();
-    let agent_data = vec![(spawn_pos, 100.0_f32, 100.0_f32, brain.memory_capacity, brain.processing_slots)];
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
 
     // Helper: create a fresh kernel with deterministic brain state,
     // dispatch total_ticks in given batch size, return final position.
@@ -659,9 +665,11 @@ fn deterministic_across_batch_sizes() {
         let mut mk = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
         let kbs = mk.kernel_batch_size();
         assert_eq!(
-            batch_size % kbs, 0,
+            batch_size % kbs,
+            0,
             "batch_size {} must be a multiple of kernel_batch_size {}",
-            batch_size, kbs
+            batch_size,
+            kbs
         );
         // Overwrite random brain state with deterministic seed
         mk.reset_agents_seeded(&brain, 12345);
@@ -685,14 +693,8 @@ fn deterministic_across_batch_sizes() {
     eprintln!("2×500:   {:?}", pos_500);
     eprintln!("10×100:  {:?}", pos_100);
 
-    assert_eq!(
-        pos_1000, pos_500,
-        "2×500 diverged from 1×1000"
-    );
-    assert_eq!(
-        pos_1000, pos_100,
-        "10×100 diverged from 1×1000"
-    );
+    assert_eq!(pos_1000, pos_500, "2×500 diverged from 1×1000");
+    assert_eq!(pos_1000, pos_100, "10×100 diverged from 1×1000");
 }
 
 // ── GPU Tick Loop Tests ─────────────────────────────────────────────

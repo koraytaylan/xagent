@@ -1593,7 +1593,9 @@ impl ApplicationHandler for App {
                     // speeds this borrows sim-time from the future; the
                     // accumulator goes negative and repays over the next
                     // few frames.
-                    let min_batch = self.gpu_kernel.as_ref()
+                    let min_batch = self
+                        .gpu_kernel
+                        .as_ref()
                         .map_or(10, |mk| mk.brain_tick_stride());
                     let ticks_to_run = if raw_ticks > 0 {
                         raw_ticks.max(min_batch)
@@ -1608,8 +1610,7 @@ impl ApplicationHandler for App {
                             self.sim_accumulator -= ticks_to_run as f64 * sim_dt;
 
                             self.gpu_tick_budget =
-                                (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1)
-                                    .min(64_000);
+                                (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1).min(64_000);
 
                             self.tick += ticks_to_run as u64;
                             self.tps_tick_count += ticks_to_run as u64;
@@ -1693,7 +1694,6 @@ impl ApplicationHandler for App {
                                 rec.record_tick(tick, &records);
                             }
                         }
-
                     }
 
                     // ── Every-frame state readback ──
@@ -1720,8 +1720,7 @@ impl ApplicationHandler for App {
                                 a.body.body.internal.energy = state[base + P_ENERGY];
                                 a.body.body.internal.integrity = state[base + P_INTEGRITY];
                                 a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
-                                a.body.body.internal.max_integrity =
-                                    state[base + P_MAX_INTEGRITY];
+                                a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
                                 a.body.body.velocity = Vec3::new(
                                     state[base + P_VEL_X],
                                     state[base + P_VEL_Y],
@@ -1740,8 +1739,7 @@ impl ApplicationHandler for App {
                                     state[base + P_FACING_Z],
                                 );
                                 a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
-                                a.cached_exploration_rate =
-                                    state[base + P_EXPLORATION_RATE_OUT];
+                                a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
                                 a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
                                 a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
                                 a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
@@ -1793,13 +1791,7 @@ impl ApplicationHandler for App {
                                 let agent = &self.agents[self.selected_agent_idx];
                                 let life_ticks = agent.age(self.tick);
                                 let motor = agent.cached_motor.clone();
-                                log_tick_to_csv(
-                                    &mut self.logger,
-                                    agent,
-                                    world,
-                                    &motor,
-                                    life_ticks,
-                                );
+                                log_tick_to_csv(&mut self.logger, agent, world, &motor, life_ticks);
                                 self.error_count += 1;
                             }
                         }

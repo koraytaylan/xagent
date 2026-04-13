@@ -191,11 +191,7 @@ impl GpuKernel {
         self.reset_agents_with_rng(brain_config, &mut rng);
     }
 
-    fn reset_agents_with_rng(
-        &mut self,
-        brain_config: &BrainConfig,
-        rng: &mut impl rand::Rng,
-    ) {
+    fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
         // Drain any pending async readback so staging buffers are clean.
         let expected = self.expected_staging_callbacks();
         for i in 0..STAGING_SLOTS {
@@ -246,11 +242,7 @@ impl GpuKernel {
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
         let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
-            brain_data.extend_from_slice(&init_brain_state_for(
-                brain_config,
-                &self.layout,
-                rng,
-            ));
+            brain_data.extend_from_slice(&init_brain_state_for(brain_config, &self.layout, rng));
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
@@ -454,7 +446,7 @@ impl GpuKernel {
             mapped_at_creation: false,
         });
 
-        // ── Async state readback staging (double-buffered) ──
+        // ── Async state readback staging (STAGING_SLOTS ring buffer) ──
         let state_size = (n * PHYS_STRIDE * 4) as u64;
         let food_state_size = ((f * FOOD_STATE_STRIDE * 4) as u64).max(4);
         let staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
@@ -1465,14 +1457,15 @@ impl GpuKernel {
 
             let phys_flag = self.staging_ready[widx].clone();
             let phys_err = self.staging_had_error[widx].clone();
-            self.state_staging[widx]
-                .slice(..buf_size)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            self.state_staging[widx].slice(..buf_size).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     if result.is_err() {
                         phys_err.store(true, Ordering::Release);
                     }
                     phys_flag.fetch_add(1, Ordering::Release);
-                });
+                },
+            );
             if self.food_count > 0 {
                 let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
                 let food_flag = self.staging_ready[widx].clone();

@@ -1437,6 +1437,15 @@ impl<'a> TabContext<'a> {
                             .max_decimals(2),
                     );
                     ui.end_row();
+
+                    ui.label("movement_speed");
+                    ui.add(
+                        egui::DragValue::new(&mut b.movement_speed)
+                            .range(2.0..=20.0)
+                            .speed(0.5)
+                            .max_decimals(1),
+                    );
+                    ui.end_row();
                 });
         });
 

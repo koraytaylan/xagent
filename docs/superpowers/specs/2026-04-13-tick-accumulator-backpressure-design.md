@@ -11,47 +11,40 @@ At 10x speed multiplier with `PresentMode::Immediate`, the UI freezes and update
 
 `PresentMode::Immediate` drives the frame rate to 200-400+ FPS. The simulation accumulator adds `dt * speed_multiplier` per frame and dispatches `floor(accumulator / SIM_DT)` ticks to the GPU. At 10x, every frame crosses the `SIM_DT` threshold and triggers a `dispatch_batch` call, which starts an async staging-buffer readback.
 
-The readback pipeline is double-buffered: only 2 staging slots can be in-flight. When both are occupied, `dispatch_batch` returns `false` (GPU backpressure). Currently, the accumulator is **not drained** on backpressure — it keeps growing each frame. When a staging slot frees up, the next dispatch fires a burst of accumulated ticks, causing an irregular position jump. The cycle repeats: dispatch, dispatch, skip, skip, burst-dispatch, skip...
+The readback pipeline was double-buffered: only 2 staging slots could be in-flight. When both were occupied, `dispatch_batch` returned `false` (GPU backpressure). The accumulator was **not drained** on backpressure — it kept growing each frame. When a staging slot freed up, the next dispatch fired a burst of accumulated ticks, causing an irregular position jump. The cycle repeated: dispatch, dispatch, skip, skip, burst-dispatch, skip...
 
 At 5x, `dt * 5` doesn't always cross `SIM_DT` at high FPS, so many frames skip dispatch naturally, giving staging buffers breathing room.
 
-The accumulator cap (`SIM_DT * gpu_tick_budget * 2`) makes this worse: the budget grows aggressively (25%/frame, cap 64k), allowing the accumulator cap to reach ~2100 seconds of sim-time — far beyond what any speed multiplier needs per frame.
+## Rejected Approaches
+
+Several accumulator-side fixes were attempted and rejected:
+
+1. **Drain accumulator on backpressure** — capping to 1 frame's worth halved effective TPS at 10x (50% backpressure rate → ~300 TPS).
+2. **`speed_tick_cap`** — capping `ticks_to_run` to `speed_multiplier * 2` throttled throughput to ~300 TPS at all speeds above 5x.
+3. **Speed-based accumulator cap** — `max_acc = SIM_DT * speed * 2.0` lost fractional precision at low FPS, causing ~45 TPS at 1x/30fps.
+4. **Larger backpressure drain (2× speed)** — dispatching 20 ticks in one batch vs 10+10 changes vision/global pass frequency, breaking simulation determinism.
+
+All of these either throttle throughput or sacrifice determinism. The root cause is in the staging pipeline, not the accumulator.
 
 ## Fix
 
-Two changes in `main.rs`, both in the tick loop:
+Triple-buffer the staging pipeline in `gpu_kernel.rs`: 3 slots instead of 2. This gives readback 3 frames to complete before backpressure stalls dispatch, eliminating the bottleneck at moderate speeds without changing batch sizes or accumulator behavior.
 
-### 1. Cap `ticks_to_run` by speed multiplier
+Changes in `gpu_kernel.rs`:
 
-Instead of tightening the accumulator cap (which discards fractional time and causes precision loss at low render FPS), cap `ticks_to_run` with 2× headroom. The accumulator retains its fractional remainder for the next frame:
+- Add `const STAGING_SLOTS: usize = 3;` — single source of truth for slot count
+- Buffer creation uses `std::array::from_fn` to create `STAGING_SLOTS` buffers
+- Struct initialization uses `[false; STAGING_SLOTS]` and `std::array::from_fn` for Arc arrays
+- All `for i in 0..2` loops changed to `for i in 0..STAGING_SLOTS` (3 locations: `reset_agents`, `try_collect_staging`, `try_reset_agents`)
+- Index flip changed from `1 - self.staging_index` to `(self.staging_index + 1) % STAGING_SLOTS`
+- `active_config_index` flip unchanged (separate double-buffered concern for world config bind groups)
 
-```rust
-let speed_tick_cap = (self.speed_multiplier * 2).max(2);
-let ticks_to_run = ((self.sim_accumulator / SIM_DT) as u32)
-    .min(self.gpu_tick_budget)
-    .min(speed_tick_cap);
-```
-
-### 2. Drain accumulator on backpressure
-
-When `dispatch_batch` returns `false`, cap the accumulator to one fixed-timestep (`SIM_DT`) worth at the current speed multiplier so the next successful dispatch sends a normal-sized batch:
-
-```rust
-if dispatched {
-    // ... existing budget/tick/accumulator logic
-} else {
-    // GPU backpressure — drop ticks rather than accumulating debt
-    // that causes burst dispatches when staging frees up.
-    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * self.speed_multiplier as f32);
-}
-```
-
-The existing budget-based accumulator cap (`SIM_DT * budget * 2`) is kept as a generous overall safety net.
+The accumulator logic in `main.rs` is unchanged — no drain, no speed cap.
 
 ## Tradeoff
 
-At 10x + very high FPS, the simulation may run slightly below 600 TPS (dropped ticks during backpressure). Smooth visual updates over exact TPS is the right tradeoff — the user chose 10x for faster visual progression, not for precise tick counting. At 100x+ the user explicitly trades smoothness for throughput, and the larger `ticks_to_run` naturally gives staging more time between dispatches.
+One additional staging buffer per kernel (~few KB). No throughput penalty — dispatch is no longer blocked at moderate speeds. At extreme speeds (100x+), the per-batch `queue.submit()` overhead becomes the bottleneck (tracked separately in issue #79), not staging.
 
 ## Files Changed
 
-- `crates/xagent-sandbox/src/main.rs` — tick loop accumulator logic (~lines 1582-1620)
+- `crates/xagent-brain/src/gpu_kernel.rs` — triple-buffered staging pipeline

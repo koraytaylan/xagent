@@ -11,6 +11,11 @@ use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::buffers::*;
 
+/// Number of async staging slots for state readback.
+/// Triple-buffering gives readback 3 frames to complete before backpressure
+/// stalls dispatch — enough for 10x+ speed at high FPS.
+const STAGING_SLOTS: usize = 3;
+
 /// Pending async readback of 4 staging buffers for telemetry.
 struct TelemetryReadback {
     /// Number of map_async callbacks that have fired (need all 4).
@@ -102,15 +107,17 @@ pub struct GpuKernel {
     bind_groups: [wgpu::BindGroup; 2],
     active_config_index: usize,
 
-    // ── Async state readback (double-buffered, non-blocking) ──
-    // Each staging slot contains phys + food buffers, mapped together.
+    // ── Async state readback (triple-buffered, non-blocking) ──
+    // Three staging slots give readback 3 frames to complete before
+    // backpressure stalls dispatch — enough for 10x+ with 1 agent.
+    // Each slot contains phys + food buffers, mapped together.
     // staging_ready counts completed map_async callbacks (need expected_staging_callbacks).
-    state_staging: [wgpu::Buffer; 2],
-    food_staging: [wgpu::Buffer; 2],
-    staging_index: usize,                    // which buffer to write NEXT
-    staging_in_flight: [bool; 2],            // submitted, not yet collected
-    staging_ready: [Arc<AtomicU32>; 2],      // map_async callbacks completed
-    staging_had_error: [Arc<AtomicBool>; 2], // set if any map_async callback errored
+    state_staging: [wgpu::Buffer; STAGING_SLOTS],
+    food_staging: [wgpu::Buffer; STAGING_SLOTS],
+    staging_index: usize,                           // which buffer to write NEXT
+    staging_in_flight: [bool; STAGING_SLOTS],       // submitted, not yet collected
+    staging_ready: [Arc<AtomicU32>; STAGING_SLOTS], // map_async callbacks completed
+    staging_had_error: [Arc<AtomicBool>; STAGING_SLOTS], // set if any map_async callback errored
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
     food_cache_valid: bool,
@@ -173,7 +180,7 @@ impl GpuKernel {
     pub fn reset_agents(&mut self, brain_config: &BrainConfig) {
         // Drain any pending async readback so staging buffers are clean.
         let expected = self.expected_staging_callbacks();
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
                 while self.staging_ready[i].load(Ordering::Acquire) < expected {
                     self.device.poll(wgpu::Maintain::Poll);
@@ -434,34 +441,22 @@ impl GpuKernel {
         let state_size = (n * PHYS_STRIDE * 4) as u64;
         let food_state_size = ((f * FOOD_STATE_STRIDE * 4) as u64).max(4);
         let staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
-        let state_staging = [
+        let state_staging = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_state_staging_0"),
+                label: Some(&format!("kernel_state_staging_{i}")),
                 size: state_size,
                 usage: staging_usage,
                 mapped_at_creation: false,
-            }),
+            })
+        });
+        let food_staging = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_state_staging_1"),
-                size: state_size,
-                usage: staging_usage,
-                mapped_at_creation: false,
-            }),
-        ];
-        let food_staging = [
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_food_staging_0"),
+                label: Some(&format!("kernel_food_staging_{i}")),
                 size: food_state_size,
                 usage: staging_usage,
                 mapped_at_creation: false,
-            }),
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_food_staging_1"),
-                size: food_state_size,
-                usage: staging_usage,
-                mapped_at_creation: false,
-            }),
-        ];
+            })
+        });
 
         // ── Pre-allocated telemetry staging buffers ──
         let tel_sensory_size = (layout.sensory_stride * 4) as u64;
@@ -992,12 +987,9 @@ impl GpuKernel {
             state_staging,
             food_staging,
             staging_index: 0,
-            staging_in_flight: [false, false],
-            staging_ready: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
-            staging_had_error: [
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ],
+            staging_in_flight: [false; STAGING_SLOTS],
+            staging_ready: std::array::from_fn(|_| Arc::new(AtomicU32::new(0))),
+            staging_had_error: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
             state_cache: vec![0.0; n * PHYS_STRIDE],
             food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
             food_cache_valid: false,
@@ -1230,7 +1222,7 @@ impl GpuKernel {
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
         let expected = self.expected_staging_callbacks();
         let mut collected = false;
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if !self.staging_in_flight[i] {
                 continue;
             }
@@ -1464,7 +1456,7 @@ impl GpuKernel {
             );
         }
         self.staging_in_flight[widx] = true;
-        self.staging_index = 1 - self.staging_index;
+        self.staging_index = (self.staging_index + 1) % STAGING_SLOTS;
         self.active_config_index = 1 - self.active_config_index;
         true
     }
@@ -1852,7 +1844,7 @@ impl GpuKernel {
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
         // Check if any staging buffer is still in flight.
         let expected = self.expected_staging_callbacks();
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
                 self.device.poll(wgpu::Maintain::Poll);
                 if self.staging_ready[i].load(Ordering::Acquire) < expected {

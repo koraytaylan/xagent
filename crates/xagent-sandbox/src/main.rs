@@ -1617,16 +1617,8 @@ impl ApplicationHandler for App {
                                         gov.tick();
                                     }
                                 }
-                            } else {
-                                // GPU backpressure — staging double-buffer full.
-                                // Allow up to 2 frames' worth of debt so the
-                                // recovery dispatch can catch up for 1 skipped
-                                // frame. Larger debt is drained to prevent the
-                                // massive bursts that cause erratic position jumps.
-                                self.sim_accumulator = self
-                                    .sim_accumulator
-                                    .min(SIM_DT * self.speed_multiplier as f32 * 2.0);
                             }
+                            // else: GPU backpressure — skip this frame, retry next
 
                             if state_updated || mk.try_collect_state() {
                                 let state = mk.cached_state();

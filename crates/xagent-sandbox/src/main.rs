@@ -1581,8 +1581,8 @@ impl ApplicationHandler for App {
                 // in the background to prevent catch-up hitch when it lands.
                 if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     self.sim_accumulator += dt * self.speed_multiplier as f32;
-                    // Cap accumulator to 2 frames' worth of ticks at the
-                    // current speed so debt stays bounded regardless of budget.
+                    // Cap accumulator to 2 fixed-timestep frames (2×SIM_DT)
+                    // worth at the current speed so debt stays bounded regardless of budget.
                     let max_acc = SIM_DT * self.speed_multiplier as f32 * 2.0;
                     self.sim_accumulator = self.sim_accumulator.min(max_acc);
                     let ticks_to_run =
@@ -1620,8 +1620,9 @@ impl ApplicationHandler for App {
                                 }
                             } else {
                                 // GPU backpressure — staging double-buffer full.
-                                // Drain accumulated debt to 1 frame's worth so the
-                                // next successful dispatch sends a normal-sized batch
+                                // Drain accumulated debt to at most one fixed sim
+                                // timestep at the current speed so the next
+                                // successful dispatch sends a normal-sized batch
                                 // instead of a burst that causes erratic position jumps.
                                 self.sim_accumulator = self
                                     .sim_accumulator

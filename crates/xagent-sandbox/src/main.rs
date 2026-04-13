@@ -1586,19 +1586,21 @@ impl ApplicationHandler for App {
                     let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
                         .min(self.gpu_tick_budget)
                         .min(500);
-                    // On the very first dispatch, force at least
-                    // brain_tick_stride ticks so the brain produces initial
-                    // motor commands. After that, dispatch exactly as many
-                    // ticks as the accumulator warrants to avoid borrowing
-                    // sim-time from the future and creating burst/stall motion.
-                    let ticks_to_run = if raw_ticks > 0 && self.tick == 0 {
-                        let min_batch = self
-                            .gpu_kernel
-                            .as_ref()
-                            .map_or(10, |kernel| kernel.brain_tick_stride());
-                        raw_ticks.max(min_batch)
-                    } else {
+                    // Only dispatch when the accumulator has enough for at
+                    // least brain_tick_stride ticks, so every dispatch
+                    // includes a brain cycle and produces motor commands.
+                    // Sub-stride dispatches would be physics-only (no brain
+                    // cycles), leaving agents with stale motor outputs.
+                    // The accumulator keeps its fractional remainder across
+                    // frames so no sim-time is lost.
+                    let min_dispatch = self
+                        .gpu_kernel
+                        .as_ref()
+                        .map_or(10, |kernel| kernel.brain_tick_stride());
+                    let ticks_to_run = if raw_ticks >= min_dispatch {
                         raw_ticks
+                    } else {
+                        0
                     };
 
                     if ticks_to_run > 0 {

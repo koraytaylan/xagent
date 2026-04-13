@@ -164,10 +164,16 @@ pub fn run_tick_loop_bench(
         accumulator = accumulator.min(max_accumulator);
 
         let remaining = (total_ticks - tick) as u32;
-        let ticks_to_run = ((accumulator / SIM_DT) as u32)
+        let min_dispatch = kernel.brain_tick_stride();
+        let raw_ticks = ((accumulator / SIM_DT) as u32)
             .min(gpu_tick_budget)
             .min(500)
             .min(remaining);
+        let ticks_to_run = if raw_ticks >= min_dispatch {
+            raw_ticks
+        } else {
+            0
+        };
 
         if ticks_to_run > 0 {
             kernel.try_collect_state();

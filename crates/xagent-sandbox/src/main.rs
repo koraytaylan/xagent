@@ -1595,10 +1595,8 @@ impl ApplicationHandler for App {
                             let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
                             if dispatched {
-                                // Grow budget aggressively — staging double-buffer
-                                // is the real throttle (dispatch_batch returns false
-                                // when both are in-flight). Only shrink if CPU
-                                // encoding takes so long it stalls the render loop.
+                                // Shrink budget only if CPU encoding takes so
+                                // long it stalls the render loop.
                                 if wall_ms > 50.0 {
                                     self.gpu_tick_budget = (self.gpu_tick_budget * 3 / 4).max(32);
                                 } else {
@@ -1618,7 +1616,6 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
-                            // else: GPU backpressure — skip this frame, retry next
 
                             if state_updated || mk.try_collect_state() {
                                 let state = mk.cached_state();

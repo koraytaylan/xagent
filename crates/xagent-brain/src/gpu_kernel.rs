@@ -1300,12 +1300,6 @@ impl GpuKernel {
     /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
     /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
-        // Check if the write-target staging buffer is free.
-        let widx = self.staging_index;
-        if self.staging_in_flight[widx] {
-            return false;
-        }
-
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
@@ -1390,73 +1384,87 @@ impl GpuKernel {
         // Physics-only remainder (ticks that don't fill a brain cycle)
         let physics_remainder = ticks_to_run % self.brain_tick_stride;
 
-        // Final submit: physics remainder + async state readback
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_kernel_final"),
-            });
-        if physics_remainder > 0 {
-            self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
-            let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.physics_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
-                pass.dispatch_workgroups(1, 1, 1);
+        // Readback is decoupled from dispatch: compute always runs,
+        // staging copy only happens when a slot is free. This prevents
+        // readback backpressure from stalling simulation at high FPS.
+        let widx = self.staging_index;
+        let readback = !self.staging_in_flight[widx];
+
+        if physics_remainder > 0 || readback {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_final"),
+                });
+
+            if physics_remainder > 0 {
+                self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
+                let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.physics_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+            }
+
+            if readback {
+                encoder.copy_buffer_to_buffer(
+                    &self.agent_phys_buffer,
+                    0,
+                    &self.state_staging[widx],
+                    0,
+                    buf_size,
+                );
+                if self.food_count > 0 {
+                    let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                    encoder.copy_buffer_to_buffer(
+                        &self.food_state_buffer,
+                        0,
+                        &self.food_staging[widx],
+                        0,
+                        food_size,
+                    );
+                }
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            if readback {
+                self.staging_ready[widx].store(0, Ordering::Release);
+                self.staging_had_error[widx].store(false, Ordering::Release);
+
+                let phys_flag = self.staging_ready[widx].clone();
+                let phys_err = self.staging_had_error[widx].clone();
+                self.state_staging[widx].slice(..buf_size).map_async(
+                    wgpu::MapMode::Read,
+                    move |result| {
+                        if result.is_err() {
+                            phys_err.store(true, Ordering::Release);
+                        }
+                        phys_flag.fetch_add(1, Ordering::Release);
+                    },
+                );
+                if self.food_count > 0 {
+                    let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                    let food_flag = self.staging_ready[widx].clone();
+                    let food_err = self.staging_had_error[widx].clone();
+                    self.food_staging[widx].slice(..food_size).map_async(
+                        wgpu::MapMode::Read,
+                        move |result| {
+                            if result.is_err() {
+                                food_err.store(true, Ordering::Release);
+                            }
+                            food_flag.fetch_add(1, Ordering::Release);
+                        },
+                    );
+                }
+                self.staging_in_flight[widx] = true;
+                self.staging_index = (self.staging_index + 1) % STAGING_SLOTS;
             }
         }
 
-        // Async state readback into staging[widx]
-        encoder.copy_buffer_to_buffer(
-            &self.agent_phys_buffer,
-            0,
-            &self.state_staging[widx],
-            0,
-            buf_size,
-        );
-        if self.food_count > 0 {
-            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-            encoder.copy_buffer_to_buffer(
-                &self.food_state_buffer,
-                0,
-                &self.food_staging[widx],
-                0,
-                food_size,
-            );
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        self.staging_ready[widx].store(0, Ordering::Release);
-        self.staging_had_error[widx].store(false, Ordering::Release);
-
-        let phys_flag = self.staging_ready[widx].clone();
-        let phys_err = self.staging_had_error[widx].clone();
-        self.state_staging[widx]
-            .slice(..buf_size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_err() {
-                    phys_err.store(true, Ordering::Release);
-                }
-                phys_flag.fetch_add(1, Ordering::Release);
-            });
-        if self.food_count > 0 {
-            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-            let food_flag = self.staging_ready[widx].clone();
-            let food_err = self.staging_had_error[widx].clone();
-            self.food_staging[widx].slice(..food_size).map_async(
-                wgpu::MapMode::Read,
-                move |result| {
-                    if result.is_err() {
-                        food_err.store(true, Ordering::Release);
-                    }
-                    food_flag.fetch_add(1, Ordering::Release);
-                },
-            );
-        }
-        self.staging_in_flight[widx] = true;
-        self.staging_index = (self.staging_index + 1) % STAGING_SLOTS;
         self.active_config_index = 1 - self.active_config_index;
         true
     }

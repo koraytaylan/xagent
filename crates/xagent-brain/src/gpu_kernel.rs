@@ -2261,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_subgroup_placeholders_are_symmetric() {
+    fn brain_tick_subgroup_placeholders_are_symmetric() {
         // Verify that brain_tick.wgsl's SUBGROUP_TOPK placeholders come in matched pairs
         let src = include_str!("shaders/kernel/brain_tick.wgsl");
         let has_params = src.contains("/* SUBGROUP_TOPK_PARAMS */");

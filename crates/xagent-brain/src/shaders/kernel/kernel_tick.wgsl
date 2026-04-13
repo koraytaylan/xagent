@@ -2,6 +2,14 @@
 // dispatch(agent_count, 1, 1) — one workgroup per agent, 256 threads each.
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
+//
+// SAFETY INVARIANT: one workgroup == one agent.
+// Several functions early-return when the agent is dead (P_ALIVE < 0.5).
+// Because all 256 threads in a workgroup share the same agent_id, they
+// all agree on the alive check, keeping barrier execution uniform.
+// If the kernel is ever restructured to pack multiple agents per workgroup,
+// the alive-check must move after all barriers or use a uniform control
+// flow pattern to avoid undefined behavior / GPU deadlocks.
 
 // EAT_RADIUS removed — read from wconfig via wc_f32(WC_FOOD_RADIUS)
 
@@ -12,6 +20,8 @@
 fn agent_physics(agent_id: u32, tick: u32) {
     let b = agent_id * PHYS_STRIDE;
 
+    // Safe to early-return: one workgroup == one agent, so all threads agree.
+    // See top-of-file invariant re: barrier uniformity.
     let alive = agent_phys[b + P_ALIVE];
     if alive < 0.5 { return; }
 
@@ -145,7 +155,8 @@ fn agent_physics(agent_id: u32, tick: u32) {
 fn agent_food_detect(agent_id: u32, tid: u32) {
     let b = agent_id * PHYS_STRIDE;
 
-    // Skip dead agents — all threads must agree (uniform control flow)
+    // Safe to early-return: one workgroup == one agent, so all threads agree.
+    // See top-of-file invariant re: barrier uniformity.
     if agent_phys[b + P_ALIVE] < 0.5 { return; }
 
     let pos = vec3f(
@@ -315,7 +326,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // ══════════════════════════════════════════════════════════════════════════
 
 fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
-    // Skip dead agents (uniform control flow — all threads agree)
+    // Safe to early-return: one workgroup == one agent, so all threads agree.
+    // See top-of-file invariant re: barrier uniformity.
     if (agent_phys[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
     coop_feature_extract(agent_id, tid);

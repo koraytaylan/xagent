@@ -19,11 +19,11 @@ The accumulator cap (`SIM_DT * gpu_tick_budget * 2`) makes this worse: the budge
 
 ## Fix
 
-Two changes in `main.rs`, both in the tick loop:
+One change in `main.rs`, in the tick loop:
 
-### 1. Drain accumulator on backpressure
+### Drain accumulator on backpressure
 
-When `dispatch_batch` returns `false`, cap the accumulator to 1 frame's worth of ticks so the next successful dispatch sends a normal-sized batch:
+When `dispatch_batch` returns `false`, cap the accumulator to one fixed-timestep (`SIM_DT`) worth at the current speed multiplier so the next successful dispatch sends a normal-sized batch:
 
 ```rust
 if dispatched {
@@ -35,19 +35,7 @@ if dispatched {
 }
 ```
 
-### 2. Tighten accumulator cap
-
-Replace the budget-based cap with a speed-aware cap:
-
-```rust
-// Before:
-let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
-
-// After:
-let max_acc = SIM_DT * self.speed_multiplier as f32 * 2.0;
-```
-
-This limits debt to 2 frames' worth regardless of budget. The budget still controls GPU batch size for high-speed modes (100x+), but the accumulator can't build up disproportionate debt.
+The existing budget-based accumulator cap (`SIM_DT * budget * 2`) is kept as a generous safety net. Tightening it to a speed-based cap would cause precision loss at low render FPS (e.g., 30fps at 1x would alternate 1/2 ticks → ~45 TPS instead of 60) because the cap discards fractional accumulator remainder needed across frames.
 
 ## Tradeoff
 

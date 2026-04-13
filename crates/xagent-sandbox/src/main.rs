@@ -1585,10 +1585,11 @@ impl ApplicationHandler for App {
                     let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
                     self.sim_accumulator = self.sim_accumulator.min(max_acc);
                     // Limit ticks dispatched per frame to what the speed
-                    // multiplier demands, with 2× headroom for frame-time
-                    // variance. Fractional accumulator is preserved for the
-                    // next frame, avoiding precision loss at low render FPS.
-                    let speed_tick_cap = (self.speed_multiplier * 2).max(2);
+                    // multiplier demands. The 3× factor covers the dt clamp
+                    // ceiling (0.05s / SIM_DT ≈ 3 ticks at 1×). Fractional
+                    // accumulator is preserved for the next frame, avoiding
+                    // precision loss at low render FPS.
+                    let speed_tick_cap = (self.speed_multiplier * 3).max(3);
                     let ticks_to_run = ((self.sim_accumulator / SIM_DT) as u32)
                         .min(self.gpu_tick_budget)
                         .min(speed_tick_cap);

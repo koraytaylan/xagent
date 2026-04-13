@@ -16,10 +16,11 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
 use xagent_brain::buffers::{
-    PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y,
-    P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_MAX_ENERGY,
-    P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
-    P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
+    FOOD_STATE_STRIDE, F_POS_X, F_POS_Z, F_RESPAWN_TIMER, PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT,
+    P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y, P_FACING_Z, P_FATIGUE_FACTOR_OUT,
+    P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT,
+    P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT,
+    P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
@@ -2230,12 +2231,24 @@ impl ApplicationHandler for App {
 
                                 // Build world snapshot for mini-map
                                 if let Some(world) = &self.world {
-                                    self.world_snapshot.food_positions = world
-                                        .food_items
-                                        .iter()
-                                        .filter(|f| !f.consumed)
-                                        .map(|f| [f.position.x, f.position.z])
-                                        .collect();
+                                    let gpu_food = self
+                                        .gpu_kernel
+                                        .as_ref()
+                                        .and_then(|mk| mk.cached_food_state());
+                                    if let Some(food) = gpu_food {
+                                        self.world_snapshot.food_positions = food
+                                            .chunks_exact(FOOD_STATE_STRIDE)
+                                            .filter(|c| c[F_RESPAWN_TIMER] <= 0.0)
+                                            .map(|c| [c[F_POS_X], c[F_POS_Z]])
+                                            .collect();
+                                    } else {
+                                        self.world_snapshot.food_positions = world
+                                            .food_items
+                                            .iter()
+                                            .filter(|f| !f.consumed)
+                                            .map(|f| [f.position.x, f.position.z])
+                                            .collect();
+                                    }
                                     self.world_snapshot.world_size = world.config.world_size;
                                 }
                                 let mut world_snap = std::mem::take(&mut self.world_snapshot);

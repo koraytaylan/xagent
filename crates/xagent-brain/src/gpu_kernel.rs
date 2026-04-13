@@ -103,11 +103,17 @@ pub struct GpuKernel {
     active_config_index: usize,
 
     // ── Async state readback (double-buffered, non-blocking) ──
+    // Each staging slot contains phys + food buffers, mapped together.
+    // staging_ready counts completed map_async callbacks (need expected_staging_callbacks).
     state_staging: [wgpu::Buffer; 2],
-    staging_index: usize,                // which buffer to write NEXT
-    staging_in_flight: [bool; 2],        // submitted, not yet collected
-    staging_ready: [Arc<AtomicBool>; 2], // map_async callback fired
+    food_staging: [wgpu::Buffer; 2],
+    staging_index: usize,                    // which buffer to write NEXT
+    staging_in_flight: [bool; 2],            // submitted, not yet collected
+    staging_ready: [Arc<AtomicU32>; 2],      // map_async callbacks completed
+    staging_had_error: [Arc<AtomicBool>; 2], // set if any map_async callback errored
     state_cache: Vec<f32>,
+    food_cache: Vec<f32>,
+    food_cache_valid: bool,
 
     // ── Async telemetry readback ──
     telemetry_staging: TelemetryStagingBuffers,
@@ -166,21 +172,41 @@ impl GpuKernel {
     /// call `upload_agents` afterwards to set physics positions.
     pub fn reset_agents(&mut self, brain_config: &BrainConfig) {
         // Drain any pending async readback so staging buffers are clean.
+        let expected = self.expected_staging_callbacks();
         for i in 0..2 {
             if self.staging_in_flight[i] {
-                while !self.staging_ready[i].load(Ordering::Acquire) {
+                while self.staging_ready[i].load(Ordering::Acquire) < expected {
                     self.device.poll(wgpu::Maintain::Poll);
                 }
-                let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                let slice = self.state_staging[i].slice(..buf_size);
-                let _data = slice.get_mapped_range();
-                drop(_data);
-                self.state_staging[i].unmap();
+
+                if self.staging_had_error[i].load(Ordering::Acquire) {
+                    // map_async errored — buffer isn't mapped, just unmap and clear.
+                    self.state_staging[i].unmap();
+                    if self.food_count > 0 {
+                        self.food_staging[i].unmap();
+                    }
+                } else {
+                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
+                    let slice = self.state_staging[i].slice(..buf_size);
+                    let _data = slice.get_mapped_range();
+                    drop(_data);
+                    self.state_staging[i].unmap();
+
+                    if self.food_count > 0 {
+                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                        let food_slice = self.food_staging[i].slice(..food_size);
+                        let _food_data = food_slice.get_mapped_range();
+                        drop(_food_data);
+                        self.food_staging[i].unmap();
+                    }
+                }
+
                 self.staging_in_flight[i] = false;
             }
-            self.staging_ready[i].store(false, Ordering::Release);
+            self.staging_ready[i].store(0, Ordering::Release);
         }
         self.staging_index = 0;
+        self.food_cache_valid = false;
 
         // Clear async telemetry state so stale readbacks from the
         // previous generation don't leak into the new one.
@@ -406,17 +432,33 @@ impl GpuKernel {
 
         // ── Async state readback staging (double-buffered) ──
         let state_size = (n * PHYS_STRIDE * 4) as u64;
+        let food_state_size = ((f * FOOD_STATE_STRIDE * 4) as u64).max(4);
+        let staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let state_staging = [
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("kernel_state_staging_0"),
                 size: state_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                usage: staging_usage,
                 mapped_at_creation: false,
             }),
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("kernel_state_staging_1"),
                 size: state_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                usage: staging_usage,
+                mapped_at_creation: false,
+            }),
+        ];
+        let food_staging = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kernel_food_staging_0"),
+                size: food_state_size,
+                usage: staging_usage,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kernel_food_staging_1"),
+                size: food_state_size,
+                usage: staging_usage,
                 mapped_at_creation: false,
             }),
         ];
@@ -948,13 +990,17 @@ impl GpuKernel {
             bind_groups,
             active_config_index: 0,
             state_staging,
+            food_staging,
             staging_index: 0,
             staging_in_flight: [false, false],
-            staging_ready: [
+            staging_ready: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
+            staging_had_error: [
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             ],
             state_cache: vec![0.0; n * PHYS_STRIDE],
+            food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
+            food_cache_valid: false,
             telemetry_staging,
             pending_telemetry: None,
             cached_telemetry: None,
@@ -1167,24 +1213,65 @@ impl GpuKernel {
         self.active_config_index = 1 - self.active_config_index;
     }
 
-    /// Non-blocking: collect any ready staging buffers into state_cache.
-    /// Returns true if state_cache was updated.
+    /// Number of map_async callbacks expected per staging slot: 1 (phys) + 1 (food)
+    /// when food exists, or just 1 when food_count is 0.
+    fn expected_staging_callbacks(&self) -> u32 {
+        if self.food_count > 0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Non-blocking: collect any ready staging buffers into state_cache + food_cache.
+    /// Returns true if caches were updated.
     fn try_collect_staging(&mut self) -> bool {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
+        let expected = self.expected_staging_callbacks();
         let mut collected = false;
         for i in 0..2 {
-            if self.staging_in_flight[i] && self.staging_ready[i].load(Ordering::Acquire) {
-                let slice = self.state_staging[i].slice(..buf_size);
-                let data = slice.get_mapped_range();
-                let floats: &[f32] = bytemuck::cast_slice(&data);
-                self.state_cache.clear();
-                self.state_cache.extend_from_slice(floats);
-                drop(data);
-                self.state_staging[i].unmap();
-                self.staging_in_flight[i] = false;
-                collected = true;
+            if !self.staging_in_flight[i] {
+                continue;
             }
+            if self.staging_ready[i].load(Ordering::Acquire) < expected {
+                continue;
+            }
+
+            if self.staging_had_error[i].load(Ordering::Acquire) {
+                // A map_async callback errored — abandon this slot.
+                self.state_staging[i].unmap();
+                if self.food_count > 0 {
+                    self.food_staging[i].unmap();
+                }
+                self.staging_in_flight[i] = false;
+                continue;
+            }
+
+            // Collect agent phys state
+            let slice = self.state_staging[i].slice(..buf_size);
+            let data = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&data);
+            self.state_cache.clear();
+            self.state_cache.extend_from_slice(floats);
+            drop(data);
+            self.state_staging[i].unmap();
+
+            // Collect food state (only when food exists)
+            if self.food_count > 0 {
+                let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                let food_slice = self.food_staging[i].slice(..food_size);
+                let food_data = food_slice.get_mapped_range();
+                let food_floats: &[f32] = bytemuck::cast_slice(&food_data);
+                self.food_cache.clear();
+                self.food_cache.extend_from_slice(food_floats);
+                drop(food_data);
+                self.food_staging[i].unmap();
+                self.food_cache_valid = true;
+            }
+
+            self.staging_in_flight[i] = false;
+            collected = true;
         }
         collected
     }
@@ -1332,17 +1419,45 @@ impl GpuKernel {
             0,
             buf_size,
         );
+        if self.food_count > 0 {
+            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+            encoder.copy_buffer_to_buffer(
+                &self.food_state_buffer,
+                0,
+                &self.food_staging[widx],
+                0,
+                food_size,
+            );
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        self.staging_ready[widx].store(false, Ordering::Release);
-        let flag = self.staging_ready[widx].clone();
+        self.staging_ready[widx].store(0, Ordering::Release);
+        self.staging_had_error[widx].store(false, Ordering::Release);
+
+        let phys_flag = self.staging_ready[widx].clone();
+        let phys_err = self.staging_had_error[widx].clone();
         self.state_staging[widx]
             .slice(..buf_size)
             .map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_ok() {
-                    flag.store(true, Ordering::Release);
+                if result.is_err() {
+                    phys_err.store(true, Ordering::Release);
                 }
+                phys_flag.fetch_add(1, Ordering::Release);
             });
+        if self.food_count > 0 {
+            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+            let food_flag = self.staging_ready[widx].clone();
+            let food_err = self.staging_had_error[widx].clone();
+            self.food_staging[widx].slice(..food_size).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
+                    if result.is_err() {
+                        food_err.store(true, Ordering::Release);
+                    }
+                    food_flag.fetch_add(1, Ordering::Release);
+                },
+            );
+        }
         self.staging_in_flight[widx] = true;
         self.staging_index = 1 - self.staging_index;
         self.active_config_index = 1 - self.active_config_index;
@@ -1358,6 +1473,16 @@ impl GpuKernel {
     /// Last collected agent physics state.
     pub fn cached_state(&self) -> &[f32] {
         &self.state_cache
+    }
+
+    /// Last collected food state (pos_x, pos_y, pos_z, respawn_timer per food).
+    /// Returns `None` until the first successful GPU readback.
+    pub fn cached_food_state(&self) -> Option<&[f32]> {
+        if self.food_cache_valid {
+            Some(&self.food_cache)
+        } else {
+            None
+        }
     }
 
     /// Blocking readback of full agent physics state.
@@ -1721,20 +1846,38 @@ impl GpuKernel {
     /// buffers are still in flight (caller should retry next frame).
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
         // Check if any staging buffer is still in flight.
+        let expected = self.expected_staging_callbacks();
         for i in 0..2 {
             if self.staging_in_flight[i] {
                 self.device.poll(wgpu::Maintain::Poll);
-                if !self.staging_ready[i].load(Ordering::Acquire) {
+                if self.staging_ready[i].load(Ordering::Acquire) < expected {
                     return false; // not ready yet — caller retries next frame
                 }
-                let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                let slice = self.state_staging[i].slice(..buf_size);
-                let _data = slice.get_mapped_range();
-                drop(_data);
-                self.state_staging[i].unmap();
+
+                if self.staging_had_error[i].load(Ordering::Acquire) {
+                    self.state_staging[i].unmap();
+                    if self.food_count > 0 {
+                        self.food_staging[i].unmap();
+                    }
+                } else {
+                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
+                    let slice = self.state_staging[i].slice(..buf_size);
+                    let _data = slice.get_mapped_range();
+                    drop(_data);
+                    self.state_staging[i].unmap();
+
+                    if self.food_count > 0 {
+                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                        let food_slice = self.food_staging[i].slice(..food_size);
+                        let _food_data = food_slice.get_mapped_range();
+                        drop(_food_data);
+                        self.food_staging[i].unmap();
+                    }
+                }
+
                 self.staging_in_flight[i] = false;
             }
-            self.staging_ready[i].store(false, Ordering::Release);
+            self.staging_ready[i].store(0, Ordering::Release);
         }
         self.staging_index = 0;
 

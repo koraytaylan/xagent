@@ -1449,8 +1449,8 @@ impl<'a> TabContext<'a> {
 
                     ui.label("population_size");
                     let mut ps = g.population_size as i32;
-                    ui.add(egui::DragValue::new(&mut ps).range(2..=100).speed(1));
-                    g.population_size = ps.max(2) as usize;
+                    ui.add(egui::DragValue::new(&mut ps).range(1..=100).speed(1));
+                    g.population_size = ps.max(1) as usize;
                     ui.end_row();
 
                     ui.label("tick_budget");

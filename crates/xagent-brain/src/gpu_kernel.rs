@@ -648,6 +648,7 @@ impl GpuKernel {
         let brain_functions_src = include_str!("shaders/kernel/brain_tick.wgsl");
         let brain_fn_end = brain_functions_src
             .find("@compute @workgroup_size(256)\nfn brain_tick(")
+            .or_else(|| brain_functions_src.find("@compute @workgroup_size(256)\r\nfn brain_tick("))
             .unwrap_or(brain_functions_src.len());
         let brain_fns_only = &brain_functions_src[..brain_fn_end];
 
@@ -671,6 +672,7 @@ impl GpuKernel {
 
             // Also replace brain_tick.wgsl's own markers (included via brain_fns_only)
             kernel_source = kernel_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+            kernel_source = kernel_source.replace("/* SUBGROUP_TOPK_ARGS */", ", sgid");
 
             let begin_marker = "// BEGIN_BITONIC_SORT";
             let end_marker = "// END_BITONIC_SORT";
@@ -690,6 +692,7 @@ impl GpuKernel {
             kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", "");
             // Also strip brain_tick.wgsl's own markers
             kernel_source = kernel_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
+            kernel_source = kernel_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
         }
 
         // ── Compose global-pass shader ──
@@ -2240,5 +2243,40 @@ impl GpuKernel {
     /// Returns the most recently collected telemetry, if any.
     pub fn cached_telemetry(&self) -> Option<&AgentTelemetry> {
         self.cached_telemetry.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn brain_tick_entry_point_marker_found_regardless_of_line_endings() {
+        let src = include_str!("shaders/kernel/brain_tick.wgsl");
+        let marker_lf = "@compute @workgroup_size(256)\nfn brain_tick(";
+        let marker_crlf = "@compute @workgroup_size(256)\r\nfn brain_tick(";
+
+        // Synthesize the opposite line-ending variant so both paths are exercised
+        let src_lf = src.replace("\r\n", "\n");
+        let src_crlf = src_lf.replace('\n', "\r\n");
+
+        assert!(
+            src_lf.find(marker_lf).is_some(),
+            "brain_tick entry point LF marker not found in LF-normalized source"
+        );
+        assert!(
+            src_crlf.find(marker_crlf).is_some(),
+            "brain_tick entry point CRLF marker not found in CRLF-normalized source"
+        );
+    }
+
+    #[test]
+    fn brain_tick_subgroup_placeholders_are_symmetric() {
+        // Verify that brain_tick.wgsl's SUBGROUP_TOPK placeholders come in matched pairs
+        let src = include_str!("shaders/kernel/brain_tick.wgsl");
+        let params_count = src.matches("/* SUBGROUP_TOPK_PARAMS */").count();
+        let args_count = src.matches("/* SUBGROUP_TOPK_ARGS */").count();
+        assert_eq!(
+            params_count, args_count,
+            "SUBGROUP_TOPK_PARAMS and SUBGROUP_TOPK_ARGS must appear the same number of times"
+        );
     }
 }

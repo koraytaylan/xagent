@@ -178,18 +178,27 @@ impl GpuKernel {
                 while self.staging_ready[i].load(Ordering::Acquire) < expected {
                     self.device.poll(wgpu::Maintain::Poll);
                 }
-                let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                let slice = self.state_staging[i].slice(..buf_size);
-                let _data = slice.get_mapped_range();
-                drop(_data);
-                self.state_staging[i].unmap();
 
-                if self.food_count > 0 {
-                    let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                    let food_slice = self.food_staging[i].slice(..food_size);
-                    let _food_data = food_slice.get_mapped_range();
-                    drop(_food_data);
-                    self.food_staging[i].unmap();
+                if self.staging_had_error[i].load(Ordering::Acquire) {
+                    // map_async errored — buffer isn't mapped, just unmap and clear.
+                    self.state_staging[i].unmap();
+                    if self.food_count > 0 {
+                        self.food_staging[i].unmap();
+                    }
+                } else {
+                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
+                    let slice = self.state_staging[i].slice(..buf_size);
+                    let _data = slice.get_mapped_range();
+                    drop(_data);
+                    self.state_staging[i].unmap();
+
+                    if self.food_count > 0 {
+                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                        let food_slice = self.food_staging[i].slice(..food_size);
+                        let _food_data = food_slice.get_mapped_range();
+                        drop(_food_data);
+                        self.food_staging[i].unmap();
+                    }
                 }
 
                 self.staging_in_flight[i] = false;
@@ -1844,18 +1853,26 @@ impl GpuKernel {
                 if self.staging_ready[i].load(Ordering::Acquire) < expected {
                     return false; // not ready yet — caller retries next frame
                 }
-                let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                let slice = self.state_staging[i].slice(..buf_size);
-                let _data = slice.get_mapped_range();
-                drop(_data);
-                self.state_staging[i].unmap();
 
-                if self.food_count > 0 {
-                    let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                    let food_slice = self.food_staging[i].slice(..food_size);
-                    let _food_data = food_slice.get_mapped_range();
-                    drop(_food_data);
-                    self.food_staging[i].unmap();
+                if self.staging_had_error[i].load(Ordering::Acquire) {
+                    self.state_staging[i].unmap();
+                    if self.food_count > 0 {
+                        self.food_staging[i].unmap();
+                    }
+                } else {
+                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
+                    let slice = self.state_staging[i].slice(..buf_size);
+                    let _data = slice.get_mapped_range();
+                    drop(_data);
+                    self.state_staging[i].unmap();
+
+                    if self.food_count > 0 {
+                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                        let food_slice = self.food_staging[i].slice(..food_size);
+                        let _food_data = food_slice.get_mapped_range();
+                        drop(_food_data);
+                        self.food_staging[i].unmap();
+                    }
                 }
 
                 self.staging_in_flight[i] = false;

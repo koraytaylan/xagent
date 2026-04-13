@@ -343,7 +343,6 @@ struct App {
     tps_tick_count: u64,
     tps_last_reset: Instant,
     tps_display: f64,
-    bp_count: u64,
     db_path: String,
     governor_config: GovernorConfig,
 
@@ -496,7 +495,6 @@ impl App {
             tps_tick_count: 0,
             tps_last_reset: Instant::now(),
             tps_display: 0.0,
-            bp_count: 0,
             db_path: db_path.to_string(),
             governor_config,
             gen_transition: None,
@@ -1581,33 +1579,33 @@ impl ApplicationHandler for App {
                 // Also skip accumulation when the kernel is being recreated
                 // in the background to prevent catch-up hitch when it lands.
                 if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
-                    let sim_dt = SIM_DT as f64;
+                    let sim_delta_time = SIM_DT as f64;
                     self.sim_accumulator += dt as f64 * self.speed_multiplier as f64;
-                    let max_acc = sim_dt * self.speed_multiplier as f64 * 3.0;
-                    self.sim_accumulator = self.sim_accumulator.min(max_acc);
-                    let raw_ticks = ((self.sim_accumulator / sim_dt) as u32)
+                    let max_accumulator = sim_delta_time * self.speed_multiplier as f64 * 3.0;
+                    self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
+                    let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
                         .min(self.gpu_tick_budget)
                         .min(500);
-                    // Every dispatch must include at least brain_tick_stride
-                    // ticks so the brain produces motor commands.  At low
-                    // speeds this borrows sim-time from the future; the
-                    // accumulator goes negative and repays over the next
-                    // few frames.
-                    let min_batch = self
-                        .gpu_kernel
-                        .as_ref()
-                        .map_or(10, |mk| mk.brain_tick_stride());
-                    let ticks_to_run = if raw_ticks > 0 {
+                    // On the very first dispatch, force at least
+                    // brain_tick_stride ticks so the brain produces initial
+                    // motor commands. After that, dispatch exactly as many
+                    // ticks as the accumulator warrants to avoid borrowing
+                    // sim-time from the future and creating burst/stall motion.
+                    let ticks_to_run = if raw_ticks > 0 && self.tick == 0 {
+                        let min_batch = self
+                            .gpu_kernel
+                            .as_ref()
+                            .map_or(10, |kernel| kernel.brain_tick_stride());
                         raw_ticks.max(min_batch)
                     } else {
-                        0
+                        raw_ticks
                     };
 
                     if ticks_to_run > 0 {
-                        if let Some(ref mut mk) = self.gpu_kernel {
-                            mk.dispatch_batch(self.tick, ticks_to_run);
+                        if let Some(ref mut kernel) = self.gpu_kernel {
+                            kernel.dispatch_batch(self.tick, ticks_to_run);
 
-                            self.sim_accumulator -= ticks_to_run as f64 * sim_dt;
+                            self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
 
                             self.gpu_tick_budget =
                                 (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1).min(64_000);
@@ -1629,10 +1627,10 @@ impl ApplicationHandler for App {
                             if self.selected_agent_idx < self.agents.len() {
                                 let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
 
-                                mk.request_agent_telemetry(brain_idx);
+                                kernel.request_agent_telemetry(brain_idx);
 
                                 // Collect any completed readback (non-blocking)
-                                if let Some(tel) = mk.try_collect_telemetry() {
+                                if let Some(tel) = kernel.try_collect_telemetry() {
                                     let a = &mut self.agents[self.selected_agent_idx];
                                     // Only update fields NOT already populated by
                                     // the fresher async physics readback above.
@@ -1701,9 +1699,9 @@ impl ApplicationHandler for App {
                     // regardless of whether ticks were dispatched this frame.
                     // This ensures smooth visual updates at low speed multipliers
                     // where dispatches happen infrequently.
-                    if let Some(ref mut mk) = self.gpu_kernel {
-                        if mk.try_collect_state() {
-                            let state = mk.cached_state();
+                    if let Some(ref mut kernel) = self.gpu_kernel {
+                        if kernel.try_collect_state() {
+                            let state = kernel.cached_state();
                             for i in 0..self.agents.len() {
                                 let base = i * PHYS_STRIDE;
                                 if base + P_URGENCY_OUT >= state.len() {
@@ -2221,7 +2219,6 @@ impl ApplicationHandler for App {
                                 if tps_elapsed >= 1.0 {
                                     self.tps_display = self.tps_tick_count as f64 / tps_elapsed;
                                     self.tps_tick_count = 0;
-                                    self.bp_count = 0;
                                     self.tps_last_reset = Instant::now();
                                 }
                                 self.evo_snapshot.ticks_per_sec = self.tps_display;
@@ -2685,8 +2682,8 @@ impl ApplicationHandler for App {
 
                 // Poll GPU kernel device after rendering so map_async
                 // callbacks can complete before the next frame.
-                if let Some(ref mk) = self.gpu_kernel {
-                    mk.device().poll(wgpu::Maintain::Poll);
+                if let Some(ref kernel) = self.gpu_kernel {
+                    kernel.device().poll(wgpu::Maintain::Poll);
                 }
 
                 // Handle evolution actions (outside renderer borrow)

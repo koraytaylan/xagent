@@ -12,7 +12,7 @@ use xagent_shared::{BrainConfig, WorldConfig};
 use crate::buffers::*;
 
 /// Number of async staging slots for state readback.
-/// Triple-buffering gives readback enough headroom while keeping the GPU
+/// Six slots give async readback additional headroom while keeping the GPU
 /// queue shallow enough that `queue.submit()` never blocks.
 const STAGING_SLOTS: usize = 6;
 
@@ -1411,7 +1411,7 @@ impl GpuKernel {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dispatch_kernel_phys"),
+                    label: Some("dispatch_kernel_physics_remainder"),
                 });
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -1423,11 +1423,13 @@ impl GpuKernel {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Opportunistic staging copy: only when a slot is free.
+        // Opportunistic staging copy: scan for any free slot.
         // Compute dispatch above always runs — staging readback is
         // decoupled so dispatch is never blocked by readback latency.
-        let widx = self.staging_index;
-        if !self.staging_in_flight[widx] {
+        let write_slot = (0..STAGING_SLOTS)
+            .map(|offset| (self.staging_index + offset) % STAGING_SLOTS)
+            .find(|&slot| !self.staging_in_flight[slot]);
+        if let Some(slot_index) = write_slot {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1436,7 +1438,7 @@ impl GpuKernel {
             encoder.copy_buffer_to_buffer(
                 &self.agent_phys_buffer,
                 0,
-                &self.state_staging[widx],
+                &self.state_staging[slot_index],
                 0,
                 buf_size,
             );
@@ -1445,19 +1447,19 @@ impl GpuKernel {
                 encoder.copy_buffer_to_buffer(
                     &self.food_state_buffer,
                     0,
-                    &self.food_staging[widx],
+                    &self.food_staging[slot_index],
                     0,
                     food_size,
                 );
             }
             self.queue.submit(std::iter::once(encoder.finish()));
 
-            self.staging_ready[widx].store(0, Ordering::Release);
-            self.staging_had_error[widx].store(false, Ordering::Release);
+            self.staging_ready[slot_index].store(0, Ordering::Release);
+            self.staging_had_error[slot_index].store(false, Ordering::Release);
 
-            let phys_flag = self.staging_ready[widx].clone();
-            let phys_err = self.staging_had_error[widx].clone();
-            self.state_staging[widx].slice(..buf_size).map_async(
+            let phys_flag = self.staging_ready[slot_index].clone();
+            let phys_err = self.staging_had_error[slot_index].clone();
+            self.state_staging[slot_index].slice(..buf_size).map_async(
                 wgpu::MapMode::Read,
                 move |result| {
                     if result.is_err() {
@@ -1468,9 +1470,9 @@ impl GpuKernel {
             );
             if self.food_count > 0 {
                 let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                let food_flag = self.staging_ready[widx].clone();
-                let food_err = self.staging_had_error[widx].clone();
-                self.food_staging[widx].slice(..food_size).map_async(
+                let food_flag = self.staging_ready[slot_index].clone();
+                let food_err = self.staging_had_error[slot_index].clone();
+                self.food_staging[slot_index].slice(..food_size).map_async(
                     wgpu::MapMode::Read,
                     move |result| {
                         if result.is_err() {
@@ -1480,8 +1482,8 @@ impl GpuKernel {
                     },
                 );
             }
-            self.staging_in_flight[widx] = true;
-            self.staging_index = (self.staging_index + 1) % STAGING_SLOTS;
+            self.staging_in_flight[slot_index] = true;
+            self.staging_index = (slot_index + 1) % STAGING_SLOTS;
         }
 
         self.active_config_index = 1 - self.active_config_index;

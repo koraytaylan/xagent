@@ -617,8 +617,9 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
 /// affect simulation results, as long as each batch is a multiple of
 /// `kernel_batch_size` (= `vision_stride * brain_tick_stride`, default 100).
 ///
-/// Uses a single GPU kernel instance and re-uploads initial state
-/// between runs to avoid cross-device FP non-determinism.
+/// Each run creates a fresh kernel from the same initial state so the
+/// comparison focuses on whether different batch decompositions change
+/// the simulation result.
 ///
 /// Test cases (all multiples of 100, total = 1000):
 ///   1. 1 × 1000   (1 dispatch)
@@ -662,26 +663,26 @@ fn deterministic_across_batch_sizes() {
     // Helper: create a fresh kernel with deterministic brain state,
     // dispatch total_ticks in given batch size, return final position.
     let run_with_batch_size = |batch_size: u32| -> [f32; 3] {
-        let mut mk = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
-        let kbs = mk.kernel_batch_size();
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        let kernel_batch = kernel.kernel_batch_size();
         assert_eq!(
-            batch_size % kbs,
+            batch_size % kernel_batch,
             0,
             "batch_size {} must be a multiple of kernel_batch_size {}",
             batch_size,
-            kbs
+            kernel_batch
         );
         // Overwrite random brain state with deterministic seed
-        mk.reset_agents_seeded(&brain, 12345);
-        mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
-        mk.upload_agents(&agent_data);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
 
         let num_batches = total_ticks / batch_size;
         for i in 0..num_batches {
-            mk.dispatch_batch((i * batch_size) as u64, batch_size);
+            kernel.dispatch_batch((i * batch_size) as u64, batch_size);
         }
 
-        let state = mk.read_full_state_blocking();
+        let state = kernel.read_full_state_blocking();
         [state[P_POS_X], state[P_POS_Y], state[P_POS_Z]]
     };
 

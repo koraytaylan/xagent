@@ -2,7 +2,9 @@
 // dispatch(agent_count, 1, 1) — one workgroup per agent.
 // 256 threads cooperate on the 7 brain passes via shared memory.
 
-// ── Shared memory (~2.5 KB) ────────────────────────────────────────────────
+const BRAIN_WORKGROUP_SIZE: u32 = 256u;
+
+// ── Shared memory (~2.5 KB at default 8×6; scales with FEATURE_COUNT) ──────
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, 32>;
@@ -40,23 +42,30 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 1: Feature extract (thread 0 — reads scale with
-// VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25, not a bottleneck)
+// Pass 1: Feature extract — all threads cooperatively load vision data,
+// thread 0 handles the 25 non-visual features (velocity, facing, touch).
+// Vision copy scales with VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
+// parallelizing across BRAIN_WORKGROUP_SIZE threads keeps it fast at any
+// resolution.
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_feature_extract(agent_id: u32, tid: u32) {
+    let s_base = agent_id * SENSORY_STRIDE;
+
+    // All threads cooperatively copy vision color + depth into s_features.
+    // sensory_buf layout: [color(VISION_COLOR_COUNT) | depth(VISION_DEPTH_COUNT) | non-visual]
+    // s_features layout:  [color(VISION_COLOR_COUNT) | depth(VISION_DEPTH_COUNT) | non-visual(25)]
+    // The vision portion maps 1:1 between the two buffers.
+    let vision_count = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
+    for (var i = tid; i < vision_count; i += BRAIN_WORKGROUP_SIZE) {
+        s_features[i] = sensory_buf[s_base + i];
+    }
+
+    // Non-visual features (25 values) — thread 0 only.
+    // Velocity magnitude requires a sqrt, so this can't be a bulk copy.
     if (tid == 0u) {
-        let s_base = agent_id * SENSORY_STRIDE;
-        var fi: u32 = 0u;
-        for (var i: u32 = 0u; i < VISION_COLOR_COUNT; i = i + 1u) {
-            s_features[fi] = sensory_buf[s_base + i];
-            fi = fi + 1u;
-        }
-        for (var i: u32 = 0u; i < VISION_DEPTH_COUNT; i = i + 1u) {
-            s_features[fi] = sensory_buf[s_base + VISION_COLOR_COUNT + i];
-            fi = fi + 1u;
-        }
-        let vel_offset = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
+        var fi = vision_count;
+        let vel_offset = vision_count;
         let vx = sensory_buf[s_base + vel_offset];
         let vy = sensory_buf[s_base + vel_offset + 1u];
         let vz = sensory_buf[s_base + vel_offset + 2u];

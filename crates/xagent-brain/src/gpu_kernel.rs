@@ -107,9 +107,9 @@ pub struct GpuKernel {
     // staging_ready counts completed map_async callbacks (need 2: phys + food).
     state_staging: [wgpu::Buffer; 2],
     food_staging: [wgpu::Buffer; 2],
-    staging_index: usize,                // which buffer to write NEXT
-    staging_in_flight: [bool; 2],        // submitted, not yet collected
-    staging_ready: [Arc<AtomicU32>; 2],  // map_async callbacks completed (need 2)
+    staging_index: usize,               // which buffer to write NEXT
+    staging_in_flight: [bool; 2],       // submitted, not yet collected
+    staging_ready: [Arc<AtomicU32>; 2], // map_async callbacks completed (need 2)
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
 
@@ -978,10 +978,7 @@ impl GpuKernel {
             food_staging,
             staging_index: 0,
             staging_in_flight: [false, false],
-            staging_ready: [
-                Arc::new(AtomicU32::new(0)),
-                Arc::new(AtomicU32::new(0)),
-            ],
+            staging_ready: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
             state_cache: vec![0.0; n * PHYS_STRIDE],
             food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
             telemetry_staging,

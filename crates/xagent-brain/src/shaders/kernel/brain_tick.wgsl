@@ -351,7 +351,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             if (abs(improvement) < DEADZONE) {
                 credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
             }
-            if (abs(credit_input) < DEADZONE) { continue; }
+            // Epsilon gate: skip near-zero tonic signals (non-tonic path
+            // already guarantees abs >= DEADZONE)
+            if (abs(credit_input) < 1e-6) { continue; }
             var effective: f32;
             if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
             else { effective = credit_input; }

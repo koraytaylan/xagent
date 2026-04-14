@@ -354,7 +354,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
                 is_tonic = true;
             }
             if (!is_tonic && abs(credit_input) < DEADZONE) { continue; }
-            if (abs(credit_input) < 1e-6) { continue; }
+            // Epsilon gate: skip near-zero tonic signals that would produce negligible weight updates.
+            // Non-tonic path already enforces abs(credit_input) >= DEADZONE, so this only matters for tonic.
+            if (is_tonic && abs(credit_input) < 1e-6) { continue; }
             var effective: f32;
             if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
             else { effective = credit_input; }

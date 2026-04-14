@@ -33,14 +33,37 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.1, 1.0]. Default 0.6.
     #[serde(default = "default_max_curiosity_bonus")]
     pub max_curiosity_bonus: f32,
-    /// Scales motor variance into fatigue relief. Higher = easier recovery from fatigue.
-    /// Heritable: mutated during breeding, clamped to [2.0, 20.0]. Default 8.0.
-    #[serde(default = "default_fatigue_recovery_sensitivity")]
-    pub fatigue_recovery_sensitivity: f32,
     /// Minimum motor output under fatigue. Lower = harsher dampening.
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
+    /// Visual field width in pixels. Default 8.
+    #[serde(default = "default_vision_width", alias = "vision_w")]
+    pub vision_width: u32,
+    /// Visual field height in pixels. Default 6.
+    #[serde(default = "default_vision_height", alias = "vision_h")]
+    pub vision_height: u32,
+    /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
+    /// Default 10.
+    #[serde(default = "default_brain_tick_stride")]
+    pub brain_tick_stride: u32,
+    /// Brain cycles between global passes (grid rebuild, collisions, vision).
+    /// Higher = more brain throughput, less frequent vision updates.
+    /// Default 10.
+    #[serde(default = "default_vision_stride")]
+    pub vision_stride: u32,
+    /// Multiplier for all energy costs (metabolic + movement). Default 0.01.
+    /// Lower = agents survive longer. Higher = harsher energy pressure.
+    #[serde(default = "default_metabolic_rate")]
+    pub metabolic_rate: f32,
+    /// Multiplier for integrity damage and regen. Default 0.01.
+    /// Lower = agents take less damage. Higher = hazard zones are deadlier.
+    #[serde(default = "default_integrity_scale")]
+    pub integrity_scale: f32,
+    /// Base movement speed (units per second). Default 8.0.
+    /// Heritable: mutated during breeding, clamped to [2.0, 20.0].
+    #[serde(default = "default_movement_speed")]
+    pub movement_speed: f32,
 }
 
 /// Configuration for the world simulation.
@@ -79,16 +102,40 @@ fn default_max_curiosity_bonus() -> f32 {
     0.6
 }
 
-fn default_fatigue_recovery_sensitivity() -> f32 {
-    8.0
-}
-
 fn default_fatigue_floor() -> f32 {
     0.1
 }
 
+fn default_vision_width() -> u32 {
+    8
+}
+
+fn default_vision_height() -> u32 {
+    6
+}
+
 fn default_seed() -> u64 {
     42
+}
+
+fn default_brain_tick_stride() -> u32 {
+    10
+}
+
+fn default_vision_stride() -> u32 {
+    10
+}
+
+fn default_metabolic_rate() -> f32 {
+    0.01
+}
+
+fn default_integrity_scale() -> f32 {
+    0.01
+}
+
+fn default_movement_speed() -> f32 {
+    8.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -174,7 +221,7 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             population_size: 10,
-            tick_budget: 50_000,
+            tick_budget: 1_000_000,
             elitism_count: 3,
             max_generations: 0,
             patience: 5,
@@ -199,8 +246,14 @@ impl Default for BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_width: default_vision_width(),
+            vision_height: default_vision_height(),
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 }
@@ -218,8 +271,14 @@ impl BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_width: 6,
+            vision_height: 4,
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 
@@ -235,8 +294,14 @@ impl BrainConfig {
             distress_exponent: 2.0,
             habituation_sensitivity: 20.0,
             max_curiosity_bonus: 0.6,
-            fatigue_recovery_sensitivity: 8.0,
             fatigue_floor: 0.1,
+            vision_width: 12,
+            vision_height: 8,
+            brain_tick_stride: default_brain_tick_stride(),
+            vision_stride: default_vision_stride(),
+            metabolic_rate: default_metabolic_rate(),
+            integrity_scale: default_integrity_scale(),
+            movement_speed: default_movement_speed(),
         }
     }
 }
@@ -290,8 +355,31 @@ impl Default for AgentDescriptor {
             brain: BrainConfig::default(),
             max_energy: 100.0,
             max_integrity: 100.0,
-            visual_resolution: (16, 12),
+            visual_resolution: (8, 6),
             fov_degrees: 90.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brain_config_tuned_defaults() {
+        let config = BrainConfig::default();
+        assert_eq!(config.brain_tick_stride, 10);
+        assert_eq!(config.vision_stride, 10);
+        assert_eq!(config.vision_width, 8);
+        assert_eq!(config.vision_height, 6);
+        assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
+        assert!((config.integrity_scale - 0.01).abs() < 1e-6);
+        assert!((config.movement_speed - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn governor_config_tuned_defaults() {
+        let config = GovernorConfig::default();
+        assert_eq!(config.tick_budget, 1_000_000);
     }
 }

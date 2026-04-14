@@ -30,10 +30,23 @@ impl FoodItem {
     }
 }
 
-/// Scatter food items across food-rich biomes.
+/// Scatter food items across food-rich biomes using the thread-local RNG.
+///
+/// Prefer [`spawn_food_seeded`] for deterministic world generation.
 pub fn spawn_food(terrain: &TerrainData, biome_map: &BiomeMap, density: f32) -> Vec<FoodItem> {
+    spawn_food_seeded(terrain, biome_map, density, rand::rng())
+}
+
+/// Scatter food items across food-rich biomes using a caller-supplied RNG.
+///
+/// Passing a seeded `SmallRng` produces deterministic worlds for a given seed.
+pub fn spawn_food_seeded(
+    terrain: &TerrainData,
+    biome_map: &BiomeMap,
+    density: f32,
+    mut rng: impl Rng,
+) -> Vec<FoodItem> {
     let half = terrain.size / 2.0;
-    let mut rng = rand::rng();
     let mut items = Vec::new();
 
     let step = 4.0; // sample grid spacing
@@ -83,15 +96,18 @@ pub fn generate_food_mesh(items: &[FoodItem]) -> Mesh {
 /// relocates to a new random position in a food-rich biome, forcing agents
 /// to forage rather than camp a single spot.
 /// Tick food respawn timers. Returns indices of food items that respawned.
+///
+/// The `rng` parameter should be the world's seeded RNG for deterministic
+/// food respawn positions.
 pub fn update_food(
     items: &mut [FoodItem],
     dt: f32,
     terrain: &TerrainData,
     biome_map: &BiomeMap,
     respawned_indices: &mut Vec<usize>,
+    rng: &mut impl Rng,
 ) {
     respawned_indices.clear();
-    let mut rng = rand::rng();
     let half = terrain.size / 2.0;
 
     for (i, item) in items.iter_mut().enumerate() {
@@ -121,7 +137,7 @@ pub fn update_food(
 fn append_cube(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    pos: Vec3,
+    position: Vec3,
     size: f32,
     color: [f32; 3],
 ) {
@@ -130,14 +146,14 @@ fn append_cube(
 
     #[rustfmt::skip]
     let p: [[f32; 3]; 8] = [
-        [pos.x - h, pos.y - h, pos.z + h],
-        [pos.x + h, pos.y - h, pos.z + h],
-        [pos.x + h, pos.y + h, pos.z + h],
-        [pos.x - h, pos.y + h, pos.z + h],
-        [pos.x - h, pos.y - h, pos.z - h],
-        [pos.x + h, pos.y - h, pos.z - h],
-        [pos.x + h, pos.y + h, pos.z - h],
-        [pos.x - h, pos.y + h, pos.z - h],
+        [position.x - h, position.y - h, position.z + h],
+        [position.x + h, position.y - h, position.z + h],
+        [position.x + h, position.y + h, position.z + h],
+        [position.x - h, position.y + h, position.z + h],
+        [position.x - h, position.y - h, position.z - h],
+        [position.x + h, position.y - h, position.z - h],
+        [position.x + h, position.y + h, position.z - h],
+        [position.x - h, position.y + h, position.z - h],
     ];
 
     let shades = [1.0_f32, 0.9, 0.85, 0.7, 0.8, 0.75];
@@ -152,10 +168,22 @@ fn append_cube(
         let col = [color[0] * s, color[1] * s, color[2] * s];
         let fb = base + (fi as u32) * 4;
 
-        vertices.push(Vertex { position: p[a], color: col });
-        vertices.push(Vertex { position: p[b], color: col });
-        vertices.push(Vertex { position: p[c], color: col });
-        vertices.push(Vertex { position: p[d], color: col });
+        vertices.push(Vertex {
+            position: p[a],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[b],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[c],
+            color: col,
+        });
+        vertices.push(Vertex {
+            position: p[d],
+            color: col,
+        });
 
         indices.extend_from_slice(&[fb, fb + 1, fb + 2, fb, fb + 2, fb + 3]);
     }

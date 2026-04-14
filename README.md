@@ -73,33 +73,38 @@ Sandbox                          Brain
 
 ## 3. The Cognitive Architecture
 
-Each tick, the brain executes a single loop:
+Each agent brain is a 7-stage predictive processing pipeline running entirely on GPU:
 
 ```
-encode → habituate → recall → predict → compare → learn → act → fatigue
+feature_extract → encode → habituate_homeo → recall_score → recall_topk → predict_and_act → learn_and_store
 ```
+
+### Dispatch Modes
+
+Two dispatch modes are available:
+
+- **GpuBrain (7-pass)**: One compute dispatch per pass per tick, one thread per agent (`@workgroup_size(1)`). Simple, inspectable, used for small-scale experiments.
+- **GpuKernel (fused)**: All per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) fused into a single dispatch per `vision_stride` cycles. Each agent gets a 256-thread workgroup. A separate global pass handles grid rebuild, collisions, and vision raycasting. This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement over per-tick dispatch.
+
+The `vision_stride` parameter (default 10) controls how many brain+physics cycles run between global passes (grid rebuild, collision, vision). Higher values mean more brain throughput but less frequent sensory updates.
 
 ### Step-by-Step
 
-1. **Encode** — The `SensoryEncoder` compresses the raw `SensoryFrame` into a fixed-size numerical vector (`EncodedState`). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque `Vec<f32>`, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
-1a. **Habituate** — `SensoryHabituation` attenuates encoded dimensions that haven't changed recently (boredom). Produces a curiosity bonus that boosts exploration when sensory input is monotonous. The raw encoding is preserved for telemetry; the habituated state flows to all downstream components.
+1. **Feature Extract** — Extracts 217 features from the packed sensory input (192 RGBA vision + 48 depth + 27 non-visual). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
 
-2. **Recall** — `PatternMemory` retrieves the most similar past experiences within a capacity budget set by the `CapacityManager`. The budget adapts: high prediction error → more recall slots to gather context.
+2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 32-dimensional encoded state. This fixed-size representation is the common currency of all downstream passes.
 
-3. **Predict** — The `Predictor` generates an expected next state by applying a learned linear transform to the current encoding, blended with recalled context patterns weighted by similarity.
+3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
 
-4. **Compare** — The prediction from the *previous* tick is compared against the *current* encoding. The RMSE between them is the **prediction error** — the universal learning signal.
+4. **Recall Score** — Computes cosine similarity between the habituated state and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
 
-5. **Learn** — Prediction error drives all adaptation:
-   - **Predictor weights** update via online gradient descent
-   - **Memory reinforcement** strengthens patterns that co-occur with low error
-   - **Encoder weights** receive L2 regularization to stay bounded
-   - **Learning rate** is modulated by homeostatic gradient magnitude
+5. **Recall Top-K** — Selects the 16 most similar patterns from the score vector and updates their recall metadata (timestamps, access counts).
 
-6. **Act** — The `ActionSelector` produces a continuous motor command (forward + turn) via a learned linear policy — weight matrices mapping encoded state to motor channel outputs. Credit assignment updates weights using the homeostatic gradient, modulated by state similarity (cosine) so learning is context-specific. Exploration adds Gaussian noise to motor outputs (adaptive rate 10–85%), boosted by the curiosity bonus from habituation.
+6. **Predict & Act** — Computes prediction error from the previous tick's prediction against the current encoded state. Performs credit assignment over recent action history weighted by homeostatic gradient. Evaluates the linear policy with prospection blending (predicted-future state + top-recalled-memory blend), applies exploration noise (adaptive rate 10–85%) and motor fatigue dampening (repetitive commands are attenuated, forcing loop-breaking).
 
-6a. **Fatigue** — `MotorFatigue` tracks recent motor output variance. Repetitive commands (low variance) dampen motor output, forcing the agent to break out of loops. Recovery is immediate when output diversifies.
+7. **Learn & Store** — Predictor gradient descent step, encoder Hebbian weight adaptation, memory reinforcement for patterns co-occurring with low error, pattern storage to the weakest slot, and per-pattern decay.
 
 ### Homeostatic Feedback
 
@@ -278,6 +283,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `max_curiosity_bonus` | Exploration boost ceiling from monotony (default 0.6). Higher → stronger curiosity drive. Heritable. |
 | `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
 | `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
+| `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
+| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
+| `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
+| `metabolic_rate` | Multiplier for all energy costs (default 1.0). Lower → agents survive longer. |
+| `integrity_scale` | Multiplier for integrity damage and regen (default 1.0). Higher → deadlier hazards. |
 
 ### World Presets
 
@@ -304,7 +314,12 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "habituation_sensitivity": 20.0,
     "max_curiosity_bonus": 0.6,
     "fatigue_recovery_sensitivity": 8.0,
-    "fatigue_floor": 0.1
+    "fatigue_floor": 0.1,
+    "vision_rays": 48,
+    "brain_tick_stride": 4,
+    "vision_stride": 10,
+    "metabolic_rate": 1.0,
+    "integrity_scale": 1.0
   },
   "world": {
     "world_size": 256.0,
@@ -417,17 +432,25 @@ xagent/
 │   │       ├── sensory.rs      # SensoryFrame, VisualField, TouchContact
 │   │       └── traits.rs       # CognitiveArchitecture trait
 │   │
-│   ├── xagent-brain/           # Cognitive architecture
+│   ├── xagent-brain/           # GPU-resident cognitive architecture
 │   │   ├── README.md           # Deep dive into brain internals
 │   │   └── src/
-│   │       ├── lib.rs          # Re-exports
-│   │       ├── brain.rs        # Brain orchestrator + BrainTelemetry + DecisionSnapshot
-│   │       ├── encoder.rs      # SensoryEncoder (feature extraction + projection)
-│   │       ├── memory.rs       # PatternMemory (store, recall, associate, decay)
-│   │       ├── predictor.rs    # Predictor (state prediction + gradient descent)
-│   │       ├── action.rs       # ActionSelector (linear policy, credit assignment)
-│   │       ├── homeostasis.rs  # HomeostaticMonitor (multi-timescale gradients)
-│   │       └── capacity.rs     # CapacityManager (adaptive recall budgets)
+│   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
+│   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
+│   │       ├── gpu_kernel.rs  # GpuKernel — fused dispatch, telemetry readback
+│   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
+│   │       └── shaders/
+│   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
+│   │           ├── encode.wgsl           # Pass 2: features × weights → 32-dim encoded
+│   │           ├── habituate_homeo.wgsl  # Pass 3: habituation EMA + homeostasis
+│   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
+│   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
+│   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
+│   │           ├── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
+│   │           └── kernel/
+│   │               ├── common.wgsl       # Shared constants for fused kernel shaders
+│   │               ├── kernel_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
+│   │               └── global_tick.wgsl  # Grid rebuild + collision pass (1,1,1)
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/
@@ -452,7 +475,7 @@ xagent/
 │       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
 │       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
-│           └── integration.rs  # 14 integration tests
+│           └── integration.rs  # 32 integration tests
 └── xagent_log_*.csv            # Generated metric logs (gitignored)
 ```
 
@@ -482,7 +505,55 @@ Minimal assumptions. A reward function encodes the designer's notion of what's "
 
 ---
 
-## 11. Testing
+## 11. Performance Invariants
+
+The simulation's throughput depends on keeping per-tick work on the GPU. These rules are non-negotiable:
+
+- **Per-tick simulation logic belongs in WGSL shaders, never in Rust.** Physics, brain passes, food detection, death/respawn -- all of it runs in compute shaders. Adding per-tick logic on the CPU side defeats the fused-kernel architecture.
+- **The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking).** The Rust side orchestrates dispatches, maps readback buffers, and feeds the UI. It never steps the simulation itself.
+- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** CSV logging, replay recording, and UI snapshot updates happen at frame cadence, not tick cadence.
+- **No CPU-side simulation work should scale with `ticks_to_run` beyond trivial bookkeeping.** The GPU tick budget is capped at 64,000 ticks per frame, and execution may be split across multiple batched dispatches. Rust may still do lightweight per-tick accounting (for example, counters or governance bookkeeping), but any per-tick simulation, physics, sensing, or brain computation on the CPU violates this invariant.
+
+---
+
+## 12. Contributing Guidelines
+
+These rules are distilled from 88 review comments across PRs #33–#49. They represent the project's hard-won invariants.
+
+### GPU & Buffer Safety
+- **All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants.** Hardcoded strides like `SENSORY_STRIDE` break when `BrainLayout` uses non-default vision dimensions.
+- **Validate index and count inputs against kernel state before computing buffer offsets.** Out-of-bounds offsets trigger wgpu validation errors or silent corruption.
+- **Constants shared between Rust and WGSL must have a single canonical source within a given shader pipeline / concatenated header set.** A pipeline may use either the `wgsl_physics_constants()` template or the `wconfig` uniform buffer for a given constant, but do not define the same constant from both sources when headers are combined. Use named constants, not magic indices (e.g., `WC_FOOD_RADIUS`, not `wc(7u)`).
+
+### Async Readback
+- **Track in-flight state explicitly.** Never overwrite a pending `map_async` operation without unmapping/cleaning up the previous one first.
+- **Always handle both success and failure paths.** If any `map_async` callback fails, the system must clean up and allow retry — "stuck forever" states are bugs.
+- **Establish data authority.** When physics readback and telemetry readback both provide the same field, document which is authoritative and never overwrite fresher data with stale async results.
+- **Unmap staging buffers on all paths:** success, error, agent switch, and generation reset.
+
+### Concurrency
+- **All SQLite connections must set `busy_timeout`.** The default is 0 (instant `SQLITE_BUSY` failure). Both main and background connections need matching timeout policies.
+- **Background threads must have a deterministic shutdown path.** Drop sender → `recv` returns `Disconnected` → thread exits. `Drop` impls must join threads and log any panics.
+- **Return `Result` or `Option` from fallible operations.** Never use `.expect()` for I/O, GPU, or thread operations. Silent failures are worse than explicit errors.
+
+### Performance
+- **Never clone large collections in per-frame hot paths.** Use `clone_from()` for in-place updates or borrow patterns. A throttled rebuild is useless if you deep-clone every frame.
+- **Use squared-distance comparisons to avoid `sqrt()` in loops.** Both CPU and GPU code should use `_SQ` variants for radius checks.
+- **Only mark throttle windows as consumed when work actually happens.** Updating `last_rebuild` without rebuilding silently wastes the throttle budget.
+
+### Documentation & Naming
+- **Docstrings must match implementation.** "Non-blocking" means non-blocking, "pre-allocates" means pre-allocates. Rename functions when behavior changes (e.g., `read_agent_telemetry` → `read_agent_telemetry_blocking`).
+- **Distinguish "start operation" from "poll/collect operation" in API naming.** A function that both starts and polls should document that clearly.
+- **Keep PR descriptions synchronized with code.** Constant values, radius sizes, and architectural claims must reflect what the code actually does.
+
+### Testing
+- **New concurrency-sensitive code paths require end-to-end tests** exercising the async lifecycle: request → complete → consume, and request → fail → cleanup.
+- **Cache invalidation must be tested:** populate → invalidate → verify fresh data returned.
+- **Non-trivial algorithms need unit tests** with representative inputs and boundary conditions.
+
+---
+
+## 13. Testing
 
 ```bash
 # Run all tests across the workspace
@@ -500,16 +571,17 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ### Test Coverage Summary
 
-**58 tests total** across the workspace:
+**134 tests total** across the workspace:
 
 | Crate | Tests | Scope |
 |-------|------:|-------|
-| **xagent-brain** | 44 | Encoder similarity/determinism, memory store/recall/decay/associations/temporal sequences, predictor convergence/gradient descent, homeostasis multi-timescale gradients/urgency/distress curves, action selector exploration/exploitation/credit assignment, capacity manager adaptive budgets, brain integration (100-tick stability, extreme inputs, prediction error convergence) |
-| **xagent-sandbox** | 14 | Physics (movement, rotation, gravity, NaN sanitization), agent lifecycle (energy depletion, death, food consumption), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy) |
+| **xagent-brain** | 38 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling, fused kernel tick loop, deterministic bench |
+| **xagent-shared** | 1 | Config defaults (vision_stride) |
+| **xagent-sandbox** | 95 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
 
 ---
 
-## 12. Future Directions
+## 14. Future Directions
 
 - **Multi-agent communication** — Agents could emit and perceive signals (sound, visual markers), enabling emergent social behaviors, cooperation, or competition.
 - **Dynamic memory growth** — Allow memory capacity to expand based on environmental complexity, simulating neuroplasticity.

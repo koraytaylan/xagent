@@ -26,15 +26,48 @@ pub fn extract_senses(agent: &AgentBody, world: &WorldState, tick: u64, frame: &
 
 /// Produce a sensory frame with awareness of other agents given as a
 /// shared positions slice. Skips agent at `self_index` automatically.
+/// Uses the spatial `AgentGrid` for O(1) proximity queries in vision and touch.
 pub fn extract_senses_with_positions(
     agent: &AgentBody,
     world: &WorldState,
     tick: u64,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     frame: &mut SensoryFrame,
 ) {
-    sample_vision_positions(agent, world, all_positions, self_index, &mut frame.vision);
+    sample_vision_positions(
+        agent,
+        world,
+        all_positions,
+        self_index,
+        agent_grid,
+        &mut frame.vision,
+    );
+    fill_frame_non_vision(
+        agent,
+        world,
+        tick,
+        all_positions,
+        self_index,
+        agent_grid,
+        frame,
+    );
+}
+
+/// Fill non-vision parts of a sensory frame (proprioception, interoception, touch).
+///
+/// Used by the GPU bench path: vision is filled from GPU output, then this
+/// function fills the remaining fields from CPU-accessible agent state.
+pub fn fill_frame_non_vision(
+    agent: &AgentBody,
+    world: &WorldState,
+    tick: u64,
+    all_positions: &[(Vec3, bool)],
+    self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
+    frame: &mut SensoryFrame,
+) {
     frame.velocity = agent.body.velocity;
     frame.facing = agent.body.facing;
     frame.angular_velocity = agent.angular_velocity;
@@ -43,7 +76,14 @@ pub fn extract_senses_with_positions(
     frame.energy_delta = agent.energy_delta();
     frame.integrity_delta = agent.integrity_delta();
     frame.touch_contacts.clear();
-    detect_touch_positions(agent, world, all_positions, self_index, &mut frame.touch_contacts);
+    detect_touch_positions(
+        agent,
+        world,
+        all_positions,
+        self_index,
+        agent_grid,
+        &mut frame.touch_contacts,
+    );
     frame.tick = tick;
 }
 
@@ -72,9 +112,14 @@ pub fn extract_senses_with_others(
 // ── vision ──────────────────────────────────────────────────────────────
 
 /// Low-resolution raycast sampling of terrain colors in front of the agent.
-/// Resolution is 8×6 (48 rays) with step size 1.0 for efficient marching.
+/// Resolution is driven by `vf.width × vf.height` with step size 1.0 for efficient marching.
 /// Also detects other agents along each ray. Writes into existing `vf` buffer.
-fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], vf: &mut VisualField) {
+fn sample_vision(
+    agent: &AgentBody,
+    world: &WorldState,
+    others: &[OtherAgent],
+    vf: &mut VisualField,
+) {
     let w = vf.width;
     let h = vf.height;
     vf.clear();
@@ -96,7 +141,8 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Others(others));
+            let (color, depth) =
+                march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Others(others));
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -109,16 +155,20 @@ fn sample_vision(agent: &AgentBody, world: &WorldState, others: &[OtherAgent], v
     }
 }
 
-/// Discriminated union for the two agent-list representations.
+/// Discriminated union for the agent-list representations.
 /// Avoids duplicating the ray-march loop.
 enum AgentSlice<'a> {
     Others(&'a [OtherAgent]),
-    Positions { all: &'a [(Vec3, bool)], self_index: usize },
+    Grid {
+        grid: &'a crate::world::spatial::AgentGrid,
+        all: &'a [(Vec3, bool)],
+        self_index: usize,
+    },
 }
 
 /// Fixed-step ray marching for terrain, food, and agent intersection.
 ///
-/// Advances a ray from `origin` in direction `dir` in increments of `step` units,
+/// Advances a ray from `origin` in direction `direction` in increments of `step` units,
 /// checking for food items, other agents, and terrain at each step. Returns the
 /// hit color and distance traveled. If no hit within `max_dist`, returns sky color.
 ///
@@ -128,7 +178,7 @@ enum AgentSlice<'a> {
 /// zero directional signal for food.
 fn march_ray_unified(
     origin: Vec3,
-    dir: Vec3,
+    direction: Vec3,
     world: &WorldState,
     max_dist: f32,
     step: f32,
@@ -141,17 +191,17 @@ fn march_ray_unified(
     let food_radius_sq: f32 = 1.0 * 1.0;
 
     // Early-out: upward-pointing rays above terrain are almost certainly sky.
-    if dir.y > 0.3 {
+    if direction.y > 0.3 {
         let origin_h = world.terrain.height_at(origin.x, origin.z);
         if origin.y > origin_h {
             return (sky, max_dist);
         }
     }
 
-    let mut t = 0.0_f32;
-    while t < max_dist {
-        let p = origin + dir * t;
-
+    let num_steps = (max_dist / step) as u32;
+    let dir_step = direction * step;
+    let mut p = origin;
+    for s in 0..num_steps {
         // Check food items via spatial grid (O(1) per step)
         for idx in world.food_grid.query_nearby(p.x, p.z) {
             let food = &world.food_items[idx];
@@ -160,7 +210,7 @@ fn march_ray_unified(
             }
             let diff = p - food.position;
             if diff.length_squared() < food_radius_sq {
-                return (food_color, t);
+                return (food_color, s as f32 * step);
             }
         }
 
@@ -173,18 +223,26 @@ fn march_ray_unified(
                     }
                     let diff = p - other.position;
                     if diff.length_squared() < agent_radius_sq {
-                        return (agent_color, t);
+                        return (agent_color, s as f32 * step);
                     }
                 }
             }
-            AgentSlice::Positions { all, self_index } => {
-                for (j, (other_pos, alive)) in all.iter().enumerate() {
-                    if j == *self_index || !alive {
+            AgentSlice::Grid {
+                grid,
+                all,
+                self_index,
+            } => {
+                for j in grid.query_nearby(p.x, p.z) {
+                    if j == *self_index {
                         continue;
                     }
-                    let diff = p - *other_pos;
+                    let (other_pos, alive) = all[j];
+                    if !alive {
+                        continue;
+                    }
+                    let diff = p - other_pos;
                     if diff.length_squared() < agent_radius_sq {
-                        return (agent_color, t);
+                        return (agent_color, s as f32 * step);
                     }
                 }
             }
@@ -198,9 +256,9 @@ fn march_ray_unified(
                 BiomeType::Barren => [0.50, 0.40, 0.20, 1.0],
                 BiomeType::Danger => [0.60, 0.20, 0.10, 1.0],
             };
-            return (c, t);
+            return (c, s as f32 * step);
         }
-        t += step;
+        p += dir_step;
     }
     (sky, max_dist)
 }
@@ -291,12 +349,13 @@ fn detect_touch(agent: &AgentBody, world: &WorldState, contacts: &mut Vec<TouchC
 
 // ── position-slice variants (C2: avoid Vec<OtherAgent> allocation) ──────
 
-/// Vision sampling using a shared positions slice.
+/// Vision sampling using a shared positions slice and spatial agent grid.
 fn sample_vision_positions(
     agent: &AgentBody,
     world: &WorldState,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     vf: &mut VisualField,
 ) {
     let w = vf.width;
@@ -320,7 +379,18 @@ fn sample_vision_positions(
 
             let ray = (fwd + right * u * tan_hf + Vec3::Y * (-v) * tan_hf).normalize_or_zero();
 
-            let (color, depth) = march_ray_unified(pos, ray, world, max_dist, step, AgentSlice::Positions { all: all_positions, self_index });
+            let (color, depth) = march_ray_unified(
+                pos,
+                ray,
+                world,
+                max_dist,
+                step,
+                AgentSlice::Grid {
+                    grid: agent_grid,
+                    all: all_positions,
+                    self_index,
+                },
+            );
 
             let idx = (row * w + col) as usize;
             let ci = idx * 4;
@@ -333,23 +403,28 @@ fn sample_vision_positions(
     }
 }
 
-/// Touch detection using shared positions slice.
+/// Touch detection using shared positions slice and spatial agent grid.
 fn detect_touch_positions(
     agent: &AgentBody,
     world: &WorldState,
     all_positions: &[(Vec3, bool)],
     self_index: usize,
+    agent_grid: &crate::world::spatial::AgentGrid,
     contacts: &mut Vec<TouchContact>,
 ) {
     detect_touch(agent, world, contacts);
 
     let agent_touch_range = 5.0;
     let pos = agent.body.position;
-    for (j, (other_pos, alive)) in all_positions.iter().enumerate() {
-        if j == self_index || !*alive {
+    for j in agent_grid.query_nearby(pos.x, pos.z) {
+        if j == self_index {
             continue;
         }
-        let diff = *other_pos - pos;
+        let (other_pos, alive) = all_positions[j];
+        if !alive {
+            continue;
+        }
+        let diff = other_pos - pos;
         let dist = diff.length();
         if dist < agent_touch_range && dist > 0.01 {
             contacts.push(TouchContact {

@@ -1,35 +1,40 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use egui_wgpu;
 use glam::Vec3;
 use log::info;
 use rand::Rng;
-use rayon::prelude::*;
+
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
-use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, SensoryFrame, WorldConfig};
+use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
-use xagent_sandbox::agent::{
-    mutate_config, mutate_learned_state, senses, Agent, AgentBody, MAX_AGENTS,
+use xagent_brain::buffers::{
+    FOOD_STATE_STRIDE, F_POS_X, F_POS_Z, F_RESPAWN_TIMER, PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT,
+    P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y, P_FACING_Z, P_FATIGUE_FACTOR_OUT,
+    P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT,
+    P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT,
+    P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
+use xagent_brain::{AgentBrainState, GpuKernel};
+use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
+use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
+use xagent_sandbox::headless;
+use xagent_sandbox::overlay;
 use xagent_sandbox::recording::MetricsLogger;
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, InstanceData, Renderer};
-use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
-use xagent_sandbox::gpu_compute::GpuBrainCompute;
-use xagent_sandbox::headless;
-use xagent_sandbox::overlay;
 use xagent_sandbox::ui::{
-    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState, ReplayState,
-    SortMode, Tab, TabContext, WorldSnapshot,
+    AgentSnapshot, EguiIntegration, EvolutionAction, EvolutionSnapshot, EvolutionState,
+    ReplayState, SortMode, Tab, TabContext, WorldSnapshot,
 };
 
 use xagent_sandbox::world::WorldState;
@@ -87,9 +92,25 @@ struct Cli {
     #[arg(long)]
     dump_tree: bool,
 
-    /// Use GPU compute for brain encode + recall (experimental)
+    /// Run headless benchmark (no UI, no DB) and print ticks/sec
     #[arg(long)]
-    gpu_brain: bool,
+    bench: bool,
+
+    /// Number of ticks for --bench mode (default: 10000)
+    #[arg(long, default_value_t = 10_000)]
+    bench_ticks: u64,
+
+    /// Number of agents for --bench mode (default: 10)
+    #[arg(long, default_value_t = 10)]
+    bench_agents: usize,
+
+    /// Override world size for --bench mode (default: from preset)
+    #[arg(long)]
+    world_size: Option<f32>,
+
+    /// Run phase profiler: breaks down time by physics/vision/brain
+    #[arg(long)]
+    bench_profile: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -108,7 +129,10 @@ fn resolve_config(cli: &Cli) -> FullConfig {
             "default" => BrainConfig::default(),
             "large" => BrainConfig::large(),
             other => {
-                eprintln!("Error: Unknown brain preset '{}'. Choose: tiny, default, large", other);
+                eprintln!(
+                    "Error: Unknown brain preset '{}'. Choose: tiny, default, large",
+                    other
+                );
                 std::process::exit(1);
             }
         };
@@ -117,11 +141,18 @@ fn resolve_config(cli: &Cli) -> FullConfig {
             "normal" => WorldConfig::default(),
             "hard" => WorldConfig::hard(),
             other => {
-                eprintln!("Error: Unknown world preset '{}'. Choose: easy, normal, hard", other);
+                eprintln!(
+                    "Error: Unknown world preset '{}'. Choose: easy, normal, hard",
+                    other
+                );
                 std::process::exit(1);
             }
         };
-        FullConfig { brain, world, governor: GovernorConfig::default() }
+        FullConfig {
+            brain,
+            world,
+            governor: GovernorConfig::default(),
+        }
     };
 
     // CLI overrides
@@ -161,53 +192,65 @@ fn print_config(config: &FullConfig) {
     println!("──────────────────────────────────────────────────");
 }
 
-const RESPAWN_COOLDOWN_FRAMES: u32 = 60;
+/// Data collected on the main thread for upload once the background-created
+/// fused kernel is ready.  Avoids passing world/agent refs across threads.
+struct PendingUpload {
+    heights: Vec<f32>,
+    biomes: Vec<u32>,
+    food_pos: Vec<(f32, f32, f32)>,
+    food_consumed: Vec<bool>,
+    food_timers: Vec<f32>,
+    agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
+}
 
 /// Base simulation rate in Hz. The simulation runs at this rate (scaled by
 /// speed multiplier) regardless of rendering frame rate.
 const SIM_RATE: f32 = 60.0;
 const SIM_DT: f32 = 1.0 / SIM_RATE;
 
+/// Minimum interval between expensive mesh rebuilds and snapshot copies.
+/// At 100 ms (10 Hz) the visual difference is indistinguishable from per-frame.
+const REBUILD_THROTTLE: Duration = Duration::from_millis(100);
+
 /// Record per-tick telemetry into agent sparkline histories.
 fn record_agent_histories(agent: &mut Agent) {
-    let t = agent.brain.telemetry();
     let cap = 10_000;
-    let h = &mut agent.prediction_error_history;
-    if h.len() >= cap {
-        h.pop_front();
+    macro_rules! push_hist {
+        ($h:expr, $v:expr) => {
+            if $h.len() >= cap {
+                $h.pop_front();
+            }
+            $h.push_back($v);
+        };
     }
-    h.push_back(t.prediction_error.clamp(0.0, 1.0));
-    let h = &mut agent.exploration_rate_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(agent.brain.action_selector.exploration_rate());
-    let ef = agent.body.body.internal.energy
-        / agent.body.body.internal.max_energy.max(0.001);
-    let h = &mut agent.energy_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(ef.clamp(0.0, 1.0));
-    let inf = agent.body.body.internal.integrity
-        / agent.body.body.internal.max_integrity.max(0.001);
-    let h = &mut agent.integrity_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(inf.clamp(0.0, 1.0));
-    let h = &mut agent.fatigue_history;
-    if h.len() >= cap {
-        h.pop_front();
-    }
-    h.push_back(agent.brain.telemetry().fatigue_factor);
-    if let Some(decision) = agent.brain.last_decision().cloned() {
-        let h = &mut agent.decision_log;
-        if h.len() >= 256 {
-            h.pop_front();
-        }
-        h.push_back(decision);
-    }
+    push_hist!(
+        agent.prediction_error_history,
+        agent.cached_prediction_error
+    );
+    push_hist!(
+        agent.exploration_rate_history,
+        agent.cached_exploration_rate
+    );
+    let ef = agent.body.body.internal.energy / agent.body.body.internal.max_energy.max(0.001);
+    push_hist!(agent.energy_history, ef.clamp(0.0, 1.0));
+    let inf =
+        agent.body.body.internal.integrity / agent.body.body.internal.max_integrity.max(0.001);
+    push_hist!(agent.integrity_history, inf.clamp(0.0, 1.0));
+    push_hist!(agent.fatigue_history, agent.cached_fatigue_factor);
+}
+
+/// State machine for non-blocking generation transitions.
+/// Each variant represents one phase of the multi-frame handoff.
+enum GenTransition {
+    /// Waiting for async readback of the best agent's brain state.
+    AwaitingReadback { result: AdvanceResult },
+    /// Readback collected; waiting for staging buffers to drain before reset.
+    AwaitingReset {
+        result: AdvanceResult,
+        inherited_state: Option<AgentBrainState>,
+        /// Whether population has already been spawned (prevents re-spawn on retry).
+        spawned: bool,
+    },
 }
 
 struct App {
@@ -233,7 +276,7 @@ struct App {
 
     /// Fixed-timestep accumulator — simulation ticks run at SIM_RATE Hz,
     /// decoupled from the render frame rate.
-    sim_accumulator: f32,
+    sim_accumulator: f64,
 
     // Speed controls (multiplier for simulation rate)
     speed_multiplier: u32,
@@ -276,6 +319,13 @@ struct App {
     // Trail overlay for selected agent
     trail_gpu: Option<GpuMesh>,
 
+    // Throttle timers — limit expensive rebuilds to ~10 Hz
+    last_mesh_rebuild: Instant,
+    last_snapshot_rebuild: Instant,
+    snap_dirty: bool,
+    cached_agent_snaps: Vec<AgentSnapshot>,
+    last_snap_chart_window: usize,
+
     // Selection marker above focused agent
     marker_gpu: Option<GpuMesh>,
 
@@ -296,26 +346,27 @@ struct App {
     db_path: String,
     governor_config: GovernorConfig,
 
-    // GPU brain compute (encode + recall offload)
-    gpu_brain: bool,
-    gpu_compute: Option<xagent_sandbox::gpu_compute::GpuBrainCompute>,
+    // Non-blocking generation transition state machine
+    gen_transition: Option<GenTransition>,
 
-    // Per-frame GPU pipeline state: stores previous frame's sensory data
-    // so collect() can apply results with the matching frames.
-    gpu_prev_frames: Vec<Option<SensoryFrame>>,
-    gpu_prev_agent_dims: Vec<(usize, usize)>,
-    // Pre-allocated output buffers for GPU collect (avoid per-frame allocation)
-    gpu_encoded_out: Vec<f32>,
-    gpu_similarities_out: Vec<f32>,
-    // Reusable batch buffers for GPU submit (avoid per-frame allocation)
-    gpu_batch_features: Vec<f32>,
-    gpu_batch_weights: Vec<f32>,
-    gpu_batch_biases: Vec<f32>,
-    gpu_batch_patterns: Vec<f32>,
-    gpu_batch_active: Vec<u32>,
+    // GPU fused kernel (all simulation computation in single dispatch)
+    gpu_kernel: Option<GpuKernel>,
+    pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
+    /// Data collected for upload once the background kernel is ready.
+    pending_upload: Option<PendingUpload>,
+    /// Inherited brain state + mutation strength deferred until a background
+    /// kernel finishes creation (when population size changes at generation
+    /// boundary and `can_reuse` is false).
+    deferred_inherited: Option<(AgentBrainState, f32)>,
 
     // egui_dock tab state
     dock_state: egui_dock::DockState<Tab>,
+
+    // Adaptive GPU tick budget — keeps dispatch under ~8ms wall time
+    gpu_tick_budget: u32,
+
+    // Diagnostic: log first readback Y vs terrain height
+    readback_logged: bool,
 
     // Sidebar sort mode
     sort_mode: SortMode,
@@ -338,7 +389,6 @@ impl App {
         governor_config: GovernorConfig,
         enable_logging: bool,
         db_path: &str,
-        gpu_brain: bool,
     ) -> Self {
         let logger = if enable_logging {
             match MetricsLogger::new() {
@@ -377,7 +427,9 @@ impl App {
                 if let Ok(mut gov) = Governor::resume(db_path) {
                     evo_snapshot.tree_nodes = gov.tree_nodes();
                     evo_snapshot.current_node_id = gov.current_node_id;
-                    evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                    evo_snapshot
+                        .fitness_history
+                        .clone_from(gov.fitness_history_by_island());
                     evo_snapshot.best_fitness = gov.best_score();
                 }
                 println!(
@@ -415,6 +467,7 @@ impl App {
             viewport_hovered: false,
             chart_window: 120,
             orbit_mode: false,
+            readback_logged: false,
             logger,
             agent_instance_buffer: None,
             agent_instance_count: 0,
@@ -427,6 +480,11 @@ impl App {
             heatmap_gpu: None,
             heatmap_dirty: false,
             trail_gpu: None,
+            last_mesh_rebuild: Instant::now(),
+            last_snapshot_rebuild: Instant::now(),
+            snap_dirty: true,
+            cached_agent_snaps: Vec::new(),
+            last_snap_chart_window: 120,
             marker_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
@@ -439,18 +497,13 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            gpu_brain,
-            gpu_compute: None,
-            gpu_prev_frames: Vec::new(),
-            gpu_prev_agent_dims: Vec::new(),
-            gpu_encoded_out: Vec::new(),
-            gpu_similarities_out: Vec::new(),
-            gpu_batch_features: Vec::new(),
-            gpu_batch_weights: Vec::new(),
-            gpu_batch_biases: Vec::new(),
-            gpu_batch_patterns: Vec::new(),
-            gpu_batch_active: Vec::new(),
+            gen_transition: None,
+            gpu_kernel: None,
+            pending_kernel: None,
+            pending_upload: None,
+            deferred_inherited: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
+            gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
             world_snapshot: WorldSnapshot::default(),
             recording: None,
@@ -460,7 +513,7 @@ impl App {
     }
 
     /// Spawn a new agent with the given BrainConfig at a safe random position
-    /// (not in a danger biome).
+    /// (not in a danger biome). The brain_idx is the agent's array index.
     fn spawn_agent(&mut self, config: BrainConfig, generation: u32) {
         if self.agents.len() >= MAX_AGENTS {
             return;
@@ -472,43 +525,103 @@ impl App {
         let id = self.next_agent_id;
         self.next_agent_id += 1;
 
-        let mut agent = Agent::new(id, pos, config, self.tick);
+        let brain_idx = self.agents.len() as u32;
+        let mut agent = Agent::new(id, pos, brain_idx, config, self.tick);
         agent.generation = generation;
 
         self.agents.push(agent);
     }
 
-    /// Ensure GPU compute pipeline matches current agent configuration.
-    /// Creates or recreates the pipeline if dimensions changed.
-    fn ensure_gpu_compute(&mut self) {
-        if !self.gpu_brain || self.agents.is_empty() {
+    /// Ensure GpuKernel is initialized for the current population.
+    fn ensure_gpu_kernel(&mut self) {
+        if self.gpu_kernel.is_some() {
             return;
         }
-        let n = self.agents.len() as u32;
-        // Use max across all agents — mutations may give different structural params
-        let dim = self.agents.iter().map(|a| a.brain.config.representation_dim).max().unwrap() as u32;
-        let fc = self.agents.iter().map(|a| a.brain.encoder.feature_count()).max().unwrap() as u32;
-        let cap = self.agents.iter().map(|a| a.brain.memory.max_capacity()).max().unwrap() as u32;
+        if self.agents.is_empty() {
+            return;
+        }
+        let world = match &self.world {
+            Some(w) => w,
+            None => return,
+        };
 
-        if let Some(ref gpu) = self.gpu_compute {
-            if gpu.matches_config(n, dim, fc, cap) {
-                return;
+        // Check if background creation finished.
+        if let Some(ref handle) = self.pending_kernel {
+            if handle.is_finished() {
+                let handle = self.pending_kernel.take().unwrap();
+                let mk = handle
+                    .join()
+                    .expect("fused kernel background thread panicked");
+                // Upload world + agent data (fast, main thread).
+                if let Some(upload) = self.pending_upload.take() {
+                    mk.upload_world(
+                        &upload.heights,
+                        &upload.biomes,
+                        &upload.food_pos,
+                        &upload.food_consumed,
+                        &upload.food_timers,
+                    );
+                    mk.upload_agents(&upload.agent_data);
+                }
+                let ac = mk.agent_count();
+
+                // Apply deferred inherited state from a generation transition
+                // that occurred while the kernel was being recreated.
+                if let Some((ref state, mutation_strength)) = self.deferred_inherited.take() {
+                    let repeats = self.governor_config.eval_repeats.max(1);
+                    let n = self.agents.len();
+                    let champion = state.clone();
+                    mk.batch_write_agent_states(n, |i| {
+                        if i < repeats {
+                            champion.clone()
+                        } else {
+                            mutate_brain_state(state, mutation_strength)
+                        }
+                    });
+                }
+
+                self.gpu_kernel = Some(mk);
+                self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
             }
+            return; // still creating
         }
 
-        match GpuBrainCompute::try_new(n, dim, fc, cap) {
-            Some(gpu) => {
-                self.log_msg(format!(
-                    "[GPU] Compute pipeline: {} agents, dim={}, features={}, memory={}",
-                    n, dim, fc, cap
-                ));
-                self.gpu_compute = Some(gpu);
-            }
-            None => {
-                self.log_msg("[GPU] No GPU available, falling back to CPU".into());
-                self.gpu_brain = false;
-            }
-        }
+        // Collect data for upload (kept on main thread).
+        let agent_count = self.agents.len() as u32;
+        let food_count = world.food_items.len();
+        let brain_config = self.brain_config.clone();
+        let world_config = world.config.clone();
+
+        self.pending_upload = Some(PendingUpload {
+            heights: world.terrain.heights.clone(),
+            biomes: world.biome_map.grid_as_u32(),
+            food_pos: world
+                .food_items
+                .iter()
+                .map(|f| (f.position.x, f.position.y, f.position.z))
+                .collect(),
+            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
+            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
+            agent_data: self
+                .agents
+                .iter()
+                .map(|a| {
+                    (
+                        a.body.body.position,
+                        a.body.body.internal.max_energy,
+                        a.body.body.internal.max_integrity,
+                        a.brain_config.memory_capacity,
+                        a.brain_config.processing_slots,
+                    )
+                })
+                .collect(),
+        });
+
+        // Spawn background thread for device + shader compilation.
+        self.pending_kernel = Some(std::thread::spawn(move || {
+            GpuKernel::new(agent_count, food_count, &brain_config, &world_config)
+        }));
+        self.log_msg("[GPU] Creating GpuKernel (background)...".into());
     }
 
     fn handle_evolution_action(&mut self, action: EvolutionAction) {
@@ -517,10 +630,13 @@ impl App {
             EvolutionAction::Start => {
                 let brain_config = self.evo_snapshot.edit_brain.clone();
                 let gov_config = self.evo_snapshot.edit_governor.clone();
-                let world_json =
-                    serde_json::to_string(&self.world_config).unwrap_or_default();
-                match Governor::new(&self.db_path, gov_config.clone(), &brain_config, &world_json)
-                {
+                let world_json = serde_json::to_string(&self.world_config).unwrap_or_default();
+                match Governor::new(
+                    &self.db_path,
+                    gov_config.clone(),
+                    &brain_config,
+                    &world_json,
+                ) {
                     Ok(gov) => {
                         self.governor = Some(gov);
                         self.governor_config = gov_config.clone();
@@ -540,7 +656,11 @@ impl App {
                         self.tps_last_reset = Instant::now();
                         self.tps_display = 0.0;
                         self.paused = false;
+                        self.gpu_kernel = None;
+                        self.pending_kernel = None;
+                        self.pending_upload = None;
                         self.spawn_evolution_population();
+                        self.ensure_gpu_kernel();
                         self.log_msg("[EVOLUTION] Started new run".into());
                     }
                     Err(e) => {
@@ -548,34 +668,37 @@ impl App {
                     }
                 }
             }
-            EvolutionAction::Resume => {
-                match Governor::resume(&self.db_path) {
-                    Ok(gov) => {
-                        let cfg = gov.current_config();
-                        self.evo_snapshot.state = EvolutionState::Running;
-                        self.evo_snapshot.generation = gov.generation;
-                        self.governor_config = gov.config.clone();
-                        if let Some(c) = &cfg {
-                            self.brain_config = c.clone();
-                        }
-                        self.governor = Some(gov);
-                        self.evo_wall_accumulated = 0.0;
-                        self.evo_wall_segment_start = Some(Instant::now());
-                        self.tps_tick_count = 0;
-                        self.tps_last_reset = Instant::now();
-                        self.tps_display = 0.0;
-                        self.paused = false;
-                        self.spawn_evolution_population();
-                        self.log_msg("[EVOLUTION] Resumed from database".into());
+            EvolutionAction::Resume => match Governor::resume(&self.db_path) {
+                Ok(gov) => {
+                    let cfg = gov.current_config();
+                    self.evo_snapshot.state = EvolutionState::Running;
+                    self.evo_snapshot.generation = gov.generation;
+                    self.governor_config = gov.config.clone();
+                    if let Some(c) = &cfg {
+                        self.brain_config = c.clone();
                     }
-                    Err(e) => {
-                        self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
-                    }
+                    self.governor = Some(gov);
+                    self.evo_wall_accumulated = 0.0;
+                    self.evo_wall_segment_start = Some(Instant::now());
+                    self.tps_tick_count = 0;
+                    self.tps_last_reset = Instant::now();
+                    self.tps_display = 0.0;
+                    self.paused = false;
+                    self.gpu_kernel = None;
+                    self.pending_kernel = None;
+                    self.pending_upload = None;
+                    self.spawn_evolution_population();
+                    self.ensure_gpu_kernel();
+                    self.log_msg("[EVOLUTION] Resumed from database".into());
                 }
-            }
+                Err(e) => {
+                    self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
+                }
+            },
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
+                self.snap_dirty = true;
                 if let Some(start) = self.evo_wall_segment_start.take() {
                     self.evo_wall_accumulated += start.elapsed().as_secs_f64();
                 }
@@ -592,6 +715,9 @@ impl App {
             }
             EvolutionAction::Reset => {
                 self.governor = None;
+                self.gpu_kernel = None;
+                self.pending_kernel = None;
+                self.pending_upload = None;
                 self.agents.clear();
                 self.next_agent_id = 0;
                 self.tick = 0;
@@ -640,10 +766,11 @@ impl App {
 
         // Start replay recording
         if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
-                .map(|a| (a.id, a.color))
-                .collect();
-            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+            let agent_info: Vec<(u32, [f32; 3])> =
+                self.agents.iter().map(|a| (a.id, a.color)).collect();
+            let initial_food: Vec<[f32; 3]> = world
+                .food_items
+                .iter()
                 .map(|f| [f.position.x, f.position.y, f.position.z])
                 .collect();
             let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
@@ -652,6 +779,8 @@ impl App {
                 &agent_info,
                 &initial_food,
                 self.governor_config.tick_budget as usize,
+                self.brain_config.vision_width,
+                self.brain_config.vision_height,
             ));
         }
     }
@@ -666,10 +795,11 @@ impl App {
 
         // Start replay recording
         if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> = self.agents.iter()
-                .map(|a| (a.id, a.color))
-                .collect();
-            let initial_food: Vec<[f32; 3]> = world.food_items.iter()
+            let agent_info: Vec<(u32, [f32; 3])> =
+                self.agents.iter().map(|a| (a.id, a.color)).collect();
+            let initial_food: Vec<[f32; 3]> = world
+                .food_items
+                .iter()
                 .map(|f| [f.position.x, f.position.y, f.position.z])
                 .collect();
             let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
@@ -678,21 +808,31 @@ impl App {
                 &agent_info,
                 &initial_food,
                 self.governor_config.tick_budget as usize,
+                self.brain_config.vision_width,
+                self.brain_config.vision_height,
             ));
         }
     }
 
-    /// Evaluate the current generation, advance to the next (or finish).
+    /// Evaluate the current generation and begin the async transition.
+    /// The actual GPU work (readback, reset, upload) spans multiple frames
+    /// via `poll_gen_transition`.
     fn advance_generation(&mut self) {
+        // Persist the recording to SQLite before moving to the next generation
+        if let (Some(ref recording), Some(ref mut gov)) = (&self.recording, &mut self.governor) {
+            gov.store_recording(recording);
+        }
         self.last_recording = self.recording.take();
         let wall_secs = self.evo_wall_accumulated
-            + self.evo_wall_segment_start
+            + self
+                .evo_wall_segment_start
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
-        // Evaluate fitness, then capture best agent's learned state using the
-        // actual composite fitness ranking (not the brain's internal metrics).
-        let (result, inherited_state) = {
+        // Evaluate fitness and decide whether evolution continues.
+        // Only kick off the async brain-state readback when the result is
+        // Continue — when Finished, no readback is needed.
+        let (result, readback_requested) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -702,49 +842,221 @@ impl App {
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
 
-            // fitness is sorted by descending composite_fitness — first entry is best
-            let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-            let state = self.agents.get(best_idx).map(|a| a.brain.export_learned_state());
+            let result = gov.advance(&fitness);
 
-            (gov.advance(&fitness), state)
+            // Only read back the best agent's brain state when evolution
+            // continues — Finished needs no inherited state.
+            let mut readback_requested = false;
+            if matches!(result, AdvanceResult::Continue { .. }) {
+                let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
+                if let Some(a) = self.agents.get(best_idx) {
+                    if let Some(mk) = self.gpu_kernel.as_mut() {
+                        if mk.request_agent_state(a.brain_idx) {
+                            readback_requested = true;
+                        }
+                    }
+                }
+            }
+
+            (result, readback_requested)
         };
 
-        // Governor borrow released — safe to call self methods
         match result {
-            AdvanceResult::Continue { configs, messages, mutation_strength } => {
-                for msg in messages {
-                    self.log_msg(msg);
+            AdvanceResult::Continue { .. } if readback_requested => {
+                self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+            }
+            AdvanceResult::Continue { .. } => {
+                // No readback was issued (no best agent or no GPU kernel) —
+                // skip directly to reset to avoid deadlocking in AwaitingReadback.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+            AdvanceResult::Finished { .. } => {
+                // Skip readback phase entirely — go straight to finish.
+                self.gen_transition = Some(GenTransition::AwaitingReset {
+                    result,
+                    inherited_state: None,
+                    spawned: false,
+                });
+            }
+        }
+    }
+
+    /// Drive the multi-frame generation transition state machine.
+    /// Called every frame; returns true while a transition is still in progress.
+    fn poll_gen_transition(&mut self) -> bool {
+        let transition = match self.gen_transition.take() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        match transition {
+            GenTransition::AwaitingReadback { result } => {
+                if self.gpu_kernel.is_none() {
+                    // No kernel — proceed without inherited state.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state: None,
+                        spawned: false,
+                    });
+                    return true;
+                }
+
+                // Poll for the async agent state readback.
+                let collected = self.gpu_kernel.as_mut().unwrap().try_collect_agent_state();
+
+                match collected {
+                    Some(Some(state)) => {
+                        // Readback complete — move to reset phase.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: Some(state),
+                            spawned: false,
+                        });
+                    }
+                    Some(None) => {
+                        // map_async error — proceed without inherited state
+                        // rather than hanging in AwaitingReadback forever.
+                        self.gen_transition = Some(GenTransition::AwaitingReset {
+                            result,
+                            inherited_state: None,
+                            spawned: false,
+                        });
+                    }
+                    None => {
+                        // Still waiting — re-enqueue for next frame.
+                        self.gen_transition = Some(GenTransition::AwaitingReadback { result });
+                    }
+                }
+                true
+            }
+            GenTransition::AwaitingReset {
+                result,
+                inherited_state,
+                spawned,
+            } => {
+                let (done, spawned) =
+                    self.try_finish_generation(&result, inherited_state.as_ref(), spawned);
+                if !done {
+                    // Reset not ready yet — re-enqueue for next frame.
+                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                        result,
+                        inherited_state,
+                        spawned,
+                    });
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Try to complete a generation transition. Returns `(done, spawned)`
+    /// where `done` is false if the GPU staging buffers aren't ready yet
+    /// (caller should retry next frame), and `spawned` tracks whether
+    /// population has been spawned (to avoid re-spawning on retry).
+    fn try_finish_generation(
+        &mut self,
+        result: &AdvanceResult,
+        inherited_state: Option<&AgentBrainState>,
+        mut spawned: bool,
+    ) -> (bool, bool) {
+        match result {
+            AdvanceResult::Continue {
+                configs,
+                messages,
+                mutation_strength,
+            } => {
+                if !spawned {
+                    for msg in messages {
+                        self.log_msg(msg.clone());
+                    }
+                    self.spawn_population_from_configs(configs);
+                    spawned = true;
                 }
                 let repeats = self.governor_config.eval_repeats.max(1);
-                self.spawn_population_from_configs(&configs);
-                // Inherit learned weights: champions get exact weights,
+
+                // Reuse existing kernel if population size matches,
+                // otherwise drop and recreate in background.
+                let can_reuse = self
+                    .gpu_kernel
+                    .as_ref()
+                    .is_some_and(|mk| mk.agent_count() == self.agents.len() as u32);
+
+                if can_reuse {
+                    let mk = self.gpu_kernel.as_mut().unwrap();
+                    // Non-blocking reset — return false to retry next frame
+                    // instead of falling back to a blocking busy-wait.
+                    if !mk.try_reset_agents(&self.brain_config) {
+                        return (false, spawned);
+                    }
+                    let agent_data: Vec<_> = self
+                        .agents
+                        .iter()
+                        .map(|a| {
+                            (
+                                a.body.body.position,
+                                a.body.body.internal.max_energy,
+                                a.body.body.internal.max_integrity,
+                                a.brain_config.memory_capacity,
+                                a.brain_config.processing_slots,
+                            )
+                        })
+                        .collect();
+                    mk.upload_agents(&agent_data);
+                } else {
+                    self.gpu_kernel = None;
+                    self.pending_kernel = None;
+                    self.pending_upload = None;
+                    self.ensure_gpu_kernel();
+                    // Kernel is being recreated in the background —
+                    // keep the transition active until it's ready.
+                    if self.gpu_kernel.is_none() {
+                        return (false, spawned);
+                    }
+                }
+
+                // Inherit learned weights: champions get exact brain state,
                 // mutants get perturbed weights for neuroevolution.
-                if let Some(ref state) = inherited_state {
-                    for (i, agent) in self.agents.iter_mut().enumerate() {
-                        if i < repeats {
-                            // Champion: exact inherited weights
-                            agent.brain.import_learned_state(state);
-                        } else {
-                            // Mutant: inherited weights + small perturbation
-                            let mutated = mutate_learned_state(state, mutation_strength);
-                            agent.brain.import_learned_state(&mutated);
-                        }
+                if let Some(state) = inherited_state {
+                    if let Some(ref mk) = self.gpu_kernel {
+                        let ms = *mutation_strength;
+                        let n = self.agents.len();
+                        // Pre-clone once for all champion slots to avoid
+                        // cloning inside the hot closure on every call.
+                        let champion = state.clone();
+                        mk.batch_write_agent_states(n, |i| {
+                            if i < repeats {
+                                champion.clone()
+                            } else {
+                                mutate_brain_state(state, ms)
+                            }
+                        });
+                    } else {
+                        // Kernel is being recreated in the background
+                        // (population size changed). Stash inherited state
+                        // so it can be applied once the kernel is ready.
+                        self.deferred_inherited = Some((state.clone(), *mutation_strength));
                     }
                 }
             }
             AdvanceResult::Finished { messages } => {
                 for msg in messages {
-                    self.log_msg(msg);
+                    self.log_msg(msg.clone());
                 }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
             }
         }
+        (true, spawned)
     }
 
-    fn log_msg(&mut self, msg: String) {
-        println!("{}", msg);
-        self.console_log.push_back(msg);
+    fn log_msg(&mut self, message: String) {
+        println!("{}", message);
+        self.console_log.push_back(message);
         if self.console_log.len() > 200 {
             self.console_log.pop_front();
         }
@@ -760,7 +1072,7 @@ impl App {
         let parent_id = parent.id;
         let parent_gen = parent.generation;
         let parent_pos = parent.body.body.position;
-        let parent_config = parent.brain.config.clone();
+        let parent_config = parent.brain_config.clone();
 
         let child_config = mutate_config(&parent_config);
         let mut rng = rand::rng();
@@ -780,7 +1092,14 @@ impl App {
         let cz = child_pos.z.clamp(-half, half);
         let cy = world.terrain.height_at(cx, cz) + 1.0;
 
-        let mut child = Agent::new(id, Vec3::new(cx, cy, cz), child_config, self.tick);
+        let brain_idx = self.agents.len() as u32;
+        let mut child = Agent::new(
+            id,
+            Vec3::new(cx, cy, cz),
+            brain_idx,
+            child_config,
+            self.tick,
+        );
         child.generation = parent_gen + 1;
 
         println!(
@@ -789,11 +1108,11 @@ impl App {
         );
         println!(
             "  Child config: cap={} slots={} dim={} lr={:.4} decay={:.4}",
-            child.brain.config.memory_capacity,
-            child.brain.config.processing_slots,
-            child.brain.config.representation_dim,
-            child.brain.config.learning_rate,
-            child.brain.config.decay_rate,
+            child.brain_config.memory_capacity,
+            child.brain_config.processing_slots,
+            child.brain_config.representation_dim,
+            child.brain_config.learning_rate,
+            child.brain_config.decay_rate,
         );
 
         self.agents.push(child);
@@ -801,10 +1120,14 @@ impl App {
 
     /// Pick the agent closest to the cursor via screen-space projection.
     fn pick_agent_at_cursor(&mut self) {
-        let Some(renderer) = &self.renderer else { return };
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
         let w = renderer.config.width as f32;
         let h = renderer.config.height as f32;
-        if w < 1.0 || h < 1.0 { return; }
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
 
         // Normalized device coordinates [-1, 1]
         let ndc_x = (self.cursor_pos.0 as f32 / w) * 2.0 - 1.0;
@@ -815,10 +1138,14 @@ impl App {
         let mut best_dist_sq = f32::MAX;
 
         for (i, agent) in self.agents.iter().enumerate() {
-            if !agent.body.body.alive { continue; }
+            if !agent.body.body.alive {
+                continue;
+            }
             let pos = agent.body.body.position;
             let clip = vp * glam::Vec4::new(pos.x, pos.y, pos.z, 1.0);
-            if clip.w <= 0.0 { continue; } // behind camera
+            if clip.w <= 0.0 {
+                continue;
+            } // behind camera
             let sx = clip.x / clip.w;
             let sy = clip.y / clip.w;
             let d = (sx - ndc_x).powi(2) + (sy - ndc_y).powi(2);
@@ -834,10 +1161,7 @@ impl App {
                 self.selected_agent_idx = idx;
                 self.agents[idx].trail_dirty = true;
                 let a = &self.agents[idx];
-                println!(
-                    "[SELECT] Agent {} (gen {}) — phase: {}",
-                    a.id, a.generation, a.brain.telemetry().behavior_phase()
-                );
+                println!("[SELECT] Agent {} (gen {})", a.id, a.generation);
                 self.hud_dirty = true;
             }
         }
@@ -881,8 +1205,8 @@ impl App {
 
         let energy = agent.body.body.internal.energy_signal();
         let integrity = agent.body.body.internal.integrity_signal();
-        let pred_err = agent.brain.telemetry().prediction_error.clamp(0.0, 1.0);
-        let explore = agent.brain.telemetry().exploration_rate.clamp(0.0, 1.0);
+        let pred_err = agent.cached_prediction_error;
+        let explore = agent.cached_exploration_rate;
 
         let bar_w = 0.35;
         let bar_h = 0.025;
@@ -949,8 +1273,11 @@ impl ApplicationHandler for App {
             .with_title("xagent — Emergent Cognitive Agent Sandbox")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
 
-        let window =
-            Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        );
         let size = window.inner_size();
         self.camera.aspect = size.width as f32 / size.height.max(1) as f32;
 
@@ -977,8 +1304,7 @@ impl ApplicationHandler for App {
 
         // Trail overlay: combined ribbons for ALL agents.
         // Each segment = 4 verts, 6 indices.
-        let max_trail_segs =
-            xagent_sandbox::agent::MAX_TRAIL_POINTS as u64 * MAX_AGENTS as u64;
+        let max_trail_segs = xagent_sandbox::agent::MAX_TRAIL_POINTS as u64 * MAX_AGENTS as u64;
         self.trail_gpu = Some(GpuMesh::new_dynamic(
             &renderer.device,
             max_trail_segs * 4,
@@ -1016,27 +1342,16 @@ impl ApplicationHandler for App {
         self.tick = 0;
         self.last_frame = Instant::now();
 
-        println!(
-            "[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D"
-        );
-        println!(
-            "[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry"
-        );
+        println!("[CONTROLS] P/Space = pause | 1-6 = speed | G = toggle 3D");
+        println!("[CONTROLS] N = spawn agent | M = spawn mutated agent | Tab = cycle telemetry");
         info!("Renderer + world + brain initialized — agent is alive");
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Forward every event to egui first.
         // If egui consumed it (pointer over a panel, typing in a text field, etc.)
         // we skip our own camera/sim key handling for that event.
-        let egui_consumed = if let (Some(egui), Some(window)) =
-            (&mut self.egui, &self.window)
-        {
+        let egui_consumed = if let (Some(egui), Some(window)) = (&mut self.egui, &self.window) {
             egui.on_window_event(window, &event)
         } else {
             false
@@ -1057,8 +1372,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size.width, new_size.height);
-                    self.camera.aspect =
-                        new_size.width as f32 / new_size.height.max(1) as f32;
+                    self.camera.aspect = new_size.width as f32 / new_size.height.max(1) as f32;
                 }
             }
 
@@ -1079,7 +1393,6 @@ impl ApplicationHandler for App {
                     }
 
                     // ── simulation controls ─────────────────────────
-
                     PhysicalKey::Code(KeyCode::KeyP | KeyCode::Space) if pressed => {
                         match self.evo_snapshot.state {
                             EvolutionState::Running => {
@@ -1116,16 +1429,25 @@ impl ApplicationHandler for App {
                         println!("[SIM] Speed: 1000x ({} ticks/sec)", SIM_RATE as u32 * 1000);
                     }
                     PhysicalKey::Code(KeyCode::Digit7) if pressed => {
-                        self.speed_multiplier = 5000;
-                        println!("[SIM] Speed: 5000x ({} ticks/sec)", SIM_RATE as u32 * 5000);
+                        self.speed_multiplier = 10000;
+                        println!(
+                            "[SIM] Speed: 10000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 10000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::Digit8) if pressed => {
-                        self.speed_multiplier = 10000;
-                        println!("[SIM] Speed: 10000x ({} ticks/sec)", SIM_RATE as u32 * 10000);
+                        self.speed_multiplier = 100000;
+                        println!(
+                            "[SIM] Speed: 100000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 100000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::Digit9) if pressed => {
-                        self.speed_multiplier = 50000;
-                        println!("[SIM] Speed: 50000x ({} ticks/sec)", SIM_RATE as u32 * 50000);
+                        self.speed_multiplier = 1000000;
+                        println!(
+                            "[SIM] Speed: 1000000x ({} ticks/sec)",
+                            SIM_RATE as u32 * 1000000
+                        );
                     }
                     PhysicalKey::Code(KeyCode::KeyH) if pressed => {
                         self.heatmap_enabled = !self.heatmap_enabled;
@@ -1139,7 +1461,11 @@ impl ApplicationHandler for App {
                         self.render_3d = !self.render_3d;
                         self.log_msg(format!(
                             "[SIM] 3D render: {}",
-                            if self.render_3d { "ON" } else { "OFF (fast mode)" }
+                            if self.render_3d {
+                                "ON"
+                            } else {
+                                "OFF (fast mode)"
+                            }
                         ));
                     }
 
@@ -1209,7 +1535,6 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
-
                 // ── FPS tracking ──────────────────────────────────
                 self.frame_times.push_back(now);
                 while self.frame_times.len() > 300 {
@@ -1227,9 +1552,10 @@ impl ApplicationHandler for App {
                 if self.orbit_mode && !self.camera.orbit_mode {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         let diff = self.camera.position - agent.body.body.position;
-                        self.camera.orbit_distance = diff.length().clamp(5.0, 200.0);
+                        let len = diff.length().max(0.001);
+                        self.camera.orbit_distance = len.clamp(5.0, 200.0);
                         self.camera.orbit_yaw = diff.z.atan2(diff.x);
-                        self.camera.orbit_pitch = (diff.y / diff.length()).asin().clamp(-1.4, -0.05);
+                        self.camera.orbit_pitch = (diff.y / len).asin().clamp(0.05, 1.4);
                     }
                 }
                 self.camera.orbit_mode = self.orbit_mode;
@@ -1242,235 +1568,107 @@ impl ApplicationHandler for App {
                     self.camera.update(dt);
                 }
 
-                // ── simulation ticks (fixed timestep) ──────────
-                if !self.paused {
-                    self.sim_accumulator += dt * self.speed_multiplier as f32;
-                    let max_ticks = max_ticks_per_frame(self.speed_multiplier, self.render_3d);
-                    let mut ticks_run = 0u32;
+                // Ensure background kernel creation is started if needed and
+                // collected when ready, even while the tick gate below
+                // suppresses accumulation.
+                self.ensure_gpu_kernel();
 
-                    // Brain decimation: at high speed, run brain every Nth tick
-                    // to keep CPU load manageable. Physics still runs every tick.
-                    let brain_stride = brain_stride(self.speed_multiplier);
-
-                    // Pre-allocate buffers outside the tick loop to avoid
-                    // repeated heap allocations (12 agents × 10 ticks = 120/frame).
-                    let mut all_positions: Vec<(Vec3, bool)> =
-                        Vec::with_capacity(self.agents.len());
-
-                    // Lazily initialize GPU compute if --gpu-brain was requested
-                    self.ensure_gpu_compute();
-
-                    let gpu_n = self.agents.len();
-                    let (gpu_dim, _gpu_fc, gpu_cap) = if let Some(ref gpu) = self.gpu_compute {
-                        (gpu.dim() as usize, gpu.feature_count() as usize, gpu.memory_capacity() as usize)
+                // ── simulation ticks (fixed timestep, adaptive budget) ──
+                // Skip ticks while a generation transition is in flight to
+                // avoid GPU contention with the async readback/reset.
+                // Also skip accumulation when the kernel is being recreated
+                // in the background to prevent catch-up hitch when it lands.
+                if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
+                    let sim_delta_time = SIM_DT as f64;
+                    self.sim_accumulator += dt as f64 * self.speed_multiplier as f64;
+                    let max_accumulator = sim_delta_time * self.speed_multiplier as f64 * 3.0;
+                    self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
+                    let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
+                        .min(self.gpu_tick_budget)
+                        .min(500);
+                    // Only dispatch when the accumulator has enough for at
+                    // least brain_tick_stride ticks, so every dispatch
+                    // includes a brain cycle and produces motor commands.
+                    // Sub-stride dispatches would be physics-only (no brain
+                    // cycles), leaving agents with stale motor outputs.
+                    // The accumulator keeps its fractional remainder across
+                    // frames so no sim-time is lost.
+                    let min_dispatch = self
+                        .gpu_kernel
+                        .as_ref()
+                        .map_or(10, |kernel| kernel.brain_tick_stride());
+                    let ticks_to_run = if raw_ticks >= min_dispatch {
+                        raw_ticks
                     } else {
-                        (0, 0, 0)
+                        0
                     };
 
-                    // ── Adaptive GPU/CPU decision ──
-                    // GPU dispatches once per frame → 1 brain tick per frame.
-                    // CPU rayon runs brain_stride-decimated ticks inside the loop.
-                    // Use GPU only when expected brain ticks ≤ 2 per frame so
-                    // agents get equivalent cognitive throughput either way.
-                    let expected_ticks = (self.sim_accumulator / SIM_DT)
-                        .min(max_ticks as f32) as u64;
-                    let expected_brain_ticks = expected_ticks / brain_stride;
-                    let use_gpu = self.gpu_compute.is_some() && expected_brain_ticks <= 2;
+                    if ticks_to_run > 0 {
+                        if let Some(ref mut kernel) = self.gpu_kernel {
+                            kernel.dispatch_batch(self.tick, ticks_to_run);
 
-                    // ── GPU COLLECT: always drain in-flight results ──
-                    // try_collect_into() unmaps staging buffers even if we don't
-                    // apply the results, preventing stale buffer buildup.
-                    // Only apply brain results when GPU is the active path
-                    // this frame — avoids a spurious double brain tick on
-                    // GPU→CPU transitions.
-                    {
-                        let gpu_opt = &mut self.gpu_compute;
-                        let enc_out = &mut self.gpu_encoded_out;
-                        let sim_out = &mut self.gpu_similarities_out;
-                        if let Some(gpu) = gpu_opt.as_mut() {
-                            if gpu.try_collect_into(enc_out, sim_out) && use_gpu {
-                                for (i, agent) in self.agents.iter_mut().enumerate() {
-                                    if i < self.gpu_prev_frames.len() {
-                                        if let Some(frame) = &self.gpu_prev_frames[i] {
-                                            let (a_dim, a_cap) = self.gpu_prev_agent_dims[i];
-                                            let enc = &enc_out[i * gpu_dim..i * gpu_dim + a_dim];
-                                            let sim = &sim_out[i * gpu_cap..i * gpu_cap + a_cap];
-                                            agent.cached_motor =
-                                                agent.brain.tick_gpu(frame, enc, sim);
-                                            record_agent_histories(agent);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                            self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
 
-                    // ── Frame time budget: never block UI longer than this ──
-                    const TICK_BUDGET_MS: u128 = 12;
-                    let tick_start = Instant::now();
+                            self.gpu_tick_budget =
+                                (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1).min(64_000);
 
-                    while self.sim_accumulator >= SIM_DT && ticks_run < max_ticks {
-                        self.sim_accumulator -= SIM_DT;
-                        ticks_run += 1;
+                            self.tick += ticks_to_run as u64;
+                            self.tps_tick_count += ticks_to_run as u64;
+                            self.snap_dirty = true;
 
-                        // Yield to UI every 16 ticks to maintain responsiveness
-                        if ticks_run % 16 == 0
-                            && tick_start.elapsed().as_millis() >= TICK_BUDGET_MS
-                        {
-                            break;
-                        }
-
-                        if let Some(world) = &mut self.world {
-                            // ── Phase 1: Snapshot positions (sequential) ──
-                            all_positions.clear();
-                            all_positions.extend(
-                                self.agents
-                                    .iter()
-                                    .map(|a| (a.body.body.position, a.body.body.alive)),
-                            );
-
-                            // ── Phase 2: Brain ticks (CPU rayon) ──
-                            // When GPU is active this frame, agents use
-                            // cached_motor from the per-frame collect above.
-                            // Otherwise, CPU rayon runs brain with stride.
-                            if !use_gpu {
-                                let tick = self.tick;
-                                let any_brain = self.agents.iter().enumerate().any(|(i, a)| {
-                                    a.body.body.alive && (tick + i as u64) % brain_stride == 0
-                                });
-
-                                if any_brain {
-                                    let world_ref: &WorldState = &*world;
-                                    let all_pos = &all_positions;
-
-                                    self.agents
-                                        .par_iter_mut()
-                                        .enumerate()
-                                        .for_each(|(i, agent)| {
-                                            if !agent.body.body.alive {
-                                                return;
-                                            }
-                                            let run_brain =
-                                                (tick + i as u64) % brain_stride == 0;
-                                            if !run_brain {
-                                                return;
-                                            }
-
-                                            senses::extract_senses_with_positions(
-                                                &agent.body,
-                                                world_ref,
-                                                tick,
-                                                all_pos,
-                                                i,
-                                                &mut agent.cached_frame,
-                                            );
-
-                                            agent.cached_motor =
-                                                agent.brain.tick(&agent.cached_frame);
-                                            record_agent_histories(agent);
-                                        });
+                            if let Some(gov) = &mut self.governor {
+                                for _ in 0..ticks_to_run {
+                                    gov.tick();
                                 }
                             }
 
-                            // ── Phase 3: Physics + stats (sequential, mutates world) ──
-                            for i in 0..self.agents.len() {
-                                let agent = &mut self.agents[i];
-                                if !agent.body.body.alive {
-                                    continue;
-                                }
+                            // Async telemetry readback for the selected agent.
+                            // `request_agent_telemetry` is gated internally: it no-ops
+                            // if a readback for the same agent is already pending, and
+                            // clears the old pending if the agent changed.
+                            if self.selected_agent_idx < self.agents.len() {
+                                let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
 
-                                let motor = agent.cached_motor.clone();
-                                let consumed = xagent_sandbox::physics::step(
-                                    &mut agent.body, &motor, world, SIM_DT,
-                                );
-                                if let Some(food_idx) = consumed {
-                                    self.food_dirty = true;
-                                    agent.food_consumed += 1;
-                                    if let Some(ref mut rec) = self.recording {
-                                        rec.record_food_event(xagent_sandbox::replay::FoodEvent {
-                                            tick: self.tick,
-                                            food_index: food_idx,
-                                            consumed: true,
-                                            new_position: None,
-                                        });
-                                    }
-                                }
-                                agent.total_ticks_alive += 1;
-                                agent.record_heatmap(world.config.world_size);
-                                agent.record_trail();
+                                kernel.request_agent_telemetry(brain_idx);
 
-                                let run_brain =
-                                    (self.tick + i as u64) % brain_stride == 0;
-                                if run_brain && i == self.selected_agent_idx {
-                                    let life_ticks = agent.age(self.tick);
-                                    log_tick_to_csv(
-                                        &mut self.logger,
-                                        agent,
-                                        world,
-                                        &motor,
-                                        life_ticks,
-                                    );
-                                    self.total_prediction_error +=
-                                        agent.brain.telemetry().prediction_error
-                                            as f64;
-                                    self.error_count += 1;
+                                // Collect any completed readback (non-blocking)
+                                if let Some(tel) = kernel.try_collect_telemetry() {
+                                    let a = &mut self.agents[self.selected_agent_idx];
+                                    // Only update fields NOT already populated by
+                                    // the every-frame physics readback (below).
+                                    // Physics readback sets: cached_motor,
+                                    // cached_gradient, cached_urgency,
+                                    // cached_fatigue_factor, cached_prediction_error,
+                                    // cached_exploration_rate.
+                                    a.cached_frame.vision.color = tel.vision_color;
+                                    a.cached_mean_attenuation = tel.mean_attenuation;
+                                    a.cached_curiosity_bonus = tel.curiosity_bonus;
+                                    a.cached_staleness = tel.staleness;
                                 }
                             }
 
-                            // ── Phase 4: Collision resolution (sequential) ──
-                            {
-                                let min_dist: f32 = 2.0;
-                                let min_dist_sq = min_dist * min_dist;
-                                let n = self.agents.len();
-                                for i in 0..n {
-                                    if !self.agents[i].body.body.alive {
-                                        continue;
-                                    }
-                                    for j in (i + 1)..n {
-                                        if !self.agents[j].body.body.alive {
-                                            continue;
-                                        }
-                                        let diff = self.agents[j].body.body.position
-                                            - self.agents[i].body.body.position;
-                                        let dist_sq = diff.length_squared();
-                                        if dist_sq < min_dist_sq && dist_sq > 0.001 {
-                                            let dist = dist_sq.sqrt();
-                                            let overlap = min_dist - dist;
-                                            let push = diff.normalize() * (overlap * 0.5);
-                                            let (left, right) = self.agents.split_at_mut(j);
-                                            left[i].body.body.position -= push;
-                                            right[0].body.body.position += push;
-                                        }
-                                    }
-                                }
-                            }
+                            self.food_dirty = true;
 
-                            let respawned = world.update(SIM_DT);
-                            if respawned {
-                                self.food_dirty = true;
-                                if let Some(ref mut rec) = self.recording {
-                                    for &idx in world.last_respawned_indices() {
-                                        let pos = world.food_items[idx].position;
-                                        rec.record_food_event(xagent_sandbox::replay::FoodEvent {
-                                            tick: self.tick,
-                                            food_index: idx,
-                                            consumed: false,
-                                            new_position: Some([pos.x, pos.y, pos.z]),
-                                        });
-                                    }
-                                }
-                            }
-                            self.heatmap_dirty = true;
-
-                            // ── Recording: capture tick data ──
+                            // Record tick for replay using the latest async physics
+                            // readback plus per-agent cached telemetry. Position/yaw/
+                            // alive/energy/integrity come from the physics readback
+                            // stored on each agent body. Motor outputs, gradient/
+                            // urgency, and the exploration/prediction/attenuation/
+                            // curiosity/fatigue/motor-variance fields come from
+                            // `cached_*` telemetry; in this path only the selected
+                            // agent's cache is refreshed each frame.
+                            // `credit_magnitude`, `patterns_recalled`, `phase`, and
+                            // `vision_color` are not populated here and are left as
+                            // defaults. `raw_gradient` mirrors `gradient` because
+                            // there is no separate raw gradient source in this GPU
+                            // readback path.
                             if let Some(ref mut rec) = self.recording {
-                                use xagent_sandbox::replay::{TickRecord, VISION_KEYFRAME_INTERVAL, GenerationRecording};
-                                let tick = self.tick;
-                                let is_keyframe = tick % VISION_KEYFRAME_INTERVAL == 0;
-
-                                let records: Vec<TickRecord> = self.agents.iter().map(|a| {
-                                    let t = a.brain.telemetry();
-                                    TickRecord {
+                                // Async readback snapshots arrive independently of
+                                // governor tick advancement, so record them at the
+                                // next dense replay index.
+                                let tick = rec.total_ticks;
+                                let records: Vec<xagent_sandbox::replay::TickRecord> = self.agents.iter().map(|a| {
+                                    xagent_sandbox::replay::TickRecord {
                                         position: [a.body.body.position.x, a.body.body.position.y, a.body.body.position.z],
                                         yaw: a.body.yaw,
                                         alive: a.body.body.alive,
@@ -1478,214 +1676,174 @@ impl ApplicationHandler for App {
                                         integrity: a.body.body.internal.integrity,
                                         motor_forward: a.cached_motor.forward,
                                         motor_turn: a.cached_motor.turn,
-                                        exploration_rate: a.brain.action_selector.exploration_rate(),
-                                        prediction_error: t.prediction_error,
-                                        gradient: t.homeostatic_gradient,
-                                        raw_gradient: t.avg_prediction_error, // TODO: BrainTelemetry lacks raw_gradient; this maps the wrong field
-                                        urgency: t.homeostatic_urgency,
-                                        credit_magnitude: a.brain.action_selector.last_credit_magnitude(),
-                                        patterns_recalled: t.recall_budget as u16,
-                                        phase: GenerationRecording::phase_to_u8(t.behavior_phase()),
-                                        mean_attenuation: t.mean_attenuation,
-                                        curiosity_bonus: t.curiosity_bonus,
-                                        fatigue_factor: t.fatigue_factor,
-                                        motor_variance: t.motor_variance,
-                                        vision_color: if is_keyframe {
-                                            Some(a.cached_frame.vision.color.clone())
-                                        } else {
-                                            None
-                                        },
+                                        exploration_rate: a.cached_exploration_rate,
+                                        prediction_error: a.cached_prediction_error,
+                                        gradient: a.cached_gradient,
+                                        raw_gradient: a.cached_gradient,
+                                        urgency: a.cached_urgency,
+                                        credit_magnitude: 0.0,
+                                        patterns_recalled: 0,
+                                        phase: xagent_sandbox::replay::GenerationRecording::phase_to_u8("RANDOM"),
+                                        mean_attenuation: a.cached_mean_attenuation,
+                                        curiosity_bonus: a.cached_curiosity_bonus,
+                                        fatigue_factor: a.cached_fatigue_factor,
+                                        staleness: a.cached_staleness,
+                                        vision_color: None,
                                     }
                                 }).collect();
                                 rec.record_tick(tick, &records);
                             }
+                        }
+                    }
 
-                            // Handle death/respawn
-                            for agent in &mut self.agents {
-                                if !agent.body.body.alive && agent.respawn_cooldown == 0 {
-                                    let life_ticks = agent.age(self.tick);
-                                    agent.longest_life = agent.longest_life.max(life_ticks);
-                                    agent.death_count += 1;
-                                    // Death signal: retroactively punish actions that led here
-                                    agent.brain.death_signal();
-                                    agent.respawn_cooldown = RESPAWN_COOLDOWN_FRAMES;
-                                } else if !agent.body.body.alive && agent.respawn_cooldown > 0 {
-                                    agent.respawn_cooldown -= 1;
-                                    if agent.respawn_cooldown == 0 {
-                                        let pos = world.safe_spawn_position();
-                                        agent.body = AgentBody::new(pos);
-                                        agent.body.body.internal.energy =
-                                            agent.body.body.internal.max_energy * 0.5;
-                                        agent.body.body.internal.integrity =
-                                            agent.body.body.internal.max_integrity;
-                                        agent.life_start_tick = self.tick;
-                                        agent.has_reproduced = false;
-                                        agent.generation += 1;
-                                        agent.reset_trail();
-                                        agent.fatigue_history.clear();
-                                        agent.brain.trauma(0.5);
+                    // ── Every-frame state readback ──
+                    // Collect GPU staging data and update agent positions
+                    // regardless of whether ticks were dispatched this frame.
+                    // This ensures smooth visual updates at low speed multipliers
+                    // where dispatches happen infrequently.
+                    if let Some(ref mut kernel) = self.gpu_kernel {
+                        if kernel.try_collect_state() {
+                            let state = kernel.cached_state();
+                            for i in 0..self.agents.len() {
+                                let base = i * PHYS_STRIDE;
+                                if base + P_URGENCY_OUT >= state.len() {
+                                    break;
+                                }
+                                let a = &mut self.agents[i];
+                                a.body.body.position = Vec3::new(
+                                    state[base + P_POS_X],
+                                    state[base + P_POS_Y],
+                                    state[base + P_POS_Z],
+                                );
+                                a.body.body.alive = state[base + P_ALIVE] > 0.5;
+                                a.body.yaw = state[base + P_YAW];
+                                a.body.body.internal.energy = state[base + P_ENERGY];
+                                a.body.body.internal.integrity = state[base + P_INTEGRITY];
+                                a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
+                                a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
+                                a.body.body.velocity = Vec3::new(
+                                    state[base + P_VEL_X],
+                                    state[base + P_VEL_Y],
+                                    state[base + P_VEL_Z],
+                                );
+                                a.food_consumed = state[base + P_FOOD_COUNT] as u32;
+                                a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+                                let new_deaths = state[base + P_DEATH_COUNT] as u32;
+                                if new_deaths > a.death_count {
+                                    a.reset_trail();
+                                }
+                                a.death_count = new_deaths;
+                                a.body.body.facing = Vec3::new(
+                                    state[base + P_FACING_X],
+                                    state[base + P_FACING_Y],
+                                    state[base + P_FACING_Z],
+                                );
+                                a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
+                                a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
+                                a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
+                                a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
+                                a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
+                                a.cached_gradient = state[base + P_GRADIENT_OUT];
+                                a.cached_urgency = state[base + P_URGENCY_OUT];
+                            }
+
+                            self.snap_dirty = true;
+                            self.hud_dirty = true;
+
+                            // Diagnostic: log first readback Y vs terrain height
+                            if !self.readback_logged {
+                                if let Some(world) = &self.world {
+                                    let n = self.agents.len().min(5);
+                                    if n > 0 {
+                                        for i in 0..n {
+                                            let a = &self.agents[i];
+                                            let p = a.body.body.position;
+                                            let terrain_y = world.terrain.height_at(p.x, p.z);
+                                            log::info!(
+                                                "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
+                                                i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
+                                            );
+                                        }
+                                        self.readback_logged = true;
                                     }
                                 }
                             }
                         }
-
-                        self.tick += 1;
-                        self.tps_tick_count += 1;
-
-                        // ── Governor tick tracking ──────────────
-                        if let Some(gov) = &mut self.governor {
-                            gov.tick();
-                        }
-
-                        // (telemetry is shown on-screen via HUD — no console spam)
                     }
+
+                    // Heatmap + trail recording
+                    if let Some(world) = &self.world {
+                        for agent in &mut self.agents {
+                            if agent.body.body.alive {
+                                agent.record_heatmap(world.config.world_size);
+                                agent.record_trail();
+                            }
+                        }
+                    }
+
+                    // Sparkline histories + CSV logging
+                    {
+                        if let Some(world) = &self.world {
+                            for agent in &mut self.agents {
+                                record_agent_histories(agent);
+                            }
+                            if self.selected_agent_idx < self.agents.len() {
+                                let agent = &self.agents[self.selected_agent_idx];
+                                let life_ticks = agent.age(self.tick);
+                                let motor = agent.cached_motor.clone();
+                                log_tick_to_csv(&mut self.logger, agent, world, &motor, life_ticks);
+                                self.error_count += 1;
+                            }
+                        }
+                    }
+
+                    self.heatmap_dirty = true;
 
                     // ── Generation completion check (after tick batch) ──
-                    if let Some(gov) = &self.governor {
-                        if gov.generation_complete() {
-                            self.advance_generation();
-                        }
-                    }
-
-                    // ── GPU SUBMIT: extract senses once per frame, submit async ──
-                    if use_gpu && ticks_run > 0 {
-                        if let Some(world) = &self.world {
-                            // Snapshot current positions
-                            all_positions.clear();
-                            all_positions.extend(
-                                self.agents
-                                    .iter()
-                                    .map(|a| (a.body.body.position, a.body.body.alive)),
-                            );
-                            let world_ref: &WorldState = world;
-                            let all_pos = &all_positions;
-                            let tick = self.tick;
-
-                            // Parallel sensory extraction for ALL alive agents
-                            struct AgentGpuSlice {
-                                feats: Vec<f32>,
-                                weights: Vec<f32>,
-                                biases: Vec<f32>,
-                                pats: Vec<f32>,
-                                mask: Vec<u32>,
-                                agent_dim: usize,
-                                agent_fc: usize,
-                                agent_cap: usize,
-                                frame: SensoryFrame,
+                    if self.gen_transition.is_none() {
+                        if let Some(gov) = &self.governor {
+                            if gov.generation_complete() {
+                                self.advance_generation();
                             }
-                            let per_agent: Vec<Option<AgentGpuSlice>> =
-                                self.agents
-                                    .par_iter_mut()
-                                    .enumerate()
-                                    .map(|(i, agent)| {
-                                        if !agent.body.body.alive {
-                                            return None;
-                                        }
-                                        senses::extract_senses_with_positions(
-                                            &agent.body, world_ref, tick, all_pos, i,
-                                            &mut agent.cached_frame,
-                                        );
-                                        let feats = agent.brain.encoder
-                                            .extract_features(&agent.cached_frame).to_vec();
-                                        let weights = agent.brain.encoder.weights().to_vec();
-                                        let biases = agent.brain.encoder.biases().to_vec();
-                                        let (pats, mask) = agent.brain.memory.gpu_pattern_data();
-                                        let pats = pats.to_vec();
-                                        let mask = mask.to_vec();
-                                        Some(AgentGpuSlice {
-                                            feats, weights, biases, pats, mask,
-                                            agent_dim: agent.brain.config.representation_dim,
-                                            agent_fc: agent.brain.encoder.feature_count(),
-                                            agent_cap: agent.brain.memory.max_capacity(),
-                                            frame: agent.cached_frame.clone(),
-                                        })
-                                    })
-                                    .collect();
-
-                            // Batch into GPU buffers + store frames for next collect
-                            let gpu = self.gpu_compute.as_mut().unwrap();
-                            self.gpu_batch_features.clear();
-                            self.gpu_batch_weights.clear();
-                            self.gpu_batch_biases.clear();
-                            self.gpu_batch_patterns.clear();
-                            self.gpu_batch_active.clear();
-
-                            self.gpu_prev_frames.clear();
-                            self.gpu_prev_frames.resize(gpu_n, None);
-                            self.gpu_prev_agent_dims.clear();
-                            self.gpu_prev_agent_dims.resize(gpu_n, (gpu_dim, gpu_cap));
-
-                            for (i, data) in per_agent.into_iter().enumerate() {
-                                if let Some(d) = data {
-                                    gpu.pad_agent_into(
-                                        &d.feats, &d.weights, &d.biases,
-                                        &d.pats, &d.mask,
-                                        d.agent_dim, d.agent_fc, d.agent_cap,
-                                        &mut self.gpu_batch_features,
-                                        &mut self.gpu_batch_weights,
-                                        &mut self.gpu_batch_biases,
-                                        &mut self.gpu_batch_patterns,
-                                        &mut self.gpu_batch_active,
-                                    );
-                                    self.gpu_prev_agent_dims[i] = (d.agent_dim, d.agent_cap);
-                                    self.gpu_prev_frames[i] = Some(d.frame);
-                                } else {
-                                    gpu.pad_agent_into(
-                                        &[], &[], &[], &[], &[],
-                                        0, 0, 0,
-                                        &mut self.gpu_batch_features,
-                                        &mut self.gpu_batch_weights,
-                                        &mut self.gpu_batch_biases,
-                                        &mut self.gpu_batch_patterns,
-                                        &mut self.gpu_batch_active,
-                                    );
-                                }
-                            }
-
-                            // Submit once per frame (async, returns immediately)
-                            gpu.submit(
-                                &self.gpu_batch_features, &self.gpu_batch_weights,
-                                &self.gpu_batch_biases, &self.gpu_batch_patterns,
-                                &self.gpu_batch_active,
-                            );
                         }
-                    }
-
-                    // Clamp accumulator: allow up to max_ticks worth of
-                    // carry-over so the time budget can spread ticks across
-                    // multiple frames, but never accumulate more than that.
-                    self.sim_accumulator = self.sim_accumulator.min(SIM_DT * max_ticks as f32);
-
-                    // Mark HUD dirty if any ticks ran this frame
-                    if ticks_run > 0 {
-                        self.hud_dirty = true;
                     }
                 }
+
+                // Drive the multi-frame generation transition state machine
+                // (runs even when sim ticks are paused/skipped due to transition).
+                self.poll_gen_transition();
 
                 // Advance replay playback
                 if self.replay_state.active && self.replay_state.playing {
                     let advance = (self.replay_state.speed as u64).max(1);
                     self.replay_state.current_tick = (self.replay_state.current_tick + advance)
                         .min(self.replay_state.total_ticks.saturating_sub(1));
-                    if self.replay_state.current_tick >= self.replay_state.total_ticks.saturating_sub(1) {
+                    if self.replay_state.current_tick
+                        >= self.replay_state.total_ticks.saturating_sub(1)
+                    {
                         self.replay_state.playing = false;
                     }
                 }
 
                 // Fix selected index if agents were removed
                 if !self.agents.is_empty() {
-                    self.selected_agent_idx =
-                        self.selected_agent_idx.min(self.agents.len() - 1);
+                    self.selected_agent_idx = self.selected_agent_idx.min(self.agents.len() - 1);
                 }
 
-                // ── rebuild dynamic meshes ─────────────────────────
-                if self.food_dirty {
+                // ── rebuild dynamic meshes (throttled to ~10 Hz) ──────
+                let mesh_rebuild_due =
+                    self.paused || self.last_mesh_rebuild.elapsed() >= REBUILD_THROTTLE;
+
+                let mut did_rebuild = false;
+
+                if self.food_dirty && mesh_rebuild_due {
                     if let (Some(renderer), Some(world), Some(food_gpu)) =
                         (&self.renderer, &self.world, &mut self.food_gpu)
                     {
                         let fm = world.food_mesh();
                         food_gpu.update_from_mesh(&renderer.queue, &fm);
                         self.food_dirty = false;
+                        did_rebuild = true;
                     }
                 }
 
@@ -1710,39 +1868,39 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // ── rebuild trail overlay for ALL agents (when any trail changed) ──
-                if let (Some(renderer), Some(trail_gpu)) =
-                    (&self.renderer, &mut self.trail_gpu)
-                {
-                    let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
-                    if any_dirty {
-                        let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
-                            .agents
-                            .iter()
-                            .map(|a| {
-                                (
-                                    a.trail.as_slice(),
-                                    &a.color as &[f32; 3],
-                                    a.body.body.alive,
-                                )
-                            })
-                            .collect();
-                        let mesh = overlay::build_all_trails_mesh(&agent_data);
-                        if mesh.indices.is_empty() {
-                            trail_gpu.num_indices = 0;
-                        } else {
-                            trail_gpu.update_from_mesh(&renderer.queue, &mesh);
-                        }
-                        for a in &mut self.agents {
-                            a.trail_dirty = false;
+                // ── rebuild trail overlay for ALL agents (throttled) ──
+                if mesh_rebuild_due {
+                    if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu)
+                    {
+                        let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
+                        if any_dirty {
+                            let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
+                                .agents
+                                .iter()
+                                .map(|a| {
+                                    (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive)
+                                })
+                                .collect();
+                            let mesh = overlay::build_all_trails_mesh(&agent_data);
+                            if mesh.indices.is_empty() {
+                                trail_gpu.num_indices = 0;
+                            } else {
+                                trail_gpu.update_from_mesh(&renderer.queue, &mesh);
+                            }
+                            for a in &mut self.agents {
+                                a.trail_dirty = false;
+                            }
+                            did_rebuild = true;
                         }
                     }
                 }
 
+                if did_rebuild && !self.paused {
+                    self.last_mesh_rebuild = Instant::now();
+                }
+
                 // ── rebuild selection marker above focused agent ──────
-                if let (Some(renderer), Some(marker_gpu)) =
-                    (&self.renderer, &mut self.marker_gpu)
-                {
+                if let (Some(renderer), Some(marker_gpu)) = (&self.renderer, &mut self.marker_gpu) {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         if agent.body.body.alive {
                             let mesh = overlay::build_marker_mesh(agent.body.body.position);
@@ -1763,7 +1921,11 @@ impl ApplicationHandler for App {
                         .map(|a| {
                             let color = if !a.body.body.alive {
                                 use xagent_sandbox::agent::srgb_to_linear;
-                                [srgb_to_linear(0.25), srgb_to_linear(0.25), srgb_to_linear(0.25)]
+                                [
+                                    srgb_to_linear(0.25),
+                                    srgb_to_linear(0.25),
+                                    srgb_to_linear(0.25),
+                                ]
                             } else {
                                 // Use the agent's assigned palette color, converted
                                 // from sRGB to linear so the sRGB framebuffer
@@ -1831,8 +1993,8 @@ impl ApplicationHandler for App {
                     if let Some(agent) = self.agents.get(self.selected_agent_idx) {
                         let energy = agent.body.body.internal.energy_signal();
                         let integrity = agent.body.body.internal.integrity_signal();
-                        let pred_err = agent.brain.telemetry().prediction_error;
-                        let explore = agent.brain.telemetry().exploration_rate;
+                        let pred_err = agent.cached_prediction_error;
+                        let explore = agent.cached_exploration_rate;
 
                         text_items.push(TextItem {
                             text: format!("Energy: {:.0}%", energy * 100.0),
@@ -1878,11 +2040,7 @@ impl ApplicationHandler for App {
                             color: info_color,
                         });
                         text_items.push(TextItem {
-                            text: format!(
-                                "Phase: {} | Quality: {:.0}%",
-                                agent.brain.telemetry().behavior_phase(),
-                                agent.brain.telemetry().decision_quality * 100.0
-                            ),
+                            text: "Phase: GPU (TBD)".to_string(),
                             x: -0.98,
                             y: info_y - 0.035,
                             scale: info_scale,
@@ -1911,11 +2069,21 @@ impl ApplicationHandler for App {
                     let tr = self.trail_gpu.as_ref().filter(|g| g.num_indices > 0);
                     let mk = self.marker_gpu.as_ref().filter(|g| g.num_indices > 0);
                     let mut mesh_vec: Vec<&GpuMesh> = Vec::with_capacity(5);
-                    if let Some(t) = t { mesh_vec.push(t); }
-                    if let Some(f) = f { mesh_vec.push(f); }
-                    if let Some(h) = h { mesh_vec.push(h); }
-                    if let Some(tr) = tr { mesh_vec.push(tr); }
-                    if let Some(mk) = mk { mesh_vec.push(mk); }
+                    if let Some(t) = t {
+                        mesh_vec.push(t);
+                    }
+                    if let Some(f) = f {
+                        mesh_vec.push(f);
+                    }
+                    if let Some(h) = h {
+                        mesh_vec.push(h);
+                    }
+                    if let Some(tr) = tr {
+                        mesh_vec.push(tr);
+                    }
+                    if let Some(mk) = mk {
+                        mesh_vec.push(mk);
+                    }
 
                     let vp = self.camera.view_projection_matrix();
 
@@ -1932,20 +2100,15 @@ impl ApplicationHandler for App {
                                         inst_count,
                                         &mut frame_ctx.encoder,
                                         &egui.viewport_color_view,
-                                    &egui.viewport_depth_view,
-                                );
-                            }
+                                        &egui.viewport_depth_view,
+                                    );
+                                }
                             }
 
                             // 2) Render egui UI to the surface (viewport texture embedded)
-                            if let (Some(egui), Some(window)) =
-                                (&mut self.egui, &self.window)
-                            {
+                            if let (Some(egui), Some(window)) = (&mut self.egui, &self.window) {
                                 let screen = egui_wgpu::ScreenDescriptor {
-                                    size_in_pixels: [
-                                        renderer.config.width,
-                                        renderer.config.height,
-                                    ],
+                                    size_in_pixels: [renderer.config.width, renderer.config.height],
                                     pixels_per_point: window.scale_factor() as f32,
                                 };
 
@@ -1960,65 +2123,82 @@ impl ApplicationHandler for App {
                                 let mut desired_vp = (0u32, 0u32);
                                 let selected_idx = self.selected_agent_idx;
 
-                                // Snapshot agent data for the UI closure
-                                let snap_window = self.chart_window * 2;
-                                let agent_snaps: Vec<AgentSnapshot> = self.agents.iter().map(|a| {
-                                    let telemetry = a.brain.telemetry();
-                                    let tail = |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
-                                        let skip = d.len().saturating_sub(snap_window);
-                                        d.iter().skip(skip).copied().collect()
-                                    };
-                                    AgentSnapshot {
-                                        id: a.id,
-                                        gen: a.generation,
-                                        energy: a.body.body.internal.energy,
-                                        max_energy: a.body.body.internal.max_energy,
-                                        integrity: a.body.body.internal.integrity,
-                                        max_integrity: a.body.body.internal.max_integrity,
-                                        alive: a.body.body.alive,
-                                        deaths: a.death_count,
-                                        color: a.color,
-                                        longest_life: a.longest_life,
-                                        exploration_rate: a.brain.action_selector.exploration_rate(),
-                                        prediction_error: telemetry.prediction_error,
-                                        forward_weight_norm: {
-                                            let w = a.brain.action_selector.export_weights();
-                                            let dim = a.brain.config.representation_dim;
-                                            w[..dim].iter().map(|x| x * x).sum::<f32>().sqrt()
-                                        },
-                                        turn_weight_norm: {
-                                            let w = a.brain.action_selector.export_weights();
-                                            let dim = a.brain.config.representation_dim;
-                                            w[dim..dim*2].iter().map(|x| x * x).sum::<f32>().sqrt()
-                                        },
-                                        prediction_error_history: tail(&a.prediction_error_history),
-                                        exploration_rate_history: tail(&a.exploration_rate_history),
-                                        energy_history: tail(&a.energy_history),
-                                        integrity_history: tail(&a.integrity_history),
-                                        decision_log: a.decision_log.iter().cloned().collect(),
-                                        gradient: telemetry.homeostatic_gradient,
-                                        urgency: telemetry.homeostatic_urgency,
-                                        food_consumed: a.food_consumed,
-                                        total_ticks_alive: a.total_ticks_alive,
-                                        motor_forward: a.cached_motor.forward,
-                                        motor_turn: a.cached_motor.turn,
-                                        phase: telemetry.behavior_phase(),
-                                        vision_color: a.cached_frame.vision.color.clone(),
-                                        vision_width: a.cached_frame.vision.width,
-                                        vision_height: a.cached_frame.vision.height,
-                                        position: [
-                                            a.body.body.position.x,
-                                            a.body.body.position.y,
-                                            a.body.body.position.z,
-                                        ],
-                                        yaw: a.body.yaw,
-                                        mean_attenuation: telemetry.mean_attenuation,
-                                        curiosity_bonus: telemetry.curiosity_bonus,
-                                        fatigue_factor: telemetry.fatigue_factor,
-                                        motor_variance: telemetry.motor_variance,
-                                        fatigue_history: tail(&a.fatigue_history),
+                                // Snapshot agent data for the UI closure (throttled to ~10 Hz)
+                                // Force rebuild when agents changed size or chart window changed.
+                                if self.cached_agent_snaps.len() != self.agents.len()
+                                    || self.chart_window != self.last_snap_chart_window
+                                {
+                                    self.snap_dirty = true;
+                                }
+                                let snap_rebuild_due = self.snap_dirty
+                                    && (self.paused
+                                        || self.last_snapshot_rebuild.elapsed()
+                                            >= REBUILD_THROTTLE);
+                                if snap_rebuild_due {
+                                    let snap_window = self.chart_window * 2;
+                                    self.cached_agent_snaps = self
+                                        .agents
+                                        .iter()
+                                        .map(|a| {
+                                            let tail =
+                                                |d: &std::collections::VecDeque<f32>| -> Vec<f32> {
+                                                    let skip = d.len().saturating_sub(snap_window);
+                                                    d.iter().skip(skip).copied().collect()
+                                                };
+                                            AgentSnapshot {
+                                                id: a.id,
+                                                generation: a.generation,
+                                                energy: a.body.body.internal.energy,
+                                                max_energy: a.body.body.internal.max_energy,
+                                                integrity: a.body.body.internal.integrity,
+                                                max_integrity: a.body.body.internal.max_integrity,
+                                                alive: a.body.body.alive,
+                                                deaths: a.death_count,
+                                                color: a.color,
+                                                longest_life: a.longest_life,
+                                                exploration_rate: a.cached_exploration_rate,
+                                                prediction_error: a.cached_prediction_error,
+                                                forward_weight_norm: 0.0, // GPU telemetry TBD
+                                                turn_weight_norm: 0.0,    // GPU telemetry TBD
+                                                prediction_error_history: tail(
+                                                    &a.prediction_error_history,
+                                                ),
+                                                exploration_rate_history: tail(
+                                                    &a.exploration_rate_history,
+                                                ),
+                                                energy_history: tail(&a.energy_history),
+                                                integrity_history: tail(&a.integrity_history),
+                                                gradient: a.cached_gradient,
+                                                urgency: a.cached_urgency,
+                                                food_consumed: a.food_consumed,
+                                                total_ticks_alive: a.total_ticks_alive,
+                                                motor_forward: a.cached_motor.forward,
+                                                motor_turn: a.cached_motor.turn,
+                                                phase: "GPU", // GPU telemetry TBD
+                                                vision_color: a.cached_frame.vision.color.clone(),
+                                                vision_width: a.cached_frame.vision.width,
+                                                vision_height: a.cached_frame.vision.height,
+                                                position: [
+                                                    a.body.body.position.x,
+                                                    a.body.body.position.y,
+                                                    a.body.body.position.z,
+                                                ],
+                                                yaw: a.body.yaw,
+                                                mean_attenuation: a.cached_mean_attenuation,
+                                                curiosity_bonus: a.cached_curiosity_bonus,
+                                                fatigue_factor: a.cached_fatigue_factor,
+                                                staleness: a.cached_staleness,
+                                                fatigue_history: tail(&a.fatigue_history),
+                                            }
+                                        })
+                                        .collect();
+                                    self.snap_dirty = false;
+                                    self.last_snap_chart_window = self.chart_window;
+                                    if !self.paused {
+                                        self.last_snapshot_rebuild = Instant::now();
                                     }
-                                }).collect();
+                                }
+                                let agent_snaps = self.cached_agent_snaps.as_slice();
 
                                 // Build evolution snapshot for the UI
                                 if let Some(gov) = &mut self.governor {
@@ -2026,11 +2206,14 @@ impl ApplicationHandler for App {
                                     self.evo_snapshot.generation = gov.generation;
                                     self.evo_snapshot.tree_nodes = gov.tree_nodes();
                                     self.evo_snapshot.current_node_id = gov.current_node_id;
-                                    self.evo_snapshot.fitness_history = gov.fitness_history_by_island();
+                                    self.evo_snapshot
+                                        .fitness_history
+                                        .clone_from(gov.fitness_history_by_island());
                                     self.evo_snapshot.best_fitness = gov.best_score();
                                 }
                                 let wall = self.evo_wall_accumulated
-                                    + self.evo_wall_segment_start
+                                    + self
+                                        .evo_wall_segment_start
                                         .map(|s| s.elapsed().as_secs_f64())
                                         .unwrap_or(0.0);
                                 self.evo_snapshot.wall_time_secs = wall;
@@ -2051,10 +2234,24 @@ impl ApplicationHandler for App {
 
                                 // Build world snapshot for mini-map
                                 if let Some(world) = &self.world {
-                                    self.world_snapshot.food_positions = world.food_items.iter()
-                                        .filter(|f| !f.consumed)
-                                        .map(|f| [f.position.x, f.position.z])
-                                        .collect();
+                                    let gpu_food = self
+                                        .gpu_kernel
+                                        .as_ref()
+                                        .and_then(|mk| mk.cached_food_state());
+                                    if let Some(food) = gpu_food {
+                                        self.world_snapshot.food_positions = food
+                                            .chunks_exact(FOOD_STATE_STRIDE)
+                                            .filter(|c| c[F_RESPAWN_TIMER] <= 0.0)
+                                            .map(|c| [c[F_POS_X], c[F_POS_Z]])
+                                            .collect();
+                                    } else {
+                                        self.world_snapshot.food_positions = world
+                                            .food_items
+                                            .iter()
+                                            .filter(|f| !f.consumed)
+                                            .map(|f| [f.position.x, f.position.z])
+                                            .collect();
+                                    }
                                     self.world_snapshot.world_size = world.config.world_size;
                                 }
                                 let mut world_snap = std::mem::take(&mut self.world_snapshot);
@@ -2073,21 +2270,30 @@ impl ApplicationHandler for App {
                                                 let x = -half + (col as f32 + 0.5) * cell;
                                                 let biome = world.biome_map.biome_at(x, z);
                                                 let c = match biome {
-                                                    BiomeType::FoodRich => egui::Color32::from_rgb(25, 70, 20),
-                                                    BiomeType::Barren => egui::Color32::from_rgb(60, 50, 30),
-                                                    BiomeType::Danger => egui::Color32::from_rgb(80, 25, 15),
+                                                    BiomeType::FoodRich => {
+                                                        egui::Color32::from_rgb(25, 70, 20)
+                                                    }
+                                                    BiomeType::Barren => {
+                                                        egui::Color32::from_rgb(60, 50, 30)
+                                                    }
+                                                    BiomeType::Danger => {
+                                                        egui::Color32::from_rgb(80, 25, 15)
+                                                    }
                                                 };
                                                 pixels.push(c);
                                             }
                                         }
-                                        egui::ColorImage { size: [res, res], pixels }
+                                        egui::ColorImage {
+                                            size: [res, res],
+                                            pixels,
+                                        }
                                     })
                                 } else {
                                     None
                                 };
 
-                                let console_lines: Vec<&str> = self.console_log.iter()
-                                    .map(|s| s.as_str()).collect();
+                                let console_lines: Vec<&str> =
+                                    self.console_log.iter().map(|s| s.as_str()).collect();
 
                                 let mut clicked_agent_idx: Option<usize> = None;
                                 let mut open_agent_tab: Option<u32> = None;
@@ -2356,7 +2562,7 @@ impl ApplicationHandler for App {
                                                                 let status = if !snap.alive { "💀" } else { "" };
                                                                 ui.label(format!(
                                                                     "Agent {} (g{}) {}",
-                                                                    snap.id, snap.gen, status
+                                                                    snap.id, snap.generation, status
                                                                 ));
                                                             });
                                                             ui.horizontal(|ui| {
@@ -2402,7 +2608,7 @@ impl ApplicationHandler for App {
                                                     desired_vp: &mut desired_vp,
                                                     viewport_hovered: &mut vp_hovered,
                                                     chart_window: &mut chart_win,
-                                                    agents: &agent_snaps,
+                                                    agents: agent_snaps,
                                                     evolution: &mut evo_snap,
                                                     evolution_action: &mut evo_action,
                                                     world: &world_snap,
@@ -2438,8 +2644,8 @@ impl ApplicationHandler for App {
                                 if let Some(agent_id) = open_agent_tab {
                                     let tab = Tab::AgentDetail(agent_id);
                                     // Check if tab already exists
-                                    let already_open = self.dock_state.iter_all_tabs()
-                                        .any(|(_, t)| *t == tab);
+                                    let already_open =
+                                        self.dock_state.iter_all_tabs().any(|(_, t)| *t == tab);
                                     if !already_open {
                                         self.dock_state.push_to_focused_leaf(tab);
                                     }
@@ -2476,6 +2682,12 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Poll GPU kernel device after rendering so map_async
+                // callbacks can complete before the next frame.
+                if let Some(ref kernel) = self.gpu_kernel {
+                    kernel.device().poll(wgpu::Maintain::Poll);
+                }
+
                 // Handle evolution actions (outside renderer borrow)
                 self.handle_evolution_action(pending_evo_action);
             }
@@ -2504,10 +2716,12 @@ fn log_tick_to_csv(
         let biome = world
             .biome_map
             .biome_at(agent.body.body.position.x, agent.body.body.position.z);
+        // Create a stub BrainTelemetry since GPU brain doesn't expose per-tick telemetry yet
+        let stub_telemetry = xagent_brain::BrainTelemetry::default();
         let _ = logger.log_tick(
             agent.id,
-            agent.brain.telemetry(),
-            agent.brain.config.memory_capacity,
+            &stub_telemetry,
+            agent.brain_config.memory_capacity,
             agent.body.body.internal.energy,
             agent.body.body.internal.max_energy,
             agent.body.body.internal.integrity,
@@ -2539,9 +2753,34 @@ fn main() {
     }
 
     if cli.dump_config {
-        let json = serde_json::to_string_pretty(&config)
-            .expect("Failed to serialize config");
+        let json = serde_json::to_string_pretty(&config).expect("Failed to serialize config");
         println!("{}", json);
+        return;
+    }
+
+    if cli.bench_profile {
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        xagent_sandbox::bench::run_profile(config.brain, config.world, agent_count, total_ticks);
+        return;
+    }
+
+    if cli.bench {
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        println!("Benchmark: {} agents, {} ticks", agent_count, total_ticks);
+        let result =
+            xagent_sandbox::bench::run_bench(config.brain, config.world, agent_count, total_ticks);
+        println!(
+            "Completed {} ticks in {:.2}s ({:.0} ticks/sec)",
+            result.total_ticks, result.elapsed_secs, result.ticks_per_sec,
+        );
         return;
     }
 
@@ -2553,7 +2792,7 @@ fn main() {
     print_config(&config);
 
     if cli.no_render {
-        headless::run_headless(config, &cli.db, cli.resume, cli.gpu_brain);
+        headless::run_headless(config, &cli.db, cli.resume, true);
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let mut app = App::new(
@@ -2562,7 +2801,6 @@ fn main() {
             config.governor,
             cli.log,
             &cli.db,
-            cli.gpu_brain,
         );
         event_loop.run_app(&mut app).expect("Event loop error");
     }
@@ -2579,27 +2817,11 @@ fn speed_label(multiplier: u32) -> &'static str {
         10 => "10×",
         100 => "100×",
         1_000 => "1k×",
-        5_000 => "5k×",
         10_000 => "10k×",
-        50_000 => "50k×",
+        100_000 => "100k×",
+        1_000_000 => "1000k×",
         _ => "?×",
     }
-}
-
-/// Cap per-frame ticks proportional to speed, with a reasonable ceiling.
-/// 3D mode: `speed × 2` (max 4000). Fast mode: `speed × 10` (max 100,000).
-fn max_ticks_per_frame(speed_multiplier: u32, render_3d: bool) -> u32 {
-    if render_3d {
-        (speed_multiplier * 2).min(4000)
-    } else {
-        (speed_multiplier * 10).min(100_000)
-    }
-}
-
-/// Brain tick decimation stride — sqrt scaling so physics still runs every tick
-/// but brain evaluations are reduced at high speed. 1x→1, 10x→3, 100x→10, 1000x→31.
-fn brain_stride(speed_multiplier: u32) -> u64 {
-    ((speed_multiplier as f32).sqrt() as u64).max(1)
 }
 
 #[cfg(test)]
@@ -2616,9 +2838,9 @@ mod tests {
         assert_eq!(speed_label(10), "10×");
         assert_eq!(speed_label(100), "100×");
         assert_eq!(speed_label(1_000), "1k×");
-        assert_eq!(speed_label(5_000), "5k×");
         assert_eq!(speed_label(10_000), "10k×");
-        assert_eq!(speed_label(50_000), "50k×");
+        assert_eq!(speed_label(100_000), "100k×");
+        assert_eq!(speed_label(1_000_000), "1000k×");
     }
 
     #[test]
@@ -2628,62 +2850,13 @@ mod tests {
         assert_eq!(speed_label(999), "?×");
     }
 
-    // ── max_ticks_per_frame ──────────────────────────────────────────
-
-    #[test]
-    fn max_ticks_3d_scales_linearly_then_caps() {
-        assert_eq!(max_ticks_per_frame(1, true), 2);
-        assert_eq!(max_ticks_per_frame(10, true), 20);
-        assert_eq!(max_ticks_per_frame(1000, true), 2000);
-        assert_eq!(max_ticks_per_frame(5000, true), 4000); // capped
-        assert_eq!(max_ticks_per_frame(50_000, true), 4000); // capped
-    }
-
-    #[test]
-    fn max_ticks_fast_mode_scales_then_caps() {
-        assert_eq!(max_ticks_per_frame(1, false), 10);
-        assert_eq!(max_ticks_per_frame(100, false), 1000);
-        assert_eq!(max_ticks_per_frame(1000, false), 10_000);
-        assert_eq!(max_ticks_per_frame(10_000, false), 100_000); // at cap
-        assert_eq!(max_ticks_per_frame(50_000, false), 100_000); // capped
-    }
-
-    // ── brain_stride ─────────────────────────────────────────────────
-
-    #[test]
-    fn brain_stride_sqrt_scaling() {
-        assert_eq!(brain_stride(1), 1);
-        assert_eq!(brain_stride(10), 3); // sqrt(10)=3.16 → 3
-        assert_eq!(brain_stride(100), 10);
-        assert_eq!(brain_stride(1000), 31); // sqrt(1000)=31.6 → 31
-        assert_eq!(brain_stride(10_000), 100);
-        assert_eq!(brain_stride(50_000), 223); // sqrt(50000)=223.6 → 223
-    }
-
-    #[test]
-    fn brain_stride_never_zero() {
-        // Even at speed 0 (shouldn't happen), stride must be ≥ 1
-        assert!(brain_stride(0) >= 1);
-    }
-
     // ── key-to-multiplier mapping ────────────────────────────────────
 
     #[test]
     fn all_speed_levels_have_labels() {
-        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 5_000, 10_000, 50_000];
+        let levels: &[u32] = &[1, 2, 5, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
         for &m in levels {
             assert_ne!(speed_label(m), "?×", "missing label for multiplier {}", m);
-        }
-    }
-
-    #[test]
-    fn fast_mode_always_ge_3d_mode() {
-        for speed in [1, 2, 5, 10, 100, 1000, 5000, 10_000, 50_000] {
-            assert!(
-                max_ticks_per_frame(speed, false) >= max_ticks_per_frame(speed, true),
-                "fast mode should allow >= 3D ticks at speed {}",
-                speed,
-            );
         }
     }
 }

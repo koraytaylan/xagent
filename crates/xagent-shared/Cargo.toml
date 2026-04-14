@@ -3,6 +3,9 @@ name = "xagent-shared"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 glam = { workspace = true }
 serde = { workspace = true }

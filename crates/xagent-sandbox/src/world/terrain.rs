@@ -17,6 +17,12 @@ pub struct TerrainData {
     pub subdivisions: u32,
     /// Flat array of heights: heights[z * verts_per_side + x]
     pub heights: Vec<f32>,
+    // Pre-cached constants for height_at (avoids recomputation per call).
+    half: f32,
+    inv_step: f32,
+    vps: u32,
+    max_coord: f32, // (vps - 1) as f32
+    max_idx: u32,   // vps - 2
 }
 
 impl TerrainData {
@@ -48,27 +54,31 @@ impl TerrainData {
             }
         }
 
+        let step = size / subdivisions as f32;
         Self {
             size,
             subdivisions,
             heights,
+            half,
+            inv_step: 1.0 / step,
+            vps,
+            max_coord: (vps - 1) as f32,
+            max_idx: vps - 2,
         }
     }
 
     /// Bilinear-interpolated height at any world-space (x, z).
+    #[inline(always)]
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
-        let half = self.size / 2.0;
-        let step = self.size / self.subdivisions as f32;
-        let vps = self.subdivisions + 1;
+        let gx = ((x + self.half) * self.inv_step).clamp(0.0, self.max_coord);
+        let gz = ((z + self.half) * self.inv_step).clamp(0.0, self.max_coord);
 
-        let gx = ((x + half) / step).clamp(0.0, (vps - 1) as f32);
-        let gz = ((z + half) / step).clamp(0.0, (vps - 1) as f32);
-
-        let ix = (gx.floor() as u32).min(vps - 2);
-        let iz = (gz.floor() as u32).min(vps - 2);
+        let ix = (gx.floor() as u32).min(self.max_idx);
+        let iz = (gz.floor() as u32).min(self.max_idx);
         let fx = gx - ix as f32;
         let fz = gz - iz as f32;
 
+        let vps = self.vps;
         let h00 = self.heights[(iz * vps + ix) as usize];
         let h10 = self.heights[(iz * vps + ix + 1) as usize];
         let h01 = self.heights[((iz + 1) * vps + ix) as usize];
@@ -129,20 +139,8 @@ fn terrain_color(x: f32, z: f32, height: f32, biome_map: &BiomeMap) -> [f32; 3] 
 
     let biome = biome_map.biome_at(x, z);
     match biome {
-        BiomeType::FoodRich => [
-            0.12 + t * 0.10,
-            0.40 + t * 0.05,
-            0.08 + t * 0.04,
-        ],
-        BiomeType::Barren => [
-            0.40 + t * 0.20,
-            0.32 + t * 0.05,
-            0.15 + t * 0.05,
-        ],
-        BiomeType::Danger => [
-            0.45 + t * 0.20,
-            0.15 + t * 0.05,
-            0.10 + t * 0.03,
-        ],
+        BiomeType::FoodRich => [0.12 + t * 0.10, 0.40 + t * 0.05, 0.08 + t * 0.04],
+        BiomeType::Barren => [0.40 + t * 0.20, 0.32 + t * 0.05, 0.15 + t * 0.05],
+        BiomeType::Danger => [0.45 + t * 0.20, 0.15 + t * 0.05, 0.10 + t * 0.03],
     }
 }

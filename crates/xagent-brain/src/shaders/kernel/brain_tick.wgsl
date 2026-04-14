@@ -559,12 +559,15 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 
-        // Exploration noise — scaled by mean habituation attenuation so that
-        // noise amplitude tracks the attenuated policy signal, preserving SNR.
+        // Exploration noise — constant amplitude, independent of habituation.
+        // Scaling noise by mean_atten (as done previously) created a death
+        // spiral: agents barely moved → input static → atten→0.1 → noise 10×
+        // smaller → agents moved even less.  Exploration must stay vigorous
+        // regardless of habituation state to drive REINFORCE-style learning.
         let tick_u = u32(tick_count);
         let seed_base = agent_id * 1000u + tick_u;
-        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5 * mean_atten;
-        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5 * mean_atten;
+        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5;
+        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5;
         fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
         trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
 

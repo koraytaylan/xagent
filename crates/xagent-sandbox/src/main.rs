@@ -276,7 +276,7 @@ struct App {
 
     /// Fixed-timestep accumulator — simulation ticks run at SIM_RATE Hz,
     /// decoupled from the render frame rate.
-    sim_accumulator: f32,
+    sim_accumulator: f64,
 
     // Speed controls (multiplier for simulation rate)
     speed_multiplier: u32,
@@ -1535,7 +1535,6 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
-
                 // ── FPS tracking ──────────────────────────────────
                 self.frame_times.push_back(now);
                 while self.frame_times.len() > 300 {
@@ -1580,110 +1579,46 @@ impl ApplicationHandler for App {
                 // Also skip accumulation when the kernel is being recreated
                 // in the background to prevent catch-up hitch when it lands.
                 if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
-                    self.sim_accumulator += dt * self.speed_multiplier as f32;
-                    // Cap accumulator to 2× budget so debt stays bounded.
-                    let max_acc = SIM_DT * self.gpu_tick_budget as f32 * 2.0;
-                    self.sim_accumulator = self.sim_accumulator.min(max_acc);
-                    let ticks_to_run =
-                        ((self.sim_accumulator / SIM_DT) as u32).min(self.gpu_tick_budget);
+                    let sim_delta_time = SIM_DT as f64;
+                    self.sim_accumulator += dt as f64 * self.speed_multiplier as f64;
+                    let max_accumulator = sim_delta_time * self.speed_multiplier as f64 * 3.0;
+                    self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
+                    let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
+                        .min(self.gpu_tick_budget)
+                        .min(500);
+                    // Only dispatch when the accumulator has enough for at
+                    // least brain_tick_stride ticks, so every dispatch
+                    // includes a brain cycle and produces motor commands.
+                    // Sub-stride dispatches would be physics-only (no brain
+                    // cycles), leaving agents with stale motor outputs.
+                    // The accumulator keeps its fractional remainder across
+                    // frames so no sim-time is lost.
+                    let min_dispatch = self
+                        .gpu_kernel
+                        .as_ref()
+                        .map_or(10, |kernel| kernel.brain_tick_stride());
+                    let ticks_to_run = if raw_ticks >= min_dispatch {
+                        raw_ticks
+                    } else {
+                        0
+                    };
 
                     if ticks_to_run > 0 {
-                        if let Some(ref mut mk) = self.gpu_kernel {
-                            let state_updated = mk.try_collect_state();
-                            let t0 = Instant::now();
-                            let dispatched = mk.dispatch_batch(self.tick, ticks_to_run);
-                            let wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                        if let Some(ref mut kernel) = self.gpu_kernel {
+                            kernel.dispatch_batch(self.tick, ticks_to_run);
 
-                            if dispatched {
-                                // Grow budget aggressively — staging double-buffer
-                                // is the real throttle (dispatch_batch returns false
-                                // when both are in-flight). Only shrink if CPU
-                                // encoding takes so long it stalls the render loop.
-                                if wall_ms > 50.0 {
-                                    self.gpu_tick_budget = (self.gpu_tick_budget * 3 / 4).max(32);
-                                } else {
-                                    self.gpu_tick_budget =
-                                        (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1)
-                                            .min(64_000);
-                                }
+                            self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
 
-                                self.tick += ticks_to_run as u64;
-                                self.tps_tick_count += ticks_to_run as u64;
-                                self.sim_accumulator -= SIM_DT * ticks_to_run as f32;
-                                self.snap_dirty = true;
+                            self.gpu_tick_budget =
+                                (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1).min(64_000);
 
-                                if let Some(gov) = &mut self.governor {
-                                    for _ in 0..ticks_to_run {
-                                        gov.tick();
-                                    }
-                                }
-                            }
-                            // else: GPU backpressure — skip this frame, retry next
+                            self.tick += ticks_to_run as u64;
+                            self.tps_tick_count += ticks_to_run as u64;
+                            self.snap_dirty = true;
 
-                            if state_updated || mk.try_collect_state() {
-                                let state = mk.cached_state();
-                                for i in 0..self.agents.len() {
-                                    let base = i * PHYS_STRIDE;
-                                    if base + P_URGENCY_OUT >= state.len() {
-                                        break;
-                                    }
-                                    let a = &mut self.agents[i];
-                                    a.body.body.position = Vec3::new(
-                                        state[base + P_POS_X],
-                                        state[base + P_POS_Y],
-                                        state[base + P_POS_Z],
-                                    );
-                                    a.body.body.alive = state[base + P_ALIVE] > 0.5;
-                                    a.body.yaw = state[base + P_YAW];
-                                    a.body.body.internal.energy = state[base + P_ENERGY];
-                                    a.body.body.internal.integrity = state[base + P_INTEGRITY];
-                                    a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
-                                    a.body.body.internal.max_integrity =
-                                        state[base + P_MAX_INTEGRITY];
-                                    a.body.body.velocity = Vec3::new(
-                                        state[base + P_VEL_X],
-                                        state[base + P_VEL_Y],
-                                        state[base + P_VEL_Z],
-                                    );
-                                    a.food_consumed = state[base + P_FOOD_COUNT] as u32;
-                                    a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
-                                    let new_deaths = state[base + P_DEATH_COUNT] as u32;
-                                    if new_deaths > a.death_count {
-                                        a.reset_trail();
-                                    }
-                                    a.death_count = new_deaths;
-                                    a.body.body.facing = Vec3::new(
-                                        state[base + P_FACING_X],
-                                        state[base + P_FACING_Y],
-                                        state[base + P_FACING_Z],
-                                    );
-                                    a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
-                                    a.cached_exploration_rate =
-                                        state[base + P_EXPLORATION_RATE_OUT];
-                                    a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
-                                    a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
-                                    a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
-                                    a.cached_gradient = state[base + P_GRADIENT_OUT];
-                                    a.cached_urgency = state[base + P_URGENCY_OUT];
-                                }
-
-                                // Diagnostic: log first readback Y vs terrain height
-                                if !self.readback_logged {
-                                    if let Some(world) = &self.world {
-                                        let n = self.agents.len().min(5);
-                                        if n > 0 {
-                                            for i in 0..n {
-                                                let a = &self.agents[i];
-                                                let p = a.body.body.position;
-                                                let terrain_y = world.terrain.height_at(p.x, p.z);
-                                                log::info!(
-                                                    "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
-                                                    i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
-                                                );
-                                            }
-                                            self.readback_logged = true;
-                                        }
-                                    }
+                            if let Some(gov) = &mut self.governor {
+                                for _ in 0..ticks_to_run {
+                                    gov.tick();
                                 }
                             }
 
@@ -1694,14 +1629,14 @@ impl ApplicationHandler for App {
                             if self.selected_agent_idx < self.agents.len() {
                                 let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
 
-                                mk.request_agent_telemetry(brain_idx);
+                                kernel.request_agent_telemetry(brain_idx);
 
                                 // Collect any completed readback (non-blocking)
-                                if let Some(tel) = mk.try_collect_telemetry() {
+                                if let Some(tel) = kernel.try_collect_telemetry() {
                                     let a = &mut self.agents[self.selected_agent_idx];
                                     // Only update fields NOT already populated by
-                                    // the fresher async physics readback above.
-                                    // Phys readback already sets: cached_motor,
+                                    // the every-frame physics readback (below).
+                                    // Physics readback sets: cached_motor,
                                     // cached_gradient, cached_urgency,
                                     // cached_fatigue_factor, cached_prediction_error,
                                     // cached_exploration_rate.
@@ -1759,42 +1694,110 @@ impl ApplicationHandler for App {
                                 rec.record_tick(tick, &records);
                             }
                         }
+                    }
 
-                        // Heatmap + trail recording
+                    // ── Every-frame state readback ──
+                    // Collect GPU staging data and update agent positions
+                    // regardless of whether ticks were dispatched this frame.
+                    // This ensures smooth visual updates at low speed multipliers
+                    // where dispatches happen infrequently.
+                    if let Some(ref mut kernel) = self.gpu_kernel {
+                        if kernel.try_collect_state() {
+                            let state = kernel.cached_state();
+                            for i in 0..self.agents.len() {
+                                let base = i * PHYS_STRIDE;
+                                if base + P_URGENCY_OUT >= state.len() {
+                                    break;
+                                }
+                                let a = &mut self.agents[i];
+                                a.body.body.position = Vec3::new(
+                                    state[base + P_POS_X],
+                                    state[base + P_POS_Y],
+                                    state[base + P_POS_Z],
+                                );
+                                a.body.body.alive = state[base + P_ALIVE] > 0.5;
+                                a.body.yaw = state[base + P_YAW];
+                                a.body.body.internal.energy = state[base + P_ENERGY];
+                                a.body.body.internal.integrity = state[base + P_INTEGRITY];
+                                a.body.body.internal.max_energy = state[base + P_MAX_ENERGY];
+                                a.body.body.internal.max_integrity = state[base + P_MAX_INTEGRITY];
+                                a.body.body.velocity = Vec3::new(
+                                    state[base + P_VEL_X],
+                                    state[base + P_VEL_Y],
+                                    state[base + P_VEL_Z],
+                                );
+                                a.food_consumed = state[base + P_FOOD_COUNT] as u32;
+                                a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
+                                let new_deaths = state[base + P_DEATH_COUNT] as u32;
+                                if new_deaths > a.death_count {
+                                    a.reset_trail();
+                                }
+                                a.death_count = new_deaths;
+                                a.body.body.facing = Vec3::new(
+                                    state[base + P_FACING_X],
+                                    state[base + P_FACING_Y],
+                                    state[base + P_FACING_Z],
+                                );
+                                a.cached_prediction_error = state[base + P_PREDICTION_ERROR];
+                                a.cached_exploration_rate = state[base + P_EXPLORATION_RATE_OUT];
+                                a.cached_fatigue_factor = state[base + P_FATIGUE_FACTOR_OUT];
+                                a.cached_motor.forward = state[base + P_MOTOR_FWD_OUT];
+                                a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
+                                a.cached_gradient = state[base + P_GRADIENT_OUT];
+                                a.cached_urgency = state[base + P_URGENCY_OUT];
+                            }
+
+                            self.snap_dirty = true;
+                            self.hud_dirty = true;
+
+                            // Diagnostic: log first readback Y vs terrain height
+                            if !self.readback_logged {
+                                if let Some(world) = &self.world {
+                                    let n = self.agents.len().min(5);
+                                    if n > 0 {
+                                        for i in 0..n {
+                                            let a = &self.agents[i];
+                                            let p = a.body.body.position;
+                                            let terrain_y = world.terrain.height_at(p.x, p.z);
+                                            log::info!(
+                                                "[TERRAIN-DIAG] Agent {} pos=({:.2}, {:.2}, {:.2}) terrain_y={:.2} diff={:.2}",
+                                                i, p.x, p.y, p.z, terrain_y, p.y - terrain_y,
+                                            );
+                                        }
+                                        self.readback_logged = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Heatmap + trail recording
+                    if let Some(world) = &self.world {
+                        for agent in &mut self.agents {
+                            if agent.body.body.alive {
+                                agent.record_heatmap(world.config.world_size);
+                                agent.record_trail();
+                            }
+                        }
+                    }
+
+                    // Sparkline histories + CSV logging
+                    {
                         if let Some(world) = &self.world {
                             for agent in &mut self.agents {
-                                if agent.body.body.alive {
-                                    agent.record_heatmap(world.config.world_size);
-                                    agent.record_trail();
-                                }
+                                record_agent_histories(agent);
+                            }
+                            if self.selected_agent_idx < self.agents.len() {
+                                let agent = &self.agents[self.selected_agent_idx];
+                                let life_ticks = agent.age(self.tick);
+                                let motor = agent.cached_motor.clone();
+                                log_tick_to_csv(&mut self.logger, agent, world, &motor, life_ticks);
+                                self.error_count += 1;
                             }
                         }
-
-                        // Sparkline histories + CSV logging
-                        {
-                            if let Some(world) = &self.world {
-                                for agent in &mut self.agents {
-                                    record_agent_histories(agent);
-                                }
-                                if self.selected_agent_idx < self.agents.len() {
-                                    let agent = &self.agents[self.selected_agent_idx];
-                                    let life_ticks = agent.age(self.tick);
-                                    let motor = agent.cached_motor.clone();
-                                    log_tick_to_csv(
-                                        &mut self.logger,
-                                        agent,
-                                        world,
-                                        &motor,
-                                        life_ticks,
-                                    );
-                                    self.error_count += 1;
-                                }
-                            }
-                        }
-
-                        self.heatmap_dirty = true;
-                        self.hud_dirty = true;
                     }
+
+                    self.heatmap_dirty = true;
 
                     // ── Generation completion check (after tick batch) ──
                     if self.gen_transition.is_none() {
@@ -2677,6 +2680,12 @@ impl ApplicationHandler for App {
                             log::warn!("Surface error: {:?}", e);
                         }
                     }
+                }
+
+                // Poll GPU kernel device after rendering so map_async
+                // callbacks can complete before the next frame.
+                if let Some(ref kernel) = self.gpu_kernel {
+                    kernel.device().poll(wgpu::Maintain::Poll);
                 }
 
                 // Handle evolution actions (outside renderer borrow)

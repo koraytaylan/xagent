@@ -11,6 +11,11 @@ use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::buffers::*;
 
+/// Number of async staging slots for state readback.
+/// Six slots give async readback additional headroom while keeping the GPU
+/// queue shallow enough that `queue.submit()` never blocks.
+const STAGING_SLOTS: usize = 6;
+
 /// Pending async readback of 4 staging buffers for telemetry.
 struct TelemetryReadback {
     /// Number of map_async callbacks that have fired (need all 4).
@@ -102,15 +107,17 @@ pub struct GpuKernel {
     bind_groups: [wgpu::BindGroup; 2],
     active_config_index: usize,
 
-    // ── Async state readback (double-buffered, non-blocking) ──
-    // Each staging slot contains phys + food buffers, mapped together.
+    // ── Async state readback (STAGING_SLOTS ring, non-blocking) ──
+    // Staging is decoupled from dispatch: in-flight readbacks do not
+    // block new dispatches. Each slot contains state + food staging
+    // buffers for one readback.
     // staging_ready counts completed map_async callbacks (need expected_staging_callbacks).
-    state_staging: [wgpu::Buffer; 2],
-    food_staging: [wgpu::Buffer; 2],
-    staging_index: usize,                    // which buffer to write NEXT
-    staging_in_flight: [bool; 2],            // submitted, not yet collected
-    staging_ready: [Arc<AtomicU32>; 2],      // map_async callbacks completed
-    staging_had_error: [Arc<AtomicBool>; 2], // set if any map_async callback errored
+    state_staging: [wgpu::Buffer; STAGING_SLOTS],
+    food_staging: [wgpu::Buffer; STAGING_SLOTS],
+    staging_index: usize,                           // which buffer to write NEXT
+    staging_in_flight: [bool; STAGING_SLOTS],       // submitted, not yet collected
+    staging_ready: [Arc<AtomicU32>; STAGING_SLOTS], // map_async callbacks completed
+    staging_had_error: [Arc<AtomicBool>; STAGING_SLOTS], // set if any map_async callback errored
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
     food_cache_valid: bool,
@@ -170,10 +177,24 @@ impl GpuKernel {
     /// Re-initialize all per-agent GPU state for a new generation without
     /// recreating the device, pipelines, or buffers.  The caller must also
     /// call `upload_agents` afterwards to set physics positions.
+    /// Reset all agent state using a deterministic RNG seed.
+    /// Produces identical brain weights for the same seed + config,
+    /// enabling reproducible test runs across resets.
+    pub fn reset_agents_seeded(&mut self, brain_config: &BrainConfig, seed: u64) {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+        self.reset_agents_with_rng(brain_config, &mut rng);
+    }
+
     pub fn reset_agents(&mut self, brain_config: &BrainConfig) {
+        let mut rng = rand::rng();
+        self.reset_agents_with_rng(brain_config, &mut rng);
+    }
+
+    fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
         // Drain any pending async readback so staging buffers are clean.
         let expected = self.expected_staging_callbacks();
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
                 while self.staging_ready[i].load(Ordering::Acquire) < expected {
                     self.device.poll(wgpu::Maintain::Poll);
@@ -217,16 +238,11 @@ impl GpuKernel {
         let n = self.agent_count as usize;
 
         // Fresh brain state, pattern memory, and action history.
-        let mut rng = rand::rng();
         let mut brain_data = Vec::with_capacity(n * self.layout.brain_stride);
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
         let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
-            brain_data.extend_from_slice(&init_brain_state_for(
-                brain_config,
-                &self.layout,
-                &mut rng,
-            ));
+            brain_data.extend_from_slice(&init_brain_state_for(brain_config, &self.layout, rng));
             pattern_data.extend_from_slice(&init_pattern_memory());
             history_data.extend_from_slice(&init_action_history());
         }
@@ -430,38 +446,26 @@ impl GpuKernel {
             mapped_at_creation: false,
         });
 
-        // ── Async state readback staging (double-buffered) ──
+        // ── Async state readback staging (STAGING_SLOTS ring buffer) ──
         let state_size = (n * PHYS_STRIDE * 4) as u64;
         let food_state_size = ((f * FOOD_STATE_STRIDE * 4) as u64).max(4);
         let staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
-        let state_staging = [
+        let state_staging = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_state_staging_0"),
+                label: Some(&format!("kernel_state_staging_{i}")),
                 size: state_size,
                 usage: staging_usage,
                 mapped_at_creation: false,
-            }),
+            })
+        });
+        let food_staging = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_state_staging_1"),
-                size: state_size,
-                usage: staging_usage,
-                mapped_at_creation: false,
-            }),
-        ];
-        let food_staging = [
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_food_staging_0"),
+                label: Some(&format!("kernel_food_staging_{i}")),
                 size: food_state_size,
                 usage: staging_usage,
                 mapped_at_creation: false,
-            }),
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kernel_food_staging_1"),
-                size: food_state_size,
-                usage: staging_usage,
-                mapped_at_creation: false,
-            }),
-        ];
+            })
+        });
 
         // ── Pre-allocated telemetry staging buffers ──
         let tel_sensory_size = (layout.sensory_stride * 4) as u64;
@@ -995,12 +999,9 @@ impl GpuKernel {
             state_staging,
             food_staging,
             staging_index: 0,
-            staging_in_flight: [false, false],
-            staging_ready: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
-            staging_had_error: [
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ],
+            staging_in_flight: [false; STAGING_SLOTS],
+            staging_ready: std::array::from_fn(|_| Arc::new(AtomicU32::new(0))),
+            staging_had_error: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
             state_cache: vec![0.0; n * PHYS_STRIDE],
             food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
             food_cache_valid: false,
@@ -1074,6 +1075,19 @@ impl GpuKernel {
         }
         self.queue
             .write_buffer(&self.agent_phys_buffer, 0, bytemuck::cast_slice(&data));
+    }
+
+    /// Minimum ticks per dispatch to guarantee at least one brain cycle.
+    pub fn brain_tick_stride(&self) -> u32 {
+        self.brain_tick_stride
+    }
+
+    /// The number of physics ticks in one full kernel batch
+    /// (`vision_stride * brain_tick_stride`).  Dispatching in exact
+    /// multiples of this value guarantees deterministic global-pass and
+    /// vision-pass frequency regardless of how the total is decomposed.
+    pub fn kernel_batch_size(&self) -> u32 {
+        self.vision_stride * self.brain_tick_stride
     }
 
     /// Write world config uniform with batch parameters.
@@ -1233,7 +1247,7 @@ impl GpuKernel {
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
         let expected = self.expected_staging_callbacks();
         let mut collected = false;
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if !self.staging_in_flight[i] {
                 continue;
             }
@@ -1283,8 +1297,9 @@ impl GpuKernel {
     ///
     /// Each kernel-batch runs `vision_stride` brain cycles in a single dispatch,
     /// followed by one global (grid+collisions) and one vision (raycasting) pass.
-    /// Non-blocking: skips if staging buffer is in flight (GPU backpressure).
-    /// Returns true if dispatched, false if skipped.
+    /// Always dispatches — compute is decoupled from staging readback.
+    /// Staging copy is opportunistic (skipped when all slots are in-flight).
+    /// Always returns `true` (kept for API compatibility).
     ///
     /// # Vision ordering guarantee
     ///
@@ -1311,12 +1326,6 @@ impl GpuKernel {
     /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
     /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
     pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
-        // Check if the write-target staging buffer is free.
-        let widx = self.staging_index;
-        if self.staging_in_flight[widx] {
-            return false;
-        }
-
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
@@ -1400,16 +1409,14 @@ impl GpuKernel {
 
         // Physics-only remainder (ticks that don't fill a brain cycle)
         let physics_remainder = ticks_to_run % self.brain_tick_stride;
-
-        // Final submit: physics remainder + async state readback
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("dispatch_kernel_final"),
-            });
         if physics_remainder > 0 {
             self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
             let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_physics_remainder"),
+                });
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.physics_pipeline);
@@ -1417,57 +1424,72 @@ impl GpuKernel {
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Async state readback into staging[widx]
-        encoder.copy_buffer_to_buffer(
-            &self.agent_phys_buffer,
-            0,
-            &self.state_staging[widx],
-            0,
-            buf_size,
-        );
-        if self.food_count > 0 {
-            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+        // Opportunistic staging copy: scan for any free slot.
+        // Compute dispatch above always runs — staging readback is
+        // decoupled so dispatch is never blocked by readback latency.
+        let write_slot = (0..STAGING_SLOTS)
+            .map(|offset| (self.staging_index + offset) % STAGING_SLOTS)
+            .find(|&slot| !self.staging_in_flight[slot]);
+        if let Some(slot_index) = write_slot {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_staging_copy"),
+                });
             encoder.copy_buffer_to_buffer(
-                &self.food_state_buffer,
+                &self.agent_phys_buffer,
                 0,
-                &self.food_staging[widx],
+                &self.state_staging[slot_index],
                 0,
-                food_size,
+                buf_size,
             );
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
+            if self.food_count > 0 {
+                let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                encoder.copy_buffer_to_buffer(
+                    &self.food_state_buffer,
+                    0,
+                    &self.food_staging[slot_index],
+                    0,
+                    food_size,
+                );
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
 
-        self.staging_ready[widx].store(0, Ordering::Release);
-        self.staging_had_error[widx].store(false, Ordering::Release);
+            self.staging_ready[slot_index].store(0, Ordering::Release);
+            self.staging_had_error[slot_index].store(false, Ordering::Release);
 
-        let phys_flag = self.staging_ready[widx].clone();
-        let phys_err = self.staging_had_error[widx].clone();
-        self.state_staging[widx]
-            .slice(..buf_size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_err() {
-                    phys_err.store(true, Ordering::Release);
-                }
-                phys_flag.fetch_add(1, Ordering::Release);
-            });
-        if self.food_count > 0 {
-            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-            let food_flag = self.staging_ready[widx].clone();
-            let food_err = self.staging_had_error[widx].clone();
-            self.food_staging[widx].slice(..food_size).map_async(
+            let phys_flag = self.staging_ready[slot_index].clone();
+            let phys_err = self.staging_had_error[slot_index].clone();
+            self.state_staging[slot_index].slice(..buf_size).map_async(
                 wgpu::MapMode::Read,
                 move |result| {
                     if result.is_err() {
-                        food_err.store(true, Ordering::Release);
+                        phys_err.store(true, Ordering::Release);
                     }
-                    food_flag.fetch_add(1, Ordering::Release);
+                    phys_flag.fetch_add(1, Ordering::Release);
                 },
             );
+            if self.food_count > 0 {
+                let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+                let food_flag = self.staging_ready[slot_index].clone();
+                let food_err = self.staging_had_error[slot_index].clone();
+                self.food_staging[slot_index].slice(..food_size).map_async(
+                    wgpu::MapMode::Read,
+                    move |result| {
+                        if result.is_err() {
+                            food_err.store(true, Ordering::Release);
+                        }
+                        food_flag.fetch_add(1, Ordering::Release);
+                    },
+                );
+            }
+            self.staging_in_flight[slot_index] = true;
+            self.staging_index = (slot_index + 1) % STAGING_SLOTS;
         }
-        self.staging_in_flight[widx] = true;
-        self.staging_index = 1 - self.staging_index;
+
         self.active_config_index = 1 - self.active_config_index;
         true
     }
@@ -1855,7 +1877,7 @@ impl GpuKernel {
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
         // Check if any staging buffer is still in flight.
         let expected = self.expected_staging_callbacks();
-        for i in 0..2 {
+        for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
                 self.device.poll(wgpu::Maintain::Poll);
                 if self.staging_ready[i].load(Ordering::Acquire) < expected {
@@ -2039,12 +2061,14 @@ impl GpuKernel {
     }
 
     /// Unmap all pre-allocated telemetry staging buffers.
-    /// Safe to call even when buffers are not currently mapped.
+    /// Only unmaps when a telemetry readback was pending.
     fn unmap_telemetry_staging(&self) {
-        self.telemetry_staging.sensory.unmap();
-        self.telemetry_staging.decision.unmap();
-        self.telemetry_staging.brain.unmap();
-        self.telemetry_staging.phys.unmap();
+        if self.pending_telemetry.is_some() {
+            self.telemetry_staging.sensory.unmap();
+            self.telemetry_staging.decision.unmap();
+            self.telemetry_staging.brain.unmap();
+            self.telemetry_staging.phys.unmap();
+        }
     }
 
     /// Kick off non-blocking telemetry readback for one agent.

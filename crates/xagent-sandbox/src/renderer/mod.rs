@@ -203,12 +203,15 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Use AutoVsync (or Mailbox) to cap render submissions to the
+        // display refresh rate.  PresentMode::Immediate floods the GPU
+        // command queue at 300-600+ fps, which starves the compute device's
+        // async staging readback (adds 40-60ms latency on Metal) and
+        // prevents sim TPS from reaching the target at high speed
+        // multipliers.  AutoVsync matches the display rate (typically
+        // 60-120Hz on macOS) — smooth enough for UI interaction while
+        // giving the compute device adequate GPU scheduling time.
         let present_mode = if surface_caps
-            .present_modes
-            .contains(&wgpu::PresentMode::Immediate)
-        {
-            wgpu::PresentMode::Immediate
-        } else if surface_caps
             .present_modes
             .contains(&wgpu::PresentMode::Mailbox)
         {

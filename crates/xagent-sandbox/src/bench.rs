@@ -31,13 +31,13 @@ pub fn run_bench(
 ) -> BenchResult {
     println!("[bench] Using GpuKernel ({} agents)", agent_count);
 
-    let (mut mk, _world) = create_kernel(&brain, &world_config, agent_count);
+    let (mut kernel, _world) = create_kernel(&brain, &world_config, agent_count);
 
     let start = Instant::now();
 
     // Single dispatch for all ticks
-    mk.dispatch_batch(0, total_ticks as u32);
-    let state = mk.read_full_state_blocking();
+    kernel.dispatch_batch(0, total_ticks as u32);
+    let state = kernel.read_full_state_blocking();
 
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
@@ -76,29 +76,29 @@ pub fn run_profile(
         agent_count, total_ticks
     );
 
-    let (mut mk, _world) = create_kernel(&brain, &world_config, agent_count);
+    let (mut kernel, _world) = create_kernel(&brain, &world_config, agent_count);
 
     // mask=0: barriers only (no compute, same barrier structure)
     let t0 = Instant::now();
-    mk.dispatch_batch_masked(0, total_ticks as u32, 0);
+    kernel.dispatch_batch_masked(0, total_ticks as u32, 0);
     let barriers_only = t0.elapsed().as_secs_f64();
 
     // mask=1: physics only (barriers + physics compute)
-    let (mut mk, _) = create_kernel(&brain, &world_config, agent_count);
+    let (mut kernel, _) = create_kernel(&brain, &world_config, agent_count);
     let t1 = Instant::now();
-    mk.dispatch_batch_masked(0, total_ticks as u32, 1);
+    kernel.dispatch_batch_masked(0, total_ticks as u32, 1);
     let physics = t1.elapsed().as_secs_f64();
 
     // mask=3: physics + vision
-    let (mut mk, _) = create_kernel(&brain, &world_config, agent_count);
+    let (mut kernel, _) = create_kernel(&brain, &world_config, agent_count);
     let t2 = Instant::now();
-    mk.dispatch_batch_masked(0, total_ticks as u32, 3);
+    kernel.dispatch_batch_masked(0, total_ticks as u32, 3);
     let phys_vision = t2.elapsed().as_secs_f64();
 
     // mask=7: full (physics + vision + brain)
-    let (mut mk, _) = create_kernel(&brain, &world_config, agent_count);
+    let (mut kernel, _) = create_kernel(&brain, &world_config, agent_count);
     let t3 = Instant::now();
-    mk.dispatch_batch_masked(0, total_ticks as u32, 7);
+    kernel.dispatch_batch_masked(0, total_ticks as u32, 7);
     let full = t3.elapsed().as_secs_f64();
 
     println!("  barriers only:     {:.3}s", barriers_only);
@@ -120,6 +120,115 @@ pub fn run_profile(
     println!("  total tps (full):  {:.0}", total_ticks as f64 / full);
 }
 
+/// Simulate the real tick loop with accumulator and per-frame dispatch —
+/// no rendering. Prints DIAG lines every second and returns the result.
+pub fn run_tick_loop_bench(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+    speed_multiplier: f32,
+    timeout_secs: f64,
+) -> BenchResult {
+    const SIM_DT: f64 = 1.0 / 60.0;
+
+    let (mut kernel, _world) = create_kernel(&brain, &world_config, agent_count);
+
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    let mut accumulator: f64 = 0.0;
+    let mut gpu_tick_budget: u32 = 32;
+    let mut last_diag = Instant::now();
+    let mut diag_ticks_since: u64 = 0;
+    let mut dispatch_count: u64 = 0;
+
+    // Simulate 120fps frame rate (8.33ms per frame)
+    let frame_delta_time: f64 = 1.0 / 120.0;
+
+    while tick < total_ticks {
+        let wall_elapsed = start.elapsed().as_secs_f64();
+        if wall_elapsed > timeout_secs {
+            eprintln!(
+                "[BENCH] TIMEOUT after {:.1}s — only {}/{} ticks ({:.0} tps)",
+                wall_elapsed,
+                tick,
+                total_ticks,
+                tick as f64 / wall_elapsed
+            );
+            break;
+        }
+
+        // Accumulate
+        accumulator += frame_delta_time * speed_multiplier as f64;
+        let max_accumulator = SIM_DT * speed_multiplier as f64 * 3.0;
+        accumulator = accumulator.min(max_accumulator);
+
+        let remaining = (total_ticks - tick) as u32;
+        let min_dispatch = kernel.brain_tick_stride();
+        let raw_ticks = ((accumulator / SIM_DT) as u32)
+            .min(gpu_tick_budget)
+            .min(500)
+            .min(remaining);
+        let ticks_to_run = if raw_ticks >= min_dispatch {
+            raw_ticks
+        } else {
+            0
+        };
+
+        if ticks_to_run > 0 {
+            kernel.try_collect_state();
+            kernel.dispatch_batch(tick, ticks_to_run);
+
+            accumulator -= ticks_to_run as f64 * SIM_DT;
+            gpu_tick_budget = (gpu_tick_budget + gpu_tick_budget / 4 + 1).min(64_000);
+            tick += ticks_to_run as u64;
+            diag_ticks_since += ticks_to_run as u64;
+            dispatch_count += 1;
+        }
+
+        // DIAG every second
+        if last_diag.elapsed().as_secs_f64() >= 1.0 {
+            let tps = diag_ticks_since as f64 / last_diag.elapsed().as_secs_f64();
+            eprintln!(
+                "[BENCH-DIAG] tick={}/{} tps={:.0} budget={} dispatches={} accumulator={:.4}",
+                tick, total_ticks, tps, gpu_tick_budget, dispatch_count, accumulator
+            );
+            diag_ticks_since = 0;
+            dispatch_count = 0;
+            last_diag = Instant::now();
+        }
+    }
+
+    // Final readback
+    let state = kernel.read_full_state_blocking();
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    let ticks_per_sec = tick as f64 / elapsed_secs;
+
+    eprintln!(
+        "[BENCH] Done: {} ticks in {:.2}s = {:.0} tps",
+        tick, elapsed_secs, ticks_per_sec
+    );
+
+    let final_positions: Vec<[f32; 3]> = (0..agent_count)
+        .map(|i| {
+            let base = i * PHYS_STRIDE;
+            [
+                state[base + P_POS_X],
+                state[base + P_POS_Y],
+                state[base + P_POS_Z],
+            ]
+        })
+        .collect();
+
+    BenchResult {
+        total_ticks: tick,
+        agent_count,
+        elapsed_secs,
+        ticks_per_sec,
+        final_positions,
+    }
+}
+
 fn create_kernel(
     brain: &BrainConfig,
     world_config: &WorldConfig,
@@ -128,7 +237,7 @@ fn create_kernel(
     let world = WorldState::new(world_config.clone());
     let food_count = world.food_items.len();
 
-    let mk = GpuKernel::new(agent_count as u32, food_count, brain, world_config);
+    let kernel = GpuKernel::new(agent_count as u32, food_count, brain, world_config);
 
     // Upload world data
     let heights = world.terrain.heights.clone();
@@ -140,7 +249,7 @@ fn create_kernel(
         .collect();
     let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
-    mk.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
 
     // Upload agents
     let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = (0..agent_count)
@@ -155,7 +264,7 @@ fn create_kernel(
             )
         })
         .collect();
-    mk.upload_agents(&agent_data);
+    kernel.upload_agents(&agent_data);
 
-    (mk, world)
+    (kernel, world)
 }

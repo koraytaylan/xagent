@@ -613,6 +613,91 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
     );
 }
 
+/// Proves that decomposing ticks into different batch sizes doesn't
+/// affect simulation results, as long as each batch is a multiple of
+/// `kernel_batch_size` (= `vision_stride * brain_tick_stride`, default 100).
+///
+/// Each run creates a fresh kernel from the same initial state so the
+/// comparison focuses on whether different batch decompositions change
+/// the simulation result.
+///
+/// Test cases (all multiples of 100, total = 1000):
+///   1. 1 × 1000   (1 dispatch)
+///   2. 2 × 500    (2 dispatches)
+///   3. 10 × 100   (10 dispatches)
+#[test]
+fn deterministic_across_batch_sizes() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{P_POS_X, P_POS_Y, P_POS_Z};
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let total_ticks: u32 = 1000;
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    // Helper: create a fresh kernel with deterministic brain state,
+    // dispatch total_ticks in given batch size, return final position.
+    let run_with_batch_size = |batch_size: u32| -> [f32; 3] {
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        let kernel_batch = kernel.kernel_batch_size();
+        assert_eq!(
+            batch_size % kernel_batch,
+            0,
+            "batch_size {} must be a multiple of kernel_batch_size {}",
+            batch_size,
+            kernel_batch
+        );
+        // Overwrite random brain state with deterministic seed
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+
+        let num_batches = total_ticks / batch_size;
+        for i in 0..num_batches {
+            kernel.dispatch_batch((i * batch_size) as u64, batch_size);
+        }
+
+        let state = kernel.read_full_state_blocking();
+        [state[P_POS_X], state[P_POS_Y], state[P_POS_Z]]
+    };
+
+    let pos_1000 = run_with_batch_size(1000);
+    let pos_500 = run_with_batch_size(500);
+    let pos_100 = run_with_batch_size(100);
+
+    eprintln!("1×1000:  {:?}", pos_1000);
+    eprintln!("2×500:   {:?}", pos_500);
+    eprintln!("10×100:  {:?}", pos_100);
+
+    assert_eq!(pos_1000, pos_500, "2×500 diverged from 1×1000");
+    assert_eq!(pos_1000, pos_100, "10×100 diverged from 1×1000");
+}
+
 // ── GPU Tick Loop Tests ─────────────────────────────────────────────
 
 #[test]

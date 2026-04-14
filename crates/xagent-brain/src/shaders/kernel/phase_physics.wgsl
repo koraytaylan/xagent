@@ -94,9 +94,9 @@ fn phase_physics(tid: u32, tick: u32) {
 
     // Energy depletion (scaled by metabolic_rate from brain config)
     let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
-    // Normalize by default speed (8.0) so baseline energy drain is unchanged;
+    // Normalize by default speed (20.0) so baseline energy drain is unchanged;
     // faster agents pay proportionally more, slower agents pay less.
-    let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414) * (move_speed / 8.0);
+    let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414) * (move_speed / 20.0);
     var energy = agent_phys[b + P_ENERGY];
     energy -= wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
     energy -= movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;

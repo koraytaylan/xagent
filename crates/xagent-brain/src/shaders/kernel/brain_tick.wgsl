@@ -626,7 +626,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     if (tid < DIM) {
         let credit_d = decision_buf[d_base + DIM + tid];
         if (abs(credit_d) >= 1e-6) {
-            let scale = learning_rate * credit_d * 0.001;
+            let scale = learning_rate * credit_d * 0.01;
             for (var j: u32 = 0u; j < FEATURE_COUNT; j = j + 1u) {
                 var w = brain_state[b + O_ENC_WEIGHTS + j * DIM + tid] + scale * s_features[j];
                 w = clamp(w, -2.0, 2.0);

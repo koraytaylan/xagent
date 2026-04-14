@@ -348,10 +348,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             if (temporal < 0.01) { continue; }
             let improvement = gradient - rec_grad;
             var credit_input = improvement;
+            var is_tonic = false;
             if (abs(improvement) < DEADZONE) {
                 credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+                is_tonic = true;
             }
-            if (abs(credit_input) < DEADZONE) { continue; }
+            if (!is_tonic && abs(credit_input) < DEADZONE) { continue; }
+            if (abs(credit_input) < 1e-6) { continue; }
             var effective: f32;
             if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
             else { effective = credit_input; }

@@ -307,7 +307,7 @@ World simulation parameters:
 | Parameter | Default | Description |
 |---|---|---|
 | `world_size` | 256.0 | Side length of the square terrain in world units. Larger worlds require more exploration. |
-| `energy_depletion_rate` | 0.01 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
+| `energy_depletion_rate` | 0.03 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
 | `movement_energy_cost` | 0.005 | Additional energy cost per unit of movement. Moving is expensive — the agent must learn to balance exploration (costly) with exploitation (staying near known food). |
 | `hazard_damage_rate` | 0.1 | Integrity damage per tick while in a hazard zone. Higher values make hazards more lethal, increasing the selection pressure to learn avoidance. |
 | `integrity_regen_rate` | 0.005 | Integrity recovered per tick when energy is above 50%. Recovery is slow relative to damage — the agent must avoid hazards rather than tanking through them. |

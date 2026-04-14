@@ -323,7 +323,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
   },
   "world": {
     "world_size": 256.0,
-    "energy_depletion_rate": 0.01,
+    "energy_depletion_rate": 0.03,
     "movement_energy_cost": 0.005,
     "hazard_damage_rate": 0.1,
     "integrity_regen_rate": 0.005,

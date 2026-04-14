@@ -437,21 +437,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         var fwd: f32 = brain_state[b + O_ACT_BIASES];
         var trn: f32 = brain_state[b + O_ACT_BIASES + 1u];
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            fwd += brain_state[b + O_ACT_FWD_WTS + d] * s_habituated[d];
-            trn += brain_state[b + O_ACT_TURN_WTS + d] * s_habituated[d];
-        }
-
-        // Prospective
-        let confidence = 1.0 - clamp(pred_error, 0.0, 1.0);
-        if (confidence > 0.1) {
-            var fwd_future: f32 = brain_state[b + O_ACT_BIASES];
-            var trn_future: f32 = brain_state[b + O_ACT_BIASES + 1u];
-            for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                fwd_future += brain_state[b + O_ACT_FWD_WTS + d] * s_prediction[d];
-                trn_future += brain_state[b + O_ACT_TURN_WTS + d] * s_prediction[d];
-            }
-            fwd += confidence * ANTICIPATION_WEIGHT * (fwd_future - fwd);
-            trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn);
+            fwd += brain_state[b + O_ACT_FWD_WTS + d] * s_encoded[d];
+            trn += brain_state[b + O_ACT_TURN_WTS + d] * s_encoded[d];
         }
 
         // Memory blend

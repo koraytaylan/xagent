@@ -160,11 +160,13 @@ pub fn run_tick_loop_bench(
 
         // Accumulate
         accumulator += frame_delta_time * speed_multiplier as f64;
-        let max_accumulator = SIM_DT * speed_multiplier as f64 * 3.0;
-        accumulator = accumulator.min(max_accumulator);
-
         let remaining = (total_ticks - tick) as u32;
         let min_dispatch = kernel.brain_tick_stride();
+        // Cap must allow at least min_dispatch ticks to accumulate,
+        // matching the main loop logic in main.rs.
+        let max_accumulator =
+            SIM_DT * (speed_multiplier as f64 * 3.0).max(min_dispatch as f64 + 2.0);
+        accumulator = accumulator.min(max_accumulator);
         let raw_ticks = ((accumulator / SIM_DT) as u32)
             .min(gpu_tick_budget)
             .min(500)

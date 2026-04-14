@@ -11,7 +11,7 @@ var<workgroup> s_encoded: array<f32, 32>;
 var<workgroup> s_habituated: array<f32, 32>;
 var<workgroup> s_homeo: array<f32, 6>;
 var<workgroup> s_similarities: array<f32, 128>;  // reused for decay tracking in pass 7
-var<workgroup> shared_sort_indices: array<u32, 128>;   // tracks pattern index through bitonic sort
+var<workgroup> shared_sort_indices: array<u32, 128>;   // multipurpose: bitonic sort indices (pass 5), credit motor cache (pass 6)
 var<workgroup> s_recall: array<f32, 17>;
 var<workgroup> s_prediction: array<f32, 32>;
 var<workgroup> s_credit: array<f32, 32>;
@@ -331,45 +331,83 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
             s_prediction[d] = fast_tanh(s_prediction[d]);
         }
+        // Pass pred_error to the post-credit block via shared memory.
+        // s_pred_error is later overwritten for pass 7.
+        s_pred_error = pred_error;
+    }
+    workgroupBarrier();
 
-        // Credit assignment
+    // ── Credit assignment: cooperative across threads 0..31 ────────────
+    // Thread 0 computes per-entry credit scalars → s_similarities[0..N].
+    // Threads 0..31 then apply all credits to their dimension in
+    // parallel, eliminating the serial DIM-loop bottleneck that was
+    // blocking 255 threads at the barrier while thread 0 looped over
+    // 64 entries × 32 dimensions.
+    {
+        let gradient = s_homeo[0u];
+        let urgency = s_homeo[2u];
         let hist_len = u32(history_buf[hi_base + O_HIST_LEN]);
-        for (var d: u32 = 0u; d < DIM; d = d + 1u) { s_credit[d] = 0.0; }
-        var credit_mag: f32 = 0.0;
 
-        for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
-            let h_off = i * 5u;
-            let rec_fwd = history_buf[hi_base + O_MOTOR_RING + h_off];
-            let rec_turn = history_buf[hi_base + O_MOTOR_RING + h_off + 1u];
-            let rec_tick = history_buf[hi_base + O_MOTOR_RING + h_off + 2u];
-            let rec_grad = history_buf[hi_base + O_MOTOR_RING + h_off + 3u];
-            let age = tick_count - rec_tick;
-            let temporal = exp(-age * CREDIT_DECAY);
-            if (temporal < 0.01) { continue; }
-            let improvement = gradient - rec_grad;
-            var credit_input = improvement;
-            if (abs(improvement) < DEADZONE) {
-                credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+        // Phase 1: thread 0 computes credit scalar for each history entry
+        if (tid == 0u) {
+            for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
+                let h_off = i * 5u;
+                let rec_fwd = history_buf[hi_base + O_MOTOR_RING + h_off];
+                let rec_turn = history_buf[hi_base + O_MOTOR_RING + h_off + 1u];
+                let rec_tick = history_buf[hi_base + O_MOTOR_RING + h_off + 2u];
+                let rec_grad = history_buf[hi_base + O_MOTOR_RING + h_off + 3u];
+                let age = tick_count - rec_tick;
+                let temporal = exp(-age * CREDIT_DECAY);
+                var credit: f32 = 0.0;
+                if (temporal >= 0.01) {
+                    let improvement = gradient - rec_grad;
+                    var credit_input = improvement;
+                    if (abs(improvement) < DEADZONE) {
+                        credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
+                    }
+                    if (abs(credit_input) >= 1e-6) {
+                        var effective: f32;
+                        if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
+                        else { effective = credit_input; }
+                        credit = effective * temporal;
+                        brain_state[b + O_ACT_BIASES] += WEIGHT_LR * credit * rec_fwd * 0.1;
+                        brain_state[b + O_ACT_BIASES + 1u] += WEIGHT_LR * credit * rec_turn * 0.1;
+                    }
+                }
+                s_similarities[i] = credit;
+                // Cache motor values in shared memory so phase 2 threads
+                // read from workgroup memory instead of storage.
+                shared_sort_indices[i * 2u] = bitcast<u32>(rec_fwd);
+                shared_sort_indices[i * 2u + 1u] = bitcast<u32>(rec_turn);
             }
-            // Epsilon gate: skip near-zero tonic signals (non-tonic path
-            // already guarantees abs >= DEADZONE)
-            if (abs(credit_input) < 1e-6) { continue; }
-            var effective: f32;
-            if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
-            else { effective = credit_input; }
-            let credit = effective * temporal;
-            credit_mag += abs(credit);
-            for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-                let feat = history_buf[hi_base + O_STATE_RING + i * DIM + d];
-                let fwd_wt_update = WEIGHT_LR * credit * rec_fwd * feat;
-                let trn_wt_update = WEIGHT_LR * credit * rec_turn * feat;
-                brain_state[b + O_ACT_FWD_WTS + d] += fwd_wt_update;
-                brain_state[b + O_ACT_TURN_WTS + d] += trn_wt_update;
-                s_credit[d] += credit * rec_fwd * feat + credit * rec_turn * feat;
-            }
-            brain_state[b + O_ACT_BIASES] += WEIGHT_LR * credit * rec_fwd * 0.1;
-            brain_state[b + O_ACT_BIASES + 1u] += WEIGHT_LR * credit * rec_turn * 0.1;
         }
+        workgroupBarrier();
+
+        // Phase 2: threads 0..31 apply all credits to their dimension
+        if (tid < DIM) {
+            s_credit[tid] = 0.0;
+            for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
+                let credit = s_similarities[i];
+                if (abs(credit) > 0.0) {
+                    let rec_fwd = bitcast<f32>(shared_sort_indices[i * 2u]);
+                    let rec_turn = bitcast<f32>(shared_sort_indices[i * 2u + 1u]);
+                    let feat = history_buf[hi_base + O_STATE_RING + i * DIM + tid];
+                    let fwd_wt_update = WEIGHT_LR * credit * rec_fwd * feat;
+                    let trn_wt_update = WEIGHT_LR * credit * rec_turn * feat;
+                    brain_state[b + O_ACT_FWD_WTS + tid] += fwd_wt_update;
+                    brain_state[b + O_ACT_TURN_WTS + tid] += trn_wt_update;
+                    s_credit[tid] += credit * rec_fwd * feat + credit * rec_turn * feat;
+                }
+            }
+        }
+    }
+    storageBarrier(); workgroupBarrier();
+
+    // ── Thread 0: weight normalization, policy, exploration, motor ─────
+    if (tid == 0u) {
+        let gradient = s_homeo[0u];
+        let urgency = s_homeo[2u];
+        let pred_error = s_pred_error;
 
         // Weight normalization
         var fwd_norm_sq: f32 = 0.0;

@@ -559,13 +559,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 
-        // Save pre-noise, pre-fatigue policy output for credit assignment history.
-        // Credit must correlate outcomes with policy intent, not random
-        // exploration noise or fatigue scaling — otherwise weight updates
-        // are randomly directed.
-        let policy_fwd = fwd;
-        let policy_trn = trn;
-
         // Exploration noise — scaled by mean habituation attenuation so that
         // noise amplitude tracks the attenuated policy signal, preserving SNR.
         let tick_u = u32(tick_count);
@@ -580,12 +573,17 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         fwd *= fatigue_factor;
         trn *= fatigue_factor;
 
-        // History recording — stores pre-noise policy output and
-        // full-strength encoded state for accurate credit assignment.
+        // History recording — stores the actual motor command (post-noise,
+        // post-fatigue) so credit assignment can correlate taken actions with
+        // outcomes.  The noise component serves as the exploration signal for
+        // REINFORCE-style learning: when weights are zero the policy output is
+        // zero, and multiplying credit by zero would create a zero-gradient
+        // trap.  The post-noise motor is non-zero even at initialization,
+        // allowing bootstrap learning.
         let hist_cursor = u32(history_buf[hi_base + O_HIST_CURSOR]);
         let hist_off = hist_cursor * 5u;
-        history_buf[hi_base + O_MOTOR_RING + hist_off] = policy_fwd;
-        history_buf[hi_base + O_MOTOR_RING + hist_off + 1u] = policy_trn;
+        history_buf[hi_base + O_MOTOR_RING + hist_off] = fwd;
+        history_buf[hi_base + O_MOTOR_RING + hist_off + 1u] = trn;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 2u] = tick_count;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 3u] = gradient;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 4u] = 0.0;

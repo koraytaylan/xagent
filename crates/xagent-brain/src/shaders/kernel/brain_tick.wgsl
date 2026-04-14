@@ -375,6 +375,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
                     }
                 }
                 s_similarities[i] = credit;
+                // Cache motor values in shared memory so phase 2 threads
+                // read from workgroup memory instead of storage.
+                shared_sort_indices[i * 2u] = bitcast<u32>(rec_fwd);
+                shared_sort_indices[i * 2u + 1u] = bitcast<u32>(rec_turn);
             }
         }
         workgroupBarrier();
@@ -385,8 +389,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
                 let credit = s_similarities[i];
                 if (abs(credit) > 0.0) {
-                    let rec_fwd = history_buf[hi_base + O_MOTOR_RING + i * 5u];
-                    let rec_turn = history_buf[hi_base + O_MOTOR_RING + i * 5u + 1u];
+                    let rec_fwd = bitcast<f32>(shared_sort_indices[i * 2u]);
+                    let rec_turn = bitcast<f32>(shared_sort_indices[i * 2u + 1u]);
                     let feat = history_buf[hi_base + O_STATE_RING + i * DIM + tid];
                     let fwd_wt_update = WEIGHT_LR * credit * rec_fwd * feat;
                     let trn_wt_update = WEIGHT_LR * credit * rec_turn * feat;

@@ -1596,8 +1596,7 @@ impl ApplicationHandler for App {
                     // accumulate, otherwise low speeds (1x, 2x) can never
                     // reach the dispatch threshold.
                     let max_accumulator = sim_delta_time
-                        * (self.speed_multiplier as f64 * 3.0)
-                            .max(min_dispatch as f64 + 2.0);
+                        * (self.speed_multiplier as f64 * 3.0).max(min_dispatch as f64 + 2.0);
                     self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
                     let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
                         .min(self.gpu_tick_budget)

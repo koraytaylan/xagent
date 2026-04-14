@@ -332,7 +332,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             s_prediction[d] = fast_tanh(s_prediction[d]);
         }
         // Pass pred_error to the post-credit block via shared memory.
-        // s_pred_error is later overwritten for pass 7 (line ~561).
+        // s_pred_error is later overwritten for pass 7.
         s_pred_error = pred_error;
     }
     workgroupBarrier();

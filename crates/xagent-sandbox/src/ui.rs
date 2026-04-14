@@ -1441,8 +1441,8 @@ impl<'a> TabContext<'a> {
                     ui.label("movement_speed");
                     ui.add(
                         egui::DragValue::new(&mut b.movement_speed)
-                            .range(2.0..=20.0)
-                            .speed(0.5)
+                            .range(20.0..=100.0)
+                            .speed(1.0)
                             .max_decimals(1),
                     );
                     ui.end_row();

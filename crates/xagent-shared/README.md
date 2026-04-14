@@ -307,12 +307,12 @@ World simulation parameters:
 | Parameter | Default | Description |
 |---|---|---|
 | `world_size` | 256.0 | Side length of the square terrain in world units. Larger worlds require more exploration. |
-| `energy_depletion_rate` | 0.01 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
+| `energy_depletion_rate` | 0.03 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
 | `movement_energy_cost` | 0.005 | Additional energy cost per unit of movement. Moving is expensive — the agent must learn to balance exploration (costly) with exploitation (staying near known food). |
-| `hazard_damage_rate` | 0.1 | Integrity damage per tick while in a hazard zone. Higher values make hazards more lethal, increasing the selection pressure to learn avoidance. |
+| `hazard_damage_rate` | 1.0 | Integrity damage per tick while in a hazard zone. Higher values make hazards more lethal, increasing the selection pressure to learn avoidance. |
 | `integrity_regen_rate` | 0.005 | Integrity recovered per tick when energy is above 50%. Recovery is slow relative to damage — the agent must avoid hazards rather than tanking through them. |
 | `food_energy_value` | 20.0 | Energy restored per food item consumed. Higher values make each food item more impactful, reducing the frequency of foraging needed. |
-| `food_density` | 0.002 | Density of food items in food-rich biomes (items per unit²). Higher density means food is easier to find, lower density increases starvation pressure. |
+| `food_density` | 0.005 | Density of food items in food-rich biomes (items per unit²). Higher density means food is easier to find, lower density increases starvation pressure. |
 | `tick_rate` | 30.0 | Simulation ticks per second. Affects the real-time speed of the simulation. |
 | `seed` | 42 | Random seed for world generation. Same seed = same terrain, biome layout, and initial food placement. |
 

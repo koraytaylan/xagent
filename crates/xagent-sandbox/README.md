@@ -642,7 +642,7 @@ On death the agent is respawned with a **fresh brain** (no persistence in headle
 | Field | Default | Easy | Hard | Description |
 |---|---|---|---|---|
 | `world_size` | 256.0 | 256.0 | 256.0 | Square terrain side length (units) |
-| `energy_depletion_rate` | 0.01 | 0.005 | 0.02 | Base metabolic cost per tick |
+| `energy_depletion_rate` | 0.03 | 0.015 | 0.05 | Base metabolic cost per tick |
 | `movement_energy_cost` | 0.005 | 0.002 | 0.01 | Energy cost per unit of movement magnitude |
 | `hazard_damage_rate` | 1.0 | 0.5 | 2.0 | Integrity damage per tick in Danger biomes |
 | `integrity_regen_rate` | 0.005 | 0.005 | 0.005 | Integrity recovery per tick (when energy > 50%) |

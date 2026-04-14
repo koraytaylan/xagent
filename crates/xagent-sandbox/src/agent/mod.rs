@@ -364,7 +364,7 @@ pub fn mutate_config_with_strength(
         integrity_scale: parent.integrity_scale,
         movement_speed: momentum
             .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
-            .clamp(2.0, 20.0),
+            .clamp(20.0, 100.0),
     }
 }
 
@@ -690,35 +690,35 @@ mod tests {
         let momentum = MutationMomentum::new(0.9);
         // Push initial config to extreme values to verify clamps.
         let too_fast = BrainConfig {
-            movement_speed: 100.0,
+            movement_speed: 200.0,
             ..BrainConfig::default()
         };
         let too_slow = BrainConfig {
-            movement_speed: 0.1,
+            movement_speed: 1.0,
             ..BrainConfig::default()
         };
         for _ in 0..50 {
             let child = mutate_config_with_strength(&too_fast, 0.3, &momentum);
             assert!(
-                child.movement_speed <= 20.0,
-                "movement_speed must be <= 20.0, got {}",
+                child.movement_speed <= 100.0,
+                "movement_speed must be <= 100.0, got {}",
                 child.movement_speed,
             );
             assert!(
-                child.movement_speed >= 2.0,
-                "movement_speed must be >= 2.0, got {}",
+                child.movement_speed >= 20.0,
+                "movement_speed must be >= 20.0, got {}",
                 child.movement_speed,
             );
 
             let child = mutate_config_with_strength(&too_slow, 0.3, &momentum);
             assert!(
-                child.movement_speed <= 20.0,
-                "movement_speed must be <= 20.0, got {}",
+                child.movement_speed <= 100.0,
+                "movement_speed must be <= 100.0, got {}",
                 child.movement_speed,
             );
             assert!(
-                child.movement_speed >= 2.0,
-                "movement_speed must be >= 2.0, got {}",
+                child.movement_speed >= 20.0,
+                "movement_speed must be >= 20.0, got {}",
                 child.movement_speed,
             );
         }

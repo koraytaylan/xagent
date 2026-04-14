@@ -60,8 +60,8 @@ pub struct BrainConfig {
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
-    /// Base movement speed (units per second). Default 8.0.
-    /// Heritable: mutated during breeding, clamped to [2.0, 20.0].
+    /// Base movement speed (units per second). Default 20.0.
+    /// Heritable: mutated during breeding, clamped to [20.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
 }
@@ -135,7 +135,7 @@ fn default_integrity_scale() -> f32 {
 }
 
 fn default_movement_speed() -> f32 {
-    8.0
+    20.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -310,7 +310,7 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             world_size: 256.0,
-            energy_depletion_rate: 0.01,
+            energy_depletion_rate: 0.03,
             movement_energy_cost: 0.005,
             hazard_damage_rate: 1.0,
             integrity_regen_rate: 0.005,
@@ -326,7 +326,7 @@ impl WorldConfig {
     /// Lots of food, slow energy drain, mild hazards.
     pub fn easy() -> Self {
         Self {
-            energy_depletion_rate: 0.005,
+            energy_depletion_rate: 0.015,
             movement_energy_cost: 0.002,
             hazard_damage_rate: 0.5,
             food_density: 0.005,
@@ -338,7 +338,7 @@ impl WorldConfig {
     /// Scarce food, fast energy drain, deadly hazards.
     pub fn hard() -> Self {
         Self {
-            energy_depletion_rate: 0.02,
+            energy_depletion_rate: 0.05,
             movement_energy_cost: 0.01,
             hazard_damage_rate: 2.0,
             food_density: 0.001,
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(config.vision_height, 6);
         assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
         assert!((config.integrity_scale - 0.01).abs() < 1e-6);
-        assert!((config.movement_speed - 8.0).abs() < 1e-6);
+        assert!((config.movement_speed - 20.0).abs() < 1e-6);
     }
 
     #[test]

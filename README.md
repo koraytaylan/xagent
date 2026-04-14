@@ -328,7 +328,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "hazard_damage_rate": 1.0,
     "integrity_regen_rate": 0.005,
     "food_energy_value": 20.0,
-    "food_density": 0.002,
+    "food_density": 0.005,
     "tick_rate": 30.0,
     "seed": 42
   }

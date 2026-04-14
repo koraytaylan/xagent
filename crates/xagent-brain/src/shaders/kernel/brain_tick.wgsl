@@ -441,14 +441,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             trn += brain_state[b + O_ACT_TURN_WTS + d] * s_encoded[d];
         }
 
-        // Prospective blending disabled: the predictor is trained in
-        // habituated space (s_habituated ≈ 0.1 × s_encoded) but the policy
-        // now evaluates in encoded space.  The scale mismatch makes
-        // (fwd_future - fwd) ≈ -0.9 × fwd, systematically dampening the
-        // policy by ~45%.  Re-enable when the predictor targets s_encoded.
-        // let confidence = 1.0 - clamp(pred_error, 0.0, 1.0);
-        // if (confidence > 0.1) { ... }
-
         // Memory blend
         if (recall_count > 0u) {
             var mem_fwd: f32 = 0.0;

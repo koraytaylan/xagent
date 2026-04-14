@@ -545,6 +545,7 @@ These rules are distilled from 88 review comments across PRs #33–#49. They rep
 - **Docstrings must match implementation.** "Non-blocking" means non-blocking, "pre-allocates" means pre-allocates. Rename functions when behavior changes (e.g., `read_agent_telemetry` → `read_agent_telemetry_blocking`).
 - **Distinguish "start operation" from "poll/collect operation" in API naming.** A function that both starts and polls should document that clearly.
 - **Keep PR descriptions synchronized with code.** Constant values, radius sizes, and architectural claims must reflect what the code actually does.
+- **No commented-out code or tombstone comments.** Delete removed code completely — don't comment it out or leave comments describing code that no longer exists. The git history preserves everything.
 
 ### Testing
 - **New concurrency-sensitive code paths require end-to-end tests** exercising the async lifecycle: request → complete → consume, and request → fail → cleanup.

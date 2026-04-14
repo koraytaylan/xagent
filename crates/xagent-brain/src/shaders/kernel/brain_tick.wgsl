@@ -519,13 +519,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 
-        // Apply staleness-based fatigue to final output
-        fwd *= fatigue_factor;
-        trn *= fatigue_factor;
-
-        // Save pre-noise policy output for credit assignment history.
+        // Save pre-noise, pre-fatigue policy output for credit assignment history.
         // Credit must correlate outcomes with policy intent, not random
-        // exploration noise — otherwise weight updates are randomly directed.
+        // exploration noise or fatigue scaling — otherwise weight updates
+        // are randomly directed.
         let policy_fwd = fwd;
         let policy_trn = trn;
 
@@ -537,6 +534,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5 * mean_atten;
         fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
         trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
+
+        // Apply staleness-based fatigue to the final motor output (post-noise)
+        // so that fatigue reliably limits actual movement, not just policy.
+        fwd *= fatigue_factor;
+        trn *= fatigue_factor;
 
         // History recording — stores pre-noise policy output and
         // full-strength encoded state for accurate credit assignment.

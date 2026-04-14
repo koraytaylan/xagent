@@ -11,7 +11,7 @@ var<workgroup> s_encoded: array<f32, 32>;
 var<workgroup> s_habituated: array<f32, 32>;
 var<workgroup> s_homeo: array<f32, 6>;
 var<workgroup> s_similarities: array<f32, 128>;  // reused for decay tracking in pass 7
-var<workgroup> shared_sort_indices: array<u32, 128>;   // tracks pattern index through bitonic sort
+var<workgroup> shared_sort_indices: array<u32, 128>;   // multipurpose: bitonic sort indices (pass 5), credit motor cache (pass 6)
 var<workgroup> s_recall: array<f32, 17>;
 var<workgroup> s_prediction: array<f32, 32>;
 var<workgroup> s_credit: array<f32, 32>;

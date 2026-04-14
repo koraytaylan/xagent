@@ -519,28 +519,36 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         brain_state[b + O_FATIGUE_FACTOR] = fatigue_factor;
 
-        // Exploration noise
-        let tick_u = u32(tick_count);
-        let seed_base = agent_id * 1000u + tick_u;
-        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5;
-        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5;
-        fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
-        trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
-
         // Apply staleness-based fatigue to final output
         fwd *= fatigue_factor;
         trn *= fatigue_factor;
 
-        // History recording
+        // Save pre-noise policy output for credit assignment history.
+        // Credit must correlate outcomes with policy intent, not random
+        // exploration noise — otherwise weight updates are randomly directed.
+        let policy_fwd = fwd;
+        let policy_trn = trn;
+
+        // Exploration noise — scaled by mean habituation attenuation so that
+        // noise amplitude tracks the attenuated policy signal, preserving SNR.
+        let tick_u = u32(tick_count);
+        let seed_base = agent_id * 1000u + tick_u;
+        let noise_fwd = (rand_f32_brain(seed_base) * 2.0 - 1.0) * 0.5 * mean_atten;
+        let noise_trn = (rand_f32_brain(seed_base + 1u) * 2.0 - 1.0) * 0.5 * mean_atten;
+        fwd = clamp(fwd + noise_fwd * exploration_rate, -1.0, 1.0);
+        trn = clamp(trn + noise_trn * exploration_rate, -1.0, 1.0);
+
+        // History recording — stores pre-noise policy output and
+        // full-strength encoded state for accurate credit assignment.
         let hist_cursor = u32(history_buf[hi_base + O_HIST_CURSOR]);
         let hist_off = hist_cursor * 5u;
-        history_buf[hi_base + O_MOTOR_RING + hist_off] = fwd;
-        history_buf[hi_base + O_MOTOR_RING + hist_off + 1u] = trn;
+        history_buf[hi_base + O_MOTOR_RING + hist_off] = policy_fwd;
+        history_buf[hi_base + O_MOTOR_RING + hist_off + 1u] = policy_trn;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 2u] = tick_count;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 3u] = gradient;
         history_buf[hi_base + O_MOTOR_RING + hist_off + 4u] = 0.0;
         for (var d: u32 = 0u; d < DIM; d = d + 1u) {
-            history_buf[hi_base + O_STATE_RING + hist_cursor * DIM + d] = s_habituated[d];
+            history_buf[hi_base + O_STATE_RING + hist_cursor * DIM + d] = s_encoded[d];
         }
         history_buf[hi_base + O_HIST_CURSOR] = f32((hist_cursor + 1u) % ACTION_HISTORY_LEN);
         let hist_len_val = history_buf[hi_base + O_HIST_LEN];

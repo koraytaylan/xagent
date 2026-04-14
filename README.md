@@ -325,7 +325,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "world_size": 256.0,
     "energy_depletion_rate": 0.03,
     "movement_energy_cost": 0.005,
-    "hazard_damage_rate": 0.1,
+    "hazard_damage_rate": 1.0,
     "integrity_regen_rate": 0.005,
     "food_energy_value": 20.0,
     "food_density": 0.002,

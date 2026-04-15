@@ -2225,7 +2225,7 @@ impl GpuKernel {
         // Decision
         let decision_data = self.telemetry_staging.decision.slice(..).get_mapped_range();
         let decision: &[f32] = bytemuck::cast_slice(&decision_data);
-        let motor_base = ENCODED_DIMENSION + ENCODED_DIMENSION;
+        let motor_base = DECISION_MOTOR;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
         drop(decision_data);

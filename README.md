@@ -286,8 +286,8 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
 | `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
 | `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
-| `metabolic_rate` | Multiplier for all energy costs (default 1.0). Lower → agents survive longer. |
-| `integrity_scale` | Multiplier for integrity damage and regen (default 1.0). Higher → deadlier hazards. |
+| `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |
+| `integrity_scale` | Multiplier for integrity damage and regen (default 0.5). Higher → deadlier hazards. |
 
 ### World Presets
 
@@ -318,8 +318,8 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "vision_rays": 48,
     "brain_tick_stride": 4,
     "vision_stride": 10,
-    "metabolic_rate": 1.0,
-    "integrity_scale": 1.0
+    "metabolic_rate": 0.5,
+    "integrity_scale": 0.5
   },
   "world": {
     "world_size": 256.0,

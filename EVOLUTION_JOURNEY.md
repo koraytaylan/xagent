@@ -236,7 +236,7 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 10. **REINFORCE feedback loop on turn weights.** Credit assignment used the full motor value (`policy + noise`) for weight updates. Any small turn bias got amplified: positive turn bias → `recorded_turn` biased positive → positive credit × positive turn → bias grows. Fixed: store exploration noise in credit history, not full motor. Noise is zero-mean, breaking the feedback loop.
 
-11. **Memory blend injected stale motor bias.** Recalled memories blended stored motor values (now noise) directly into the policy. Surviving food-event memories had fixed random noise values that created a persistent turn injection. Fixed: removed memory motor blend — memory contributes through recall scoring only.
+11. **Memory blend injected stale motor bias.** Recalled memories blended stored motor values (originally noise) directly into the policy. Surviving food-event memories had fixed random noise values that created a persistent turn injection. Fixed: replaced the old direct noise-injection blend with a constrained valence-weighted memory blend using actual motor commands. Memory now stores real approach actions and recall uses valence sign to produce escape (negative valence negates the approach direction).
 
 12. **Random walk in weight space.** Even with noise-only credit, each food/hazard event added a random-direction vector to action weights. After ~50 events, the accumulated drift produced a detectable turn bias. Weight decay (`ACTION_WEIGHT_DECAY=0.01`) prevents unbounded drift. The drift-vs-decay equilibrium keeps bias below noise level.
 

@@ -5,7 +5,7 @@
 
 fn phase_death_respawn(tid: u32, tick: u32) {
     let base = tid * PHYS_STRIDE;
-    if (agent_phys[base + P_DIED_FLAG] < 0.5) { return; }
+    if (physics_state[base + P_DIED_FLAG] < 0.5) { return; }
 
     // ── 1. Pick a safe spawn position ──────────────────────────────────────
     let world_half = wc_f32(WC_WORLD_HALF_BOUND);
@@ -36,40 +36,40 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     let spawn_y = sample_height(spawn_x, spawn_z) + AGENT_HALF_HEIGHT;
 
     // ── 2. Preserve fitness fields before reset ────────────────────────────
-    let saved_food_count   = agent_phys[base + P_FOOD_COUNT];
-    let saved_ticks_alive  = agent_phys[base + P_TICKS_ALIVE];
-    let saved_death_count  = agent_phys[base + P_DEATH_COUNT] + 1.0;
-    let max_energy         = agent_phys[base + P_MAX_ENERGY];
-    let max_integrity      = agent_phys[base + P_MAX_INTEGRITY];
-    let memory_cap         = agent_phys[base + P_MEMORY_CAP];
-    let processing_slots   = agent_phys[base + P_PROCESSING_SLOTS];
+    let saved_food_count   = physics_state[base + P_FOOD_COUNT];
+    let saved_ticks_alive  = physics_state[base + P_TICKS_ALIVE];
+    let saved_death_count  = physics_state[base + P_DEATH_COUNT] + 1.0;
+    let max_energy         = physics_state[base + P_MAX_ENERGY];
+    let max_integrity      = physics_state[base + P_MAX_INTEGRITY];
+    let memory_cap         = physics_state[base + P_MEMORY_CAP];
+    let processing_slots   = physics_state[base + P_PROCESSING_SLOTS];
 
     // ── 3. Reset physics state ─────────────────────────────────────────────
     // Zero the full stride first, then write specific values.
     for (var i = 0u; i < PHYS_STRIDE; i++) {
-        agent_phys[base + i] = 0.0;
+        physics_state[base + i] = 0.0;
     }
-    agent_phys[base + P_POS_X]           = spawn_x;
-    agent_phys[base + P_POS_Y]           = spawn_y;
-    agent_phys[base + P_POS_Z]           = spawn_z;
+    physics_state[base + P_POS_X]           = spawn_x;
+    physics_state[base + P_POS_Y]           = spawn_y;
+    physics_state[base + P_POS_Z]           = spawn_z;
     // velocity: already zero from the loop
     // facing: (0, 0, 1)
-    agent_phys[base + P_FACING_Z]        = 1.0;
+    physics_state[base + P_FACING_Z]        = 1.0;
     // yaw, angular_vel: already zero
-    agent_phys[base + P_ENERGY]          = max_energy;
-    agent_phys[base + P_MAX_ENERGY]      = max_energy;
-    agent_phys[base + P_INTEGRITY]       = max_integrity;
-    agent_phys[base + P_MAX_INTEGRITY]   = max_integrity;
-    agent_phys[base + P_PREV_ENERGY]     = max_energy;
-    agent_phys[base + P_PREV_INTEGRITY]  = max_integrity;
-    agent_phys[base + P_ALIVE]           = 1.0;
+    physics_state[base + P_ENERGY]          = max_energy;
+    physics_state[base + P_MAX_ENERGY]      = max_energy;
+    physics_state[base + P_INTEGRITY]       = max_integrity;
+    physics_state[base + P_MAX_INTEGRITY]   = max_integrity;
+    physics_state[base + P_PREV_ENERGY]     = max_energy;
+    physics_state[base + P_PREV_INTEGRITY]  = max_integrity;
+    physics_state[base + P_ALIVE]           = 1.0;
     // died_flag: already zero
-    agent_phys[base + P_MEMORY_CAP]      = memory_cap;
-    agent_phys[base + P_PROCESSING_SLOTS] = processing_slots;
+    physics_state[base + P_MEMORY_CAP]      = memory_cap;
+    physics_state[base + P_PROCESSING_SLOTS] = processing_slots;
     // Restore fitness fields
-    agent_phys[base + P_FOOD_COUNT]      = saved_food_count;
-    agent_phys[base + P_TICKS_ALIVE]     = saved_ticks_alive;
-    agent_phys[base + P_DEATH_COUNT]     = saved_death_count;
+    physics_state[base + P_FOOD_COUNT]      = saved_food_count;
+    physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
+    physics_state[base + P_DEATH_COUNT]     = saved_death_count;
 
     // ── 4. Reset brain state ───────────────────────────────────────────────
     let brain_base = tid * BRAIN_STRIDE;
@@ -77,7 +77,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Halve reinforcement values
     let pat_base = tid * PATTERN_STRIDE;
     for (var i = 0u; i < MEMORY_CAP; i++) {
-        pattern_buf[pat_base + O_PAT_REINF + i] *= 0.5;
+        pattern_buffer[pat_base + O_PAT_REINF + i] *= 0.5;
     }
 
     // Zero homeostasis EMAs (6 values)
@@ -99,7 +99,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     brain_state[brain_base + O_FATIGUE_FACTOR] = 1.0;
 
     // Reset habituation (fresh start for new life's perceptual context)
-    for (var i = 0u; i < DIM; i++) {
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_HAB_EMA + i] = 0.0;
         brain_state[brain_base + O_HAB_ATTEN + i] = 1.0;
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
@@ -108,6 +108,6 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Zero action history
     let hist_base = tid * HISTORY_STRIDE;
     for (var i = 0u; i < HISTORY_STRIDE; i++) {
-        history_buf[hist_base + i] = 0.0;
+        history_buffer[hist_base + i] = 0.0;
     }
 }

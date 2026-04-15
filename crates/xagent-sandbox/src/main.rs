@@ -173,7 +173,7 @@ fn print_config(config: &FullConfig) {
         config.brain.memory_capacity,
         config.brain.processing_slots,
         config.brain.visual_encoding_size,
-        config.brain.representation_dim,
+        config.brain.representation_dimension,
         config.brain.learning_rate,
         config.brain.decay_rate,
     );
@@ -1110,7 +1110,7 @@ impl App {
             "  Child config: cap={} slots={} dim={} lr={:.4} decay={:.4}",
             child.brain_config.memory_capacity,
             child.brain_config.processing_slots,
-            child.brain_config.representation_dim,
+            child.brain_config.representation_dimension,
             child.brain_config.learning_rate,
             child.brain_config.decay_rate,
         );

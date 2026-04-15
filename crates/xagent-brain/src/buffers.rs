@@ -12,7 +12,8 @@ use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 
 // ── Dimensions ───────────────────────────────────────────────────────
 
-pub const DIM: usize = 32;
+pub const ENCODED_DIMENSION: usize = 128;
+pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
 /// Feature count for the default 8×6 vision layout.
 /// Used to compute default brain state offsets (`O_ENC_BIASES`),
 /// `FEATURES_STRIDE`, and `FIXED_TAIL_SIZE`.
@@ -21,6 +22,7 @@ const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25; // 265
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const ACTION_HISTORY_LEN: usize = 64;
+pub const INITIAL_FORWARD_BIAS: f32 = 0.3;
 pub const ERROR_HISTORY_LEN: usize = 128;
 pub const MAX_TOUCH_CONTACTS: usize = 4;
 pub const TOUCH_FEATURES: usize = 4; // dir_x, dir_z, intensity, tag/4
@@ -34,27 +36,28 @@ pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTAC
 // ── Brain state buffer offsets (default 8×6 layout) ──────────────────
 // These constants are valid for the default vision dimensions (8×6).
 // For other dimensions, use `BrainLayout` to compute dynamic offsets.
-// The *tail* offsets (from `O_PRED_CTX_WT` onward) are vision-independent:
-// `O_FOO - O_PRED_CTX_WT` is the same regardless of vision size.
+// The *tail* offsets (from `O_PREDICTOR_CONTEXT_WEIGHT` onward) are vision-independent:
+// `O_FOO - O_PREDICTOR_CONTEXT_WEIGHT` is the same regardless of vision size.
 
 pub const O_ENC_WEIGHTS: usize = 0;
-pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * DIM; // 8480
-pub const O_PRED_WEIGHTS: usize = O_ENC_BIASES + DIM; // 8512
-pub const O_PRED_CTX_WT: usize = O_PRED_WEIGHTS + DIM * DIM; // 9536
-pub const O_PRED_ERR_RING: usize = O_PRED_CTX_WT + 1; // 9537
-pub const O_PRED_ERR_CURSOR: usize = O_PRED_ERR_RING + ERROR_HISTORY_LEN; // 9665
-pub const O_PRED_ERR_COUNT: usize = O_PRED_ERR_CURSOR + 1; // 9666
-pub const O_HAB_EMA: usize = O_PRED_ERR_COUNT + 1; // 9667
-pub const O_HAB_ATTEN: usize = O_HAB_EMA + DIM; // 9699
-pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + DIM; // 9731
+pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * ENCODED_DIMENSION; // 8480
+pub const O_PREDICTOR_WEIGHTS: usize = O_ENC_BIASES + ENCODED_DIMENSION; // 8512
+pub const O_PREDICTOR_CONTEXT_WEIGHT: usize =
+    O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+pub const O_PREDICTION_ERROR_RING: usize = O_PREDICTOR_CONTEXT_WEIGHT + 1; // 9537
+pub const O_PREDICTION_ERROR_CURSOR: usize = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN; // 9665
+pub const O_PREDICTION_ERROR_COUNT: usize = O_PREDICTION_ERROR_CURSOR + 1; // 9666
+pub const O_HAB_EMA: usize = O_PREDICTION_ERROR_COUNT + 1; // 9667
+pub const O_HAB_ATTEN: usize = O_HAB_EMA + ENCODED_DIMENSION; // 9699
+pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + ENCODED_DIMENSION; // 9731
 
 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
-pub const O_HOMEO: usize = O_PREV_ENCODED + DIM; // 9763
-pub const O_ACT_FWD_WTS: usize = O_HOMEO + 6; // 9769
-pub const O_ACT_TURN_WTS: usize = O_ACT_FWD_WTS + DIM; // 9801
+pub const O_HOMEO: usize = O_PREV_ENCODED + ENCODED_DIMENSION; // 9763
+pub const O_ACTION_FORWARD_WEIGHTS: usize = O_HOMEO + 6; // 9769
+pub const O_ACTION_TURN_WEIGHTS: usize = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION; // 9801
 
 // act_biases: [fwd_bias, turn_bias]
-pub const O_ACT_BIASES: usize = O_ACT_TURN_WTS + DIM; // 9833
+pub const O_ACT_BIASES: usize = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION; // 9833
 pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 9835
 pub const POS_RING_LEN: usize = 16;
 pub const O_POS_RING_X: usize = O_EXPLORATION_RATE + 1; // 9836
@@ -64,22 +67,22 @@ pub const O_POS_RING_LEN: usize = O_POS_RING_CURSOR + 1; // 9869
 pub const O_ACCUM_FWD: usize = O_POS_RING_LEN + 1; // 9870
 pub const O_FATIGUE_FACTOR: usize = O_ACCUM_FWD + 1; // 9871
 pub const O_PREV_PREDICTION: usize = O_FATIGUE_FACTOR + 1; // 9872
-pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + DIM; // 9904
+pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
 pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 9905
 pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 9906
 pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1; // 9907
 pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1; // 9908
 pub const BRAIN_STRIDE: usize = O_MOVEMENT_SPEED + 1; // 9909
 
-/// Number of elements in `brain_state` from `O_PRED_CTX_WT` (inclusive)
+/// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
 /// doesn't change with feature_count / vision dimensions.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PRED_CTX_WT; // 373
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PREDICTOR_CONTEXT_WEIGHT; // 373
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
 pub const O_PAT_STATES: usize = 0;
-pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * DIM; // 4096
+pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * ENCODED_DIMENSION; // 4096
 pub const O_PAT_REINF: usize = O_PAT_NORMS + MEMORY_CAP; // 4224
 pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP; // 4352
                                                          // motor: [forward, turn, outcome_valence] × cap
@@ -96,7 +99,7 @@ pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1; // 5251
 pub const O_MOTOR_RING: usize = 0;
 // motor_ring: [forward, turn, tick, gradient, _pad] × ACTION_HISTORY_LEN
 pub const O_STATE_RING: usize = O_MOTOR_RING + ACTION_HISTORY_LEN * 5; // 320
-pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * DIM; // 2368
+pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION; // 2368
 pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1; // 2369
 pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1; // 2370
 
@@ -169,12 +172,12 @@ impl BrainLayout {
             .checked_add(depth_count)
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
             .expect("vision dimensions overflow sensory stride");
-        // brain_stride = feature_count * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
-        // (FIXED_TAIL_SIZE = fixed fields starting at O_PRED_CTX_WT through O_MOVEMENT_SPEED, incl. position ring)
+        // brain_stride = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE
+        // (FIXED_TAIL_SIZE = fixed fields starting at O_PREDICTOR_CONTEXT_WEIGHT through O_MOVEMENT_SPEED, incl. position ring)
         let brain_stride = feature_count
-            .checked_mul(DIM)
-            .and_then(|v| v.checked_add(DIM))
-            .and_then(|v| v.checked_add(DIM * DIM))
+            .checked_mul(ENCODED_DIMENSION)
+            .and_then(|v| v.checked_add(ENCODED_DIMENSION))
+            .and_then(|v| v.checked_add(PREDICTOR_DIMENSION * ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
             .expect("vision dimensions overflow brain stride");
         Self {
@@ -247,12 +250,15 @@ pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
 pub const FEATURES_STRIDE: usize = FEATURE_COUNT; // 265
-pub const ENCODED_STRIDE: usize = DIM; // 32
-pub const HABITUATED_STRIDE: usize = DIM; // 32
+pub const ENCODED_STRIDE: usize = ENCODED_DIMENSION; // 32
+pub const HABITUATED_STRIDE: usize = ENCODED_DIMENSION; // 32
 pub const HOMEO_OUT_STRIDE: usize = 6; // grad, raw_grad, urgency, grad_fast, grad_med, grad_slow
 pub const SIMILARITIES_STRIDE: usize = MEMORY_CAP; // 128
 pub const RECALL_IDX_STRIDE: usize = RECALL_K + 1; // 16 indices + 1 count
-pub const DECISION_STRIDE: usize = DIM + DIM + 4; // prediction(32) + credit(32) + motor(4) = 68
+pub const DECISION_PREDICTION: usize = 0;
+pub const DECISION_CREDIT: usize = ENCODED_DIMENSION;
+pub const DECISION_MOTOR: usize = ENCODED_DIMENSION + ENCODED_DIMENSION;
+pub const DECISION_STRIDE: usize = DECISION_MOTOR + 4;
 
 // ── Config buffer layout ──────────────────────────────────────────────
 
@@ -441,35 +447,41 @@ pub fn init_brain_state_for(
 
     // Encoder weights: Xavier init (scale = 1/sqrt(feature_count))
     let scale = 1.0 / (fc as f32).sqrt();
-    for i in 0..(fc * DIM) {
+    for i in 0..(fc * ENCODED_DIMENSION) {
         state[i] = (rng.random::<f32>() * 2.0 - 1.0) * scale;
     }
 
-    // Compute dynamic offsets: O_PRED_CTX_WT = fc*DIM + DIM + DIM*DIM
-    let o_pred_weights = fc * DIM + DIM;
-    let o_pred_ctx_wt = o_pred_weights + DIM * DIM;
+    // Compute dynamic offsets: O_PREDICTOR_CONTEXT_WEIGHT = fc*ENCODED_DIMENSION + ENCODED_DIMENSION + PREDICTOR_DIMENSION*ENCODED_DIMENSION
+    let o_pred_weights = fc * ENCODED_DIMENSION + ENCODED_DIMENSION;
+    let o_pred_ctx_wt = o_pred_weights + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
 
     // Predictor weights: small random
-    for i in 0..(DIM * DIM) {
+    for i in 0..(PREDICTOR_DIMENSION * ENCODED_DIMENSION) {
         state[o_pred_weights + i] = (rng.random::<f32>() * 2.0 - 1.0) * 0.1;
     }
 
     // Predictor context weight: 0.15
     state[o_pred_ctx_wt] = 0.15;
 
-    // Fixed deltas from O_PRED_CTX_WT (same regardless of feature_count)
-    let delta_hab_atten = O_HAB_ATTEN - O_PRED_CTX_WT;
-    let delta_exploration = O_EXPLORATION_RATE - O_PRED_CTX_WT;
-    let delta_fatigue_factor = O_FATIGUE_FACTOR - O_PRED_CTX_WT;
-    let delta_hab_sens = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
-    let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT;
-    let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PRED_CTX_WT;
-    let delta_movement_speed = O_MOVEMENT_SPEED - O_PRED_CTX_WT;
+    // Fixed deltas from O_PREDICTOR_CONTEXT_WEIGHT (same regardless of feature_count)
+    let delta_hab_atten = O_HAB_ATTEN - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_exploration = O_EXPLORATION_RATE - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_fatigue_factor = O_FATIGUE_FACTOR - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_hab_sens = O_HAB_SENSITIVITY - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_movement_speed = O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
-    for i in 0..DIM {
+    for i in 0..ENCODED_DIMENSION {
         state[o_pred_ctx_wt + delta_hab_atten + i] = 1.0;
     }
+
+    // Forward bias: agents default to moving forward so exploration
+    // covers ground instead of random-walking in place.  Learning
+    // adjusts this via credit assignment.
+    let delta_act_biases = O_ACT_BIASES - O_PREDICTOR_CONTEXT_WEIGHT;
+    state[o_pred_ctx_wt + delta_act_biases] = INITIAL_FORWARD_BIAS;
 
     // Exploration rate: 0.5 (balanced start)
     state[o_pred_ctx_wt + delta_exploration] = 0.5;
@@ -509,7 +521,7 @@ pub fn build_config(config: &BrainConfig) -> Vec<f32> {
 /// Build config buffer values with explicit layout.
 pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> {
     let mut cfg = vec![0.0_f32; CONFIG_SIZE];
-    cfg[CFG_REPR_DIM] = DIM as f32;
+    cfg[CFG_REPR_DIM] = ENCODED_DIMENSION as f32;
     cfg[CFG_FEATURE_COUNT] = layout.feature_count as f32;
     cfg[CFG_MEMORY_CAP] = MEMORY_CAP as f32;
     cfg[CFG_RECALL_K] = RECALL_K as f32;
@@ -604,7 +616,9 @@ mod tests {
             );
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;
-            let o_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
+            let o_pred_ctx_wt = fc * ENCODED_DIMENSION
+                + ENCODED_DIMENSION
+                + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
             assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
         }
     }
@@ -615,7 +629,10 @@ mod tests {
         assert_eq!(layout.vision_color_count, 32 * 24 * 4);
         assert_eq!(layout.vision_depth_count, 32 * 24);
         assert_eq!(layout.sensory_stride, 32 * 24 * 5 + NON_VISUAL_COUNT);
-        let expected = layout.feature_count * DIM + DIM + DIM * DIM + FIXED_TAIL_SIZE;
+        let expected = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+            + FIXED_TAIL_SIZE;
         assert_eq!(layout.brain_stride, expected);
     }
 
@@ -721,19 +738,22 @@ mod tests {
         let mut aos_offsets = std::collections::HashSet::new();
         let mut soa_offsets = std::collections::HashSet::new();
         for pat in 0..MEMORY_CAP {
-            for d in 0..DIM {
-                aos_offsets.insert(O_PAT_STATES + pat * DIM + d);
+            for d in 0..ENCODED_DIMENSION {
+                aos_offsets.insert(O_PAT_STATES + pat * ENCODED_DIMENSION + d);
                 soa_offsets.insert(O_PAT_STATES + d * MEMORY_CAP + pat);
             }
         }
-        assert_eq!(aos_offsets.len(), MEMORY_CAP * DIM);
-        assert_eq!(soa_offsets.len(), MEMORY_CAP * DIM);
+        assert_eq!(aos_offsets.len(), MEMORY_CAP * ENCODED_DIMENSION);
+        assert_eq!(soa_offsets.len(), MEMORY_CAP * ENCODED_DIMENSION);
         assert_eq!(
             aos_offsets, soa_offsets,
             "SoA and AoS must cover identical offsets"
         );
         assert_eq!(*aos_offsets.iter().min().unwrap(), 0);
-        assert_eq!(*aos_offsets.iter().max().unwrap(), MEMORY_CAP * DIM - 1);
+        assert_eq!(
+            *aos_offsets.iter().max().unwrap(),
+            MEMORY_CAP * ENCODED_DIMENSION - 1
+        );
     }
 
     #[test]

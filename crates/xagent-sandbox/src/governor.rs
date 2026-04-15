@@ -669,7 +669,7 @@ impl Governor {
                         let short = match *name {
                             "memory_capacity" => "mem",
                             "processing_slots" => "slots",
-                            "representation_dim" => "repr",
+                            "representation_dimension" => "repr",
                             "learning_rate" => "lr",
                             "decay_rate" => "decay",
                             "distress_exponent" => "distress",
@@ -1021,7 +1021,7 @@ impl Governor {
                 "  Config: mem={} slots={} dim={} lr={:.4} decay={:.4}",
                 c.memory_capacity,
                 c.processing_slots,
-                c.representation_dim,
+                c.representation_dimension,
                 c.learning_rate,
                 c.decay_rate,
             );
@@ -1481,9 +1481,9 @@ fn record_mutations(
             child.processing_slots as f64,
         ),
         (
-            "representation_dim",
-            parent.representation_dim as f64,
-            child.representation_dim as f64,
+            "representation_dimension",
+            parent.representation_dimension as f64,
+            child.representation_dimension as f64,
         ),
         (
             "learning_rate",
@@ -2014,8 +2014,8 @@ mod tests {
         assert_eq!(configs[0].memory_capacity, parent_config.memory_capacity);
         assert_eq!(configs[0].processing_slots, parent_config.processing_slots);
         assert_eq!(
-            configs[0].representation_dim,
-            parent_config.representation_dim
+            configs[0].representation_dimension,
+            parent_config.representation_dimension
         );
         assert!((configs[0].learning_rate - parent_config.learning_rate).abs() < f32::EPSILON);
         assert!((configs[0].decay_rate - parent_config.decay_rate).abs() < f32::EPSILON);
@@ -2261,7 +2261,7 @@ mod tests {
             memory_capacity: 1000,
             processing_slots: 100,
             visual_encoding_size: 64,
-            representation_dim: 500,
+            representation_dimension: 500,
             learning_rate: 0.9,
             decay_rate: 0.9,
             distress_exponent: 2.0,
@@ -2271,7 +2271,7 @@ mod tests {
             memory_capacity: 1,
             processing_slots: 1,
             visual_encoding_size: 64,
-            representation_dim: 1,
+            representation_dimension: 1,
             learning_rate: 0.001,
             decay_rate: 0.001,
             distress_exponent: 2.0,
@@ -2286,13 +2286,13 @@ mod tests {
             let child = crossover_config(&a, &b);
             if child.memory_capacity == a.memory_capacity
                 || child.processing_slots == a.processing_slots
-                || child.representation_dim == a.representation_dim
+                || child.representation_dimension == a.representation_dimension
             {
                 has_a_param = true;
             }
             if child.memory_capacity == b.memory_capacity
                 || child.processing_slots == b.processing_slots
-                || child.representation_dim == b.representation_dim
+                || child.representation_dimension == b.representation_dimension
             {
                 has_b_param = true;
             }

@@ -121,7 +121,7 @@ This is the **only** evaluative signal. There is no reward function.
 |---|---|
 | `memory_capacity` | Finite pattern storage → forced forgetting → what survives = what matters |
 | `processing_slots` | Limited recall per tick → forced prioritization → attention-like behavior |
-| `representation_dim` | Fixed encoding size → forced compression → abstraction |
+| `representation_dimension` | Fixed encoding size → forced compression → abstraction |
 
 See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into each component.
 
@@ -262,7 +262,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 ### Brain Presets
 
-| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
+| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dimension` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
 |--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
 | **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
@@ -275,7 +275,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `memory_capacity` | Max stored patterns. Smaller → faster forgetting, stronger capacity pressure. |
 | `processing_slots` | Max recall operations per tick. Smaller → narrower attention. |
 | `visual_encoding_size` | Resolution of visual encoding (average-pooled bins). Smaller → coarser visual perception. |
-| `representation_dim` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
+| `representation_dimension` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
@@ -307,7 +307,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "memory_capacity": 128,
     "processing_slots": 16,
     "visual_encoding_size": 64,
-    "representation_dim": 32,
+    "representation_dimension": 128,
     "learning_rate": 0.05,
     "decay_rate": 0.001,
     "distress_exponent": 2.0,

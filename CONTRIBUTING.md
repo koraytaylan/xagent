@@ -1,6 +1,6 @@
 # Contributing to XAgent
 
-These rules are distilled from 305 code review comments across PRs #1–#100. They represent the project's hard-won invariants.
+These rules are distilled from hundreds of code review comments through PR #100. They represent the project's hard-won invariants.
 
 ## Tooling
 
@@ -62,11 +62,11 @@ reviewed and refactored as part of normal code review.
 
 ### Logging
 
-- Use `log::warn!` / `log::error!` (or `tracing`) for all diagnostic output. Never use `eprintln!` or `println!` for errors or warnings — they bypass log filtering and are invisible in structured logging setups.
+- In library code and long-lived runtime paths, use `log::warn!` / `log::error!` (or `tracing`) for warnings and errors. Do not use `eprintln!` or `println!` there, because they bypass log filtering and are invisible in structured logging setups. Direct `println!` / `eprintln!` output is acceptable for intentional user-facing CLI messages and in tests/benches where stdout/stderr is part of the interface or harness behavior.
 
 ### Commit Messages
 
-Use conventional commit prefixes: `feat:`, `fix:`, `perf:`.
+Use conventional commit prefixes: `feat:`, `fix:`, `perf:`, `refactor:`, `doc:`, `chore:`.
 
 ## Numeric Safety
 
@@ -86,8 +86,8 @@ Use conventional commit prefixes: `feat:`, `fix:`, `perf:`.
 ## WGSL Safety
 
 - `select()` evaluates all arguments before choosing — guard divisions with `max(denominator, epsilon)` instead of relying on the condition to skip them.
-- Use `storageBarrier()` (not `workgroupBarrier()`) to synchronize reads/writes to `var<storage>` buffers within a workgroup.
-- Early-return in a workgroup shader does not exempt an invocation from barrier participation — restructure control flow to ensure all invocations reach each barrier.
+- When synchronizing reads/writes to `var<storage>` buffers within a workgroup, use `storageBarrier()` together with `workgroupBarrier()` when you need both memory visibility and execution synchronization.
+- Early-return in a workgroup shader is only safe when the return condition is uniform across the entire workgroup and occurs before the first barrier; otherwise, restructure control flow to ensure all invocations reach each barrier.
 - When removing or renaming a constant or function in a shared WGSL header, grep all shaders that concatenate that header to verify no dangling references.
 
 ## Async Readback
@@ -113,7 +113,7 @@ Use conventional commit prefixes: `feat:`, `fix:`, `perf:`.
 
 - Per-tick simulation logic belongs in WGSL shaders, never in Rust.
 - The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking).
-- No CPU-side work should scale with `ticks_to_run` — up to 64,000 ticks may be scheduled per frame/batch call, with GPU work dispatched in chunks.
+- No CPU-side work should scale with `ticks_to_run` — the sandbox loop dispatches GPU work in chunks of at most 500 ticks per frame/batch call, while the internal accumulated tick budget may grow up to 64,000.
 - Never clone large collections in per-frame hot paths. Use `clone_from()` for in-place updates or borrow patterns. A throttled rebuild is useless if you deep-clone every frame.
 - Use squared-distance comparisons to avoid `sqrt()` in loops. Both CPU and GPU code should use `_SQ` variants for radius checks.
 - Only mark throttle windows as consumed when work actually happens. Updating `last_rebuild` without rebuilding silently wastes the throttle budget.
@@ -135,7 +135,7 @@ Use conventional commit prefixes: `feat:`, `fix:`, `perf:`.
 
 ## CI Discipline
 
-- Benchmark and release-profile steps should not run on every push — gate them on `workflow_dispatch` or schedule triggers.
+- Benchmark and release-profile steps should generally be gated on `workflow_dispatch` or schedule triggers; running them on pushes to `develop` is acceptable when they are intentionally non-blocking CI signal.
 - Clippy must lint `--all-targets` to catch issues in tests, benches, and examples.
 
 ## Incremental Cleanup

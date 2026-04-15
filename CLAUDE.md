@@ -1,7 +1,7 @@
 # Project: xagent
 
 ## Contributing Rules
-All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That file is the single source of truth for code style, naming, GPU/buffer safety, async readback, concurrency, performance, and testing rules.
+All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That file is the single source of truth for code style, naming, numeric safety, GPU/buffer safety, WGSL safety, async readback, state invariants, concurrency, performance, serialization compatibility, testing, CI discipline, logging, and related rules.
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate

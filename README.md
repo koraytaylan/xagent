@@ -518,7 +518,7 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 ## 12. Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of code style, naming, GPU/buffer safety, concurrency, performance, and testing rules.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of code style, naming, GPU/buffer safety, concurrency, performance, testing, and related rules.
 
 ---
 

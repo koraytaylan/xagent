@@ -322,7 +322,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             brain_state[brain_base + O_PREDICTION_ERROR_COUNT] = err_count + 1.0;
         }
 
-        // Recalled context blend (uses precomputed similarities from s_similarities)
+        // Recalled context blend (uses precomputed similarities from s_recall_similarity)
         if (recall_count > 0u) {
             let context_weight = brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT];
             var total_sim: f32 = 0.0;

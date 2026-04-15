@@ -286,7 +286,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         s_prediction[tid] = s;
     }
 
-    // ── Precompute recalled cosine similarities: threads 0..RECALL_K ──
+    // ── Precompute recalled cosine similarities: threads 0..(RECALL_K-1) ──
     // Each thread computes one recall entry's cosine sim in parallel,
     // eliminating the serial 16×128 bottleneck in thread 0's memory
     // blend and context blend loops.

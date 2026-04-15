@@ -9,12 +9,12 @@ fn phase_food_detect(tid: u32) {
     let b = agent * PHYS_STRIDE;
 
     // Skip dead agents
-    let alive = agent_phys[b + P_ALIVE];
+    let alive = physics_state[b + P_ALIVE];
     if alive < 0.5 { return; }
 
     // Agent position
-    let ax = agent_phys[b + P_POS_X];
-    let az = agent_phys[b + P_POS_Z];
+    let ax = physics_state[b + P_POS_X];
+    let az = physics_state[b + P_POS_Z];
 
     // Search 3x3 neighborhood
     let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
@@ -71,8 +71,8 @@ fn phase_food_detect(tid: u32) {
         if result.exchanged {
             // Winner: award energy and increment food count
             let food_energy = wc_f32(WC_FOOD_ENERGY);
-            agent_phys[b + P_ENERGY] = agent_phys[b + P_ENERGY] + food_energy;
-            agent_phys[b + P_FOOD_COUNT] = agent_phys[b + P_FOOD_COUNT] + 1.0;
+            physics_state[b + P_ENERGY] = physics_state[b + P_ENERGY] + food_energy;
+            physics_state[b + P_FOOD_COUNT] = physics_state[b + P_FOOD_COUNT] + 1.0;
         }
     }
 }

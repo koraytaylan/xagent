@@ -18,7 +18,8 @@ const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
-const DIM: u32 = 32u;
+const ENCODED_DIMENSION: u32 = 128u;
+const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
 const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
@@ -28,19 +29,19 @@ const ERROR_HISTORY_LEN: u32 = 128u;
 // ── Brain state offsets (derived from FEATURE_COUNT) ────────────────────────
 
 const O_ENC_WEIGHTS: u32 = 0u;
-const O_ENC_BIASES: u32 = FEATURE_COUNT * DIM;
-const O_PRED_WEIGHTS: u32 = O_ENC_BIASES + DIM;
-const O_PRED_CTX_WT: u32 = O_PRED_WEIGHTS + DIM * DIM;
-const O_PRED_ERR_RING: u32 = O_PRED_CTX_WT + 1u;
-const O_PRED_ERR_CURSOR: u32 = O_PRED_ERR_RING + ERROR_HISTORY_LEN;
-const O_PRED_ERR_COUNT: u32 = O_PRED_ERR_CURSOR + 1u;
-const O_HAB_EMA: u32 = O_PRED_ERR_COUNT + 1u;
-const O_HAB_ATTEN: u32 = O_HAB_EMA + DIM;
-const O_PREV_ENCODED: u32 = O_HAB_ATTEN + DIM;
-const O_HOMEO: u32 = O_PREV_ENCODED + DIM;
-const O_ACT_FWD_WTS: u32 = O_HOMEO + 6u;
-const O_ACT_TURN_WTS: u32 = O_ACT_FWD_WTS + DIM;
-const O_ACT_BIASES: u32 = O_ACT_TURN_WTS + DIM;
+const O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION;
+const O_PREDICTOR_WEIGHTS: u32 = O_ENC_BIASES + ENCODED_DIMENSION;
+const O_PREDICTOR_CONTEXT_WEIGHT: u32 = O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+const O_PREDICTION_ERROR_RING: u32 = O_PREDICTOR_CONTEXT_WEIGHT + 1u;
+const O_PREDICTION_ERROR_CURSOR: u32 = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
+const O_PREDICTION_ERROR_COUNT: u32 = O_PREDICTION_ERROR_CURSOR + 1u;
+const O_HAB_EMA: u32 = O_PREDICTION_ERROR_COUNT + 1u;
+const O_HAB_ATTEN: u32 = O_HAB_EMA + ENCODED_DIMENSION;
+const O_PREV_ENCODED: u32 = O_HAB_ATTEN + ENCODED_DIMENSION;
+const O_HOMEO: u32 = O_PREV_ENCODED + ENCODED_DIMENSION;
+const O_ACTION_FORWARD_WEIGHTS: u32 = O_HOMEO + 6u;
+const O_ACTION_TURN_WEIGHTS: u32 = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
+const O_ACT_BIASES: u32 = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
 const O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
 const POS_RING_LEN: u32 = 16u;
 const O_POS_RING_X: u32 = O_EXPLORATION_RATE + 1u;
@@ -50,7 +51,7 @@ const O_POS_RING_LEN: u32 = O_POS_RING_CURSOR + 1u;
 const O_ACCUM_FWD: u32 = O_POS_RING_LEN + 1u;
 const O_FATIGUE_FACTOR: u32 = O_ACCUM_FWD + 1u;
 const O_PREV_PREDICTION: u32 = O_FATIGUE_FACTOR + 1u;
-const O_TICK_COUNT: u32 = O_PREV_PREDICTION + DIM;
+const O_TICK_COUNT: u32 = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
 const O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
 const O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
 const O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
@@ -59,35 +60,38 @@ const O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
 const BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
-const PATTERN_STRIDE: u32 = 5251u;
-const HISTORY_STRIDE: u32 = 2370u;
+const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
+const HISTORY_STRIDE: u32 = O_HIST_LEN + 1u;
 const FEATURES_STRIDE: u32 = FEATURE_COUNT;
-const DECISION_STRIDE: u32 = 68u;      // prediction(32) + credit(32) + motor(4)
+const DECISION_PREDICTION: u32 = 0u;
+const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
+const DECISION_MOTOR: u32 = ENCODED_DIMENSION + ENCODED_DIMENSION;
+const DECISION_STRIDE: u32 = DECISION_MOTOR + 4u;
 const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 
 // ── Pattern memory offsets ──────────────────────────────────────────────────
 // O_PAT_STATES uses SoA (Structure-of-Arrays) layout: [dim][pattern]
-// Index as: p_base + d * MEMORY_CAP + pattern_idx
+// Index as: pattern_base + d * MEMORY_CAP + pattern_idx
 // This gives coalesced reads when 128 threads each read one pattern.
 // Other regions (norms, reinf, motor, meta, active) remain AoS.
 
 const O_PAT_STATES: u32 = 0u;
-const O_PAT_NORMS: u32 = 4096u;
-const O_PAT_REINF: u32 = 4224u;
-const O_PAT_MOTOR: u32 = 4352u;
-const O_PAT_META: u32 = 4736u;
-const O_PAT_ACTIVE: u32 = 5120u;
-const O_ACTIVE_COUNT: u32 = 5248u;
-const O_MIN_REINF_IDX: u32 = 5249u;
-const O_LAST_STORED_IDX: u32 = 5250u;
+const O_PAT_NORMS: u32 = MEMORY_CAP * ENCODED_DIMENSION;
+const O_PAT_REINF: u32 = O_PAT_NORMS + MEMORY_CAP;
+const O_PAT_MOTOR: u32 = O_PAT_REINF + MEMORY_CAP;
+const O_PAT_META: u32 = O_PAT_MOTOR + MEMORY_CAP * 3u;
+const O_PAT_ACTIVE: u32 = O_PAT_META + MEMORY_CAP * 3u;
+const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
+const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
+const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
 
 // ── Action history offsets ──────────────────────────────────────────────────
 
 const O_MOTOR_RING: u32 = 0u;
-const O_STATE_RING: u32 = 320u;
-const O_HIST_CURSOR: u32 = 2368u;
-const O_HIST_LEN: u32 = 2369u;
+const O_STATE_RING: u32 = ACTION_HISTORY_LEN * 5u;
+const O_HIST_CURSOR: u32 = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION;
+const O_HIST_LEN: u32 = O_HIST_CURSOR + 1u;
 
 // ── Config buffer offsets ───────────────────────────────────────────────────
 
@@ -140,6 +144,11 @@ const F_POS_Y: u32 = 1u;
 const F_POS_Z: u32 = 2u;
 const F_RESPAWN_TIMER: u32 = 3u;
 
+// ── Math constants ─────────────────────────────────────────────────────────
+
+const PI: f32 = 3.14159265;
+const TWO_PI: f32 = 6.28318530;
+
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
@@ -178,7 +187,7 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 // ── Vision constants ────────────────────────────────────────────────────────
 
-const VISION_FOV_HALF: f32 = 0.7853982;   // PI/4 = 45 degrees half-FOV
+const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
@@ -232,33 +241,39 @@ const WC_BRAIN_TICK_STRIDE: u32 = 23u;
 
 const HAB_EMA_ALPHA: f32 = 0.02;
 const ATTEN_FLOOR: f32 = 0.1;
+const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
-const FAST_ALPHA: f32 = 0.6;
-const MED_ALPHA: f32 = 0.04;
-const SLOW_ALPHA: f32 = 0.004;
+const GRADIENT_FAST_BLEND: f32 = 0.6;
+const GRADIENT_MEDIUM_BLEND: f32 = 0.04;
+const GRADIENT_SLOW_BLEND: f32 = 0.004;
 const DISTRESS_SCALE: f32 = 10.0;
 const MAX_DISTRESS: f32 = 10.0;
-const GRAD_BLEND_FAST: f32 = 0.5;
-const GRAD_BLEND_MED: f32 = 0.35;
-const GRAD_BLEND_SLOW: f32 = 0.15;
+const GRADIENT_WEIGHT_FAST: f32 = 0.5;
+const GRADIENT_WEIGHT_MEDIUM: f32 = 0.35;
+const GRADIENT_WEIGHT_SLOW: f32 = 0.15;
 
 // ── Predict-and-act constants ───────────────────────────────────────────────
 
-const CREDIT_DECAY: f32 = 0.04;
-const WEIGHT_LR: f32 = 0.10;
+const CREDIT_DECAY: f32 = 0.3;
+const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
 const PAIN_AMP: f32 = 3.0;
-const DEADZONE: f32 = 0.01;
+const DEADZONE: f32 = 0.005;
 const MAX_WEIGHT_NORM: f32 = 2.0;
+const ACTION_WEIGHT_DECAY: f32 = 0.01;
 const ANTICIPATION_WEIGHT: f32 = 0.5;
-const TONIC_CREDIT_SCALE: f32 = 0.1;
+const TONIC_CREDIT_SCALE: f32 = 0.5;
+const ENCODER_CREDIT_SCALE: f32 = 0.1;
+const CREDIT_EPSILON: f32 = 1e-6;
+const KLINOTAXIS_SENSITIVITY: f32 = 500.0;
+const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Buffer bindings — 15 storage + 2 uniform, single bind group
 // ═══════════════════════════════════════════════════════════════════════════
 
-@group(0) @binding(0)  var<storage, read_write> agent_phys:        array<f32>;
-@group(0) @binding(1)  var<storage, read_write> decision_buf:      array<f32>;
+@group(0) @binding(0)  var<storage, read_write> physics_state:        array<f32>;
+@group(0) @binding(1)  var<storage, read_write> decision_buffer:      array<f32>;
 @group(0) @binding(2)  var<storage, read>       heightmap:         array<f32>;
 @group(0) @binding(3)  var<storage, read>       biome_grid:        array<u32>;
 @group(0) @binding(4)  var<uniform>             wconfig:           array<vec4<f32>, 6>;
@@ -267,10 +282,10 @@ const TONIC_CREDIT_SCALE: f32 = 0.1;
 @group(0) @binding(7)  var<storage, read_write> food_grid:         array<atomic<u32>>;
 @group(0) @binding(8)  var<storage, read_write> agent_grid:        array<atomic<u32>>;
 @group(0) @binding(9)  var<storage, read_write> collision_scratch: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read_write> sensory_buf:       array<f32>;
+@group(0) @binding(10) var<storage, read_write> sensory_buffer:       array<f32>;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
-@group(0) @binding(12) var<storage, read_write> pattern_buf:       array<f32>;
-@group(0) @binding(13) var<storage, read_write> history_buf:       array<f32>;
+@group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
+@group(0) @binding(13) var<storage, read_write> history_buffer:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 

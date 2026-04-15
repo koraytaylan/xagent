@@ -173,7 +173,7 @@ fn print_config(config: &FullConfig) {
         config.brain.memory_capacity,
         config.brain.processing_slots,
         config.brain.visual_encoding_size,
-        config.brain.representation_dim,
+        config.brain.representation_dimension,
         config.brain.learning_rate,
         config.brain.decay_rate,
     );
@@ -1110,7 +1110,7 @@ impl App {
             "  Child config: cap={} slots={} dim={} lr={:.4} decay={:.4}",
             child.brain_config.memory_capacity,
             child.brain_config.processing_slots,
-            child.brain_config.representation_dim,
+            child.brain_config.representation_dimension,
             child.brain_config.learning_rate,
             child.brain_config.decay_rate,
         );
@@ -1581,11 +1581,6 @@ impl ApplicationHandler for App {
                 if !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none() {
                     let sim_delta_time = SIM_DT as f64;
                     self.sim_accumulator += dt as f64 * self.speed_multiplier as f64;
-                    let max_accumulator = sim_delta_time * self.speed_multiplier as f64 * 3.0;
-                    self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
-                    let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
-                        .min(self.gpu_tick_budget)
-                        .min(500);
                     // Only dispatch when the accumulator has enough for at
                     // least brain_tick_stride ticks, so every dispatch
                     // includes a brain cycle and produces motor commands.
@@ -1597,6 +1592,15 @@ impl ApplicationHandler for App {
                         .gpu_kernel
                         .as_ref()
                         .map_or(10, |kernel| kernel.brain_tick_stride());
+                    // Cap must allow at least min_dispatch ticks to
+                    // accumulate, otherwise low speeds (1x, 2x) can never
+                    // reach the dispatch threshold.
+                    let max_accumulator = sim_delta_time
+                        * (self.speed_multiplier as f64 * 3.0).max(min_dispatch as f64 + 2.0);
+                    self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
+                    let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
+                        .min(self.gpu_tick_budget)
+                        .min(500);
                     let ticks_to_run = if raw_ticks >= min_dispatch {
                         raw_ticks
                     } else {

@@ -121,7 +121,7 @@ This is the **only** evaluative signal. There is no reward function.
 |---|---|
 | `memory_capacity` | Finite pattern storage → forced forgetting → what survives = what matters |
 | `processing_slots` | Limited recall per tick → forced prioritization → attention-like behavior |
-| `representation_dim` | Fixed encoding size → forced compression → abstraction |
+| `representation_dimension` | Fixed encoding size → forced compression → abstraction |
 
 See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into each component.
 
@@ -262,7 +262,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 ### Brain Presets
 
-| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dim` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
+| Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dimension` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
 |--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
 | **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
@@ -275,7 +275,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `memory_capacity` | Max stored patterns. Smaller → faster forgetting, stronger capacity pressure. |
 | `processing_slots` | Max recall operations per tick. Smaller → narrower attention. |
 | `visual_encoding_size` | Resolution of visual encoding (average-pooled bins). Smaller → coarser visual perception. |
-| `representation_dim` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
+| `representation_dimension` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
@@ -286,8 +286,8 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
 | `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
 | `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
-| `metabolic_rate` | Multiplier for all energy costs (default 1.0). Lower → agents survive longer. |
-| `integrity_scale` | Multiplier for integrity damage and regen (default 1.0). Higher → deadlier hazards. |
+| `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |
+| `integrity_scale` | Multiplier for integrity damage and regen (default 0.5). Higher → deadlier hazards. |
 
 ### World Presets
 
@@ -307,7 +307,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "memory_capacity": 128,
     "processing_slots": 16,
     "visual_encoding_size": 64,
-    "representation_dim": 32,
+    "representation_dimension": 128,
     "learning_rate": 0.05,
     "decay_rate": 0.001,
     "distress_exponent": 2.0,
@@ -318,17 +318,17 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "vision_rays": 48,
     "brain_tick_stride": 4,
     "vision_stride": 10,
-    "metabolic_rate": 1.0,
-    "integrity_scale": 1.0
+    "metabolic_rate": 0.5,
+    "integrity_scale": 0.5
   },
   "world": {
     "world_size": 256.0,
-    "energy_depletion_rate": 0.01,
+    "energy_depletion_rate": 0.03,
     "movement_energy_cost": 0.005,
-    "hazard_damage_rate": 0.1,
+    "hazard_damage_rate": 1.0,
     "integrity_regen_rate": 0.005,
     "food_energy_value": 20.0,
-    "food_density": 0.002,
+    "food_density": 0.005,
     "tick_rate": 30.0,
     "seed": 42
   }
@@ -516,40 +516,9 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 ---
 
-## 12. Contributing Guidelines
+## 12. Contributing
 
-These rules are distilled from 88 review comments across PRs #33–#49. They represent the project's hard-won invariants.
-
-### GPU & Buffer Safety
-- **All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants.** Hardcoded strides like `SENSORY_STRIDE` break when `BrainLayout` uses non-default vision dimensions.
-- **Validate index and count inputs against kernel state before computing buffer offsets.** Out-of-bounds offsets trigger wgpu validation errors or silent corruption.
-- **Constants shared between Rust and WGSL must have a single canonical source within a given shader pipeline / concatenated header set.** A pipeline may use either the `wgsl_physics_constants()` template or the `wconfig` uniform buffer for a given constant, but do not define the same constant from both sources when headers are combined. Use named constants, not magic indices (e.g., `WC_FOOD_RADIUS`, not `wc(7u)`).
-
-### Async Readback
-- **Track in-flight state explicitly.** Never overwrite a pending `map_async` operation without unmapping/cleaning up the previous one first.
-- **Always handle both success and failure paths.** If any `map_async` callback fails, the system must clean up and allow retry — "stuck forever" states are bugs.
-- **Establish data authority.** When physics readback and telemetry readback both provide the same field, document which is authoritative and never overwrite fresher data with stale async results.
-- **Unmap staging buffers on all paths:** success, error, agent switch, and generation reset.
-
-### Concurrency
-- **All SQLite connections must set `busy_timeout`.** The default is 0 (instant `SQLITE_BUSY` failure). Both main and background connections need matching timeout policies.
-- **Background threads must have a deterministic shutdown path.** Drop sender → `recv` returns `Disconnected` → thread exits. `Drop` impls must join threads and log any panics.
-- **Return `Result` or `Option` from fallible operations.** Never use `.expect()` for I/O, GPU, or thread operations. Silent failures are worse than explicit errors.
-
-### Performance
-- **Never clone large collections in per-frame hot paths.** Use `clone_from()` for in-place updates or borrow patterns. A throttled rebuild is useless if you deep-clone every frame.
-- **Use squared-distance comparisons to avoid `sqrt()` in loops.** Both CPU and GPU code should use `_SQ` variants for radius checks.
-- **Only mark throttle windows as consumed when work actually happens.** Updating `last_rebuild` without rebuilding silently wastes the throttle budget.
-
-### Documentation & Naming
-- **Docstrings must match implementation.** "Non-blocking" means non-blocking, "pre-allocates" means pre-allocates. Rename functions when behavior changes (e.g., `read_agent_telemetry` → `read_agent_telemetry_blocking`).
-- **Distinguish "start operation" from "poll/collect operation" in API naming.** A function that both starts and polls should document that clearly.
-- **Keep PR descriptions synchronized with code.** Constant values, radius sizes, and architectural claims must reflect what the code actually does.
-
-### Testing
-- **New concurrency-sensitive code paths require end-to-end tests** exercising the async lifecycle: request → complete → consume, and request → fail → cleanup.
-- **Cache invalidation must be tested:** populate → invalidate → verify fresh data returned.
-- **Non-trivial algorithms need unit tests** with representative inputs and boundary conditions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of code style, naming, GPU/buffer safety, concurrency, performance, testing, and related rules.
 
 ---
 

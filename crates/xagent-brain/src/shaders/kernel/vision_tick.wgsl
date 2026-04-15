@@ -2,7 +2,7 @@
 // dispatch(agent_count, 1, 1) — each workgroup's WORKGROUP_SIZE threads
 // cooperatively cast all VISION_RAYS rays (looping when VISION_RAYS >
 // WORKGROUP_SIZE), then thread 0 packs proprioception/interoception/touch
-// into sensory_buf.
+// into sensory_buffer.
 
 const WORKGROUP_SIZE: u32 = 256u;
 
@@ -14,7 +14,7 @@ fn vision_tick(
     let agent_id = wgid.x;
     let tid = lid.x;
 
-    if (agent_phys[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
+    if (physics_state[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
     // Each thread casts rays in a strided loop (handles VISION_RAYS > WORKGROUP_SIZE)
     for (var ray = tid; ray < VISION_RAYS; ray += WORKGROUP_SIZE) {

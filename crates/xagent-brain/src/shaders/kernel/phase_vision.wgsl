@@ -9,19 +9,19 @@
 
 fn vision_single_ray(agent_id: u32, ray_idx: u32) {
     let base = agent_id * PHYS_STRIDE;
-    if (agent_phys[base + P_ALIVE] < 0.5) { return; }
+    if (physics_state[base + P_ALIVE] < 0.5) { return; }
 
     let s_base = agent_id * SENSORY_STRIDE;
 
     let pos = vec3<f32>(
-        agent_phys[base + P_POS_X],
-        agent_phys[base + P_POS_Y],
-        agent_phys[base + P_POS_Z],
+        physics_state[base + P_POS_X],
+        physics_state[base + P_POS_Y],
+        physics_state[base + P_POS_Z],
     );
     let facing = vec3<f32>(
-        agent_phys[base + P_FACING_X],
-        agent_phys[base + P_FACING_Y],
-        agent_phys[base + P_FACING_Z],
+        physics_state[base + P_FACING_X],
+        physics_state[base + P_FACING_Y],
+        physics_state[base + P_FACING_Z],
     );
 
     let grid_width  = wc_u32(WC_GRID_WIDTH);
@@ -115,11 +115,11 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
                     if other == agent_id { continue; }
 
                     let ob = other * PHYS_STRIDE;
-                    if agent_phys[ob + P_ALIVE] < 0.5 { continue; }
+                    if physics_state[ob + P_ALIVE] < 0.5 { continue; }
 
-                    let ox = agent_phys[ob + P_POS_X];
-                    let oy = agent_phys[ob + P_POS_Y];
-                    let oz = agent_phys[ob + P_POS_Z];
+                    let ox = physics_state[ob + P_POS_X];
+                    let oy = physics_state[ob + P_POS_Y];
+                    let oz = physics_state[ob + P_POS_Z];
 
                     let dx = ray_pos.x - ox;
                     let dy = ray_pos.y - oy;
@@ -161,18 +161,18 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
 
     // ── Write vision results ──────────────────────────────────────────
     let ci = s_base + ray_idx * 4u;
-    sensory_buf[ci]      = hit_color.x;
-    sensory_buf[ci + 1u] = hit_color.y;
-    sensory_buf[ci + 2u] = hit_color.z;
-    sensory_buf[ci + 3u] = hit_color.w;
-    sensory_buf[s_base + VISION_COLOR_COUNT + ray_idx] = hit_depth / VISION_MAX_DIST;
+    sensory_buffer[ci]      = hit_color.x;
+    sensory_buffer[ci + 1u] = hit_color.y;
+    sensory_buffer[ci + 2u] = hit_color.z;
+    sensory_buffer[ci + 3u] = hit_color.w;
+    sensory_buffer[s_base + VISION_COLOR_COUNT + ray_idx] = hit_depth / VISION_MAX_DIST;
 }
 
 // ── Per-agent non-visual senses ───────────────────────────────────────────
 
 fn phase_vision_senses(tid: u32) {
     let base = tid * PHYS_STRIDE;
-    if (agent_phys[base + P_ALIVE] < 0.5) { return; }
+    if (physics_state[base + P_ALIVE] < 0.5) { return; }
 
     let agent_count = wc_u32(WC_AGENT_COUNT);
     if tid >= agent_count { return; }
@@ -182,43 +182,43 @@ fn phase_vision_senses(tid: u32) {
     let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
 
     let pos = vec3<f32>(
-        agent_phys[base + P_POS_X],
-        agent_phys[base + P_POS_Y],
-        agent_phys[base + P_POS_Z],
+        physics_state[base + P_POS_X],
+        physics_state[base + P_POS_Y],
+        physics_state[base + P_POS_Z],
     );
 
     let nv_base = s_base + VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
     var off = nv_base;
 
-    sensory_buf[off]      = agent_phys[base + P_VEL_X];
-    sensory_buf[off + 1u] = agent_phys[base + P_VEL_Y];
-    sensory_buf[off + 2u] = agent_phys[base + P_VEL_Z];
+    sensory_buffer[off]      = physics_state[base + P_VEL_X];
+    sensory_buffer[off + 1u] = physics_state[base + P_VEL_Y];
+    sensory_buffer[off + 2u] = physics_state[base + P_VEL_Z];
     off += 3u;
 
-    sensory_buf[off]      = agent_phys[base + P_FACING_X];
-    sensory_buf[off + 1u] = agent_phys[base + P_FACING_Y];
-    sensory_buf[off + 2u] = agent_phys[base + P_FACING_Z];
+    sensory_buffer[off]      = physics_state[base + P_FACING_X];
+    sensory_buffer[off + 1u] = physics_state[base + P_FACING_Y];
+    sensory_buffer[off + 2u] = physics_state[base + P_FACING_Z];
     off += 3u;
 
-    sensory_buf[off] = agent_phys[base + P_ANGULAR_VEL];
+    sensory_buffer[off] = physics_state[base + P_ANGULAR_VEL];
     off += 1u;
 
-    let energy = agent_phys[base + P_ENERGY];
-    let max_energy = agent_phys[base + P_MAX_ENERGY];
-    sensory_buf[off] = energy / max(max_energy, 1e-6);
+    let energy = physics_state[base + P_ENERGY];
+    let max_energy = physics_state[base + P_MAX_ENERGY];
+    sensory_buffer[off] = energy / max(max_energy, 1e-6);
     off += 1u;
 
-    let integrity = agent_phys[base + P_INTEGRITY];
-    let max_integrity = agent_phys[base + P_MAX_INTEGRITY];
-    sensory_buf[off] = integrity / max(max_integrity, 1e-6);
+    let integrity = physics_state[base + P_INTEGRITY];
+    let max_integrity = physics_state[base + P_MAX_INTEGRITY];
+    sensory_buffer[off] = integrity / max(max_integrity, 1e-6);
     off += 1u;
 
-    let prev_energy = agent_phys[base + P_PREV_ENERGY];
-    sensory_buf[off] = energy - prev_energy;
+    let prev_energy = physics_state[base + P_PREV_ENERGY];
+    sensory_buffer[off] = energy - prev_energy;
     off += 1u;
 
-    let prev_integrity = agent_phys[base + P_PREV_INTEGRITY];
-    sensory_buf[off] = integrity - prev_integrity;
+    let prev_integrity = physics_state[base + P_PREV_INTEGRITY];
+    sensory_buffer[off] = integrity - prev_integrity;
     off += 1u;
 
     // ── Touch contacts ────────────────────────────────────────────────
@@ -226,7 +226,7 @@ fn phase_vision_senses(tid: u32) {
     let touch_base = off;
 
     for (var i: u32 = 0u; i < MAX_TOUCH_CONTACTS * 4u; i++) {
-        sensory_buf[touch_base + i] = 0.0;
+        sensory_buffer[touch_base + i] = 0.0;
     }
 
     let self_cx = cell_coord(pos.x) + grid_offset;
@@ -259,10 +259,10 @@ fn phase_vision_senses(tid: u32) {
                 if dist < TOUCH_FOOD_RANGE {
                     let slot = touch_base + touch_count * 4u;
                     let inv_dist = 1.0 / max(dist, 1e-6);
-                    sensory_buf[slot]      = fdx * inv_dist;
-                    sensory_buf[slot + 1u] = fdz * inv_dist;
-                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_FOOD_RANGE;
-                    sensory_buf[slot + 3u] = f32(TOUCH_FOOD) / 4.0;
+                    sensory_buffer[slot]      = fdx * inv_dist;
+                    sensory_buffer[slot + 1u] = fdz * inv_dist;
+                    sensory_buffer[slot + 2u] = 1.0 - dist / TOUCH_FOOD_RANGE;
+                    sensory_buffer[slot + 3u] = f32(TOUCH_FOOD) / 4.0;
                     touch_count += 1u;
                 }
             }
@@ -290,19 +290,19 @@ fn phase_vision_senses(tid: u32) {
                 if other == tid { continue; }
 
                 let ob = other * PHYS_STRIDE;
-                if agent_phys[ob + P_ALIVE] < 0.5 { continue; }
+                if physics_state[ob + P_ALIVE] < 0.5 { continue; }
 
-                let adx = agent_phys[ob + P_POS_X] - pos.x;
-                let adz = agent_phys[ob + P_POS_Z] - pos.z;
+                let adx = physics_state[ob + P_POS_X] - pos.x;
+                let adz = physics_state[ob + P_POS_Z] - pos.z;
                 let dist = sqrt(adx * adx + adz * adz);
 
                 if dist < TOUCH_AGENT_RANGE {
                     let slot = touch_base + touch_count * 4u;
                     let inv_dist = 1.0 / max(dist, 1e-6);
-                    sensory_buf[slot]      = adx * inv_dist;
-                    sensory_buf[slot + 1u] = adz * inv_dist;
-                    sensory_buf[slot + 2u] = 1.0 - dist / TOUCH_AGENT_RANGE;
-                    sensory_buf[slot + 3u] = f32(TOUCH_AGENT) / 4.0;
+                    sensory_buffer[slot]      = adx * inv_dist;
+                    sensory_buffer[slot + 1u] = adz * inv_dist;
+                    sensory_buffer[slot + 2u] = 1.0 - dist / TOUCH_AGENT_RANGE;
+                    sensory_buffer[slot + 3u] = f32(TOUCH_AGENT) / 4.0;
                     touch_count += 1u;
                 }
             }

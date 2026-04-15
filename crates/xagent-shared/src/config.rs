@@ -16,7 +16,8 @@ pub struct BrainConfig {
     /// Resolution of the visual encoder (downsampled from raw vision).
     pub visual_encoding_size: usize,
     /// Length of the internal representation vector.
-    pub representation_dim: usize,
+    #[serde(alias = "representation_dim")]
+    pub representation_dimension: usize,
     /// Base learning rate for association updates.
     pub learning_rate: f32,
     /// Decay rate for unreinforced patterns per tick.
@@ -52,16 +53,16 @@ pub struct BrainConfig {
     /// Default 10.
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
-    /// Multiplier for all energy costs (metabolic + movement). Default 0.01.
+    /// Multiplier for all energy costs (metabolic + movement). Default 0.5.
     /// Lower = agents survive longer. Higher = harsher energy pressure.
     #[serde(default = "default_metabolic_rate")]
     pub metabolic_rate: f32,
-    /// Multiplier for integrity damage and regen. Default 0.01.
+    /// Multiplier for integrity damage and regen. Default 0.5.
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
-    /// Base movement speed (units per second). Default 8.0.
-    /// Heritable: mutated during breeding, clamped to [2.0, 20.0].
+    /// Base movement speed (units per second). Default 20.0.
+    /// Heritable: mutated during breeding, clamped to [20.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
 }
@@ -127,15 +128,15 @@ fn default_vision_stride() -> u32 {
 }
 
 fn default_metabolic_rate() -> f32 {
-    0.01
+    0.5
 }
 
 fn default_integrity_scale() -> f32 {
-    0.01
+    0.5
 }
 
 fn default_movement_speed() -> f32 {
-    8.0
+    20.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -240,7 +241,7 @@ impl Default for BrainConfig {
             memory_capacity: 128,
             processing_slots: 16,
             visual_encoding_size: 64,
-            representation_dim: 32,
+            representation_dimension: 128,
             learning_rate: 0.05,
             decay_rate: 0.001,
             distress_exponent: 2.0,
@@ -265,7 +266,7 @@ impl BrainConfig {
             memory_capacity: 24,
             processing_slots: 8,
             visual_encoding_size: 32,
-            representation_dim: 16,
+            representation_dimension: 128,
             learning_rate: 0.08,
             decay_rate: 0.002,
             distress_exponent: 2.0,
@@ -288,7 +289,7 @@ impl BrainConfig {
             memory_capacity: 512,
             processing_slots: 32,
             visual_encoding_size: 128,
-            representation_dim: 64,
+            representation_dimension: 128,
             learning_rate: 0.03,
             decay_rate: 0.0005,
             distress_exponent: 2.0,
@@ -310,7 +311,7 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             world_size: 256.0,
-            energy_depletion_rate: 0.01,
+            energy_depletion_rate: 0.03,
             movement_energy_cost: 0.005,
             hazard_damage_rate: 1.0,
             integrity_regen_rate: 0.005,
@@ -326,7 +327,7 @@ impl WorldConfig {
     /// Lots of food, slow energy drain, mild hazards.
     pub fn easy() -> Self {
         Self {
-            energy_depletion_rate: 0.005,
+            energy_depletion_rate: 0.015,
             movement_energy_cost: 0.002,
             hazard_damage_rate: 0.5,
             food_density: 0.005,
@@ -338,7 +339,7 @@ impl WorldConfig {
     /// Scarce food, fast energy drain, deadly hazards.
     pub fn hard() -> Self {
         Self {
-            energy_depletion_rate: 0.02,
+            energy_depletion_rate: 0.05,
             movement_energy_cost: 0.01,
             hazard_damage_rate: 2.0,
             food_density: 0.001,
@@ -372,9 +373,9 @@ mod tests {
         assert_eq!(config.vision_stride, 10);
         assert_eq!(config.vision_width, 8);
         assert_eq!(config.vision_height, 6);
-        assert!((config.metabolic_rate - 0.01).abs() < 1e-6);
-        assert!((config.integrity_scale - 0.01).abs() < 1e-6);
-        assert!((config.movement_speed - 8.0).abs() < 1e-6);
+        assert!((config.metabolic_rate - 0.5).abs() < 1e-6);
+        assert!((config.integrity_scale - 0.5).abs() < 1e-6);
+        assert!((config.movement_speed - 20.0).abs() < 1e-6);
     }
 
     #[test]

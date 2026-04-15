@@ -121,7 +121,10 @@ impl MutationMomentum {
         let params: Vec<(&str, f32)> = vec![
             ("memory_capacity", parent.memory_capacity as f32),
             ("processing_slots", parent.processing_slots as f32),
-            ("representation_dim", parent.representation_dim as f32),
+            (
+                "representation_dimension",
+                parent.representation_dimension as f32,
+            ),
             ("learning_rate", parent.learning_rate),
             ("decay_rate", parent.decay_rate),
             ("distress_exponent", parent.distress_exponent),
@@ -138,7 +141,7 @@ impl MutationMomentum {
                     let w_val = match *name {
                         "memory_capacity" => w.memory_capacity as f32,
                         "processing_slots" => w.processing_slots as f32,
-                        "representation_dim" => w.representation_dim as f32,
+                        "representation_dimension" => w.representation_dimension as f32,
                         "learning_rate" => w.learning_rate,
                         "decay_rate" => w.decay_rate,
                         "distress_exponent" => w.distress_exponent,

@@ -9,11 +9,11 @@ fn phase_agent_grid(tid: u32) {
     let b = agent * PHYS_STRIDE;
 
     // Skip dead agents
-    if agent_phys[b + P_ALIVE] < 0.5 { return; }
+    if physics_state[b + P_ALIVE] < 0.5 { return; }
 
     // Read position
-    let px = agent_phys[b + P_POS_X];
-    let pz = agent_phys[b + P_POS_Z];
+    let px = physics_state[b + P_POS_X];
+    let pz = physics_state[b + P_POS_Z];
 
     // Compute cell with offset
     let grid_offset = i32(wc_u32(WC_GRID_OFFSET));

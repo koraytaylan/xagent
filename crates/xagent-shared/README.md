@@ -253,7 +253,7 @@ pub struct BrainConfig {
     pub memory_capacity: usize,
     pub processing_slots: usize,
     pub visual_encoding_size: usize,
-    pub representation_dim: usize,
+    pub representation_dimension: usize,
     pub learning_rate: f32,
     pub decay_rate: f32,
     pub distress_exponent: f32,
@@ -271,7 +271,7 @@ Brain capacity parameters. These are not implementation details — they are the
 | `memory_capacity` | 128 | Maximum number of patterns the memory can hold. Smaller values force the brain to forget more aggressively, leading to stronger habit formation and more stereotyped behavior. Larger values allow richer memory but slower convergence. The increased default (128) allows learning multiple survival skills while still maintaining capacity pressure — only the most reinforced patterns survive decay, which *is* emergent attention. |
 | `processing_slots` | 16 | Maximum number of patterns that can be recalled/compared per tick. This is the agent's "attention span" — with fewer slots, it makes faster but cruder decisions. More slots means better pattern matching but higher computational cost per tick. |
 | `visual_encoding_size` | 64 | Resolution of the visual encoder output (downsampled from raw vision). Smaller values force more aggressive compression, which means the brain sees less detail but processes faster. Larger values preserve more visual information. |
-| `representation_dim` | 32 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
+| `representation_dimension` | 128 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
 | `learning_rate` | 0.05 | Base learning rate for association updates. Higher rates mean faster adaptation but more instability (catastrophic forgetting). Lower rates mean more stable memory but slower learning. |
 | `decay_rate` | 0.001 | Decay rate for unreinforced patterns per tick. Patterns that aren't recalled or reinforced gradually lose strength. Higher decay means more aggressive forgetting — the brain only retains frequently-used patterns. |
 | `distress_exponent` | 2.0 | Exponent for the homeostatic distress curve. Higher values mean the agent stays calm longer but panics harder at critical levels. Heritable: mutated during breeding, clamped to [1.5, 5.0]. |
@@ -307,12 +307,12 @@ World simulation parameters:
 | Parameter | Default | Description |
 |---|---|---|
 | `world_size` | 256.0 | Side length of the square terrain in world units. Larger worlds require more exploration. |
-| `energy_depletion_rate` | 0.01 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
+| `energy_depletion_rate` | 0.03 | Energy drained per tick from base metabolism. This is the constant pressure that forces the agent to eat. |
 | `movement_energy_cost` | 0.005 | Additional energy cost per unit of movement. Moving is expensive — the agent must learn to balance exploration (costly) with exploitation (staying near known food). |
-| `hazard_damage_rate` | 0.1 | Integrity damage per tick while in a hazard zone. Higher values make hazards more lethal, increasing the selection pressure to learn avoidance. |
+| `hazard_damage_rate` | 1.0 | Integrity damage per tick while in a hazard zone. Higher values make hazards more lethal, increasing the selection pressure to learn avoidance. |
 | `integrity_regen_rate` | 0.005 | Integrity recovered per tick when energy is above 50%. Recovery is slow relative to damage — the agent must avoid hazards rather than tanking through them. |
 | `food_energy_value` | 20.0 | Energy restored per food item consumed. Higher values make each food item more impactful, reducing the frequency of foraging needed. |
-| `food_density` | 0.002 | Density of food items in food-rich biomes (items per unit²). Higher density means food is easier to find, lower density increases starvation pressure. |
+| `food_density` | 0.005 | Density of food items in food-rich biomes (items per unit²). Higher density means food is easier to find, lower density increases starvation pressure. |
 | `tick_rate` | 30.0 | Simulation ticks per second. Affects the real-time speed of the simulation. |
 | `seed` | 42 | Random seed for world generation. Same seed = same terrain, biome layout, and initial food placement. |
 

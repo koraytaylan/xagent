@@ -16,6 +16,7 @@ pub struct BrainConfig {
     /// Resolution of the visual encoder (downsampled from raw vision).
     pub visual_encoding_size: usize,
     /// Length of the internal representation vector.
+    #[serde(alias = "representation_dim")]
     pub representation_dimension: usize,
     /// Base learning rate for association updates.
     pub learning_rate: f32,
@@ -52,11 +53,11 @@ pub struct BrainConfig {
     /// Default 10.
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
-    /// Multiplier for all energy costs (metabolic + movement). Default 0.01.
+    /// Multiplier for all energy costs (metabolic + movement). Default 0.5.
     /// Lower = agents survive longer. Higher = harsher energy pressure.
     #[serde(default = "default_metabolic_rate")]
     pub metabolic_rate: f32,
-    /// Multiplier for integrity damage and regen. Default 0.01.
+    /// Multiplier for integrity damage and regen. Default 0.5.
     /// Lower = agents take less damage. Higher = hazard zones are deadlier.
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,

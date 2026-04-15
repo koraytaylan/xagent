@@ -259,15 +259,13 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 Our agents had the gradient signal (homeostatic fast EMA) but never used it for movement modulation. The exploration rate was based on policy confidence, novelty, and curiosity — none of which carried gradient-direction information.
 
-**Fix:** Added `KLINOTAXIS_SENSITIVITY=100.0` to the exploration rate computation. The fast gradient (`gradient_fast`) modulates exploration:
+**Fix:** Added `KLINOTAXIS_SENSITIVITY=500.0` scaling the final turn motor output. Klinotaxis uses the fast-vs-medium gradient deviation to modulate steering:
 
-- Gradient improving (approaching food, leaving danger) → exploration decreases → agent goes straighter → persists in the improving direction
-- Gradient worsening (entering danger, starving) → exploration increases → agent turns more → changes direction
+- Gradient worsening suddenly (fast drops below medium) → turn amplitude amplified up to 3× → agent reorients
+- Gradient stabilizing after worsening (fast recovers, medium still shifted) → turn amplitude suppressed to 0.3× → agent goes straight → escapes
+- Gradient improving (food eaten) → turn suppressed → agent persists in the rewarding direction
 
-This requires zero learning — it's a reactive feedback loop. Expected behaviors:
-- Hazard avoidance: enter danger → gradient worsens → turn more → exit → gradient improves → go straight → escape
-- Post-food persistence: eat food → gradient spikes positive → go straight → continue in food-rich area
-- Starvation response: prolonged energy drain → gradient worsens → explore more → find new area
+This produces the biological escape sequence: brief reorientation burst then straight-line flight. It requires zero learning — it's a reactive feedback loop driven by multi-timescale gradient comparison.
 
 Learning (credit assignment) then builds on this reactive foundation, associating specific visual patterns with gradient predictions.
 

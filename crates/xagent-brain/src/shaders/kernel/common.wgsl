@@ -60,8 +60,8 @@ const O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
 const BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
-const PATTERN_STRIDE: u32 = 5251u;
-const HISTORY_STRIDE: u32 = 2370u;
+const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
+const HISTORY_STRIDE: u32 = O_HIST_LEN + 1u;
 const FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
 const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
@@ -77,21 +77,21 @@ const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 // Other regions (norms, reinf, motor, meta, active) remain AoS.
 
 const O_PAT_STATES: u32 = 0u;
-const O_PAT_NORMS: u32 = 4096u;
-const O_PAT_REINF: u32 = 4224u;
-const O_PAT_MOTOR: u32 = 4352u;
-const O_PAT_META: u32 = 4736u;
-const O_PAT_ACTIVE: u32 = 5120u;
-const O_ACTIVE_COUNT: u32 = 5248u;
-const O_MIN_REINF_IDX: u32 = 5249u;
-const O_LAST_STORED_IDX: u32 = 5250u;
+const O_PAT_NORMS: u32 = MEMORY_CAP * ENCODED_DIMENSION;
+const O_PAT_REINF: u32 = O_PAT_NORMS + MEMORY_CAP;
+const O_PAT_MOTOR: u32 = O_PAT_REINF + MEMORY_CAP;
+const O_PAT_META: u32 = O_PAT_MOTOR + MEMORY_CAP * 3u;
+const O_PAT_ACTIVE: u32 = O_PAT_META + MEMORY_CAP * 3u;
+const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
+const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
+const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
 
 // ── Action history offsets ──────────────────────────────────────────────────
 
 const O_MOTOR_RING: u32 = 0u;
-const O_STATE_RING: u32 = 320u;
-const O_HIST_CURSOR: u32 = 2368u;
-const O_HIST_LEN: u32 = 2369u;
+const O_STATE_RING: u32 = ACTION_HISTORY_LEN * 5u;
+const O_HIST_CURSOR: u32 = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION;
+const O_HIST_LEN: u32 = O_HIST_CURSOR + 1u;
 
 // ── Config buffer offsets ───────────────────────────────────────────────────
 

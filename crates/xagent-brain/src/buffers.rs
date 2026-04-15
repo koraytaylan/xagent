@@ -18,7 +18,7 @@ pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
 /// Used to compute default brain state offsets (`O_ENC_BIASES`),
 /// `FEATURES_STRIDE`, and `FIXED_TAIL_SIZE`.
 /// For other vision dimensions, use `BrainLayout::feature_count`.
-const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25; // 265
+const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25;
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const ACTION_HISTORY_LEN: usize = 64;
@@ -40,68 +40,68 @@ pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTAC
 // `O_FOO - O_PREDICTOR_CONTEXT_WEIGHT` is the same regardless of vision size.
 
 pub const O_ENC_WEIGHTS: usize = 0;
-pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * ENCODED_DIMENSION; // 8480
-pub const O_PREDICTOR_WEIGHTS: usize = O_ENC_BIASES + ENCODED_DIMENSION; // 8512
+pub const O_ENC_BIASES: usize = O_ENC_WEIGHTS + FEATURE_COUNT * ENCODED_DIMENSION;
+pub const O_PREDICTOR_WEIGHTS: usize = O_ENC_BIASES + ENCODED_DIMENSION;
 pub const O_PREDICTOR_CONTEXT_WEIGHT: usize =
     O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
-pub const O_PREDICTION_ERROR_RING: usize = O_PREDICTOR_CONTEXT_WEIGHT + 1; // 9537
-pub const O_PREDICTION_ERROR_CURSOR: usize = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN; // 9665
-pub const O_PREDICTION_ERROR_COUNT: usize = O_PREDICTION_ERROR_CURSOR + 1; // 9666
-pub const O_HAB_EMA: usize = O_PREDICTION_ERROR_COUNT + 1; // 9667
-pub const O_HAB_ATTEN: usize = O_HAB_EMA + ENCODED_DIMENSION; // 9699
-pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + ENCODED_DIMENSION; // 9731
+pub const O_PREDICTION_ERROR_RING: usize = O_PREDICTOR_CONTEXT_WEIGHT + 1;
+pub const O_PREDICTION_ERROR_CURSOR: usize = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
+pub const O_PREDICTION_ERROR_COUNT: usize = O_PREDICTION_ERROR_CURSOR + 1;
+pub const O_HAB_EMA: usize = O_PREDICTION_ERROR_COUNT + 1;
+pub const O_HAB_ATTEN: usize = O_HAB_EMA + ENCODED_DIMENSION;
+pub const O_PREV_ENCODED: usize = O_HAB_ATTEN + ENCODED_DIMENSION;
 
 // homeo: [grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]
-pub const O_HOMEO: usize = O_PREV_ENCODED + ENCODED_DIMENSION; // 9763
-pub const O_ACTION_FORWARD_WEIGHTS: usize = O_HOMEO + 6; // 9769
-pub const O_ACTION_TURN_WEIGHTS: usize = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION; // 9801
+pub const O_HOMEO: usize = O_PREV_ENCODED + ENCODED_DIMENSION;
+pub const O_ACTION_FORWARD_WEIGHTS: usize = O_HOMEO + 6;
+pub const O_ACTION_TURN_WEIGHTS: usize = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
 
 // act_biases: [fwd_bias, turn_bias]
-pub const O_ACT_BIASES: usize = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION; // 9833
-pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2; // 9835
+pub const O_ACT_BIASES: usize = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
+pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2;
 pub const POS_RING_LEN: usize = 16;
-pub const O_POS_RING_X: usize = O_EXPLORATION_RATE + 1; // 9836
-pub const O_POS_RING_Z: usize = O_POS_RING_X + POS_RING_LEN; // 9852
-pub const O_POS_RING_CURSOR: usize = O_POS_RING_Z + POS_RING_LEN; // 9868
-pub const O_POS_RING_LEN: usize = O_POS_RING_CURSOR + 1; // 9869
-pub const O_ACCUM_FWD: usize = O_POS_RING_LEN + 1; // 9870
-pub const O_FATIGUE_FACTOR: usize = O_ACCUM_FWD + 1; // 9871
-pub const O_PREV_PREDICTION: usize = O_FATIGUE_FACTOR + 1; // 9872
+pub const O_POS_RING_X: usize = O_EXPLORATION_RATE + 1;
+pub const O_POS_RING_Z: usize = O_POS_RING_X + POS_RING_LEN;
+pub const O_POS_RING_CURSOR: usize = O_POS_RING_Z + POS_RING_LEN;
+pub const O_POS_RING_LEN: usize = O_POS_RING_CURSOR + 1;
+pub const O_ACCUM_FWD: usize = O_POS_RING_LEN + 1;
+pub const O_FATIGUE_FACTOR: usize = O_ACCUM_FWD + 1;
+pub const O_PREV_PREDICTION: usize = O_FATIGUE_FACTOR + 1;
 pub const O_TICK_COUNT: usize = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
-pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1; // 9905
-pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1; // 9906
-pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1; // 9907
-pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1; // 9908
-pub const BRAIN_STRIDE: usize = O_MOVEMENT_SPEED + 1; // 9909
+pub const O_HAB_SENSITIVITY: usize = O_TICK_COUNT + 1;
+pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1;
+pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1;
+pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1;
+pub const BRAIN_STRIDE: usize = O_MOVEMENT_SPEED + 1;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
 /// doesn't change with feature_count / vision dimensions.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PREDICTOR_CONTEXT_WEIGHT; // 373
+pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PREDICTOR_CONTEXT_WEIGHT;
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
 pub const O_PAT_STATES: usize = 0;
-pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * ENCODED_DIMENSION; // 4096
-pub const O_PAT_REINF: usize = O_PAT_NORMS + MEMORY_CAP; // 4224
-pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP; // 4352
-                                                         // motor: [forward, turn, outcome_valence] × cap
-pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3; // 4736
-                                                            // meta: [created_at, last_accessed, activation_count] × cap
-pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3; // 5120
-pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP; // 5248
-pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1; // 5249
-pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1; // 5250
-pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1; // 5251
+pub const O_PAT_NORMS: usize = O_PAT_STATES + MEMORY_CAP * ENCODED_DIMENSION;
+pub const O_PAT_REINF: usize = O_PAT_NORMS + MEMORY_CAP;
+pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP;
+// motor: [forward, turn, outcome_valence] × cap
+pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3;
+// meta: [created_at, last_accessed, activation_count] × cap
+pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3;
+pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP;
+pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1;
+pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1;
+pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1;
 
 // ── Action history buffer offsets (per agent) ─────────────────────────
 
 pub const O_MOTOR_RING: usize = 0;
 // motor_ring: [forward, turn, tick, gradient, _pad] × ACTION_HISTORY_LEN
-pub const O_STATE_RING: usize = O_MOTOR_RING + ACTION_HISTORY_LEN * 5; // 320
-pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION; // 2368
-pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1; // 2369
-pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1; // 2370
+pub const O_STATE_RING: usize = O_MOTOR_RING + ACTION_HISTORY_LEN * 5;
+pub const O_HIST_CURSOR: usize = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION;
+pub const O_HIST_LEN: usize = O_HIST_CURSOR + 1;
+pub const HISTORY_STRIDE: usize = O_HIST_LEN + 1;
 
 // ── Agent physics buffer layout (per agent, GPU-resident) ─────────────
 
@@ -210,9 +210,9 @@ pub const FOOD_STATE_STRIDE: usize = 4;
 
 pub const GRID_CELL_SIZE: f32 = 8.0;
 pub const FOOD_GRID_MAX_PER_CELL: usize = 16;
-pub const FOOD_GRID_CELL_STRIDE: usize = 1 + FOOD_GRID_MAX_PER_CELL; // 17
+pub const FOOD_GRID_CELL_STRIDE: usize = 1 + FOOD_GRID_MAX_PER_CELL;
 pub const AGENT_GRID_MAX_PER_CELL: usize = 32;
-pub const AGENT_GRID_CELL_STRIDE: usize = 1 + AGENT_GRID_MAX_PER_CELL; // 33
+pub const AGENT_GRID_CELL_STRIDE: usize = 1 + AGENT_GRID_MAX_PER_CELL;
 
 /// Compute grid width (cells per axis) for a given world size.
 pub fn grid_width(world_size: f32) -> usize {
@@ -249,11 +249,11 @@ pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
-pub const FEATURES_STRIDE: usize = FEATURE_COUNT; // 265
-pub const ENCODED_STRIDE: usize = ENCODED_DIMENSION; // 32
-pub const HABITUATED_STRIDE: usize = ENCODED_DIMENSION; // 32
+pub const FEATURES_STRIDE: usize = FEATURE_COUNT;
+pub const ENCODED_STRIDE: usize = ENCODED_DIMENSION;
+pub const HABITUATED_STRIDE: usize = ENCODED_DIMENSION;
 pub const HOMEO_OUT_STRIDE: usize = 6; // grad, raw_grad, urgency, grad_fast, grad_med, grad_slow
-pub const SIMILARITIES_STRIDE: usize = MEMORY_CAP; // 128
+pub const SIMILARITIES_STRIDE: usize = MEMORY_CAP;
 pub const RECALL_IDX_STRIDE: usize = RECALL_K + 1; // 16 indices + 1 count
 pub const DECISION_PREDICTION: usize = 0;
 pub const DECISION_CREDIT: usize = ENCODED_DIMENSION;

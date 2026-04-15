@@ -516,41 +516,9 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 ---
 
-## 12. Contributing Guidelines
+## 12. Contributing
 
-These rules are distilled from 88 review comments across PRs #33–#49. They represent the project's hard-won invariants.
-
-### GPU & Buffer Safety
-- **All buffer offsets must derive from `BrainLayout` / kernel config, never hardcoded constants.** Hardcoded strides like `SENSORY_STRIDE` break when `BrainLayout` uses non-default vision dimensions.
-- **Validate index and count inputs against kernel state before computing buffer offsets.** Out-of-bounds offsets trigger wgpu validation errors or silent corruption.
-- **Constants shared between Rust and WGSL must have a single canonical source within a given shader pipeline / concatenated header set.** A pipeline may use either the `wgsl_physics_constants()` template or the `wconfig` uniform buffer for a given constant, but do not define the same constant from both sources when headers are combined. Use named constants, not magic indices (e.g., `WC_FOOD_RADIUS`, not `wc(7u)`).
-
-### Async Readback
-- **Track in-flight state explicitly.** Never overwrite a pending `map_async` operation without unmapping/cleaning up the previous one first.
-- **Always handle both success and failure paths.** If any `map_async` callback fails, the system must clean up and allow retry — "stuck forever" states are bugs.
-- **Establish data authority.** When physics readback and telemetry readback both provide the same field, document which is authoritative and never overwrite fresher data with stale async results.
-- **Unmap staging buffers on all paths:** success, error, agent switch, and generation reset.
-
-### Concurrency
-- **All SQLite connections must set `busy_timeout`.** The default is 0 (instant `SQLITE_BUSY` failure). Both main and background connections need matching timeout policies.
-- **Background threads must have a deterministic shutdown path.** Drop sender → `recv` returns `Disconnected` → thread exits. `Drop` impls must join threads and log any panics.
-- **Return `Result` or `Option` from fallible operations.** Never use `.expect()` for I/O, GPU, or thread operations. Silent failures are worse than explicit errors.
-
-### Performance
-- **Never clone large collections in per-frame hot paths.** Use `clone_from()` for in-place updates or borrow patterns. A throttled rebuild is useless if you deep-clone every frame.
-- **Use squared-distance comparisons to avoid `sqrt()` in loops.** Both CPU and GPU code should use `_SQ` variants for radius checks.
-- **Only mark throttle windows as consumed when work actually happens.** Updating `last_rebuild` without rebuilding silently wastes the throttle budget.
-
-### Documentation & Naming
-- **Docstrings must match implementation.** "Non-blocking" means non-blocking, "pre-allocates" means pre-allocates. Rename functions when behavior changes (e.g., `read_agent_telemetry` → `read_agent_telemetry_blocking`).
-- **Distinguish "start operation" from "poll/collect operation" in API naming.** A function that both starts and polls should document that clearly.
-- **Keep PR descriptions synchronized with code.** Constant values, radius sizes, and architectural claims must reflect what the code actually does.
-- **No commented-out code or tombstone comments.** Delete removed code completely — don't comment it out or leave comments describing code that no longer exists. The git history preserves everything.
-
-### Testing
-- **New concurrency-sensitive code paths require end-to-end tests** exercising the async lifecycle: request → complete → consume, and request → fail → cleanup.
-- **Cache invalidation must be tested:** populate → invalidate → verify fresh data returned.
-- **Non-trivial algorithms need unit tests** with representative inputs and boundary conditions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of code style, naming, GPU/buffer safety, concurrency, performance, testing, and related rules.
 
 ---
 

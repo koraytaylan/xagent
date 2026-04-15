@@ -13,6 +13,7 @@ var<workgroup> s_homeo: array<f32, 6>;
 var<workgroup> s_similarities: array<f32, MEMORY_CAP>;
 var<workgroup> shared_sort_indices: array<u32, MEMORY_CAP>;
 var<workgroup> s_recall: array<f32, 17>;
+var<workgroup> s_recall_similarity: array<f32, RECALL_K>;
 var<workgroup> s_prediction: array<f32, PREDICTOR_DIMENSION>;
 var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_pred_error: f32;
@@ -284,6 +285,18 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         s_prediction[tid] = s;
     }
+
+    // ── Precompute recalled cosine similarities: threads 0..(RECALL_K-1) ──
+    // Each thread computes one recall entry's cosine sim in parallel,
+    // eliminating the serial 16×128 bottleneck in thread 0's memory
+    // blend and context blend loops.
+    if (tid < RECALL_K) {
+        if (tid < recall_count) {
+            s_recall_similarity[tid] = cosine_sim_pat_s(agent_id, u32(s_recall[tid]));
+        } else {
+            s_recall_similarity[tid] = 0.0;
+        }
+    }
     workgroupBarrier();
 
     // ── Thread 0: rest of predict + act ────────────────────────────────
@@ -309,19 +322,17 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             brain_state[brain_base + O_PREDICTION_ERROR_COUNT] = err_count + 1.0;
         }
 
-        // Recalled context blend
+        // Recalled context blend (uses precomputed similarities from s_recall_similarity)
         if (recall_count > 0u) {
             let context_weight = brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT];
             var total_sim: f32 = 0.0;
             for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
-                let idx = u32(s_recall[k]);
-                total_sim += max(cosine_sim_pat_s(agent_id, idx), 0.0);
+                total_sim += max(s_recall_similarity[k], 0.0);
             }
             if (total_sim > 1e-8) {
                 for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
                     let idx = u32(s_recall[k]);
-                    let sim = cosine_sim_pat_s(agent_id, idx);
-                    let w = context_weight * max(sim, 0.0) / total_sim;
+                    let w = context_weight * max(s_recall_similarity[k], 0.0) / total_sim;
                     for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
                         s_prediction[d] += pattern_buffer[pattern_base + d * MEMORY_CAP + idx] * w;
                     }
@@ -459,7 +470,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             var total_weight: f32 = 0.0;
             for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
                 let idx = u32(s_recall[k]);
-                let sim = cosine_sim_pat_s(agent_id, idx);
+                let sim = s_recall_similarity[k];
                 let motor_base = pattern_base + O_PAT_MOTOR + idx * 3u;
                 let valence = pattern_buffer[motor_base + 2u];
                 let weight = sim * valence;

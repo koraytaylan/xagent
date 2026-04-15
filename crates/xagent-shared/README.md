@@ -253,7 +253,7 @@ pub struct BrainConfig {
     pub memory_capacity: usize,
     pub processing_slots: usize,
     pub visual_encoding_size: usize,
-    pub representation_dim: usize,
+    pub representation_dimension: usize,
     pub learning_rate: f32,
     pub decay_rate: f32,
     pub distress_exponent: f32,
@@ -271,7 +271,7 @@ Brain capacity parameters. These are not implementation details — they are the
 | `memory_capacity` | 128 | Maximum number of patterns the memory can hold. Smaller values force the brain to forget more aggressively, leading to stronger habit formation and more stereotyped behavior. Larger values allow richer memory but slower convergence. The increased default (128) allows learning multiple survival skills while still maintaining capacity pressure — only the most reinforced patterns survive decay, which *is* emergent attention. |
 | `processing_slots` | 16 | Maximum number of patterns that can be recalled/compared per tick. This is the agent's "attention span" — with fewer slots, it makes faster but cruder decisions. More slots means better pattern matching but higher computational cost per tick. |
 | `visual_encoding_size` | 64 | Resolution of the visual encoder output (downsampled from raw vision). Smaller values force more aggressive compression, which means the brain sees less detail but processes faster. Larger values preserve more visual information. |
-| `representation_dim` | 32 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
+| `representation_dimension` | 128 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
 | `learning_rate` | 0.05 | Base learning rate for association updates. Higher rates mean faster adaptation but more instability (catastrophic forgetting). Lower rates mean more stable memory but slower learning. |
 | `decay_rate` | 0.001 | Decay rate for unreinforced patterns per tick. Patterns that aren't recalled or reinforced gradually lose strength. Higher decay means more aggressive forgetting — the brain only retains frequently-used patterns. |
 | `distress_exponent` | 2.0 | Exponent for the homeostatic distress curve. Higher values mean the agent stays calm longer but panics harder at critical levels. Heritable: mutated during breeding, clamped to [1.5, 5.0]. |

@@ -22,95 +22,117 @@ fn agent_physics(agent_id: u32, tick: u32) {
 
     // Safe to early-return: one workgroup == one agent, so all threads agree.
     // See top-of-file invariant re: barrier uniformity.
-    let alive = agent_phys[b + P_ALIVE];
+    let alive = physics_state[b + P_ALIVE];
     if alive < 0.5 { return; }
 
     let dt = wc_f32(WC_DT);
     let world_half = wc_f32(WC_WORLD_HALF_BOUND);
 
     // Snapshot prev energy/integrity
-    agent_phys[b + P_PREV_ENERGY] = agent_phys[b + P_ENERGY];
-    agent_phys[b + P_PREV_INTEGRITY] = agent_phys[b + P_INTEGRITY];
+    physics_state[b + P_PREV_ENERGY] = physics_state[b + P_ENERGY];
+    physics_state[b + P_PREV_INTEGRITY] = physics_state[b + P_INTEGRITY];
 
     // Save last-good position/velocity for NaN recovery
-    let last_pos = vec3<f32>(agent_phys[b + P_POS_X], agent_phys[b + P_POS_Y], agent_phys[b + P_POS_Z]);
-    let last_vel = vec3<f32>(agent_phys[b + P_VEL_X], agent_phys[b + P_VEL_Y], agent_phys[b + P_VEL_Z]);
+    let last_pos = vec3<f32>(physics_state[b + P_POS_X], physics_state[b + P_POS_Y], physics_state[b + P_POS_Z]);
+    let last_vel = vec3<f32>(physics_state[b + P_VEL_X], physics_state[b + P_VEL_Y], physics_state[b + P_VEL_Z]);
 
-    // Read motor commands from decision_buf
-    let dec_base = agent_id * DECISION_STRIDE;
-    let motor_offset = dec_base + DIM + DIM;
-    var motor_fwd = decision_buf[motor_offset];
-    var motor_turn = decision_buf[motor_offset + 1u];
-    var motor_strafe = decision_buf[motor_offset + 2u];
+    // Read motor commands from decision_buffer
+    let decision_base = agent_id * DECISION_STRIDE;
+    let motor_offset = decision_base + DECISION_MOTOR;
+    var motor_forward = decision_buffer[motor_offset];
+    var motor_turn = decision_buffer[motor_offset + 1u];
+    var motor_strafe = decision_buffer[motor_offset + 2u];
 
     // Sanitize motor: clamp [-1,1], NaN -> 0
-    if !is_finite(motor_fwd) { motor_fwd = 0.0; }
+    if !is_finite(motor_forward) { motor_forward = 0.0; }
     if !is_finite(motor_turn) { motor_turn = 0.0; }
     if !is_finite(motor_strafe) { motor_strafe = 0.0; }
-    motor_fwd = clamp(motor_fwd, -1.0, 1.0);
+    motor_forward = clamp(motor_forward, -1.0, 1.0);
     motor_turn = clamp(motor_turn, -1.0, 1.0);
     motor_strafe = clamp(motor_strafe, -1.0, 1.0);
 
     // Turning
-    var yaw = agent_phys[b + P_YAW];
+    var yaw = physics_state[b + P_YAW];
     let prev_yaw = yaw;
     yaw += motor_turn * TURN_SPEED * dt;
-    agent_phys[b + P_YAW] = yaw;
-    agent_phys[b + P_ANGULAR_VEL] = (yaw - prev_yaw) / max(dt, 1e-6);
+    physics_state[b + P_YAW] = yaw;
+    physics_state[b + P_ANGULAR_VEL] = (yaw - prev_yaw) / max(dt, 1e-6);
     let facing = normalize(vec3<f32>(sin(yaw), 0.0, cos(yaw)));
-    agent_phys[b + P_FACING_X] = facing.x;
-    agent_phys[b + P_FACING_Y] = 0.0;
-    agent_phys[b + P_FACING_Z] = facing.z;
+    physics_state[b + P_FACING_X] = facing.x;
+    physics_state[b + P_FACING_Y] = 0.0;
+    physics_state[b + P_FACING_Z] = facing.z;
 
     // Locomotion
     let right = vec3<f32>(facing.z, 0.0, -facing.x);
-    var desired = facing * motor_fwd + right * motor_strafe;
+    var desired = facing * motor_forward + right * motor_strafe;
     let desired_sq = dot(desired, desired);
     if desired_sq > 1.0 {
         desired = desired / sqrt(desired_sq);
     }
     let move_speed = brain_state[agent_id * BRAIN_STRIDE + O_MOVEMENT_SPEED];
-    agent_phys[b + P_VEL_X] = desired.x * move_speed;
-    agent_phys[b + P_VEL_Z] = desired.z * move_speed;
+    physics_state[b + P_VEL_X] = desired.x * move_speed;
+    physics_state[b + P_VEL_Z] = desired.z * move_speed;
 
     // Gravity
-    agent_phys[b + P_VEL_Y] = agent_phys[b + P_VEL_Y] - GRAVITY * dt;
+    physics_state[b + P_VEL_Y] = physics_state[b + P_VEL_Y] - GRAVITY * dt;
 
     // Integrate position
     var pos = vec3<f32>(
-        agent_phys[b + P_POS_X] + agent_phys[b + P_VEL_X] * dt,
-        agent_phys[b + P_POS_Y] + agent_phys[b + P_VEL_Y] * dt,
-        agent_phys[b + P_POS_Z] + agent_phys[b + P_VEL_Z] * dt,
+        physics_state[b + P_POS_X] + physics_state[b + P_VEL_X] * dt,
+        physics_state[b + P_POS_Y] + physics_state[b + P_VEL_Y] * dt,
+        physics_state[b + P_POS_Z] + physics_state[b + P_VEL_Z] * dt,
     );
 
-    // Clamp to world bounds
+    // Bounce off world bounds: clamp position and reflect velocity/facing
+    let pre_clamp_x = pos.x;
+    let pre_clamp_z = pos.z;
     pos.x = clamp(pos.x, -world_half, world_half);
     pos.z = clamp(pos.z, -world_half, world_half);
+    var bounced = false;
+    if (pos.x != pre_clamp_x) {
+        physics_state[b + P_VEL_X] *= -1.0;
+        yaw = -yaw;
+        bounced = true;
+    }
+    if (pos.z != pre_clamp_z) {
+        physics_state[b + P_VEL_Z] *= -1.0;
+        yaw = PI - yaw;
+        bounced = true;
+    }
+    if (bounced) {
+        physics_state[b + P_YAW] = yaw;
+        physics_state[b + P_FACING_X] = sin(yaw);
+        physics_state[b + P_FACING_Z] = cos(yaw);
+        var yaw_delta = yaw - prev_yaw;
+        if (yaw_delta > PI) { yaw_delta -= TWO_PI; }
+        if (yaw_delta < -PI) { yaw_delta += TWO_PI; }
+        physics_state[b + P_ANGULAR_VEL] = yaw_delta / max(dt, 1e-6);
+    }
 
     // Ground collision
     let ground = sample_height(pos.x, pos.z);
     if pos.y < ground + AGENT_HALF_HEIGHT {
         pos.y = ground + AGENT_HALF_HEIGHT;
-        agent_phys[b + P_VEL_Y] = 0.0;
+        physics_state[b + P_VEL_Y] = 0.0;
     }
 
     // NaN recovery
     if !is_finite(pos.x) || !is_finite(pos.y) || !is_finite(pos.z) {
         pos = last_pos;
-        agent_phys[b + P_VEL_X] = last_vel.x;
-        agent_phys[b + P_VEL_Y] = last_vel.y;
-        agent_phys[b + P_VEL_Z] = last_vel.z;
+        physics_state[b + P_VEL_X] = last_vel.x;
+        physics_state[b + P_VEL_Y] = last_vel.y;
+        physics_state[b + P_VEL_Z] = last_vel.z;
     }
 
-    agent_phys[b + P_POS_X] = pos.x;
-    agent_phys[b + P_POS_Y] = pos.y;
-    agent_phys[b + P_POS_Z] = pos.z;
+    physics_state[b + P_POS_X] = pos.x;
+    physics_state[b + P_POS_Y] = pos.y;
+    physics_state[b + P_POS_Z] = pos.z;
 
     // Energy depletion
     let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
     // Normalize by default speed (20.0) so baseline energy drain is unchanged.
-    let movement_mag = min(abs(motor_fwd) + abs(motor_strafe), 1.414) * (move_speed / 20.0);
-    var energy = agent_phys[b + P_ENERGY];
+    let movement_mag = min(abs(motor_forward) + abs(motor_strafe), 1.414) * (move_speed / 20.0);
+    var energy = physics_state[b + P_ENERGY];
     energy -= wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
     energy -= movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;
 
@@ -118,33 +140,33 @@ fn agent_physics(agent_id: u32, tick: u32) {
     let integrity_scale = bc_f32(CFG_INTEGRITY_SCALE);
     let biome_type = sample_biome(pos.x, pos.z);
     if biome_type == BIOME_DANGER {
-        agent_phys[b + P_INTEGRITY] = agent_phys[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
+        physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
     }
 
     // Integrity regen when energy > 50%
-    let max_e = agent_phys[b + P_MAX_ENERGY];
-    var integrity = agent_phys[b + P_INTEGRITY];
-    let max_i = agent_phys[b + P_MAX_INTEGRITY];
+    let max_e = physics_state[b + P_MAX_ENERGY];
+    var integrity = physics_state[b + P_INTEGRITY];
+    let max_i = physics_state[b + P_MAX_INTEGRITY];
     if energy / max_e > 0.5 && integrity < max_i {
         integrity = min(integrity + wc_f32(WC_INTEGRITY_REGEN) * integrity_scale, max_i);
     }
 
     // Metabolic brain drain
-    let mem_cap = agent_phys[b + P_MEMORY_CAP];
-    let proc_slots = agent_phys[b + P_PROCESSING_SLOTS];
+    let mem_cap = physics_state[b + P_MEMORY_CAP];
+    let proc_slots = physics_state[b + P_PROCESSING_SLOTS];
     energy -= (METABOLIC_BASE_COST + mem_cap * METABOLIC_MEMORY_COST + proc_slots * METABOLIC_PROCESSING_COST) * metabolic_rate;
 
     // Clamp and death check
     energy = max(energy, 0.0);
     integrity = max(integrity, 0.0);
-    agent_phys[b + P_ENERGY] = energy;
-    agent_phys[b + P_INTEGRITY] = integrity;
+    physics_state[b + P_ENERGY] = energy;
+    physics_state[b + P_INTEGRITY] = integrity;
 
     if energy <= 0.0 || integrity <= 0.0 {
-        agent_phys[b + P_ALIVE] = 0.0;
-        agent_phys[b + P_DIED_FLAG] = 1.0;
+        physics_state[b + P_ALIVE] = 0.0;
+        physics_state[b + P_DIED_FLAG] = 1.0;
     } else {
-        agent_phys[b + P_TICKS_ALIVE] = agent_phys[b + P_TICKS_ALIVE] + 1.0;
+        physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;
     }
 }
 
@@ -157,12 +179,12 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
 
     // Safe to early-return: one workgroup == one agent, so all threads agree.
     // See top-of-file invariant re: barrier uniformity.
-    if agent_phys[b + P_ALIVE] < 0.5 { return; }
+    if physics_state[b + P_ALIVE] < 0.5 { return; }
 
     let pos = vec3f(
-        agent_phys[b + P_POS_X],
-        agent_phys[b + P_POS_Y],
-        agent_phys[b + P_POS_Z]);
+        physics_state[b + P_POS_X],
+        physics_state[b + P_POS_Y],
+        physics_state[b + P_POS_Z]);
     let food_count = wc_u32(WC_FOOD_COUNT);
     let eat_radius = wc_f32(WC_FOOD_RADIUS);
     let eat_radius_sq = eat_radius * eat_radius;
@@ -214,8 +236,8 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             let result = atomicCompareExchangeWeak(&food_flags[best_idx], 0u, 1u);
             if (result.exchanged) {
                 let food_energy = wc_f32(WC_FOOD_ENERGY);
-                agent_phys[b + P_ENERGY] += food_energy;
-                agent_phys[b + P_FOOD_COUNT] += 1.0;
+                physics_state[b + P_ENERGY] += food_energy;
+                physics_state[b + P_FOOD_COUNT] += 1.0;
             }
         }
     }
@@ -227,7 +249,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
 
 fn agent_death_respawn(agent_id: u32, tick: u32) {
     let base = agent_id * PHYS_STRIDE;
-    if (agent_phys[base + P_DIED_FLAG] < 0.5) { return; }
+    if (physics_state[base + P_DIED_FLAG] < 0.5) { return; }
 
     // 1. Pick a safe spawn position
     let world_half = wc_f32(WC_WORLD_HALF_BOUND);
@@ -257,41 +279,41 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     let spawn_y = sample_height(spawn_x, spawn_z) + AGENT_HALF_HEIGHT;
 
     // 2. Preserve fitness fields
-    let saved_food_count   = agent_phys[base + P_FOOD_COUNT];
-    let saved_ticks_alive  = agent_phys[base + P_TICKS_ALIVE];
-    let saved_death_count  = agent_phys[base + P_DEATH_COUNT] + 1.0;
-    let max_energy         = agent_phys[base + P_MAX_ENERGY];
-    let max_integrity      = agent_phys[base + P_MAX_INTEGRITY];
-    let memory_cap         = agent_phys[base + P_MEMORY_CAP];
-    let processing_slots   = agent_phys[base + P_PROCESSING_SLOTS];
+    let saved_food_count   = physics_state[base + P_FOOD_COUNT];
+    let saved_ticks_alive  = physics_state[base + P_TICKS_ALIVE];
+    let saved_death_count  = physics_state[base + P_DEATH_COUNT] + 1.0;
+    let max_energy         = physics_state[base + P_MAX_ENERGY];
+    let max_integrity      = physics_state[base + P_MAX_INTEGRITY];
+    let memory_cap         = physics_state[base + P_MEMORY_CAP];
+    let processing_slots   = physics_state[base + P_PROCESSING_SLOTS];
 
     // 3. Reset physics state
     for (var i = 0u; i < PHYS_STRIDE; i++) {
-        agent_phys[base + i] = 0.0;
+        physics_state[base + i] = 0.0;
     }
-    agent_phys[base + P_POS_X]           = spawn_x;
-    agent_phys[base + P_POS_Y]           = spawn_y;
-    agent_phys[base + P_POS_Z]           = spawn_z;
-    agent_phys[base + P_FACING_Z]        = 1.0;
-    agent_phys[base + P_ENERGY]          = max_energy;
-    agent_phys[base + P_MAX_ENERGY]      = max_energy;
-    agent_phys[base + P_INTEGRITY]       = max_integrity;
-    agent_phys[base + P_MAX_INTEGRITY]   = max_integrity;
-    agent_phys[base + P_PREV_ENERGY]     = max_energy;
-    agent_phys[base + P_PREV_INTEGRITY]  = max_integrity;
-    agent_phys[base + P_ALIVE]           = 1.0;
-    agent_phys[base + P_MEMORY_CAP]      = memory_cap;
-    agent_phys[base + P_PROCESSING_SLOTS] = processing_slots;
-    agent_phys[base + P_FOOD_COUNT]      = saved_food_count;
-    agent_phys[base + P_TICKS_ALIVE]     = saved_ticks_alive;
-    agent_phys[base + P_DEATH_COUNT]     = saved_death_count;
+    physics_state[base + P_POS_X]           = spawn_x;
+    physics_state[base + P_POS_Y]           = spawn_y;
+    physics_state[base + P_POS_Z]           = spawn_z;
+    physics_state[base + P_FACING_Z]        = 1.0;
+    physics_state[base + P_ENERGY]          = max_energy;
+    physics_state[base + P_MAX_ENERGY]      = max_energy;
+    physics_state[base + P_INTEGRITY]       = max_integrity;
+    physics_state[base + P_MAX_INTEGRITY]   = max_integrity;
+    physics_state[base + P_PREV_ENERGY]     = max_energy;
+    physics_state[base + P_PREV_INTEGRITY]  = max_integrity;
+    physics_state[base + P_ALIVE]           = 1.0;
+    physics_state[base + P_MEMORY_CAP]      = memory_cap;
+    physics_state[base + P_PROCESSING_SLOTS] = processing_slots;
+    physics_state[base + P_FOOD_COUNT]      = saved_food_count;
+    physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
+    physics_state[base + P_DEATH_COUNT]     = saved_death_count;
 
     // 4. Reset brain state
     let brain_base = agent_id * BRAIN_STRIDE;
 
-    let pat_base = agent_id * PATTERN_STRIDE;
+    let pattern_base = agent_id * PATTERN_STRIDE;
     for (var i = 0u; i < MEMORY_CAP; i++) {
-        pattern_buf[pat_base + O_PAT_REINF + i] *= 0.5;
+        pattern_buffer[pattern_base + O_PAT_REINF + i] *= 0.5;
     }
 
     for (var i = 0u; i < 6u; i++) {
@@ -309,15 +331,15 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     brain_state[brain_base + O_ACCUM_FWD] = 0.0;
     brain_state[brain_base + O_FATIGUE_FACTOR] = 1.0;
 
-    for (var i = 0u; i < DIM; i++) {
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_HAB_EMA + i] = 0.0;
         brain_state[brain_base + O_HAB_ATTEN + i] = 1.0;
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
     }
 
-    let hist_base = agent_id * HISTORY_STRIDE;
+    let history_base = agent_id * HISTORY_STRIDE;
     for (var i = 0u; i < HISTORY_STRIDE; i++) {
-        history_buf[hist_base + i] = 0.0;
+        history_buffer[history_base + i] = 0.0;
     }
 }
 
@@ -328,7 +350,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     // Safe to early-return: one workgroup == one agent, so all threads agree.
     // See top-of-file invariant re: barrier uniformity.
-    if (agent_phys[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
+    if (physics_state[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
     coop_feature_extract(agent_id, tid);
     workgroupBarrier();
@@ -361,13 +383,13 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // earlier kernel phases, but it does NOT mean all brain inputs are from the
 // same cycle.
 //
-// Vision data (sensory_buf) is written by the external vision pass, which
+// Vision data (sensory_buffer) is written by the external vision pass, which
 // runs in the same GPU command encoder AFTER this kernel dispatch.  The
-// brain therefore reads sensory_buf written by the *previous* batch's vision
+// brain therefore reads sensory_buffer written by the *previous* batch's vision
 // pass — a one-batch lag that is consistent regardless of stride values.
 // Non-visual proprioception (velocity, energy, etc.) follows the same lag
-// because it is also packed into sensory_buf by that vision pass.  In this
-// function, the only physics state read directly from agent_phys before
+// because it is also packed into sensory_buffer by that vision pass.  In this
+// function, the only physics state read directly from physics_state before
 // feature extraction is the same-cycle P_ALIVE flag used for the early-out.
 //
 // When brain_tick_stride == vision_stride the batch covers exactly
@@ -410,9 +432,9 @@ fn kernel_tick(
         workgroupBarrier();
 
         // Brain: all 256 threads, 7 cooperative passes.
-        // Reads sensory_buf (vision + proprioception) from the previous batch's
+        // Reads sensory_buffer (vision + proprioception) from the previous batch's
         // vision pass.  Physics state updated in this cycle is NOT yet in
-        // sensory_buf — that update happens in the vision pass at the end of
+        // sensory_buffer — that update happens in the vision pass at the end of
         // this batch, making it available for the following batch.
         brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
         workgroupBarrier();

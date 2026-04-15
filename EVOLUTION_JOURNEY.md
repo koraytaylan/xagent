@@ -208,6 +208,69 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 **Lesson:** CPU↔GPU coordination overhead dominates at high tick rates. The simulation math was already fast — the bottleneck was 11–19 dispatches per tick, per-tick uniform writes, and blocking readback. Fusing passes and batching cycles eliminated the coordination cost. Also: when composing shaders from fragments, marker-based string replacement is fragile — every code path that uses the markers must be tested with subgroups both enabled and disabled.
 
+### 19. The Circling Investigation (Issue #13)
+
+**Symptom:** After thousands of iterations, agents ran in persistent circles instead of developing food-seeking or danger-avoidance behavior.
+
+**Investigation:** Deep analysis of the credit assignment pipeline, homeostatic gradient system, and motor output chain revealed a cascade of independent failures. Four sub-issues (#14–#17) were already closed with fixes for depth in features, habituation silencing memory, credit assignment freeze, and memory blend freeze — but agents still circled.
+
+**Root causes found and fixed (PRs #87–#100):**
+
+1. **Tonic credit too weak (#87, #88).** `TONIC_CREDIT_SCALE=0.1` made the tonic fallback fall below `DEADZONE=0.01` in all realistic scenarios. Credit only fired during brief gradient transitions (~5 ticks per food event), leaving 95%+ of simulation time with zero learning. Fixed: `TONIC_CREDIT_SCALE=0.5`, `DEADZONE=0.005`, tonic bypasses DEADZONE.
+
+2. **Policy evaluated in attenuated space (#89, #100).** Credit trained weights against `s_encoded` (full strength) but the policy read `s_habituated` (attenuated 10× by habituation floor 0.1). SNR was 0.25 — noise dominated 4:1. Fixed: policy reads `s_encoded` directly.
+
+3. **Credit assignment serialized on thread 0 (#96).** After enabling tonic credit, the credit loop processed ~60 of 64 history entries instead of ~4, causing a 15× workload increase on thread 0 while 255 threads waited. Max TPS dropped from 45k to 15k. Fixed: two-phase cooperative credit — thread 0 computes scalar credits, threads 0–31 update weights in parallel.
+
+4. **Zero-gradient trap (#97).** Storing pre-noise policy output in credit history meant `rec_forward = tanh(0) = 0` with zero-init weights, making all weight updates exactly zero. Fixed: store post-noise motor — the noise IS the REINFORCE exploration signal.
+
+5. **Exploration noise scaled by habituation (#99).** Noise amplitude of ±0.0125 (with mean_atten=0.1) produced near-zero motor commands, a second death spiral. Fixed: constant noise amplitude independent of habituation.
+
+6. **Energy economics rewarded inertia (#98).** At `energy_depletion_rate=0.01`, agents survived full generations eating ~3 food items passively. Evolution drove `movement_speed` from 14.3→2.0 over 300 generations, selecting for immobility. Fixed: drain 3× higher (0.03), movement_speed floor raised to 20.
+
+7. **Prospective blending dampened policy (#100).** Predictor targeted habituated space but policy evaluated in encoded space. Scale mismatch made `(fwd_future - fwd) ≈ -0.9 × fwd`, systematically dampening the policy by ~45%. Fixed: removed prospective blending until predictor is retrained.
+
+8. **Correlated noise seeds.** Forward noise at tick T+1 used the same seed as turn noise at tick T (`seed_base + 1`), creating identical values — a deterministic spiral. Fixed: independent hash-based seeds (`pcg_hash(agent_id ^ (tick * 747796405))` with double-hash for turn).
+
+9. **Tick-0 gradient spike imprinted random turn bias.** `prev_energy` initialized to 0.0 while sensory buffer was also 0.0 (vision hadn't run yet). On tick 1, energy jumped 0→1.0, creating a massive fake gradient that credited whatever random noise the agent had. Fixed: clamp homeostatic deltas to `MAX_HOMEOSTATIC_DELTA=0.3` — no real gameplay event exceeds this.
+
+10. **REINFORCE feedback loop on turn weights.** Credit assignment used the full motor value (`policy + noise`) for weight updates. Any small turn bias got amplified: positive turn bias → `recorded_turn` biased positive → positive credit × positive turn → bias grows. Fixed: store exploration noise in credit history, not full motor. Noise is zero-mean, breaking the feedback loop.
+
+11. **Memory blend injected stale motor bias.** Recalled memories blended stored motor values (originally noise) directly into the policy. Surviving food-event memories had fixed random noise values that created a persistent turn injection. Fixed: replaced the old direct noise-injection blend with a constrained valence-weighted memory blend using actual motor commands. Memory now stores real approach actions and recall uses valence sign to produce escape (negative valence negates the approach direction).
+
+12. **Random walk in weight space.** Even with noise-only credit, each food/hazard event added a random-direction vector to action weights. After ~50 events, the accumulated drift produced a detectable turn bias. Weight decay (`ACTION_WEIGHT_DECAY=0.01`) prevents unbounded drift. The drift-vs-decay equilibrium keeps bias below noise level.
+
+13. **Forward bias for exploration.** With zero turn AND zero forward policy, agents random-walked in place (50% of steps backward, canceling forward progress). Added `INITIAL_FORWARD_BIAS=0.3` so agents default to moving forward. Learning adjusts turn direction; the forward drive provides the mobility for exploration.
+
+14. **Boundary trapping.** Forward bias drove agents to world edges where position clamping absorbed forward motion. Fixed: bounce reflection (yaw reflected on wall contact, velocity component reversed).
+
+**Lesson:** Circling had 14 independent causes that compounded. No single fix was sufficient. The investigation required systematic elimination: zeroing turn weights confirmed the bias was learned (not mechanical), which pointed to the credit assignment feedback loop, which led to the noise-only credit fix, which revealed the random drift, which led to weight decay. Each fix exposed the next layer.
+
+### 20. Klinotaxis — The Missing Reactive Layer
+
+**Symptom:** After fixing all circling causes, agents wandered naturally but showed zero deliberate behavior. No food-seeking, no danger-avoidance, flat fitness across 21 generations. Food-per-death of 0.87 was consistent with random bumping.
+
+**Root cause:** The REINFORCE credit assignment can't learn spatial responses because: (A) the credit window (7 ticks at CREDIT_DECAY=0.3) is shorter than the time to reach visible food (~30 ticks), so the causal turn is outside the window when food is eaten; (B) the random encoder destroys spatial information, making "food left" and "food right" produce nearly identical encoded states.
+
+**Insight from biology:** We skipped the two simplest spatial navigation strategies that evolution developed billions of years before directional steering:
+
+- **Klinokinesis** (bacteria): modulate turning rate based on stimulus intensity. No direction sense needed.
+- **Klinotaxis** (C. elegans, 302 neurons): compare current gradient with recent past. Improving → go straight. Worsening → turn. Produces directed approach/avoidance through temporal comparison alone.
+
+Our agents had the gradient signal (homeostatic fast EMA) but never used it for movement modulation. The exploration rate was based on policy confidence, novelty, and curiosity — none of which carried gradient-direction information.
+
+**Fix:** Added `KLINOTAXIS_SENSITIVITY=500.0` scaling the final turn motor output. Klinotaxis uses the fast-vs-medium gradient deviation to modulate steering:
+
+- Gradient worsening suddenly (fast drops below medium) → turn amplitude amplified up to 3× → agent reorients
+- Gradient stabilizing after worsening (fast recovers, medium still shifted) → turn amplitude suppressed to 0.3× → agent goes straight → escapes
+- Gradient improving (food eaten) → turn suppressed → agent persists in the rewarding direction
+
+This produces the biological escape sequence: brief reorientation burst then straight-line flight. It requires zero learning — it's a reactive feedback loop driven by multi-timescale gradient comparison.
+
+Learning (credit assignment) then builds on this reactive foundation, associating specific visual patterns with gradient predictions.
+
+**Lesson:** Before asking "why can't agents learn to seek food?" ask "do agents have the reactive machinery to seek ANYTHING?" The simplest organisms don't learn to navigate — they navigate reactively and learn to refine. We were trying to learn level-3 behavior (spatial steering) without implementing level-1 (klinokinesis/klinotaxis).
+
 ---
 
 ## The Disconnect (Current State)

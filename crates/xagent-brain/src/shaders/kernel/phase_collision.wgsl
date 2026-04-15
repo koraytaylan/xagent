@@ -10,12 +10,12 @@ fn phase_collision_accumulate(tid: u32) {
     let b = agent * PHYS_STRIDE;
 
     // Skip dead agents
-    if agent_phys[b + P_ALIVE] < 0.5 { return; }
+    if physics_state[b + P_ALIVE] < 0.5 { return; }
 
     // Read self position
-    let self_x = agent_phys[b + P_POS_X];
-    let self_y = agent_phys[b + P_POS_Y];
-    let self_z = agent_phys[b + P_POS_Z];
+    let self_x = physics_state[b + P_POS_X];
+    let self_y = physics_state[b + P_POS_Y];
+    let self_z = physics_state[b + P_POS_Z];
 
     // Compute cell with offset
     let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
@@ -49,12 +49,12 @@ fn phase_collision_accumulate(tid: u32) {
                 let ob = other * PHYS_STRIDE;
 
                 // Skip dead other
-                if agent_phys[ob + P_ALIVE] < 0.5 { continue; }
+                if physics_state[ob + P_ALIVE] < 0.5 { continue; }
 
                 // Compute displacement from self to other
-                let diff_x = agent_phys[ob + P_POS_X] - self_x;
-                let diff_y = agent_phys[ob + P_POS_Y] - self_y;
-                let diff_z = agent_phys[ob + P_POS_Z] - self_z;
+                let diff_x = physics_state[ob + P_POS_X] - self_x;
+                let diff_y = physics_state[ob + P_POS_Y] - self_y;
+                let diff_z = physics_state[ob + P_POS_Z] - self_z;
                 let dist_sq = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
 
                 if dist_sq < COLLISION_MIN_DIST_SQ && dist_sq > 0.001 {
@@ -98,10 +98,10 @@ fn phase_collision_apply(tid: u32) {
     let b = agent * PHYS_STRIDE;
 
     // Skip dead agents (but scratch was already cleared above)
-    if agent_phys[b + P_ALIVE] < 0.5 { return; }
+    if physics_state[b + P_ALIVE] < 0.5 { return; }
 
     // Apply accumulated push
-    agent_phys[b + P_POS_X] += f32(ipx) / COLLISION_FIXED_SCALE;
-    agent_phys[b + P_POS_Y] += f32(ipy) / COLLISION_FIXED_SCALE;
-    agent_phys[b + P_POS_Z] += f32(ipz) / COLLISION_FIXED_SCALE;
+    physics_state[b + P_POS_X] += f32(ipx) / COLLISION_FIXED_SCALE;
+    physics_state[b + P_POS_Y] += f32(ipy) / COLLISION_FIXED_SCALE;
+    physics_state[b + P_POS_Z] += f32(ipz) / COLLISION_FIXED_SCALE;
 }

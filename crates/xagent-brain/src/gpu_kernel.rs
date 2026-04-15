@@ -1620,10 +1620,19 @@ impl GpuKernel {
         // Use dynamic base so this works with any BrainLayout, not
         // just the default FEATURE_COUNT (see init_brain_state_for).
         let tail_base = bs - FIXED_TAIL_SIZE;
-        let first_delta = O_HAB_SENSITIVITY - O_PRED_CTX_WT;
-        debug_assert_eq!(O_HAB_MAX_CURIOSITY - O_PRED_CTX_WT, first_delta + 1);
-        debug_assert_eq!(O_FATIGUE_FLOOR - O_PRED_CTX_WT, first_delta + 2);
-        debug_assert_eq!(O_MOVEMENT_SPEED - O_PRED_CTX_WT, first_delta + 3);
+        let first_delta = O_HAB_SENSITIVITY - O_PREDICTOR_CONTEXT_WEIGHT;
+        debug_assert_eq!(
+            O_HAB_MAX_CURIOSITY - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 1
+        );
+        debug_assert_eq!(
+            O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 2
+        );
+        debug_assert_eq!(
+            O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 3
+        );
 
         let values = [
             config.habituation_sensitivity,
@@ -1996,7 +2005,7 @@ impl GpuKernel {
         let dec_size = (DECISION_STRIDE * 4) as u64;
         let mut decision = Vec::with_capacity(DECISION_STRIDE);
         self.read_buffer_range(&self.decision_buffer, dec_offset, dec_size, &mut decision);
-        let motor_base = DIM + DIM; // prediction(32) + credit(32)
+        let motor_base = DECISION_MOTOR;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
 
@@ -2013,13 +2022,16 @@ impl GpuKernel {
         );
 
         // Compute dynamic brain-state offsets from layout's feature_count
-        let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
-        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
-        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
-        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PRED_CTX_WT);
-        // Habituation: mean of attenuation values (DIM floats)
-        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
-        let mean_attenuation = atten_sum / DIM as f32;
+        let dyn_pred_ctx_wt =
+            fc * ENCODED_DIMENSION + ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT);
+        // Habituation: mean of attenuation values (ENCODED_DIMENSION floats)
+        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + ENCODED_DIMENSION]
+            .iter()
+            .sum();
+        let mean_attenuation = atten_sum / ENCODED_DIMENSION as f32;
 
         // Curiosity bonus: 1.0 - mean_attenuation (higher attenuation = less curious)
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
@@ -2196,12 +2208,13 @@ impl GpuKernel {
         let _pending = self.pending_telemetry.take().unwrap();
 
         // Compute dynamic brain-state offsets from layout's feature_count.
-        // All offsets past O_PRED_CTX_WT have a fixed delta from that anchor.
+        // All offsets past O_PREDICTOR_CONTEXT_WEIGHT have a fixed delta from that anchor.
         let fc = self.layout.feature_count;
-        let dyn_pred_ctx_wt = fc * DIM + DIM + DIM * DIM;
-        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PRED_CTX_WT);
-        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PRED_CTX_WT);
-        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PRED_CTX_WT);
+        let dyn_pred_ctx_wt =
+            fc * ENCODED_DIMENSION + ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT);
         // Sensory
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
@@ -2212,7 +2225,7 @@ impl GpuKernel {
         // Decision
         let decision_data = self.telemetry_staging.decision.slice(..).get_mapped_range();
         let decision: &[f32] = bytemuck::cast_slice(&decision_data);
-        let motor_base = DIM + DIM;
+        let motor_base = DECISION_MOTOR;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
         drop(decision_data);
@@ -2222,8 +2235,10 @@ impl GpuKernel {
         let brain_data = self.telemetry_staging.brain.slice(..).get_mapped_range();
         let brain: &[f32] = bytemuck::cast_slice(&brain_data);
 
-        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + DIM].iter().sum();
-        let mean_attenuation = atten_sum / DIM as f32;
+        let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + ENCODED_DIMENSION]
+            .iter()
+            .sum();
+        let mean_attenuation = atten_sum / ENCODED_DIMENSION as f32;
         let curiosity_bonus = (1.0 - mean_attenuation).max(0.0);
         let fatigue_factor = brain[dyn_fatigue_factor];
         let fatigue_floor = brain[dyn_fatigue_floor];

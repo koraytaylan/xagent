@@ -14,7 +14,8 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
 use xagent_brain::buffers::{
-    AgentBrainState, DIM, FIXED_TAIL_SIZE, O_ACT_FWD_WTS, O_ACT_TURN_WTS, O_PRED_CTX_WT,
+    AgentBrainState, ENCODED_DIMENSION, FIXED_TAIL_SIZE, O_ACTION_FORWARD_WEIGHTS,
+    O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
 };
 use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
 
@@ -321,7 +322,7 @@ pub fn mutate_config_with_strength(
             )
             .min(MAX_PROCESSING_SLOTS),
         visual_encoding_size: parent.visual_encoding_size,
-        representation_dim: parent.representation_dim,
+        representation_dimension: parent.representation_dimension,
         learning_rate: momentum.biased_perturb_f(
             &mut rng,
             parent.learning_rate,
@@ -377,31 +378,33 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     let mut mutated = state.clone();
 
     // Derive layout from actual state length (supports dynamic vision_width × vision_height).
-    // brain_stride = fc * DIM + DIM + DIM*DIM + FIXED_TAIL_SIZE
+    // brain_stride = fc * ENCODED_DIMENSION + ENCODED_DIMENSION + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE
     let variable_part = state
         .brain_state
         .len()
-        .checked_sub(DIM + DIM * DIM + FIXED_TAIL_SIZE)
+        .checked_sub(ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE)
         .expect("brain_state too short for layout");
     assert!(
-        variable_part % DIM == 0,
-        "brain_state length not aligned to DIM"
+        variable_part % ENCODED_DIMENSION == 0,
+        "brain_state length not aligned to ENCODED_DIMENSION"
     );
-    let fc = variable_part / DIM;
+    let fc = variable_part / ENCODED_DIMENSION;
 
-    let o_pred_wts = fc * DIM + DIM;
-    let o_pred_ctx = o_pred_wts + DIM * DIM;
-    // Fixed deltas from O_PRED_CTX_WT are layout-independent
-    let act_fwd = o_pred_ctx + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
-    let act_turn = o_pred_ctx + (O_ACT_TURN_WTS - O_PRED_CTX_WT);
+    let predictor_weights_offset = fc * ENCODED_DIMENSION + ENCODED_DIMENSION;
+    let predictor_context_offset =
+        predictor_weights_offset + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+    // Fixed deltas from O_PREDICTOR_CONTEXT_WEIGHT are layout-independent
+    let act_fwd =
+        predictor_context_offset + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let act_turn = predictor_context_offset + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
 
     assert!(
-        act_turn + DIM <= state.brain_state.len(),
+        act_turn + ENCODED_DIMENSION <= state.brain_state.len(),
         "computed offsets exceed brain_state bounds"
     );
 
     // Mutate encoder weights (small perturbation)
-    for i in 0..(fc * DIM) {
+    for i in 0..(fc * ENCODED_DIMENSION) {
         if rng.random::<f32>() < 0.1 {
             mutated.brain_state[i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
             mutated.brain_state[i] = mutated.brain_state[i].clamp(-2.0, 2.0);
@@ -409,7 +412,7 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     }
 
     // Mutate action weights
-    for i in 0..DIM {
+    for i in 0..ENCODED_DIMENSION {
         if rng.random::<f32>() < 0.2 {
             mutated.brain_state[act_fwd + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
             mutated.brain_state[act_turn + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
@@ -417,12 +420,12 @@ pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainS
     }
 
     // Mutate predictor weights
-    for i in 0..(DIM * DIM) {
+    for i in 0..(PREDICTOR_DIMENSION * ENCODED_DIMENSION) {
         if rng.random::<f32>() < 0.05 {
-            mutated.brain_state[o_pred_wts + i] +=
+            mutated.brain_state[predictor_weights_offset + i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[o_pred_wts + i] =
-                mutated.brain_state[o_pred_wts + i].clamp(-3.0, 3.0);
+            mutated.brain_state[predictor_weights_offset + i] =
+                mutated.brain_state[predictor_weights_offset + i].clamp(-3.0, 3.0);
         }
     }
 
@@ -444,7 +447,7 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             b.processing_slots
         },
         visual_encoding_size: a.visual_encoding_size,
-        representation_dim: a.representation_dim,
+        representation_dimension: a.representation_dimension,
         learning_rate: if rng.random::<f32>() < 0.5 {
             a.learning_rate
         } else {
@@ -601,7 +604,7 @@ pub fn generate_all_agents_mesh(agents: &[Agent]) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xagent_brain::buffers::O_ACT_TURN_WTS;
+    use xagent_brain::buffers::O_ACTION_TURN_WEIGHTS;
 
     #[test]
     fn reset_for_new_life_clears_fatigue_history() {
@@ -624,14 +627,15 @@ mod tests {
     fn mutate_brain_state_perturbs_weights() {
         let mut state = AgentBrainState::new_blank();
         // Set some non-zero action weights
-        for i in 0..DIM {
-            state.brain_state[O_ACT_FWD_WTS + i] = 0.5;
-            state.brain_state[O_ACT_TURN_WTS + i] = 0.5;
+        for i in 0..ENCODED_DIMENSION {
+            state.brain_state[O_ACTION_FORWARD_WEIGHTS + i] = 0.5;
+            state.brain_state[O_ACTION_TURN_WEIGHTS + i] = 0.5;
         }
         let mutated = mutate_brain_state(&state, 0.1);
         // Action weights should differ (20% mutation rate per weight)
-        let fwd_same = (0..DIM).all(|i| {
-            mutated.brain_state[O_ACT_FWD_WTS + i] == state.brain_state[O_ACT_FWD_WTS + i]
+        let fwd_same = (0..ENCODED_DIMENSION).all(|i| {
+            mutated.brain_state[O_ACTION_FORWARD_WEIGHTS + i]
+                == state.brain_state[O_ACTION_FORWARD_WEIGHTS + i]
         });
         assert!(
             !fwd_same,
@@ -668,9 +672,11 @@ mod tests {
         // Use non-default vision dimensions to exercise dynamic offset logic
         let layout = BrainLayout::new(6, 4);
         let mut state = AgentBrainState::new_for(layout.brain_stride);
-        let dyn_act_fwd =
-            layout.feature_count * DIM + DIM + DIM * DIM + (O_ACT_FWD_WTS - O_PRED_CTX_WT);
-        for i in 0..DIM {
+        let dyn_act_fwd = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+            + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        for i in 0..ENCODED_DIMENSION {
             state.brain_state[dyn_act_fwd + i] = 0.5;
         }
         // Should not panic — validates checked arithmetic with non-default layout

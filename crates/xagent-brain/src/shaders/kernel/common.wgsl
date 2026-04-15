@@ -144,6 +144,11 @@ const F_POS_Y: u32 = 1u;
 const F_POS_Z: u32 = 2u;
 const F_RESPAWN_TIMER: u32 = 3u;
 
+// ── Math constants ─────────────────────────────────────────────────────────
+
+const PI: f32 = 3.14159265;
+const TWO_PI: f32 = 6.28318530;
+
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
@@ -182,7 +187,7 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 // ── Vision constants ────────────────────────────────────────────────────────
 
-const VISION_FOV_HALF: f32 = 0.7853982;   // PI/4 = 45 degrees half-FOV
+const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;

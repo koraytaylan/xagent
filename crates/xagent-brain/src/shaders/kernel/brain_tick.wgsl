@@ -415,7 +415,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + d] *= (1.0 - ACTION_WEIGHT_DECAY);
             brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d] *= (1.0 - ACTION_WEIGHT_DECAY);
         }
+        brain_state[brain_base + O_ACT_BIASES] *= (1.0 - ACTION_WEIGHT_DECAY);
         brain_state[brain_base + O_ACT_BIASES + 1u] *= (1.0 - ACTION_WEIGHT_DECAY);
+        brain_state[brain_base + O_ACT_BIASES] = clamp(brain_state[brain_base + O_ACT_BIASES], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+        brain_state[brain_base + O_ACT_BIASES + 1u] = clamp(brain_state[brain_base + O_ACT_BIASES + 1u], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
         var fwd_norm_sq: f32 = 0.0;
         var trn_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {

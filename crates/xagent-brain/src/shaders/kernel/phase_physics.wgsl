@@ -81,14 +81,17 @@ fn phase_physics(tid: u32, tick: u32) {
     }
     if (pos.z != pre_clamp_z) {
         physics_state[b + P_VEL_Z] *= -1.0;
-        yaw = 3.14159265 - yaw;
+        yaw = PI - yaw;
         bounced = true;
     }
     if (bounced) {
         physics_state[b + P_YAW] = yaw;
         physics_state[b + P_FACING_X] = sin(yaw);
         physics_state[b + P_FACING_Z] = cos(yaw);
-        physics_state[b + P_ANGULAR_VEL] = (yaw - prev_yaw) / max(dt, 1e-6);
+        var yaw_delta = yaw - prev_yaw;
+        if (yaw_delta > PI) { yaw_delta -= TWO_PI; }
+        if (yaw_delta < -PI) { yaw_delta += TWO_PI; }
+        physics_state[b + P_ANGULAR_VEL] = yaw_delta / max(dt, 1e-6);
     }
 
     // Ground collision (use sample_height from common.wgsl)

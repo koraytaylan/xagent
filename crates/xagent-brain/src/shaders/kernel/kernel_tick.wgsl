@@ -88,19 +88,22 @@ fn agent_physics(agent_id: u32, tick: u32) {
     let pre_clamp_z = pos.z;
     pos.x = clamp(pos.x, -world_half, world_half);
     pos.z = clamp(pos.z, -world_half, world_half);
+    var bounced = false;
     if (pos.x != pre_clamp_x) {
         physics_state[b + P_VEL_X] *= -1.0;
         yaw = -yaw;
-        physics_state[b + P_YAW] = yaw;
-        physics_state[b + P_FACING_X] = sin(yaw);
-        physics_state[b + P_FACING_Z] = cos(yaw);
+        bounced = true;
     }
     if (pos.z != pre_clamp_z) {
         physics_state[b + P_VEL_Z] *= -1.0;
         yaw = 3.14159265 - yaw;
+        bounced = true;
+    }
+    if (bounced) {
         physics_state[b + P_YAW] = yaw;
         physics_state[b + P_FACING_X] = sin(yaw);
         physics_state[b + P_FACING_Z] = cos(yaw);
+        physics_state[b + P_ANGULAR_VEL] = (yaw - prev_yaw) / max(dt, 1e-6);
     }
 
     // Ground collision

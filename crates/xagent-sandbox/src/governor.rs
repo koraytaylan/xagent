@@ -2443,7 +2443,8 @@ mod tests {
     fn momentum_persists_across_resume() {
         use std::fs;
 
-        let db_path = "/tmp/xagent_test_momentum_persist.db";
+        let db_path = std::env::temp_dir().join("xagent_test_momentum_persist.db");
+        let db_path = db_path.to_str().unwrap();
         let _ = fs::remove_file(db_path);
 
         let config = GovernorConfig {

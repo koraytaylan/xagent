@@ -1430,17 +1430,14 @@ impl ApplicationHandler for App {
                     }
 
                     // ── telemetry cycling ───────────────────────────
-                    PhysicalKey::Code(KeyCode::Tab) if pressed => {
-                        if !self.agents.is_empty() {
-                            self.selected_agent_idx =
-                                (self.selected_agent_idx + 1) % self.agents.len();
-                            self.agents[self.selected_agent_idx].trail_dirty = true;
-                            let a = &self.agents[self.selected_agent_idx];
-                            println!(
-                                "[TELEMETRY] Now showing Agent {} (gen {}, color: ({:.2},{:.2},{:.2}))",
-                                a.id, a.generation, a.color[0], a.color[1], a.color[2]
-                            );
-                        }
+                    PhysicalKey::Code(KeyCode::Tab) if pressed && !self.agents.is_empty() => {
+                        self.selected_agent_idx = (self.selected_agent_idx + 1) % self.agents.len();
+                        self.agents[self.selected_agent_idx].trail_dirty = true;
+                        let a = &self.agents[self.selected_agent_idx];
+                        println!(
+                            "[TELEMETRY] Now showing Agent {} (gen {}, color: ({:.2},{:.2},{:.2}))",
+                            a.id, a.generation, a.color[0], a.color[1], a.color[2]
+                        );
                     }
                     _ => {}
                 }

@@ -1732,7 +1732,7 @@ impl ApplicationHandler for App {
                                 a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                 let new_deaths = state[base + P_DEATH_COUNT] as u32;
                                 if new_deaths > a.death_count {
-                                    a.reset_trail();
+                                    a.record_death_and_restart_life(self.tick);
                                 }
                                 a.death_count = new_deaths;
                                 a.body.body.facing = Vec3::new(

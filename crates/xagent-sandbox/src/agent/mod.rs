@@ -261,6 +261,14 @@ impl Agent {
         self.trail_dirty = true;
     }
 
+    /// Record the life that just ended and start a new life from `current_tick`.
+    pub fn record_death_and_restart_life(&mut self, current_tick: u64) {
+        let life_duration = current_tick.saturating_sub(self.life_start_tick);
+        self.longest_life = self.longest_life.max(life_duration);
+        self.life_start_tick = current_tick;
+        self.reset_trail();
+    }
+
     /// Number of unique heatmap cells visited (non-zero entries).
     pub fn unique_cells_explored(&self) -> u32 {
         self.heatmap.iter().filter(|&&c| c > 0).count() as u32
@@ -728,6 +736,28 @@ mod tests {
                 child.movement_speed,
             );
         }
+    }
+
+    #[test]
+    fn record_death_and_restart_life_updates_longest_life() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 10);
+        agent.trail.push([1.0, 0.0, 1.0]);
+        agent.trail_dirty = false;
+
+        agent.record_death_and_restart_life(42);
+        assert_eq!(agent.longest_life, 32);
+        assert_eq!(agent.life_start_tick, 42);
+        assert!(agent.trail.is_empty());
+        assert!(agent.trail_dirty);
+
+        agent.trail_dirty = false;
+        agent.record_death_and_restart_life(55);
+        assert_eq!(
+            agent.longest_life, 32,
+            "shorter life should not reduce longest_life"
+        );
+        assert_eq!(agent.life_start_tick, 55);
+        assert!(agent.trail_dirty);
     }
 
     #[test]

@@ -2443,9 +2443,11 @@ mod tests {
     fn momentum_persists_across_resume() {
         use std::fs;
 
-        let db_path = std::env::temp_dir().join("xagent_test_momentum_persist.db");
-        let db_path = db_path.to_str().unwrap();
-        let _ = fs::remove_file(db_path);
+        let db_path = std::env::temp_dir()
+            .join("xagent_test_momentum_persist.db")
+            .to_string_lossy()
+            .into_owned();
+        let _ = fs::remove_file(&db_path);
 
         let config = GovernorConfig {
             population_size: 10,
@@ -2463,7 +2465,7 @@ mod tests {
 
         // Create governor, inject momentum, advance (which persists)
         {
-            let mut gov = Governor::new(db_path, config.clone(), &brain, "{}").unwrap();
+            let mut gov = Governor::new(&db_path, config.clone(), &brain, "{}").unwrap();
             gov.momentums[0]
                 .momentum_mut()
                 .insert("learning_rate".into(), 0.05);
@@ -2475,7 +2477,7 @@ mod tests {
 
         // Resume and verify momentum survived
         {
-            let gov = Governor::resume(db_path).unwrap();
+            let gov = Governor::resume(&db_path).unwrap();
             assert_eq!(gov.momentums.len(), 2);
             // Momentum was persisted after advance, which calls decay_step.
             // The injected values were also blended with winner data during advance.
@@ -2485,7 +2487,7 @@ mod tests {
             assert!(has_data, "momentum should have been persisted and restored");
         }
 
-        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]

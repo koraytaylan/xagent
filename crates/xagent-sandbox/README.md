@@ -16,7 +16,6 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
 | egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
-| CSV telemetry recording | `recording.rs` |
 | Per-generation replay recording & playback | `replay.rs` |
 | Event loop & orchestration | `main.rs` |
 
@@ -29,10 +28,10 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  main.rs  (winit ApplicationHandler – event loop & orchestration)         │
 │                                                                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ recording  │  │
+│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │   replay   │  │
 │  │          │  │          │  │          │  │          │  │            │  │
-│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │recording.rs│  │
-│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │ replay.rs  │  │
+│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │  replay.rs │  │
+│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
@@ -68,7 +67,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │  4. Rebuild meshes (agents, food)                 │         │          │
 │  │  5. Build HUD bars                                │         │          │
 │  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  7. Log telemetry to CSV                          │                    │
+│  │  7. Update replay telemetry                       │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -484,31 +483,9 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Recording, Telemetry & Replay (`recording.rs`, `replay.rs`)
+### 3.5 Telemetry & Replay (`replay.rs`)
 
-#### CSV Format
-
-File name: `xagent_log_YYYY-MM-DD_HH-MM-SS.csv` (UTC, no chrono dependency).
-
-Columns (29 total):
-
-```
-agent_id, tick, prediction_error, avg_prediction_error, memory_utilization,
-memory_capacity, exploration_rate, homeostatic_gradient,
-energy, max_energy, integrity, max_integrity,
-position_x, position_y, position_z, facing_x, facing_z,
-biome, action_forward, action_strafe, action_turn, action_discrete, alive,
-exploitation_ratio, decision_quality, behavior_phase, death_count, life_ticks,
-generation
-```
-
-#### Flush Strategy
-
-- Writes are buffered via `BufWriter<File>`.
-- **Flushed every 100 ticks** for crash safety.
-- Final flush on session exit (`print_session_summary()`).
-
-#### Per-Generation Replay Recording (`replay.rs`)
+#### Per-Generation Replay Recording
 
 The replay system captures per-tick agent state during evolution runs, enabling
 post-hoc playback of any completed generation.
@@ -783,7 +760,7 @@ Each frame, when the window requests a redraw:
       ├─ agent.cached_motor = motor
       ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
       │   → updates position, velocity, energy, integrity, alive
-      └─ If selected agent: log to CSV, accumulate prediction error
+      └─ If selected agent: accumulate prediction error
 
    d. world.update(dt) — decrement food respawn timers, relocate respawned food
 
@@ -920,7 +897,6 @@ marker floating above it in the 3D viewport. Its data drives:
 - **Bottom console**: scrollable log of evolution events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
-- CSV logging
 
 ### Death & Respawn Guardrails
 

@@ -1169,7 +1169,7 @@ impl<'a> TabContext<'a> {
                     ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
                     ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
                     ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
-                    ("Fatigue", egui::Color32::from_rgb(220, 120, 60)),
+                    ("Fatigue", egui::Color32::from_rgb(220, 80, 80)),
                 ] {
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -1228,7 +1228,7 @@ impl<'a> TabContext<'a> {
                 ),
                 (
                     &effective_snap.fatigue_history,
-                    egui::Color32::from_rgb(220, 120, 60),
+                    egui::Color32::from_rgb(220, 80, 80),
                 ),
             ];
             for &(full_data, color) in &series_data {

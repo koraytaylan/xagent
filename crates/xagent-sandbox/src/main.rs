@@ -1750,13 +1750,8 @@ impl ApplicationHandler for App {
                     }
 
                     // Sparkline histories
-                    {
-                        for agent in &mut self.agents {
-                            record_agent_histories(agent);
-                        }
-                        if self.selected_agent_idx < self.agents.len() {
-                            self.error_count += 1;
-                        }
+                    for agent in &mut self.agents {
+                        record_agent_histories(agent);
                     }
 
                     self.heatmap_dirty = true;

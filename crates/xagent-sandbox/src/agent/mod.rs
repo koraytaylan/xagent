@@ -741,11 +741,12 @@ mod tests {
     #[test]
     fn record_death_and_restart_life_updates_longest_life() {
         let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 10);
+        let initial_life_start_tick = agent.life_start_tick;
         agent.trail.push([1.0, 0.0, 1.0]);
         agent.trail_dirty = false;
 
         agent.record_death_and_restart_life(42);
-        assert_eq!(agent.longest_life, 32);
+        assert_eq!(agent.longest_life, 42 - initial_life_start_tick);
         assert_eq!(agent.life_start_tick, 42);
         assert!(agent.trail.is_empty());
         assert!(agent.trail_dirty);
@@ -753,7 +754,8 @@ mod tests {
         agent.trail_dirty = false;
         agent.record_death_and_restart_life(55);
         assert_eq!(
-            agent.longest_life, 32,
+            agent.longest_life,
+            42 - initial_life_start_tick,
             "shorter life should not reduce longest_life"
         );
         assert_eq!(agent.life_start_tick, 55);

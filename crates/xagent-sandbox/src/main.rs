@@ -278,10 +278,6 @@ struct App {
     paused: bool,
     render_3d: bool,
 
-    // Session statistics
-    total_prediction_error: f64,
-    error_count: u64,
-
     // Telemetry selection
     selected_agent_idx: usize,
     viewport_hovered: bool,
@@ -437,8 +433,6 @@ impl App {
             speed_multiplier: 1,
             paused: true,
             render_3d: true,
-            total_prediction_error: 0.0,
-            error_count: 0,
             selected_agent_idx: 0,
             viewport_hovered: false,
             chart_window: 120,
@@ -1143,12 +1137,6 @@ impl App {
     }
 
     fn print_session_summary(&mut self) {
-        let avg_err = if self.error_count > 0 {
-            self.total_prediction_error / self.error_count as f64
-        } else {
-            0.0
-        };
-
         let total_deaths: u32 = self.agents.iter().map(|a| a.death_count).sum();
 
         println!();
@@ -1157,7 +1145,6 @@ impl App {
         println!("Total agents spawned: {}", self.next_agent_id);
         println!("Living agents: {}", self.agents.len());
         println!("Total deaths: {}", total_deaths);
-        println!("Avg prediction error: {:.2}", avg_err);
         println!();
     }
 

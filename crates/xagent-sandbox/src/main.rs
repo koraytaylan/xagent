@@ -1136,7 +1136,7 @@ impl App {
         }
     }
 
-    fn print_session_summary(&mut self) {
+    fn print_session_summary(&self) {
         let total_deaths: u32 = self.agents.iter().map(|a| a.death_count).sum();
 
         println!();

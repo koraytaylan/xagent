@@ -57,17 +57,14 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  ┌────┴──────────────────────────────────────────────┐         │          │
 │  │  Per-frame pipeline                               │         │          │
 │  │  1. Input events → camera update                  │         │          │
-│  │  2. For each tick:                                │         │          │
-│  │     a. extract_senses() → SensoryFrame            │         │          │
-│  │     b. brain.tick(frame) → MotorCommand            │         │          │
-│  │     c. physics::step(agent, motor, world)         │         │          │
-│  │     d. Record tick data + food events to replay   │         │          │
-│  │     e. death/respawn/reproduction checks          │         │          │
-│  │  3. Advance replay playback (if active)           │         │          │
-│  │  4. Rebuild meshes (agents, food)                 │         │          │
-│  │  5. Build HUD bars                                │         │          │
-│  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  7. Update replay telemetry                       │                    │
+│  │  2. Ensure/collect fused GPU kernel readiness     │         │          │
+│  │  3. Dispatch GPU tick batch (physics+brain+world) │         │          │
+│  │  4. Async selected-agent telemetry readback       │         │          │
+│  │  5. Every-frame GPU state readback → agent cache  │         │          │
+│  │  6. Record replay + history/heatmap/trail updates │         │          │
+│  │  7. Generation transition + replay playback       │         │          │
+│  │  8. Rebuild meshes + HUD bars                     │         │          │
+│  │  9. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 

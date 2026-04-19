@@ -261,15 +261,16 @@ impl Agent {
         self.trail_dirty = true;
     }
 
-    /// Record the life that just ended and start a new life from `current_tick`.
-    pub fn record_death_and_restart_life(&mut self, current_tick: u64) {
+    /// Record the life that just ended at `death_tick` and start a new life
+    /// from that same death-transition tick.
+    pub fn record_death_and_restart_life(&mut self, death_tick: u64) {
         // P_TICKS_ALIVE does not increment on the death tick, so exclude that
         // terminal tick in CPU-side lifetime accounting as well.
-        let life_duration = current_tick
+        let life_duration = death_tick
             .saturating_sub(self.life_start_tick)
             .saturating_sub(1);
         self.longest_life = self.longest_life.max(life_duration);
-        self.life_start_tick = current_tick;
+        self.life_start_tick = death_tick;
         self.reset_trail();
     }
 

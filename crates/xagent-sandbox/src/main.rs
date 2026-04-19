@@ -1480,7 +1480,8 @@ impl ApplicationHandler for App {
 
                     // ── telemetry cycling ───────────────────────────
                     PhysicalKey::Code(KeyCode::Tab) if pressed && !self.agents.is_empty() => {
-                        self.selected_agent_idx = (self.selected_agent_idx + 1) % self.agents.len();
+                        let next_agent_idx = (self.selected_agent_idx + 1) % self.agents.len();
+                        self.selected_agent_idx = next_agent_idx;
                         self.agents[self.selected_agent_idx].trail_dirty = true;
                         let a = &self.agents[self.selected_agent_idx];
                         println!(

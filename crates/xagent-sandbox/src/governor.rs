@@ -2441,10 +2441,11 @@ mod tests {
 
     #[test]
     fn momentum_persists_across_resume() {
-        let temp_db = tempfile::NamedTempFile::new()
-            .expect("failed to create temp file")
-            .into_temp_path();
-        let db_path = temp_db.to_str().expect("temp DB path must be valid UTF-8");
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let db_path_buf = temp_dir.path().join("momentum_persists_across_resume.db");
+        let db_path = db_path_buf
+            .to_str()
+            .expect("temp DB path must be valid UTF-8");
 
         let config = GovernorConfig {
             population_size: 10,

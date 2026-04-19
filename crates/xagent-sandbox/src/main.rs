@@ -1739,6 +1739,7 @@ impl ApplicationHandler for App {
                                         // Multiple deaths can happen between readbacks at high
                                         // speed multipliers. Without per-death timing from GPU,
                                         // skip longest-life updates to avoid overestimation.
+                                        // death_count still syncs to new_deaths below.
                                         a.life_start_tick = self.tick;
                                         a.reset_trail();
                                     }

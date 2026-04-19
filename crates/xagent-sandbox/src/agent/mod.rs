@@ -750,10 +750,10 @@ mod tests {
         agent.trail_dirty = false;
 
         agent.record_death_and_restart_life(42);
-        let first_life = 42u64
+        let expected_first_life = 42u64
             .saturating_sub(initial_life_start_tick)
             .saturating_sub(1);
-        assert_eq!(agent.longest_life, first_life);
+        assert_eq!(agent.longest_life, expected_first_life);
         assert_eq!(agent.life_start_tick, 42);
         assert!(agent.trail.is_empty());
         assert!(agent.trail_dirty);
@@ -761,7 +761,7 @@ mod tests {
         agent.trail_dirty = false;
         agent.record_death_and_restart_life(55);
         assert_eq!(
-            agent.longest_life, first_life,
+            agent.longest_life, expected_first_life,
             "shorter life should not reduce longest_life"
         );
         assert_eq!(agent.life_start_tick, 55);

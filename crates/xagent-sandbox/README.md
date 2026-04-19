@@ -760,7 +760,7 @@ Each frame, when the window requests a redraw:
       ├─ agent.cached_motor = motor
       ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
       │   → updates position, velocity, energy, integrity, alive
-      └─ If selected agent: accumulate prediction error
+      └─ If selected agent: update history/replay/HUD state
 
    d. world.update(dt) — decrement food respawn timers, relocate respawned food
 

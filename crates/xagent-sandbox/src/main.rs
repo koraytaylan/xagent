@@ -63,7 +63,7 @@ struct Cli {
     #[arg(long)]
     tick_rate: Option<f32>,
 
-    /// Run headless (no window, just simulation + logging)
+    /// Run headless (no window, simulation only)
     #[arg(long)]
     no_render: bool,
 

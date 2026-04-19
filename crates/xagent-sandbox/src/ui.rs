@@ -1163,14 +1163,36 @@ impl<'a> TabContext<'a> {
             });
             ui.add_space(4.0);
 
+            let series_data: [(&str, &[f32], egui::Color32); 5] = [
+                (
+                    "Energy",
+                    &effective_snap.energy_history,
+                    egui::Color32::from_rgb(80, 200, 80),
+                ),
+                (
+                    "Integrity",
+                    &effective_snap.integrity_history,
+                    egui::Color32::from_rgb(100, 150, 255),
+                ),
+                (
+                    "Pred. Error",
+                    &effective_snap.prediction_error_history,
+                    egui::Color32::from_rgb(200, 140, 60),
+                ),
+                (
+                    "Exploration",
+                    &effective_snap.exploration_rate_history,
+                    egui::Color32::from_rgb(180, 100, 220),
+                ),
+                (
+                    "Fatigue",
+                    &effective_snap.fatigue_history,
+                    egui::Color32::from_rgb(220, 80, 80),
+                ),
+            ];
+
             ui.horizontal(|ui| {
-                for (label, color) in [
-                    ("Energy", egui::Color32::from_rgb(80, 200, 80)),
-                    ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
-                    ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
-                    ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
-                    ("Fatigue", egui::Color32::from_rgb(220, 80, 80)),
-                ] {
+                for &(label, _, color) in &series_data {
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
@@ -1209,29 +1231,7 @@ impl<'a> TabContext<'a> {
             }
 
             let window = *chart_window;
-            let series_data: [(&[f32], egui::Color32); 5] = [
-                (
-                    &effective_snap.energy_history,
-                    egui::Color32::from_rgb(80, 200, 80),
-                ),
-                (
-                    &effective_snap.integrity_history,
-                    egui::Color32::from_rgb(100, 150, 255),
-                ),
-                (
-                    &effective_snap.prediction_error_history,
-                    egui::Color32::from_rgb(200, 140, 60),
-                ),
-                (
-                    &effective_snap.exploration_rate_history,
-                    egui::Color32::from_rgb(180, 100, 220),
-                ),
-                (
-                    &effective_snap.fatigue_history,
-                    egui::Color32::from_rgb(220, 80, 80),
-                ),
-            ];
-            for &(full_data, color) in &series_data {
+            for &(_, full_data, color) in &series_data {
                 let start = full_data.len().saturating_sub(window);
                 let data = &full_data[start..];
                 if data.len() < 2 {

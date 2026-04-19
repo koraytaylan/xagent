@@ -263,7 +263,11 @@ impl Agent {
 
     /// Record the life that just ended and start a new life from `current_tick`.
     pub fn record_death_and_restart_life(&mut self, current_tick: u64) {
-        let life_duration = current_tick.saturating_sub(self.life_start_tick);
+        // P_TICKS_ALIVE does not increment on the death tick, so exclude that
+        // terminal tick in CPU-side lifetime accounting as well.
+        let life_duration = current_tick
+            .saturating_sub(self.life_start_tick)
+            .saturating_sub(1);
         self.longest_life = self.longest_life.max(life_duration);
         self.life_start_tick = current_tick;
         self.reset_trail();
@@ -746,7 +750,10 @@ mod tests {
         agent.trail_dirty = false;
 
         agent.record_death_and_restart_life(42);
-        assert_eq!(agent.longest_life, 42 - initial_life_start_tick);
+        let first_life = 42u64
+            .saturating_sub(initial_life_start_tick)
+            .saturating_sub(1);
+        assert_eq!(agent.longest_life, first_life);
         assert_eq!(agent.life_start_tick, 42);
         assert!(agent.trail.is_empty());
         assert!(agent.trail_dirty);
@@ -754,8 +761,7 @@ mod tests {
         agent.trail_dirty = false;
         agent.record_death_and_restart_life(55);
         assert_eq!(
-            agent.longest_life,
-            42 - initial_life_start_tick,
+            agent.longest_life, first_life,
             "shorter life should not reduce longest_life"
         );
         assert_eq!(agent.life_start_tick, 55);

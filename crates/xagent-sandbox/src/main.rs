@@ -1732,7 +1732,16 @@ impl ApplicationHandler for App {
                                 a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                 let new_deaths = state[base + P_DEATH_COUNT] as u32;
                                 if new_deaths > a.death_count {
-                                    a.record_death_and_restart_life(self.tick);
+                                    let death_delta = new_deaths - a.death_count;
+                                    if death_delta == 1 {
+                                        a.record_death_and_restart_life(self.tick);
+                                    } else {
+                                        // Multiple deaths can happen between readbacks at high
+                                        // speed multipliers. Without per-death timing from GPU,
+                                        // skip longest-life updates to avoid overestimation.
+                                        a.life_start_tick = self.tick;
+                                        a.reset_trail();
+                                    }
                                 }
                                 a.death_count = new_deaths;
                                 a.body.body.facing = Vec3::new(

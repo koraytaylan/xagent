@@ -1732,16 +1732,21 @@ impl ApplicationHandler for App {
                                 a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                 let new_deaths = state[base + P_DEATH_COUNT] as u32;
                                 if new_deaths > a.death_count {
-                                    let last_simulated_tick = self.tick.saturating_sub(1);
                                     let death_delta = new_deaths - a.death_count;
                                     if death_delta == 1 {
+                                        // Upper-bound the death tick with the last simulated
+                                        // tick — the actual death may have happened earlier
+                                        // within the dispatched batch, but we lack per-death
+                                        // timing from GPU to pinpoint it exactly.
+                                        let last_simulated_tick = self.tick.saturating_sub(1);
                                         a.record_death_and_restart_life(last_simulated_tick);
                                     } else {
                                         // Multiple deaths can happen between readbacks at high
                                         // speed multipliers. Without per-death timing from GPU,
-                                        // skip longest-life updates to avoid overestimation.
+                                        // skip longest-life updates to avoid overestimation and
+                                        // start the new life at self.tick so age(self.tick) == 0.
                                         // death_count still syncs to new_deaths below.
-                                        a.life_start_tick = last_simulated_tick;
+                                        a.life_start_tick = self.tick;
                                         a.reset_trail();
                                     }
                                 }

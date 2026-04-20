@@ -262,15 +262,15 @@ impl Agent {
     }
 
     /// Record the life that just ended at `death_tick` and start a new life
-    /// from that same death-transition tick.
+    /// on the following tick, after the death-transition tick.
     pub fn record_death_and_restart_life(&mut self, death_tick: u64) {
-        // P_TICKS_ALIVE does not increment on the death tick, so exclude that
-        // terminal tick in CPU-side lifetime accounting as well.
-        let life_duration = death_tick
-            .saturating_sub(self.life_start_tick)
-            .saturating_sub(1);
+        // P_TICKS_ALIVE is incremented only on ticks where the agent survives,
+        // so the completed life spans [life_start_tick, death_tick) — giving
+        // `death_tick - life_start_tick` survived ticks. Respawn happens on the
+        // death tick itself, so the next life's first alive tick is death_tick + 1.
+        let life_duration = death_tick.saturating_sub(self.life_start_tick);
         self.longest_life = self.longest_life.max(life_duration);
-        self.life_start_tick = death_tick;
+        self.life_start_tick = death_tick.saturating_add(1);
         self.reset_trail();
     }
 
@@ -745,28 +745,34 @@ mod tests {
 
     #[test]
     fn record_death_and_restart_life_updates_longest_life() {
+        // First life: born at tick 10, dies at tick 42 → 32 survived physics
+        // ticks (10..42 inclusive of start, exclusive of death). Respawn places
+        // life_start_tick on the following tick (43).
         let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 10);
-        let initial_life_start_tick = agent.life_start_tick;
+        assert_eq!(agent.life_start_tick, 10);
         agent.trail.push([1.0, 0.0, 1.0]);
         agent.trail_dirty = false;
 
         agent.record_death_and_restart_life(42);
-        let expected_first_life = 42u64
-            .saturating_sub(initial_life_start_tick)
-            .saturating_sub(1);
-        assert_eq!(agent.longest_life, expected_first_life);
-        assert_eq!(agent.life_start_tick, 42);
+        assert_eq!(agent.longest_life, 32);
+        assert_eq!(agent.life_start_tick, 43);
         assert!(agent.trail.is_empty());
         assert!(agent.trail_dirty);
 
+        // Second life: 43..55 = 12 ticks, shorter than 32, so longest_life stays.
         agent.trail_dirty = false;
         agent.record_death_and_restart_life(55);
         assert_eq!(
-            agent.longest_life, expected_first_life,
+            agent.longest_life, 32,
             "shorter life should not reduce longest_life"
         );
-        assert_eq!(agent.life_start_tick, 55);
+        assert_eq!(agent.life_start_tick, 56);
         assert!(agent.trail_dirty);
+
+        // Third life: 56..120 = 64 ticks, longer than 32, so longest_life advances.
+        agent.record_death_and_restart_life(120);
+        assert_eq!(agent.longest_life, 64);
+        assert_eq!(agent.life_start_tick, 121);
     }
 
     #[test]

@@ -136,7 +136,9 @@ pub const P_MOTOR_FWD_OUT: usize = 27;
 pub const P_MOTOR_TURN_OUT: usize = 28;
 pub const P_GRADIENT_OUT: usize = 29;
 pub const P_URGENCY_OUT: usize = 30;
-/// Tick at which this agent most recently died (f32 for bitcast from u32).
+/// Tick at which this agent most recently died, stored as f32 via numeric
+/// conversion (`f32(tick)` in WGSL, `as u64` on readback).  Exact for integer
+/// ticks up to 2^24 — matches the precision guarantees of `P_TICKS_ALIVE`.
 /// Written by the physics phase when energy/integrity reaches zero, preserved
 /// across the death/respawn reset so CPU readback can attribute the death to
 /// an exact tick instead of the end-of-batch upper bound.

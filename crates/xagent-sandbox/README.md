@@ -70,8 +70,8 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 
 External crates:
   xagent-shared   BodyState, InternalState, SensoryFrame, MotorCommand,
-                  WorldConfig, BrainConfig, FullConfig, CognitiveArchitecture
-  xagent-brain    Brain (implements CognitiveArchitecture)
+                  WorldConfig, BrainConfig, FullConfig
+  xagent-brain    GpuKernel (fused per-agent compute pipeline)
 ```
 
 ---

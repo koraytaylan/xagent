@@ -5,16 +5,21 @@
 //
 // SAFETY INVARIANT — barrier uniformity:
 // Multi-thread functions (`agent_food_detect`, `brain_tick_inner`) must reach
-// every `workgroupBarrier()` / `storageBarrier()` from all 256 threads. To
-// avoid relying on "all threads in this workgroup happen to evaluate the alive
-// flag identically", they:
-//   1. Read `P_ALIVE` once into a local `alive` variable.
-//   2. Wrap per-agent work in `if (alive) { ... }` blocks rather than
-//      early-returning.
-//   3. Keep barriers outside those blocks so they execute regardless of
-//      logical state.
-// This is robust against mid-kernel death transitions and hypothetical memory
-// corruption that could desynchronize the flag across threads.
+// every `workgroupBarrier()` / `storageBarrier()` from all 256 threads,
+// including the internal barriers inside guarded cooperative passes
+// (`coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`). To
+// guarantee this, the alive flag is made workgroup-uniform by construction:
+//   1. The sole writer to `P_ALIVE` (thread 0, via `agent_physics` /
+//      `agent_death_respawn`) then broadcasts the post-write value into the
+//      workgroup variable `s_alive` immediately before the next
+//      `workgroupBarrier()`.
+//   2. All threads read `s_alive` — never `physics_state[P_ALIVE]` directly —
+//      after that barrier, so every thread observes the same value.
+//   3. Per-agent work is wrapped in `if (alive) { ... }`; inter-pass barriers
+//      live outside the guard so dead agents still execute them.
+// `workgroupBarrier()` alone does not synchronize storage memory, so without
+// this broadcast per-thread reads of `P_ALIVE` could disagree and deadlock the
+// internal barriers inside guarded passes.
 //
 // Single-thread helpers (`agent_physics`, `agent_death_respawn`) are invoked
 // from inside `if (tid == 0u) { ... }` blocks in the entry point and therefore
@@ -22,6 +27,11 @@
 // 0's call, and all threads still reach the outer barrier after the `if` block.
 
 // EAT_RADIUS removed — read from wconfig via wc_f32(WC_FOOD_RADIUS)
+
+// Workgroup-uniform alive broadcast. Written by thread 0 immediately before a
+// `workgroupBarrier()`, read by all threads after that barrier. Encoded as u32
+// (1 = alive, 0 = dead) so no atomics are needed. See SAFETY INVARIANT above.
+var<workgroup> s_alive: u32;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
@@ -188,11 +198,12 @@ fn agent_physics(agent_id: u32, tick: u32) {
 fn agent_food_detect(agent_id: u32, tid: u32) {
     let b = agent_id * PHYS_STRIDE;
 
-    // Read the alive flag once into a uniform local. All subsequent barriers
-    // must execute regardless of logical state — see top-of-file SAFETY
-    // INVARIANT. The scan and the thread-0 eat step are gated on `alive`; the
-    // reduction barriers below are not.
-    let alive = physics_state[b + P_ALIVE] >= 0.5;
+    // Read the workgroup-uniform alive flag (broadcast by thread 0 before the
+    // preceding workgroupBarrier()). Never read `physics_state[P_ALIVE]`
+    // directly here — see top-of-file SAFETY INVARIANT. The scan and the
+    // thread-0 eat step are gated on `alive`; the reduction barriers below are
+    // not.
+    let alive = s_alive != 0u;
 
     // Default "no candidate" sentinel values so the reduction runs safely even
     // when the agent is dead (or a hypothetical divergence prevented the scan).
@@ -370,15 +381,15 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // ══════════════════════════════════════════════════════════════════════════
 
 fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
-    // Read the alive flag once into a uniform local, then wrap every
-    // cooperative pass in `if (alive) { ... }`. Inter-pass barriers live
-    // outside the guards so they are reached by all 256 threads regardless of
-    // logical state — see top-of-file SAFETY INVARIANT. Passes with their own
-    // internal barriers (`coop_recall_topk`, `coop_predict_and_act`,
-    // `coop_learn_and_store`) stay consistent because the guard is uniform: all
-    // threads either enter together (hitting every internal barrier) or skip
-    // together (hitting none).
-    let alive = physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5;
+    // Read the workgroup-uniform alive flag (broadcast by thread 0 before the
+    // preceding workgroupBarrier()). Because `s_alive` is identical across the
+    // workgroup by construction, cooperative passes with their own internal
+    // barriers (`coop_recall_topk`, `coop_predict_and_act`,
+    // `coop_learn_and_store`) are safe: all 256 threads either enter together
+    // (hitting every internal barrier) or skip together. Inter-pass barriers
+    // live outside the guards so they execute regardless of logical state.
+    // See top-of-file SAFETY INVARIANT.
+    let alive = s_alive != 0u;
 
     if (alive) { coop_feature_extract(agent_id, tid); }
     workgroupBarrier();
@@ -416,10 +427,10 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // brain therefore reads sensory_buffer written by the *previous* batch's vision
 // pass — a one-batch lag that is consistent regardless of stride values.
 // Non-visual proprioception (velocity, energy, etc.) follows the same lag
-// because it is also packed into sensory_buffer by that vision pass.  In this
-// function, the only physics state read directly from physics_state before
-// feature extraction is the same-cycle P_ALIVE flag used as a uniform guard
-// for the cooperative passes (see `brain_tick_inner`).
+// because it is also packed into sensory_buffer by that vision pass.  The
+// same-cycle P_ALIVE value is read only by thread 0 and broadcast into
+// `s_alive` before each workgroupBarrier() that gates a multi-thread pass
+// (see `brain_tick_inner` and `agent_food_detect`).
 //
 // When brain_tick_stride == vision_stride the batch covers exactly
 // (vision_stride * brain_tick_stride) physics ticks and vision runs once
@@ -443,10 +454,14 @@ fn kernel_tick(
 
         // Per-agent physics: thread 0 loops over brain_tick_stride sub-ticks.
         // Physics always precedes brain within the same cycle (barrier below).
+        // Thread 0 is the sole writer of `P_ALIVE`, so it broadcasts the
+        // post-physics value into `s_alive` for the workgroup to read after
+        // the barrier.
         if (tid == 0u) {
             for (var t = 0u; t < stride; t++) {
                 agent_physics(agent_id, base_tick + t);
             }
+            s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
         }
         workgroupBarrier();
 
@@ -454,9 +469,11 @@ fn kernel_tick(
         agent_food_detect(agent_id, tid);
         workgroupBarrier();
 
-        // Death/respawn: thread 0
+        // Death/respawn: thread 0. Re-broadcasts `s_alive` because respawn may
+        // flip `P_ALIVE` back to 1.
         if (tid == 0u) {
             agent_death_respawn(agent_id, base_tick);
+            s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
         }
         workgroupBarrier();
 

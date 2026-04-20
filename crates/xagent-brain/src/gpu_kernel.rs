@@ -1373,10 +1373,15 @@ impl GpuKernel {
 
             // Fused kernel: 1 pass, cycles_this_batch brain cycles
             // SAFETY: dispatch(agent_count, 1, 1) — one workgroup per agent.
-            // Multi-thread passes guard per-agent work with a uniform `if (alive)`
-            // and keep every barrier outside the guard, so barrier uniformity
-            // holds regardless of P_ALIVE transitions. See the top-of-file SAFETY
-            // INVARIANT in kernel_tick.wgsl before changing the dispatch shape.
+            // Multi-thread passes may conditionally call cooperative helpers
+            // that contain internal workgroup/storage barriers, so barrier
+            // uniformity relies on the `alive` guard being workgroup-uniform.
+            // The kernel makes this uniform by construction: thread 0 (the sole
+            // writer of `P_ALIVE`) broadcasts the post-write value into a
+            // `var<workgroup> s_alive` before each workgroupBarrier(), and all
+            // other threads read `s_alive` rather than `physics_state[P_ALIVE]`.
+            // See the top-of-file SAFETY INVARIANT in kernel_tick.wgsl before
+            // changing the dispatch shape or the alive-uniformity contract.
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);

@@ -92,9 +92,9 @@ The `vision_stride` parameter (default 10) controls how many brain+physics cycle
 
 Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
-1. **Feature Extract** — Extracts 217 features from the packed sensory input (192 RGBA vision + 48 depth + 27 non-visual). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+1. **Feature Extract** — Reads the packed sensory input (`SENSORY_STRIDE = 267`: 192 RGBA vision + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (`FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features) inside the fused kernel. This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
 
-2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 32-dimensional encoded state. This fixed-size representation is the common currency of all downstream passes.
+2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 
 3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
 
@@ -117,11 +117,11 @@ This is the **only** evaluative signal. There is no reward function.
 
 ### Capacity Constraints
 
-| Constraint | Effect |
-|---|---|
-| `memory_capacity` | Finite pattern storage → forced forgetting → what survives = what matters |
-| `processing_slots` | Limited recall per tick → forced prioritization → attention-like behavior |
-| `representation_dimension` | Fixed encoding size → forced compression → abstraction |
+| Constraint | Kernel wiring | Intended effect |
+|---|---|---|
+| `memory_capacity` | **Proxy (metabolic cost)** — feeds per-tick energy drain only; kernel pattern memory is fixed at `MEMORY_CAP = 128`. | Finite pattern storage → forced forgetting → what survives = what matters. |
+| `processing_slots` | **Proxy (metabolic cost)** — feeds per-tick energy drain only; kernel recall width is fixed at `RECALL_K = 16`. | Limited recall per tick → forced prioritization → attention-like behavior. |
+| `representation_dimension` | **Locked (compile-time)** — must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; not evolved, not user-tunable. | Fixed encoding size → forced compression → abstraction. |
 
 See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into each component.
 
@@ -264,9 +264,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 | Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dimension` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
 |--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
-| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
-| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **tiny** | 24 | 8 | 32 | 128 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **default** | 128 | 16 | 64 | 128 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **large** | 512 | 32 | 128 | 128 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+
+> `representation_dimension` is **locked (compile-time)** to `ENCODED_DIMENSION = 128` — all presets carry `128`; preset-specific overrides would be ignored by the kernel. See issue #106.
 
 **Parameter effects:**
 
@@ -275,7 +277,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `memory_capacity` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
 | `visual_encoding_size` | **Legacy / unused.** No kernel stage reads this field; preserved only for config backwards compatibility (see issue #106). |
-| `representation_dimension` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
+| `representation_dimension` | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The GPU kernel sizes encoder weights, predictor weights, and workgroup arrays from that constant — WGSL cannot resize them at runtime. The config field is a read-only echo; mismatched values log a warning and are ignored. Not mutated by evolution, not exposed in the UI (see issues #103, #106). |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
@@ -404,24 +406,29 @@ xagent/
 │   │       └── traits.rs       # CognitiveArchitecture trait
 │   │
 │   ├── xagent-brain/           # GPU-resident cognitive architecture
-│   │   ├── README.md           # Deep dive into brain internals
+│   │   ├── README.md           # Deep dive into brain internals (partially stale — see issue #106)
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
-│   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
-│   │       ├── gpu_kernel.rs  # GpuKernel — fused dispatch, telemetry readback
+│   │       ├── gpu_kernel.rs   # GpuKernel — fused dispatch, telemetry readback
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
-│   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
-│   │           ├── encode.wgsl           # Pass 2: features × weights → 32-dim encoded
-│   │           ├── habituate_homeo.wgsl  # Pass 3: habituation EMA + homeostasis
-│   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
-│   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
-│   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
-│   │           ├── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
 │   │           └── kernel/
-│   │               ├── common.wgsl       # Shared constants for fused kernel shaders
-│   │               ├── kernel_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
-│   │               └── global_tick.wgsl  # Grid rebuild + collision pass (1,1,1)
+│   │               ├── common.wgsl            # Shared constants for fused kernel shaders
+│   │               ├── brain_tick.wgsl        # Fused per-agent brain pass (all 7 legacy passes inlined)
+│   │               ├── kernel_tick.wgsl       # Fused per-agent kernel (physics + food + death + brain loop)
+│   │               ├── global_tick.wgsl       # Grid rebuild + collision pass (1,1,1)
+│   │               ├── physics_tick.wgsl      # Physics-only stride (between vision cycles)
+│   │               ├── vision_tick.wgsl       # Vision-only stride (when vision is due)
+│   │               ├── phase_clear.wgsl       # Per-frame buffer clears
+│   │               ├── phase_prepare_dispatch.wgsl # Indirect-dispatch argument prep
+│   │               ├── phase_physics.wgsl     # Movement, gravity, bounds
+│   │               ├── phase_collision.wgsl   # Agent-agent collision response
+│   │               ├── phase_vision.wgsl      # Raycast vision sampling
+│   │               ├── phase_food_grid.wgsl   # Food spatial grid rebuild
+│   │               ├── phase_food_detect.wgsl # Per-agent food detection
+│   │               ├── phase_food_respawn.wgsl # Consumed-food respawn timers
+│   │               ├── phase_agent_grid.wgsl  # Agent spatial grid rebuild
+│   │               └── phase_death.wgsl       # Death detection + respawn
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/

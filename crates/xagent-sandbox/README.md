@@ -639,7 +639,7 @@ On death the agent is respawned with a **fresh brain** (no persistence in headle
 | `memory_capacity` | 24 | 128 | 512 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | 8 | 16 | 32 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
 | `visual_encoding_size` | 32 | 64 | 128 | **Legacy / unused.** No kernel stage reads this field. Preserved only for config backwards compatibility (see issue #106). |
-| `representation_dimension` | 128 | 128 | 128 | Internal representation length |
+| `representation_dimension` | 128 | 128 | 128 | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; mismatched config values log a warning and are ignored (see issues #103, #106). |
 | `learning_rate` | 0.08 | 0.05 | 0.03 | Association update rate |
 | `decay_rate` | 0.002 | 0.001 | 0.0005 | Unreinforced pattern decay per tick |
 

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 /// Each field is tagged with its relationship to the live GPU kernel:
 ///
 /// - **active** — directly shapes kernel behavior every tick.
+/// - **locked (compile-time)** — must equal a compile-time constant baked
+///   into the Rust/WGSL brain (e.g. `xagent_brain::buffers::ENCODED_DIMENSION`).
+///   The value in this struct is a read-only echo; the kernel ignores any
+///   other value and `build_config_for` logs a warning on mismatch.
 /// - **proxy (metabolic)** — only feeds the per-tick metabolic cost formula;
 ///   the kernel's actual structural capacity is a compile-time constant and
 ///   does not change with this value.
@@ -36,7 +40,14 @@ pub struct BrainConfig {
     /// existing saved configs; will be either wired to a real encoder or
     /// removed in a future release. Not mutated by evolution.
     pub visual_encoding_size: usize,
-    /// Length of the internal representation vector.
+    /// **Locked (compile-time).** Length of the internal representation
+    /// vector. Must equal `xagent_brain::buffers::ENCODED_DIMENSION` — the
+    /// kernel uses that constant to size encoder weights, predictor weights,
+    /// pattern rows, and workgroup arrays, none of which are resizable at
+    /// runtime. The value in this struct is a read-only echo of that
+    /// constant; `build_config_for` writes `ENCODED_DIMENSION` into the GPU
+    /// config slot regardless and logs a warning if the config value
+    /// disagrees. Not mutated by evolution and not exposed in the UI.
     #[serde(alias = "representation_dim")]
     pub representation_dimension: usize,
     /// Base learning rate for association updates.

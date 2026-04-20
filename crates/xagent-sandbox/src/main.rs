@@ -1480,7 +1480,8 @@ impl ApplicationHandler for App {
 
                     // ── telemetry cycling ───────────────────────────
                     PhysicalKey::Code(KeyCode::Tab) if pressed && !self.agents.is_empty() => {
-                        self.selected_agent_idx = (self.selected_agent_idx + 1) % self.agents.len();
+                        let next_agent_idx = (self.selected_agent_idx + 1) % self.agents.len();
+                        self.selected_agent_idx = next_agent_idx;
                         self.agents[self.selected_agent_idx].trail_dirty = true;
                         let a = &self.agents[self.selected_agent_idx];
                         println!(
@@ -2438,9 +2439,12 @@ impl ApplicationHandler for App {
                                                         .color(egui::Color32::GRAY),
                                                 );
                                                 ui.separator();
+                                                let scroll_width = ui.available_width();
                                                 egui::ScrollArea::vertical()
                                                     .stick_to_bottom(true)
+                                                    .min_scrolled_width(scroll_width)
                                                     .show(ui, |ui| {
+                                                        ui.set_min_width(scroll_width);
                                                         for line in &console_lines {
                                                             let color = if line.contains("ERROR") || line.contains("Failed to") {
                                                                 egui::Color32::from_rgb(255, 100, 100)

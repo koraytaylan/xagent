@@ -16,7 +16,6 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
 | egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
-| CSV telemetry recording | `recording.rs` |
 | Per-generation replay recording & playback | `replay.rs` |
 | Event loop & orchestration | `main.rs` |
 
@@ -29,10 +28,10 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  main.rs  (winit ApplicationHandler – event loop & orchestration)         │
 │                                                                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ recording  │  │
+│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │   replay   │  │
 │  │          │  │          │  │          │  │          │  │            │  │
-│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │recording.rs│  │
-│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │ replay.rs  │  │
+│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │  replay.rs │  │
+│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
@@ -58,17 +57,14 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  ┌────┴──────────────────────────────────────────────┐         │          │
 │  │  Per-frame pipeline                               │         │          │
 │  │  1. Input events → camera update                  │         │          │
-│  │  2. For each tick:                                │         │          │
-│  │     a. extract_senses() → SensoryFrame            │         │          │
-│  │     b. brain.tick(frame) → MotorCommand            │         │          │
-│  │     c. physics::step(agent, motor, world)         │         │          │
-│  │     d. Record tick data + food events to replay   │         │          │
-│  │     e. death/respawn/reproduction checks          │         │          │
-│  │  3. Advance replay playback (if active)           │         │          │
-│  │  4. Rebuild meshes (agents, food)                 │         │          │
-│  │  5. Build HUD bars                                │         │          │
-│  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  7. Log telemetry to CSV                          │                    │
+│  │  2. Ensure/collect fused GPU kernel readiness     │         │          │
+│  │  3. Dispatch GPU tick batch (physics+brain+world) │         │          │
+│  │  4. Async selected-agent telemetry readback       │         │          │
+│  │  5. Every-frame GPU state readback → agent cache  │         │          │
+│  │  6. Record replay + history/heatmap/trail updates │         │          │
+│  │  7. Generation transition + replay playback       │         │          │
+│  │  8. Rebuild meshes + HUD bars                     │         │          │
+│  │  9. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -484,31 +480,9 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Recording, Telemetry & Replay (`recording.rs`, `replay.rs`)
+### 3.5 Telemetry & Replay (`replay.rs`)
 
-#### CSV Format
-
-File name: `xagent_log_YYYY-MM-DD_HH-MM-SS.csv` (UTC, no chrono dependency).
-
-Columns (29 total):
-
-```
-agent_id, tick, prediction_error, avg_prediction_error, memory_utilization,
-memory_capacity, exploration_rate, homeostatic_gradient,
-energy, max_energy, integrity, max_integrity,
-position_x, position_y, position_z, facing_x, facing_z,
-biome, action_forward, action_strafe, action_turn, action_discrete, alive,
-exploitation_ratio, decision_quality, behavior_phase, death_count, life_ticks,
-generation
-```
-
-#### Flush Strategy
-
-- Writes are buffered via `BufWriter<File>`.
-- **Flushed every 100 ticks** for crash safety.
-- Final flush on session exit (`print_session_summary()`).
-
-#### Per-Generation Replay Recording (`replay.rs`)
+#### Per-Generation Replay Recording
 
 The replay system captures per-tick agent state during evolution runs, enabling
 post-hoc playback of any completed generation.
@@ -770,47 +744,64 @@ Each frame, when the window requests a redraw:
 
 2. Update camera position from held keys (WASD/E/Shift)
 
-3. If not paused, run as many simulation ticks as the current speed/mode allows,
-   bounded by the per-frame tick time budget and `max_ticks_per_frame`
-   (currently up to 4000 in 3D mode and up to 1,000,000 in fast mode):
-   a. Collect all agent positions into a snapshot (Vec<(Vec3, bool)>)
+3. If not paused, dispatch a batched tick range on the GPU fused kernel
+   (physics + brain + food detection + death/respawn all run inside
+   `kernel_tick.wgsl`; no per-tick simulation work runs on the CPU,
+   though governor bookkeeping does — one `gov.tick()` per simulated
+   tick):
+   a. Accumulate `sim_accumulator` from real-time dt × speed multiplier
 
-   b. For each living agent i:
-      ├─ extract_senses_with_positions(agent.body, world, tick, positions, i)
-      │   → produces SensoryFrame
-      ├─ brain.tick(&frame)
-      │   → produces MotorCommand
-      ├─ agent.cached_motor = motor
-      ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
-      │   → updates position, velocity, energy, integrity, alive
-      └─ If selected agent: log to CSV, accumulate prediction error
+   b. Compute `raw_ticks` from `sim_accumulator / sim_delta_time`,
+      bounded by `gpu_tick_budget` (an internal warmup throttle that
+      grows by ~25% on each successful dispatch up to 64,000 so cold
+      starts don't dispatch giant batches) and the hard per-frame cap
+      of 500. Dispatch only when `raw_ticks >= brain_tick_stride()`
+      so the batch contains at least one full brain cycle; otherwise
+      skip and let the accumulator carry over to the next frame. There
+      is no rounding to a multiple of the stride — `ticks_to_run`
+      equals `raw_ticks` once the threshold is met.
 
-   d. world.update(dt) — decrement food respawn timers, relocate respawned food
+   c. `kernel.dispatch_batch(self.tick, ticks_to_run)` — one submit
+      covers the whole range. `self.tick` is advanced by `ticks_to_run`
+      and `gov.tick()` is called once per simulated tick (CPU-side
+      bookkeeping only — no simulation work).
 
-   e. Death/respawn processing:
-      ├─ Dead agent with cooldown == 0 → log death, set cooldown = 60
-      └─ Dead agent with cooldown > 0 → decrement; if 0 → respawn
+   d. Request async agent telemetry readback for the selected agent.
+      Collect any completed telemetry (vision, curiosity, staleness)
+      without blocking.
 
-   f. Increment global tick counter, mark food mesh as dirty
+   e. Append a TickRecord to the active replay recording using
+      GPU-readback state + the per-agent `cached_*` telemetry.
 
-   g. Reproduction check:
-      ├─ Find agents where can_reproduce() && !has_reproduced
-      └─ For each: set has_reproduced, spawn_child (mutated config)
+4. Every-frame non-blocking state readback (runs even when no ticks
+   were dispatched so the viewport stays responsive at low speeds):
+   `kernel.try_collect_state()` → update each agent's position, yaw,
+   energy, integrity, velocity, facing, food_consumed, death count,
+   and cached motor/gradient/urgency/prediction/exploration/fatigue.
 
-   h. Every 100 ticks: print telemetry to console
+5. Heatmap + trail recording for every living agent (CPU sampling of
+   the latest GPU readback).
 
-4. Fix selected_agent_idx if agents were added/removed
+6. Sparkline history updates per agent.
 
-5. Rebuild dynamic GPU meshes:
-   ├─ Food mesh (if dirty)
-   └─ Agent mesh (combined, rebuilt every frame)
+7. Generation completion check → `advance_generation()` kicks off the
+   multi-frame transition state machine; `poll_gen_transition()` drives
+   it each frame.
 
-6. Build HUD bars for selected agent
+8. Advance replay playback if active.
 
-7. Render:
-   ├─ 3D pass: terrain + food + agents (depth-tested)
-   ├─ HUD pass: background panels + status bars (alpha-blended)
-   └─ Text pass: bitmap font labels (alpha-blended)
+9. Fix selected_agent_idx if agents were added/removed.
+
+10. Rebuild dynamic GPU meshes (throttled to ~10 Hz):
+    ├─ Food mesh (if dirty)
+    └─ Agent mesh (combined)
+
+11. Build HUD bars for selected agent.
+
+12. Render:
+    ├─ 3D pass: terrain + food + agents (depth-tested)
+    ├─ HUD pass: background panels + status bars (alpha-blended)
+    └─ Text pass: bitmap font labels (alpha-blended)
 ```
 
 ---
@@ -920,7 +911,6 @@ marker floating above it in the 3D viewport. Its data drives:
 - **Bottom console**: scrollable log of evolution events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
-- CSV logging
 
 ### Death & Respawn Guardrails
 

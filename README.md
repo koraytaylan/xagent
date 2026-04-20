@@ -44,7 +44,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, `WorldConfig`, and the `CognitiveArchitecture` trait. No logic — just types. |
 | **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
-| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, CSV logging, and the main event loop. |
+| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, and the main event loop. |
 
 ### Communication Flow
 
@@ -200,7 +200,7 @@ cargo run --release
 # Run with presets
 cargo run --release -- --brain-preset tiny --world-preset hard
 
-# Run headless (simulation + CSV logging, no window)
+# Run headless (simulation, no window)
 cargo run --release -- --no-render
 
 # Set a specific random seed
@@ -358,7 +358,7 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 
 ### Key Metrics to Watch
 
-These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning). The CSV log files also record all metrics per tick. Completed generations can be replayed via the built-in replay system.
+These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning). Completed generations can be replayed via the built-in replay system.
 
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
@@ -370,35 +370,6 @@ These metrics are visible in the **sidebar** (compact vitals, phase label, sorta
 | `mean_attenuation` | Near 1.0 (diverse input) | Near 0.1 (habituated, monotonous) |
 | `curiosity_bonus` | Low (varied sensory experience) | High (boredom driving exploration) |
 | `fatigue_factor` | Near 1.0 (diverse motor output) | Near floor (repetitive, dampened) |
-
-### CSV Log Files
-
-Each run produces a timestamped CSV file (e.g., `xagent_log_2026-03-23_21-06-03.csv`) with per-tick metrics:
-
-| Column | Description |
-|--------|-------------|
-| `agent_id` | Agent identifier |
-| `tick` | Simulation tick number |
-| `prediction_error` | Instantaneous prediction error (RMSE) |
-| `avg_prediction_error` | Rolling average over last 32 ticks |
-| `memory_utilization` | Fraction of memory capacity in use [0.0, 1.0] |
-| `memory_capacity` | Total memory slots |
-| `exploration_rate` | Current exploration probability [0.05, 0.95] |
-| `homeostatic_gradient` | Composite stability gradient (+ = improving) |
-| `energy` / `max_energy` | Current and maximum energy |
-| `integrity` / `max_integrity` | Current and maximum integrity |
-| `position_x/y/z` | World-space position |
-| `facing_x/z` | Forward direction vector |
-| `biome` | Current biome (FoodRich, Barren, Danger) |
-| `action_forward/strafe/turn` | Continuous motor output values |
-| `action_discrete` | Discrete action (None, Consume, Push, Jump) |
-| `alive` | Whether the agent is currently alive |
-| `exploitation_ratio` | Fraction of informed (non-random) actions |
-| `decision_quality` | Composite quality score [0.0, 1.0] |
-| `behavior_phase` | Current phase label (RANDOM/EXPLORING/LEARNING/ADAPTED) |
-| `death_count` | Cumulative deaths |
-| `life_ticks` | Ticks alive in current life |
-| `generation` | Life iteration — incremented on each death/respawn |
 
 ### Experiment Tips
 
@@ -473,10 +444,8 @@ xagent/
 │       │   │   └── font.rs     # Bitmap font atlas + text rendering
 │       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot, WorldSnapshot, ReplayState)
 │       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
-│       │   └── recording.rs    # CSV metrics logger
 │       └── tests/
 │           └── integration.rs  # 32 integration tests
-└── xagent_log_*.csv            # Generated metric logs (gitignored)
 ```
 
 ---
@@ -511,7 +480,7 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 - **Per-tick simulation logic belongs in WGSL shaders, never in Rust.** Physics, brain passes, food detection, death/respawn -- all of it runs in compute shaders. Adding per-tick logic on the CPU side defeats the fused-kernel architecture.
 - **The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking).** The Rust side orchestrates dispatches, maps readback buffers, and feeds the UI. It never steps the simulation itself.
-- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** CSV logging, replay recording, and UI snapshot updates happen at frame cadence, not tick cadence.
+- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** Replay recording and UI snapshot updates happen at frame cadence, not tick cadence.
 - **No CPU-side simulation work should scale with `ticks_to_run` beyond trivial bookkeeping.** The GPU tick budget is capped at 64,000 ticks per frame, and execution may be split across multiple batched dispatches. Rust may still do lightweight per-tick accounting (for example, counters or governance bookkeeping), but any per-tick simulation, physics, sensing, or brain computation on the CPU violates this invariant.
 
 ---

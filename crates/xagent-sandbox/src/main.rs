@@ -27,7 +27,6 @@ use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS
 use xagent_sandbox::governor::{check_existing_session, reset_database, AdvanceResult, Governor};
 use xagent_sandbox::headless;
 use xagent_sandbox::overlay;
-use xagent_sandbox::recording::MetricsLogger;
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
@@ -64,17 +63,13 @@ struct Cli {
     #[arg(long)]
     tick_rate: Option<f32>,
 
-    /// Run headless (no window, just simulation + logging)
+    /// Run headless (no window, simulation only)
     #[arg(long)]
     no_render: bool,
 
     /// Print current config as JSON to stdout and exit
     #[arg(long)]
     dump_config: bool,
-
-    /// Enable CSV metrics logging to file
-    #[arg(long)]
-    log: bool,
 
     /// SQLite database path for evolution state (default: xagent.db)
     #[arg(long, default_value = "xagent.db")]
@@ -286,18 +281,11 @@ struct App {
     paused: bool,
     render_3d: bool,
 
-    // Session statistics
-    total_prediction_error: f64,
-    error_count: u64,
-
     // Telemetry selection
     selected_agent_idx: usize,
     viewport_hovered: bool,
     chart_window: usize,
     orbit_mode: bool,
-
-    // CSV metrics logger
-    logger: Option<MetricsLogger>,
 
     // GPU instancing for agents
     agent_instance_buffer: Option<wgpu::Buffer>,
@@ -390,24 +378,8 @@ impl App {
         brain_config: BrainConfig,
         world_config: WorldConfig,
         governor_config: GovernorConfig,
-        enable_logging: bool,
         db_path: &str,
     ) -> Self {
-        let logger = if enable_logging {
-            match MetricsLogger::new() {
-                Ok(l) => {
-                    println!("[RECORDING] Logging metrics to: {}", l.file_name);
-                    Some(l)
-                }
-                Err(e) => {
-                    eprintln!("[RECORDING] Failed to create metrics log: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Check for existing session to determine initial UI state
         let mut evo_snapshot = EvolutionSnapshot::default();
         evo_snapshot.edit_brain = brain_config.clone();
@@ -464,14 +436,11 @@ impl App {
             speed_multiplier: 1,
             paused: true,
             render_3d: true,
-            total_prediction_error: 0.0,
-            error_count: 0,
             selected_agent_idx: 0,
             viewport_hovered: false,
             chart_window: 120,
             orbit_mode: false,
             readback_logged: false,
-            logger,
             agent_instance_buffer: None,
             agent_instance_count: 0,
             frame_times: VecDeque::new(),
@@ -1172,24 +1141,8 @@ impl App {
         }
     }
 
-    fn print_session_summary(&mut self) {
-        if let Some(logger) = &mut self.logger {
-            let _ = logger.flush();
-        }
-
-        let avg_err = if self.error_count > 0 {
-            self.total_prediction_error / self.error_count as f64
-        } else {
-            0.0
-        };
-
+    fn print_session_summary(&self) {
         let total_deaths: u32 = self.agents.iter().map(|a| a.death_count).sum();
-
-        let log_name = self
-            .logger
-            .as_ref()
-            .map(|l| l.file_name.as_str())
-            .unwrap_or("(none)");
 
         println!();
         println!("=== xagent Session Summary ===");
@@ -1197,8 +1150,6 @@ impl App {
         println!("Total agents spawned: {}", self.next_agent_id);
         println!("Living agents: {}", self.agents.len());
         println!("Total deaths: {}", total_deaths);
-        println!("Avg prediction error: {:.2}", avg_err);
-        println!("Log file: {}", log_name);
         println!();
     }
 
@@ -1804,20 +1755,9 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Sparkline histories + CSV logging
-                    {
-                        if let Some(world) = &self.world {
-                            for agent in &mut self.agents {
-                                record_agent_histories(agent);
-                            }
-                            if self.selected_agent_idx < self.agents.len() {
-                                let agent = &self.agents[self.selected_agent_idx];
-                                let life_ticks = agent.age(self.tick);
-                                let motor = agent.cached_motor.clone();
-                                log_tick_to_csv(&mut self.logger, agent, world, &motor, life_ticks);
-                                self.error_count += 1;
-                            }
-                        }
+                    // Sparkline histories
+                    for agent in &mut self.agents {
+                        record_agent_histories(agent);
                     }
 
                     self.heatmap_dirty = true;
@@ -2729,41 +2669,6 @@ impl ApplicationHandler for App {
     }
 }
 
-// ── Free functions to avoid borrow conflicts ───────────────────────────
-
-fn log_tick_to_csv(
-    logger: &mut Option<MetricsLogger>,
-    agent: &Agent,
-    world: &WorldState,
-    motor: &xagent_shared::MotorCommand,
-    life_ticks: u64,
-) {
-    if let Some(logger) = logger {
-        let biome = world
-            .biome_map
-            .biome_at(agent.body.body.position.x, agent.body.body.position.z);
-        // Create a stub BrainTelemetry since GPU brain doesn't expose per-tick telemetry yet
-        let stub_telemetry = xagent_brain::BrainTelemetry::default();
-        let _ = logger.log_tick(
-            agent.id,
-            &stub_telemetry,
-            agent.brain_config.memory_capacity,
-            agent.body.body.internal.energy,
-            agent.body.body.internal.max_energy,
-            agent.body.body.internal.integrity,
-            agent.body.body.internal.max_integrity,
-            agent.body.body.position,
-            agent.body.body.facing,
-            biome,
-            motor,
-            agent.body.body.alive,
-            agent.death_count,
-            life_ticks,
-            agent.generation,
-        );
-    }
-}
-
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -2821,13 +2726,7 @@ fn main() {
         headless::run_headless(config, &cli.db, cli.resume, true);
     } else {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let mut app = App::new(
-            config.brain,
-            config.world,
-            config.governor,
-            cli.log,
-            &cli.db,
-        );
+        let mut app = App::new(config.brain, config.world, config.governor, &cli.db);
         event_loop.run_app(&mut app).expect("Event loop error");
     }
 }

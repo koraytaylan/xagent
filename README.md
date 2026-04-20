@@ -92,7 +92,7 @@ The `vision_stride` parameter (default 10) controls how many brain+physics cycle
 
 Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
-1. **Feature Extract** — Extracts 217 features from the packed sensory input (192 RGBA vision + 48 depth + 27 non-visual). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+1. **Feature Extract** — Reads the packed sensory input (`SENSORY_STRIDE = 267`: 192 RGBA vision + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (`FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features) inside the fused kernel. This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
 
 2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 
@@ -406,24 +406,29 @@ xagent/
 │   │       └── traits.rs       # CognitiveArchitecture trait
 │   │
 │   ├── xagent-brain/           # GPU-resident cognitive architecture
-│   │   ├── README.md           # Deep dive into brain internals
+│   │   ├── README.md           # Deep dive into brain internals (partially stale — see issue #106)
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
-│   │       ├── gpu_brain.rs    # GpuBrain — 7-pass pipeline, state I/O, resize
-│   │       ├── gpu_kernel.rs  # GpuKernel — fused dispatch, telemetry readback
+│   │       ├── gpu_kernel.rs   # GpuKernel — fused dispatch, telemetry readback
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
-│   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
-│   │           ├── encode.wgsl           # Pass 2: features × weights → 128-dim encoded
-│   │           ├── habituate_homeo.wgsl  # Pass 3: habituation EMA + homeostasis
-│   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
-│   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection
-│   │           ├── predict_and_act.wgsl  # Pass 6: prediction, credit, policy, motor output
-│   │           ├── learn_and_store.wgsl  # Pass 7: weight updates, memory store/decay
 │   │           └── kernel/
-│   │               ├── common.wgsl       # Shared constants for fused kernel shaders
-│   │               ├── kernel_tick.wgsl    # Fused per-agent kernel (physics+food+death+brain)
-│   │               └── global_tick.wgsl  # Grid rebuild + collision pass (1,1,1)
+│   │               ├── common.wgsl            # Shared constants for fused kernel shaders
+│   │               ├── brain_tick.wgsl        # Fused per-agent brain pass (all 7 legacy passes inlined)
+│   │               ├── kernel_tick.wgsl       # Fused per-agent kernel (physics + food + death + brain loop)
+│   │               ├── global_tick.wgsl       # Grid rebuild + collision pass (1,1,1)
+│   │               ├── physics_tick.wgsl      # Physics-only stride (between vision cycles)
+│   │               ├── vision_tick.wgsl       # Vision-only stride (when vision is due)
+│   │               ├── phase_clear.wgsl       # Per-frame buffer clears
+│   │               ├── phase_prepare_dispatch.wgsl # Indirect-dispatch argument prep
+│   │               ├── phase_physics.wgsl     # Movement, gravity, bounds
+│   │               ├── phase_collision.wgsl   # Agent-agent collision response
+│   │               ├── phase_vision.wgsl      # Raycast vision sampling
+│   │               ├── phase_food_grid.wgsl   # Food spatial grid rebuild
+│   │               ├── phase_food_detect.wgsl # Per-agent food detection
+│   │               ├── phase_food_respawn.wgsl # Consumed-food respawn timers
+│   │               ├── phase_agent_grid.wgsl  # Agent spatial grid rebuild
+│   │               └── phase_death.wgsl       # Death detection + respawn
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/

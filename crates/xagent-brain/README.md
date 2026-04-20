@@ -332,31 +332,33 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ## 6. Component Deep Dive: The 7-Pass Pipeline
 
-### 6.1 Feature Extraction (Pass 1) -- `feature_extract.wgsl`
+### 6.1 Feature Extraction (Pass 1) -- `brain_tick.wgsl::coop_feature_extract`
 
-**What it does**: Transforms raw sensory input (267 f32 per agent) into a feature vector (217 f32 per agent). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
+> **Note:** the multi-file, multi-pass layout described in §6 below predates the GPU-fused kernel. Passes 1-7 are now inlined into `src/shaders/kernel/brain_tick.wgsl` as `coop_feature_extract`, `coop_encode`, etc. File references in §§6.1-6.7 are retained for conceptual organization; the authoritative source is `brain_tick.wgsl`. A full rewrite of §6 is tracked as follow-up to issue #106.
+
+**What it does**: Transforms raw sensory input (`SENSORY_STRIDE = 267` f32: 192 color + 48 depth + 27 non-visual) into the brain feature vector (`FEATURE_COUNT = 265` f32: 192 color + 48 depth + 25 derived non-visual). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
 
 **How it works**:
 
 1. **Vision RGBA**: Direct copy of 192 values (8x6 grid, 4 channels each). No spatial pooling -- the full color+alpha grid is preserved. This gives the brain per-pixel color access, critical for learning that "red ahead = danger zone" and "green ahead = food zone."
 
-2. **Velocity magnitude**: Computes `sqrt(vx^2 + vy^2 + vz^2)` from the 3-component velocity vector, collapsing direction into a single speed scalar.
+2. **Vision depth**: Direct copy of 48 depth values (one per pixel). The fused kernel includes depth in the feature buffer — not skipped.
 
-3. **Proprioception**: Copies facing direction (3), angular velocity (1).
+3. **Velocity magnitude**: Computes `sqrt(vx^2 + vy^2 + vz^2)` from the 3-component velocity vector, collapsing direction into a single speed scalar.
 
-4. **Interoception**: Copies energy (1), integrity (1), energy delta (1), integrity delta (1).
+4. **Proprioception**: Copies facing direction (3), angular velocity (1).
 
-5. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
+5. **Interoception**: Copies energy (1), integrity (1), energy delta (1), integrity delta (1).
 
-**Feature layout**: `[192 RGBA | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 217`
+6. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
 
-**Why depth is skipped**: The 48 depth values from the sensory frame are present in the upload buffer but not extracted as features. Vision RGBA already encodes biome-specific color, which is the primary discriminant. Depth would add dimensionality without proportional information gain for the current world complexity.
+**Feature layout**: `[192 RGBA | 48 depth | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 265`
 
 ---
 
-### 6.2 Encoding (Pass 2) -- `encode.wgsl`
+### 6.2 Encoding (Pass 2) -- `brain_tick.wgsl::coop_encode`
 
-**What it does**: Projects the 217-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 217 inputs compressed to 128 outputs, forcing the brain to learn what matters.
+**What it does**: Projects the 265-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 265 inputs compressed to 128 outputs, forcing the brain to learn what matters.
 
 **How it works**:
 
@@ -364,13 +366,13 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 encoded[d] = fast_tanh( sum_f( features[f] * weights[f * ENCODED_DIMENSION + d] ) + biases[d] )
 ```
 
-For each of the 128 output dimensions, the shader computes a weighted sum across all 217 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
+For each of the 128 output dimensions, the shader computes a weighted sum across all 265 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
 
 **Weight initialization** (in `buffers::init_brain_state`): Xavier/Glorot uniform -- `uniform(-scale, scale)` where `scale = 1/sqrt(FEATURE_COUNT)`. This prevents tanh saturation at initialization.
 
 **Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x ENCODED_DIMENSION]`, indexed as `[f * ENCODED_DIMENSION + d]`). This layout means each output dimension's weights are scattered across memory at stride `ENCODED_DIMENSION` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
 
-**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA values + 25 non-visual features = 217 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
+**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA + 48 depth + 25 non-visual features = 265 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
 
 ---
 

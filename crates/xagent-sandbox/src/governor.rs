@@ -1017,8 +1017,10 @@ impl Governor {
         if let Some(best_config) = fitness.first() {
             let c = &best_config.config;
             println!("╠{}╣", bar);
+            // `mem_cost` / `proc_cost`: metabolic-cost proxies — kernel widths
+            // are fixed at MEMORY_CAP=128, RECALL_K=16 (see issue #106).
             let cfg_line = format!(
-                "  Config: mem={} slots={} dim={} lr={:.4} decay={:.4}",
+                "  Config: mem_cost={} proc_cost={} dim={} lr={:.4} decay={:.4}",
                 c.memory_capacity,
                 c.processing_slots,
                 c.representation_dimension,

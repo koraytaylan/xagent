@@ -272,9 +272,9 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 | Parameter | What it controls |
 |-----------|-----------------|
-| `memory_capacity` | Max stored patterns. Smaller → faster forgetting, stronger capacity pressure. |
-| `processing_slots` | Max recall operations per tick. Smaller → narrower attention. |
-| `visual_encoding_size` | Resolution of visual encoding (average-pooled bins). Smaller → coarser visual perception. |
+| `memory_capacity` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
+| `processing_slots` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
+| `visual_encoding_size` | **Legacy / unused.** No kernel stage reads this field; preserved only for config backwards compatibility (see issue #106). |
 | `representation_dimension` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |

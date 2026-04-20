@@ -1,13 +1,14 @@
 // ── Kernel common definitions ──────────────────────────────────────────
 // Shared constants, buffer bindings, and helper functions for all phases.
-// Values MUST match buffers.rs and the per-shader constants injected by
-// wgsl_constants() / wgsl_physics_constants().
+// Values MUST match buffers.rs and any WGSL `override` constants supplied
+// by the Rust host at pipeline creation via
+// `PipelineCompilationOptions::constants`.
 
 // ── Vision grid (pipeline-overridable constants) ──────────────────────────
 // VISION_W and VISION_H are supplied by the Rust host at pipeline creation
 // time via `PipelineCompilationOptions::constants`. Defaults below keep the
 // shader standalone-compilable (LSP tooling, WGSL validators) at the 8×6 grid.
-// See `gpu_kernel.rs::override_constants()` for the canonical override map.
+// See `gpu_kernel.rs::vision_override_constants()` for the canonical override map.
 
 override VISION_W: u32 = 8u;
 override VISION_H: u32 = 6u;

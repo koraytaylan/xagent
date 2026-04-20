@@ -1,7 +1,9 @@
 // ── Subgroup-accelerated bitonic sort (replaces the workgroup-memory sort) ──
-// This fragment is substituted between the `BEGIN_BITONIC_SORT` /
-// `END_BITONIC_SORT` markers in `brain_passes.wgsl` at pipeline creation time
-// when `wgpu::Features::SUBGROUP` is available.
+// This fragment is spliced between the `BEGIN_BITONIC_SORT` /
+// `END_BITONIC_SORT` markers in `brain_passes.wgsl` by the Rust host before
+// creating the shader module/pipeline, when `wgpu::Features::SUBGROUP` is
+// available. This is host-side shader composition, not WGSL `override`
+// specialization via `PipelineCompilationOptions::constants`.
 //
 // The fragment is self-contained — it relies on the same shared memory
 // (`s_similarities`, `shared_sort_indices`) declared in brain_passes.wgsl,

@@ -7,7 +7,8 @@
 //   - brain_tick.wgsl (standalone brain pass)
 //   - kernel_tick.wgsl (fused kernel, delegates via brain_tick_inner)
 //
-// Composition contract (see `gpu_kernel.rs::compose_shader()`):
+// Composition contract (see the module-level "Shader composition contract"
+// docs in `gpu_kernel.rs` and the inline composition in `GpuKernel::new`):
 //   common.wgsl + brain_passes.wgsl + brain_tick.wgsl  (brain pipeline)
 //   common.wgsl + brain_passes.wgsl + kernel_tick.wgsl (kernel pipeline)
 //

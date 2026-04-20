@@ -117,11 +117,11 @@ This is the **only** evaluative signal. There is no reward function.
 
 ### Capacity Constraints
 
-| Constraint | Effect |
-|---|---|
-| `memory_capacity` | Finite pattern storage → forced forgetting → what survives = what matters |
-| `processing_slots` | Limited recall per tick → forced prioritization → attention-like behavior |
-| `representation_dimension` | Fixed encoding size → forced compression → abstraction |
+| Constraint | Kernel wiring | Intended effect |
+|---|---|---|
+| `memory_capacity` | **Proxy (metabolic cost)** — feeds per-tick energy drain only; kernel pattern memory is fixed at `MEMORY_CAP = 128`. | Finite pattern storage → forced forgetting → what survives = what matters. |
+| `processing_slots` | **Proxy (metabolic cost)** — feeds per-tick energy drain only; kernel recall width is fixed at `RECALL_K = 16`. | Limited recall per tick → forced prioritization → attention-like behavior. |
+| `representation_dimension` | **Locked (compile-time)** — must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; not evolved, not user-tunable. | Fixed encoding size → forced compression → abstraction. |
 
 See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into each component.
 
@@ -275,7 +275,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `memory_capacity` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
 | `visual_encoding_size` | **Legacy / unused.** No kernel stage reads this field; preserved only for config backwards compatibility (see issue #106). |
-| `representation_dimension` | Internal representation vector length. Fixed across generations (not evolved) to preserve weight inheritance. Smaller → more compression, more abstraction. |
+| `representation_dimension` | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The GPU kernel sizes encoder weights, predictor weights, and workgroup arrays from that constant — WGSL cannot resize them at runtime. The config field is a read-only echo; mismatched values log a warning and are ignored. Not mutated by evolution, not exposed in the UI (see issues #103, #106). |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |

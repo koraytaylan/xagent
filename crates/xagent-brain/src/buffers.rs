@@ -519,7 +519,21 @@ pub fn build_config(config: &BrainConfig) -> Vec<f32> {
 }
 
 /// Build config buffer values with explicit layout.
+///
+/// `representation_dimension` is locked to the compile-time `ENCODED_DIMENSION`
+/// constant (WGSL workgroup arrays cannot be runtime-sized). If the provided
+/// `BrainConfig` disagrees, a warning is logged and `ENCODED_DIMENSION` wins.
+/// See issue #106 for the field taxonomy.
 pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> {
+    if config.representation_dimension != ENCODED_DIMENSION {
+        log::warn!(
+            "BrainConfig.representation_dimension={} does not match compile-time \
+             ENCODED_DIMENSION={}; the kernel uses ENCODED_DIMENSION and ignores the \
+             config value (see issue #106).",
+            config.representation_dimension,
+            ENCODED_DIMENSION,
+        );
+    }
     let mut cfg = vec![0.0_f32; CONFIG_SIZE];
     cfg[CFG_REPR_DIM] = ENCODED_DIMENSION as f32;
     cfg[CFG_FEATURE_COUNT] = layout.feature_count as f32;
@@ -688,6 +702,21 @@ mod tests {
             CFG_INTEGRITY_SCALE,
             packed[CFG_INTEGRITY_SCALE]
         );
+    }
+
+    #[test]
+    fn build_config_locks_repr_dim_to_encoded_dimension() {
+        // representation_dimension is a locked (compile-time) field: the GPU
+        // config slot always reflects ENCODED_DIMENSION, no matter what the
+        // BrainConfig says. See issue #106.
+        let mut config = BrainConfig::default();
+        config.representation_dimension = ENCODED_DIMENSION + 64;
+        let packed = build_config(&config);
+        assert!((packed[CFG_REPR_DIM] - ENCODED_DIMENSION as f32).abs() < f32::EPSILON);
+
+        config.representation_dimension = 1;
+        let packed = build_config(&config);
+        assert!((packed[CFG_REPR_DIM] - ENCODED_DIMENSION as f32).abs() < f32::EPSILON);
     }
 
     #[test]

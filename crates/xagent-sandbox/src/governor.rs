@@ -2441,10 +2441,11 @@ mod tests {
 
     #[test]
     fn momentum_persists_across_resume() {
-        use std::fs;
-
-        let db_path = "/tmp/xagent_test_momentum_persist.db";
-        let _ = fs::remove_file(db_path);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let db_path_buf = temp_dir.path().join("momentum_persists_across_resume.db");
+        let db_path = db_path_buf
+            .to_str()
+            .expect("temp DB path must be valid UTF-8");
 
         let config = GovernorConfig {
             population_size: 10,
@@ -2483,8 +2484,6 @@ mod tests {
                 || gov.momentums[1].get("decay_rate") != 0.0;
             assert!(has_data, "momentum should have been persisted and restored");
         }
-
-        let _ = fs::remove_file(db_path);
     }
 
     #[test]

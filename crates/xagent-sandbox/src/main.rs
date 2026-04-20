@@ -1734,37 +1734,12 @@ impl ApplicationHandler for App {
                                 a.food_consumed = state[base + P_FOOD_COUNT] as u32;
                                 a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                 let new_deaths = state[base + P_DEATH_COUNT] as u32;
-                                if new_deaths > a.death_count {
-                                    let death_delta = new_deaths - a.death_count;
-                                    // GPU records the tick at which the most recent
-                                    // death in the batch was detected (energy/integrity
-                                    // hit zero in agent_physics) and preserves it across
-                                    // the death/respawn reset.
-                                    let gpu_death_tick = state[base + P_LAST_DEATH_TICK] as u64;
-                                    // Clamp to the most recent simulated tick as a
-                                    // safety net in case the GPU value is corrupted or
-                                    // lags the death_count increment by a staging readback.
-                                    let last_simulated_tick = self.tick.saturating_sub(1);
-                                    let death_tick = gpu_death_tick.min(last_simulated_tick);
-                                    if death_delta == 1 {
-                                        a.record_death_and_restart_life(death_tick);
-                                    } else {
-                                        // Multiple deaths occurred since the last
-                                        // readback; we only know the most recent death
-                                        // tick.  Calling record_death_and_restart_life
-                                        // here would compute life_duration against a
-                                        // stale life_start_tick (spanning several lives)
-                                        // and overestimate longest_life — the exact
-                                        // failure PR #123 guarded against.  Resync the
-                                        // life boundary using the GPU death tick without
-                                        // updating longest_life.  Full per-life timing
-                                        // would require a per-agent ring buffer of death
-                                        // ticks or a GPU-side last_respawn_tick slot.
-                                        a.life_start_tick = death_tick.saturating_add(1);
-                                        a.reset_trail();
-                                    }
-                                }
-                                a.death_count = new_deaths;
+                                let gpu_death_tick = state[base + P_LAST_DEATH_TICK] as u64;
+                                a.apply_death_count_readback(
+                                    new_deaths,
+                                    gpu_death_tick,
+                                    self.tick.saturating_sub(1),
+                                );
                                 a.body.body.facing = Vec3::new(
                                     state[base + P_FACING_X],
                                     state[base + P_FACING_Y],

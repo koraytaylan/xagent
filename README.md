@@ -21,7 +21,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 │                                                                   │
 │  ┌───────────────────┐                                            │
 │  │  xagent-shared    │◄────────────────────────────────────────┐  │
-│  │  (interface)      │    Types, traits, config                │  │
+│  │  (interface)      │    Types and config                     │  │
 │  └────────┬──────────┘                                         │  │
 │           │                                                    │  │
 │           │  depends on                      depends on        │  │

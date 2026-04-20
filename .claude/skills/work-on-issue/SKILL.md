@@ -92,7 +92,7 @@ Do not push on hook failure. Fix the root cause and create a new commit.
 2. If no open PR exists, create one with `mcp__github__create_pull_request` targeting `develop`:
    - Title: conventional-commit style, < 70 chars.
    - Body: Summary (1–3 bullets), Test Plan (checklist), and `Closes #<num>` (or `Refs #<num>` if scope is partial).
-3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching review events. **Do not rely on the subscription for CI status** — webhook events are lossy (e.g. PR #132 completed CI with zero events delivered). Treat any CI event that does arrive as a hint, but always confirm with an active poll (Step 6).
+3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching review events. **Do not rely on the subscription for CI status** — webhook delivery is lossy and CI-completion events can be dropped. Treat any CI event that does arrive as a hint, but always confirm with an active poll (Step 6).
 
 ## Step 6 — CI babysitting (active polling, not event-driven)
 

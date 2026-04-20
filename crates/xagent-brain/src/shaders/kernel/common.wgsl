@@ -103,7 +103,7 @@ const CFG_INTEGRITY_SCALE: u32 = 8u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 31u;
+const PHYS_STRIDE: u32 = 32u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -135,6 +135,7 @@ const P_MOTOR_FWD_OUT: u32 = 27u;
 const P_MOTOR_TURN_OUT: u32 = 28u;
 const P_GRADIENT_OUT: u32 = 29u;
 const P_URGENCY_OUT: u32 = 30u;
+const P_LAST_DEATH_TICK: u32 = 31u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 

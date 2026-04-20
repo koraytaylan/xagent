@@ -165,6 +165,9 @@ fn agent_physics(agent_id: u32, tick: u32) {
     if energy <= 0.0 || integrity <= 0.0 {
         physics_state[b + P_ALIVE] = 0.0;
         physics_state[b + P_DIED_FLAG] = 1.0;
+        // Record the exact tick of death for CPU-side longest_life accounting.
+        // Stored as f32 (exact for integer ticks up to 2^24 — matches P_TICKS_ALIVE).
+        physics_state[b + P_LAST_DEATH_TICK] = f32(tick);
     } else {
         physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;
     }
@@ -286,6 +289,9 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     let max_integrity      = physics_state[base + P_MAX_INTEGRITY];
     let memory_cap         = physics_state[base + P_MEMORY_CAP];
     let processing_slots   = physics_state[base + P_PROCESSING_SLOTS];
+    // Preserve the physics-recorded death tick through the reset so CPU
+    // readback can attribute this death to its exact tick.
+    let saved_last_death_tick = physics_state[base + P_LAST_DEATH_TICK];
 
     // 3. Reset physics state
     for (var i = 0u; i < PHYS_STRIDE; i++) {
@@ -307,6 +313,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     physics_state[base + P_FOOD_COUNT]      = saved_food_count;
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
+    physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
 
     // 4. Reset brain state
     let brain_base = agent_id * BRAIN_STRIDE;

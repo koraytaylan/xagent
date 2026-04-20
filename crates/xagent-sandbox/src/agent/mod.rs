@@ -776,6 +776,47 @@ mod tests {
     }
 
     #[test]
+    fn record_death_with_gpu_reported_tick_is_accurate_under_batching() {
+        // Simulate the scenario PR #123 fixed conservatively: an agent dies
+        // mid-batch and the CPU only observes the new death_count after the
+        // entire batch has been dispatched (self.tick has advanced past the
+        // actual death tick by up to `ticks_to_run - 1`).
+        //
+        // With GPU-reported death ticks, longest_life must match the true
+        // life duration — NOT a conservative upper bound derived from
+        // `self.tick - 1`.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Agent was born at tick 0.  It dies at tick 100 but the CPU's
+        // next-tick counter has already advanced to 500 (500-tick batch).
+        let gpu_death_tick = 100;
+        agent.record_death_and_restart_life(gpu_death_tick);
+        assert_eq!(
+            agent.longest_life, 100,
+            "longest_life must reflect the GPU-reported death tick, not the batch boundary"
+        );
+        assert_eq!(agent.life_start_tick, 101);
+    }
+
+    #[test]
+    fn record_death_multiple_deaths_in_batch_updates_longest_life_for_most_recent() {
+        // When multiple deaths cluster in one batch, each readback invocation
+        // calls record_death_and_restart_life once with the *most recent*
+        // GPU-reported death tick.  We accept that earlier intra-batch lives
+        // aren't individually timed — the most recent life is covered.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Say two deaths happened in one batch: first at tick 40, second at 90.
+        // CPU only sees death_count jump by 2 and reads P_LAST_DEATH_TICK = 90.
+        // The most recent life (respawn at ~41 through death at 90) is 49 ticks.
+        let last_gpu_death_tick = 90;
+        agent.record_death_and_restart_life(last_gpu_death_tick);
+        assert_eq!(
+            agent.longest_life, 90,
+            "longest_life should reflect most recent GPU death tick (agent still tracked from birth 0)"
+        );
+        assert_eq!(agent.life_start_tick, 91);
+    }
+
+    #[test]
     fn hsv_to_rgb_outputs_in_unit_range() {
         let hues = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 359.999];
         for &h in &hues {

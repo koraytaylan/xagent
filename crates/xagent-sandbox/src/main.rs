@@ -18,9 +18,9 @@ use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 use xagent_brain::buffers::{
     FOOD_STATE_STRIDE, F_POS_X, F_POS_Z, F_RESPAWN_TIMER, PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT,
     P_ENERGY, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y, P_FACING_Z, P_FATIGUE_FACTOR_OUT,
-    P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT,
-    P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT,
-    P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
+    P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_LAST_DEATH_TICK, P_MAX_ENERGY, P_MAX_INTEGRITY,
+    P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR,
+    P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
@@ -1732,23 +1732,22 @@ impl ApplicationHandler for App {
                                 a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
                                 let new_deaths = state[base + P_DEATH_COUNT] as u32;
                                 if new_deaths > a.death_count {
-                                    let death_delta = new_deaths - a.death_count;
-                                    if death_delta == 1 {
-                                        // Upper-bound the death tick with the last simulated
-                                        // tick — the actual death may have happened earlier
-                                        // within the dispatched batch, but we lack per-death
-                                        // timing from GPU to pinpoint it exactly.
-                                        let last_simulated_tick = self.tick.saturating_sub(1);
-                                        a.record_death_and_restart_life(last_simulated_tick);
-                                    } else {
-                                        // Multiple deaths can happen between readbacks at high
-                                        // speed multipliers. Without per-death timing from GPU,
-                                        // skip longest-life updates to avoid overestimation and
-                                        // start the new life at self.tick so age(self.tick) == 0.
-                                        // death_count still syncs to new_deaths below.
-                                        a.life_start_tick = self.tick;
-                                        a.reset_trail();
-                                    }
+                                    // GPU records the tick at which death was detected
+                                    // (energy/integrity hit zero in agent_physics) and
+                                    // preserves it across the death/respawn reset.  This
+                                    // lets longest_life reflect the actual life duration
+                                    // even when several ticks are dispatched per batch.
+                                    let gpu_death_tick = state[base + P_LAST_DEATH_TICK] as u64;
+                                    // Clamp to the most recent simulated tick as a safety
+                                    // net in case the GPU value is corrupted or lags the
+                                    // death_count increment by a staging readback.
+                                    let last_simulated_tick = self.tick.saturating_sub(1);
+                                    let death_tick = gpu_death_tick.min(last_simulated_tick);
+                                    // Multi-death batches update longest_life using only
+                                    // the most recent GPU death tick; earlier lives in the
+                                    // same batch aren't individually timed (would need a
+                                    // per-agent ring buffer of death ticks).
+                                    a.record_death_and_restart_life(death_tick);
                                 }
                                 a.death_count = new_deaths;
                                 a.body.body.facing = Vec3::new(

@@ -92,16 +92,25 @@ Do not push on hook failure. Fix the root cause and create a new commit.
 2. If no open PR exists, create one with `mcp__github__create_pull_request` targeting `develop`:
    - Title: conventional-commit style, < 70 chars.
    - Body: Summary (1–3 bullets), Test Plan (checklist), and `Closes #<num>` (or `Refs #<num>` if scope is partial).
-3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching CI + review events.
+3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching review events. **Do not rely on the subscription for CI status** — webhook events are lossy (e.g. PR #132 completed CI with zero events delivered). Treat any CI event that does arrive as a hint, but always confirm with an active poll (Step 6).
 
-## Step 6 — CI babysitting
+## Step 6 — CI babysitting (active polling, not event-driven)
 
-For every `<github-webhook-activity>` event with CI failures:
+After every push, actively poll the head commit's check runs until CI concludes. Do not wait passively for webhooks.
 
-1. Read the failing job log (fetch via the event payload; if absent, use `mcp__github__list_commits` → `get_commit` to locate the check run and pull its log URL).
-2. Reproduce locally when possible (`cargo fmt/clippy/test`).
-3. Fix the root cause — never `--no-verify`, never disable a failing test, never mask a clippy lint without a justified `#[allow]` + comment.
-4. Commit (`fix:` or `chore:` prefix), push, let CI re-run. Repeat until green.
+1. Capture the pushed SHA: `git rev-parse HEAD`.
+2. Poll `mcp__github__get_commit` for that SHA (or `mcp__github__pull_request_read` for the PR — whichever exposes check-run/status data in this MCP server). Inspect every check run / status context.
+3. Poll interval: start at 30s, back off to 60s after 3 min, cap at 2 min. Give up and surface the state to the user after ~20 min of `in_progress`/`queued` so the user can intervene.
+4. Classify the aggregate state:
+   - **All required checks `success`** → CI is green, proceed to Step 7.
+   - **Any `failure`/`cancelled`/`timed_out`/`action_required`** → fix loop below.
+   - **Any `in_progress`/`queued`/`pending`** → keep polling.
+5. On failure:
+   1. Read the failing check's log URL from the `get_commit` payload; fetch the log (or use `mcp__github__list_commits` → `get_commit` to drill into the check run if needed).
+   2. Reproduce locally when possible (`cargo fmt`/`clippy`/`test`).
+   3. Fix the root cause — never `--no-verify`, never disable a failing test, never mask a clippy lint without a justified `#[allow]` + comment.
+   4. Commit (`fix:` or `chore:` prefix), push, and go back to step 1 with the new head SHA. Repeat until green.
+6. If a webhook CI event does arrive while you're polling, fine — but never *skip* a poll because the webhook said something. The poll is authoritative.
 
 ## Step 7 — Copilot review loop
 
@@ -118,7 +127,7 @@ Copilot reviews the PR diff against `develop`. A dirty merge state produces nois
    - Re-run the full local gate after resolution: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p xagent-sandbox`.
    - Commit with a `chore: merge develop into <branch>` (or `fix:` if the resolution involved behavior changes) — never amend an existing commit.
    - `git push`. If the remote rejected because someone else pushed meanwhile, `git pull --rebase` and retry.
-5. Wait for CI to go green on the merge commit before requesting review (loop back to Step 6 if it fails).
+5. Actively poll CI on the merge commit per Step 6 until it goes green. Do not assume success from silence — the webhook subscription is not reliable for CI status. Loop back to Step 6's fix path if it fails.
 
 Only then call `mcp__github__request_copilot_review`.
 

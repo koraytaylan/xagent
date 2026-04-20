@@ -283,8 +283,8 @@ Brain capacity parameters. These are not implementation details — they are the
 **Presets**:
 
 - **`BrainConfig::default()`** — Balanced defaults. Good starting point for most experiments. 128 memory slots, 16 processing slots, moderate learning and decay. Enough capacity to learn multiple survival skills while still maintaining prioritization pressure.
-- **`BrainConfig::tiny()`** — Minimal capacity (24 memory, 8 processing, 32 visual, 16 representation). Use this to observe how severe constraints shape behavior: the agent forgets quickly, attends narrowly, and develops strong habits. Interesting for studying capacity-driven cognition.
-- **`BrainConfig::large()`** — More capacity (512 memory, 32 processing, 128 visual, 64 representation). Slower emergence but richer eventual behavior. The agent can maintain more patterns, recall more context, and form finer-grained representations. Use this when you want to see what the architecture can do without tight constraints.
+- **`BrainConfig::tiny()`** — Minimal capacity (24 memory, 8 processing, 32 visual). Use this to observe how severe constraints shape behavior: the agent forgets quickly, attends narrowly, and develops strong habits. Interesting for studying capacity-driven cognition. `representation_dimension` is locked to `ENCODED_DIMENSION = 128` across all presets (see issue #106).
+- **`BrainConfig::large()`** — More capacity (512 memory, 32 processing, 128 visual). Slower emergence but richer eventual behavior. The agent can maintain more patterns, recall more context, and form finer-grained representations. `representation_dimension` is locked to `ENCODED_DIMENSION = 128` across all presets (see issue #106).
 
 #### `WorldConfig`
 

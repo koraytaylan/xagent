@@ -100,7 +100,7 @@ This is analogous to how biological organisms don't have explicit goals -- they 
 The brain has finite resources:
 - A fixed-size memory (`MEMORY_CAP = 128` patterns per agent)
 - A per-tick recall budget (`RECALL_K = 16` top patterns)
-- A fixed-dimension representation space (`DIM = 32`)
+- A fixed-dimension representation space (`ENCODED_DIMENSION = 128`)
 
 These constraints aren't limitations to be engineered around -- they are **generative**. Because the brain can't attend to everything, it must select. Because memory is finite, it must forget. Because the representation is compressed, it must abstract. These constraints give rise to attention, habit formation, chunking, and other cognitive phenomena without any of them being explicitly programmed.
 
@@ -356,21 +356,21 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ### 6.2 Encoding (Pass 2) -- `encode.wgsl`
 
-**What it does**: Projects the 217-dimensional feature vector into a 32-dimensional encoded representation via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 217 inputs compressed to 32 outputs, forcing the brain to learn what matters.
+**What it does**: Projects the 217-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 217 inputs compressed to 128 outputs, forcing the brain to learn what matters.
 
 **How it works**:
 
 ```
-encoded[d] = fast_tanh( sum_f( features[f] * weights[f * DIM + d] ) + biases[d] )
+encoded[d] = fast_tanh( sum_f( features[f] * weights[f * ENCODED_DIMENSION + d] ) + biases[d] )
 ```
 
-For each of the 32 output dimensions, the shader computes a weighted sum across all 217 features (column-major weight layout: `weights[f * DIM + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
+For each of the 128 output dimensions, the shader computes a weighted sum across all 217 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
 
 **Weight initialization** (in `buffers::init_brain_state`): Xavier/Glorot uniform -- `uniform(-scale, scale)` where `scale = 1/sqrt(FEATURE_COUNT)`. This prevents tanh saturation at initialization.
 
-**Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x DIM]`, indexed as `[f * DIM + d]`). This layout means each output dimension's weights are scattered across memory at stride `DIM` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
+**Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x ENCODED_DIMENSION]`, indexed as `[f * ENCODED_DIMENSION + d]`). This layout means each output dimension's weights are scattered across memory at stride `ENCODED_DIMENSION` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
 
-**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA values + 25 non-visual features = 217 inputs compressed to 32 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
+**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA values + 25 non-visual features = 217 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
 
 ---
 

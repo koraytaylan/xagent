@@ -94,7 +94,7 @@ Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
 1. **Feature Extract** — Extracts 217 features from the packed sensory input (192 RGBA vision + 48 depth + 27 non-visual). This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
 
-2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 32-dimensional encoded state. This fixed-size representation is the common currency of all downstream passes.
+2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 
 3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
 
@@ -264,9 +264,11 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 
 | Preset | `memory_capacity` | `processing_slots` | `visual_encoding_size` | `representation_dimension` | `learning_rate` | `decay_rate` | `distress_exponent` | `habituation_sensitivity` | `max_curiosity_bonus` | `fatigue_recovery_sensitivity` | `fatigue_floor` |
 |--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tiny** | 24 | 8 | 32 | 16 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
-| **default** | 128 | 16 | 64 | 32 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
-| **large** | 512 | 32 | 128 | 64 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **tiny** | 24 | 8 | 32 | 128 | 0.08 | 0.002 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **default** | 128 | 16 | 64 | 128 | 0.05 | 0.001 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+| **large** | 512 | 32 | 128 | 128 | 0.03 | 0.0005 | 2.0 | 20.0 | 0.6 | 8.0 | 0.1 |
+
+> `representation_dimension` is **locked (compile-time)** to `ENCODED_DIMENSION = 128` — all presets carry `128`; preset-specific overrides would be ignored by the kernel. See issue #106.
 
 **Parameter effects:**
 
@@ -412,7 +414,7 @@ xagent/
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
 │   │           ├── feature_extract.wgsl  # Pass 1: sensory → 217 features
-│   │           ├── encode.wgsl           # Pass 2: features × weights → 32-dim encoded
+│   │           ├── encode.wgsl           # Pass 2: features × weights → 128-dim encoded
 │   │           ├── habituate_homeo.wgsl  # Pass 3: habituation EMA + homeostasis
 │   │           ├── recall_score.wgsl     # Pass 4: cosine similarity scoring
 │   │           ├── recall_topk.wgsl      # Pass 5: top-16 selection

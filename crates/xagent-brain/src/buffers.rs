@@ -8,7 +8,15 @@
 //! Integer values (cursors, counts, ticks) are stored as f32 and cast
 //! via bitcast in WGSL. Safe for exact integers up to 2^24 = 16,777,216.
 
+use std::sync::atomic::AtomicBool;
+
 use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
+
+/// First-hit guard for the `representation_dimension` vs `ENCODED_DIMENSION`
+/// mismatch warning in `build_config_for`. `build_config_for` runs on every
+/// `GpuKernel::reset_agents*` and on each evolution-spawned config, so without
+/// this guard a single bad saved config would spam the log across a long run.
+static REPR_DIM_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ── Dimensions ───────────────────────────────────────────────────────
 
@@ -522,14 +530,18 @@ pub fn build_config(config: &BrainConfig) -> Vec<f32> {
 ///
 /// `representation_dimension` is locked to the compile-time `ENCODED_DIMENSION`
 /// constant (WGSL workgroup arrays cannot be runtime-sized). If the provided
-/// `BrainConfig` disagrees, a warning is logged and `ENCODED_DIMENSION` wins.
-/// See issue #106 for the field taxonomy.
+/// `BrainConfig` disagrees, a warning is logged once per process (de-duped via
+/// `REPR_DIM_MISMATCH_WARNED` so `reset_agents*` and evolution breeding don't
+/// spam the log) and `ENCODED_DIMENSION` wins. See issue #106 for the field
+/// taxonomy.
 pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> {
-    if config.representation_dimension != ENCODED_DIMENSION {
+    if config.representation_dimension != ENCODED_DIMENSION
+        && !REPR_DIM_MISMATCH_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         log::warn!(
             "BrainConfig.representation_dimension={} does not match compile-time \
              ENCODED_DIMENSION={}; the kernel uses ENCODED_DIMENSION and ignores the \
-             config value (see issue #106).",
+             config value (see issue #106). Further mismatches this run will be silent.",
             config.representation_dimension,
             ENCODED_DIMENSION,
         );

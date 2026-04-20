@@ -41,13 +41,13 @@ pub struct BrainConfig {
     /// removed in a future release. Not mutated by evolution.
     pub visual_encoding_size: usize,
     /// **Locked (compile-time).** Length of the internal representation
-    /// vector. Must equal `xagent_brain::buffers::ENCODED_DIMENSION` (currently
-    /// 128) — the kernel uses that constant to size encoder weights,
-    /// predictor weights, pattern rows, and workgroup arrays, none of which
-    /// are resizable at runtime. The value in this struct is a read-only
-    /// echo of that constant; `build_config_for` writes `ENCODED_DIMENSION`
-    /// into the GPU config slot regardless and logs a warning if the config
-    /// value disagrees. Not mutated by evolution and not exposed in the UI.
+    /// vector. Must equal `xagent_brain::buffers::ENCODED_DIMENSION` — the
+    /// kernel uses that constant to size encoder weights, predictor weights,
+    /// pattern rows, and workgroup arrays, none of which are resizable at
+    /// runtime. The value in this struct is a read-only echo of that
+    /// constant; `build_config_for` writes `ENCODED_DIMENSION` into the GPU
+    /// config slot regardless and logs a warning if the config value
+    /// disagrees. Not mutated by evolution and not exposed in the UI.
     #[serde(alias = "representation_dim")]
     pub representation_dimension: usize,
     /// Base learning rate for association updates.

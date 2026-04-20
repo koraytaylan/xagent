@@ -105,7 +105,24 @@ For every `<github-webhook-activity>` event with CI failures:
 
 ## Step 7 — Copilot review loop
 
-Once CI is green (or immediately if CI is still running but you've pushed all planned changes), call `mcp__github__request_copilot_review` on the PR.
+### 7a. Pre-review sync (run before **every** `request_copilot_review` call)
+
+Copilot reviews the PR diff against `develop`. A dirty merge state produces noisy or misleading reviews, so sync first:
+
+1. `git fetch origin develop`.
+2. Check mergeability — either inspect the PR (`mcp__github__pull_request_read` → `mergeable`/`mergeable_state`) or attempt a local merge dry-run (`git merge --no-commit --no-ff origin/develop` then `git merge --abort`).
+3. If the branch is behind but clean, fast-forward by rebasing or using `mcp__github__update_pull_request_branch`, then `git push`.
+4. If there are conflicts, resolve them locally:
+   - `git merge origin/develop` (preferred over rebase on a shared PR branch — preserves review anchors and avoids force-push).
+   - Open each conflicted file, reconcile by hand. Prefer semantic merges over textual ones: re-apply the intent of both sides, don't just accept one.
+   - Re-run the full local gate after resolution: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p xagent-sandbox`.
+   - Commit with a `chore: merge develop into <branch>` (or `fix:` if the resolution involved behavior changes) — never amend an existing commit.
+   - `git push`. If the remote rejected because someone else pushed meanwhile, `git pull --rebase` and retry.
+5. Wait for CI to go green on the merge commit before requesting review (loop back to Step 6 if it fails).
+
+Only then call `mcp__github__request_copilot_review`.
+
+### 7b. Processing review comments
 
 For each review comment that arrives:
 
@@ -116,7 +133,7 @@ For each review comment that arrives:
    - **Out of scope.** If a fix is valid but exceeds the scope defined in step 1, open a follow-up issue via `mcp__github__issue_write` (title + body describing the deferred work, labeled as tracked from this PR). Link it with `mcp__github__sub_issue_write` if appropriate. Reply on the comment with the new issue number and a short explanation. Resolve the thread.
 3. Use `mcp__github__add_reply_to_pull_request_comment` for replies — keep them concrete, cite files/lines, avoid filler.
 
-After **every** push that addresses review feedback, call `mcp__github__request_copilot_review` again so Copilot re-reads the updated diff.
+After **every** push that addresses review feedback, repeat step 7a (sync + conflict check) before calling `mcp__github__request_copilot_review` again so Copilot re-reads the updated diff against a clean merge.
 
 Loop until Copilot's next review emits zero new comments.
 
@@ -126,7 +143,7 @@ Preconditions before merge:
 
 - CI is green on the latest commit.
 - No unresolved review threads.
-- Branch is up to date with `develop` — if behind, `mcp__github__update_pull_request_branch` or rebase locally and push.
+- Branch is up to date with `develop` and free of merge conflicts. If behind, sync via step 7a (`update_pull_request_branch` if clean, otherwise merge locally and resolve). Never rely on GitHub's web "resolve conflicts" flow — do it locally so the gate runs.
 
 Merge with `mcp__github__merge_pull_request`, `merge_method: "merge"` (creates a merge commit, as requested). Use the PR title as the merge commit title.
 
@@ -158,4 +175,5 @@ End your turn with a 1–2 sentence summary: PR URL, merge status, and issue sta
 - Never skip hooks (`--no-verify`, `--no-gpg-sign`) unless the user explicitly asks.
 - Never mark a thread resolved without either applying the change, declining with a reason, or filing a follow-up.
 - Never merge with red CI or unresolved threads.
+- Never request a Copilot review while the PR has merge conflicts — resolve them first (step 7a).
 - Never invent file paths, line numbers, or commit SHAs — read them first.

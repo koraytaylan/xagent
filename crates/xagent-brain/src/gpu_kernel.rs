@@ -2,7 +2,56 @@
 //!
 //! Composes all phase WGSL fragments into one shader, creates a unified
 //! buffer set and pipeline, and runs N ticks per dispatch(1,1,1).
+//!
+//! # Shader composition contract
+//!
+//! All pipelines start with `common.wgsl`, then concatenate phase-specific
+//! fragments in a fixed order:
+//!
+//! | Pipeline | Fragments after `common.wgsl`                                         |
+//! |----------|-----------------------------------------------------------------------|
+//! | physics  | phase_clear, phase_food_grid, phase_physics, phase_death,             |
+//! |          | phase_food_detect, phase_food_respawn, phase_agent_grid,              |
+//! |          | phase_collision, physics_tick                                         |
+//! | vision   | phase_vision, vision_tick                                             |
+//! | brain    | brain_passes, brain_tick                                              |
+//! | kernel   | brain_passes, kernel_tick                                             |
+//! | global   | phase_clear, phase_food_grid, phase_food_respawn, phase_agent_grid,   |
+//! |          | phase_collision, global_tick                                          |
+//! | prepare  | phase_prepare_dispatch                                                |
+//!
+//! ## Pipeline-overridable constants
+//!
+//! `VISION_W` and `VISION_H` are declared as `override` in `common.wgsl` and
+//! supplied by [`vision_override_constants`] at pipeline creation. All derived
+//! sizes (`VISION_RAYS`, `FEATURE_COUNT`, the `O_*` offset cascade,
+//! `BRAIN_STRIDE`, `FEATURES_STRIDE`) are also `override`-expressions chained
+//! from these two inputs. No string replacement is required.
+//!
+//! ## Subgroup markers (stability contract)
+//!
+//! When `wgpu::Features::SUBGROUP` is available, [`apply_subgroup_markers`]
+//! splices in the subgroup builtin and the subgroup-accelerated bitonic sort.
+//! When subgroup is absent, the same function collapses the placeholders to
+//! no-ops and the workgroup-memory fallback in `brain_passes.wgsl` is used.
+//!
+//! | Marker                                    | Site                                        |
+//! |-------------------------------------------|---------------------------------------------|
+//! | `// SUBGROUP_ENTRY_PARAMS`                | brain_tick.wgsl entry params                |
+//! | `// KERNEL_SUBGROUP_ENTRY_PARAMS`         | kernel_tick.wgsl entry params               |
+//! | `/* SUBGROUP_TOPK_PARAMS */`              | brain_passes.wgsl `coop_recall_topk`        |
+//! | `/* SUBGROUP_TOPK_ARGS */`                | call sites of `coop_recall_topk`            |
+//! | `/* KERNEL_SUBGROUP_TOPK_PARAMS */`       | kernel_tick.wgsl `brain_tick_inner`         |
+//! | `/* KERNEL_SUBGROUP_TOPK_ARGS */`         | `brain_tick_inner` -> `coop_recall_topk`    |
+//! | `/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */`   | `kernel_tick` -> `brain_tick_inner`         |
+//! | `// BEGIN_BITONIC_SORT`                   | fallback bitonic sort start (brain_passes)  |
+//! | `// END_BITONIC_SORT`                     | fallback bitonic sort end (brain_passes)    |
+//!
+//! Tests in `gpu_kernel::tests::shader_composition` assert presence and
+//! symmetry of every marker across the files that reference them. Do not
+//! rename or move markers without updating both the helper and the tests.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -10,6 +59,91 @@ use wgpu;
 use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::buffers::*;
+
+/// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
+/// dedicated WGSL file so the fragment stays validator-friendly.
+const BITONIC_SORT_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sort_subgroup.wgsl");
+
+/// Build the pipeline override map that feeds `VISION_W` / `VISION_H`
+/// into the WGSL override cascade. The returned map is the single source
+/// of truth for the vision-grid dimensions at pipeline creation time.
+fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
+    let mut map = HashMap::new();
+    map.insert("VISION_W".to_string(), f64::from(layout.vision_width));
+    map.insert("VISION_H".to_string(), f64::from(layout.vision_height));
+    map
+}
+
+/// Splice subgroup markers into a composed shader source.
+///
+/// `src` is expected to contain every marker listed in the module-level
+/// doc block. When `has_subgroup` is true, markers are replaced with their
+/// subgroup-enabled substitutions (including the bitonic-sort fragment from
+/// `bitonic_sort_subgroup.wgsl`). When false, markers collapse to no-ops and
+/// the workgroup-memory fallback in `brain_passes.wgsl` is retained.
+fn apply_subgroup_markers(src: &str, has_subgroup: bool) -> String {
+    let mut out = src.to_string();
+    if has_subgroup {
+        // Entry-point builtins
+        let builtin = "@builtin(subgroup_invocation_id) sgid: u32,";
+        out = out.replace("// SUBGROUP_ENTRY_PARAMS", builtin);
+        out = out.replace("// KERNEL_SUBGROUP_ENTRY_PARAMS", builtin);
+
+        // Function signatures and call sites
+        out = out.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+        out = out.replace("/* SUBGROUP_TOPK_ARGS */", ", sgid");
+        out = out.replace("/* KERNEL_SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
+        out = out.replace("/* KERNEL_SUBGROUP_TOPK_ARGS */", ", sgid");
+        out = out.replace("/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", ", sgid");
+
+        // Replace the fallback bitonic-sort body with the subgroup variant.
+        // `replace_fenced` reports an error if the fence markers disappear.
+        out = replace_fenced(
+            &out,
+            "// BEGIN_BITONIC_SORT",
+            "// END_BITONIC_SORT",
+            BITONIC_SORT_SUBGROUP_SRC,
+        );
+    } else {
+        // Strip placeholder comments so the fallback code compiles cleanly.
+        out = out.replace("// SUBGROUP_ENTRY_PARAMS\n", "");
+        out = out.replace("// KERNEL_SUBGROUP_ENTRY_PARAMS\n", "");
+        out = out.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
+        out = out.replace(" /* SUBGROUP_TOPK_ARGS */", "");
+        out = out.replace(" /* KERNEL_SUBGROUP_TOPK_PARAMS */", "");
+        out = out.replace(" /* KERNEL_SUBGROUP_TOPK_ARGS */", "");
+        out = out.replace(" /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", "");
+    }
+    out
+}
+
+/// Replace every region enclosed by `begin`/`end` (inclusive) with
+/// `replacement`. Logs an error and returns the input untouched if either
+/// marker is missing — callers treat this as a loud signal that the
+/// composition contract has drifted.
+fn replace_fenced(src: &str, begin: &str, end: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0;
+    let mut found_any = false;
+    while let Some(begin_rel) = src[cursor..].find(begin) {
+        let begin_abs = cursor + begin_rel;
+        let Some(end_rel) = src[begin_abs..].find(end) else {
+            log::error!("[GpuKernel] Unmatched composition fence: {begin} without trailing {end}");
+            return src.to_string();
+        };
+        let end_abs = begin_abs + end_rel + end.len();
+        out.push_str(&src[cursor..begin_abs]);
+        out.push_str(replacement);
+        cursor = end_abs;
+        found_any = true;
+    }
+    if !found_any {
+        log::error!("[GpuKernel] Composition fence {begin}..{end} not found — subgroup sort was not spliced in");
+        return src.to_string();
+    }
+    out.push_str(&src[cursor..]);
+    out
+}
 
 /// Number of async staging slots for state readback.
 /// Six slots give async readback additional headroom while keeping the GPU
@@ -506,20 +640,12 @@ impl GpuKernel {
             bytemuck::cast_slice(&build_config_for(brain_config, &layout)),
         );
 
-        // ── String-replace vision grid dimensions in common shader ──
-        let common_src = include_str!("shaders/kernel/common.wgsl")
-            .replace(
-                "const VISION_W: u32 = 8u;",
-                &format!("const VISION_W: u32 = {}u;", layout.vision_width),
-            )
-            .replace(
-                "const VISION_H: u32 = 6u;",
-                &format!("const VISION_H: u32 = {}u;", layout.vision_height),
-            );
+        // ── Compose shader sources (see module-level composition contract) ──
+        let common_src = include_str!("shaders/kernel/common.wgsl");
 
-        // ── Compose physics shader ──
+        // Physics pipeline: common + phase fragments + physics entry
         let physics_source = [
-            &common_src,
+            common_src,
             include_str!("shaders/kernel/phase_clear.wgsl"),
             include_str!("shaders/kernel/phase_food_grid.wgsl"),
             include_str!("shaders/kernel/phase_physics.wgsl"),
@@ -532,176 +658,39 @@ impl GpuKernel {
         ]
         .join("\n");
 
-        // ── Compose vision shader ──
+        // Vision pipeline: common + vision fragments + vision entry
         let vision_source = [
-            &common_src,
+            common_src,
             include_str!("shaders/kernel/phase_vision.wgsl"),
             include_str!("shaders/kernel/vision_tick.wgsl"),
         ]
         .join("\n");
 
-        // ── Compose brain shader ──
-        let mut brain_source = format!(
-            "{}\n{}",
-            &common_src,
-            include_str!("shaders/kernel/brain_tick.wgsl")
+        // Brain pipeline: common + brain_passes + brain entry
+        let brain_source = apply_subgroup_markers(
+            &[
+                common_src,
+                include_str!("shaders/kernel/brain_passes.wgsl"),
+                include_str!("shaders/kernel/brain_tick.wgsl"),
+            ]
+            .join("\n"),
+            has_subgroup,
         );
 
-        // Subgroup-accelerated bitonic sort (shared between brain and kernel shaders)
-        let subgroup_sort = r#"
-    // ── Subgroup-accelerated stages 0–4 (15 barrier-free passes) ──
-    // Each of 128 threads holds one element in registers.
-    // subgroupShuffle exchanges values within 32-wide subgroups.
-    var my_val: f32 = -3.0;
-    var my_index: u32 = 0u;
-    if (tid < MEMORY_CAP) {
-        my_val = s_similarities[tid];
-        my_index = shared_sort_indices[tid];
-    }
-
-    for (var stage: u32 = 0u; stage < 5u; stage = stage + 1u) {
-        for (var step: u32 = 0u; step <= stage; step = step + 1u) {
-            if (tid < MEMORY_CAP) {
-                let half = 1u << (stage - step);
-                let partner_tid = tid ^ half;
-                let partner_val = subgroupShuffle(my_val, sgid ^ half);
-                let partner_idx = subgroupShuffle(my_index, sgid ^ half);
-
-                let i = min(tid, partner_tid);
-                let descending = ((i >> (stage + 1u)) & 1u) == 0u;
-                let i_am_low = tid < partner_tid;
-                let want_max = i_am_low == descending;
-                if ((my_val < partner_val) == want_max) {
-                    my_val = partner_val;
-                    my_index = partner_idx;
-                }
-            }
-            // No barrier needed — subgroup ops are synchronous within subgroup
-        }
-    }
-
-    // Write back to shared memory for stages 5–6
-    if (tid < MEMORY_CAP) {
-        s_similarities[tid] = my_val;
-        shared_sort_indices[tid] = my_index;
-    }
-    workgroupBarrier();
-
-    // ── Shared-memory stages 5–6 (13 passes with barriers) ──
-    for (var stage: u32 = 5u; stage < 7u; stage = stage + 1u) {
-        for (var step: u32 = 0u; step <= stage; step = step + 1u) {
-            if (tid < 64u) {
-                let block_size = 1u << (stage + 1u - step);
-                let half = block_size >> 1u;
-                let group = tid / half;
-                let local_id = tid % half;
-                let i = group * block_size + local_id;
-                let j = i + half;
-                let descending = ((i >> (stage + 1u)) & 1u) == 0u;
-
-                let val_i = s_similarities[i];
-                let val_j = s_similarities[j];
-                let idx_i = shared_sort_indices[i];
-                let idx_j = shared_sort_indices[j];
-
-                let should_swap = (descending && val_i < val_j) || (!descending && val_i > val_j);
-                if (should_swap) {
-                    s_similarities[i] = val_j;
-                    s_similarities[j] = val_i;
-                    shared_sort_indices[i] = idx_j;
-                    shared_sort_indices[j] = idx_i;
-                }
-            }
-            workgroupBarrier();
-        }
-    }
-"#;
-
-        if has_subgroup {
-            // Add subgroup builtins to entry point
-            brain_source = brain_source.replace(
-                "// SUBGROUP_ENTRY_PARAMS",
-                "@builtin(subgroup_invocation_id) sgid: u32,",
-            );
-
-            // Add sgid to coop_recall_topk signature and call
-            brain_source = brain_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
-            brain_source = brain_source.replace("/* SUBGROUP_TOPK_ARGS */", ", sgid");
-
-            // Find and replace the bitonic sort block
-            let begin_marker = "// BEGIN_BITONIC_SORT";
-            let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) = (
-                brain_source.find(begin_marker),
-                brain_source.find(end_marker),
-            ) {
-                let end_pos = end_pos + end_marker.len();
-                brain_source.replace_range(begin_pos..end_pos, subgroup_sort);
-            } else {
-                log::error!("[GpuKernel] Subgroup sort markers not found in brain shader — falling back to shared-memory sort");
-            }
-        } else {
-            // Remove placeholder comments for non-subgroup path
-            brain_source = brain_source.replace("// SUBGROUP_ENTRY_PARAMS\n", "");
-            brain_source = brain_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
-            brain_source = brain_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
-        }
-
-        // ── Compose fused kernel shader ──
-        // brain_tick.wgsl functions (strip entry point) + kernel_tick.wgsl
-        let brain_functions_src = include_str!("shaders/kernel/brain_tick.wgsl");
-        let brain_fn_end = brain_functions_src
-            .find("@compute @workgroup_size(256)\nfn brain_tick(")
-            .or_else(|| brain_functions_src.find("@compute @workgroup_size(256)\r\nfn brain_tick("))
-            .unwrap_or(brain_functions_src.len());
-        let brain_fns_only = &brain_functions_src[..brain_fn_end];
-
-        let mut kernel_source = format!(
-            "{}\n{}\n{}",
-            &common_src,
-            brain_fns_only,
-            include_str!("shaders/kernel/kernel_tick.wgsl"),
+        // Fused kernel pipeline: common + brain_passes + kernel entry
+        let kernel_source = apply_subgroup_markers(
+            &[
+                common_src,
+                include_str!("shaders/kernel/brain_passes.wgsl"),
+                include_str!("shaders/kernel/kernel_tick.wgsl"),
+            ]
+            .join("\n"),
+            has_subgroup,
         );
 
-        if has_subgroup {
-            kernel_source = kernel_source.replace(
-                "// KERNEL_SUBGROUP_ENTRY_PARAMS",
-                "@builtin(subgroup_invocation_id) sgid: u32,",
-            );
-            kernel_source =
-                kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
-            kernel_source = kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_ARGS */", ", sgid");
-            kernel_source =
-                kernel_source.replace("/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", ", sgid");
-
-            // Also replace brain_tick.wgsl's own markers (included via brain_fns_only)
-            kernel_source = kernel_source.replace("/* SUBGROUP_TOPK_PARAMS */", ", sgid: u32");
-            kernel_source = kernel_source.replace("/* SUBGROUP_TOPK_ARGS */", ", sgid");
-
-            let begin_marker = "// BEGIN_BITONIC_SORT";
-            let end_marker = "// END_BITONIC_SORT";
-            if let (Some(begin_pos), Some(end_pos)) = (
-                kernel_source.find(begin_marker),
-                kernel_source.find(end_marker),
-            ) {
-                let end_pos = end_pos + end_marker.len();
-                kernel_source.replace_range(begin_pos..end_pos, subgroup_sort);
-            } else {
-                log::error!("[GpuKernel] Subgroup sort markers not found in kernel shader");
-            }
-        } else {
-            kernel_source = kernel_source.replace("// KERNEL_SUBGROUP_ENTRY_PARAMS\n", "");
-            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_PARAMS */", "");
-            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_ARGS */", "");
-            kernel_source = kernel_source.replace(" /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */", "");
-            // Also strip brain_tick.wgsl's own markers
-            kernel_source = kernel_source.replace(" /* SUBGROUP_TOPK_PARAMS */", "");
-            kernel_source = kernel_source.replace(" /* SUBGROUP_TOPK_ARGS */", "");
-        }
-
-        // ── Compose global-pass shader ──
+        // Global pipeline: common + global fragments + global entry
         let global_source = [
-            &common_src,
+            common_src,
             include_str!("shaders/kernel/phase_clear.wgsl"),
             include_str!("shaders/kernel/phase_food_grid.wgsl"),
             include_str!("shaders/kernel/phase_food_respawn.wgsl"),
@@ -710,6 +699,15 @@ impl GpuKernel {
             include_str!("shaders/kernel/global_tick.wgsl"),
         ]
         .join("\n");
+
+        // Pipeline-overridable constants: VISION_W and VISION_H drive the
+        // entire vision/feature/brain-offset cascade via override-expressions
+        // in common.wgsl. All derived overrides evaluate at pipeline creation.
+        let vision_overrides = vision_override_constants(&layout);
+        let override_options = wgpu::PipelineCompilationOptions {
+            constants: &vision_overrides,
+            zero_initialize_workgroup_memory: true,
+        };
 
         // ── Explicit bind group layout (all 16 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
@@ -799,7 +797,7 @@ impl GpuKernel {
             layout: Some(&physics_layout),
             module: &physics_module,
             entry_point: Some("physics_tick"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
@@ -813,7 +811,7 @@ impl GpuKernel {
             layout: Some(&brain_layout),
             module: &vision_module,
             entry_point: Some("vision_tick"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
@@ -827,13 +825,13 @@ impl GpuKernel {
             layout: Some(&brain_layout),
             module: &brain_module,
             entry_point: Some("brain_tick"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
         // ── Create prepare_dispatch pipeline (indirect dispatch args) ──
         let prepare_source = [
-            &common_src,
+            common_src,
             include_str!("shaders/kernel/phase_prepare_dispatch.wgsl"),
         ]
         .join("\n");
@@ -846,7 +844,7 @@ impl GpuKernel {
             layout: Some(&brain_layout),
             module: &prepare_module,
             entry_point: Some("prepare_dispatch"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
@@ -870,7 +868,7 @@ impl GpuKernel {
             layout: Some(&brain_layout),
             module: &kernel_module,
             entry_point: Some("kernel_tick"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
@@ -884,7 +882,7 @@ impl GpuKernel {
             layout: Some(&global_layout),
             module: &global_module,
             entry_point: Some("global_tick"),
-            compilation_options: Default::default(),
+            compilation_options: override_options.clone(),
             cache: None,
         });
 
@@ -2292,35 +2290,278 @@ impl GpuKernel {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const BRAIN_PASSES_SRC: &str = include_str!("shaders/kernel/brain_passes.wgsl");
+    const BRAIN_TICK_SRC: &str = include_str!("shaders/kernel/brain_tick.wgsl");
+    const KERNEL_TICK_SRC: &str = include_str!("shaders/kernel/kernel_tick.wgsl");
+    const COMMON_SRC: &str = include_str!("shaders/kernel/common.wgsl");
+    const BITONIC_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sort_subgroup.wgsl");
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Pipeline-overridable constants — verify the cascade is declared with
+    // `override` and the host override map lists the canonical roots.
+    // ────────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn brain_tick_entry_point_marker_found_regardless_of_line_endings() {
-        let src = include_str!("shaders/kernel/brain_tick.wgsl");
-        let marker_lf = "@compute @workgroup_size(256)\nfn brain_tick(";
-        let marker_crlf = "@compute @workgroup_size(256)\r\nfn brain_tick(";
-
-        // Synthesize the opposite line-ending variant so both paths are exercised
-        let src_lf = src.replace("\r\n", "\n");
-        let src_crlf = src_lf.replace('\n', "\r\n");
-
+    fn vision_dimensions_are_pipeline_overridable() {
         assert!(
-            src_lf.find(marker_lf).is_some(),
-            "brain_tick entry point LF marker not found in LF-normalized source"
+            COMMON_SRC.contains("override VISION_W:"),
+            "common.wgsl must declare VISION_W as `override` for pipeline-level overrides"
         );
         assert!(
-            src_crlf.find(marker_crlf).is_some(),
-            "brain_tick entry point CRLF marker not found in CRLF-normalized source"
+            COMMON_SRC.contains("override VISION_H:"),
+            "common.wgsl must declare VISION_H as `override` for pipeline-level overrides"
+        );
+        assert!(
+            !COMMON_SRC.contains("const VISION_W:"),
+            "VISION_W must not have a stale const declaration — only `override`"
+        );
+        assert!(
+            !COMMON_SRC.contains("const VISION_H:"),
+            "VISION_H must not have a stale const declaration — only `override`"
         );
     }
 
     #[test]
-    fn brain_tick_subgroup_placeholders_are_symmetric() {
-        // Verify that brain_tick.wgsl's SUBGROUP_TOPK placeholders come in matched pairs
-        let src = include_str!("shaders/kernel/brain_tick.wgsl");
-        let params_count = src.matches("/* SUBGROUP_TOPK_PARAMS */").count();
-        let args_count = src.matches("/* SUBGROUP_TOPK_ARGS */").count();
+    fn derived_vision_constants_are_override_expressions() {
+        // Any constant that transitively references VISION_W/VISION_H must be
+        // `override`, otherwise WGSL validation will reject mixing const and
+        // override in the same expression.
+        for name in [
+            "VISION_RAYS",
+            "VISION_COLOR_COUNT",
+            "VISION_DEPTH_COUNT",
+            "SENSORY_STRIDE",
+            "FEATURE_COUNT",
+            "O_ENC_BIASES",
+            "O_PREDICTOR_WEIGHTS",
+            "O_MOVEMENT_SPEED",
+            "BRAIN_STRIDE",
+            "FEATURES_STRIDE",
+        ] {
+            let needle = format!("override {name}:");
+            assert!(
+                COMMON_SRC.contains(&needle),
+                "{name} must be declared `override` because it depends on VISION_W/VISION_H"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_override_map_covers_root_constants() {
+        let layout = BrainLayout::new(10, 7);
+        let map = vision_override_constants(&layout);
+        assert_eq!(map.get("VISION_W").copied(), Some(10.0));
+        assert_eq!(map.get("VISION_H").copied(), Some(7.0));
+        // Derived values chain through WGSL `override` expressions — they
+        // must NOT be set from Rust or the chain becomes two sources of truth.
+        assert!(!map.contains_key("FEATURE_COUNT"));
+        assert!(!map.contains_key("BRAIN_STRIDE"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Subgroup marker stability contract — every marker must appear where
+    // the composition helper expects it, and placeholder pairs must match.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn brain_tick_has_expected_subgroup_markers() {
+        assert!(
+            BRAIN_TICK_SRC.contains("// SUBGROUP_ENTRY_PARAMS"),
+            "brain_tick.wgsl must carry `// SUBGROUP_ENTRY_PARAMS` for the entry point"
+        );
+        assert!(
+            BRAIN_TICK_SRC.contains("/* SUBGROUP_TOPK_ARGS */"),
+            "brain_tick.wgsl must carry `/* SUBGROUP_TOPK_ARGS */` at the coop_recall_topk call"
+        );
+    }
+
+    #[test]
+    fn brain_passes_has_topk_param_marker_and_bitonic_fence() {
         assert_eq!(
-            params_count, args_count,
-            "SUBGROUP_TOPK_PARAMS and SUBGROUP_TOPK_ARGS must appear the same number of times"
+            BRAIN_PASSES_SRC
+                .matches("/* SUBGROUP_TOPK_PARAMS */")
+                .count(),
+            1,
+            "brain_passes.wgsl must declare exactly one SUBGROUP_TOPK_PARAMS marker"
+        );
+        assert!(
+            BRAIN_PASSES_SRC.contains("// BEGIN_BITONIC_SORT"),
+            "brain_passes.wgsl must open the BEGIN_BITONIC_SORT fence"
+        );
+        assert!(
+            BRAIN_PASSES_SRC.contains("// END_BITONIC_SORT"),
+            "brain_passes.wgsl must close the END_BITONIC_SORT fence"
+        );
+    }
+
+    #[test]
+    fn kernel_tick_has_expected_subgroup_markers() {
+        for marker in [
+            "// KERNEL_SUBGROUP_ENTRY_PARAMS",
+            "/* KERNEL_SUBGROUP_TOPK_PARAMS */",
+            "/* KERNEL_SUBGROUP_TOPK_ARGS */",
+            "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
+        ] {
+            assert!(
+                KERNEL_TICK_SRC.contains(marker),
+                "kernel_tick.wgsl must declare the `{marker}` marker"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_param_and_arg_counts_match_for_composed_brain_shader() {
+        // After concatenation, every SUBGROUP_TOPK_PARAMS site must have a
+        // matching ARGS site at the call, otherwise substitution leaves the
+        // shader with unbalanced function signatures.
+        let composed = [COMMON_SRC, BRAIN_PASSES_SRC, BRAIN_TICK_SRC].join("\n");
+        let params = composed.matches("/* SUBGROUP_TOPK_PARAMS */").count();
+        let args = composed.matches("/* SUBGROUP_TOPK_ARGS */").count();
+        assert_eq!(
+            params, args,
+            "SUBGROUP_TOPK_PARAMS and SUBGROUP_TOPK_ARGS must be balanced in the brain shader"
+        );
+    }
+
+    #[test]
+    fn top_k_param_and_arg_counts_match_for_composed_kernel_shader() {
+        let composed = [COMMON_SRC, BRAIN_PASSES_SRC, KERNEL_TICK_SRC].join("\n");
+        let k_params = composed
+            .matches("/* KERNEL_SUBGROUP_TOPK_PARAMS */")
+            .count();
+        let k_args = composed
+            .matches("/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */")
+            .count();
+        assert_eq!(
+            k_params, k_args,
+            "KERNEL_SUBGROUP_TOPK_PARAMS and KERNEL_SUBGROUP_TOPK_INNER_ARGS must be balanced"
+        );
+        let delegate_args = composed.matches("/* KERNEL_SUBGROUP_TOPK_ARGS */").count();
+        assert_eq!(
+            delegate_args, 1,
+            "KERNEL_SUBGROUP_TOPK_ARGS must appear exactly once at brain_tick_inner's delegate call"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // apply_subgroup_markers — both branches produce markerless output.
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn composed_brain_shader() -> String {
+        [COMMON_SRC, BRAIN_PASSES_SRC, BRAIN_TICK_SRC].join("\n")
+    }
+
+    fn composed_kernel_shader() -> String {
+        [COMMON_SRC, BRAIN_PASSES_SRC, KERNEL_TICK_SRC].join("\n")
+    }
+
+    fn assert_no_markers_remain(src: &str) {
+        for marker in [
+            "// SUBGROUP_ENTRY_PARAMS",
+            "// KERNEL_SUBGROUP_ENTRY_PARAMS",
+            "/* SUBGROUP_TOPK_PARAMS */",
+            "/* SUBGROUP_TOPK_ARGS */",
+            "/* KERNEL_SUBGROUP_TOPK_PARAMS */",
+            "/* KERNEL_SUBGROUP_TOPK_ARGS */",
+            "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
+        ] {
+            assert!(
+                !src.contains(marker),
+                "Marker `{marker}` should be substituted, found in output:\n{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn subgroup_path_substitutes_all_brain_markers() {
+        let out = apply_subgroup_markers(&composed_brain_shader(), true);
+        assert_no_markers_remain(&out);
+        assert!(
+            out.contains("subgroup_invocation_id"),
+            "subgroup path must splice in the subgroup builtin"
+        );
+        assert!(
+            out.contains("subgroupShuffle"),
+            "subgroup path must splice in the subgroup bitonic sort"
+        );
+        assert!(
+            !out.contains("// BEGIN_BITONIC_SORT"),
+            "fence markers must be removed after substitution"
+        );
+    }
+
+    #[test]
+    fn non_subgroup_path_strips_all_brain_markers() {
+        let out = apply_subgroup_markers(&composed_brain_shader(), false);
+        assert_no_markers_remain(&out);
+        assert!(
+            !out.contains("subgroup_invocation_id"),
+            "non-subgroup path must not reference subgroup builtins"
+        );
+        // Fences stay — the fallback sort body lives between them.
+        assert!(out.contains("// BEGIN_BITONIC_SORT"));
+        assert!(out.contains("// END_BITONIC_SORT"));
+    }
+
+    #[test]
+    fn subgroup_path_substitutes_all_kernel_markers() {
+        let out = apply_subgroup_markers(&composed_kernel_shader(), true);
+        assert_no_markers_remain(&out);
+        // Kernel shader concatenates brain_passes, so the subgroup sort must
+        // have been spliced there too.
+        assert!(out.contains("subgroupShuffle"));
+    }
+
+    #[test]
+    fn non_subgroup_path_strips_all_kernel_markers() {
+        let out = apply_subgroup_markers(&composed_kernel_shader(), false);
+        assert_no_markers_remain(&out);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Source-shape contract — brain_passes must NOT carry an entry point,
+    // so that kernel_tick can concatenate it without duplicate functions.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn brain_passes_has_no_entry_point() {
+        assert!(
+            !BRAIN_PASSES_SRC.contains("@compute"),
+            "brain_passes.wgsl must contain only helper functions, not an entry point"
+        );
+    }
+
+    #[test]
+    fn brain_tick_entry_point_is_present() {
+        assert!(
+            BRAIN_TICK_SRC.contains("@compute @workgroup_size(256)"),
+            "brain_tick.wgsl must declare the @compute entry point"
+        );
+        assert!(
+            BRAIN_TICK_SRC.contains("fn brain_tick("),
+            "brain_tick.wgsl must declare the brain_tick entry function"
+        );
+    }
+
+    #[test]
+    fn kernel_tick_entry_point_is_present() {
+        assert!(
+            KERNEL_TICK_SRC.contains("@compute @workgroup_size(256)"),
+            "kernel_tick.wgsl must declare the @compute entry point"
+        );
+        assert!(
+            KERNEL_TICK_SRC.contains("fn kernel_tick("),
+            "kernel_tick.wgsl must declare the kernel_tick entry function"
+        );
+    }
+
+    #[test]
+    fn bitonic_sort_subgroup_file_has_subgroup_shuffle() {
+        assert!(
+            BITONIC_SUBGROUP_SRC.contains("subgroupShuffle"),
+            "bitonic_sort_subgroup.wgsl must rely on subgroupShuffle — otherwise why live in a separate file"
         );
     }
 }

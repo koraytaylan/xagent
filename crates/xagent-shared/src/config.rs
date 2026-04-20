@@ -7,13 +7,34 @@
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the brain's capacity constraints.
+///
+/// Each field is tagged with its relationship to the live GPU kernel:
+///
+/// - **active** — directly shapes kernel behavior every tick.
+/// - **proxy (metabolic)** — only feeds the per-tick metabolic cost formula;
+///   the kernel's actual structural capacity is a compile-time constant and
+///   does not change with this value.
+/// - **legacy** — carried through config/UI/evolution for backwards
+///   compatibility but currently has no kernel-side effect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrainConfig {
-    /// Maximum number of patterns the memory can hold.
+    /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
+    /// via `metabolic_drain_per_tick` and `physics_state[P_MEMORY_CAP]`. The
+    /// kernel's actual pattern-memory size is fixed at
+    /// `xagent_brain::buffers::MEMORY_CAP = 128`, independent of this value.
+    /// Mutated by evolution; clamped to `[1, 2048]` at breeding time.
     pub memory_capacity: usize,
-    /// Maximum number of patterns that can be recalled/compared per tick.
+    /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
+    /// via `metabolic_drain_per_tick` and `physics_state[P_PROCESSING_SLOTS]`.
+    /// The kernel's actual recall width is fixed at
+    /// `xagent_brain::buffers::RECALL_K = 16`, independent of this value.
+    /// Mutated by evolution; clamped to `[1, 128]` at breeding time.
     pub processing_slots: usize,
-    /// Resolution of the visual encoder (downsampled from raw vision).
+    /// **Legacy.** Currently has no effect in the GPU kernel — there is no
+    /// visual-encoder downsampling stage that reads this field. Preserved
+    /// through breeding and serialization for backwards compatibility with
+    /// existing saved configs; will be either wired to a real encoder or
+    /// removed in a future release. Not mutated by evolution.
     pub visual_encoding_size: usize,
     /// Length of the internal representation vector.
     #[serde(alias = "representation_dim")]

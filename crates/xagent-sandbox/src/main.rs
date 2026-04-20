@@ -168,11 +168,14 @@ fn resolve_config(cli: &Cli) -> FullConfig {
 
 fn print_config(config: &FullConfig) {
     println!("── Active Configuration ──────────────────────────");
+    // `mem_cost` / `proc_cost` reflect the metabolic-cost proxies — the
+    // kernel's actual pattern-memory and recall widths are fixed constants
+    // (see `xagent_brain::buffers::{MEMORY_CAP, RECALL_K}`). `visual_encoding_size`
+    // is currently unused and omitted from this summary (see issue #106).
     println!(
-        "  Brain: capacity={} slots={} vis={} dim={} lr={} decay={}",
+        "  Brain: mem_cost={} proc_cost={} dim={} lr={} decay={}",
         config.brain.memory_capacity,
         config.brain.processing_slots,
-        config.brain.visual_encoding_size,
         config.brain.representation_dimension,
         config.brain.learning_rate,
         config.brain.decay_rate,
@@ -1106,8 +1109,10 @@ impl App {
             "[REPRODUCE] Agent {} (gen {}) → child Agent {} (gen {}) at ({:.1}, {:.1})",
             parent_id, parent_gen, id, child.generation, cx, cz
         );
+        // `mem_cost` / `proc_cost`: metabolic-cost proxies — kernel widths
+        // are fixed at MEMORY_CAP=128, RECALL_K=16 (see issue #106).
         println!(
-            "  Child config: cap={} slots={} dim={} lr={:.4} decay={:.4}",
+            "  Child config: mem_cost={} proc_cost={} dim={} lr={:.4} decay={:.4}",
             child.brain_config.memory_capacity,
             child.brain_config.processing_slots,
             child.brain_config.representation_dimension,

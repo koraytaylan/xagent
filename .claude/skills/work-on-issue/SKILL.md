@@ -92,25 +92,24 @@ Do not push on hook failure. Fix the root cause and create a new commit.
 2. If no open PR exists, create one with `mcp__github__create_pull_request` targeting `develop`:
    - Title: conventional-commit style, < 70 chars.
    - Body: Summary (1–3 bullets), Test Plan (checklist), and `Closes #<num>` (or `Refs #<num>` if scope is partial).
-3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching review events. **Do not rely on the subscription for CI status** — webhook delivery is lossy and CI-completion events can be dropped. Treat any CI event that does arrive as a hint, but always confirm with an active poll (Step 6).
+3. Subscribe to PR activity: `mcp__github__subscribe_pr_activity` for the PR number. Tell the user you're now watching CI + review events. Webhook delivery is best-effort — events can be dropped — so treat the subscription as the primary signal and use bounded-wait fallbacks (Step 6 for CI, Step 7c for Copilot) to keep progress from stalling when the event never arrives.
 
-## Step 6 — CI babysitting (active polling, not event-driven)
+## Step 6 — CI babysitting (webhook-first, bounded polling fallback)
 
-After every push, actively poll the head commit's check runs until CI concludes. Do not wait passively for webhooks.
+After every push, capture the head SHA (`git rev-parse HEAD`) and wait for CI to conclude using this policy:
 
-1. Capture the pushed SHA: `git rev-parse HEAD`.
-2. Poll `mcp__github__get_commit` for that SHA (or `mcp__github__pull_request_read` for the PR — whichever exposes check-run/status data in this MCP server). Inspect every check run / status context.
-3. Poll interval: start at 30s, back off to 60s after 3 min, cap at 2 min. Give up and surface the state to the user after ~20 min of `in_progress`/`queued` so the user can intervene.
-4. Classify the aggregate state:
+1. **Webhook window — 60 seconds.** Wait up to 1 minute for a `<github-webhook-activity>` event whose `head_sha`/`commit_sha` matches the pushed SHA. If a `check_run.completed` / `check_suite.completed` / `status` event arrives indicating conclusion, jump straight to step 3.
+2. **Poll fallback.** If the webhook window expires with no conclusion event (or if an event arrived but is ambiguous), start polling `mcp__github__get_commit` on the head SHA (or `mcp__github__pull_request_read` — whichever exposes check-run / status data). Poll cadence: every 30s for the first 3 min, then every 60s, capped at 2 min. Between polls, keep listening for webhook events — if one arrives, act on it immediately and reset the poll timer. Surface the state to the user after ~20 min of `in_progress`/`queued` so they can intervene.
+3. **Classify the aggregate state** (from the webhook payload or the latest poll):
    - **All required checks `success`** → CI is green, proceed to Step 7.
-   - **Any `failure`/`cancelled`/`timed_out`/`action_required`** → fix loop below.
-   - **Any `in_progress`/`queued`/`pending`** → keep polling.
-5. On failure:
-   1. Read the failing check's log URL from the `get_commit` payload; fetch the log (or use `mcp__github__list_commits` → `get_commit` to drill into the check run if needed).
-   2. Reproduce locally when possible (`cargo fmt`/`clippy`/`test`).
+   - **Any `failure` / `cancelled` / `timed_out` / `action_required`** → fix loop below.
+   - **Any `in_progress` / `queued` / `pending`** → keep waiting (webhook + poll).
+4. **On failure:**
+   1. Read the failing check's log URL from the `get_commit` payload or the webhook event; fetch the log (or use `mcp__github__list_commits` → `get_commit` to drill into the check run if needed).
+   2. Reproduce locally when possible (`cargo fmt` / `clippy` / `test`).
    3. Fix the root cause — never `--no-verify`, never disable a failing test, never mask a clippy lint without a justified `#[allow]` + comment.
-   4. Commit (`fix:` or `chore:` prefix), push, and go back to step 1 with the new head SHA. Repeat until green.
-6. If a webhook CI event does arrive while you're polling, fine — but never *skip* a poll because the webhook said something. The poll is authoritative.
+   4. Commit (`fix:` or `chore:` prefix), push, and return to step 1 with the new head SHA. Repeat until green.
+5. **Authority rule.** If a webhook says "success" and a poll says otherwise (or vice versa), trust the poll — the API reflects current state, webhooks may be stale.
 
 ## Step 7 — Copilot review loop
 
@@ -127,13 +126,21 @@ Copilot reviews the PR diff against `develop`. A dirty merge state produces nois
    - Re-run the full local gate after resolution: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p xagent-sandbox`.
    - Commit with a `chore: merge develop into <branch>` (or `fix:` if the resolution involved behavior changes) — never amend an existing commit.
    - `git push`. If the remote rejected because someone else pushed meanwhile, `git pull --rebase` and retry.
-5. Actively poll CI on the merge commit per Step 6 until it goes green. Do not assume success from silence — the webhook subscription is not reliable for CI status. Loop back to Step 6's fix path if it fails.
+5. Wait for CI on the merge commit per Step 6 (1-minute webhook window, then poll) until it goes green. Loop back to Step 6's fix path if it fails.
 
 Only then call `mcp__github__request_copilot_review`.
 
-### 7b. Processing review comments
+### 7b. Wait for the review (webhook-first, 5-minute fallback)
 
-For each review comment that arrives:
+After calling `mcp__github__request_copilot_review`:
+
+1. **Webhook window — 5 minutes.** Watch for `<github-webhook-activity>` events tagged as a Copilot review (`pull_request_review` with `user.login` matching the Copilot reviewer, or `pull_request_review_comment` from the same bot). When the `submitted`/`completed` event arrives, proceed to 7c with the event payload.
+2. **Poll fallback.** If 5 minutes pass with no review event, call `mcp__github__pull_request_read` to list reviews/comments and check whether Copilot has posted a review since the last request. Keep polling every 60s (capped at 2 min) while still listening for webhooks; after ~15 min with no review, surface to the user — Copilot may be disabled, rate-limited, or the request may have silently failed. Offer to re-request.
+3. **Authority rule.** The API is authoritative for "has Copilot reviewed yet" — a missing webhook does not mean no review exists.
+
+### 7c. Processing review comments
+
+For each review comment (from the webhook payload or the poll result):
 
 1. Read the comment and the referenced code carefully. Re-check against CONTRIBUTING.md — Copilot may be wrong about project-specific rules.
 2. Decide one of three outcomes:
@@ -142,7 +149,7 @@ For each review comment that arrives:
    - **Out of scope.** If a fix is valid but exceeds the scope defined in step 1, open a follow-up issue via `mcp__github__issue_write` (title + body describing the deferred work, labeled as tracked from this PR). Link it with `mcp__github__sub_issue_write` if appropriate. Reply on the comment with the new issue number and a short explanation. Resolve the thread.
 3. Use `mcp__github__add_reply_to_pull_request_comment` for replies — keep them concrete, cite files/lines, avoid filler.
 
-After **every** push that addresses review feedback, repeat step 7a (sync + conflict check) before calling `mcp__github__request_copilot_review` again so Copilot re-reads the updated diff against a clean merge.
+After **every** push that addresses review feedback, repeat step 7a (sync + conflict check), call `mcp__github__request_copilot_review` again, and re-enter step 7b so Copilot re-reads the updated diff against a clean merge.
 
 Loop until Copilot's next review emits zero new comments.
 

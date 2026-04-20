@@ -3,13 +3,23 @@
 // Loops over vision_stride brain cycles internally.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 //
-// SAFETY INVARIANT: one workgroup == one agent.
-// Several functions early-return when the agent is dead (P_ALIVE < 0.5).
-// Because all 256 threads in a workgroup share the same agent_id, they
-// all agree on the alive check, keeping barrier execution uniform.
-// If the kernel is ever restructured to pack multiple agents per workgroup,
-// the alive-check must move after all barriers or use a uniform control
-// flow pattern to avoid undefined behavior / GPU deadlocks.
+// SAFETY INVARIANT — barrier uniformity:
+// Multi-thread functions (`agent_food_detect`, `brain_tick_inner`) must reach
+// every `workgroupBarrier()` / `storageBarrier()` from all 256 threads. To
+// avoid relying on "all threads in this workgroup happen to evaluate the alive
+// flag identically", they:
+//   1. Read `P_ALIVE` once into a local `alive` variable.
+//   2. Wrap per-agent work in `if (alive) { ... }` blocks rather than
+//      early-returning.
+//   3. Keep barriers outside those blocks so they execute regardless of
+//      logical state.
+// This is robust against mid-kernel death transitions and hypothetical memory
+// corruption that could desynchronize the flag across threads.
+//
+// Single-thread helpers (`agent_physics`, `agent_death_respawn`) are invoked
+// from inside `if (tid == 0u) { ... }` blocks in the entry point and therefore
+// contain no barriers themselves; their internal early-returns only exit thread
+// 0's call, and all threads still reach the outer barrier after the `if` block.
 
 // EAT_RADIUS removed — read from wconfig via wc_f32(WC_FOOD_RADIUS)
 
@@ -20,8 +30,9 @@
 fn agent_physics(agent_id: u32, tick: u32) {
     let b = agent_id * PHYS_STRIDE;
 
-    // Safe to early-return: one workgroup == one agent, so all threads agree.
-    // See top-of-file invariant re: barrier uniformity.
+    // Called only from `if (tid == 0u) { ... }` in the entry point; contains
+    // no barriers, so an early return here affects only thread 0's progression
+    // through the caller and does not perturb workgroup barrier uniformity.
     let alive = physics_state[b + P_ALIVE];
     if alive < 0.5 { return; }
 
@@ -177,34 +188,42 @@ fn agent_physics(agent_id: u32, tick: u32) {
 fn agent_food_detect(agent_id: u32, tid: u32) {
     let b = agent_id * PHYS_STRIDE;
 
-    // Safe to early-return: one workgroup == one agent, so all threads agree.
-    // See top-of-file invariant re: barrier uniformity.
-    if physics_state[b + P_ALIVE] < 0.5 { return; }
+    // Read the alive flag once into a uniform local. All subsequent barriers
+    // must execute regardless of logical state — see top-of-file SAFETY
+    // INVARIANT. The scan and the thread-0 eat step are gated on `alive`; the
+    // reduction barriers below are not.
+    let alive = physics_state[b + P_ALIVE] >= 0.5;
 
-    let pos = vec3f(
-        physics_state[b + P_POS_X],
-        physics_state[b + P_POS_Y],
-        physics_state[b + P_POS_Z]);
-    let food_count = wc_u32(WC_FOOD_COUNT);
-    let eat_radius = wc_f32(WC_FOOD_RADIUS);
-    let eat_radius_sq = eat_radius * eat_radius;
-
-    // Each thread scans a slice of food_state
+    // Default "no candidate" sentinel values so the reduction runs safely even
+    // when the agent is dead (or a hypothetical divergence prevented the scan).
     var local_best_idx = 0xFFFFFFFFu;
     var local_best_dist_sq = 1e12;
-    for (var f = tid; f < food_count; f += 256u) {
-        if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
-        let fbase = f * FOOD_STATE_STRIDE;
-        let dx = pos.x - food_state[fbase + F_POS_X];
-        let dz = pos.z - food_state[fbase + F_POS_Z];
-        let d_sq = dx * dx + dz * dz;
-        if (d_sq < eat_radius_sq && d_sq < local_best_dist_sq) {
-            local_best_dist_sq = d_sq;
-            local_best_idx = f;
+
+    if (alive) {
+        let pos = vec3f(
+            physics_state[b + P_POS_X],
+            physics_state[b + P_POS_Y],
+            physics_state[b + P_POS_Z]);
+        let food_count = wc_u32(WC_FOOD_COUNT);
+        let eat_radius = wc_f32(WC_FOOD_RADIUS);
+        let eat_radius_sq = eat_radius * eat_radius;
+
+        // Each thread scans a slice of food_state
+        for (var f = tid; f < food_count; f += 256u) {
+            if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
+            let fbase = f * FOOD_STATE_STRIDE;
+            let dx = pos.x - food_state[fbase + F_POS_X];
+            let dz = pos.z - food_state[fbase + F_POS_Z];
+            let d_sq = dx * dx + dz * dz;
+            if (d_sq < eat_radius_sq && d_sq < local_best_dist_sq) {
+                local_best_dist_sq = d_sq;
+                local_best_idx = f;
+            }
         }
     }
 
-    // Two-phase shared-memory reduction (s_similarities/shared_sort_indices are 128 elements)
+    // Two-phase shared-memory reduction (s_similarities/shared_sort_indices are 128 elements).
+    // Runs unconditionally so both barriers are reached by every thread.
     // Phase 1: first 128 threads write directly
     if (tid < 128u) {
         s_similarities[tid] = local_best_dist_sq;
@@ -222,7 +241,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     }
     workgroupBarrier();
 
-    if (tid == 0u) {
+    if (tid == 0u && alive) {
         var best_idx = 0xFFFFFFFFu;
         var best_dist_sq = 1e12;
         for (var i = 0u; i < 128u; i++) {
@@ -249,6 +268,9 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
 
 fn agent_death_respawn(agent_id: u32, tick: u32) {
     let base = agent_id * PHYS_STRIDE;
+    // Called only from `if (tid == 0u) { ... }` in the entry point; contains
+    // no barriers, so an early return here affects only thread 0's progression
+    // through the caller and does not perturb workgroup barrier uniformity.
     if (physics_state[base + P_DIED_FLAG] < 0.5) { return; }
 
     // 1. Pick a safe spawn position
@@ -348,29 +370,35 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // ══════════════════════════════════════════════════════════════════════════
 
 fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
-    // Safe to early-return: one workgroup == one agent, so all threads agree.
-    // See top-of-file invariant re: barrier uniformity.
-    if (physics_state[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
+    // Read the alive flag once into a uniform local, then wrap every
+    // cooperative pass in `if (alive) { ... }`. Inter-pass barriers live
+    // outside the guards so they are reached by all 256 threads regardless of
+    // logical state — see top-of-file SAFETY INVARIANT. Passes with their own
+    // internal barriers (`coop_recall_topk`, `coop_predict_and_act`,
+    // `coop_learn_and_store`) stay consistent because the guard is uniform: all
+    // threads either enter together (hitting every internal barrier) or skip
+    // together (hitting none).
+    let alive = physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5;
 
-    coop_feature_extract(agent_id, tid);
+    if (alive) { coop_feature_extract(agent_id, tid); }
     workgroupBarrier();
 
-    coop_encode(agent_id, tid);
+    if (alive) { coop_encode(agent_id, tid); }
     workgroupBarrier();
 
-    coop_habituate_homeo(agent_id, tid);
+    if (alive) { coop_habituate_homeo(agent_id, tid); }
     storageBarrier(); workgroupBarrier();
 
-    coop_recall_score(agent_id, tid);
+    if (alive) { coop_recall_score(agent_id, tid); }
     workgroupBarrier();
 
-    coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */);
+    if (alive) { coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */); }
     storageBarrier(); workgroupBarrier();
 
-    coop_predict_and_act(agent_id, tid);
+    if (alive) { coop_predict_and_act(agent_id, tid); }
     storageBarrier(); workgroupBarrier();
 
-    coop_learn_and_store(agent_id, tid);
+    if (alive) { coop_learn_and_store(agent_id, tid); }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -390,7 +418,8 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // Non-visual proprioception (velocity, energy, etc.) follows the same lag
 // because it is also packed into sensory_buffer by that vision pass.  In this
 // function, the only physics state read directly from physics_state before
-// feature extraction is the same-cycle P_ALIVE flag used for the early-out.
+// feature extraction is the same-cycle P_ALIVE flag used as a uniform guard
+// for the cooperative passes (see `brain_tick_inner`).
 //
 // When brain_tick_stride == vision_stride the batch covers exactly
 // (vision_stride * brain_tick_stride) physics ticks and vision runs once

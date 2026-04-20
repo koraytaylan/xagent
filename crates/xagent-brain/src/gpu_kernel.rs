@@ -1373,10 +1373,10 @@ impl GpuKernel {
 
             // Fused kernel: 1 pass, cycles_this_batch brain cycles
             // SAFETY: dispatch(agent_count, 1, 1) — one workgroup per agent.
-            // The kernel early-returns dead agents before barriers; this is
-            // only safe because all threads in a workgroup share agent_id.
-            // If this dispatch shape ever changes, audit all P_ALIVE
-            // early-returns in kernel_tick.wgsl for barrier uniformity.
+            // Multi-thread passes guard per-agent work with a uniform `if (alive)`
+            // and keep every barrier outside the guard, so barrier uniformity
+            // holds regardless of P_ALIVE transitions. See the top-of-file SAFETY
+            // INVARIANT in kernel_tick.wgsl before changing the dispatch shape.
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);

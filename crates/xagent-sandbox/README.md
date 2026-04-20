@@ -746,18 +746,25 @@ Each frame, when the window requests a redraw:
 
 3. If not paused, dispatch a batched tick range on the GPU fused kernel
    (physics + brain + food detection + death/respawn all run inside
-   `kernel_tick.wgsl`; nothing per-tick runs on the CPU):
+   `kernel_tick.wgsl`; no per-tick simulation work runs on the CPU,
+   though governor bookkeeping does — one `gov.tick()` per simulated
+   tick):
    a. Accumulate `sim_accumulator` from real-time dt × speed multiplier
 
-   b. Compute `ticks_to_run`, bounded by the per-frame cap (≤500 ticks
-      per batch) and rounded down to a multiple of `brain_tick_stride()`
-      so every dispatch completes an integer number of brain cycles.
-      The internal `gpu_tick_budget` grows up to 64,000 ticks/frame in
-      fast mode.
+   b. Compute `raw_ticks` from `sim_accumulator / sim_delta_time`,
+      bounded by `gpu_tick_budget` (an internal warmup throttle that
+      grows by ~25% on each successful dispatch up to 64,000 so cold
+      starts don't dispatch giant batches) and the hard per-frame cap
+      of 500. Dispatch only when `raw_ticks >= brain_tick_stride()`
+      so the batch contains at least one full brain cycle; otherwise
+      skip and let the accumulator carry over to the next frame. There
+      is no rounding to a multiple of the stride — `ticks_to_run`
+      equals `raw_ticks` once the threshold is met.
 
-   c. `kernel.dispatch_batch(self.tick, ticks_to_run)` — one submit covers
-      the whole range. `self.tick` and governor bookkeeping are advanced
-      by `ticks_to_run`; no per-tick CPU simulation work.
+   c. `kernel.dispatch_batch(self.tick, ticks_to_run)` — one submit
+      covers the whole range. `self.tick` is advanced by `ticks_to_run`
+      and `gov.tick()` is called once per simulated tick (CPU-side
+      bookkeeping only — no simulation work).
 
    d. Request async agent telemetry readback for the selected agent.
       Collect any completed telemetry (vision, curiosity, staleness)

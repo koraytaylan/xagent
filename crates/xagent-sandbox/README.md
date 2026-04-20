@@ -744,47 +744,57 @@ Each frame, when the window requests a redraw:
 
 2. Update camera position from held keys (WASD/E/Shift)
 
-3. If not paused, run as many simulation ticks as the current speed/mode allows,
-   bounded by the per-frame tick time budget and `max_ticks_per_frame`
-   (currently up to 4000 in 3D mode and up to 1,000,000 in fast mode):
-   a. Collect all agent positions into a snapshot (Vec<(Vec3, bool)>)
+3. If not paused, dispatch a batched tick range on the GPU fused kernel
+   (physics + brain + food detection + death/respawn all run inside
+   `kernel_tick.wgsl`; nothing per-tick runs on the CPU):
+   a. Accumulate `sim_accumulator` from real-time dt × speed multiplier
 
-   b. For each living agent i:
-      ├─ extract_senses_with_positions(agent.body, world, tick, positions, i)
-      │   → produces SensoryFrame
-      ├─ brain.tick(&frame)
-      │   → produces MotorCommand
-      ├─ agent.cached_motor = motor
-      ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
-      │   → updates position, velocity, energy, integrity, alive
-      └─ If selected agent: update history/replay/HUD state
+   b. Compute `ticks_to_run`, bounded by the per-frame cap (≤500 ticks
+      per batch) and rounded down to a multiple of `brain_tick_stride()`
+      so every dispatch completes an integer number of brain cycles.
+      The internal `gpu_tick_budget` grows up to 64,000 ticks/frame in
+      fast mode.
 
-   d. world.update(dt) — decrement food respawn timers, relocate respawned food
+   c. `kernel.dispatch_batch(self.tick, ticks_to_run)` — one submit covers
+      the whole range. `self.tick` and governor bookkeeping are advanced
+      by `ticks_to_run`; no per-tick CPU simulation work.
 
-   e. Death/respawn processing:
-      ├─ Dead agent with cooldown == 0 → log death, set cooldown = 60
-      └─ Dead agent with cooldown > 0 → decrement; if 0 → respawn
+   d. Request async agent telemetry readback for the selected agent.
+      Collect any completed telemetry (vision, curiosity, staleness)
+      without blocking.
 
-   f. Increment global tick counter, mark food mesh as dirty
+   e. Append a TickRecord to the active replay recording using
+      GPU-readback state + the per-agent `cached_*` telemetry.
 
-   g. Reproduction check:
-      ├─ Find agents where can_reproduce() && !has_reproduced
-      └─ For each: set has_reproduced, spawn_child (mutated config)
+4. Every-frame non-blocking state readback (runs even when no ticks
+   were dispatched so the viewport stays responsive at low speeds):
+   `kernel.try_collect_state()` → update each agent's position, yaw,
+   energy, integrity, velocity, facing, food_consumed, death count,
+   and cached motor/gradient/urgency/prediction/exploration/fatigue.
 
-   h. Every 100 ticks: print telemetry to console
+5. Heatmap + trail recording for every living agent (CPU sampling of
+   the latest GPU readback).
 
-4. Fix selected_agent_idx if agents were added/removed
+6. Sparkline history updates per agent.
 
-5. Rebuild dynamic GPU meshes:
-   ├─ Food mesh (if dirty)
-   └─ Agent mesh (combined, rebuilt every frame)
+7. Generation completion check → `advance_generation()` kicks off the
+   multi-frame transition state machine; `poll_gen_transition()` drives
+   it each frame.
 
-6. Build HUD bars for selected agent
+8. Advance replay playback if active.
 
-7. Render:
-   ├─ 3D pass: terrain + food + agents (depth-tested)
-   ├─ HUD pass: background panels + status bars (alpha-blended)
-   └─ Text pass: bitmap font labels (alpha-blended)
+9. Fix selected_agent_idx if agents were added/removed.
+
+10. Rebuild dynamic GPU meshes (throttled to ~10 Hz):
+    ├─ Food mesh (if dirty)
+    └─ Agent mesh (combined)
+
+11. Build HUD bars for selected agent.
+
+12. Render:
+    ├─ 3D pass: terrain + food + agents (depth-tested)
+    ├─ HUD pass: background panels + status bars (alpha-blended)
+    └─ Text pass: bitmap font labels (alpha-blended)
 ```
 
 ---

@@ -422,15 +422,22 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // earlier kernel phases, but it does NOT mean all brain inputs are from the
 // same cycle.
 //
-// Vision data (sensory_buffer) is written by the external vision pass, which
-// runs in the same GPU command encoder AFTER this kernel dispatch.  The
-// brain therefore reads sensory_buffer written by the *previous* batch's vision
-// pass — a one-batch lag that is consistent regardless of stride values.
-// Non-visual proprioception (velocity, energy, etc.) follows the same lag
-// because it is also packed into sensory_buffer by that vision pass.  The
-// same-cycle P_ALIVE value is read only by thread 0 and broadcast into
-// `s_alive` before each workgroupBarrier() that gates a multi-thread pass
-// (see `brain_tick_inner` and `agent_food_detect`).
+// Brain inputs have two visibility regimes:
+//
+//   * Lagged via `sensory_buffer` (one-batch lag, consistent across strides):
+//     vision (color + depth), and the proprioceptive signals that the vision
+//     pass packs alongside vision — velocity, facing, angular state, touch.
+//     The external vision pass runs in the same GPU command encoder AFTER
+//     this kernel dispatch, so the brain reads sensory_buffer written by the
+//     *previous* batch's vision pass.
+//
+//   * Same-cycle direct reads from `physics_state`: `P_ALIVE` (broadcast
+//     through `s_alive`, see SAFETY INVARIANT), and the homeostasis /
+//     staleness inputs consumed by `coop_habituate_homeo`
+//     (`P_ENERGY` / `P_INTEGRITY` / `P_MAX_*`) and `coop_predict_and_act`
+//     (`P_POS_X` / `P_POS_Z`). These are made visible to all 256 threads by
+//     the `storageBarrier(); workgroupBarrier();` pair that follows each
+//     thread-0-only phase.
 //
 // When brain_tick_stride == vision_stride the batch covers exactly
 // (vision_stride * brain_tick_stride) physics ticks and vision runs once
@@ -456,26 +463,33 @@ fn kernel_tick(
         // Physics always precedes brain within the same cycle (barrier below).
         // Thread 0 is the sole writer of `P_ALIVE`, so it broadcasts the
         // post-physics value into `s_alive` for the workgroup to read after
-        // the barrier.
+        // the barrier. `storageBarrier()` is required because thread 0's
+        // writes to `physics_state` (position, velocity, energy, integrity,
+        // P_ALIVE) are read by other threads in `agent_food_detect` and by the
+        // cooperative brain passes that read `physics_state` directly —
+        // `workgroupBarrier()` alone would not publish storage writes.
         if (tid == 0u) {
             for (var t = 0u; t < stride; t++) {
                 agent_physics(agent_id, base_tick + t);
             }
             s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
         }
-        workgroupBarrier();
+        storageBarrier(); workgroupBarrier();
 
         // Brute-force food detection: all 256 threads cooperate
         agent_food_detect(agent_id, tid);
         workgroupBarrier();
 
         // Death/respawn: thread 0. Re-broadcasts `s_alive` because respawn may
-        // flip `P_ALIVE` back to 1.
+        // flip `P_ALIVE` back to 1. `storageBarrier()` is required because
+        // respawn rewrites `physics_state`, `brain_state`, `pattern_buffer`,
+        // and `history_buffer`, all of which are read by the cooperative
+        // passes in `brain_tick_inner` below.
         if (tid == 0u) {
             agent_death_respawn(agent_id, base_tick);
             s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
         }
-        workgroupBarrier();
+        storageBarrier(); workgroupBarrier();
 
         // Brain: all 256 threads, 7 cooperative passes.
         // Reads sensory_buffer (vision + proprioception) from the previous batch's

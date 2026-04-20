@@ -3,66 +3,73 @@
 // Values MUST match buffers.rs and the per-shader constants injected by
 // wgsl_constants() / wgsl_physics_constants().
 
-// ── Vision grid (string-replaced at shader compile time) ───────────────────
+// ── Vision grid (pipeline-overridable constants) ──────────────────────────
+// VISION_W and VISION_H are supplied by the Rust host at pipeline creation
+// time via `PipelineCompilationOptions::constants`. Defaults below keep the
+// shader standalone-compilable (LSP tooling, WGSL validators) at the 8×6 grid.
+// See `gpu_kernel.rs::override_constants()` for the canonical override map.
 
-const VISION_W: u32 = 8u;
-const VISION_H: u32 = 6u;
+override VISION_W: u32 = 8u;
+override VISION_H: u32 = 6u;
 
 // ── Derived vision / sensory constants ─────────────────────────────────────
+// Expressions that read `override` inputs must themselves be `override` —
+// they are evaluated at pipeline creation time, not shader-module creation.
 
-const VISION_RAYS: u32 = VISION_W * VISION_H;
-const VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
-const VISION_DEPTH_COUNT: u32 = VISION_RAYS;
+override VISION_RAYS: u32 = VISION_W * VISION_H;
+override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
+override VISION_DEPTH_COUNT: u32 = VISION_RAYS;
 const MAX_TOUCH_CONTACTS: u32 = 4u;
-const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
+override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
 const ENCODED_DIMENSION: u32 = 128u;
 const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
-const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
+override FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
 const ACTION_HISTORY_LEN: u32 = 64u;
 const ERROR_HISTORY_LEN: u32 = 128u;
 
 // ── Brain state offsets (derived from FEATURE_COUNT) ────────────────────────
+// These must be `override` because they transitively reference FEATURE_COUNT.
 
 const O_ENC_WEIGHTS: u32 = 0u;
-const O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION;
-const O_PREDICTOR_WEIGHTS: u32 = O_ENC_BIASES + ENCODED_DIMENSION;
-const O_PREDICTOR_CONTEXT_WEIGHT: u32 = O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
-const O_PREDICTION_ERROR_RING: u32 = O_PREDICTOR_CONTEXT_WEIGHT + 1u;
-const O_PREDICTION_ERROR_CURSOR: u32 = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
-const O_PREDICTION_ERROR_COUNT: u32 = O_PREDICTION_ERROR_CURSOR + 1u;
-const O_HAB_EMA: u32 = O_PREDICTION_ERROR_COUNT + 1u;
-const O_HAB_ATTEN: u32 = O_HAB_EMA + ENCODED_DIMENSION;
-const O_PREV_ENCODED: u32 = O_HAB_ATTEN + ENCODED_DIMENSION;
-const O_HOMEO: u32 = O_PREV_ENCODED + ENCODED_DIMENSION;
-const O_ACTION_FORWARD_WEIGHTS: u32 = O_HOMEO + 6u;
-const O_ACTION_TURN_WEIGHTS: u32 = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
-const O_ACT_BIASES: u32 = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
-const O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
+override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION;
+override O_PREDICTOR_WEIGHTS: u32 = O_ENC_BIASES + ENCODED_DIMENSION;
+override O_PREDICTOR_CONTEXT_WEIGHT: u32 = O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+override O_PREDICTION_ERROR_RING: u32 = O_PREDICTOR_CONTEXT_WEIGHT + 1u;
+override O_PREDICTION_ERROR_CURSOR: u32 = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
+override O_PREDICTION_ERROR_COUNT: u32 = O_PREDICTION_ERROR_CURSOR + 1u;
+override O_HAB_EMA: u32 = O_PREDICTION_ERROR_COUNT + 1u;
+override O_HAB_ATTEN: u32 = O_HAB_EMA + ENCODED_DIMENSION;
+override O_PREV_ENCODED: u32 = O_HAB_ATTEN + ENCODED_DIMENSION;
+override O_HOMEO: u32 = O_PREV_ENCODED + ENCODED_DIMENSION;
+override O_ACTION_FORWARD_WEIGHTS: u32 = O_HOMEO + 6u;
+override O_ACTION_TURN_WEIGHTS: u32 = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
+override O_ACT_BIASES: u32 = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
+override O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
 const POS_RING_LEN: u32 = 16u;
-const O_POS_RING_X: u32 = O_EXPLORATION_RATE + 1u;
-const O_POS_RING_Z: u32 = O_POS_RING_X + POS_RING_LEN;
-const O_POS_RING_CURSOR: u32 = O_POS_RING_Z + POS_RING_LEN;
-const O_POS_RING_LEN: u32 = O_POS_RING_CURSOR + 1u;
-const O_ACCUM_FWD: u32 = O_POS_RING_LEN + 1u;
-const O_FATIGUE_FACTOR: u32 = O_ACCUM_FWD + 1u;
-const O_PREV_PREDICTION: u32 = O_FATIGUE_FACTOR + 1u;
-const O_TICK_COUNT: u32 = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
-const O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
-const O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
-const O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
-const O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
+override O_POS_RING_X: u32 = O_EXPLORATION_RATE + 1u;
+override O_POS_RING_Z: u32 = O_POS_RING_X + POS_RING_LEN;
+override O_POS_RING_CURSOR: u32 = O_POS_RING_Z + POS_RING_LEN;
+override O_POS_RING_LEN: u32 = O_POS_RING_CURSOR + 1u;
+override O_ACCUM_FWD: u32 = O_POS_RING_LEN + 1u;
+override O_FATIGUE_FACTOR: u32 = O_ACCUM_FWD + 1u;
+override O_PREV_PREDICTION: u32 = O_FATIGUE_FACTOR + 1u;
+override O_TICK_COUNT: u32 = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
+override O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
+override O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
+override O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
+override O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-const BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
+override BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
 const HISTORY_STRIDE: u32 = O_HIST_LEN + 1u;
-const FEATURES_STRIDE: u32 = FEATURE_COUNT;
+override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
 const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
 const DECISION_MOTOR: u32 = ENCODED_DIMENSION + ENCODED_DIMENSION;

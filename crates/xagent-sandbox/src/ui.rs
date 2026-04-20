@@ -1364,12 +1364,6 @@ impl<'a> TabContext<'a> {
                     b.visual_encoding_size = ve.max(1) as usize;
                     ui.end_row();
 
-                    ui.label("representation_dimension");
-                    let mut rd = b.representation_dimension as i32;
-                    ui.add(egui::DragValue::new(&mut rd).range(4..=128).speed(1));
-                    b.representation_dimension = rd.max(1) as usize;
-                    ui.end_row();
-
                     ui.label("learning_rate");
                     ui.add(
                         egui::DragValue::new(&mut b.learning_rate)
@@ -1526,9 +1520,6 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("visual_encoding_size");
                         ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
-                        ui.label("representation_dimension");
-                        ui.monospace(format!("{}", cfg.representation_dimension));
                         ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1702,9 +1693,6 @@ impl<'a> TabContext<'a> {
                                         ui.label("visual_encoding_size");
                                         ui.monospace(format!("{}", cfg.visual_encoding_size));
                                         ui.end_row();
-                                        ui.label("representation_dimension");
-                                        ui.monospace(format!("{}", cfg.representation_dimension));
-                                        ui.end_row();
                                         ui.label("learning_rate");
                                         ui.monospace(format!("{:.5}", cfg.learning_rate));
                                         ui.end_row();
@@ -1737,9 +1725,6 @@ impl<'a> TabContext<'a> {
                             ui.end_row();
                             ui.label("visual_encoding_size");
                             ui.monospace(format!("{}", cfg.visual_encoding_size));
-                            ui.end_row();
-                            ui.label("representation_dimension");
-                            ui.monospace(format!("{}", cfg.representation_dimension));
                             ui.end_row();
                             ui.label("learning_rate");
                             ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1919,9 +1904,6 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("visual_encoding_size");
                         ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
-                        ui.label("representation_dimension");
-                        ui.monospace(format!("{}", cfg.representation_dimension));
                         ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));

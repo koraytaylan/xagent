@@ -136,7 +136,14 @@ pub const P_MOTOR_FWD_OUT: usize = 27;
 pub const P_MOTOR_TURN_OUT: usize = 28;
 pub const P_GRADIENT_OUT: usize = 29;
 pub const P_URGENCY_OUT: usize = 30;
-pub const PHYS_STRIDE: usize = 31;
+/// Tick at which this agent most recently died, stored as f32 via numeric
+/// conversion (`f32(tick)` in WGSL, `as u64` on readback).  Exact for integer
+/// ticks up to 2^24 — matches the precision guarantees of `P_TICKS_ALIVE`.
+/// Written by the physics phase when energy/integrity reaches zero, preserved
+/// across the death/respawn reset so CPU readback can attribute the death to
+/// an exact tick instead of the end-of-batch upper bound.
+pub const P_LAST_DEATH_TICK: usize = 31;
+pub const PHYS_STRIDE: usize = 32;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -787,6 +794,7 @@ mod tests {
             P_EXPLORATION_RATE_OUT as u32
         );
         assert_eq!(wgsl["P_FATIGUE_FACTOR_OUT"], P_FATIGUE_FACTOR_OUT as u32);
+        assert_eq!(wgsl["P_LAST_DEATH_TICK"], P_LAST_DEATH_TICK as u32);
     }
 
     #[test]
@@ -966,6 +974,7 @@ mod tests {
             P_MOTOR_TURN_OUT,
             P_GRADIENT_OUT,
             P_URGENCY_OUT,
+            P_LAST_DEATH_TICK,
         ]
         .iter()
         .max()

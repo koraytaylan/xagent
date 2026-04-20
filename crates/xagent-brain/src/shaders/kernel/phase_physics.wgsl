@@ -151,6 +151,9 @@ fn phase_physics(tid: u32, tick: u32) {
     if energy <= 0.0 || integrity <= 0.0 {
         physics_state[b + P_ALIVE] = 0.0;
         physics_state[b + P_DIED_FLAG] = 1.0;
+        // Record the exact tick of death for CPU-side longest_life accounting.
+        // Stored as f32 (exact for integer ticks up to 2^24 — matches P_TICKS_ALIVE).
+        physics_state[b + P_LAST_DEATH_TICK] = f32(tick);
     } else {
         // Increment ticks alive (stored as f32, safe for integers up to 2^24)
         physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;

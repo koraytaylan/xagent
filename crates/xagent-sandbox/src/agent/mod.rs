@@ -274,6 +274,47 @@ impl Agent {
         self.reset_trail();
     }
 
+    /// Reconcile CPU-side life bookkeeping with a GPU readback of `P_DEATH_COUNT`
+    /// and `P_LAST_DEATH_TICK`.
+    ///
+    /// `gpu_death_tick` is the tick the GPU recorded for the **most recent** death
+    /// in the batch; `last_simulated_tick` caps it as a safety net against
+    /// corrupted or stale readbacks (`self.tick - 1` in the readback loop).
+    ///
+    /// Single-death batches (`new_deaths - self.death_count == 1`) call
+    /// `record_death_and_restart_life`, so `longest_life` reflects the exact
+    /// GPU-reported life duration — the win over PR #123's batch-boundary
+    /// upper bound.
+    ///
+    /// Multi-death batches skip the `longest_life` update: we only know the
+    /// most recent death tick, not the intermediate respawn ticks, so computing
+    /// `life_duration` from the current `life_start_tick` would span several
+    /// lives and overestimate. Instead we resync `life_start_tick` to
+    /// `death_tick + 1` so the new life's `age()` starts from zero and reset
+    /// the trail. Full per-life timing would require a per-agent ring buffer
+    /// of death ticks or a GPU-side `last_respawn_tick` slot.
+    ///
+    /// `self.death_count` is always updated to `new_deaths` on exit; callers
+    /// must not also write it.
+    pub fn apply_death_count_readback(
+        &mut self,
+        new_deaths: u32,
+        gpu_death_tick: u64,
+        last_simulated_tick: u64,
+    ) {
+        if new_deaths > self.death_count {
+            let death_delta = new_deaths - self.death_count;
+            let death_tick = gpu_death_tick.min(last_simulated_tick);
+            if death_delta == 1 {
+                self.record_death_and_restart_life(death_tick);
+            } else {
+                self.life_start_tick = death_tick.saturating_add(1);
+                self.reset_trail();
+            }
+        }
+        self.death_count = new_deaths;
+    }
+
     /// Number of unique heatmap cells visited (non-zero entries).
     pub fn unique_cells_explored(&self) -> u32 {
         self.heatmap.iter().filter(|&&c| c > 0).count() as u32
@@ -773,6 +814,92 @@ mod tests {
         agent.record_death_and_restart_life(120);
         assert_eq!(agent.longest_life, 64);
         assert_eq!(agent.life_start_tick, 121);
+    }
+
+    #[test]
+    fn record_death_with_gpu_reported_tick_is_accurate_under_batching() {
+        // Simulate the scenario PR #123 fixed conservatively: an agent dies
+        // mid-batch and the CPU only observes the new death_count after the
+        // entire batch has been dispatched (self.tick has advanced past the
+        // actual death tick by up to `ticks_to_run - 1`).
+        //
+        // With a GPU-reported death tick from a single observed death, the
+        // life duration must match the true lifetime — NOT a conservative
+        // upper bound derived from `self.tick - 1`.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Agent was born at tick 0.  It dies at tick 100 but the CPU's
+        // next-tick counter has already advanced to 500 (500-tick batch).
+        let gpu_death_tick = 100;
+        agent.record_death_and_restart_life(gpu_death_tick);
+        assert_eq!(
+            agent.longest_life, 100,
+            "longest_life must reflect the GPU-reported death tick, not the batch boundary"
+        );
+        assert_eq!(agent.life_start_tick, 101);
+    }
+
+    #[test]
+    fn apply_death_count_readback_single_death_uses_gpu_tick() {
+        // Single death observed since the last readback: longest_life should
+        // match the GPU-reported tick exactly, and death_count should sync.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Agent was born at tick 0.  It died at tick 100; CPU is now at tick
+        // 500 (dispatched 500 ticks in one batch).
+        agent.apply_death_count_readback(1, 100, 499);
+        assert_eq!(
+            agent.longest_life, 100,
+            "single-death path must use the GPU death tick for longest_life"
+        );
+        assert_eq!(agent.life_start_tick, 101);
+        assert_eq!(agent.death_count, 1);
+    }
+
+    #[test]
+    fn apply_death_count_readback_multi_death_does_not_inflate_longest_life() {
+        // Two deaths observed in one batch: we only know the most recent death
+        // tick, so computing life_duration from life_start_tick would span
+        // several lives and overestimate.  Must skip the longest_life update
+        // but still resync life_start_tick and death_count.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Say deaths occurred at ticks 40 and 90 (we only see GPU tick 90).
+        // From life_start_tick=0, record_death_and_restart_life(90) would
+        // report a life of 90 ticks — but the agent actually lived at most
+        // 49 ticks (41..90).  The multi-death branch must NOT inflate.
+        agent.apply_death_count_readback(2, 90, 499);
+        assert_eq!(
+            agent.longest_life, 0,
+            "multi-death path must NOT update longest_life (can't reconstruct per-life timing)"
+        );
+        assert_eq!(
+            agent.life_start_tick, 91,
+            "life_start_tick should resync to the tick after the most recent GPU death"
+        );
+        assert_eq!(agent.death_count, 2);
+    }
+
+    #[test]
+    fn apply_death_count_readback_no_death_delta_is_noop() {
+        // Readback observes the same death count we already have: nothing to do.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 10);
+        agent.death_count = 3;
+        agent.longest_life = 42;
+        let start_before = agent.life_start_tick;
+        agent.apply_death_count_readback(3, 500, 999);
+        assert_eq!(agent.longest_life, 42);
+        assert_eq!(agent.life_start_tick, start_before);
+        assert_eq!(agent.death_count, 3);
+    }
+
+    #[test]
+    fn apply_death_count_readback_clamps_stale_gpu_tick_to_last_simulated() {
+        // Safety net: if the GPU reports a death tick past the last simulated
+        // tick (shouldn't happen, but defensively guard), clamp to the CPU's
+        // view of the simulation frontier.
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        // Implausible gpu_death_tick = 10_000, last_simulated_tick = 100.
+        agent.apply_death_count_readback(1, 10_000, 100);
+        assert_eq!(agent.longest_life, 100);
+        assert_eq!(agent.life_start_tick, 101);
     }
 
     #[test]

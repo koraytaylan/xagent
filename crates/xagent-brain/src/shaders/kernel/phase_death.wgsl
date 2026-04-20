@@ -43,6 +43,9 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     let max_integrity      = physics_state[base + P_MAX_INTEGRITY];
     let memory_cap         = physics_state[base + P_MEMORY_CAP];
     let processing_slots   = physics_state[base + P_PROCESSING_SLOTS];
+    // Preserve the physics-recorded death tick through the reset so CPU
+    // readback can attribute this death to its exact tick.
+    let saved_last_death_tick = physics_state[base + P_LAST_DEATH_TICK];
 
     // ── 3. Reset physics state ─────────────────────────────────────────────
     // Zero the full stride first, then write specific values.
@@ -70,6 +73,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     physics_state[base + P_FOOD_COUNT]      = saved_food_count;
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
+    physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
 
     // ── 4. Reset brain state ───────────────────────────────────────────────
     let brain_base = tid * BRAIN_STRIDE;

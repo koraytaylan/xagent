@@ -534,7 +534,7 @@ policy_confidence = clamp((|fwd| + |trn|) / 2.0, 0.0, 1.0)
 exploration_rate = clamp(0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity - urgency_penalty, 0.10, 0.85)
 ```
 
-Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG seeded by `(agent * 1000 + tick)`. The motor output is clamped to [-1, 1].
+Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG with the exploration seed derived from `agent_id ^ (tick_u * 747796405u)` before hashing. The motor output is clamped to [-1, 1].
 
 #### 6.6.7 Motor Fatigue
 
@@ -557,8 +557,8 @@ When motor output is varied, fatigue factor is near 1.0 (no dampening). When out
 #### 6.6.8 Output Recording
 
 After computing final motor output:
-1. Records `[fwd, trn, tick, gradient, _pad]` to the action history ring at `O_MOTOR_RING`.
-2. Records the habituated state snapshot at `O_STATE_RING` for future credit assignment.
+1. Records `[noise_fwd * exploration_rate, noise_trn * exploration_rate, tick, gradient, 0.0]` to the action history ring at `O_MOTOR_RING`. Storing the exploration noise (not the full motor) is what makes credit assignment a proper REINFORCE gradient -- see PR #97.
+2. Records the encoded (pre-habituation) state snapshot at `O_STATE_RING` for future credit assignment -- matches the features the policy and credit updates train against.
 3. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
 4. Increments `O_TICK_COUNT`.
 5. Writes `[prediction(32), credit_signal(32), fwd, trn, strafe, _pad]` to the decision buffer for pass 7 and CPU readback.

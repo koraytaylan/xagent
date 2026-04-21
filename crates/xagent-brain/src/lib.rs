@@ -5,6 +5,7 @@
 //! from the interaction of capacity constraints, prediction error, and
 //! homeostatic pressure.
 
+pub(crate) mod async_readback;
 pub mod buffers;
 pub mod gpu_kernel;
 

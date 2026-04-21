@@ -1,8 +1,8 @@
 # xagent-shared
 
-Shared types, traits, and configuration for the xagent cognitive agent platform.
+Shared types and configuration for the xagent cognitive agent platform.
 
-This crate is the **interface contract** between the brain and sandbox crates. It contains no logic — only data structures, the `CognitiveArchitecture` trait, and configuration with presets. Every type that crosses the brain↔sandbox boundary lives here, which keeps the dependency graph clean and makes it possible to swap cognitive architectures without touching the simulation.
+This crate is the **interface contract** between the brain and sandbox crates. It contains no logic — only data structures and configuration with presets. Every type that crosses the brain↔sandbox boundary lives here, which keeps the dependency graph clean.
 
 ```
                 ┌───────────────────────┐
@@ -13,7 +13,6 @@ This crate is the **interface contract** between the brain and sandbox crates. I
                 │  BodyState            │
                 │  BrainConfig          │
                 │  WorldConfig          │
-                │  CognitiveArchitecture│
                 └──────────┬────────────┘
                            │
               ┌────────────┼────────────┐
@@ -22,12 +21,12 @@ This crate is the **interface contract** between the brain and sandbox crates. I
      ┌────────────────┐       ┌──────────────────┐
      │  xagent-brain  │       │ xagent-sandbox   │
      │                │       │                  │
-     │  implements    │       │  uses types to   │
-     │  Cognitive-    │       │  build frames,   │
-     │  Architecture  │       │  interpret motor │
-     └────────────────┘       │  commands, track │
-                              │  body state      │
-                              └──────────────────┘
+     │  packs shared  │       │  uses types to   │
+     │  types into    │       │  build frames,   │
+     │  GPU buffers;  │       │  interpret motor │
+     │  kernel runs   │       │  commands, track │
+     │  on buffers    │       │  body state      │
+     └────────────────┘       └──────────────────┘
 ```
 
 ---
@@ -40,7 +39,6 @@ This crate is the **interface contract** between the brain and sandbox crates. I
    - [2.2 motor.rs — Motor Output](#22-motorrs--motor-output)
    - [2.3 body.rs — Physical Body State](#23-bodyrs--physical-body-state)
    - [2.4 config.rs — Configuration & Presets](#24-configrs--configuration--presets)
-   - [2.5 traits.rs — CognitiveArchitecture Trait](#25-traitsrs--cogitivearchitecture-trait)
 3. [Type Relationships & Data Flow](#3-type-relationships--data-flow)
 4. [Configuration Guide](#4-configuration-guide)
 5. [Adding New Types](#5-adding-new-types)
@@ -56,7 +54,6 @@ In many game/simulation architectures the "brain" and the "world" are tightly co
 | Principle | How xagent-shared achieves it |
 |---|---|
 | **Decoupling** | Brain and sandbox never import each other. They only import shared types. |
-| **Swappable brains** | Any struct implementing `CognitiveArchitecture` can serve as the agent's brain. You can drop in a neural network, a behavior tree, or a random-action generator without changing the sandbox. |
 | **Clean dependency graph** | `xagent-shared` has zero workspace dependencies. Both `xagent-brain` and `xagent-sandbox` depend on it, but never on each other. This prevents circular dependencies and keeps compile times predictable. |
 | **Serialization boundary** | Every type derives `Serialize`/`Deserialize`. Configuration can be loaded from JSON files, sensory frames can be logged to disk, and motor commands can be replayed — all because the interface types are data-only. |
 | **No hidden logic** | Shared contains no algorithms, no update loops, no mutable global state. It is a vocabulary crate: it defines the words that brain and sandbox use to talk to each other. |
@@ -354,42 +351,6 @@ pub struct FullConfig {
 
 Combined configuration for JSON serialization. Both fields have `#[serde(default)]` so you can provide partial JSON and get defaults for the rest.
 
-### 2.5 `traits.rs` — CognitiveArchitecture Trait
-
-```rust
-pub trait CognitiveArchitecture {
-    fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand;
-}
-```
-
-The single trait that makes the entire architecture swappable. Any struct that implements `CognitiveArchitecture` can serve as an agent's brain.
-
-**Why it exists**: The sandbox doesn't know or care what happens inside the brain. It only knows that each tick it provides a `SensoryFrame` and gets back a `MotorCommand`. This contract is what enables:
-
-- **Multiple brain implementations**: The default `Brain` in `xagent-brain` uses predictive processing, but you could implement a rule-based system, a neural network, a random agent, or a human-controlled agent — all using the same interface.
-- **A/B testing**: Run different cognitive architectures in the same world and compare their survival outcomes.
-- **Incremental development**: Build a simple reactive brain first, then gradually add prediction, memory, and learning without changing the sandbox.
-
-**How to implement a custom brain**:
-
-```rust
-use xagent_shared::{CognitiveArchitecture, SensoryFrame, MotorCommand};
-
-struct MyBrain {
-    // your internal state
-}
-
-impl CognitiveArchitecture for MyBrain {
-    fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
-        // Process frame.vision, frame.energy_signal, etc.
-        // Return a MotorCommand with forward/strafe/turn/action
-        MotorCommand::idle()
-    }
-}
-```
-
-The `tick` method receives an immutable reference to the frame (the brain can read but not modify the world) and returns a `MotorCommand` by value. The brain can maintain any internal state it needs via `&mut self`.
-
 ---
 
 ## 3. Type Relationships & Data Flow
@@ -536,5 +497,5 @@ To add a new discrete action:
 |---|---|
 | **Dependencies** | `glam` (vec math), `serde` (serialization) |
 | **Dependents** | `xagent-brain`, `xagent-sandbox` |
-| **Logic** | None — data structures and trait definitions only |
+| **Logic** | None — data structures only |
 | **Unsafe** | None |

@@ -21,7 +21,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 │                                                                   │
 │  ┌───────────────────┐                                            │
 │  │  xagent-shared    │◄────────────────────────────────────────┐  │
-│  │  (interface)      │    Types, traits, config                │  │
+│  │  (interface)      │    Types and config                     │  │
 │  └────────┬──────────┘                                         │  │
 │           │                                                    │  │
 │           │  depends on                      depends on        │  │
@@ -42,7 +42,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 
 | Crate | Role |
 |-------|------|
-| **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, `WorldConfig`, and the `CognitiveArchitecture` trait. No logic — just types. |
+| **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, and `WorldConfig`. No logic — just types. |
 | **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
 | **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, and the main event loop. |
 
@@ -402,8 +402,7 @@ xagent/
 │   │       ├── body.rs         # BodyState, InternalState
 │   │       ├── config.rs       # BrainConfig, WorldConfig, presets
 │   │       ├── motor.rs        # MotorCommand, MotorAction
-│   │       ├── sensory.rs      # SensoryFrame, VisualField, TouchContact
-│   │       └── traits.rs       # CognitiveArchitecture trait
+│   │       └── sensory.rs      # SensoryFrame, VisualField, TouchContact
 │   │
 │   ├── xagent-brain/           # GPU-resident cognitive architecture
 │   │   ├── README.md           # Deep dive into brain internals (partially stale — see issue #106)

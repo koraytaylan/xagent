@@ -49,9 +49,9 @@ gradient = blended_gradient * (1.0 + urgency)
 ```
 
 with `blended_gradient` ∈ roughly ±0.3, `urgency` ∈ [0, 10]. Peak magnitude is
-therefore ~3.3 in practice — three orders of magnitude larger than the
-`DEADZONE`. That wide range is the fundamental source of brittleness: every
-downstream threshold has to work across it.
+therefore ~3.3 in practice — about 660× larger than the `DEADZONE`
+(roughly 2.8 orders of magnitude). That wide range is the fundamental source
+of brittleness: every downstream threshold has to work across it.
 
 ### Credit assignment — action weights
 
@@ -134,7 +134,7 @@ they are flagged here, not fixed here.
 
 ## Interaction Map — why this is brittle
 
-The credit pipeline is a seven-stage product of these constants. The path
+The credit pipeline is a ten-stage product of these constants. The path
 from a joules-gained event to a weight update:
 
 1. **Raw gradient** is clamped by `MAX_HOMEOSTATIC_DELTA = 0.3` per tick.

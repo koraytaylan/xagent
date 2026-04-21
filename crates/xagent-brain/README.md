@@ -463,7 +463,7 @@ A simple iterative argmax loop runs K times:
 
 ---
 
-### 6.6 Prediction + Action Selection (Pass 6) -- `predict_and_act.wgsl`
+### 6.6 Prediction + Action Selection (Pass 6) -- `brain_passes.wgsl::coop_predict_and_act`
 
 This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with memory blend, exploration noise, and motor fatigue.
 

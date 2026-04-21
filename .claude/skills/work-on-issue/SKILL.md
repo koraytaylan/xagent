@@ -157,7 +157,9 @@ Before ending the cycle, list every thread on the PR (`mcp__github__pull_request
 
 After **every** push that addresses review feedback, repeat step 7a (sync + conflict check), call `mcp__github__request_copilot_review` again, and re-enter step 7b so Copilot re-reads the updated diff against a clean merge.
 
-Loop until Copilot's next review emits zero new comments.
+**No-change exit:** if an entire review cycle completes without any "apply the fix" outcomes — every comment was declined with reason or deferred to a follow-up issue, and no new commits were pushed — do **not** re-request a review. The diff Copilot reviewed hasn't changed, so a re-review would produce the same comments. Once all threads are resolved, go straight to Step 8 (merge).
+
+Loop until either Copilot's next review emits zero new comments, or a cycle ends with zero code changes.
 
 ## Step 8 — Merge
 

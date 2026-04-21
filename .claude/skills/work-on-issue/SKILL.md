@@ -143,11 +143,17 @@ After calling `mcp__github__request_copilot_review`:
 For each review comment (from the webhook payload or the poll result):
 
 1. Read the comment and the referenced code carefully. Re-check against CONTRIBUTING.md — Copilot may be wrong about project-specific rules.
-2. Decide one of three outcomes:
-   - **Apply the fix.** Make the change, verify locally, commit, push. Reply on the comment explaining what you changed. Resolve the thread with `mcp__github__resolve_review_thread` once the push lands.
-   - **Decline with reason.** If the suggestion conflicts with CONTRIBUTING.md, is wrong, or is a stylistic preference you disagree with, reply with a concrete rationale (cite the CONTRIBUTING.md section or the code invariant). Resolve the thread.
-   - **Out of scope.** If a fix is valid but exceeds the scope defined in step 1, open a follow-up issue via `mcp__github__issue_write` (title + body describing the deferred work, labeled as tracked from this PR). Link it with `mcp__github__sub_issue_write` if appropriate. Reply on the comment with the new issue number and a short explanation. Resolve the thread.
-3. Use `mcp__github__add_reply_to_pull_request_comment` for replies — keep them concrete, cite files/lines, avoid filler.
+2. Decide one of three outcomes and do the outcome-specific work:
+   - **Apply the fix.** Make the change, verify locally, commit, push.
+   - **Decline with reason.** The suggestion conflicts with CONTRIBUTING.md, is wrong, or is a stylistic preference you disagree with.
+   - **Out of scope.** The fix is valid but exceeds the scope defined in step 1 — open a follow-up issue via `mcp__github__issue_write` (title + body describing the deferred work, labeled as tracked from this PR). Link it with `mcp__github__sub_issue_write` if appropriate.
+3. **Reply on the comment** with `mcp__github__add_reply_to_pull_request_comment`. Replies must be concrete, cite files/lines, avoid filler:
+   - Apply → what you changed and the commit SHA.
+   - Decline → concrete rationale citing the CONTRIBUTING.md section or the code invariant.
+   - Out of scope → the new issue number and a one-line reason it's deferred.
+4. **Resolve the thread** with `mcp__github__resolve_review_thread`. This step is mandatory for **every** outcome — including decline and out-of-scope. A thread left unresolved blocks merge (Step 8 preconditions) and misleads reviewers into thinking work is still pending. The follow-up issue **is** the resolution for out-of-scope comments; don't leave the thread open as a second reminder.
+
+Before ending the cycle, list every thread on the PR (`mcp__github__pull_request_read` method `get_review_comments`) and confirm `isResolved: true` for each one you've processed. Any thread still showing `isResolved: false` is a bug in this cycle — go back and resolve it before proceeding.
 
 After **every** push that addresses review feedback, repeat step 7a (sync + conflict check), call `mcp__github__request_copilot_review` again, and re-enter step 7b so Copilot re-reads the updated diff against a clean merge.
 
@@ -190,6 +196,7 @@ End your turn with a 1–2 sentence summary: PR URL, merge status, and issue sta
 - Never force-push to `main`/`develop`. Never push to a branch other than the one this PR lives on.
 - Never skip hooks (`--no-verify`, `--no-gpg-sign`) unless the user explicitly asks.
 - Never mark a thread resolved without either applying the change, declining with a reason, or filing a follow-up.
+- Never leave a thread unresolved after processing — decline and out-of-scope outcomes require `resolve_review_thread` just as much as apply does.
 - Never merge with red CI or unresolved threads.
 - Never request a Copilot review while the PR has merge conflicts — resolve them first (step 7a).
 - Never invent file paths, line numbers, or commit SHAs — read them first.

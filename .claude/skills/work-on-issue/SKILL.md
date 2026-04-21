@@ -19,7 +19,7 @@ Use the GitHub MCP tools (prefix `mcp__github__`) for every GitHub interaction. 
 - `mcp__github__list_pull_requests`, `mcp__github__search_pull_requests`, `mcp__github__pull_request_read`, `mcp__github__create_pull_request`, `mcp__github__update_pull_request`, `mcp__github__update_pull_request_branch`, `mcp__github__merge_pull_request`
 - `mcp__github__list_commits`, `mcp__github__get_commit`, `mcp__github__get_file_contents`
 - `mcp__github__request_copilot_review`
-- `mcp__github__add_reply_to_pull_request_comment`, `mcp__github__resolve_review_thread`, `mcp__github__unresolve_review_thread`
+- `mcp__github__add_reply_to_pull_request_comment` (thread resolution is not callable from this skill — see Step 7c)
 - `mcp__github__subscribe_pr_activity`, `mcp__github__unsubscribe_pr_activity`
 
 Load any tool you haven't used yet with `ToolSearch` (`select:<tool>`) before calling it.
@@ -151,13 +151,12 @@ For each review comment (from the webhook payload or the poll result):
    - Apply → what you changed and the commit SHA.
    - Decline → concrete rationale citing the CONTRIBUTING.md section or the code invariant.
    - Out of scope → the new issue number and a one-line reason it's deferred.
-4. **Resolve the thread** with `mcp__github__resolve_review_thread`. This step is mandatory for **every** outcome — including decline and out-of-scope. A thread left unresolved blocks merge (Step 8 preconditions) and misleads reviewers into thinking work is still pending. The follow-up issue **is** the resolution for out-of-scope comments; don't leave the thread open as a second reminder.
 
-Before ending the cycle, list every thread on the PR (`mcp__github__pull_request_read` method `get_review_comments`) and confirm `isResolved: true` for each one you've processed. Any thread still showing `isResolved: false` is a bug in this cycle — go back and resolve it before proceeding.
+**Thread resolution is the user's job, not the skill's.** The `resolve_review_thread` MCP tool is not reliably callable from this skill's harness — treat it as unavailable. Do not try to resolve threads yourself. Instead, at the end of each review cycle, post a single summary comment on the PR (or message the user in chat) listing every thread you processed in a table: thread id / subject, outcome (apply/decline/out-of-scope), commit SHA or follow-up issue number, and **"please resolve"**. The user resolves them from the GitHub UI. Merge (Step 8) waits for the user to confirm resolution is done.
 
 After **every** push that addresses review feedback, repeat step 7a (sync + conflict check), call `mcp__github__request_copilot_review` again, and re-enter step 7b so Copilot re-reads the updated diff against a clean merge.
 
-**No-change exit:** if an entire review cycle completes without any "apply the fix" outcomes — every comment was declined with reason or deferred to a follow-up issue, and no new commits were pushed — do **not** re-request a review. The diff Copilot reviewed hasn't changed, so a re-review would produce the same comments. Once all threads are resolved, go straight to Step 8 (merge).
+**No-change exit:** if an entire review cycle completes without any "apply the fix" outcomes — every comment was declined with reason or deferred to a follow-up issue, and no new commits were pushed — do **not** re-request a review. The diff Copilot reviewed hasn't changed, so a re-review would produce the same comments. Hand the resolution list to the user and wait for them to confirm threads are resolved, then go to Step 8.
 
 Loop until either Copilot's next review emits zero new comments, or a cycle ends with zero code changes.
 
@@ -166,7 +165,7 @@ Loop until either Copilot's next review emits zero new comments, or a cycle ends
 Preconditions before merge:
 
 - CI is green on the latest commit.
-- No unresolved review threads.
+- The user has confirmed all processed review threads are resolved (the skill cannot resolve them itself — see Step 7c). Check via `mcp__github__pull_request_read` method `get_review_comments` that every thread reports `isResolved: true`; if any are still open, ask the user to resolve them and wait before proceeding.
 - Branch is up to date with `develop` and free of merge conflicts. If behind, sync via step 7a (`update_pull_request_branch` if clean, otherwise merge locally and resolve). Never rely on GitHub's web "resolve conflicts" flow — do it locally so the gate runs.
 
 Merge with `mcp__github__merge_pull_request`, `merge_method: "merge"` (creates a merge commit, as requested). Use the PR title as the merge commit title.
@@ -197,8 +196,7 @@ End your turn with a 1–2 sentence summary: PR URL, merge status, and issue sta
 
 - Never force-push to `main`/`develop`. Never push to a branch other than the one this PR lives on.
 - Never skip hooks (`--no-verify`, `--no-gpg-sign`) unless the user explicitly asks.
-- Never mark a thread resolved without either applying the change, declining with a reason, or filing a follow-up.
-- Never leave a thread unresolved after processing — decline and out-of-scope outcomes require `resolve_review_thread` just as much as apply does.
-- Never merge with red CI or unresolved threads.
+- Never try to call `resolve_review_thread` yourself — it is not reliably callable from this harness. Hand resolution off to the user per Step 7c.
+- Never merge with red CI or unresolved threads. If threads are still open, ask the user to resolve them and wait.
 - Never request a Copilot review while the PR has merge conflicts — resolve them first (step 7a).
 - Never invent file paths, line numbers, or commit SHAs — read them first.

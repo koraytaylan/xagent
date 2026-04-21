@@ -107,7 +107,10 @@ coupling survived reunification; it is just one hop further from credit.
 | --- | --- | --- | --- |
 | `MEMORY_BLEND_STRENGTH` | `0.4` | `brain_passes.wgsl:498` | motor signal attenuated by up to 40% when memory recall fires |
 | `KLINOTAXIS_SENSITIVITY` | `500.0` | `brain_passes.wgsl:606` | turn multiplier ∈ [0.3, 3.0] based on fast-vs-medium deviation |
-| `ANTICIPATION_WEIGHT` | `0.5` | `common.wgsl:273` | **dead** — declared but not referenced in any shader |
+
+A third entry, `ANTICIPATION_WEIGHT`, was declared in `common.wgsl` but
+referenced by no shader since PR #100 removed prospective blending. It is
+deleted in this PR (see "What this PR actually does" below).
 
 ### Inline magic numbers in the credit/policy hot path
 

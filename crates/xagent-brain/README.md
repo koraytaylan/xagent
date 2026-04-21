@@ -465,7 +465,7 @@ A simple iterative argmax loop runs K times:
 
 ### 6.6 Prediction + Action Selection (Pass 6) -- `predict_and_act.wgsl`
 
-This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with prospection and memory blend, exploration noise, and motor fatigue.
+This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with memory blend, exploration noise, and motor fatigue.
 
 #### 6.6.1 Prediction Error
 
@@ -491,8 +491,8 @@ The `context_weight` parameter (stored at `O_PRED_CTX_WT`, initialized to 0.15) 
 
 The homeostatic gradient is used to assign credit/blame to recent actions in the 64-entry history ring buffer. For each recorded action:
 
-1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.04`. Actions older than ~60 ticks contribute negligibly.
-2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.01)`, skip (filters metabolic noise).
+1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.3`. The loop skips entries with `temporal < 0.01`, so actions older than ~15 ticks contribute negligibly.
+2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.005)`, the improvement is replaced by a tonic fallback `gradient * urgency * TONIC_CREDIT_SCALE (0.5)` instead of being skipped.
 3. **Pain amplification**: Negative improvements are multiplied by `PAIN_AMP = 3.0`, reflecting the biological reality that aversive stimuli produce stronger learning signals.
 4. **State-conditioned weight update**: `weights[d] += WEIGHT_LR * credit * recorded_motor * recorded_state[d]`. The recorded state snapshot from when the action was taken ensures credit is attributed to the correct sensory context.
 
@@ -500,11 +500,11 @@ The homeostatic gradient is used to assign credit/blame to recent actions in the
 
 #### 6.6.4 Policy Evaluation
 
-Continuous motor output is computed as a dot product of learned weights with the habituated state:
+Continuous motor output is computed as a dot product of learned weights with the encoded state (pre-habituation), matching the features that credit assignment trains against:
 
 ```
-fwd = dot(fwd_weights, habituated) + fwd_bias
-trn = dot(trn_weights, habituated) + trn_bias
+fwd = dot(fwd_weights, encoded) + fwd_bias
+trn = dot(trn_weights, encoded) + trn_bias
 ```
 
 This is a continuous-output linear policy -- no discrete action table. The agent learns which features predict beneficial forward motion and which predict beneficial turning.

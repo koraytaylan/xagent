@@ -21,11 +21,11 @@ This crate is the **interface contract** between the brain and sandbox crates. I
      ┌────────────────┐       ┌──────────────────┐
      │  xagent-brain  │       │ xagent-sandbox   │
      │                │       │                  │
-     │  GPU kernel    │       │  uses types to   │
-     │  consumes      │       │  build frames,   │
-     │  SensoryFrame, │       │  interpret motor │
-     │  emits         │       │  commands, track │
-     │  MotorCommand  │       │  body state      │
+     │  packs shared  │       │  uses types to   │
+     │  types into    │       │  build frames,   │
+     │  GPU buffers;  │       │  interpret motor │
+     │  kernel runs   │       │  commands, track │
+     │  on buffers    │       │  body state      │
      └────────────────┘       └──────────────────┘
 ```
 

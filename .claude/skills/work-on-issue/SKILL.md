@@ -18,7 +18,7 @@ Use the GitHub MCP tools (prefix `mcp__github__`) for every GitHub interaction. 
 - `mcp__github__issue_read`, `mcp__github__list_issues`, `mcp__github__search_issues`, `mcp__github__issue_write`, `mcp__github__add_issue_comment`, `mcp__github__sub_issue_write`
 - `mcp__github__list_pull_requests`, `mcp__github__search_pull_requests`, `mcp__github__pull_request_read`, `mcp__github__create_pull_request`, `mcp__github__update_pull_request`, `mcp__github__update_pull_request_branch`, `mcp__github__merge_pull_request`
 - `mcp__github__list_commits`, `mcp__github__get_commit`, `mcp__github__get_file_contents`
-- `mcp__github__request_copilot_review`
+- `mcp__github__request_copilot_review` (initial request only — re-requests are not callable from this skill, see Step 7c)
 - `mcp__github__add_reply_to_pull_request_comment` (thread resolution is not callable from this skill — see Step 7c)
 - `mcp__github__subscribe_pr_activity`, `mcp__github__unsubscribe_pr_activity`
 
@@ -134,7 +134,7 @@ Copilot reviews the PR diff against `develop`. A dirty merge state produces nois
    - `git push`. If the remote rejected because someone else pushed meanwhile, `git pull --rebase` and retry.
 5. Wait for CI on the merge commit per Step 6 (poll on each turn; resume on webhook or `/loop` tick) until it goes green. Loop back to Step 6's fix path if it fails.
 
-Only then call `mcp__github__request_copilot_review`.
+Only then call `mcp__github__request_copilot_review` for the **initial** review request. Re-requests after subsequent pushes don't work from this harness — see step 7c for the hand-off pattern.
 
 ### 7b. Wait for the review (turn-based polling)
 
@@ -142,7 +142,7 @@ After calling `mcp__github__request_copilot_review`:
 
 1. Tell the user the review is requested and end the turn. As with CI, Claude can't sleep inside a turn — it will be resumed by a `pull_request_review` / `pull_request_review_comment` webhook event, a user ping, or a `/loop` tick.
 2. **On every resume,** poll `mcp__github__pull_request_read` (methods `get_reviews` and `get_review_comments`) and check whether Copilot has posted a review newer than the last request. If yes, proceed to 7c with the API data.
-3. If several resumes pass without a Copilot review, surface to the user — Copilot may be disabled, rate-limited, or the request may have silently failed. Offer to re-request, and suggest `/loop 2m …` if the user wants timed polling.
+3. If several resumes pass without a Copilot review, surface to the user — Copilot may be disabled, rate-limited, or the request may have silently failed. Ask the user to re-request the review from the GitHub UI (re-requests via `mcp__github__request_copilot_review` aren't reliable from here), and suggest `/loop 2m …` if they want timed polling.
 4. **Authority rule.** The API is authoritative for "has Copilot reviewed yet" — a missing webhook does not mean no review exists.
 
 ### 7c. Processing review comments
@@ -161,7 +161,7 @@ For each review comment (from the webhook payload or the poll result):
 
 **Thread resolution is the user's job, not the skill's.** The `resolve_review_thread` MCP tool is not reliably callable from this skill's harness — treat it as unavailable. Do not try to resolve threads yourself. Instead, at the end of each review cycle, post a single summary comment on the PR (or message the user in chat) listing every thread you processed in a table: thread id / subject, outcome (apply/decline/out-of-scope), commit SHA or follow-up issue number, and **"please resolve"**. The user resolves them from the GitHub UI. Merge (Step 8) waits for the user to confirm resolution is done.
 
-After **every** push that addresses review feedback, repeat step 7a (sync + conflict check), call `mcp__github__request_copilot_review` again, and re-enter step 7b so Copilot re-reads the updated diff against a clean merge.
+After **every** push that addresses review feedback, repeat step 7a (sync + conflict check). **Do not call `mcp__github__request_copilot_review` again** — re-requesting from this skill's harness does not work after the initial request. Instead, ask the user to re-request the review from the GitHub UI ("Reviewers → Copilot → Re-request review") and wait for confirmation. Once the user confirms, re-enter step 7b so Copilot re-reads the updated diff.
 
 **No-change exit:** if an entire review cycle completes without any "apply the fix" outcomes — every comment was declined with reason or deferred to a follow-up issue, and no new commits were pushed — do **not** re-request a review. The diff Copilot reviewed hasn't changed, so a re-review would produce the same comments. Hand the resolution list to the user and wait for them to confirm threads are resolved, then go to Step 8.
 
@@ -204,6 +204,7 @@ End your turn with a 1–2 sentence summary: PR URL, merge status, and issue sta
 - Never force-push to `main`/`develop`. Never push to a branch other than the one this PR lives on.
 - Never skip hooks (`--no-verify`, `--no-gpg-sign`) unless the user explicitly asks.
 - Never try to call `resolve_review_thread` yourself — it is not reliably callable from this harness. Hand resolution off to the user per Step 7c.
+- Never call `request_copilot_review` after the initial request — re-requests don't work from this harness. Ask the user to re-request from the GitHub UI after each push.
 - Never merge with red CI or unresolved threads. If threads are still open, ask the user to resolve them and wait.
 - Never request a Copilot review while the PR has merge conflicts — resolve them first (step 7a).
 - Never invent file paths, line numbers, or commit SHAs — read them first.

@@ -52,12 +52,11 @@
 //! rename or move markers without updating both the helper and the tests.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
 
 use wgpu;
 use xagent_shared::{BrainConfig, WorldConfig};
 
+use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
 /// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
@@ -152,10 +151,8 @@ const STAGING_SLOTS: usize = 6;
 
 /// Pending async readback of 4 staging buffers for telemetry.
 struct TelemetryReadback {
-    /// Number of map_async callbacks that have fired (need all 4).
-    completed: Arc<AtomicU32>,
-    /// Set if any map_async callback returned an error.
-    had_error: Arc<AtomicBool>,
+    /// Shared completion/error state for all 4 `map_async` callbacks.
+    tracker: ReadbackTracker,
     agent_index: u32,
 }
 
@@ -191,10 +188,8 @@ struct AgentStateReadback {
     brain_size: u64,
     pattern_size: u64,
     history_size: u64,
-    /// Counts how many of the 3 map_async callbacks have fired successfully.
-    mapped_count: Arc<AtomicU8>,
-    /// Set if any map_async callback reports an error.
-    had_error: Arc<AtomicBool>,
+    /// Shared completion/error state for all 3 `map_async` callbacks.
+    tracker: ReadbackTracker,
     brain_stride: usize,
 }
 
@@ -244,14 +239,13 @@ pub struct GpuKernel {
     // ── Async state readback (STAGING_SLOTS ring, non-blocking) ──
     // Staging is decoupled from dispatch: in-flight readbacks do not
     // block new dispatches. Each slot contains state + food staging
-    // buffers for one readback.
-    // staging_ready counts completed map_async callbacks (need expected_staging_callbacks).
+    // buffers for one readback, plus a `ReadbackTracker` that aggregates
+    // completion/error across the slot's `map_async` callbacks.
     state_staging: [wgpu::Buffer; STAGING_SLOTS],
     food_staging: [wgpu::Buffer; STAGING_SLOTS],
-    staging_index: usize,                           // which buffer to write NEXT
-    staging_in_flight: [bool; STAGING_SLOTS],       // submitted, not yet collected
-    staging_ready: [Arc<AtomicU32>; STAGING_SLOTS], // map_async callbacks completed
-    staging_had_error: [Arc<AtomicBool>; STAGING_SLOTS], // set if any map_async callback errored
+    staging_index: usize,                     // which buffer to write NEXT
+    staging_in_flight: [bool; STAGING_SLOTS], // submitted, not yet collected
+    staging_trackers: [ReadbackTracker; STAGING_SLOTS],
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
     food_cache_valid: bool,
@@ -327,38 +321,17 @@ impl GpuKernel {
 
     fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
         // Drain any pending async readback so staging buffers are clean.
-        let expected = self.expected_staging_callbacks();
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
-                while self.staging_ready[i].load(Ordering::Acquire) < expected {
+                // Spin until every callback has fired, blocking if needed —
+                // reset is a rare, synchronous operation.
+                while self.staging_trackers[i].status() == ReadbackStatus::Pending {
                     self.device.poll(wgpu::Maintain::Poll);
                 }
-
-                if self.staging_had_error[i].load(Ordering::Acquire) {
-                    // map_async errored — buffer isn't mapped, just unmap and clear.
-                    self.state_staging[i].unmap();
-                    if self.food_count > 0 {
-                        self.food_staging[i].unmap();
-                    }
-                } else {
-                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                    let slice = self.state_staging[i].slice(..buf_size);
-                    let _data = slice.get_mapped_range();
-                    drop(_data);
-                    self.state_staging[i].unmap();
-
-                    if self.food_count > 0 {
-                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                        let food_slice = self.food_staging[i].slice(..food_size);
-                        let _food_data = food_slice.get_mapped_range();
-                        drop(_food_data);
-                        self.food_staging[i].unmap();
-                    }
-                }
-
+                self.unmap_staging_slot(i);
                 self.staging_in_flight[i] = false;
             }
-            self.staging_ready[i].store(0, Ordering::Release);
+            self.staging_trackers[i].reset();
         }
         self.staging_index = 0;
         self.food_cache_valid = false;
@@ -998,8 +971,10 @@ impl GpuKernel {
             food_staging,
             staging_index: 0,
             staging_in_flight: [false; STAGING_SLOTS],
-            staging_ready: std::array::from_fn(|_| Arc::new(AtomicU32::new(0))),
-            staging_had_error: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
+            // One `map_async` for agent phys plus one for food state when food_count > 0.
+            staging_trackers: std::array::from_fn(|_| {
+                ReadbackTracker::new(if f > 0 { 2 } else { 1 })
+            }),
             state_cache: vec![0.0; n * PHYS_STRIDE],
             food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
             food_cache_valid: false,
@@ -1228,13 +1203,17 @@ impl GpuKernel {
         self.active_config_index = 1 - self.active_config_index;
     }
 
-    /// Number of map_async callbacks expected per staging slot: 1 (phys) + 1 (food)
-    /// when food exists, or just 1 when food_count is 0.
-    fn expected_staging_callbacks(&self) -> u32 {
+    /// Unmap every buffer participating in the given staging slot.
+    ///
+    /// Always called after the slot's [`ReadbackTracker`] reports
+    /// [`ReadbackStatus::Ready`] or [`ReadbackStatus::Failed`]: on failure
+    /// the mapping never completed so `unmap` is a no-op on the unmapped
+    /// buffer, while on success we need to release the mapping before the
+    /// slot can be reused.
+    fn unmap_staging_slot(&self, slot: usize) {
+        self.state_staging[slot].unmap();
         if self.food_count > 0 {
-            2
-        } else {
-            1
+            self.food_staging[slot].unmap();
         }
     }
 
@@ -1243,24 +1222,20 @@ impl GpuKernel {
     fn try_collect_staging(&mut self) -> bool {
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
-        let expected = self.expected_staging_callbacks();
         let mut collected = false;
         for i in 0..STAGING_SLOTS {
             if !self.staging_in_flight[i] {
                 continue;
             }
-            if self.staging_ready[i].load(Ordering::Acquire) < expected {
-                continue;
-            }
-
-            if self.staging_had_error[i].load(Ordering::Acquire) {
-                // A map_async callback errored — abandon this slot.
-                self.state_staging[i].unmap();
-                if self.food_count > 0 {
-                    self.food_staging[i].unmap();
+            match self.staging_trackers[i].status() {
+                ReadbackStatus::Pending => continue,
+                ReadbackStatus::Failed => {
+                    // A map_async callback errored — abandon this slot.
+                    self.unmap_staging_slot(i);
+                    self.staging_in_flight[i] = false;
+                    continue;
                 }
-                self.staging_in_flight[i] = false;
-                continue;
+                ReadbackStatus::Ready => {}
             }
 
             // Collect agent phys state
@@ -1270,7 +1245,6 @@ impl GpuKernel {
             self.state_cache.clear();
             self.state_cache.extend_from_slice(floats);
             drop(data);
-            self.state_staging[i].unmap();
 
             // Collect food state (only when food exists)
             if self.food_count > 0 {
@@ -1281,10 +1255,10 @@ impl GpuKernel {
                 self.food_cache.clear();
                 self.food_cache.extend_from_slice(food_floats);
                 drop(food_data);
-                self.food_staging[i].unmap();
                 self.food_cache_valid = true;
             }
 
+            self.unmap_staging_slot(i);
             self.staging_in_flight[i] = false;
             collected = true;
         }
@@ -1461,33 +1435,13 @@ impl GpuKernel {
             }
             self.queue.submit(std::iter::once(encoder.finish()));
 
-            self.staging_ready[slot_index].store(0, Ordering::Release);
-            self.staging_had_error[slot_index].store(false, Ordering::Release);
-
-            let phys_flag = self.staging_ready[slot_index].clone();
-            let phys_err = self.staging_had_error[slot_index].clone();
-            self.state_staging[slot_index].slice(..buf_size).map_async(
-                wgpu::MapMode::Read,
-                move |result| {
-                    if result.is_err() {
-                        phys_err.store(true, Ordering::Release);
-                    }
-                    phys_flag.fetch_add(1, Ordering::Release);
-                },
-            );
+            self.staging_trackers[slot_index].reset();
+            self.staging_trackers[slot_index]
+                .install(self.state_staging[slot_index].slice(..buf_size));
             if self.food_count > 0 {
                 let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                let food_flag = self.staging_ready[slot_index].clone();
-                let food_err = self.staging_had_error[slot_index].clone();
-                self.food_staging[slot_index].slice(..food_size).map_async(
-                    wgpu::MapMode::Read,
-                    move |result| {
-                        if result.is_err() {
-                            food_err.store(true, Ordering::Release);
-                        }
-                        food_flag.fetch_add(1, Ordering::Release);
-                    },
-                );
+                self.staging_trackers[slot_index]
+                    .install(self.food_staging[slot_index].slice(..food_size));
             }
             self.staging_in_flight[slot_index] = true;
             self.staging_index = (slot_index + 1) % STAGING_SLOTS;
@@ -1718,35 +1672,11 @@ impl GpuKernel {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Set up map_async on all three staging buffers. Each callback
-        // increments a shared counter; we only consider the readback ready
-        // when all 3 have completed. If any fails, we set an error flag so
-        // the caller can abandon the readback instead of hanging forever.
-        let mapped_count = Arc::new(AtomicU8::new(0));
-        let had_error = Arc::new(AtomicBool::new(false));
-
-        let make_callback = |count: Arc<AtomicU8>, err: Arc<AtomicBool>| {
-            move |result: Result<(), wgpu::BufferAsyncError>| {
-                if result.is_ok() {
-                    count.fetch_add(1, Ordering::Release);
-                } else {
-                    err.store(true, Ordering::Release);
-                }
-            }
-        };
-
-        brain_staging.slice(..).map_async(
-            wgpu::MapMode::Read,
-            make_callback(mapped_count.clone(), had_error.clone()),
-        );
-        pattern_staging.slice(..).map_async(
-            wgpu::MapMode::Read,
-            make_callback(mapped_count.clone(), had_error.clone()),
-        );
-        history_staging.slice(..).map_async(
-            wgpu::MapMode::Read,
-            make_callback(mapped_count.clone(), had_error.clone()),
-        );
+        // Aggregate completion/error for all 3 staging buffers in a single tracker.
+        let tracker = ReadbackTracker::new(3);
+        tracker.install(brain_staging.slice(..));
+        tracker.install(pattern_staging.slice(..));
+        tracker.install(history_staging.slice(..));
 
         self.agent_state_staging = Some(AgentStateReadback {
             brain_staging,
@@ -1755,8 +1685,7 @@ impl GpuKernel {
             brain_size,
             pattern_size: pat_size,
             history_size: hist_size,
-            mapped_count,
-            had_error,
+            tracker,
             brain_stride: bs,
         });
         true
@@ -1769,24 +1698,24 @@ impl GpuKernel {
         let readback = self.agent_state_staging.as_ref()?;
         self.device.poll(wgpu::Maintain::Poll);
 
-        // If any mapping failed, abandon the readback.
-        if readback.had_error.load(Ordering::Acquire) {
-            log::error!("[GPU] agent-state map_async failed — abandoning readback");
-            let rb = self.agent_state_staging.take().unwrap();
-            // Unmap any buffers that did succeed to avoid leaking.
-            let _ =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rb.brain_staging.unmap()));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rb.pattern_staging.unmap()
-            }));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rb.history_staging.unmap()
-            }));
-            return Some(None);
-        }
-
-        if readback.mapped_count.load(Ordering::Acquire) < 3 {
-            return None; // not all 3 buffers mapped yet
+        match readback.tracker.status() {
+            ReadbackStatus::Pending => return None,
+            ReadbackStatus::Failed => {
+                log::error!("[GPU] agent-state map_async failed — abandoning readback");
+                let rb = self.agent_state_staging.take().unwrap();
+                // Unmap any buffers that did succeed to avoid leaking.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rb.brain_staging.unmap()
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rb.pattern_staging.unmap()
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rb.history_staging.unmap()
+                }));
+                return Some(None);
+            }
+            ReadbackStatus::Ready => {}
         }
 
         let readback = self.agent_state_staging.take().unwrap();
@@ -1888,38 +1817,18 @@ impl GpuKernel {
     /// buffers are still in flight (caller should retry next frame).
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
         // Check if any staging buffer is still in flight.
-        let expected = self.expected_staging_callbacks();
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
                 self.device.poll(wgpu::Maintain::Poll);
-                if self.staging_ready[i].load(Ordering::Acquire) < expected {
-                    return false; // not ready yet — caller retries next frame
-                }
-
-                if self.staging_had_error[i].load(Ordering::Acquire) {
-                    self.state_staging[i].unmap();
-                    if self.food_count > 0 {
-                        self.food_staging[i].unmap();
-                    }
-                } else {
-                    let buf_size = (self.agent_count as usize * PHYS_STRIDE * 4) as u64;
-                    let slice = self.state_staging[i].slice(..buf_size);
-                    let _data = slice.get_mapped_range();
-                    drop(_data);
-                    self.state_staging[i].unmap();
-
-                    if self.food_count > 0 {
-                        let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                        let food_slice = self.food_staging[i].slice(..food_size);
-                        let _food_data = food_slice.get_mapped_range();
-                        drop(_food_data);
-                        self.food_staging[i].unmap();
+                match self.staging_trackers[i].status() {
+                    ReadbackStatus::Pending => return false, // caller retries next frame
+                    ReadbackStatus::Ready | ReadbackStatus::Failed => {
+                        self.unmap_staging_slot(i);
+                        self.staging_in_flight[i] = false;
                     }
                 }
-
-                self.staging_in_flight[i] = false;
             }
-            self.staging_ready[i].store(0, Ordering::Release);
+            self.staging_trackers[i].reset();
         }
         self.staging_index = 0;
 
@@ -2155,32 +2064,19 @@ impl GpuKernel {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Completion counter increments unconditionally (Ok or Err);
-        // error flag records whether any mapping failed.
-        let completed = Arc::new(AtomicU32::new(0));
-        let had_error = Arc::new(AtomicBool::new(false));
-
+        // Aggregate completion/error for all 4 staging buffers in a single tracker.
+        let tracker = ReadbackTracker::new(4);
         for staging in [
             &self.telemetry_staging.sensory,
             &self.telemetry_staging.decision,
             &self.telemetry_staging.brain,
             &self.telemetry_staging.phys,
         ] {
-            let cnt = completed.clone();
-            let err = had_error.clone();
-            staging
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    if result.is_err() {
-                        err.store(true, Ordering::Release);
-                    }
-                    cnt.fetch_add(1, Ordering::AcqRel);
-                });
+            tracker.install(staging.slice(..));
         }
 
         self.pending_telemetry = Some(TelemetryReadback {
-            completed,
-            had_error,
+            tracker,
             agent_index: index,
         });
     }
@@ -2194,17 +2090,15 @@ impl GpuKernel {
         self.device.poll(wgpu::Maintain::Poll);
 
         let pending = self.pending_telemetry.as_ref()?;
-        let completed = pending.completed.load(Ordering::Acquire);
-        if completed < 4 {
-            return None;
-        }
-
-        // All 4 callbacks fired. Check for errors.
-        if pending.had_error.load(Ordering::Acquire) {
-            // At least one mapping failed — unmap staging buffers and allow retry.
-            self.unmap_telemetry_staging();
-            self.pending_telemetry = None;
-            return None;
+        match pending.tracker.status() {
+            ReadbackStatus::Pending => return None,
+            ReadbackStatus::Failed => {
+                // At least one mapping failed — unmap staging buffers and allow retry.
+                self.unmap_telemetry_staging();
+                self.pending_telemetry = None;
+                return None;
+            }
+            ReadbackStatus::Ready => {}
         }
 
         // All 4 mappings succeeded — consume pending state and read data.

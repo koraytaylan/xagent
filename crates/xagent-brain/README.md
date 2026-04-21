@@ -509,18 +509,7 @@ trn = dot(trn_weights, habituated) + trn_bias
 
 This is a continuous-output linear policy -- no discrete action table. The agent learns which features predict beneficial forward motion and which predict beneficial turning.
 
-#### 6.6.5 Prospective Evaluation
-
-The policy weights are applied not just to the current state but also to the predicted future state:
-
-```
-fwd += confidence * ANTICIPATION_WEIGHT * (fwd_future - fwd)
-trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn)
-```
-
-This is delta-based: it measures the *change* between current and predicted preferences, not the absolute predicted value. This eliminates fixed-point convergence problems. `confidence = 1 - clamp(pred_error, 0, 1)` -- low accuracy means short effective horizon.
-
-#### 6.6.6 Memory-Informed Motor Blend
+#### 6.6.5 Memory-Informed Motor Blend
 
 Recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
 
@@ -534,7 +523,7 @@ fwd = fwd * (1 - mix) + mem_fwd * mix
 - **Negative valence**: "do the opposite" -- the sign flip steers away from past mistakes
 - Memory contributes up to 40% of motor signal
 
-#### 6.6.7 Exploration Noise
+#### 6.6.6 Exploration Noise
 
 Exploration rate is computed dynamically:
 
@@ -547,7 +536,7 @@ exploration_rate = clamp(0.5 - policy_confidence * 0.25 + novelty_bonus + curios
 
 Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG seeded by `(agent * 1000 + tick)`. The motor output is clamped to [-1, 1].
 
-#### 6.6.8 Motor Fatigue
+#### 6.6.7 Motor Fatigue
 
 A ring buffer of recent motor outputs (forward and turn separately) tracks motor variance. Low variance means repetitive output, which triggers dampening:
 
@@ -565,7 +554,7 @@ When motor output is varied, fatigue factor is near 1.0 (no dampening). When out
 | `fatigue_recovery_sensitivity` | 8.0 (default) | Per-agent, heritable |
 | `fatigue_floor` | 0.1 (default) | Per-agent, heritable |
 
-#### 6.6.9 Output Recording
+#### 6.6.8 Output Recording
 
 After computing final motor output:
 1. Records `[fwd, trn, tick, gradient, _pad]` to the action history ring at `O_MOTOR_RING`.

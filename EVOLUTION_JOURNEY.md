@@ -290,7 +290,7 @@ This section is a fixed point of reference for what each `BrainConfig` field doe
 
 The other `BrainConfig` fields are all kernel-active: `distress_exponent`, `metabolic_rate`, and `integrity_scale` upload via the brain-config slot (`CFG_DISTRESS_EXP`, `CFG_METABOLIC_RATE`, `CFG_INTEGRITY_SCALE`); `habituation_sensitivity`, `max_curiosity_bonus`, `fatigue_floor`, and `movement_speed` upload as per-agent heritable state and are consumed every tick. None of those are subject to the locked / proxy / legacy caveats above.
 
-When a section below cites a parameter behaviour that contradicts this table, the table is authoritative — the section is recording an earlier architectural era, not a current contract.
+When a section below cites a parameter behavior that contradicts this table, the table is authoritative — the section is recording an earlier architectural era, not a current contract.
 
 ---
 
@@ -320,7 +320,7 @@ The action selector — which determines ALL behavior — is disconnected from t
 
 ### A. Reunify the Brain
 
-**Status note (post-fused-kernel).** This proposal predates the issue #106 parameter taxonomy. The phrasing further down — "Evolution can influence behavior by tuning how fast the encoder adapts (learning_rate), how many patterns it can store (memory_capacity), and how rich the representation is (representation_dim)" — currently only holds for `learning_rate`. `representation_dimension` is locked to `ENCODED_DIMENSION`, and `memory_capacity` is a metabolic proxy (kernel pattern memory is fixed at `MEMORY_CAP`). Realising the rest of this path requires either runtime-sized WGSL arrays / per-config shader recompilation (to unlock `representation_dimension`) or wiring `memory_capacity` to a real dynamic pattern buffer rather than the metabolic-drain formula. See *Current Parameter Roles* above; open issue #107 tracks the architectural reunification work.
+**Status note (post-fused-kernel).** This proposal predates the issue #106 parameter taxonomy. The phrasing further down — "Evolution can influence behavior by tuning how fast the encoder adapts (learning_rate), how many patterns it can store (memory_capacity), and how rich the representation is (representation_dim)" — currently only holds for `learning_rate`. `representation_dimension` is locked to `ENCODED_DIMENSION`, and `memory_capacity` is a metabolic proxy (kernel pattern memory is fixed at `MEMORY_CAP`). Realizing the rest of this path requires either runtime-sized WGSL arrays / per-config shader recompilation (to unlock `representation_dimension`) or wiring `memory_capacity` to a real dynamic pattern buffer rather than the metabolic-drain formula. See *Current Parameter Roles* above; open issue #107 tracks the architectural reunification work.
 
 The action selector must work in the SAME representational space as memory and prediction. This means the encoder must be TRAINABLE — learning to produce representations that are useful for action selection, not just a frozen random projection.
 

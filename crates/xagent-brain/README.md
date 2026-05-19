@@ -463,9 +463,9 @@ A simple iterative argmax loop runs K times:
 
 ---
 
-### 6.6 Prediction + Action Selection (Pass 6) -- `predict_and_act.wgsl`
+### 6.6 Prediction + Action Selection (Pass 6) -- `brain_passes.wgsl::coop_predict_and_act`
 
-This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with prospection and memory blend, exploration noise, and motor fatigue.
+This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with memory blend, exploration noise, and motor fatigue.
 
 #### 6.6.1 Prediction Error
 
@@ -491,8 +491,8 @@ The `context_weight` parameter (stored at `O_PRED_CTX_WT`, initialized to 0.15) 
 
 The homeostatic gradient is used to assign credit/blame to recent actions in the 64-entry history ring buffer. For each recorded action:
 
-1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.04`. Actions older than ~60 ticks contribute negligibly.
-2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.01)`, skip (filters metabolic noise).
+1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.3`. The loop skips entries with `temporal < 0.01`, so actions older than ~15 ticks contribute negligibly.
+2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.005)`, the improvement is replaced by a tonic fallback `gradient * urgency * TONIC_CREDIT_SCALE (0.5)` instead of being skipped.
 3. **Pain amplification**: Negative improvements are multiplied by `PAIN_AMP = 3.0`, reflecting the biological reality that aversive stimuli produce stronger learning signals.
 4. **State-conditioned weight update**: `weights[d] += WEIGHT_LR * credit * recorded_motor * recorded_state[d]`. The recorded state snapshot from when the action was taken ensures credit is attributed to the correct sensory context.
 
@@ -500,27 +500,16 @@ The homeostatic gradient is used to assign credit/blame to recent actions in the
 
 #### 6.6.4 Policy Evaluation
 
-Continuous motor output is computed as a dot product of learned weights with the habituated state:
+Continuous motor output is computed as a dot product of learned weights with the encoded state (pre-habituation), matching the features that credit assignment trains against:
 
 ```
-fwd = dot(fwd_weights, habituated) + fwd_bias
-trn = dot(trn_weights, habituated) + trn_bias
+fwd = dot(fwd_weights, encoded) + fwd_bias
+trn = dot(trn_weights, encoded) + trn_bias
 ```
 
 This is a continuous-output linear policy -- no discrete action table. The agent learns which features predict beneficial forward motion and which predict beneficial turning.
 
-#### 6.6.5 Prospective Evaluation
-
-The policy weights are applied not just to the current state but also to the predicted future state:
-
-```
-fwd += confidence * ANTICIPATION_WEIGHT * (fwd_future - fwd)
-trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn)
-```
-
-This is delta-based: it measures the *change* between current and predicted preferences, not the absolute predicted value. This eliminates fixed-point convergence problems. `confidence = 1 - clamp(pred_error, 0, 1)` -- low accuracy means short effective horizon.
-
-#### 6.6.6 Memory-Informed Motor Blend
+#### 6.6.5 Memory-Informed Motor Blend
 
 Recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
 
@@ -534,7 +523,7 @@ fwd = fwd * (1 - mix) + mem_fwd * mix
 - **Negative valence**: "do the opposite" -- the sign flip steers away from past mistakes
 - Memory contributes up to 40% of motor signal
 
-#### 6.6.7 Exploration Noise
+#### 6.6.6 Exploration Noise
 
 Exploration rate is computed dynamically:
 
@@ -545,9 +534,9 @@ policy_confidence = clamp((|fwd| + |trn|) / 2.0, 0.0, 1.0)
 exploration_rate = clamp(0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity - urgency_penalty, 0.10, 0.85)
 ```
 
-Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG seeded by `(agent * 1000 + tick)`. The motor output is clamped to [-1, 1].
+Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG with the exploration seed derived from `agent_id ^ (tick_u * 747796405u)` before hashing. The motor output is clamped to [-1, 1].
 
-#### 6.6.8 Motor Fatigue
+#### 6.6.7 Motor Fatigue
 
 A ring buffer of recent motor outputs (forward and turn separately) tracks motor variance. Low variance means repetitive output, which triggers dampening:
 
@@ -565,11 +554,11 @@ When motor output is varied, fatigue factor is near 1.0 (no dampening). When out
 | `fatigue_recovery_sensitivity` | 8.0 (default) | Per-agent, heritable |
 | `fatigue_floor` | 0.1 (default) | Per-agent, heritable |
 
-#### 6.6.9 Output Recording
+#### 6.6.8 Output Recording
 
 After computing final motor output:
-1. Records `[fwd, trn, tick, gradient, _pad]` to the action history ring at `O_MOTOR_RING`.
-2. Records the habituated state snapshot at `O_STATE_RING` for future credit assignment.
+1. Records `[noise_fwd * exploration_rate, noise_trn * exploration_rate, tick, gradient, 0.0]` to the action history ring at `O_MOTOR_RING`. Storing the exploration noise (not the full motor) is what makes credit assignment a proper REINFORCE gradient -- see PR #97.
+2. Records the encoded (pre-habituation) state snapshot at `O_STATE_RING` for future credit assignment -- matches the features the policy and credit updates train against.
 3. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
 4. Increments `O_TICK_COUNT`.
 5. Writes `[prediction(32), credit_signal(32), fwd, trn, strafe, _pad]` to the decision buffer for pass 7 and CPU readback.

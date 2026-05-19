@@ -18,17 +18,17 @@ This crate is the **interface contract** between the brain and sandbox crates. I
               ┌────────────┼────────────┐
               │                         │
               ▼                         ▼
-     ┌────────────────┐       ┌──────────────────┐
-     │  xagent-brain  │       │ xagent-sandbox   │
-     │                │       │                  │
-     │  GpuKernel     │       │  Builds world    │
-     │  uploads these │       │  state, calls    │
-     │  configs to    │       │  kernel.dispatch │
-     │  GPU buffers,  │       │  _batch, reads   │
-     │  runs the      │       │  back vitals and │
-     │  fused per-    │       │  telemetry for   │
-     │  agent kernel  │       │  UI + replay     │
-     └────────────────┘       └──────────────────┘
+     ┌────────────────┐       ┌─────────────────────┐
+     │  xagent-brain  │       │ xagent-sandbox      │
+     │                │       │                     │
+     │  GpuKernel     │       │  Builds world       │
+     │  uploads these │       │  state, calls       │
+     │  configs to    │       │  kernel             │
+     │  GPU buffers,  │       │  .dispatch_batch,   │
+     │  runs the      │       │  reads back vitals  │
+     │  fused per-    │       │  and telemetry for  │
+     │  agent kernel  │       │  UI + replay        │
+     └────────────────┘       └─────────────────────┘
 ```
 
 > **Historical note.** Earlier versions of this crate documented `SensoryFrame` and `MotorCommand` as the per-tick interface — the sandbox would build a `SensoryFrame`, call a `Brain::tick(frame) -> MotorCommand` method, and apply the result. The runtime has since moved entirely onto the GPU (`xagent_brain::GpuKernel`). These types are still the canonical shape of one sensory snapshot and one motor command, used for `BrainConfig`/`WorldConfig` serialization, replay records, and unit-test fixtures — but they no longer cross the bus per tick. The sandbox builds world state and uploads it to GPU buffers; the kernel computes vision, motor output, and the rest in-place.

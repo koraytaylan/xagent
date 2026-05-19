@@ -17,7 +17,7 @@ sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> 
   | brain-only entry points). One queue.submit() runs N fused ticks per batch.
 ```
 
-`GpuKernel` is the sole runtime. There is no CPU-side brain object, no `Brain::tick(frame) -> MotorCommand` API, and no swappable cognitive-architecture trait. The CPU uploads sensory data and world configuration to GPU storage buffers, then calls `kernel.dispatch_batch(start_tick, ticks_to_run)`. The kernel runs `ticks_to_run` simulated ticks per submission: physics, food detection, death/respawn, and the seven brain stages all run cooperatively per agent inside a single 256-thread workgroup, with `workgroupBarrier()` between stages. All persistent brain state lives permanently in GPU storage buffers — there is no per-tick CPU↔GPU marshalling of brain state. The only data that crosses the bus per tick is whatever the CPU side asks the kernel to read back (typically position/vitals for the UI and a per-frame telemetry snapshot for the selected agent).
+`GpuKernel` is the sole runtime. There is no CPU-side brain object, no `Brain::tick(frame) -> MotorCommand` API, and no swappable cognitive-architecture trait. At startup the CPU uploads world geometry (terrain heightmap, biome grid, food positions/timers/consumed flags) and the initial per-agent physics rows; thereafter the only thing the CPU writes per dispatch is the world-config uniform (`start_tick`, `ticks_to_run`, `vision_stride`, `brain_tick_stride`, phase mask). `kernel.dispatch_batch(start_tick, ticks_to_run)` splits the requested ticks into kernel-batches of `vision_stride * brain_tick_stride` ticks each, submitting one command buffer per batch (plus an optional physics-only remainder); every batch runs the four passes `prepare → kernel → global → vision`. The brain stage in step 2 reads its sensory inputs from the `sensory_buffer` that the *previous* batch's vision pass wrote — a one-batch sensory lag that lets the costly global+vision work amortize over `vision_stride` brain cycles. All persistent brain state lives permanently in GPU storage buffers; the only data that crosses the bus while the simulation is running is whatever the CPU side asks the kernel to read back (typically position/vitals for the UI and a per-frame telemetry snapshot for the selected agent).
 
 ---
 
@@ -235,22 +235,24 @@ SensoryFrame                                                                  Mo
 
 ## 4. GPU-Resident Design
 
-`GpuKernel` keeps **all** simulation state permanently on the GPU. Even the world configuration, food state, and physics state live in GPU storage buffers — the CPU updates them through `upload_world` / `upload_agents` calls, then leaves them alone while batches run. This eliminates the CPU↔GPU marshalling bottleneck that would otherwise dominate per-tick cost.
+`GpuKernel` keeps **all** simulation state permanently on the GPU. The world geometry, food state, and per-agent physics rows live in GPU storage buffers; the CPU populates them through `upload_world` / `upload_agents` and then leaves them alone while batches run. This eliminates the CPU↔GPU marshalling bottleneck that would otherwise dominate per-tick cost.
 
 ### Per-Batch I/O Budget
 
-A batch dispatches `ticks_to_run` simulated ticks in a single `queue.submit()`. The CPU side only crosses the bus when:
+A `dispatch_batch(start_tick, ticks_to_run)` call splits the work into one or more kernel-batches, each its own command buffer + `queue.submit()`. The CPU side only crosses the bus when:
 
 | Direction | When | What |
 |-----------|------|------|
-| CPU → GPU | At init / on config change | `upload_world`, `upload_agents`, `upload_world_config` |
-| CPU → GPU | Once per batch | World-config uniform: `[start_tick, ticks_to_run, phase_mask]` |
+| CPU → GPU | At init / when terrain or food layout changes | `upload_world`: terrain heightmap, biome grid, food positions/consumed/timers |
+| CPU → GPU | At spawn / on evolution offspring | `upload_agents`: initial physics rows |
+| CPU → GPU | Once per kernel-batch | `upload_world_config`: world-config uniform with `start_tick`, `ticks_to_run`, `vision_stride`, `brain_tick_stride`, phase mask |
+| CPU → GPU | On heritable-config edit | `write_agent_state` / `write_agent_heritable_config` |
 | GPU → CPU | When `try_collect_state` is called | Position, vitals, motor cache, exploration/fatigue, death counts |
 | GPU → CPU | When `try_collect_telemetry` is called | One agent's vision + decision snapshot (selected agent only) |
 | GPU → CPU | When `try_collect_agent_state` is called | One agent's full `AgentBrainState` (for inheritance, debugging) |
-| GPU only | Per-tick simulation | Brain state, pattern memory, action history, physics state, food state |
+| GPU only | Per-tick simulation | Brain state, pattern memory, action history, physics state, food state, **sensory features** (written by the vision pass into `sensory_buf`) |
 
-The asymmetry is intentional: sensory frames are not packed and uploaded per tick — vision rays, touch contacts, and proprioception are all computed *inside* the kernel from world state and the per-agent physics row. The brain pipeline reads its own sensory input from the same buffers that physics writes to.
+The asymmetry is intentional. Sensory frames are not packed and uploaded per tick: the vision pass raycasts on the GPU from terrain/biome/food/agent buffers and writes the feature layout directly into `sensory_buf`. The brain stage in the next kernel-batch reads its inputs from that same `sensory_buf` — a one-batch sensory lag that amortizes the cost of vision + grid rebuild over `vision_stride` brain cycles.
 
 ### Non-Blocking Readback
 
@@ -681,12 +683,13 @@ The method list below is the contract used by `xagent-sandbox`. See `gpu_kernel.
 | Method | Description |
 |--------|-------------|
 | `is_available() -> bool` | Static probe: returns true if any wgpu adapter (real GPU or software fallback) exists. Used by tests to skip GPU work on headless CI. |
-| `new(agent_count, brain_config, world_config, seed)` | Creates the wgpu device, allocates all buffers and pipelines, composes the fused shaders with subgroup markers and override constants, uploads the initial world + agent state. |
-| `upload_world(&WorldConfig)` | Uploads world parameters (size, food density, hazard rates, …) to the world-config storage buffer. Call when the config changes. |
-| `upload_agents(&[AgentSpawn])` | Writes initial physics rows for the listed agents into `physics_state`. Used when spawning a new generation. |
-| `dispatch_batch(start_tick, ticks_to_run)` | Single `queue.submit()` that runs the global pass once and the per-agent fused pass for `ticks_to_run` simulated ticks. Returns `true` if the batch was dispatched. |
-| `dispatch_batch_masked(start_tick, ticks_to_run, phase_mask)` | Same as above but skips selected phases (used by tests and benchmarks). |
-| `try_collect_state() -> bool` | Non-blocking: polls the state-readback tracker; if a buffer is ready, copies it into `cached_state`. Returns `true` on update. |
+| `new(agent_count, food_count, brain_config, world_config)` | Creates the wgpu device (requesting `PUSH_CONSTANTS`, optionally `SUBGROUP`), allocates all buffers and pipelines, and composes the fused shaders with subgroup markers and the `VISION_W`/`VISION_H` override cascade. |
+| `upload_world(terrain_heights, biome_grid, food_positions, food_consumed, food_timers)` | Writes the terrain heightmap, biome grid, and the food spatial buffers (positions, consumed flags, respawn timers) into GPU storage. Static-ish world data — call when the world is built or food layout changes. |
+| `upload_agents(&[(Vec3, f32, f32, usize, usize)])` | Writes initial physics rows `(position, max_energy, max_integrity, memory_capacity, processing_slots)` for the listed agents into `agent_phys` storage. Used when spawning a new generation. |
+| `upload_world_config(start_tick, ticks_to_run)` | Writes the per-batch world-config uniform consumed by all four passes inside a kernel-batch (start tick, batch size, stride parameters). Called internally by `dispatch_batch`. |
+| `dispatch_batch(start_tick, ticks_to_run)` | Splits the work into kernel-batches of `vision_stride * brain_tick_stride` ticks; each batch is one command-buffer + `queue.submit()` running `prepare → kernel → global → vision` plus an opportunistic copy into a staging slot. Always returns `true` (kept for API compatibility — staging copies may be skipped when all slots are in flight, but compute is decoupled from readback). |
+| `dispatch_batch_masked(start_tick, ticks_to_run, phase_mask)` | Variant that gates which phases run per cycle (bit 0 = physics, bit 1 = vision, bit 2 = brain). Used by tests and benchmarks; always submits a blocking copy at the end to guarantee deterministic readback. |
+| `try_collect_state() -> bool` | Non-blocking: polls all in-flight state-readback slots; if any is ready, copies the most recent into `cached_state` (and `cached_food_state` when food exists). Returns `true` on update. |
 | `cached_state() -> &[f32]` | Latest physics-state snapshot (positions, vitals, motor, death counts, telemetry slots). |
 | `cached_food_state() -> Option<&[f32]>` | Latest food-state snapshot when available. |
 | `read_full_state_blocking() -> &[f32]` | Test/debug only: blocks until the next state readback completes. |
@@ -701,7 +704,8 @@ The method list below is the contract used by `xagent-sandbox`. See `gpu_kernel.
 | `batch_write_agent_states(count, F)` | Bulk variant of `write_agent_state` driven by a closure (one allocation, one submit). |
 | `try_reset_agents(&BrainConfig) -> bool` | Re-initializes every agent's brain + physics row from the given config. |
 | `reset_agents(&BrainConfig)` / `reset_agents_seeded(&BrainConfig, seed)` | Blocking variants used at startup. |
-| `brain_tick_stride() -> u32` | Returns the current brain-tick stride (`vision_stride`), the minimum batch size that contains at least one full brain cycle. |
+| `brain_tick_stride() -> u32` | Returns `brain_config.brain_tick_stride` — the number of physics ticks per brain cycle. Sandbox uses it as the minimum batch size that contains a full brain cycle. |
+| `kernel_batch_size() -> u32` | Returns `vision_stride * brain_tick_stride` — the number of physics ticks in one full kernel-batch; dispatching in exact multiples guarantees deterministic global- and vision-pass cadence. |
 
 ### AgentBrainState
 

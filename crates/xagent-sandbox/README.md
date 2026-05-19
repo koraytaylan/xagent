@@ -938,7 +938,7 @@ Brain state is preserved across deaths — it lives in GPU buffers and is mutate
 
 1. **Random respawn position** — `phase_death.wgsl` samples up to 50 biome positions before settling on a non-Danger spawn (falling back to the last candidate if all sampled cells are Danger). The agent reappears at an unpredictable location.
 2. **Memory trauma** — `O_PAT_REINF[i] *= 0.5` for every pattern slot. Patterns below the activation threshold drop out of recall on the next tick; the strongest survive. The respawned agent retains learned representations but with weaker confidence.
-3. **Homeostasis + habituation + history reset** — the three-timescale gradient EMAs, exploration rate, fatigue factor, habituation EMAs, position-ring staleness state, and action history are zeroed. The respawned agent has no homeostatic memory of the previous life.
+3. **Homeostasis + habituation + history reset** — the three-timescale gradient EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (fresh perceptual context), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the action history is zeroed. The respawned agent has no homeostatic memory of the previous life.
 
 The credit chain during danger encounters is unchanged from the pre-fused design:
 
@@ -954,9 +954,9 @@ Suicide prevention is emergent: death is maximally unpredictable (massive predic
 
 All per-tick simulation runs in `xagent_brain::GpuKernel` — physics, vision raycasting, food detection, agent-agent collision, death/respawn, and the full brain pipeline. The CPU side only encodes dispatches and reads back UI state. The main throughput knobs are:
 
-- **Vision resolution**: 8×6 by default (48 rays per agent per global pass). Larger grids scale linearly with `VISION_RAYS` in both shader work and `BrainLayout::feature_count` (encoder weights).
-- **`vision_stride`**: how many physics+brain cycles run between global passes (grid rebuild, collision, vision raycasting). Higher values trade sensory freshness for raw brain throughput.
-- **Brain-tick batching**: one `dispatch_batch` runs `ticks_to_run` simulated ticks per `queue.submit()` so the CPU cost per simulated tick is amortized to near zero.
+- **Vision resolution**: 8×6 by default (48 rays per agent per vision pass). Larger grids scale linearly with `VISION_RAYS` in both shader work and `BrainLayout::feature_count` (encoder weights).
+- **`vision_stride`**: how many physics+brain cycles run between global+vision passes (grid rebuild, collision, raycasting). Higher values trade sensory freshness for brain throughput; the brain reads from the previous batch's vision output, so this is also the sensory-lag in brain cycles.
+- **Kernel-batching**: `dispatch_batch(ticks_to_run)` splits work into kernel-batches of `vision_stride * brain_tick_stride` ticks, submitting one command buffer per batch (plus an optional physics-only remainder). Per-simulated-tick CPU cost is the world-config uniform write + command-encoder setup, divided by the batch size — small at any throughput.
 - **Subgroup top-K** (when supported): the recall top-K reduction uses a subgroup-accelerated bitonic sort spliced in by `apply_subgroup_markers`. On hardware without `wgpu::Features::SUBGROUP`, the same code path falls back to a workgroup-memory bitonic sort.
 - **MAX_AGENTS**: 100. Per-agent storage scales linearly; `BrainLayout::brain_stride` × 100 × 4 bytes is the worst-case persistent allocation.
 

@@ -4,10 +4,13 @@
 //! [`GpuKernel::dispatch_batch`] splits the requested ticks into one or more
 //! kernel-batches; each batch encodes a `prepare → kernel → global → vision`
 //! sequence into its own command buffer and submits it. The per-agent `kernel`
-//! pass is a fused WGSL compute stage that loops `vision_stride` cycles of
-//! physics, food detection, death/respawn, and all seven cooperative brain
-//! stages — so the *per-agent* work is one dispatch per cycle, but a single
-//! `dispatch_batch` may submit several command buffers.
+//! pass is a fused WGSL compute stage that **internally** loops `vision_stride`
+//! cycles of physics, food detection, death/respawn, and all seven cooperative
+//! brain stages inside a single `dispatch_workgroups(agent_count, 1, 1)`. So
+//! each kernel-batch issues exactly one kernel dispatch — the `vision_stride`
+//! cycles are a `for` loop inside the shader, not separate dispatches — while a
+//! single `dispatch_batch` call may submit several command buffers (one per
+//! kernel-batch, plus an optional physics-only remainder).
 //!
 //! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge from
 //! the interaction of capacity constraints, prediction error, and homeostatic

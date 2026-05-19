@@ -193,10 +193,10 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                               │  agents → sensory_buf     │
                               └───────────────────────────┘
 
-  Persistent GPU buffers (live across ticks):
-  ─── brain_state_buf ────  8,468 f32/agent  (encoder weights, predictor, habituation, homeo, action, fatigue)
-  ─── pattern_buf ────────  5,251 f32/agent  (128 patterns: states, norms, reinforcement, motor, meta, active)
-  ─── history_buf ────────  2,370 f32/agent  (64-entry action history ring: motor+state snapshots)
+  Persistent GPU buffers (live across ticks; sizes shown for default 8×6 vision, `ENCODED_DIMENSION = 128`):
+  ─── brain_state_buf ────  `BrainLayout::brain_stride` (51,381 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue)
+  ─── pattern_buf ────────  `PATTERN_STRIDE` (17,539 f32/agent)            (128 patterns: states, norms, reinforcement, motor, meta, active)
+  ─── history_buf ────────  `HISTORY_STRIDE` (8,514 f32/agent)             (64-entry action history ring: motor+state snapshots)
   ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
   ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
   ─── sensory_buf ────────     per-agent     (raw vision + non-visual features written by vision pass)
@@ -212,8 +212,8 @@ The `kernel_tick.wgsl` per-agent pass runs the seven cooperative brain functions
 
 ```
 brain cycle (executed vision_stride times per kernel-batch):
-  1. coop_feature_extract   sensory_buf (267 f32) → features (217 f32)
-  2. coop_encode            features → encoded (32 f32)
+  1. coop_feature_extract   sensory_buf (`SENSORY_STRIDE`, 267 f32 for 8×6) → features (`BrainLayout::feature_count` = `VISION_RAYS * 5 + 25`, 265 f32 for 8×6)
+  2. coop_encode            features → encoded (`ENCODED_DIMENSION` = 128 f32)
   3. coop_habituate_homeo   habituation EMA + homeostatic gradient/urgency
   4. coop_recall_score      cosine similarity vs 128 patterns
   5. coop_recall_topk       top-16 selection (subgroup or workgroup bitonic sort)
@@ -335,7 +335,7 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ## 6. Component Deep Dive: The 7 Brain Stages
 
-> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. Dimension numbers in §§6.1–6.7 (e.g. `DIM = 32`, `FEATURE_COUNT = 217`) reflect the pre-fused legacy layout — a full rewrite to the current dimensions (`ENCODED_DIMENSION = 128`, vision-dependent `FEATURE_COUNT`) is tracked as a follow-up.
+> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The current dimensions are `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = VISION_RAYS * 5 + 25` (= 265 for the default 8×6 vision); any older `DIM = 32` / `FEATURE_COUNT = 217` references in the §§6.1–6.7 prose are legacy and should be read against the values in §5 Buffer Layout.
 
 ### 6.1 Feature Extraction -- `coop_feature_extract`
 

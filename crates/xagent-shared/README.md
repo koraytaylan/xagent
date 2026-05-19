@@ -380,7 +380,7 @@ These shared types describe the *shape* of one tick's worth of sensory input and
 
 **Per-batch flow**:
 
-1. **Sandbox uploads world + agent state**: When the world or an agent spec changes (startup, spawn, config edit), the sandbox uploads the new `WorldConfig` / `BrainConfig` / `BodyState` rows into the kernel's GPU buffers.
+1. **Sandbox uploads world + agent state**: When the world geometry or an agent spec changes (startup, spawn, config edit), the sandbox uploads new terrain/biome/food data and `BodyState` / `BrainConfig` rows into the kernel's GPU **storage** buffers via `GpuKernel::upload_world` / `upload_agents` / `write_agent_*`. `WorldConfig` (tick window, vision/brain strides, phase mask) is a separate path — it lives in a double-buffered **uniform** buffer (`world_config_bufs`) that `upload_world_config[_masked]` rewrites once per kernel-batch from inside `dispatch_batch`.
 
 2. **Sandbox dispatches a batch**: `kernel.dispatch_batch(start_tick, ticks_to_run)` runs many simulated ticks per submission. Inside the kernel, each agent's vision rays are raycast in WGSL, touch contacts are detected from the spatial grids, motor output is computed from the encoded state, and physics integrates position/velocity/energy/integrity — all without crossing the bus.
 
@@ -395,7 +395,7 @@ These shared types describe the *shape* of one tick's worth of sensory input and
 | `BodyState` | Physical state at spawn / on inspection | Uploaded into the physics-state buffer when a new agent is spawned; read back when the CPU needs position/vitals. |
 | `InternalState` | Physiological variables | Held inside `BodyState`; reconstituted from physics readback. |
 | `BrainConfig` | Heritable capacity + tuning parameters | Uploaded into the brain-state tail per agent at spawn or after evolution mutation. |
-| `WorldConfig` | World parameters | Uploaded into the world-config storage buffer at startup and on edit. |
+| `WorldConfig` | World parameters | Uploaded into the double-buffered world-config uniform buffer; rewritten once per kernel-batch by `upload_world_config[_masked]`. |
 
 Note that the brain stages still **never** see `BodyState` directly — they read the normalized fields (`energy_signal`, `integrity_signal`, deltas) the physics phase writes into the sensory layout. The brain doesn't know its exact energy level, only the normalized signal. This information asymmetry is preserved on the GPU side too: the encoder reads the same opaque buffer of floats regardless of how the physics phase produced them.
 

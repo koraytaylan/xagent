@@ -614,7 +614,7 @@ When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) an
 Death detection and respawn run entirely inside the kernel — no per-death Rust call into the brain. `phase_death.wgsl` is invoked after each per-agent physics step:
 
 1. **Detect**: If `physics_state[P_ENERGY] ≤ 0` or `P_INTEGRITY ≤ 0`, the agent is marked dead.
-2. **Spawn search**: up to 50 GPU-RNG samples pick a position in a non-Danger biome (the sample falls back to the last candidate if all attempts hit hazards).
+2. **Spawn search**: up to 50 GPU-RNG samples pick a position in a non-Danger biome; if every attempt hits Danger the shader does **not** reuse a previously sampled cell — it draws one fresh random `(cx, cz)` within world bounds and skips the biome check entirely (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 3. **Reset physics row**: full energy, full integrity, zero velocity, facing +Z, alive flag restored. Death count is incremented; `food_count`, `ticks_alive`, and `last_death_tick` are preserved through the reset so CPU readback can attribute the death.
 4. **Trauma**: all pattern reinforcement values are multiplied by `0.5` in-place. Patterns below the activation threshold drop out of recall; the strongest survive.
 5. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed, attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, and action history zeroed.
@@ -936,7 +936,7 @@ marker floating above it in the 3D viewport. Its data drives:
 
 Brain state is preserved across deaths — it lives in GPU buffers and is mutated (not destroyed) by the respawn pass. Three guardrails make death costly without making it terminal:
 
-1. **Random respawn position** — `phase_death.wgsl` samples up to 50 biome positions before settling on a non-Danger spawn (falling back to the last candidate if all sampled cells are Danger). The agent reappears at an unpredictable location.
+1. **Random respawn position** — `phase_death.wgsl` samples up to 50 biome positions before settling on a non-Danger spawn (falling back to one fresh random position within world bounds, without the biome check, if all sampled cells are Danger). The agent reappears at an unpredictable location.
 2. **Memory trauma** — `O_PAT_REINF[i] *= 0.5` for every pattern slot. Patterns below the activation threshold drop out of recall on the next tick; the strongest survive. The respawned agent retains learned representations but with weaker confidence.
 3. **Homeostasis + habituation + history reset** — the three-timescale gradient EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (fresh perceptual context), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the action history is zeroed. The respawned agent has no homeostatic memory of the previous life.
 

@@ -1,7 +1,7 @@
 # xagent — Emergent Cognitive Agent Platform
 
-> **No hardcoded behaviors. No reward functions. No explicit goals.**
-> Fear, curiosity, attention, and habit all emerge from capacity constraints, sensory experience, and homeostatic pressure.
+> **No hardcoded goals. No reward functions. A numerically flattened brain interface.**
+> One small reactive substrate (a klinotaxis turn-gain modulator) is hardcoded, and the sensory packer carries some inductive bias (fixed modality layout, top-4 touch priors, `surface_tag` scalar channel). Beyond that scaffolding, fear, curiosity, attention, and habit emerge from capacity constraints, sensory experience, and homeostatic pressure.
 
 ## 1. Project Vision
 
@@ -67,7 +67,9 @@ Sandbox                          Brain
   └────────────────────────────────┘
 ```
 
-> **Core Principle: Semantic Opacity** — The brain never sees the named fields of `SensoryFrame`. The encoder flattens vision, touch, energy, and all other modalities into a single opaque `Vec<f32>`. The brain has no concept of "eyes," "hunger," or "other agents" — only numerical patterns. All meaning is *discovered* through prediction error and homeostatic correlation, not provided through labels. This is the architectural foundation that makes emergence genuine rather than engineered. See the [brain crate README](crates/xagent-brain/README.md#the-brain-has-no-eyes) for the full explanation.
+> **Core Principle: Numerically Flattened Brain Interface** — The brain consumes a flat float buffer, not the named fields of `SensoryFrame`. It operates over numeric features and encoded state, not over Rust structs or domain symbols like `"food"` / `"hazard"`. Meaning at this level is *discovered* through prediction error and homeostatic correlation, not provided through labels.
+>
+> The flattening is not free of inductive bias. `pack_sensory_frame()` fixes the modality layout (vision color, depth, proprioception, interoception, touch — all in a known positional order), selects the top 4 touch contacts by intensity, and preserves `surface_tag` (terrain/food/hazard/agent) as a scalar category channel (`c.surface_tag as f32 / 4.0`). The shader boundary strips struct labels; the packer chose the layout. The honest summary: **a numerically flattened, mostly opaque interface — not a bias-free one.** See the [brain crate README](crates/xagent-brain/README.md#the-brain-has-no-eyes) for the full explanation.
 
 ---
 
@@ -92,7 +94,7 @@ The `vision_stride` parameter (default 10) controls how many brain+physics cycle
 
 Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
 
-1. **Feature Extract** — Reads the packed sensory input (`SENSORY_STRIDE = 267`: 192 RGBA vision + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (`FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features) inside the fused kernel. This is the semantic firewall: the frame's named fields (vision, energy, touch) are flattened into an opaque feature vector, and from this point on the brain operates without any knowledge of what the numbers originally represented.
+1. **Feature Extract** — Reads the packed sensory input (`SENSORY_STRIDE = 267`: 192 RGBA vision + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (`FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features) inside the fused kernel. The frame's named fields (vision, energy, touch) were flattened upstream by `pack_sensory_frame()` into a fixed-positional float buffer; from this point on the brain operates over numeric features without struct labels. The positional layout itself is a handcrafted prior — see the caveat in §2.
 
 2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 

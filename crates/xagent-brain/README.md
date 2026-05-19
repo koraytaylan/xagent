@@ -2,7 +2,7 @@
 
 A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU.
 
-The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors -- no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
+The brain crate is the decision-making core of each xagent. It has no hardcoded goals -- no "hunger module", no "fear module", no goal system. One narrow caveat: the action stage carries a hardcoded klinotaxis turn-gain modulator (`shaders/kernel/brain_passes.wgsl:600-607`, gated by `KLINOTAXIS_SENSITIVITY` in `common.wgsl`). It is a reflex on the homeostatic gradient, not a goal. Everything else the agent does emerges from a single loop and a single principle:
 
 > **Prediction error drives everything.**
 
@@ -61,7 +61,7 @@ World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extrac
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
+This is a fundamental difference from traditional AI systems, with two narrow caveats. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." The brain operates over numeric features, not symbolic categories. **Caveats:** (1) `pack_sensory_frame()` fixes the modality layout — vision color, depth, proprioception, interoception, and touch occupy a known positional order — so the layout itself is a handcrafted inductive bias; (2) `TouchContact::surface_tag` (terrain/food/hazard/agent) is preserved as a scalar category channel, encoded as `c.surface_tag as f32 / 4.0`, before flattening. The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips most of that structure away, but not all. What remains -- prediction + homeostatic gradient + experience -- is where the meaning of those numeric patterns is discovered.
 
 ---
 

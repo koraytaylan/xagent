@@ -50,10 +50,10 @@ The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. B
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array, and `feature_extract.wgsl` further compresses it to 217 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array (default 8×6 vision), and `feature_extract.wgsl` further compresses it to 265 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
-World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [217 f32]
+World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [265 f32]
                |                                                        |
       Named fields like                                        Brain sees only a
       "vision", "energy"                                       flat array<f32>
@@ -158,7 +158,7 @@ SensoryFrame                                                                  Mo
       |                                                                             |
       v                                                                             |
 ┌─────────────┐  features   ┌──────────┐  encoded   ┌──────────────────┐            |
-│   Pass 1:   │  (217 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
+│   Pass 1:   │  (265 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
 │   Feature   │────────────>│  Encode  │───────────>│  Habituate +     │            |
 │   Extract   │             │          │            │  Homeostasis     │            |
 └─────────────┘             └──────────┘            └────────┬─────────┘            |
@@ -213,8 +213,8 @@ SensoryFrame                                                                  Mo
 ```
 1. CPU packs SensoryFrames into flat f32 arrays (pack_sensory_frame)
 2. CPU uploads sensory buffer to GPU                           (~52KB for 50 agents)
-3. GPU Pass 1: feature_extract   (267 f32 --> 217 f32)        one thread per agent
-4. GPU Pass 2: encode            (217 f32 --> 32 f32)         one thread per agent
+3. GPU Pass 1: feature_extract   (267 f32 --> 265 f32)        one thread per agent
+4. GPU Pass 2: encode            (265 f32 --> 32 f32)         one thread per agent
 5. GPU Pass 3: habituate_homeo   (habituation EMA + homeostatic gradient/urgency)
 6. GPU Pass 4: recall_score      (cosine sim vs 128 patterns)
 7. GPU Pass 5: recall_topk       (top-16 selection, metadata update)
@@ -265,7 +265,7 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `DIM` | 32 | Internal representation dimensionality |
-| `FEATURE_COUNT` | 217 | Extracted feature count (192 RGBA + 25 non-visual) |
+| `FEATURE_COUNT` | 265 (default 8×6) | Extracted feature count (192 RGBA + 48 depth + 25 non-visual); derived from `BrainLayout` for other vision sizes |
 | `MEMORY_CAP` | 128 | Maximum patterns per agent |
 | `RECALL_K` | 16 | Top-K recalled patterns per tick |
 | `ACTION_HISTORY_LEN` | 64 | Credit assignment lookback window |
@@ -636,7 +636,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 
 | Phenomenon | How It Emerges | Contributing Passes |
 |------------|---------------|---------------------|
-| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (217 --> 32) compresses information | Pass 2, Pass 4-5 |
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (265 --> 32) compresses information | Pass 2, Pass 4-5 |
 | **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | Pass 3, 6 (credit + prospection) |
 | **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | Pass 3 (habituation), Pass 6 (exploration) |
 | **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | Pass 6 (credit), Pass 7 (reinforcement) |

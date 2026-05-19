@@ -388,7 +388,7 @@ pub struct Agent {
     pub generation: u32,           // life iteration (incremented on each death/respawn)
     pub life_start_tick: u64,      // reset on respawn
     pub longest_life: u64,
-    pub respawn_cooldown: u32,      // legacy/unused — kept for serialization compat; respawn now happens immediately on the GPU (see Death & Respawn). Always 0 in current runtime.
+    pub respawn_cooldown: u32,      // legacy/unused — always 0 in current runtime (respawn is GPU-immediate; see Death & Respawn). `Agent` is not serialized, so this is not retained for any wire/DB format.
     pub has_reproduced: bool,
     pub food_consumed: u32,        // cumulative food consumed
     pub total_ticks_alive: u64,    // cumulative ticks alive across all lives
@@ -418,7 +418,7 @@ pub struct Agent {
 
 The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` / `history_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation, evolution mutation, and JSON serialization.
 
-**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
+**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 
 **Agent mesh** — 2.0-unit cube with 6-face shading (each face darkened by factors
 1.0, 0.9, 0.8, 0.7, 0.85, 0.75). Combined into a single vertex buffer for all agents.
@@ -892,7 +892,7 @@ access to the current agent.
 
 ### Agent Palette Colors
 
-Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
+Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 
 ### Selection Marker
 

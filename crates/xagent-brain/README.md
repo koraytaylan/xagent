@@ -716,7 +716,7 @@ Used for cross-generation inheritance (the governor reads parent state, mutates 
 
 Death detection and respawn live entirely in WGSL (`phase_death.wgsl`, invoked from `kernel_tick.wgsl` after the physics step). There is no `death_signal` Rust call. When the kernel decides an agent has died (energy ≤ 0 or integrity ≤ 0):
 
-1. **Spawn search**: up to 50 GPU-RNG samples pick a non-Danger biome position.
+1. **Spawn search**: tries up to 50 GPU-RNG samples for a non-Danger biome position; if all 50 attempts land in Danger biomes, falls back to one fresh random position within world bounds without the biome check (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 2. **Physics reset**: full energy, full integrity, zero velocity, facing +Z; death count incremented; fitness counters (`food_count`, `ticks_alive`, `last_death_tick`) preserved.
 3. **Memory trauma**: all `O_PAT_REINF` entries are multiplied by `0.5`. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (which gates on `O_PAT_ACTIVE` in `brain_passes.wgsl`, not on reinforcement) is not cut off by this step. Halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest memories survive.
 4. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed and attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, action history zeroed.

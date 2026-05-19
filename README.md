@@ -187,7 +187,7 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 
 Brain state lives in GPU buffers and is preserved across deaths. When `phase_death.wgsl` detects an agent's death (energy or integrity ≤ 0), it executes the respawn pass on the GPU:
 
-1. **Random respawn position** — agent reappears at an unpredictable non-Danger location (up to 50 biome-sampling attempts).
+1. **Random respawn position** — the shader tries up to 50 non-Danger biome samples; if all 50 attempts land in Danger biomes, it falls back to one fresh random position within world bounds without the biome check (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 2. **Memory trauma** — pattern reinforcement values are halved in-place (`O_PAT_REINF[i] *= 0.5`). The death pass itself does not change any pattern's `O_PAT_ACTIVE` flag, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. Instead, halved reinforcement means subsequent decay (`O_PAT_REINF -= effective_rate` per brain cycle) reaches the `<= 0.0` deactivation point sooner for the weakest patterns; strongest survive. This models the cognitive cost of catastrophic discontinuity without wiping the brain.
 3. **Homeostasis + habituation + history reset** — the three-timescale homeostasis EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (so the next tick's perception starts fully un-attenuated), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and action history is zeroed. The respawned agent has no homeostatic memory of the previous life but keeps its encoder/predictor weights and pattern memory.
 
@@ -195,7 +195,7 @@ Suicide prevention is emergent: death produces a sudden, massive prediction erro
 
 ### Agent Palette Colors
 
-Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.25, 0.25, 0.25]`. This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
+Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`). This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
 
 ### Agent Trails
 

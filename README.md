@@ -60,14 +60,18 @@ Sandbox                                                GpuKernel (GPU)
   │ ────────────────────────────────────────────────────────►│
   │                                                          │
   │  2. dispatch_batch(start_tick, ticks_to_run)             │
-  │     – splits `ticks_to_run` into kernel-batches of       │
-  │       `vision_stride * brain_tick_stride` ticks, each    │
-  │       its own queue.submit() (uniform write + four       │
-  │       passes per batch):                                 │
+  │     – splits `ticks_to_run` into full kernel-batches     │
+  │       of `vision_stride * brain_tick_stride` ticks,      │
+  │       plus a shorter remainder kernel-batch when         │
+  │       `brain_cycles % vision_stride != 0`, plus an       │
+  │       optional physics-only remainder for the trailing   │
+  │       `ticks_to_run % brain_tick_stride` ticks. Each     │
+  │       kernel-batch is its own queue.submit() (uniform    │
+  │       write + four passes per batch):                    │
   │         a. prepare  — indirect-dispatch args             │
   │         b. kernel   — fused physics → food detect →      │
   │                       death/respawn → brain, looped      │
-  │                       `vision_stride` times              │
+  │                       `cycles_this_batch` times          │
   │         c. global   — grid rebuild + food respawn        │
   │                       + agent collisions                 │
   │         d. vision   — raycasting writes `sensory_buf`    │
@@ -184,7 +188,7 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 Brain state lives in GPU buffers and is preserved across deaths. When `phase_death.wgsl` detects an agent's death (energy or integrity ≤ 0), it executes the respawn pass on the GPU:
 
 1. **Random respawn position** — agent reappears at an unpredictable non-Danger location (up to 50 biome-sampling attempts).
-2. **Memory trauma** — pattern reinforcement values are halved in-place (`O_PAT_REINF[i] *= 0.5`). Weakest patterns drop below their activation threshold and decay out; strongest survive. This models the cognitive cost of catastrophic discontinuity without wiping the brain.
+2. **Memory trauma** — pattern reinforcement values are halved in-place (`O_PAT_REINF[i] *= 0.5`). The death pass itself does not change any pattern's `O_PAT_ACTIVE` flag, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. Instead, halved reinforcement means subsequent decay (`O_PAT_REINF -= effective_rate` per brain cycle) reaches the `<= 0.0` deactivation point sooner for the weakest patterns; strongest survive. This models the cognitive cost of catastrophic discontinuity without wiping the brain.
 3. **Homeostasis + habituation + history reset** — the three-timescale homeostasis EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (so the next tick's perception starts fully un-attenuated), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and action history is zeroed. The respawned agent has no homeostatic memory of the previous life but keeps its encoder/predictor weights and pattern memory.
 
 Suicide prevention is emergent: death produces a sudden, massive prediction error that the brain is wired to minimize, and the trauma pass weakens whatever patterns the brain had associated with the lethal context.

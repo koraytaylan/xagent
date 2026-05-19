@@ -1,9 +1,10 @@
-//! The cognitive architecture for xagent — a GPU-resident predictive processing brain.
+//! The cognitive runtime for xagent — a GPU-resident predictive processing brain.
 //!
-//! All brain computation runs on GPU via 7 WGSL compute shaders.
-//! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge
-//! from the interaction of capacity constraints, prediction error, and
-//! homeostatic pressure.
+//! All simulation runs inside [`GpuKernel`]: a fused WGSL compute kernel that
+//! executes physics, food detection, death/respawn, and all seven cooperative
+//! brain stages per agent in a single dispatch. No behavior is hardcoded. Fear,
+//! curiosity, habit, and attention emerge from the interaction of capacity
+//! constraints, prediction error, and homeostatic pressure.
 
 pub(crate) mod async_readback;
 pub mod buffers;

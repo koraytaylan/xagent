@@ -1,10 +1,17 @@
 //! The cognitive runtime for xagent — a GPU-resident predictive processing brain.
 //!
-//! All simulation runs inside [`GpuKernel`]: a fused WGSL compute kernel that
-//! executes physics, food detection, death/respawn, and all seven cooperative
-//! brain stages per agent in a single dispatch. No behavior is hardcoded. Fear,
-//! curiosity, habit, and attention emerge from the interaction of capacity
-//! constraints, prediction error, and homeostatic pressure.
+//! All simulation runs inside [`GpuKernel`]. A call to
+//! [`GpuKernel::dispatch_batch`] splits the requested ticks into one or more
+//! kernel-batches; each batch encodes a `prepare → kernel → global → vision`
+//! sequence into its own command buffer and submits it. The per-agent `kernel`
+//! pass is a fused WGSL compute stage that loops `vision_stride` cycles of
+//! physics, food detection, death/respawn, and all seven cooperative brain
+//! stages — so the *per-agent* work is one dispatch per cycle, but a single
+//! `dispatch_batch` may submit several command buffers.
+//!
+//! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge from
+//! the interaction of capacity constraints, prediction error, and homeostatic
+//! pressure.
 
 pub(crate) mod async_readback;
 pub mod buffers;

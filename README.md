@@ -68,7 +68,8 @@ Sandbox                                                GpuKernel (GPU)
   │         b. kernel   — fused physics → food detect →      │
   │                       death/respawn → brain, looped      │
   │                       `vision_stride` times              │
-  │         c. global   — grid rebuild + agent collisions    │
+  │         c. global   — grid rebuild + food respawn        │
+  │                       + agent collisions                 │
   │         d. vision   — raycasting writes `sensory_buf`    │
   │     – the brain reads `sensory_buf` from the *previous*  │
   │       batch's vision pass (one-batch sensory lag)        │
@@ -176,7 +177,7 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 - Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (food, terrain edges, hazards, other agents — top 4 encoded into brain), proprioception, interoception
 - **Agent vision**: ray marching detects terrain (biome-colored), food items (lime green `[0.70, 0.95, 0.20, 1.0]`), and other agents (magenta `[0.9, 0.2, 0.6, 1.0]`) in the visual field
 - **Agent-agent collision**: physical collision resolution pushes overlapping agents apart (2-unit minimum separation)
-- Death occurs when energy or integrity reaches zero → respawn with optional brain persistence
+- Death occurs when energy or integrity reaches zero → respawn on the GPU with brain state preserved (encoder/predictor weights and pattern memory survive; only homeostasis, habituation, and history are reset — see *Brain Persistence & Death Guardrails* below)
 
 ### Brain Persistence & Death Guardrails
 

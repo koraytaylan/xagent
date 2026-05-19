@@ -133,7 +133,9 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                                    brain_passes for the `kernel` pipeline. Loops
                                    over vision_stride cycles internally.
                                    Dispatch: (agent_count, 1, 1), 256 threads/workgroup.
-  global_tick.wgsl              -- Grid rebuild + collision pass.
+  global_tick.wgsl              -- Spatial-grid rebuild (food + agent), food
+                                   respawn/timer updates, and pairwise agent
+                                   collision resolution.
                                    Dispatch: (1, 1, 1).
   physics_tick.wgsl             -- Physics-only stride entry.
   vision_tick.wgsl              -- Vision-only stride entry.
@@ -146,7 +148,7 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                                    when `wgpu::Features::SUBGROUP` is supported.
 ```
 
-`GpuKernel` is the only runtime. There is no alternative `GpuBrain` mode and no per-pass dispatch path — the seven cooperative brain functions in `brain_passes.wgsl` are inlined into a single fused entry point at pipeline creation. The CPU encodes one command buffer per `dispatch_batch`, the GPU executes `ticks_to_run` simulated ticks inside it, and per-agent state never leaves GPU memory unless the CPU explicitly requests a readback.
+`GpuKernel` is the only runtime. There is no alternative `GpuBrain` mode and no per-pass dispatch path — the seven cooperative brain functions in `brain_passes.wgsl` are inlined into a single fused entry point at pipeline creation. A single `dispatch_batch(start_tick, ticks_to_run)` call splits the work into one or more kernel-batches of `vision_stride * brain_tick_stride` ticks; each batch encodes its own command buffer with `prepare → kernel → global → vision` and submits it (`queue.submit()` once per batch, plus an optional physics-only remainder and a separate opportunistic staging copy). Per-agent state never leaves GPU memory unless the CPU explicitly requests a readback.
 
 ---
 
@@ -154,81 +156,72 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
 
 ```
                      ┌──────────────────────────────────────────────────────────────────┐
-                     │                    GPU: 7 compute passes                         │
+                     │  GpuKernel — one kernel-batch (queue.submit() x 1)               │
                      └──────────────────────────────────────────────────────────────────┘
 
-SensoryFrame                                                                  MotorCommand
-(packed on CPU                                                                (forward, turn)
- 267 f32/agent)                                                                     |
-      |                                                                             |
-      v                                                                             |
-┌─────────────┐  features   ┌──────────┐  encoded   ┌──────────────────┐            |
-│   Pass 1:   │  (217 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
-│   Feature   │────────────>│  Encode  │───────────>│  Habituate +     │            |
-│   Extract   │             │          │            │  Homeostasis     │            |
-└─────────────┘             └──────────┘            └────────┬─────────┘            |
-                                                  habituated |  homeo_out           |
-                                                  (32 f32)   |  (6 f32)             |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 4:      │             |
-                                                    │  Recall Score   │             |
-                                                    │ (cosine sim x   │             |
-                                                    │  128 patterns)  │             |
-                                                    └────────┬────────┘             |
-                                                   sims(128) |                      |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 5:      │             |
-                                                    │  Recall Top-K   │             |
-                                                    │ (best 16 of 128)│             |
-                                                    └────────┬────────┘             |
-                                              recall_idx(17) |                      |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 6:      │     decision|
-                                                    │  Predict + Act  │─────────────┘
-                                                    │ (predict, credit│     (motor +
-                                                    │  policy, fatigue│      prediction +
-                                                    │  exploration)   │      credit signal)
-                                                    └────────┬────────┘
-                                                   decision  |
-                                                             v
-                                                    ┌─────────────────┐
-                                                    │    Pass 7:      │
-                                                    │  Learn + Store  │
-                                                    │ (grad descent,  │
-                                                    │  Hebbian credit,│
-                                                    │  memory reinf., │
-                                                    │  pattern store, │
-                                                    │  decay)         │
-                                                    └─────────────────┘
+                                  uniform: WorldConfig (CPU → GPU, once per kernel-batch)
+                                          │
+                                          v
+                              ┌───────────────────────────┐
+                              │  prepare_dispatch.wgsl    │   dispatch: (1, 1, 1)
+                              │  (indirect-dispatch args) │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  kernel_tick.wgsl         │   dispatch: (agent_count, 1, 1)
+                              │  per-agent fused pass     │   256 threads per workgroup
+                              │  ─ loops vision_stride    │
+                              │    cycles ─────────────▶  │
+                              │      ┌── per cycle ──┐   │
+                              │      │  physics      │   │     reads sensory_buf written
+                              │      │  food_detect  │   │     by the *previous* batch
+                              │      │  death/respawn│   │     (one-batch sensory lag)
+                              │      │  brain (7-stg)│   │
+                              │      └───────────────┘   │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  global_tick.wgsl         │   dispatch: (1, 1, 1)
+                              │  grid rebuild (food+agent)│
+                              │  food respawn/timers      │
+                              │  pairwise collisions      │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  vision_tick.wgsl         │   dispatch: (agent_count, 1, 1)
+                              │  raycasts terrain/food/   │
+                              │  agents → sensory_buf     │
+                              └───────────────────────────┘
 
   Persistent GPU buffers (live across ticks):
-  ─── brain_state_buf ───  8,468 f32/agent  (encoder weights, predictor, habituation, homeo, action, fatigue)
+  ─── brain_state_buf ────  8,468 f32/agent  (encoder weights, predictor, habituation, homeo, action, fatigue)
   ─── pattern_buf ────────  5,251 f32/agent  (128 patterns: states, norms, reinforcement, motor, meta, active)
   ─── history_buf ────────  2,370 f32/agent  (64-entry action history ring: motor+state snapshots)
+  ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
+  ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
+  ─── sensory_buf ────────     per-agent     (raw vision + non-visual features written by vision pass)
+  ─── decision_buf ───────     per-agent     (motor + prediction error + credit, written by brain stage 6)
 
-  Transient GPU buffers (overwritten each tick):
-  sensory, features, encoded, habituated, homeo_out, similarities, recall_buf, decision
+  Transient GPU buffers (overwritten each cycle):
+  features, encoded, habituated, homeo_out, similarities, recall_buf
 ```
 
-### Tick Execution Order
+### Brain Stages Inside the Fused Kernel
+
+The `kernel_tick.wgsl` per-agent pass runs the seven cooperative brain functions back-to-back, all on the same workgroup and same agent slot. They are no longer separate dispatches:
 
 ```
-1. CPU packs SensoryFrames into flat f32 arrays (pack_sensory_frame)
-2. CPU uploads sensory buffer to GPU                           (~52KB for 50 agents)
-3. GPU Pass 1: feature_extract   (267 f32 --> 217 f32)        one thread per agent
-4. GPU Pass 2: encode            (217 f32 --> 32 f32)         one thread per agent
-5. GPU Pass 3: habituate_homeo   (habituation EMA + homeostatic gradient/urgency)
-6. GPU Pass 4: recall_score      (cosine sim vs 128 patterns)
-7. GPU Pass 5: recall_topk       (top-16 selection, metadata update)
-8. GPU Pass 6: predict_and_act   (prediction error, credit assignment, policy eval,
-                                  prospection, memory blend, exploration noise,
-                                  motor fatigue, history recording)
-9. GPU Pass 7: learn_and_store   (predictor gradient descent, encoder Hebbian credit,
-                                  memory reinforcement, pattern storage, decay)
-10. CPU reads back motor commands from decision buffer         (~800B for 50 agents)
+brain cycle (executed vision_stride times per kernel-batch):
+  1. coop_feature_extract   sensory_buf (267 f32) → features (217 f32)
+  2. coop_encode            features → encoded (32 f32)
+  3. coop_habituate_homeo   habituation EMA + homeostatic gradient/urgency
+  4. coop_recall_score      cosine similarity vs 128 patterns
+  5. coop_recall_topk       top-16 selection (subgroup or workgroup bitonic sort)
+  6. coop_predict_and_act   prediction error, credit, policy, fatigue, exploration
+                              → writes motor into decision_buf (consumed by the
+                                physics step in the same kernel cycle)
+  7. coop_learn_and_store   predictor gradient, Hebbian credit, memory reinforcement,
+                              pattern storage, decay
 ```
 
 ---

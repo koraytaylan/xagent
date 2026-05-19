@@ -388,7 +388,7 @@ pub struct Agent {
     pub generation: u32,           // life iteration (incremented on each death/respawn)
     pub life_start_tick: u64,      // reset on respawn
     pub longest_life: u64,
-    pub respawn_cooldown: u32,
+    pub respawn_cooldown: u32,      // legacy/unused — kept for serialization compat; respawn now happens immediately on the GPU (see Death & Respawn). Always 0 in current runtime.
     pub has_reproduced: bool,
     pub food_consumed: u32,        // cumulative food consumed
     pub total_ticks_alive: u64,    // cumulative ticks alive across all lives
@@ -1064,7 +1064,7 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 
 ### When to Worry
 
-- **High speed_multiplier (1000×+)**: at 1,000,000 ticks/frame the kernel still completes within a frame budget because each batch is a single `queue.submit()`. The per-frame cap (`speed × 2` in 3D mode, `speed × 10` in fast mode, capped at 1,000,000) bounds the worst case.
+- **High speed_multiplier (1000×+)**: `raw_ticks` per frame is hard-capped at 500 in the main app loop (`main.rs`), and is also bounded by the adaptive `gpu_tick_budget`. Each `dispatch_batch` may submit several command buffers (one `queue.submit()` per kernel-batch of `vision_stride * brain_tick_stride` ticks, plus an optional physics-only remainder and a separate opportunistic staging copy), but the small per-frame tick cap keeps the worst-case submission count bounded.
 - **Large vision grids**: doubling `vision_rays` quadruples the encoder weight count and roughly doubles the kernel cycle cost. Stay near the default 8×6 unless an experiment specifically needs higher resolution.
 - **Telemetry readback churn**: `request_agent_telemetry` issued every frame for every agent would serialize the kernel against the staging buffer mappings. The sandbox issues it once per frame for the *selected* agent only.
 

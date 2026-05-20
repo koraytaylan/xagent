@@ -106,16 +106,16 @@ feature_extract → encode → habituate_homeo → recall_score → recall_topk 
 
 ### Runtime: `GpuKernel`
 
-All per-agent simulation runs inside `xagent_brain::GpuKernel`. A call to `dispatch_batch(start_tick, ticks_to_run)` splits the requested ticks into one or more **kernel-batches** of `vision_stride * brain_tick_stride` ticks each. Each kernel-batch is its own command-encoder + `queue.submit()`, and within a batch runs four passes in this order:
+All per-agent simulation runs inside `xagent_brain::GpuKernel`. A call to `dispatch_batch(start_tick, ticks_to_run)` splits the requested ticks into **full kernel-batches** of `vision_stride * brain_tick_stride` ticks, plus a shorter **remainder kernel-batch** of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional **physics-only remainder** for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch is its own command-encoder + `queue.submit()`, and within a batch runs four passes in this order:
 
 1. **`prepare`** — sets up indirect-dispatch arguments for the variable-width passes.
 2. **`kernel`** (`kernel_tick.wgsl`, dispatched as `(agent_count, 1, 1)` with 256 threads per workgroup). The pass loops `vision_stride` times internally, executing on each iteration: physics integration, food detection, death/respawn, and all 7 brain stages.
-3. **`global`** (`global_tick.wgsl`, dispatched as `(1,1,1)`) — spatial-grid rebuilds for food and agents, plus pairwise agent–agent collision resolution.
+3. **`global`** (`global_tick.wgsl`, dispatched as `(1,1,1)`) — spatial-grid rebuilds for food and agents, food respawn/timer updates, plus pairwise agent–agent collision resolution.
 4. **`vision`** — raycasting writes the per-agent sensory feature buffer.
 
 The brain stage in step 2 reads its sensory input from the buffer that step 4 wrote in the **previous** batch, so the pipeline has a one-batch sensory lag. This lag is intentional and consistent across stride settings — it lets the costly global+vision passes run once per kernel-batch instead of once per simulated tick.
 
-The `vision_stride` parameter (default 10) is the inner-loop count of the `kernel` pass — how many brain+physics cycles run between global/vision updates. `brain_tick_stride` (default 1) controls how many physics ticks run per brain cycle. CPU work per simulated tick is dominated by command-encoder setup and a fixed-size world-config uniform write per kernel-batch — not per-tick — which is what makes 60,000+ brain ticks/second per agent achievable.
+The `vision_stride` parameter (default 10) is the inner-loop count of the `kernel` pass — how many brain+physics cycles run between global/vision updates. `brain_tick_stride` (default 10) controls how many physics ticks run per brain cycle. CPU work per simulated tick is dominated by command-encoder setup and a fixed-size world-config uniform write per kernel-batch — not per-tick — which is what makes 60,000+ brain ticks/second per agent achievable.
 
 The 7 brain stages are inlined as cooperative WGSL functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) defined in `brain_passes.wgsl` and composed into `kernel_tick.wgsl` at pipeline creation. They share the same buffer layout (`BrainLayout`, `O_*` offset constants in `buffers.rs`) and operate on the agent-local 256-thread workgroup with `workgroupBarrier()` between stages.
 
@@ -317,8 +317,8 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
 | `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
 | `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
-| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
-| `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
+| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 10). Higher → faster but less responsive. |
+| `vision_stride` | Brain cycles between global passes — grid rebuild, food respawn, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
 | `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |
 | `integrity_scale` | Multiplier for integrity damage and regen (default 0.5). Higher → deadlier hazards. |
 
@@ -349,7 +349,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "fatigue_recovery_sensitivity": 8.0,
     "fatigue_floor": 0.1,
     "vision_rays": 48,
-    "brain_tick_stride": 4,
+    "brain_tick_stride": 10,
     "vision_stride": 10,
     "metabolic_rate": 0.5,
     "integrity_scale": 0.5
@@ -448,7 +448,7 @@ xagent/
 │   │               ├── brain_passes.wgsl      # Cooperative brain-stage functions (coop_feature_extract …)
 │   │               ├── brain_tick.wgsl        # Brain-only fused entry (one tick, no physics)
 │   │               ├── kernel_tick.wgsl       # Per-agent fused pass: physics + food + death + brain × vision_stride
-│   │               ├── global_tick.wgsl       # Grid rebuild + agent collision pass (dispatch (1,1,1))
+│   │               ├── global_tick.wgsl       # Grid rebuild + food respawn + agent collision (dispatch (1,1,1))
 │   │               ├── physics_tick.wgsl      # Physics-only stride entry
 │   │               ├── vision_tick.wgsl       # Vision-only stride entry
 │   │               ├── phase_clear.wgsl       # Per-batch buffer clears

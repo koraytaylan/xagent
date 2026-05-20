@@ -148,7 +148,7 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                                    when `wgpu::Features::SUBGROUP` is supported.
 ```
 
-`GpuKernel` is the only runtime. There is no alternative `GpuBrain` mode and no per-pass dispatch path — the seven cooperative brain functions in `brain_passes.wgsl` are inlined into a single fused entry point at pipeline creation. A single `dispatch_batch(start_tick, ticks_to_run)` call splits the work into one or more kernel-batches of `vision_stride * brain_tick_stride` ticks; each batch encodes its own command buffer with `prepare → kernel → global → vision` and submits it (`queue.submit()` once per batch, plus an optional physics-only remainder and a separate opportunistic staging copy). Per-agent state never leaves GPU memory unless the CPU explicitly requests a readback.
+`GpuKernel` is the only runtime. There is no alternative `GpuBrain` mode and no per-pass dispatch path — the seven cooperative brain functions in `brain_passes.wgsl` are inlined into a single fused entry point at pipeline creation. A single `dispatch_batch(start_tick, ticks_to_run)` call splits the work into full kernel-batches of `vision_stride * brain_tick_stride` ticks, plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch encodes its own command buffer with `prepare → kernel → global → vision` and submits it (`queue.submit()` once per batch); the physics-only remainder is a separate submit that masks brain/vision off. A separate opportunistic staging copy is appended. Per-agent state never leaves GPU memory unless the CPU explicitly requests a readback.
 
 ---
 
@@ -681,7 +681,7 @@ The method list below is the contract used by `xagent-sandbox`. See `gpu_kernel.
 | `upload_agents(&[(Vec3, f32, f32, usize, usize)])` | Writes initial physics rows `(position, max_energy, max_integrity, memory_capacity, processing_slots)` for the listed agents into `agent_phys` storage. Used when spawning a new generation. |
 | `upload_world_config(start_tick, ticks_to_run)` | Writes the per-batch world-config uniform consumed by all four passes inside a kernel-batch (start tick, batch size, stride parameters). Called internally by `dispatch_batch`. |
 | `dispatch_batch(start_tick, ticks_to_run)` | Splits the work into full kernel-batches of `vision_stride * brain_tick_stride` ticks, plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch is one command-buffer + `queue.submit()` running `prepare → kernel → global → vision`; the physics-only remainder is a separate submit that masks brain/vision off. An opportunistic copy into a staging slot is appended. Always returns `true` (kept for API compatibility — staging copies may be skipped when all slots are in flight, but compute is decoupled from readback). |
-| `dispatch_batch_masked(start_tick, ticks_to_run, phase_mask)` | Variant that gates which phases run per cycle (bit 0 = physics, bit 1 = vision, bit 2 = brain). Used by tests and benchmarks; always submits a blocking copy at the end to guarantee deterministic readback. |
+| `dispatch_batch_masked(start_tick, ticks_to_run, phase_mask)` | Variant for tests and benchmarks that gates which phases run per cycle (bit 0 = physics, bit 1 = vision, bit 2 = brain). Iterates cycles in chunks of 100 (Metal command-buffer deadlock workaround), appends a remainder physics-only pass, copies `agent_phys` to the active staging slot, then blocks on `device.poll(Wait)` for GPU completion. Does **not** run any global pass (no grid rebuild, food respawn, or collisions) and does **not** update `cached_state` — call sites read GPU buffers directly. |
 | `try_collect_state() -> bool` | Non-blocking: polls all in-flight state-readback slots; if any is ready, copies the most recent into `cached_state` (and `cached_food_state` when food exists). Returns `true` on update. |
 | `cached_state() -> &[f32]` | Latest physics-state snapshot (positions, vitals, motor, death counts, telemetry slots). |
 | `cached_food_state() -> Option<&[f32]>` | Latest food-state snapshot when available. |
@@ -756,7 +756,7 @@ The `BrainConfig` struct (defined in `xagent-shared`) provides heritable paramet
 | `fatigue_recovery_sensitivity` | 8.0 | How fast fatigue lifts when motor output diversifies (heritable) |
 | `fatigue_floor` | 0.1 | Minimum motor output under full fatigue (heritable) |
 | `vision_rays` | 48 | Number of vision rays (W×H). Affects sensory buffer size |
-| `brain_tick_stride` | 4 | Physics ticks per brain+vision cycle. Higher → faster, less responsive |
+| `brain_tick_stride` | 10 | Physics ticks per brain+vision cycle. Higher → faster, less responsive |
 | `vision_stride` | 10 | Brain cycles between global passes (grid, collisions, vision). Higher → more throughput |
 | `metabolic_rate` | 1.0 | Multiplier for all energy costs. Lower → agents survive longer |
 | `integrity_scale` | 1.0 | Multiplier for integrity damage/regen. Higher → deadlier hazards |

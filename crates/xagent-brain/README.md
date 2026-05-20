@@ -49,7 +49,7 @@ sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> 
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-In the live runtime sensory features are produced on-GPU: the vision pass raycasts into `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual), and the brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` projects it into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The CPU-side `buffers::pack_sensory_frame()` is the one place that still touches named fields -- and even there the flattening is not free of inductive bias: the function fixes the modality layout (vision color, depth, proprioception, interoception, touch -- in a known positional order), keeps the top 4 touch contacts by intensity, and preserves `TouchContact::surface_tag` as a scalar category channel (`surface_tag as f32 / 4.0`, with concrete tags `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, `TOUCH_AGENT`). The shader boundary strips the struct labels; the packer chose the layout. From `coop_feature_extract` onward, the brain operates on opaque numerical vectors -- no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+In the live runtime sensory features are produced on-GPU: the vision pass raycasts colors and depths into `sensory_buffer`, and the same vision pipeline's `phase_vision_senses` (`src/shaders/kernel/phase_vision.wgsl`) appends per-agent proprioception, interoception, energy/integrity deltas, and touch contacts in a fixed positional layout — touch slots are filled in 3×3-cell discovery order (food cells first, then agent cells) up to `MAX_TOUCH_CONTACTS`, with each contact encoded as `(direction_x, direction_z, normalized_proximity, surface_tag / 4.0)`. The CPU-side `buffers::pack_sensory_frame()` is only exercised by `buffers` tests; it does not feed the live brain. The brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` then projects `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual) into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The packing is not free of inductive bias — the modality layout, contact-cap, and `surface_tag` category channel (with concrete tags `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, `TOUCH_AGENT`) are all hand-chosen priors — but they live entirely in shader/packer code, not as named fields the brain reads. From `coop_feature_extract` onward, the brain operates on opaque numerical vectors: no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
 World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> coop_feature_extract --> [265 f32]
@@ -261,7 +261,7 @@ All buffers are created at `GpuKernel::new` with sizes proportional to `agent_co
 
 ## 5. Buffer Layout
 
-All buffer offsets and stride constants are defined once in `buffers.rs` and auto-generated into WGSL via `wgsl_constants()`. This function emits a constants header that is prepended to every shader at pipeline creation time. The constants include all offsets, strides, and utility functions (`fast_tanh`, `pcg_hash`, `rand_f32`, `rand_normal`). Because both Rust and WGSL code derive from the same source of truth, offset mismatch bugs are impossible.
+Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, `HISTORY_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAPACITY`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
 
 ### Core Dimensions
 
@@ -274,9 +274,9 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
 | `ACTION_HISTORY_LEN` | 64 | Credit-assignment lookback window |
 | `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
 
-The feature/encoded sizes and all derived per-agent strides scale with the configured vision dimensions. `BrainLayout::new(vision_width, vision_height)` is the single source of truth — see `crates/xagent-brain/src/buffers.rs`. Concrete strides for the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`) come out to `brain_stride = 51,381` f32, `PATTERN_STRIDE = 17,539` f32, `HISTORY_STRIDE = 8,514` f32. The `O_*` offset constants and per-region sizes are auto-generated alongside `BrainLayout` and surfaced to WGSL via the `wgsl_constants()` helper.
+The feature/encoded sizes and all derived per-agent strides scale with the configured vision dimensions. `BrainLayout::new(vision_width, vision_height)` is the single source of truth — see `crates/xagent-brain/src/buffers.rs`. Concrete strides for the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`) come out to `brain_stride = 51,381` f32, `PATTERN_STRIDE = 17,539` f32, `HISTORY_STRIDE = 8,514` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
 
-### Sensory Input Layout (CPU --> GPU)
+### Sensory Buffer Layout (GPU-produced)
 
 ```
 [  192 RGBA vision  |  48 depth  |  vel(3)  fac(3)  ang(1)  e(1)  i(1)  ed(1)  id(1)  touch(16)  ]
@@ -284,7 +284,7 @@ The feature/encoded sizes and all derived per-agent strides scale with the confi
  0                   192          240                                                              267
 ```
 
-Total: `SENSORY_STRIDE = 267` f32 per agent. `pack_sensory_frame()` handles the CPU-side packing, including sorting touch contacts by intensity and zero-padding.
+Total for the default 8×6 vision: `SENSORY_STRIDE = 267` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, and up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
 
 ### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,381 f32 for the default 8×6 layout)
 
@@ -813,9 +813,9 @@ The fused kernel runs N simulated ticks per dispatch with one workgroup per agen
 
 WGSL's structured buffer support requires compile-time-known layouts. With per-agent strides computed from constants (e.g., `agent * BRAIN_STRIDE + O_ENC_WEIGHTS`), a flat `array<f32>` with computed offsets is simpler and more flexible than nested structs. The offset constants are auto-generated from Rust, so the "indexing math" is actually just named constants that read like field accesses.
 
-### Why wgsl_constants() Auto-Generation
+### Why Shared `override` Constants in `common.wgsl`
 
-Every shader needs the same set of 50+ offset constants, utility functions (`fast_tanh`, `pcg_hash`), and dimension values. Manually keeping these in sync between Rust and WGSL would be a maintenance nightmare. `wgsl_constants()` generates the shared header from Rust constants, which is prepended to each shader source at pipeline creation time. A single source of truth, zero chance of offset mismatch.
+Every shader in the kernel pipeline needs the same set of 50+ offset constants and dimension values (`SENSORY_STRIDE`, `FEATURE_COUNT`, `ENCODED_DIMENSION`, the `O_*` offsets, etc.). Manually keeping these in sync between Rust and WGSL would be a maintenance nightmare. The chosen mechanism: `common.wgsl` declares each constant as a WGSL `override` derived from `VISION_W`/`VISION_H` (`override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;`), `gpu_kernel.rs` concatenates `common.wgsl` with each phase fragment via `include_str!`, and the matching `BrainLayout`-derived values are bound to the pipeline as override values at pipeline creation time. Utility functions (`fast_tanh`, `pcg_hash`, `rand_f32`, `rand_normal`) live as plain WGSL functions inside `common.wgsl` and are inlined into every concatenated shader. A single source of truth (`BrainLayout` on the Rust side, the `override` declarations on the WGSL side), zero chance of offset mismatch as long as the override values are forwarded at pipeline creation.
 
 ### Why Cosine Similarity for Pattern Matching
 

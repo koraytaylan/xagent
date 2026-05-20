@@ -10,7 +10,10 @@
 //! each kernel-batch issues exactly one kernel dispatch — the `vision_stride`
 //! cycles are a `for` loop inside the shader, not separate dispatches — while a
 //! single `dispatch_batch` call may submit several command buffers (one per
-//! kernel-batch, plus an optional physics-only remainder).
+//! full kernel-batch, an optional shorter remainder kernel-batch when
+//! `brain_cycles % vision_stride != 0`, an optional physics-only remainder
+//! for the trailing `ticks_to_run % brain_tick_stride` ticks, and an
+//! opportunistic state-staging copy when a readback slot is free).
 //!
 //! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge from
 //! the interaction of capacity constraints, prediction error, and homeostatic

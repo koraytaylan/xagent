@@ -2,7 +2,7 @@
 
 A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU.
 
-The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors -- no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
+The brain crate is the decision-making core of each xagent. It has no hardcoded goals -- no "hunger module", no "fear module", no goal system. One narrow caveat: the action stage carries a hardcoded klinotaxis turn-gain modulator (`src/shaders/kernel/brain_passes.wgsl:600-607`, scaled by `KLINOTAXIS_SENSITIVITY` in `src/shaders/kernel/common.wgsl`). It is a reflex on the homeostatic gradient, not a goal. Everything else the agent does emerges from a single loop and a single principle:
 
 > **Prediction error drives everything.**
 
@@ -50,10 +50,10 @@ The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. B
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array, and `feature_extract.wgsl` further compresses it to 217 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array (default 8×6 vision), and the fused kernel's `coop_feature_extract` (in `src/shaders/kernel/brain_passes.wgsl`, inlined from the old `feature_extract.wgsl`) further compresses it to 265 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level. See the note in §6.1 for the current inlined implementation.
 
 ```
-World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [217 f32]
+World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> coop_feature_extract (kernel) --> [265 f32]
                |                                                        |
       Named fields like                                        Brain sees only a
       "vision", "energy"                                       flat array<f32>
@@ -61,7 +61,7 @@ World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extrac
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
+This is a fundamental difference from traditional AI systems, with two narrow caveats. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." The brain operates over numeric features, not symbolic categories. **Caveats:** (1) `pack_sensory_frame()` fixes the modality layout — vision color, depth, proprioception, interoception, and touch occupy a known positional order — so the layout itself is a handcrafted inductive bias; (2) `TouchContact::surface_tag` (concrete tags: `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, `TOUCH_AGENT` — see `crates/xagent-sandbox/src/agent/senses.rs`) is preserved as a scalar category channel, encoded as `c.surface_tag as f32 / 4.0`, before flattening. The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips most of that structure away, but not all. What remains -- prediction + homeostatic gradient + experience -- is where the meaning of those numeric patterns is discovered.
 
 ---
 
@@ -158,12 +158,12 @@ SensoryFrame                                                                  Mo
       |                                                                             |
       v                                                                             |
 ┌─────────────┐  features   ┌──────────┐  encoded   ┌──────────────────┐            |
-│   Pass 1:   │  (217 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
+│   Pass 1:   │  (265 f32)  │  Pass 2: │  (128 f32) │     Pass 3:      │            |
 │   Feature   │────────────>│  Encode  │───────────>│  Habituate +     │            |
 │   Extract   │             │          │            │  Homeostasis     │            |
 └─────────────┘             └──────────┘            └────────┬─────────┘            |
                                                   habituated |  homeo_out           |
-                                                  (32 f32)   |  (6 f32)             |
+                                                  (128 f32)  |  (6 f32)             |
                                                              v                      |
                                                     ┌─────────────────┐             |
                                                     │    Pass 4:      │             |
@@ -213,8 +213,8 @@ SensoryFrame                                                                  Mo
 ```
 1. CPU packs SensoryFrames into flat f32 arrays (pack_sensory_frame)
 2. CPU uploads sensory buffer to GPU                           (~52KB for 50 agents)
-3. GPU Pass 1: feature_extract   (267 f32 --> 217 f32)        one thread per agent
-4. GPU Pass 2: encode            (217 f32 --> 32 f32)         one thread per agent
+3. GPU Pass 1: feature_extract   (267 f32 --> 265 f32)        one thread per agent
+4. GPU Pass 2: encode            (265 f32 --> 128 f32)        one thread per agent  (ENCODED_DIMENSION)
 5. GPU Pass 3: habituate_homeo   (habituation EMA + homeostatic gradient/urgency)
 6. GPU Pass 4: recall_score      (cosine sim vs 128 patterns)
 7. GPU Pass 5: recall_topk       (top-16 selection, metadata update)
@@ -265,7 +265,7 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `DIM` | 32 | Internal representation dimensionality |
-| `FEATURE_COUNT` | 217 | Extracted feature count (192 RGBA + 25 non-visual) |
+| `FEATURE_COUNT` | 265 (default 8×6) | Extracted feature count (192 RGBA + 48 depth + 25 non-visual); derived from `BrainLayout` for other vision sizes |
 | `MEMORY_CAP` | 128 | Maximum patterns per agent |
 | `RECALL_K` | 16 | Top-K recalled patterns per tick |
 | `ACTION_HISTORY_LEN` | 64 | Credit assignment lookback window |
@@ -636,7 +636,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 
 | Phenomenon | How It Emerges | Contributing Passes |
 |------------|---------------|---------------------|
-| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (217 --> 32) compresses information | Pass 2, Pass 4-5 |
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (265 --> 32) compresses information | Pass 2, Pass 4-5 |
 | **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | Pass 3, 6 (credit + prospection) |
 | **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | Pass 3 (habituation), Pass 6 (exploration) |
 | **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | Pass 6 (credit), Pass 7 (reinforcement) |

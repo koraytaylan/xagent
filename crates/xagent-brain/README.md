@@ -2,7 +2,7 @@
 
 A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU inside a fused compute kernel.
 
-The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors -- no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
+The brain crate is the decision-making core of each xagent. It has no hardcoded goals or domain modules -- no "hunger module", no "fear module", no reward function. The one exception is a single reactive substrate: `brain_passes.wgsl` applies a hardcoded klinotaxis turn-gain modulator (`klinotaxis_factor`, scaled by `KLINOTAXIS_SENSITIVITY` in `common.wgsl`) that lets prediction-error gradient nudge turn direction before policy learning has anything to say. Beyond that scaffolding, everything the agent does emerges from a single loop and a single principle:
 
 > **Prediction error drives everything.**
 
@@ -49,10 +49,10 @@ sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> 
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array, and `feature_extract.wgsl` further compresses it to 217 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+In the live runtime sensory features are produced on-GPU: the vision pass raycasts into `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual), and the brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` projects it into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The CPU-side `buffers::pack_sensory_frame()` is the one place that still touches named fields -- and even there the flattening is not free of inductive bias: the function fixes the modality layout (vision color, depth, proprioception, interoception, touch -- in a known positional order), keeps the top 4 touch contacts by intensity, and preserves `TouchContact::surface_tag` as a scalar category channel (`surface_tag as f32 / 4.0`, with concrete tags `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, `TOUCH_AGENT`). The shader boundary strips the struct labels; the packer chose the layout. From `coop_feature_extract` onward, the brain operates on opaque numerical vectors -- no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
-World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [217 f32]
+World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> coop_feature_extract --> [265 f32]
                |                                                        |
       Named fields like                                        Brain sees only a
       "vision", "energy"                                       flat array<f32>
@@ -60,7 +60,7 @@ World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extrac
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
+This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." But the picture is not bias-free either: the packer's fixed modality layout and the preserved `surface_tag` channel are hand-chosen priors that ride along with the otherwise opaque vector. The honest summary is that `pack_sensory_frame()` strips struct labels but keeps positional structure; what the brain then sees is a numerically flattened interface, not a pristine raw signal. What remains downstream is prediction + homeostatic gradient + experience, and from these ingredients combined with that bounded prior, all meaning is discovered.
 
 ---
 
@@ -265,14 +265,16 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
 
 ### Core Dimensions
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `DIM` | 32 | Internal representation dimensionality |
-| `FEATURE_COUNT` | 217 | Extracted feature count (192 RGBA + 25 non-visual) |
-| `MEMORY_CAP` | 128 | Maximum patterns per agent |
-| `RECALL_K` | 16 | Top-K recalled patterns per tick |
-| `ACTION_HISTORY_LEN` | 64 | Credit assignment lookback window |
-| `ERROR_HISTORY_LEN` | 128 | Prediction error ring buffer size |
+| Constant | Value (default 8×6) | Description |
+|----------|--------------------:|-------------|
+| `ENCODED_DIMENSION` | 128 | Internal encoded state dimensionality (`crates/xagent-brain/src/buffers.rs`) |
+| `BrainLayout::feature_count` | 265 = `VISION_RAYS * 5 + 25` | Feature vector size (192 RGBA + 48 depth + 25 derived non-visual; scales with `VISION_W`/`VISION_H`) |
+| `MEMORY_CAPACITY` | 128 | Maximum patterns per agent |
+| `RECALL_TOPK` | 16 | Top-K recalled patterns per tick |
+| `ACTION_HISTORY_LEN` | 64 | Credit-assignment lookback window |
+| `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
+
+The feature/encoded sizes and all derived per-agent strides scale with the configured vision dimensions. `BrainLayout::new(vision_width, vision_height)` is the single source of truth — see `crates/xagent-brain/src/buffers.rs`. Concrete strides for the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`) come out to `brain_stride = 51,381` f32, `PATTERN_STRIDE = 17,539` f32, `HISTORY_STRIDE = 8,514` f32. The `O_*` offset constants and per-region sizes are auto-generated alongside `BrainLayout` and surfaced to WGSL via the `wgsl_constants()` helper.
 
 ### Sensory Input Layout (CPU --> GPU)
 
@@ -284,48 +286,22 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
 
 Total: `SENSORY_STRIDE = 267` f32 per agent. `pack_sensory_frame()` handles the CPU-side packing, including sorting touch contacts by intensity and zero-padding.
 
-### Brain State Buffer (per agent: `BRAIN_STRIDE = 8,468` f32)
+### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,381 f32 for the default 8×6 layout)
 
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Encoder weights | `O_ENC_WEIGHTS = 0` | 6,944 | `FEATURE_COUNT * DIM` weight matrix |
-| Encoder biases | `O_ENC_BIASES = 6944` | 32 | Per-dimension bias |
-| Predictor weights | `O_PRED_WEIGHTS = 6976` | 1,024 | `DIM * DIM` prediction matrix |
-| Predictor context weight | `O_PRED_CTX_WT = 8000` | 1 | Recall blending strength |
-| Prediction error ring | `O_PRED_ERR_RING = 8001` | 128 | Error history |
-| Habituation EMA | `O_HAB_EMA = 8131` | 32 | Per-dim change tracking |
-| Habituation attenuation | `O_HAB_ATTEN = 8163` | 32 | Per-dim dampening factor |
-| Previous encoded state | `O_PREV_ENCODED = 8195` | 32 | For habituation delta |
-| Homeostasis state | `O_HOMEO = 8227` | 6 | `[grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]` |
-| Action forward weights | `O_ACT_FWD_WTS = 8233` | 32 | Policy weights for forward |
-| Action turn weights | `O_ACT_TURN_WTS = 8265` | 32 | Policy weights for turn |
-| Action biases | `O_ACT_BIASES = 8297` | 2 | `[fwd_bias, turn_bias]` |
-| Exploration rate | `O_EXPLORATION_RATE = 8299` | 1 | Current exploration level |
-| Fatigue rings | `O_FATIGUE_FWD_RING = 8300` | 128 | `[fwd(64), turn(64)]` |
-| Fatigue state | `O_FATIGUE_CURSOR = 8428` | 3 | `[cursor, factor, length]` |
-| Previous prediction | `O_PREV_PREDICTION = 8431` | 32 | For next-tick error |
-| Tick count | `O_TICK_COUNT = 8463` | 1 | Agent-local tick counter |
-| Heritable config | `O_HAB_SENSITIVITY = 8464` | 4 | `[hab_sens, max_curiosity, fatigue_recovery, fatigue_floor]` |
+Regions (in offset order; concrete offsets are dimension-dependent and emitted by `BrainLayout` — see `crates/xagent-brain/src/buffers.rs`):
 
-### Pattern Memory Buffer (per agent: `PATTERN_STRIDE = 5,251` f32)
+- `O_ENCODER_WEIGHTS` — `feature_count * ENCODED_DIMENSION` (= 33,920 for 8×6) encoder weight matrix.
+- `O_ENCODER_BIASES` — `ENCODED_DIMENSION` (128) per-dimension bias.
+- `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
+- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, and per-agent `movement_speed`.
 
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Pattern states | `O_PAT_STATES = 0` | 4,096 | `128 * 32` encoded state per pattern |
-| Norms | `O_PAT_NORMS = 4096` | 128 | Cached L2 norm per pattern |
-| Reinforcement | `O_PAT_REINF = 4224` | 128 | Strength (decays over time) |
-| Motor context | `O_PAT_MOTOR = 4352` | 384 | `[forward, turn, outcome_valence] * 128` |
-| Metadata | `O_PAT_META = 4736` | 384 | `[created_at, last_accessed, activation_count] * 128` |
-| Active flags | `O_PAT_ACTIVE = 5120` | 128 | `1.0` = active, `0.0` = empty |
-| Bookkeeping | `O_ACTIVE_COUNT = 5248` | 3 | `[active_count, min_reinf_idx, last_stored_idx]` |
+### Pattern Memory Buffer (per agent: `PATTERN_STRIDE`, 17,539 f32 for the default 8×6 layout)
 
-### Action History Buffer (per agent: `HISTORY_STRIDE = 2,370` f32)
+Stores `MEMORY_CAPACITY` (= 128) patterns. Regions: `O_PAT_STATES` (`MEMORY_CAPACITY * ENCODED_DIMENSION` encoded-space states), `O_PAT_NORMS` (cached L2 norms), `O_PAT_REINF` (per-pattern reinforcement that decays over time), `O_PAT_MOTOR` (`[forward, turn, outcome_valence] * MEMORY_CAPACITY`), `O_PAT_META` (`[created_at, last_accessed, activation_count] * MEMORY_CAPACITY`), `O_PAT_ACTIVE` (active flag — recall is gated here, not on `O_PAT_REINF`), and `O_ACTIVE_COUNT` bookkeeping. Exact offsets are derived from `BrainLayout` and emitted alongside the buffer; see `crates/xagent-brain/src/buffers.rs`.
 
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Motor ring | `O_MOTOR_RING = 0` | 320 | `[forward, turn, tick, gradient, _pad] * 64` |
-| State ring | `O_STATE_RING = 320` | 2,048 | `[encoded_state(32)] * 64` snapshots |
-| Bookkeeping | `O_HIST_CURSOR = 2368` | 2 | `[cursor, length]` |
+### Action History Buffer (per agent: `HISTORY_STRIDE`, 8,514 f32 for the default 8×6 layout)
+
+A 64-entry ring of motor commands plus per-entry encoded-state snapshots. Regions: `O_MOTOR_RING` (`[forward, turn, tick, gradient, _pad] * ACTION_HISTORY_LEN`), `O_STATE_RING` (`[encoded_state(ENCODED_DIMENSION)] * ACTION_HISTORY_LEN` snapshots — `ENCODED_DIMENSION * ACTION_HISTORY_LEN` f32 in total), and `O_HIST_CURSOR` bookkeeping. Exact offsets are dimension-dependent; see `crates/xagent-brain/src/buffers.rs`.
 
 ### Integer Storage Convention
 
@@ -335,7 +311,7 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ## 6. Component Deep Dive: The 7 Brain Stages
 
-> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The current dimensions are `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = VISION_RAYS * 5 + 25` (= 265 for the default 8×6 vision); any older `DIM = 32` / `FEATURE_COUNT = 217` references in the §§6.1–6.7 prose are legacy and should be read against the values in §5 Buffer Layout.
+> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The canonical dimensions and offsets are emitted by `BrainLayout` in `crates/xagent-brain/src/buffers.rs` and surfaced to WGSL via `common.wgsl`; for the default 8×6 vision they evaluate to `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = 265`. Any older `DIM = 32` / `FEATURE_COUNT = 217` literals in the §§6.1–6.7 prose are legacy — defer to `buffers.rs` and `common.wgsl` whenever the numbers disagree.
 
 ### 6.1 Feature Extraction -- `coop_feature_extract`
 
@@ -635,21 +611,21 @@ Patterns whose reinforcement drops to zero are deactivated. After decay, the slo
 
 ## 7. Emergent Phenomena
 
-None of these behaviors are explicitly programmed. They arise from the interaction of the 7 shader passes and their shared constraints:
+None of these behaviors are explicitly programmed. They arise from the interaction of the seven cooperative brain stages and their shared constraints (referenced by the `coop_*` function inlined into `kernel_tick.wgsl`):
 
-| Phenomenon | How It Emerges | Contributing Passes |
+| Phenomenon | How It Emerges | Contributing Stages |
 |------------|---------------|---------------------|
-| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (217 --> 32) compresses information | Pass 2, Pass 4-5 |
-| **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | Pass 3, 6 (credit + prospection) |
-| **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | Pass 3 (habituation), Pass 6 (exploration) |
-| **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | Pass 6 (credit), Pass 7 (reinforcement) |
-| **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | Pass 6 (error + exploration) |
-| **Adaptation** | Prediction error decreases in stable environments --> exploration drops --> behavior stabilizes | Pass 6, Pass 7 (predictor learning) |
-| **Panic** | Low energy/integrity --> high urgency --> exploration suppressed --> agent falls back on policy weights | Pass 3 (urgency), Pass 6 (exploration) |
-| **Forgetting** | Patterns not recalled or reinforced decay below zero and are deactivated | Pass 7 (decay) |
-| **Boredom / Loop Breaking** | Monotonous input --> habituation attenuates repetitive dimensions --> curiosity rises --> exploration increases; simultaneously, low motor variance --> fatigue dampens output --> repeated action weakens | Pass 3 (habituation), Pass 6 (fatigue + exploration) |
-| **Contextual Memory** | Policy weights map encoded features to motor preferences -- different percepts trigger different behaviors; recalled patterns blend motor advice | Pass 6 (policy + memory blend) |
-| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | Pass 3 (homeostasis) |
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 265 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
+| **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | `coop_habituate_homeo`, `coop_predict_and_act` (credit + prospection) |
+| **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | `coop_habituate_homeo`, `coop_predict_and_act` (exploration) |
+| **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | `coop_predict_and_act` (credit), `coop_learn_and_store` (reinforcement) |
+| **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | `coop_predict_and_act` (error + exploration) |
+| **Adaptation** | Prediction error decreases in stable environments --> exploration drops --> behavior stabilizes | `coop_predict_and_act`, `coop_learn_and_store` (predictor learning) |
+| **Panic** | Low energy/integrity --> high urgency --> exploration suppressed --> agent falls back on policy weights | `coop_habituate_homeo` (urgency), `coop_predict_and_act` (exploration) |
+| **Forgetting** | Patterns not recalled or reinforced decay below zero and are deactivated | `coop_learn_and_store` (decay) |
+| **Boredom / Loop Breaking** | Monotonous input --> habituation attenuates repetitive dimensions --> curiosity rises --> exploration increases; simultaneously, low motor variance --> fatigue dampens output --> repeated action weakens | `coop_habituate_homeo`, `coop_predict_and_act` (fatigue + exploration) |
+| **Contextual Memory** | Policy weights map encoded features to motor preferences -- different percepts trigger different behaviors; recalled patterns blend motor advice | `coop_predict_and_act` (policy + memory blend) |
+| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | `coop_habituate_homeo` (homeostasis) |
 
 ---
 
@@ -821,11 +797,11 @@ GPU-dependent integration tests (full kernel-tick behavioral checks, determinist
 ### Why GPU-Resident Over CPU
 
 The previous CPU implementation had one `Brain` struct per agent with heap-allocated weight matrices, pattern vectors, and ring buffers. At 50+ agents, the per-tick cost was dominated by:
-- 50 independent matrix multiplies (encoder: 217x32, predictor: 32x32)
+- 50 independent matrix multiplies (encoder: `feature_count x ENCODED_DIMENSION`, predictor: `ENCODED_DIMENSION x ENCODED_DIMENSION` — for the default 8×6 vision: 265x128 and 128x128)
 - 50 * 128 cosine similarity computations (recall scoring)
 - Scattered memory access patterns (each agent's data in different heap locations)
 
-Moving to GPU makes all 50 agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. The CPU's only job is packing sensory frames and reading motor commands.
+Moving to GPU makes all agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. Sensory features are now produced on-GPU by the vision pass (writing `sensory_buffer`) and motor commands are consumed on-GPU by the physics step (reading `decision_buffer`); the CPU does not pack sensory frames per tick and does not read motor commands per tick. The only routine bus traffic during the simulation is the per-batch world-config uniform write and asynchronous readbacks for telemetry and UI snapshots.
 
 ### Why a Fused Kernel
 

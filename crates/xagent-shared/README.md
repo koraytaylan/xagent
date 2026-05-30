@@ -366,7 +366,7 @@ These shared types describe the *shape* of one tick's worth of sensory input and
   ───────                                   ────────────                          ───────────────
 
   Builds initial agent specs        ──►   BodyState, BrainConfig    ──►   upload_agents / upload_world
-  Updates world configuration       ──►   WorldConfig               ──►   upload_world
+  Updates world configuration       ──►   WorldConfig               ──►   upload_world_config
                                             │
                                             │ (descriptor types — never marshalled per tick)
                                             ▼

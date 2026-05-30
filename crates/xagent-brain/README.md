@@ -263,7 +263,7 @@ All buffers are created at `GpuKernel::new` with sizes proportional to `agent_co
 
 ## 5. Buffer Layout
 
-Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, `HISTORY_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAPACITY`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
+Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, `HISTORY_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAP`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
 
 ### Core Dimensions
 
@@ -271,12 +271,12 @@ Buffer offsets, strides, and dimension constants live in two coordinated source-
 |----------|--------------------:|-------------|
 | `ENCODED_DIMENSION` | 128 | Internal encoded state dimensionality (`crates/xagent-brain/src/buffers.rs`) |
 | `BrainLayout::feature_count` | 265 = `VISION_RAYS * 5 + 25` | Feature vector size (192 RGBA + 48 depth + 25 derived non-visual; scales with `VISION_W`/`VISION_H`) |
-| `MEMORY_CAPACITY` | 128 | Maximum patterns per agent |
-| `RECALL_TOPK` | 16 | Top-K recalled patterns per tick |
+| `MEMORY_CAP` | 128 | Maximum patterns per agent |
+| `RECALL_K` | 16 | Top-K recalled patterns per tick |
 | `ACTION_HISTORY_LEN` | 64 | Credit-assignment lookback window |
 | `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
 
-The feature/encoded sizes and all derived per-agent strides scale with the configured vision dimensions. `BrainLayout::new(vision_width, vision_height)` is the single source of truth — see `crates/xagent-brain/src/buffers.rs`. Concrete strides for the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`) come out to `brain_stride = 51,381` f32, `PATTERN_STRIDE = 17,539` f32, `HISTORY_STRIDE = 8,514` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
+The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` and `HISTORY_STRIDE` do **not** — they are fixed `pub const`s derived from `MEMORY_CAP`, `ACTION_HISTORY_LEN`, and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 51,381` f32, with the fixed `PATTERN_STRIDE = 17,539` f32 and `HISTORY_STRIDE = 8,514` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
 
 ### Sensory Buffer Layout (GPU-produced)
 
@@ -297,13 +297,13 @@ Regions (in offset order; concrete offsets are dimension-dependent and emitted b
 - `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
 - `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, and per-agent `movement_speed`.
 
-### Pattern Memory Buffer (per agent: `PATTERN_STRIDE`, 17,539 f32 for the default 8×6 layout)
+### Pattern Memory Buffer (per agent: `PATTERN_STRIDE` = 17,539 f32, a fixed constant)
 
-Stores `MEMORY_CAPACITY` (= 128) patterns. Regions: `O_PAT_STATES` (`MEMORY_CAPACITY * ENCODED_DIMENSION` encoded-space states), `O_PAT_NORMS` (cached L2 norms), `O_PAT_REINF` (per-pattern reinforcement that decays over time), `O_PAT_MOTOR` (`[forward, turn, outcome_valence] * MEMORY_CAPACITY`), `O_PAT_META` (`[created_at, last_accessed, activation_count] * MEMORY_CAPACITY`), `O_PAT_ACTIVE` (active flag — recall is gated here, not on `O_PAT_REINF`), and `O_ACTIVE_COUNT` bookkeeping. Exact offsets are derived from `BrainLayout` and emitted alongside the buffer; see `crates/xagent-brain/src/buffers.rs`.
+Stores `MEMORY_CAP` (= 128) patterns. Regions: `O_PAT_STATES` (`MEMORY_CAP * ENCODED_DIMENSION` encoded-space states), `O_PAT_NORMS` (cached L2 norms), `O_PAT_REINF` (per-pattern reinforcement that decays over time), `O_PAT_MOTOR` (`[forward, turn, outcome_valence] * MEMORY_CAP`), `O_PAT_META` (`[created_at, last_accessed, activation_count] * MEMORY_CAP`), `O_PAT_ACTIVE` (active flag — recall is gated here, not on `O_PAT_REINF`), and `O_ACTIVE_COUNT` bookkeeping. The `O_PAT_*` offsets are fixed constants (derived from `MEMORY_CAP` and `ENCODED_DIMENSION`, independent of vision dimensions); see `crates/xagent-brain/src/buffers.rs`.
 
-### Action History Buffer (per agent: `HISTORY_STRIDE`, 8,514 f32 for the default 8×6 layout)
+### Action History Buffer (per agent: `HISTORY_STRIDE` = 8,514 f32, a fixed constant)
 
-A 64-entry ring of motor commands plus per-entry encoded-state snapshots. Regions: `O_MOTOR_RING` (`[forward, turn, tick, gradient, _pad] * ACTION_HISTORY_LEN`), `O_STATE_RING` (`[encoded_state(ENCODED_DIMENSION)] * ACTION_HISTORY_LEN` snapshots — `ENCODED_DIMENSION * ACTION_HISTORY_LEN` f32 in total), and `O_HIST_CURSOR` bookkeeping. Exact offsets are dimension-dependent; see `crates/xagent-brain/src/buffers.rs`.
+A 64-entry ring of motor commands plus per-entry encoded-state snapshots. Regions: `O_MOTOR_RING` (`[forward, turn, tick, gradient, _pad] * ACTION_HISTORY_LEN`), `O_STATE_RING` (`[encoded_state(ENCODED_DIMENSION)] * ACTION_HISTORY_LEN` snapshots — `ENCODED_DIMENSION * ACTION_HISTORY_LEN` f32 in total), and `O_HIST_CURSOR` bookkeeping. The `O_HIST_*` offsets are fixed constants (derived from `ACTION_HISTORY_LEN` and `ENCODED_DIMENSION`, independent of vision dimensions); see `crates/xagent-brain/src/buffers.rs`.
 
 ### Integer Storage Convention
 
@@ -688,7 +688,7 @@ pub struct AgentBrainState {
 }
 ```
 
-Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring), mutation, and DB persistence. The three vectors are the exact GPU buffer contents for one agent slice. Stride values are reported by `BrainLayout` and depend on the vision dimensions; the legacy `8,468 / 5,251 / 2,370` figures from the pre-fused era are no longer accurate for arbitrary configurations.
+Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring), mutation, and DB persistence. The three vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` and `history` slices use the fixed `PATTERN_STRIDE` and `HISTORY_STRIDE` constants. The legacy `8,468 / 5,251 / 2,370` figures from the pre-fused era are no longer accurate (current 8×6 values: `51,381 / 17,539 / 8,514`).
 
 ### Death / Respawn on the GPU
 

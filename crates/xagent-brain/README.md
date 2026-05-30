@@ -257,7 +257,7 @@ The asymmetry is intentional. Sensory frames are not packed and uploaded per tic
 
 ### Buffer Allocation
 
-All buffers are created at `GpuKernel::new` with sizes proportional to `agent_count` and the vision dimensions encoded in `BrainLayout`. Persistent buffers (`brain_state`, `pattern_buffer`, `history_buffer`, `physics_state`, `food_state`, world-config, sensory) use `STORAGE | COPY_SRC | COPY_DST`; transient working buffers use `STORAGE` only. Staging buffers for readback use `MAP_READ | COPY_DST` and are sized for the worst-case message (full state for `state_readback`, one agent's slice for the others).
+All buffers are created at `GpuKernel::new` with sizes proportional to `agent_count` and the vision dimensions encoded in `BrainLayout`. Persistent storage buffers (`brain_state`, `pattern_buffer`, `history_buffer`, `physics_state`, `food_state`, sensory) use `STORAGE | COPY_SRC | COPY_DST`, and transient working buffers use `STORAGE` only; the double-buffered world-config and the heritable brain-config are uniform buffers (`UNIFORM | COPY_DST`). Staging buffers for readback use `MAP_READ | COPY_DST` and are sized for the worst-case message (full state for `state_readback`, one agent's slice for the others).
 
 ---
 

@@ -43,58 +43,89 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 | Crate | Role |
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, and `WorldConfig`. No logic — just types. |
-| **`xagent-brain`** | Cognitive architecture. Implements predictive processing: sensory encoding, pattern memory, state prediction, homeostatic monitoring, capacity management, and action selection. |
+| **`xagent-brain`** | GPU-resident cognitive runtime. Owns the `GpuKernel` that holds all per-agent brain state in GPU buffers and runs predictive processing (sensory encoding, pattern memory, state prediction, homeostatic monitoring, action selection) inside a fused compute kernel. |
 | **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, and the main event loop. |
 
 ### Communication Flow
 
+The sandbox does not call a Rust `tick()` method on the brain. All per-agent simulation — physics, vision sampling, food detection, death/respawn, and the full brain pipeline — runs inside `GpuKernel`. The CPU side only orchestrates dispatches and reads back state asynchronously:
+
 ```
-Sandbox                          Brain
-  │                                │
-  │  1. Build SensoryFrame         │
-  │     (vision, touch, energy,    │
-  │      integrity, velocity)      │
-  │ ──────────────────────────────►│
-  │                                │  2. Encode → Recall → Predict
-  │                                │     → Compare → Learn → Act
-  │  3. Apply MotorCommand         │
-  │     (forward, strafe, turn,    │
-  │      consume/push/jump)        │
-  │◄────────────────────────────── │
-  │                                │
-  │  4. Step physics, update world │
-  │                                │
-  └────────────────────────────────┘
+Sandbox                                                GpuKernel (GPU)
+  │                                                          │
+  │  1. upload_world(terrain, biomes, food) and              │
+  │     upload_agents(initial physics rows)                  │
+  │     — done at startup and whenever the world or          │
+  │     agent set changes                                    │
+  │ ────────────────────────────────────────────────────────►│
+  │                                                          │
+  │  2. dispatch_batch(start_tick, ticks_to_run)             │
+  │     – splits `ticks_to_run` into full kernel-batches     │
+  │       of `vision_stride * brain_tick_stride` ticks,      │
+  │       plus a shorter remainder kernel-batch when         │
+  │       `brain_cycles % vision_stride != 0`, plus an       │
+  │       optional physics-only remainder for the trailing   │
+  │       `ticks_to_run % brain_tick_stride` ticks. Each     │
+  │       kernel-batch is its own queue.submit() (uniform    │
+  │       write + four passes per batch):                    │
+  │         a. prepare  — indirect-dispatch args             │
+  │         b. kernel   — fused physics → food detect →      │
+  │                       death/respawn → brain, looped      │
+  │                       `cycles_this_batch` times          │
+  │         c. global   — grid rebuild + food respawn        │
+  │                       + agent collisions                 │
+  │         d. vision   — raycasting writes `sensory_buf`    │
+  │     – the brain reads `sensory_buf` from the *previous*  │
+  │       batch's vision pass (one-batch sensory lag)        │
+  │ ────────────────────────────────────────────────────────►│
+  │                                                          │
+  │  3. try_collect_state() / request_agent_telemetry()      │
+  │     – non-blocking readback of position, vitals,         │
+  │       motor (from `physics_state[P_MOTOR_*_OUT]`),       │
+  │       and per-agent telemetry                            │
+  │◄──────────────────────────────────────────────────────── │
+  │                                                          │
+  │  4. Update UI snapshots, replay records, meshes          │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
 ```
+
+`MotorCommand` is no longer a CPU return value. Each kernel cycle's `coop_predict_and_act` writes motor output to the per-agent `decision_buffer`; the next physics step in the same kernel reads it from there to advance the body. The kernel also copies the latest motor values into `physics_state[P_MOTOR_FWD_OUT]` / `P_MOTOR_TURN_OUT` purely as telemetry slots for the CPU readback path — they are output-only echoes of the latest `coop_predict_and_act` output in `decision_buffer`, i.e. the values the *next* cycle's physics step will read (the current cycle's physics already ran earlier in the same iteration), surfaced here for CPU telemetry.
 
 > **Core Principle: Numerically Flattened Brain Interface** — The brain consumes a flat float buffer, not the named fields of `SensoryFrame`. It operates over numeric features and encoded state, not over Rust structs or domain symbols like `"food"` / `"hazard"`. Meaning at this level is *discovered* through prediction error and homeostatic correlation, not provided through labels.
 >
-> The flattening is not free of inductive bias. `pack_sensory_frame()` fixes the modality layout (vision color, depth, proprioception, interoception, touch — all in a known positional order), selects the top 4 touch contacts by intensity, and preserves `surface_tag` (concrete tags: `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, `TOUCH_AGENT` — see [crates/xagent-sandbox/src/agent/senses.rs](crates/xagent-sandbox/src/agent/senses.rs)) as a scalar category channel (`c.surface_tag as f32 / 4.0`). The shader boundary strips struct labels; the packer chose the layout. The honest summary: **a numerically flattened, mostly opaque interface — not a bias-free one.** See the [brain crate README](crates/xagent-brain/README.md#the-brain-has-no-eyes) for the full explanation.
+> The flattening is not free of inductive bias. In the live `GpuKernel` runtime, sensory features are written directly into `sensory_buffer` by the GPU — `phase_vision_senses` (`crates/xagent-brain/src/shaders/kernel/phase_vision.wgsl`) lays out velocity / facing / angular-velocity / energy / integrity / energy-delta / integrity-delta / touch contacts in a known positional order, fills up to `MAX_TOUCH_CONTACTS` touch slots in 3×3-cell discovery order (food first, then agents), and encodes the contact category as a scalar channel `f32(TOUCH_*) / 4.0`. Today `phase_vision_senses` only writes `TOUCH_FOOD` and `TOUCH_AGENT` contacts; `TOUCH_TERRAIN_EDGE` and `TOUCH_HAZARD` exist in the shared tag enum but are not yet emitted. The CPU-side `pack_sensory_frame()` mirrors this positional layout but is only exercised by `buffers` tests (and, unlike the GPU's discovery-order fill, selects the top `MAX_TOUCH_CONTACTS` contacts by intensity); it does not feed the live brain. Either way the shader boundary strips struct labels, but the positional layout itself is a handcrafted prior. The honest summary: **a numerically flattened, mostly opaque interface — not a bias-free one.** See the [brain crate README](crates/xagent-brain/README.md#the-brain-has-no-eyes) for the full explanation.
 
 ---
 
 ## 3. The Cognitive Architecture
 
-Each agent brain is a 7-stage predictive processing pipeline running entirely on GPU:
+Each agent's brain is a 7-stage predictive processing pipeline that runs as a sequence of cooperative functions inside the fused GPU kernel:
 
 ```
 feature_extract → encode → habituate_homeo → recall_score → recall_topk → predict_and_act → learn_and_store
 ```
 
-### Dispatch Modes
+### Runtime: `GpuKernel`
 
-Two dispatch modes are available:
+All per-agent simulation runs inside `xagent_brain::GpuKernel`. A call to `dispatch_batch(start_tick, ticks_to_run)` splits the requested ticks into **full kernel-batches** of `vision_stride * brain_tick_stride` ticks, plus a shorter **remainder kernel-batch** of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional **physics-only remainder** for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch is its own command-encoder + `queue.submit()`, and within a batch runs four passes in this order:
 
-- **GpuBrain (7-pass)**: One compute dispatch per pass per tick, one thread per agent (`@workgroup_size(1)`). Simple, inspectable, used for small-scale experiments.
-- **GpuKernel (fused)**: All per-agent computation (physics, food detection, death/respawn, and all 7 brain passes) fused into a single dispatch per `vision_stride` cycles. Each agent gets a 256-thread workgroup. A separate global pass handles grid rebuild, collisions, and vision raycasting. This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement over per-tick dispatch.
+1. **`prepare`** — sets up indirect-dispatch arguments for the variable-width passes.
+2. **`kernel`** (`kernel_tick.wgsl`, dispatched as `(agent_count, 1, 1)` with 256 threads per workgroup). The pass reads `cycles_this_batch` from the world-config uniform — normally `vision_stride`, but the shorter remainder kernel-batch overrides it to `remainder_cycles` — and loops that many times internally, executing on each iteration: physics integration, food detection, death/respawn, and all 7 brain stages.
+3. **`global`** (`global_tick.wgsl`, dispatched as `(1,1,1)`) — spatial-grid rebuilds for food and agents, food respawn/timer updates, plus pairwise agent–agent collision resolution.
+4. **`vision`** — raycasting writes the per-agent sensory feature buffer.
 
-The `vision_stride` parameter (default 10) controls how many brain+physics cycles run between global passes (grid rebuild, collision, vision). Higher values mean more brain throughput but less frequent sensory updates.
+The brain stage in step 2 reads its sensory input from the buffer that step 4 wrote in the **previous** batch, so the pipeline has a one-batch sensory lag. This lag is intentional and consistent across stride settings — it lets the costly global+vision passes run once per kernel-batch instead of once per simulated tick.
+
+The `vision_stride` parameter (default 10) is the inner-loop count of the `kernel` pass — how many brain+physics cycles run between global/vision updates. `brain_tick_stride` (default 10) controls how many physics ticks run per brain cycle. CPU work per simulated tick is dominated by command-encoder setup and a fixed-size world-config uniform write per kernel-batch — not per-tick — which is what makes 60,000+ brain ticks/second per agent achievable.
+
+The 7 brain stages are inlined as cooperative WGSL functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) defined in `brain_passes.wgsl` and composed into `kernel_tick.wgsl` at pipeline creation. They share the same buffer layout (`BrainLayout`, `O_*` offset constants in `buffers.rs`) and operate on the agent-local 256-thread workgroup with `workgroupBarrier()` between stages.
 
 ### Step-by-Step
 
-Each pass runs as a WGSL compute shader dispatched over all agents in parallel.
+Each stage runs as a cooperative function inside the fused kernel, with all 256 workgroup threads contributing to the per-agent computation.
 
-1. **Feature Extract** — Reads the packed sensory input (default 8×6 vision: `SENSORY_STRIDE = 267`: 192 RGBA vision + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (default: `FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features) inside the fused kernel. Both strides are derived from `VISION_W`/`VISION_H` via `BrainLayout` (Rust side, `crates/xagent-brain/src/buffers.rs`) and WGSL `override` expressions (`crates/xagent-brain/src/shaders/kernel/common.wgsl`). The frame's named fields (vision, energy, touch) were flattened upstream by `pack_sensory_frame()` into a fixed-positional float buffer; from this point on the brain operates over numeric features without struct labels. The positional layout itself is a handcrafted prior — see the caveat in §2.
+1. **Feature Extract** — Reads the packed sensory input written by the previous batch's vision pass (default 8×6 vision: `SENSORY_STRIDE = 267`: 192 RGBA + 48 depth + 27 non-visual fields) and transforms it into the brain feature vector (default: `FEATURE_COUNT = 265`: 192 RGBA + 48 depth + 25 derived non-visual features — the velocity 3-vector is collapsed into a single speed scalar). Both strides are derived from `VISION_W`/`VISION_H` via `BrainLayout` (Rust side, `crates/xagent-brain/src/buffers.rs`) and WGSL `override` expressions (`crates/xagent-brain/src/shaders/kernel/common.wgsl`). These features are written directly into `sensory_buffer` by the GPU vision pass — the test-only `pack_sensory_frame()` mirrors the same fixed-positional layout but is not in the live path; from this point on the brain operates over numeric features without struct labels. The positional layout itself is a handcrafted prior — see the caveat in §2.
 
 2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 
@@ -149,24 +180,24 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 
 - Physical simulation: gravity, locomotion, collision with terrain
 - Internal state: energy (depletes over time and with movement) and integrity (damaged by hazards, regenerates when energy > 50%)
-- Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (food, terrain edges, hazards, other agents — top 4 encoded into brain), proprioception, interoception
+- Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (up to 4 encoded into brain — the GPU vision pass currently emits food and other-agent contacts; terrain-edge and hazard tags are reserved in the shared contract but not yet emitted), proprioception, interoception
 - **Agent vision**: ray marching detects terrain (biome-colored), food items (lime green `[0.70, 0.95, 0.20, 1.0]`), and other agents (magenta `[0.9, 0.2, 0.6, 1.0]`) in the visual field
 - **Agent-agent collision**: physical collision resolution pushes overlapping agents apart (2-unit minimum separation)
-- Death occurs when energy or integrity reaches zero → respawn with optional brain persistence
+- Death occurs when energy or integrity reaches zero → respawn on the GPU with brain state preserved (encoder/predictor weights and pattern memory survive; only homeostasis, habituation, and history are reset — see *Brain Persistence & Death Guardrails* below)
 
 ### Brain Persistence & Death Guardrails
 
-When brain persistence is enabled (default), three guardrails prevent suicide loops:
+Brain state lives in GPU buffers and is preserved across deaths. When `phase_death.wgsl` detects an agent's death (energy or integrity ≤ 0), it executes the respawn pass on the GPU:
 
-1. **Partial respawn energy** — 50% energy, 70% integrity (not full health). Dying is not a "free heal."
-2. **Random respawn position** — agent reappears at an unpredictable location.
-3. **Memory trauma** — `brain.trauma(0.2)` applies 20% reinforcement decay on death. Weakest memories are wiped; strongest survive. Models the cognitive cost of catastrophic discontinuity.
+1. **Random respawn position** — the shader tries up to 50 non-Danger biome samples; if all 50 attempts land in Danger biomes, the `!found` branch reuses the attempt-0 sample — it re-draws with RNG seed `tick * 256 + agent_id` (identical to attempt 0) and spawns there without re-checking the biome, so an agent that is wholly Danger-blocked can reappear in a Danger cell (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
+2. **Memory trauma** — pattern reinforcement values are halved in-place (`O_PAT_REINF[i] *= 0.5`). The death pass itself does not change any pattern's `O_PAT_ACTIVE` flag, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. Instead, halved reinforcement means subsequent decay (`O_PAT_REINF -= effective_rate` per brain cycle) reaches the `<= 0.0` deactivation point sooner for the weakest patterns; strongest survive. This models the cognitive cost of catastrophic discontinuity without wiping the brain.
+3. **Homeostasis + habituation + history reset** — the three-timescale homeostasis EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (so the next tick's perception starts fully un-attenuated), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and action history is zeroed. The respawned agent has no homeostatic memory of the previous life but keeps its encoder/predictor weights and pattern memory.
 
-Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), and the brain's core drive is minimizing prediction error.
+Suicide prevention is emergent: death produces a sudden, massive prediction error that the brain is wired to minimize, and the trauma pass weakens whatever patterns the brain had associated with the lethal context.
 
 ### Agent Palette Colors
 
-Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.25, 0.25, 0.25]`. This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
+Each agent is assigned a **static palette color** at spawn. The same color is used in the 3D viewport and the sidebar agent list (with an sRGB→linear conversion for correct GPU rendering). Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`). This makes it easy to track individual agents across the sidebar and the 3D world at a glance.
 
 ### Agent Trails
 
@@ -288,8 +319,8 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `fatigue_recovery_sensitivity` | How easily motor fatigue lifts (default 8.0). Higher → faster recovery. Heritable. |
 | `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
 | `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
-| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 4). Higher → faster but less responsive. |
-| `vision_stride` | Brain cycles between global passes — grid rebuild, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
+| `brain_tick_stride` | Physics ticks per brain+vision cycle (default 10). Higher → faster but less responsive. |
+| `vision_stride` | Brain cycles between global passes — grid rebuild, food respawn, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
 | `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |
 | `integrity_scale` | Multiplier for integrity damage and regen (default 0.5). Higher → deadlier hazards. |
 
@@ -320,7 +351,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "fatigue_recovery_sensitivity": 8.0,
     "fatigue_floor": 0.1,
     "vision_rays": 48,
-    "brain_tick_stride": 4,
+    "brain_tick_stride": 10,
     "vision_stride": 10,
     "metabolic_rate": 0.5,
     "integrity_scale": 0.5
@@ -406,21 +437,23 @@ xagent/
 │   │       ├── motor.rs        # MotorCommand, MotorAction
 │   │       └── sensory.rs      # SensoryFrame, VisualField, TouchContact
 │   │
-│   ├── xagent-brain/           # GPU-resident cognitive architecture
-│   │   ├── README.md           # Deep dive into brain internals (partially stale — see issue #106)
+│   ├── xagent-brain/           # GPU-resident cognitive runtime
+│   │   ├── README.md           # Deep dive into GpuKernel internals
 │   │   └── src/
-│   │       ├── lib.rs          # Re-exports, fast_tanh, BrainTelemetry, AgentTelemetry
-│   │       ├── gpu_kernel.rs   # GpuKernel — fused dispatch, telemetry readback
+│   │       ├── lib.rs          # Re-exports: GpuKernel, AgentTelemetry, AgentBrainState, BrainLayout
+│   │       ├── gpu_kernel.rs   # GpuKernel: fused dispatch, async readback, shader composition
+│   │       ├── async_readback.rs # Readback-tracker state machine for non-blocking state collection
 │   │       ├── buffers.rs      # Buffer layout constants, sensory packing, AgentBrainState
 │   │       └── shaders/
 │   │           └── kernel/
-│   │               ├── common.wgsl            # Shared constants for fused kernel shaders
-│   │               ├── brain_tick.wgsl        # Fused per-agent brain pass (all 7 legacy passes inlined)
-│   │               ├── kernel_tick.wgsl       # Fused per-agent kernel (physics + food + death + brain loop)
-│   │               ├── global_tick.wgsl       # Grid rebuild + collision pass (1,1,1)
-│   │               ├── physics_tick.wgsl      # Physics-only stride (between vision cycles)
-│   │               ├── vision_tick.wgsl       # Vision-only stride (when vision is due)
-│   │               ├── phase_clear.wgsl       # Per-frame buffer clears
+│   │               ├── common.wgsl            # Shared constants + override cascade (VISION_W/VISION_H)
+│   │               ├── brain_passes.wgsl      # Cooperative brain-stage functions (coop_feature_extract …)
+│   │               ├── brain_tick.wgsl        # Brain-only fused entry (one tick, no physics)
+│   │               ├── kernel_tick.wgsl       # Per-agent fused pass: physics + food + death + brain × vision_stride
+│   │               ├── global_tick.wgsl       # Grid rebuild + food respawn + agent collision (dispatch (1,1,1))
+│   │               ├── physics_tick.wgsl      # Physics-only stride entry
+│   │               ├── vision_tick.wgsl       # Vision-only stride entry
+│   │               ├── phase_clear.wgsl       # Per-batch buffer clears
 │   │               ├── phase_prepare_dispatch.wgsl # Indirect-dispatch argument prep
 │   │               ├── phase_physics.wgsl     # Movement, gravity, bounds
 │   │               ├── phase_collision.wgsl   # Agent-agent collision response
@@ -429,7 +462,8 @@ xagent/
 │   │               ├── phase_food_detect.wgsl # Per-agent food detection
 │   │               ├── phase_food_respawn.wgsl # Consumed-food respawn timers
 │   │               ├── phase_agent_grid.wgsl  # Agent spatial grid rebuild
-│   │               └── phase_death.wgsl       # Death detection + respawn
+│   │               ├── phase_death.wgsl       # Death detection + respawn
+│   │               └── bitonic_sort_subgroup.wgsl # Subgroup-accelerated top-K (when supported)
 │   │
 │   └── xagent-sandbox/         # World simulation + application
 │       ├── src/

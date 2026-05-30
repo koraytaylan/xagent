@@ -18,16 +18,20 @@ This crate is the **interface contract** between the brain and sandbox crates. I
               ┌────────────┼────────────┐
               │                         │
               ▼                         ▼
-     ┌────────────────┐       ┌──────────────────┐
-     │  xagent-brain  │       │ xagent-sandbox   │
-     │                │       │                  │
-     │  packs shared  │       │  uses types to   │
-     │  types into    │       │  build frames,   │
-     │  GPU buffers;  │       │  interpret motor │
-     │  kernel runs   │       │  commands, track │
-     │  on buffers    │       │  body state      │
-     └────────────────┘       └──────────────────┘
+     ┌────────────────┐       ┌─────────────────────┐
+     │  xagent-brain  │       │ xagent-sandbox      │
+     │                │       │                     │
+     │  GpuKernel     │       │  Builds world       │
+     │  uploads these │       │  state, calls       │
+     │  configs to    │       │  kernel             │
+     │  GPU buffers,  │       │  .dispatch_batch,   │
+     │  runs the      │       │  reads back vitals  │
+     │  fused per-    │       │  and telemetry for  │
+     │  agent kernel  │       │  UI + replay        │
+     └────────────────┘       └─────────────────────┘
 ```
+
+> **Historical note.** Earlier versions of this crate documented `SensoryFrame` and `MotorCommand` as the per-tick interface — the sandbox would build a `SensoryFrame`, call a `Brain::tick(frame) -> MotorCommand` method, and apply the result. The runtime has since moved entirely onto the GPU (`xagent_brain::GpuKernel`). These types are still the canonical shape of one sensory snapshot and one motor command, used for `BrainConfig`/`WorldConfig` serialization, replay records, and unit-test fixtures — but they no longer cross the bus per tick. The sandbox builds world state and uploads it to GPU buffers; the kernel computes vision, motor output, and the rest in-place.
 
 ---
 
@@ -355,42 +359,45 @@ Combined configuration for JSON serialization. Both fields have `#[serde(default
 
 ## 3. Type Relationships & Data Flow
 
-The types in this crate form a clean data-flow pipeline:
+These shared types describe the *shape* of one tick's worth of sensory input and motor output. The actual per-tick computation happens inside the GPU kernel — the structures here are the contract the host code uses to set up that kernel and read its results.
 
 ```
-  Sandbox                     Shared Types                     Brain
-  ───────                     ────────────                     ─────
+  Sandbox                                   Shared Types                          GpuKernel (GPU)
+  ───────                                   ────────────                          ───────────────
 
-  Physics engine     ──►   BodyState          ──►   (internal tracking)
-  Sensory extraction ──►   SensoryFrame       ──►   brain.tick(frame)
-                           MotorCommand       ◄──   return value
-  Physics engine     ◄──   MotorCommand
+  Builds initial agent specs        ──►   BodyState, BrainConfig    ──►   upload_agents / upload_world
+  Updates world configuration       ──►   WorldConfig               ──►   upload_world_config
+                                            │
+                                            │ (descriptor types — never marshalled per tick)
+                                            ▼
+                                          Per-agent storage buffer rows
+                                          (physics_state, brain_state, …)
+                                            │
+  Reads back vitals + telemetry     ◄──   normalized copies of      ◄──   state readback into shared
+                                          SensoryFrame fields and          types for UI + replay
+                                          MotorCommand for display
 ```
 
-**Per-tick flow**:
+**Per-batch flow**:
 
-1. **Sandbox builds `SensoryFrame`**: The sandbox reads the agent's `BodyState`, renders low-res vision from the agent's viewpoint, gathers touch contacts, normalizes physiological signals, and packages everything into a `SensoryFrame`.
+1. **Sandbox uploads world + agent state**: When the world geometry or an agent spec changes (startup, spawn, config edit), the sandbox uploads new terrain/biome/food data and `BodyState` / `BrainConfig` rows into the kernel's GPU **storage** buffers via `GpuKernel::upload_world` / `upload_agents` / `write_agent_*`. `WorldConfig` (tick window, vision/brain strides, phase mask) is a separate path — it lives in a double-buffered **uniform** buffer (`world_config_bufs`) that `upload_world_config[_masked]` rewrites once per kernel-batch from inside `dispatch_batch`.
 
-2. **Brain processes `SensoryFrame`**: The brain's `tick()` method receives the frame. It encodes the sensory data, recalls relevant patterns from memory, predicts what will happen next, measures prediction error, updates its internal model, and selects an action.
+2. **Sandbox dispatches a batch**: `kernel.dispatch_batch(start_tick, ticks_to_run)` runs many simulated ticks per submission. Inside the kernel, each agent's vision rays are raycast in WGSL, touch contacts are detected from the spatial grids, motor output is computed from the encoded state, and physics integrates position/velocity/energy/integrity — all without crossing the bus.
 
-3. **Brain returns `MotorCommand`**: The brain's output is a `MotorCommand` specifying how the agent wants to move and what (if any) discrete action to perform.
-
-4. **Sandbox executes `MotorCommand`**: The physics engine applies the motor command to the agent's `BodyState` — updating position, velocity, and facing based on the thrust/strafe/turn values. If a discrete action is specified, it's executed (e.g., consuming food in front).
-
-5. **Sandbox updates `BodyState`**: Energy is depleted, integrity is damaged or regenerated, collisions are resolved, and the alive flag is checked. The updated `BodyState` feeds into the next tick's `SensoryFrame`.
+3. **Sandbox reads back what it needs for UI**: Non-blocking `try_collect_state` / `try_collect_telemetry` calls produce snapshots that the sandbox reshapes back into `SensoryFrame`-like data for replay recording and `MotorCommand` for telemetry rendering. These are convenience reconstitutions of the shape — the authoritative per-tick state lives in GPU storage.
 
 **What flows where**:
 
-| Type | Direction | Description |
+| Type | Role | Where it actually lives |
 |---|---|---|
-| `SensoryFrame` | sandbox → brain | Complete sensory snapshot for one tick |
-| `MotorCommand` | brain → sandbox | The brain's intended actions |
-| `BodyState` | sandbox-internal | Physical state; sandbox reads/writes, brain never sees directly |
-| `InternalState` | sandbox-internal | Physiological variables; normalized copies appear in `SensoryFrame` |
-| `BrainConfig` | config → brain | Capacity constraints, set at startup |
-| `WorldConfig` | config → sandbox | World parameters, set at startup |
+| `SensoryFrame` | Snapshot of one tick's sensory inputs (shape contract) | Reconstituted from GPU readback for replay / unit-test fixtures. Not uploaded per tick. |
+| `MotorCommand` | Snapshot of one tick's motor output (shape contract) | Reconstituted from GPU readback for the UI/replay. Not returned per tick from a Rust call. |
+| `BodyState` | Physical state at spawn / on inspection | Uploaded into the physics-state buffer when a new agent is spawned; read back when the CPU needs position/vitals. |
+| `InternalState` | Physiological variables | Held inside `BodyState`; reconstituted from physics readback. |
+| `BrainConfig` | Heritable capacity + tuning parameters | Uploaded into the brain-state tail per agent at spawn or after evolution mutation. |
+| `WorldConfig` | World parameters | Uploaded into the double-buffered world-config uniform buffer; rewritten once per kernel-batch by `upload_world_config[_masked]`. |
 
-Note that the brain **never** receives `BodyState` directly — it only gets the normalized, noisy signals in `SensoryFrame`. The brain doesn't know its exact energy level, only its `energy_signal` (a float between 0 and 1). This information asymmetry is deliberate: it forces the brain to build internal models of its own state rather than having perfect self-knowledge.
+Note that the brain stages still **never** see `BodyState` directly — they read the normalized fields (`energy_signal`, `integrity_signal`, deltas) the physics phase writes into the sensory layout. The brain doesn't know its exact energy level, only the normalized signal. This information asymmetry is preserved on the GPU side too: the encoder reads the same opaque buffer of floats regardless of how the physics phase produced them.
 
 ---
 

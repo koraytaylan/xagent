@@ -1065,7 +1065,7 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 ### When to Worry
 
 - **High speed_multiplier (1000×+)**: `raw_ticks` per frame is hard-capped at 500 in the main app loop (`main.rs`), and is also bounded by the adaptive `gpu_tick_budget`. Each `dispatch_batch` may submit several command buffers (one `queue.submit()` per kernel-batch of `vision_stride * brain_tick_stride` ticks, plus an optional physics-only remainder and a separate opportunistic staging copy), but the small per-frame tick cap keeps the worst-case submission count bounded.
-- **Large vision grids**: doubling `vision_rays` quadruples the encoder weight count and roughly doubles the kernel cycle cost. Stay near the default 8×6 unless an experiment specifically needs higher resolution.
+- **Large vision grids**: the encoder weight count scales linearly with `vision_rays` (= `VISION_W × VISION_H`), so doubling the `vision_rays` count roughly doubles both the encoder weights and the kernel cycle cost. Doubling *both* vision dimensions quadruples `vision_rays` (and therefore the encoder weights). Stay near the default 8×6 unless an experiment specifically needs higher resolution.
 - **Telemetry readback churn**: `request_agent_telemetry` issued every frame for every agent would serialize the kernel against the staging buffer mappings. The sandbox issues it once per frame for the *selected* agent only.
 
 ---

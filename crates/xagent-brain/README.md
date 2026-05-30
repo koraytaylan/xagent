@@ -52,15 +52,17 @@ The most important thing to understand about this architecture: **the brain has 
 In the live runtime sensory features are produced on-GPU: the vision pass raycasts colors and depths into `sensory_buffer`, and the same vision pipeline's `phase_vision_senses` (`src/shaders/kernel/phase_vision.wgsl`) appends per-agent proprioception, interoception, energy/integrity deltas, and touch contacts in a fixed positional layout — touch slots are filled in 3×3-cell discovery order (food cells first, then agent cells) up to `MAX_TOUCH_CONTACTS`, with each contact encoded as `(direction_x, direction_z, normalized_proximity, surface_tag / 4.0)`. The CPU-side `buffers::pack_sensory_frame()` is only exercised by `buffers` tests; it does not feed the live brain. The brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` then projects `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual) into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The packing is not free of inductive bias — the modality layout, contact-cap, and `surface_tag` category channel are all hand-chosen priors — but they live entirely in shader/packer code, not as named fields the brain reads. (The `surface_tag` enum reserves `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, and `TOUCH_AGENT`, but `phase_vision_senses` currently emits only `TOUCH_FOOD` and `TOUCH_AGENT` contacts.) From `coop_feature_extract` onward, the brain operates on opaque numerical vectors: no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
-World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> coop_feature_extract --> [265 f32]
-               |                                                        |
-      Named fields like                                        Brain sees only a
-      "vision", "energy"                                       flat array<f32>
+World --> GPU vision pass --> sensory_buffer [267 f32] --> coop_feature_extract --> [265 f32]
+              |                                                  |
+     phase_vision_raycast +                            Brain sees only a
+     phase_vision_senses (GPU)                         flat array<f32>
+
+(the test-only pack_sensory_frame() mirrors the same [267 f32] layout — not in the live path)
 ```
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." But the picture is not bias-free either: the packer's fixed modality layout and the preserved `surface_tag` channel are hand-chosen priors that ride along with the otherwise opaque vector. The honest summary is that `pack_sensory_frame()` strips struct labels but keeps positional structure; what the brain then sees is a numerically flattened interface, not a pristine raw signal. What remains downstream is prediction + homeostatic gradient + experience, and from these ingredients combined with that bounded prior, all meaning is discovered.
+This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." But the picture is not bias-free either: the fixed modality layout and the preserved `surface_tag` channel are hand-chosen priors that ride along with the otherwise opaque vector. The honest summary is that the shader boundary — the GPU vision pass, with the test-only `pack_sensory_frame()` mirroring its layout — strips struct labels but keeps positional structure; what the brain then sees is a numerically flattened interface, not a pristine raw signal. What remains downstream is prediction + homeostatic gradient + experience, and from these ingredients combined with that bounded prior, all meaning is discovered.
 
 ---
 
@@ -219,7 +221,7 @@ brain cycle (executed vision_stride times per kernel-batch):
   5. coop_recall_topk       top-16 selection (subgroup or workgroup bitonic sort)
   6. coop_predict_and_act   prediction error, credit, policy, fatigue, exploration
                               → writes motor into decision_buf (consumed by the
-                                physics step in the same kernel cycle)
+                                physics step in the next kernel cycle)
   7. coop_learn_and_store   predictor gradient, Hebbian credit, memory reinforcement,
                               pattern storage, decay
 ```

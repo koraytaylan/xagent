@@ -77,12 +77,16 @@ pub struct BrainConfig {
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
-    /// Default 10.
+    /// Default 10, clamped to `[1, MAX_BRAIN_TICK_STRIDE]` in the UI. Combined
+    /// with `vision_stride` this sets the one-batch sensory lag — see
+    /// [`BrainConfig::sensory_lag_ticks`].
     #[serde(default = "default_brain_tick_stride")]
     pub brain_tick_stride: u32,
     /// Brain cycles between global passes (grid rebuild, collisions, vision).
     /// Higher = more brain throughput, less frequent vision updates.
-    /// Default 10.
+    /// Default 10, clamped to `[1, MAX_VISION_STRIDE]` in the UI. Combined with
+    /// `brain_tick_stride` this sets the one-batch sensory lag — see
+    /// [`BrainConfig::sensory_lag_ticks`].
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
     /// Multiplier for all energy costs (metabolic + movement). Default 0.5.
@@ -292,6 +296,61 @@ impl Default for BrainConfig {
 }
 
 impl BrainConfig {
+    /// Maximum `brain_tick_stride` (physics ticks per brain+vision cycle). The
+    /// UI `DragValue` clamps to this; configs loaded from JSON or mutated
+    /// programmatically are expected to respect it as well.
+    pub const MAX_BRAIN_TICK_STRIDE: u32 = 32;
+
+    /// Maximum `vision_stride` (brain cycles between vision passes). The UI
+    /// `DragValue` clamps to this.
+    pub const MAX_VISION_STRIDE: u32 = 50;
+
+    /// Upper bound on the one-batch sensory lag, in physics ticks.
+    ///
+    /// # The sensory-lag invariant
+    ///
+    /// The brain reads vision and proprioception from `sensory_buffer`, which the
+    /// global vision pass refreshes *after* each fused-kernel batch completes (see
+    /// `kernel_tick.wgsl` and `GpuKernel::dispatch_batch`). One batch covers
+    /// `vision_stride * brain_tick_stride` physics ticks, so the brain always acts
+    /// on visual state that is exactly one batch — [`sensory_lag_ticks`] ticks —
+    /// stale. The lag is intentional and constant across stride settings.
+    ///
+    /// # Why it is bounded
+    ///
+    /// Credit assignment pairs a motor command with the gradient that command
+    /// produced (CONTRIBUTING.md → State Invariants: temporal alignment). The
+    /// larger the lag, the more the visual evidence at decision time
+    /// desynchronizes from the action's actual outcome. The credit-assignment
+    /// bugs unraveled during the circling investigation (issue #13) were rooted in
+    /// exactly this kind of temporal mismatch, so bounding the product acts as a
+    /// tripwire: if a future change grows the strides — or makes them dynamic —
+    /// past what the design was validated for, the bound trips instead of silently
+    /// resurrecting those bugs.
+    ///
+    /// The bound is the largest lag the UI clamps permit
+    /// (`MAX_BRAIN_TICK_STRIDE * MAX_VISION_STRIDE`), so every in-range config is
+    /// accepted and anything larger signals a path that bypassed those clamps.
+    ///
+    /// See `docs/reviews/2026-04-15-gemini-31-pro.md` ("The One-Batch Sensory
+    /// Lag") and issue #115.
+    ///
+    /// [`sensory_lag_ticks`]: BrainConfig::sensory_lag_ticks
+    pub const MAX_SENSORY_LAG_TICKS: u32 = Self::MAX_BRAIN_TICK_STRIDE * Self::MAX_VISION_STRIDE;
+
+    /// The one-batch sensory lag for this config, in physics ticks
+    /// (`vision_stride * brain_tick_stride`).
+    ///
+    /// Saturates to [`u32::MAX`] if the product overflows (e.g. a corrupt config),
+    /// so a caller comparing against
+    /// [`MAX_SENSORY_LAG_TICKS`](Self::MAX_SENSORY_LAG_TICKS) still rejects it
+    /// rather than wrapping to a small value. See the
+    /// [`MAX_SENSORY_LAG_TICKS`](Self::MAX_SENSORY_LAG_TICKS) docs for the full
+    /// invariant and the rationale for the bound.
+    pub fn sensory_lag_ticks(&self) -> u32 {
+        self.vision_stride.saturating_mul(self.brain_tick_stride)
+    }
+
     /// Minimal capacity — interesting for observing constraints.
     pub fn tiny() -> Self {
         Self {
@@ -414,5 +473,54 @@ mod tests {
     fn governor_config_tuned_defaults() {
         let config = GovernorConfig::default();
         assert_eq!(config.tick_budget, 1_000_000);
+    }
+
+    #[test]
+    fn sensory_lag_is_product_of_strides() {
+        let config = BrainConfig {
+            brain_tick_stride: 7,
+            vision_stride: 9,
+            ..BrainConfig::default()
+        };
+        assert_eq!(config.sensory_lag_ticks(), 63);
+    }
+
+    #[test]
+    fn default_sensory_lag_is_within_bound() {
+        let config = BrainConfig::default();
+        // Default 10 * 10 = 100 ticks, well under the bound.
+        assert_eq!(config.sensory_lag_ticks(), 100);
+        assert!(config.sensory_lag_ticks() <= BrainConfig::MAX_SENSORY_LAG_TICKS);
+    }
+
+    #[test]
+    fn sensory_lag_bound_tracks_stride_clamps() {
+        // These mirror the UI DragValue clamps in ui.rs — keep them in sync.
+        assert_eq!(BrainConfig::MAX_BRAIN_TICK_STRIDE, 32);
+        assert_eq!(BrainConfig::MAX_VISION_STRIDE, 50);
+        assert_eq!(BrainConfig::MAX_SENSORY_LAG_TICKS, 1600);
+        // A config at both clamp ceilings hits exactly the bound (inclusive).
+        let config = BrainConfig {
+            brain_tick_stride: BrainConfig::MAX_BRAIN_TICK_STRIDE,
+            vision_stride: BrainConfig::MAX_VISION_STRIDE,
+            ..BrainConfig::default()
+        };
+        assert_eq!(
+            config.sensory_lag_ticks(),
+            BrainConfig::MAX_SENSORY_LAG_TICKS
+        );
+    }
+
+    #[test]
+    fn sensory_lag_saturates_on_overflow() {
+        // A corrupt/hand-edited config must not wrap to a small lag and sneak past
+        // the bound; the product saturates so the comparison still rejects it.
+        let config = BrainConfig {
+            brain_tick_stride: u32::MAX,
+            vision_stride: 2,
+            ..BrainConfig::default()
+        };
+        assert_eq!(config.sensory_lag_ticks(), u32::MAX);
+        assert!(config.sensory_lag_ticks() > BrainConfig::MAX_SENSORY_LAG_TICKS);
     }
 }

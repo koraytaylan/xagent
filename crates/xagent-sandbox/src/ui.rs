@@ -1429,16 +1429,20 @@ impl<'a> TabContext<'a> {
                     b.vision_height = vision_height.max(2) as u32;
                     ui.end_row();
 
+                    // Clamp ranges come from BrainConfig so the UI ceiling stays
+                    // tied to the sensory-lag bound (BrainConfig::MAX_SENSORY_LAG_TICKS).
+                    let max_bts = xagent_shared::BrainConfig::MAX_BRAIN_TICK_STRIDE as i32;
+                    let max_vs = xagent_shared::BrainConfig::MAX_VISION_STRIDE as i32;
                     ui.label("brain_tick_stride");
                     let mut bts = b.brain_tick_stride as i32;
-                    ui.add(egui::DragValue::new(&mut bts).range(1..=32).speed(1));
-                    b.brain_tick_stride = bts.clamp(1, 32) as u32;
+                    ui.add(egui::DragValue::new(&mut bts).range(1..=max_bts).speed(1));
+                    b.brain_tick_stride = bts.clamp(1, max_bts) as u32;
                     ui.end_row();
 
                     ui.label("vision_stride");
                     let mut vs = b.vision_stride as i32;
-                    ui.add(egui::DragValue::new(&mut vs).range(1..=50).speed(1));
-                    b.vision_stride = vs.clamp(1, 50) as u32;
+                    ui.add(egui::DragValue::new(&mut vs).range(1..=max_vs).speed(1));
+                    b.vision_stride = vs.clamp(1, max_vs) as u32;
                     ui.end_row();
 
                     ui.label("metabolic_rate");

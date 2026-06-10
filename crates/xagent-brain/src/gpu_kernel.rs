@@ -440,6 +440,31 @@ impl GpuKernel {
         let layout = BrainLayout::new(brain_config.vision_width, brain_config.vision_height);
         let brain_tick_stride = brain_config.brain_tick_stride;
 
+        // Sensory-lag bound (issue #115). The brain reads vision/proprioception
+        // from `sensory_buffer`, refreshed by the vision pass at the end of each
+        // batch, so it acts on data `sensory_lag_ticks()` physics ticks stale (see
+        // `BrainConfig::MAX_SENSORY_LAG_TICKS`). Beyond the bound, credit
+        // assignment desynchronizes from action outcomes — the failure mode behind
+        // the circling investigation (#13). Warn in every build for visibility on
+        // externally-loaded configs, and `debug_assert!` to hard-trip a developer
+        // who grows the strides past what the design was validated for.
+        let sensory_lag = brain_config.sensory_lag_ticks();
+        if sensory_lag > BrainConfig::MAX_SENSORY_LAG_TICKS {
+            log::warn!(
+                "sensory lag {sensory_lag} ticks (vision_stride {} * brain_tick_stride {}) \
+                 exceeds MAX_SENSORY_LAG_TICKS {}; credit assignment may desynchronize from \
+                 action outcomes (issue #115)",
+                brain_config.vision_stride,
+                brain_tick_stride,
+                BrainConfig::MAX_SENSORY_LAG_TICKS,
+            );
+        }
+        debug_assert!(
+            sensory_lag <= BrainConfig::MAX_SENSORY_LAG_TICKS,
+            "sensory lag {sensory_lag} ticks exceeds MAX_SENSORY_LAG_TICKS {} (issue #115)",
+            BrainConfig::MAX_SENSORY_LAG_TICKS,
+        );
+
         let storage_rw = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;

@@ -503,6 +503,16 @@ fn kernel_tick(
         // vision pass.  Physics state updated in this cycle is NOT yet in
         // sensory_buffer — that update happens in the vision pass at the end of
         // this batch, making it available for the following batch.
+        //
+        // SENSORY-LAG RISK (issue #115): this read is stale by exactly one batch =
+        // vision_stride * brain_tick_stride physics ticks. The lag is intentional
+        // and constant, but credit assignment pairs a motor command with the
+        // gradient it produced — the larger the lag, the more the visual evidence
+        // at decision time desynchronizes from the action's outcome, the failure
+        // mode behind the circling investigation. The product is bounded on the
+        // Rust side by `BrainConfig::MAX_SENSORY_LAG_TICKS` (asserted in
+        // `GpuKernel::new`); do NOT grow the strides or make them dynamic past that
+        // bound without revalidating credit assignment.
         brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
         workgroupBarrier();
     }

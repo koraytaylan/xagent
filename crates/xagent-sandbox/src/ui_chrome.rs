@@ -109,7 +109,10 @@ pub(crate) fn draw_top_bar(
             ) && state.tick_budget > 0
             {
                 ui.separator();
-                let progress = state.gen_tick as f32 / state.tick_budget as f32;
+                // Clamp to [0, 1]: gen_tick can overshoot tick_budget (the
+                // governor completes a generation on gen_tick >= tick_budget),
+                // which would otherwise render an overfull bar and >100% text.
+                let progress = (state.gen_tick as f32 / state.tick_budget as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(progress)
                         .text(format!(

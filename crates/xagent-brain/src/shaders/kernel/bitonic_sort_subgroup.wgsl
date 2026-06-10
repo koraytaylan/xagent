@@ -1,14 +1,29 @@
 // ── Subgroup-accelerated bitonic sort (replaces the workgroup-memory sort) ──
 // This fragment is spliced between the `BEGIN_BITONIC_SORT` /
 // `END_BITONIC_SORT` markers in `brain_passes.wgsl` by the Rust host before
-// creating the shader module/pipeline, when `wgpu::Features::SUBGROUP` is
-// available. This is host-side shader composition, not WGSL `override`
-// specialization via `PipelineCompilationOptions::constants`.
+// creating the shader module/pipeline, when the `wgpu::Features::SUBGROUP`
+// feature is present AND the adapter guarantees a subgroup width of at least 32
+// (see the width contract below). This is host-side shader composition, not
+// WGSL `override` specialization via `PipelineCompilationOptions::constants`.
 //
 // The fragment is self-contained — it relies on the same shared memory
 // (`s_similarities`, `shared_sort_indices`) declared in brain_passes.wgsl,
 // and on local variables `tid` (thread id, 0..255) and `sgid` (subgroup
 // invocation id) being in scope at the splice site.
+//
+// ── Subgroup-width contract (issue #133) ──
+// This fragment REQUIRES a subgroup width of at least 32 invocations. Stages
+// 0–4 pair lanes via `subgroupShuffle(my_val, sgid ^ half)` with `half` up to
+// `1 << 4 == 16`, so lanes 0..=31 must all be valid members of the same
+// subgroup. The mapping of `tid` onto subgroup lanes must also be contiguous in
+// aligned blocks of the subgroup width — true for the 1-D workgroup used here,
+// where `sgid == tid % subgroup_size` — so that `tid ^ half` and `sgid ^ half`
+// address the same bitonic partner. On 16-wide subgroups (some Intel iGPUs,
+// some AMD configs) `sgid ^ 16` would address a lane outside the subgroup and
+// return an implementation-defined value, corrupting top-K recall. The Rust
+// host therefore only splices this fragment in when the adapter reports
+// `min_subgroup_size >= 32` — see `subgroup_bitonic_supported()` in
+// gpu_kernel.rs.
 //
 // See `gpu_kernel.rs::apply_subgroup_markers()` for the full marker contract.
 

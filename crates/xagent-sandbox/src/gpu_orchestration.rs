@@ -111,14 +111,15 @@ impl App {
         self.log_msg("[GPU] Creating GpuKernel (background)...".into());
     }
 
-    /// Advance the simulation for one frame: dispatch fixed-timestep ticks,
-    /// collect the every-frame state readback, record per-tick overlay/history
-    /// data, and check for generation completion.
+    /// Advance the simulation for one active frame: dispatch fixed-timestep
+    /// ticks, apply the latest GPU state readback, record per-tick
+    /// overlay/history data, and check for generation completion.
     ///
-    /// Ticks are skipped while paused, while a generation transition is in
-    /// flight (to avoid GPU contention with the async readback/reset), and while
-    /// the kernel is being recreated in the background (to prevent a catch-up
-    /// hitch when it lands).
+    /// The entire step — including the readback and overlay/history recording —
+    /// is skipped while paused, while a generation transition is in flight (to
+    /// avoid GPU contention with the async readback/reset), and while the kernel
+    /// is being recreated in the background (to prevent a catch-up hitch when it
+    /// lands).
     pub(crate) fn step_simulation(&mut self, dt: f32) {
         let sim_active =
             !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none();

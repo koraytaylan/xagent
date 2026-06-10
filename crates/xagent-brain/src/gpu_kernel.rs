@@ -71,7 +71,7 @@ const BITONIC_SORT_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sor
 /// members of the same subgroup. On narrower subgroups (e.g. 16-wide Intel
 /// iGPUs and some AMD configs) `sgid ^ 16` addresses a lane outside the
 /// subgroup and the shuffle returns an implementation-defined value, corrupting
-/// top-K recall (issue #133).
+/// top-K recall.
 const MIN_SUBGROUP_WIDTH_FOR_BITONIC: u32 = 32;
 
 /// Whether the subgroup-accelerated bitonic sort may be spliced into the brain
@@ -80,8 +80,8 @@ const MIN_SUBGROUP_WIDTH_FOR_BITONIC: u32 = 32;
 /// Requires both the `SUBGROUP` feature and a guaranteed subgroup width of at
 /// least [`MIN_SUBGROUP_WIDTH_FOR_BITONIC`]. `min_subgroup_size` is the floor the
 /// adapter promises, so gating on it ensures *every* subgroup the device
-/// produces is wide enough for the lane-pairing math — see issue #133. Adapters
-/// that do not report subgroup limits leave `min_subgroup_size` at `0`, which
+/// produces is wide enough for the lane-pairing math. Adapters that do not
+/// report subgroup limits leave `min_subgroup_size` at `0`, which
 /// correctly fails the check and keeps the workgroup-memory fallback sort.
 fn subgroup_bitonic_supported(has_feature: bool, min_subgroup_size: u32) -> bool {
     has_feature && min_subgroup_size >= MIN_SUBGROUP_WIDTH_FOR_BITONIC
@@ -429,8 +429,8 @@ impl GpuKernel {
 
         let adapter_limits = adapter.limits();
 
-        // Subgroup-accelerated bitonic sort gating (issue #133). The splice is
-        // only correct when every subgroup the device can produce is at least
+        // Subgroup-accelerated bitonic sort gating. The splice is only correct
+        // when every subgroup the device can produce is at least
         // `MIN_SUBGROUP_WIDTH_FOR_BITONIC` wide, so gate on the adapter's
         // guaranteed floor rather than the bare `SUBGROUP` feature.
         let has_subgroup_feature = adapter.features().contains(wgpu::Features::SUBGROUP);
@@ -444,7 +444,7 @@ impl GpuKernel {
         } else if has_subgroup_feature {
             log::info!(
                 "[GpuKernel] Subgroup feature present but min width {subgroup_min_width} < {} — \
-                 using shared-memory-only bitonic sort (issue #133)",
+                 using shared-memory-only bitonic sort",
                 MIN_SUBGROUP_WIDTH_FOR_BITONIC
             );
         } else {
@@ -2480,8 +2480,8 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // Subgroup-width gating (issue #133) — the subgroup bitonic sort must only
-    // be spliced in when the adapter guarantees a wide-enough subgroup.
+    // Subgroup-width gating — the subgroup bitonic sort must only be spliced in
+    // when the adapter guarantees a wide-enough subgroup.
     // ────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -2489,7 +2489,7 @@ mod tests {
         // Feature present and the guaranteed width covers the shuffle stages.
         assert!(subgroup_bitonic_supported(true, 32));
         assert!(subgroup_bitonic_supported(true, 64));
-        // Feature present but subgroups can be too narrow → fall back (issue #133).
+        // Feature present but subgroups can be too narrow → fall back.
         assert!(!subgroup_bitonic_supported(true, 16));
         assert!(!subgroup_bitonic_supported(true, 8));
         // Adapters that do not report subgroup limits leave the floor at 0.

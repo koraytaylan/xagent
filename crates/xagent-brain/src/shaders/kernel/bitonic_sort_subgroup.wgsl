@@ -11,7 +11,7 @@
 // and on local variables `tid` (thread id, 0..255) and `sgid` (subgroup
 // invocation id) being in scope at the splice site.
 //
-// ── Subgroup-width contract (issue #133) ──
+// ── Subgroup-width contract ──
 // This fragment REQUIRES a subgroup width of at least 32 invocations. Stages
 // 0–4 pair lanes via `subgroupShuffle(my_val, sgid ^ half)` with `half` up to
 // `1 << 4 == 16`, so lanes 0..=31 must all be valid members of the same

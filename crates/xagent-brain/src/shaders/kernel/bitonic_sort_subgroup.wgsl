@@ -15,10 +15,15 @@
 // This fragment REQUIRES a subgroup width of at least 32 invocations. Stages
 // 0–4 pair lanes via `subgroupShuffle(my_val, sgid ^ half)` with `half` up to
 // `1 << 4 == 16`, so lanes 0..=31 must all be valid members of the same
-// subgroup. The mapping of `tid` onto subgroup lanes must also be contiguous in
-// aligned blocks of the subgroup width — true for the 1-D workgroup used here,
-// where `sgid == tid % subgroup_size` — so that `tid ^ half` and `sgid ^ half`
-// address the same bitonic partner. On 16-wide subgroups (some Intel iGPUs,
+// subgroup. It also ASSUMES the invocation-to-lane mapping is the natural
+// contiguous one — `sgid == tid % subgroup_size`, with subgroups partitioning
+// `tid` into aligned blocks of the subgroup width — so that `tid ^ half` and
+// `sgid ^ half` select the same bitonic partner. WGSL/WebGPU does NOT guarantee
+// this: the relation between `local_invocation_id` and `subgroup_invocation_id`
+// is implementation-defined, so it is a requirement of this optimization, not a
+// spec property. It holds on the naga backends in use for a 1-D workgroup; a
+// backend that lays subgroups out differently must not take this path. On
+// 16-wide subgroups (some Intel iGPUs,
 // some AMD configs) `sgid ^ 16` would address a lane outside the subgroup and
 // return an implementation-defined value, corrupting top-K recall. The Rust
 // host therefore only splices this fragment in when the adapter reports

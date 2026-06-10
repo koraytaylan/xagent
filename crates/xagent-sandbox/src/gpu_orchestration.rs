@@ -232,7 +232,8 @@ impl App {
         }
     }
 
-    /// Collect the every-frame physics readback and apply it to agent bodies.
+    /// Apply the latest GPU physics readback to agent bodies when a new state
+    /// buffer is ready (no-op otherwise).
     ///
     /// Authoritative for position/yaw/alive/energy/integrity/velocity and the
     /// `cached_*` motor/gradient/urgency/prediction/exploration/fatigue fields.

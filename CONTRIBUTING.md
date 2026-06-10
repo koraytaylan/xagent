@@ -57,6 +57,8 @@ reviewed and refactored as part of normal code review.
 - Keep PR descriptions synchronized with code. Constant values, radius sizes, and architectural claims must reflect what the code actually does.
 - No commented-out code or tombstone comments. Delete removed code completely — git history preserves everything.
 - No stale TODOs. If the referenced work is done or abandoned, delete the TODO.
+- Inline code comments must describe the code as it currently is. They must not reference GitHub issue/PR numbers, past implementations ("was previously…", "before the refactor…"), or planned future adjustments ("will be replaced once…"). Put that history in commit messages, PR descriptions, and the issue tracker instead — `git blame` links a line back to its commit and issue.
+- The rule above covers comments only. `Closes #N` / `Refs #N` in commit messages and PR descriptions is expected — that is the intended home for the reference — and runtime log/error message strings that surface an issue number to operators are out of scope. Strip pre-existing comment references file-by-file under [Incremental Cleanup](#incremental-cleanup) as code is touched, not in one big-bang pass.
 - Do not write values to buffers or fields that nothing reads. Unused writes waste bandwidth and mislead readers about data flow.
 - We plan to enable `#![warn(missing_docs)]` incrementally per crate.
 

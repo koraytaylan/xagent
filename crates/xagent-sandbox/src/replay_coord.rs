@@ -17,7 +17,8 @@ impl App {
     /// the exploration/prediction/attenuation/curiosity/fatigue fields come from
     /// the per-agent `cached_*` telemetry; in this GPU path only the selected
     /// agent's cache is refreshed each frame. `credit_magnitude`,
-    /// `patterns_recalled`, `phase`, and `vision_color` are left at defaults, and
+    /// `patterns_recalled`, and `vision_color` are left at defaults and `phase`
+    /// is recorded as `RANDOM`, since this GPU path tracks none of them;
     /// `raw_gradient` mirrors `gradient` because the GPU readback exposes no
     /// separate raw gradient. No-op when no recording is active.
     pub(crate) fn record_replay_tick(&mut self) {

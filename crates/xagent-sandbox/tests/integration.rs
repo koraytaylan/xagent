@@ -1694,12 +1694,13 @@ fn gpu_agents_y_matches_terrain_after_single_tick() {
 // learning changes can be evaluated against recorded numbers instead of
 // intuition. See docs/superpowers/plans/2026-06-10-emergent-learning-pathway.md.
 
-/// Probe agents per arena (4×4 grid). An even count keeps left/right food
-/// bearings balanced so a systematic turn bias cannot masquerade as
-/// food-seeking; 16 agents give several hundred scored samples per run.
-const PROBE_AGENT_COUNT: usize = 16;
-/// Agents per side of the square probe grid.
+/// Agents per side of the square probe grid. Must stay even so the derived
+/// agent count is even: alternating left/right food bearings then balance
+/// exactly, and a systematic turn bias cannot masquerade as food-seeking.
 const PROBE_GRID_SIDE: usize = 4;
+/// Probe agents per arena — derived from the grid side so the two can
+/// never drift. 16 agents give several hundred scored samples per run.
+const PROBE_AGENT_COUNT: usize = PROBE_GRID_SIDE * PROBE_GRID_SIDE;
 /// Spacing between probe agents. Greater than 2× the vision range (30) so
 /// no probe agent can ever see another agent or another agent's food item.
 const PROBE_AGENT_SPACING: f32 = 64.0;

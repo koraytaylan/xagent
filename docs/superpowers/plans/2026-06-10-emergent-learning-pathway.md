@@ -172,21 +172,26 @@ The audit's core lesson: every constant change was individually plausible and
 collectively wrong, and the two changes that fully froze learning passed
 review. So the gates come first.
 
-- [ ] **Step 1: Directional learning probe (integration test).** Construct a
-  `GpuKernel` with one agent and one food item placed at a fixed bearing
-  (±30°, distance 15). Run N brain ticks, read motor telemetry, score
-  turn-sign correctness against the food bearing over M seeded trials.
-  Assert the *baseline* (current code) scores ≈ chance — this makes the
-  probe falsifiable and gives the number future phases must beat. Gate
-  behind the existing GPU-test mechanism.
-- [ ] **Step 2: Approach-rate metric.** Same scaffold, free-running: count
-  food-visible→distance-decreased transitions per 1k brain ticks, and
-  food-per-life from `P_FOOD_COUNT`/`P_DEATH_COUNT`.
-- [ ] **Step 3: Headless A/B logging.** Extend `run_headless` to log per
-  generation: food-per-life, policy weight norms, exploration rate mean.
-  Fixed seed → reproducible before/after comparison.
-- [ ] **Step 4: Record baseline numbers** in the PR body and in a short
-  `docs/superpowers/specs/` baseline note. Commit.
+- [x] **Step 1: Directional learning probe (integration test).** Built as a
+  16-agent flat-world arena (4×4 grid, 64-unit spacing — beyond vision
+  range, so independent trials), one food item per agent at bearing
+  ±atan(3/7) (exactly on a ray column) at distance 5 — the distance the
+  default 8×6 ray rows can actually see ground food (the vertical ray
+  layout, not horizontal acuity, binds visibility; see the baseline note).
+  Single-tick strides + zero movement speed pin the geometry; turn-sign
+  correctness is scored against the per-tick bearing. Baseline asserted to
+  the chance band [0.38, 0.62]. Includes a separate information-path test
+  asserting all agents see a food pixel.
+- [x] **Step 2: Foraging-rate metric.** Free-running probe arena with the
+  default config: food-per-agent-per-1k-ticks and deaths over 3000 ticks,
+  with liveness accounting asserted.
+- [x] **Step 3: Headless A/B logging.** `run_headless` now prints per
+  generation: food, deaths, food-per-life, and the best agent's policy
+  weight norms (`w_fwd`, `w_turn`).
+- [x] **Step 4: Record baseline numbers** —
+  [`docs/superpowers/specs/2026-06-10-learning-baseline.md`](../specs/2026-06-10-learning-baseline.md):
+  alignment 0.498 (chance), foraging 0.042 food/agent/1k-ticks, visibility
+  16/16.
 
 ## Phase 1: TD(λ) critic and trace-based actor credit
 

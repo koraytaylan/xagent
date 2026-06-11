@@ -9,7 +9,9 @@ use log::info;
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
-    PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
+    BrainLayout, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS,
+    O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE, P_DEATH_COUNT,
+    P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
@@ -224,6 +226,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         inherited_state = agents
             .get(best_idx)
             .map(|a| kernel.read_agent_state(a.brain_idx));
+        log_learning_metrics(&agents, inherited_state.as_ref(), &current_configs[0]);
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",
@@ -260,6 +263,50 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         total_time.as_secs_f64(),
         governor.generation,
     );
+}
+
+/// Per-generation learning metrics: behavioral signal (food per life) plus
+/// the policy weight norms of the generation's best agent. These stay flat
+/// for a population that isn't learning and should trend upward once credit
+/// assignment reaches food-approach actions. Printed alongside the fitness
+/// line so headless runs double as before/after measurement records.
+fn log_learning_metrics(
+    agents: &[Agent],
+    best_state: Option<&AgentBrainState>,
+    config: &BrainConfig,
+) {
+    let total_food: u64 = agents.iter().map(|a| u64::from(a.food_consumed)).sum();
+    let total_deaths: u64 = agents.iter().map(|a| u64::from(a.death_count)).sum();
+    // Every agent lives at least once; each death starts another life.
+    let lives = agents.len() as u64 + total_deaths;
+    let food_per_life = total_food as f64 / lives.max(1) as f64;
+
+    let mut weight_norms = String::new();
+    if let Some(state) = best_state {
+        let layout = BrainLayout::new(config.vision_width, config.vision_height);
+        // Tail offsets are vision-independent deltas from the context-weight
+        // slot; rebase them onto this layout's dynamic position.
+        let tail_base = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let forward_base = tail_base + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let turn_base = tail_base + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        if state.brain_state.len() >= turn_base + ENCODED_DIMENSION {
+            let l2_norm = |base: usize| -> f32 {
+                state.brain_state[base..base + ENCODED_DIMENSION]
+                    .iter()
+                    .map(|w| w * w)
+                    .sum::<f32>()
+                    .sqrt()
+            };
+            weight_norms = format!(
+                " | w_fwd {:.3} | w_turn {:.3}",
+                l2_norm(forward_base),
+                l2_norm(turn_base),
+            );
+        }
+    }
+    println!("  Food: {total_food} | Deaths: {total_deaths} | Food/life: {food_per_life:.2}{weight_norms}");
 }
 
 /// Print evolution tree from database and exit.

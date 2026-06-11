@@ -2251,6 +2251,101 @@ fn learning_probe_mirrored_steering_is_chance() {
     );
 }
 
+/// Diagnostic: does the encoder keep food-left and food-right linearly
+/// separable? Presents one agent (one encoder) the same scene with food on
+/// the right, then on the left, and reads the pre-habituation encoded state
+/// (`O_PREV_ENCODED`) for each. The directional signal the policy must read
+/// is `encoded(right) − encoded(left)`; this measures whether that signal
+/// rises above the within-class noise (two right-side scenes at slightly
+/// different distances).
+///
+/// Reports `between` (cosine of right vs left) against `within` (cosine of
+/// two right-side scenes). If `between ≈ within ≈ 1`, the encoder collapses
+/// the food side below the readout floor — the encoder is the binding
+/// constraint for directional steering. If `1 − between` is clearly larger
+/// than `1 − within`, the side is represented and the bottleneck is the
+/// credit/temporal path instead. Measurement-first: prints the numbers and
+/// asserts only that the read succeeded.
+#[test]
+fn encoder_food_side_separability_diagnostic() {
+    use xagent_brain::buffers::{
+        BrainLayout, ENCODED_DIMENSION, O_PREDICTOR_CONTEXT_WEIGHT, O_PREV_ENCODED,
+        PREDICTOR_DIMENSION,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = probe_brain_config();
+    let world_config = WorldConfig {
+        seed: 1,
+        ..Default::default()
+    };
+    let mut kernel = xagent_brain::GpuKernel::new(1, 1, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 31);
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+    let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    let agent_data = vec![(
+        glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    let layout = BrainLayout::new(brain.vision_width, brain.vision_height);
+    let prev_encoded_off = layout.feature_count * ENCODED_DIMENSION
+        + ENCODED_DIMENSION
+        + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+        + (O_PREV_ENCODED - O_PREDICTOR_CONTEXT_WEIGHT);
+
+    // Present food at a given bearing/distance and return the encoded state.
+    // Two single-tick batches: the first runs vision, the second lets the
+    // brain encode that frame into O_PREV_ENCODED.
+    let mut tick = 0_u64;
+    let mut present = |kernel: &mut xagent_brain::GpuKernel, bearing: f32, dist: f32| -> Vec<f32> {
+        let food = vec![(bearing.sin() * dist, PROBE_FOOD_Y, bearing.cos() * dist)];
+        kernel.upload_world(&heights, &biomes, &food, &[false], &[0.0]);
+        kernel.upload_agents(&agent_data); // re-pin pose (facing +Z, full energy)
+        kernel.dispatch_batch(tick, 1);
+        kernel.dispatch_batch(tick + 1, 1);
+        tick += 2;
+        let bs = kernel.read_agent_state(0).brain_state;
+        bs[prev_encoded_off..prev_encoded_off + ENCODED_DIMENSION].to_vec()
+    };
+
+    let cosine = |a: &[f32], b: &[f32]| -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na < 1e-8 || nb < 1e-8 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    };
+
+    let e_right = present(&mut kernel, PROBE_FOOD_BEARING, PROBE_FOOD_DISTANCE);
+    let e_right2 = present(&mut kernel, PROBE_FOOD_BEARING, PROBE_FOOD_DISTANCE + 1.0);
+    let e_left = present(&mut kernel, -PROBE_FOOD_BEARING, PROBE_FOOD_DISTANCE);
+
+    assert!(
+        e_right.iter().any(|v| v.abs() > 1e-6) && e_left.iter().any(|v| v.abs() > 1e-6),
+        "encoded states are all-zero — vision/encode path did not run"
+    );
+
+    let within = cosine(&e_right, &e_right2);
+    let between = cosine(&e_right, &e_left);
+    eprintln!(
+        "encoder separability: within(right,right') cos={within:.4} (dist {:.4}), \
+         between(right,left) cos={between:.4} (dist {:.4})",
+        1.0 - within,
+        1.0 - between,
+    );
+}
+
 /// The critic must learn that the steady metabolic drain makes every state
 /// slightly negative-valued: with stationary agents and no food events, the
 /// value telemetry should settle below zero, and every TD error must

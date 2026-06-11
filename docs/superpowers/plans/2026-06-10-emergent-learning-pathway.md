@@ -252,6 +252,46 @@ surprise-driven plus the L2 ball already bound magnitude).
 **Gate:** separability test passes; directional probe improves over Phase 1;
 TPS cost < 15%.
 
+### Phase 2 outcome — NOT MERGED (documented negative result)
+
+Tied-weight vision reconstruction was implemented (vision-only target, decode
+through the transposed encoder weights, `Δw = rate·(x−x̂)·encoded`, vision
+features only) and measured against the Phase-1 directional gate on the
+fixed training seed:
+
+| Reconstruction rate | Trained alignment | Phase-1 reference |
+|---|---|---|
+| 0.001 | 0.603 | 0.643 |
+| 0.0003 | 0.613 | 0.643 |
+| 0 (Phase 1) | 0.643 | 0.643 |
+
+Reconstruction was **neutral-to-slightly-negative** at every rate tried and
+never cleared the gate's "improves over Phase 1" bar; lowering the rate only
+walked the metric back toward the Phase-1 value. (Training-time foraging rose
+slightly — 588→730 vs 609→770 — but the post-training behavioral readout did
+not.) Two compounding reasons:
+
+1. **The encoder is not the currently-binding constraint.** Phase 1 already
+   reaches 0.643 ≫ chance with the random-projection encoder, so the
+   8×6 random projection preserves enough food-direction signal for the
+   policy. There was little representational headroom for reconstruction to
+   add.
+2. **Moving-target cost.** Reshaping the encoder while the policy reads it
+   makes the policy chase a shifting code, which slightly slowed policy
+   convergence — visible as the rate-dependent dip (0.001 worse than 0.0003).
+
+Per the plan's own discipline ("No phase merges on 'should work'"), the
+reconstruction code was reverted; `develop`/this branch keep the validated
+Phase-1 learner. The trainable-encoder idea is not refuted in general — it is
+not worthwhile *at 8×6 with TD(λ) already extracting the signal*. It should be
+revisited only if a later phase makes the encoder the binding constraint (e.g.
+much higher vision resolution where a random projection dilutes a small food
+signal across many pixels), and then with an objective that emphasizes the
+*varying* part of the input rather than dominant background variance.
+
+**Re-scope:** proceed directly to Phase 3 (vision acuity), the next plausibly
+binding constraint — can the agent see food at range at all.
+
 ## Phase 3: Vision acuity
 
 - [ ] **Step 1: Default 16×12.** Change config defaults; verify the

@@ -102,3 +102,16 @@ gain comes from reward-driven learning, not a directional bias artifact.
 
 TPS unchanged within noise (the serial history-ring credit loop is gone;
 the TD path is fully parallel across the 128 trace dimensions).
+
+## Phase 2 (encoder self-supervision) — negative result, not merged
+
+Tied-weight vision reconstruction was implemented and measured against the
+Phase-1 gate (same training seed): alignment **0.603** at rate 0.001 and
+**0.613** at 0.0003, versus **0.643** for Phase 1 with no reconstruction.
+Reconstruction was neutral-to-slightly-negative at every rate and never
+cleared the "improves over Phase 1" bar, so it was reverted (see the plan's
+"Phase 2 outcome" section for the mechanism analysis). The headline: TD(λ)
+already extracts the food-direction signal from the random-projection
+encoder at 8×6, so encoder representation is not the binding constraint and
+reshaping it only adds a moving-target cost. Work proceeds to Phase 3
+(vision acuity).

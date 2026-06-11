@@ -699,8 +699,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 7: Learn and store
-// Predictor: threads 0..31; Encoder: threads 0..31;
-// Memory reinforcement: threads 0..127; Decay: threads 0..127
+// Predictor: threads 0..PREDICTOR_DIMENSION; Encoder credit: one encoded dim
+// per thread; Memory reinforcement / decay: threads 0..MEMORY_CAP.
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_learn_and_store(agent_id: u32, tid: u32) {
@@ -738,7 +738,9 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
         brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] = clamp(brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
 
-    // ── 7b. Encoder credit: threads 0..31 ──────────────────────────────
+    // ── 7b. Encoder credit: one encoded dimension per thread ────────────
+    // Task-driven nudge: features that co-occurred with TD-error eligibility
+    // get their weights into this dimension strengthened.
     if (tid < ENCODED_DIMENSION) {
         let action_credit = decision_buffer[decision_base + DECISION_CREDIT + tid];
         if (abs(action_credit) >= CREDIT_EPSILON) {

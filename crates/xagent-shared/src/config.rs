@@ -70,10 +70,15 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
-    /// Visual field width in pixels. Default 8.
+    /// Visual field width in pixels. Default 8. Odd × odd grids (e.g. 17×13)
+    /// give the best distal-food visibility — an odd height puts a ray row on
+    /// the horizon and an odd width a column straight ahead — but the default
+    /// stays 8×6 until the learner can act on directional vision (see
+    /// `docs/superpowers/specs/2026-06-10-learning-baseline.md`).
     #[serde(default = "default_vision_width", alias = "vision_w")]
     pub vision_width: u32,
-    /// Visual field height in pixels. Default 6.
+    /// Visual field height in pixels. Default 6. See `vision_width` for the
+    /// odd-grid range-visibility note.
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.

@@ -416,7 +416,7 @@ pub struct Agent {
 }
 ```
 
-The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` / `history_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation, evolution mutation, and JSON serialization.
+The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation, evolution mutation, and JSON serialization.
 
 **Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 

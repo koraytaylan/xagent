@@ -30,6 +30,10 @@ var<workgroup> s_recall_similarity: array<f32, RECALL_K>;
 var<workgroup> s_prediction: array<f32, PREDICTOR_DIMENSION>;
 var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_pred_error: f32;
+var<workgroup> s_td_error: f32;
+// Exploration noise terms [forward, turn] published by thread 0's motor
+// block for the parallel eligibility-trace update.
+var<workgroup> s_explore: array<f32, 2>;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -285,7 +289,6 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 fn coop_predict_and_act(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let pattern_base = agent_id * PATTERN_STRIDE;
-    let history_base = agent_id * HISTORY_STRIDE;
     let decision_base = agent_id * DECISION_STRIDE;
     let tick_count = brain_state[brain_base + O_TICK_COUNT];
     let recall_count = u32(s_recall[RECALL_K]);
@@ -362,68 +365,67 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     }
     workgroupBarrier();
 
-    // ── Credit assignment: cooperative across threads 0..31 ────────────
-    // Thread 0 computes per-entry credit scalars → s_similarities[0..N].
-    // Threads 0..31 then apply all credits to their dimension in
-    // parallel, eliminating the serial ENCODED_DIMENSION-loop bottleneck that was
-    // blocking 255 threads at the barrier while thread 0 looped over
-    // 64 entries × 32 dimensions.
+    // ── TD(λ) credit: value head + eligibility traces ───────────────────
+    // The critic estimates the discounted homeostatic return from the
+    // current encoded state. The TD error δ for the previous transition is
+    // the single credit signal: it updates the critic, both policy
+    // channels, and the encoder-credit vector through the per-dimension
+    // eligibility traces — no deadzone, no tonic fallback, no history ring.
     {
-        let gradient = s_homeo[0u];
-        let urgency = s_homeo[2u];
-        let hist_len = u32(history_buffer[history_base + O_HIST_LEN]);
-
-        // Phase 1: thread 0 computes credit scalar for each history entry
-        if (tid == 0u) {
-            for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
-                let h_off = i * 5u;
-                let recorded_forward = history_buffer[history_base + O_MOTOR_RING + h_off];
-                let recorded_turn = history_buffer[history_base + O_MOTOR_RING + h_off + 1u];
-                let rec_tick = history_buffer[history_base + O_MOTOR_RING + h_off + 2u];
-                let rec_grad = history_buffer[history_base + O_MOTOR_RING + h_off + 3u];
-                let age = tick_count - rec_tick;
-                let temporal = exp(-age * CREDIT_DECAY);
-                var credit: f32 = 0.0;
-                if (temporal >= 0.01) {
-                    let improvement = gradient - rec_grad;
-                    var credit_input = improvement;
-                    if (abs(improvement) < DEADZONE) {
-                        credit_input = gradient * urgency * TONIC_CREDIT_SCALE;
-                    }
-                    if (abs(credit_input) >= CREDIT_EPSILON) {
-                        var effective: f32;
-                        if (credit_input < 0.0) { effective = credit_input * PAIN_AMP; }
-                        else { effective = credit_input; }
-                        credit = effective * temporal;
-                        brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * credit * recorded_forward * 0.1;
-                        brain_state[brain_base + O_ACT_BIASES + 1u] += ACTION_WEIGHT_LEARNING_RATE * credit * recorded_turn * 0.1;
-                    }
-                }
-                s_similarities[i] = credit;
-                // Cache motor values in shared memory so phase 2 threads
-                // read from workgroup memory instead of storage.
-                shared_sort_indices[i * 2u] = bitcast<u32>(recorded_forward);
-                shared_sort_indices[i * 2u + 1u] = bitcast<u32>(recorded_turn);
-            }
+        // Value partial products: threads 0..ENCODED_DIMENSION. Reuses
+        // s_credit as ENCODED_DIMENSION-sized scratch — it is rewritten
+        // with the encoder-credit values later in this block, after the
+        // reduction below has consumed these partials.
+        if (tid < ENCODED_DIMENSION) {
+            s_credit[tid] =
+                brain_state[brain_base + O_VALUE_WEIGHTS + tid] * s_encoded[tid];
         }
         workgroupBarrier();
 
-        // Phase 2: threads 0..31 apply all credits to their dimension
-        if (tid < ENCODED_DIMENSION) {
-            s_credit[tid] = 0.0;
-            for (var i: u32 = 0u; i < hist_len; i = i + 1u) {
-                let credit = s_similarities[i];
-                if (abs(credit) > 0.0) {
-                    let recorded_forward = bitcast<f32>(shared_sort_indices[i * 2u]);
-                    let recorded_turn = bitcast<f32>(shared_sort_indices[i * 2u + 1u]);
-                    let feat = history_buffer[history_base + O_STATE_RING + i * ENCODED_DIMENSION + tid];
-                    let forward_weight_update = ACTION_WEIGHT_LEARNING_RATE * credit * recorded_forward * feat;
-                    let turn_weight_update = ACTION_WEIGHT_LEARNING_RATE * credit * recorded_turn * feat;
-                    brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] += forward_weight_update;
-                    brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] += turn_weight_update;
-                    s_credit[tid] += credit * recorded_forward * feat + credit * recorded_turn * feat;
-                }
+        // Thread 0: reduce value, form δ, update the scalar biases.
+        if (tid == 0u) {
+            var value: f32 = brain_state[brain_base + O_VALUE_BIAS];
+            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
+                value += s_credit[d];
             }
+            // Reward is the immediate urgency-amplified homeostatic delta
+            // accrued since the previous brain tick.
+            let reward = s_homeo[1u];
+            let prev_value = brain_state[brain_base + O_PREV_VALUE];
+            let td_error = clamp(
+                reward + TD_DISCOUNT * value - prev_value,
+                -MAX_TD_ERROR, MAX_TD_ERROR,
+            );
+            brain_state[brain_base + O_PREV_VALUE] = value;
+            s_td_error = td_error;
+
+            let critic_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
+            let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
+            let turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
+            brain_state[brain_base + O_VALUE_BIAS] +=
+                CRITIC_LEARNING_RATE * td_error * critic_bias_trace;
+            brain_state[brain_base + O_ACT_BIASES] +=
+                ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
+            brain_state[brain_base + O_ACT_BIASES + 1u] +=
+                ACTION_WEIGHT_LEARNING_RATE * td_error * turn_bias_trace;
+        }
+        workgroupBarrier();
+
+        // Threads 0..ENCODED_DIMENSION: apply δ through the traces.
+        if (tid < ENCODED_DIMENSION) {
+            let td_error = s_td_error;
+            let critic_trace = brain_state[brain_base + O_TRACE_CRITIC + tid];
+            let forward_trace = brain_state[brain_base + O_TRACE_FWD + tid];
+            let turn_trace = brain_state[brain_base + O_TRACE_TURN + tid];
+            brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
+                CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * td_error * critic_trace;
+            brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
+                ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * td_error * forward_trace;
+            brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] +=
+                ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * td_error * turn_trace;
+            // Encoder credit: which encoded dimensions carried the policy's
+            // eligibility when this outcome arrived.
+            s_credit[tid] = td_error * (forward_trace + turn_trace);
         }
     }
     storageBarrier(); workgroupBarrier();
@@ -434,13 +436,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         let urgency = s_homeo[2u];
         let prediction_error = s_pred_error;
 
-        // Weight decay + normalization
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + d] *= (1.0 - ACTION_WEIGHT_DECAY);
-            brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d] *= (1.0 - ACTION_WEIGHT_DECAY);
-        }
-        brain_state[brain_base + O_ACT_BIASES] *= (1.0 - ACTION_WEIGHT_DECAY);
-        brain_state[brain_base + O_ACT_BIASES + 1u] *= (1.0 - ACTION_WEIGHT_DECAY);
+        // Weight normalization. No per-tick decay: TD updates are
+        // surprise-driven (they stop when δ calibrates to zero), so decay
+        // would only erase accumulated policy knowledge — including the
+        // initial forward bias that provides exploration mobility. The
+        // L2 balls below are the sole magnitude bound.
         brain_state[brain_base + O_ACT_BIASES] = clamp(brain_state[brain_base + O_ACT_BIASES], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
         brain_state[brain_base + O_ACT_BIASES + 1u] = clamp(brain_state[brain_base + O_ACT_BIASES + 1u], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
         var fwd_norm_sq: f32 = 0.0;
@@ -465,6 +465,24 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
                 brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d] *= scale;
             }
         }
+
+        // Value head: L2-ball clamp only — no per-tick decay. Decay would
+        // continuously erase the learned value landscape, and the critic
+        // must hold "states like this end well/badly" across episodes.
+        var val_norm_sq: f32 = 0.0;
+        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
+            let vw = brain_state[brain_base + O_VALUE_WEIGHTS + d];
+            val_norm_sq += vw * vw;
+        }
+        let val_norm = sqrt(val_norm_sq);
+        if (val_norm > MAX_WEIGHT_NORM) {
+            let scale = MAX_WEIGHT_NORM / val_norm;
+            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
+                brain_state[brain_base + O_VALUE_WEIGHTS + d] *= scale;
+            }
+        }
+        brain_state[brain_base + O_VALUE_BIAS] = clamp(
+            brain_state[brain_base + O_VALUE_BIAS], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
 
         // Policy evaluation
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES];
@@ -606,26 +624,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         let klinotaxis_factor = clamp(1.0 - gradient_deviation * KLINOTAXIS_SENSITIVITY, 0.3, 3.0);
         turn *= klinotaxis_factor;
 
-        // History records the exploration noise, not the full motor.
-        // Credit × noise is the proper REINFORCE gradient: noise is zero-mean,
-        // so only noise directions that correlate with outcomes get reinforced.
-        // Using the full motor (policy + noise) creates a feedback loop where
-        // any turn bias gets reinforced by every positive credit event.
-        let exploration_forward = noise_forward * exploration_rate;
-        let exploration_turn = noise_turn * exploration_rate;
-        let hist_cursor = u32(history_buffer[history_base + O_HIST_CURSOR]);
-        let hist_off = hist_cursor * 5u;
-        history_buffer[history_base + O_MOTOR_RING + hist_off] = exploration_forward;
-        history_buffer[history_base + O_MOTOR_RING + hist_off + 1u] = exploration_turn;
-        history_buffer[history_base + O_MOTOR_RING + hist_off + 2u] = tick_count;
-        history_buffer[history_base + O_MOTOR_RING + hist_off + 3u] = gradient;
-        history_buffer[history_base + O_MOTOR_RING + hist_off + 4u] = 0.0;
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            history_buffer[history_base + O_STATE_RING + hist_cursor * ENCODED_DIMENSION + d] = s_encoded[d];
-        }
-        history_buffer[history_base + O_HIST_CURSOR] = f32((hist_cursor + 1u) % ACTION_HISTORY_LEN);
-        let hist_len_val = history_buffer[history_base + O_HIST_LEN];
-        history_buffer[history_base + O_HIST_LEN] = min(hist_len_val + 1.0, f32(ACTION_HISTORY_LEN));
+        // Publish the exploration noise terms for the eligibility-trace
+        // update below. The traces carry noise, not the full motor: noise is
+        // zero-mean, so only noise directions that correlate with TD errors
+        // get reinforced. Using the full motor (policy + noise) creates a
+        // feedback loop where any turn bias gets reinforced by every
+        // positive credit event.
+        s_explore[0u] = noise_forward * exploration_rate;
+        s_explore[1u] = noise_turn * exploration_rate;
 
         // Save prediction + tick + decision buffer
         for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
@@ -649,8 +655,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         decision_buffer[decision_base + DECISION_MOTOR] = forward;
         decision_buffer[decision_base + DECISION_MOTOR + 1u] = turn;
+        // Slot 2 is consumed by the physics phase as strafe — keep it zero.
         decision_buffer[decision_base + DECISION_MOTOR + 2u] = 0.0;
-        decision_buffer[decision_base + DECISION_MOTOR + 3u] = 0.0;
+        // Slot 3 is TD-error telemetry for CPU readback.
+        decision_buffer[decision_base + DECISION_MOTOR + 3u] = s_td_error;
 
         // Write telemetry to physics buffer for CPU readback
         let phys_base = agent_id * PHYS_STRIDE;
@@ -662,12 +670,40 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         physics_state[phys_base + P_GRADIENT_OUT] = gradient;
         physics_state[phys_base + P_URGENCY_OUT] = urgency;
     }
+    workgroupBarrier();
+
+    // ── Eligibility trace update (all dims in parallel) ─────────────────
+    // Accumulating traces: z ← γλ·z + feature term. The critic trace
+    // carries the state; the actor traces carry exploration-noise ×
+    // state — the likelihood-ratio direction of the action actually
+    // taken — so future TD errors credit exactly the noise kicks (and the
+    // states they occurred in) that caused them.
+    {
+        let trace_decay = TD_DISCOUNT * TD_LAMBDA;
+        if (tid < ENCODED_DIMENSION) {
+            let enc = s_encoded[tid];
+            brain_state[brain_base + O_TRACE_CRITIC + tid] =
+                brain_state[brain_base + O_TRACE_CRITIC + tid] * trace_decay + enc;
+            brain_state[brain_base + O_TRACE_FWD + tid] =
+                brain_state[brain_base + O_TRACE_FWD + tid] * trace_decay + s_explore[0u] * enc;
+            brain_state[brain_base + O_TRACE_TURN + tid] =
+                brain_state[brain_base + O_TRACE_TURN + tid] * trace_decay + s_explore[1u] * enc;
+        }
+        if (tid == 0u) {
+            brain_state[brain_base + O_TRACE_BIASES] =
+                brain_state[brain_base + O_TRACE_BIASES] * trace_decay + 1.0;
+            brain_state[brain_base + O_TRACE_BIASES + 1u] =
+                brain_state[brain_base + O_TRACE_BIASES + 1u] * trace_decay + s_explore[0u];
+            brain_state[brain_base + O_TRACE_BIASES + 2u] =
+                brain_state[brain_base + O_TRACE_BIASES + 2u] * trace_decay + s_explore[1u];
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 7: Learn and store
-// Predictor: threads 0..31; Encoder: threads 0..31;
-// Memory reinforcement: threads 0..127; Decay: threads 0..127
+// Predictor: threads 0..PREDICTOR_DIMENSION; Encoder credit: one encoded dim
+// per thread; Memory reinforcement / decay: threads 0..MEMORY_CAP.
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_learn_and_store(agent_id: u32, tid: u32) {
@@ -705,7 +741,9 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
         brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] = clamp(brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
 
-    // ── 7b. Encoder credit: threads 0..31 ──────────────────────────────
+    // ── 7b. Encoder credit: one encoded dimension per thread ────────────
+    // Task-driven nudge: features that co-occurred with TD-error eligibility
+    // get their weights into this dimension strengthened.
     if (tid < ENCODED_DIMENSION) {
         let action_credit = decision_buffer[decision_base + DECISION_CREDIT + tid];
         if (abs(action_credit) >= CREDIT_EPSILON) {

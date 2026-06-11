@@ -109,9 +109,16 @@ fn phase_death_respawn(tid: u32, tick: u32) {
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
     }
 
-    // Zero action history
-    let hist_base = tid * HISTORY_STRIDE;
-    for (var i = 0u; i < HISTORY_STRIDE; i++) {
-        history_buffer[hist_base + i] = 0.0;
+    // Reset TD transients: eligibility traces and the previous-state value
+    // are episodic — credit must never leak across the death boundary.
+    // The value weights themselves are learned knowledge and survive.
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        brain_state[brain_base + O_TRACE_CRITIC + i] = 0.0;
+        brain_state[brain_base + O_TRACE_FWD + i] = 0.0;
+        brain_state[brain_base + O_TRACE_TURN + i] = 0.0;
     }
+    brain_state[brain_base + O_TRACE_BIASES] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
+    brain_state[brain_base + O_PREV_VALUE] = 0.0;
 }

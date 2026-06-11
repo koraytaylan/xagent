@@ -298,7 +298,9 @@ const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
 const MAX_TD_ERROR: f32 = 1.0;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Buffer bindings — 14 storage + 2 uniform, single bind group
+// Buffer bindings — 13 storage + 2 uniform, single bind group
+// (binding 13 is intentionally unused; the numbering of the remaining
+// bindings is stable so the bind-group layout in gpu_kernel.rs stays aligned)
 // ═══════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)  var<storage, read_write> physics_state:        array<f32>;

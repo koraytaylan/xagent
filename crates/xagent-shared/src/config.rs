@@ -70,10 +70,15 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
-    /// Visual field width in pixels. Default 8.
+    /// Visual field width in pixels. Default 17 — an odd count puts one ray
+    /// column straight ahead, pairing with the horizon row for distal food
+    /// detection.
     #[serde(default = "default_vision_width", alias = "vision_w")]
     pub vision_width: u32,
-    /// Visual field height in pixels. Default 6.
+    /// Visual field height in pixels. Default 13 — an odd count puts one ray
+    /// row exactly on the horizon, which tracks ground-level food at any
+    /// distance (the vertical ray gap, not horizontal acuity, is what bounds
+    /// ground-food visibility).
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
@@ -144,11 +149,11 @@ fn default_fatigue_floor() -> f32 {
 }
 
 fn default_vision_width() -> u32 {
-    8
+    17
 }
 
 fn default_vision_height() -> u32 {
-    6
+    13
 }
 
 fn default_seed() -> u64 {
@@ -462,8 +467,10 @@ mod tests {
         let config = BrainConfig::default();
         assert_eq!(config.brain_tick_stride, 10);
         assert_eq!(config.vision_stride, 10);
-        assert_eq!(config.vision_width, 8);
-        assert_eq!(config.vision_height, 6);
+        // Odd × odd grid: one horizon-grazing ray row plus one straight-ahead
+        // column, which is what bounds ground-food visibility at range.
+        assert_eq!(config.vision_width, 17);
+        assert_eq!(config.vision_height, 13);
         assert!((config.metabolic_rate - 0.5).abs() < 1e-6);
         assert!((config.integrity_scale - 0.5).abs() < 1e-6);
         assert!((config.movement_speed - 20.0).abs() < 1e-6);

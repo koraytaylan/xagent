@@ -5,7 +5,7 @@ All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That 
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 75 lib unit + 3 bin unit + 50 integration tests (128 total)
+- `cargo test -p xagent-sandbox` — runs 75 lib unit + 3 bin unit + 51 integration tests (129 total)
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence

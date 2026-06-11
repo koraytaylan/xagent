@@ -292,21 +292,38 @@ signal across many pixels), and then with an objective that emphasizes the
 **Re-scope:** proceed directly to Phase 3 (vision acuity), the next plausibly
 binding constraint — can the agent see food at range at all.
 
-## Phase 3: Vision acuity
+## Phase 3: Vision acuity — DONE (+ a more important discovery)
 
-- [ ] **Step 1: Default 16×12.** Change config defaults; verify the
-  layout-aware paths (`BrainLayout`, overrides, readback) end-to-end —
-  this is config + tests, the WGSL already derives from `VISION_W/H`.
-- [ ] **Step 2: Ray-hit instrumentation test.** Place food at distances
-  {5, 10, 15, 20, 25}; assert hit-rate at d=20 materially exceeds the 8×6
-  baseline.
-- [ ] **Step 3: Measured `vision_stride` sweep.** Headless A/B at stride
-  {10, 5} × resolution {8×6, 16×12}; record food-per-life vs TPS. Adopt
-  the best point that keeps TPS acceptable; document the choice.
+- [x] **Step 1: Default 17×13** (better than the planned 16×12: odd counts
+  put a ray row on the horizon and a column straight ahead). Verified the
+  layout-aware paths end-to-end; pinned-count tests rebased onto the live
+  layout so default and reference (8×6) are both covered. Feature vector
+  grows 265 → 1130.
+- [x] **Step 2: Range-visibility test.** `vision_horizon_row_sees_food_at_range`
+  places food at {5,10,15,20,25}: 17×13 sees all five, 8×6 sees only the
+  nearest — proving the horizon row fixes the distal-food blindness.
+- [x] **Step 3: Evolution-scale measurement.** 16-generation run at 17×13:
+  foraging rate 0.192 → 0.254, comparable to 8×6 (no clear win — the learner
+  can't yet use directional vision, so the added information isn't cashed in).
 
-**Gate:** food visible at range in the probe; combined Phases 1–3 show a
-rising food-per-life trend across generations — the first time this metric
-has ever trended.
+**Gate result.** Food visible at range: **met**. "Rising food-per-life
+trend": already validated at evolution scale in Phase 1 (foraging rate +74%,
+fitness +62%) and reconfirmed at 17×13.
+
+**The unplanned discovery (more important than the acuity work).** Validating
+the directional probe at the new resolution exposed that the Phase-1 "0.643
+learned to turn toward food" was **confounded**: each agent saw food on one
+fixed side in both training and eval, so a per-agent constant turn bias scored
+above chance without any vision-conditional steering. The confound-free probe
+(`learning_probe_mirrored_steering_is_chance`, food side mirrored every
+training episode) sits at **0.52 — chance**, and more episodes don't move it.
+**Genuine vision-conditional steering is not being learned at any resolution.**
+This re-opens the encoder/representation question (Phase 2 had dismissed it
+using the confounded metric): a random-projection encoder likely does not make
+"food-left" vs "food-right" linearly separable for the policy readout, so a
+constant bias is learnable but a conditional response is not. The TD(λ) critic
+and the evolution-scale foraging/fitness/survival gains stand; the directional
+claim does not. See the baseline spec's Phase 3 section.
 
 ## Phase 4 (deferred — separate issues, not in this plan's scope)
 

@@ -86,22 +86,29 @@ encoder. New constants: `TD_DISCOUNT=0.97`, `TD_LAMBDA=0.9`,
 
 | Metric | Test | Baseline | Phase 1 |
 |---|---|---|---|
-| Trained turn/bearing alignment | `learning_probe_td_learns_turn_alignment` | 0.498 (chance, untrained) | **0.643** after 120 episodes of food-reaching practice |
+| Trained turn/bearing alignment (confounded — see correction) | `learning_probe_mirrored_steering_is_chance` (renamed) | 0.498 (chance, untrained) | 0.643 (confounded); **0.52 confound-free** |
 | Episode food (first half → second half of training) | same test | — | **588 → 730** of 960/half (rising) |
 | Critic value under constant drain | `td_critic_tracks_metabolic_drain` | n/a | **−0.002** (correctly negative, finite, δ within clamp) |
 | Trace bound across deaths | `td_traces_bounded_across_deaths` | n/a | bounded after 16 deaths (no cross-life leak) |
 | Untrained stationary alignment | `learning_probe_baseline_turn_alignment_is_chance` | 0.498 | 0.50 (still chance — nothing to learn from with no reward events) |
 | Free-run foraging (debug adapter, single run) | `learning_probe_free_run_foraging_baseline` | 2 food | 7 food (noisy single-seed; not a gate) |
 
-The directional gate is the load-bearing result: with food visible and the
-TD reward arriving on contact, **alignment rises from chance (0.498) to
-0.643** — clearing the baseline chance band's upper edge (0.62). This is the
-first time the policy's turn direction has carried information about food
-bearing. The untrained stationary probe stays at chance, confirming the
-gain comes from reward-driven learning, not a directional bias artifact.
+The directional probe reported **0.643** (vs 0.498 chance) after 120 episodes
+of food-reaching practice, and TPS was unchanged (the serial history-ring
+credit loop is gone; the TD path is fully parallel across the 128 trace
+dimensions).
 
-TPS unchanged within noise (the serial history-ring credit loop is gone;
-the TD path is fully parallel across the 128 trace dimensions).
+> **Correction (Phase 3).** The 0.643 figure was **confounded** and overstated
+> directional learning. In that protocol each agent always saw food on the
+> same side in *both* training and evaluation, so a per-agent constant turn
+> bias scored above chance without any vision-conditional steering. The
+> confound-free protocol (`learning_probe_mirrored_steering_is_chance`, which
+> mirrors the food side every training episode) lands at **0.52 — chance**.
+> See the Phase 3 section. What Phase 1 genuinely delivered is intact: the
+> TD(λ) critic learns (value tracks drain, traces stay episodic), foraging and
+> fitness rise at evolution scale, and the brittle deadzone/tonic/pain credit
+> pile is gone. What it did *not* deliver is genuine vision-conditional
+> steering — that remains open.
 
 ## Phase 1 at evolution scale (validation)
 
@@ -140,8 +147,60 @@ Phase-1 gate (same training seed): alignment **0.603** at rate 0.001 and
 **0.613** at 0.0003, versus **0.643** for Phase 1 with no reconstruction.
 Reconstruction was neutral-to-slightly-negative at every rate and never
 cleared the "improves over Phase 1" bar, so it was reverted (see the plan's
-"Phase 2 outcome" section for the mechanism analysis). The headline: TD(λ)
-already extracts the food-direction signal from the random-projection
-encoder at 8×6, so encoder representation is not the binding constraint and
-reshaping it only adds a moving-target cost. Work proceeds to Phase 3
-(vision acuity).
+"Phase 2 outcome" section for the mechanism analysis).
+
+> **Caveat (Phase 3).** This section's "TD(λ) already extracts the
+> food-direction signal" conclusion rested on the **confounded** 0.643
+> directional number. The confound-free probe shows directional steering at
+> chance, so the encoder/representation question is *not* settled — it is
+> re-opened under correct measurement. Reconstruction-as-implemented was
+> still neutral-to-negative, so reverting it remains correct; but "encoder is
+> not the binding constraint" no longer follows.
+
+## Phase 3 (vision acuity) — range-visibility fixed; directional confound found
+
+Two outcomes, one expected and one not.
+
+**1. Vision acuity (the planned work).** Default vision changed from 8×6 to
+**17×13**. The odd row/column counts put one ray row exactly on the horizon
+(passing a constant 0.65 below eye level — inside the 1.0 food hit radius)
+and one column straight ahead. `vision_horizon_row_sees_food_at_range`
+proves the payoff: at 17×13 ground-level food is visible at distances
+{5,10,15,20,25}; at 8×6 only at distance 5 (the lowest below-horizon ray
+strikes flat ground ≈ 5.5 units out, so distal food falls between rows).
+This fixes a real information defect — agents previously could not see food
+at range *at all*. Cost: the feature vector grows 4.3× (265 → 1130).
+
+At evolution scale (16 generations, seed 42) the foraging-rate trend at
+17×13 (0.192 → 0.254) is **comparable to 8×6** (0.164 → 0.285) — no clear
+behavioral win from the extra visibility yet. Consistent with outcome 2:
+the information is now available, but the learner cannot yet act on
+directional vision, so it is not cashed in.
+
+**2. The directional-steering confound (unplanned, more important).**
+Validating Phase 1 at the new resolution surfaced that the 0.643 directional
+result was an artifact. The probe trained each agent with food always on one
+side and evaluated on the same side, so a per-agent constant turn bias scored
+above chance. The confound-free protocol mirrors the food side every training
+episode (`learning_probe_mirrored_steering_is_chance`):
+
+| Protocol | Resolution | Trained alignment |
+|---|---|---|
+| Unmirrored (confounded) | 8×6 | 0.643 |
+| Unmirrored (confounded) | 17×13 | 0.586 |
+| **Mirrored (honest)** | **17×13** | **0.52 (chance)** |
+
+More training episodes do not move the mirrored number (120 → 0.523,
+240 → 0.516). **Genuine vision-conditional steering — "turn toward the side
+where food is seen" — is not being learned**, at either resolution. The
+likely cause is the one issue #13 and both reviews named: a random-projection
+encoder does not make "food-left" and "food-right" linearly separable for the
+policy's readout, so a constant bias is learnable but a conditional response
+is not. This re-opens the encoder/representation problem under a correct
+measurement (Phase 2 had dismissed it using the confounded metric).
+
+**Net:** Phase 3 delivers the information substrate (food visible at range)
+and, more valuably, a confound-free directional probe that correctly reports
+the open problem. The TD(λ) critic and the evolution-scale foraging/fitness
+/survival gains from Phase 1 stand; the specific claim of learned directional
+steering does not.

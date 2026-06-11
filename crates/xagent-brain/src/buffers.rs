@@ -22,10 +22,12 @@ static REPR_DIM_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub const ENCODED_DIMENSION: usize = 128;
 pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
-/// Feature count for the default 8×6 vision layout.
-/// Used to compute default brain state offsets (`O_ENC_BIASES`),
-/// `FEATURES_STRIDE`, and `FIXED_TAIL_SIZE`.
-/// For other vision dimensions, use `BrainLayout::feature_count`.
+/// Feature count for the reference 8×6 vision layout that anchors the
+/// static `O_*` offset constants below. The runtime default layout is
+/// `BrainLayout::default()` (which follows `BrainConfig::default()`); use
+/// `BrainLayout::feature_count` for any live layout. The static constants
+/// remain valid as tail *deltas* (`O_X - O_PREDICTOR_CONTEXT_WEIGHT`) for
+/// every layout, because the tail is vision-independent.
 const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25;
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
@@ -40,9 +42,9 @@ pub const TOUCH_FEATURES: usize = 4; // dir_x, dir_z, intensity, tag/4
 /// velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16)
 pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTACTS * TOUCH_FEATURES;
 
-// ── Brain state buffer offsets (default 8×6 layout) ──────────────────
-// These constants are valid for the default vision dimensions (8×6).
-// For other dimensions, use `BrainLayout` to compute dynamic offsets.
+// ── Brain state buffer offsets (reference 8×6 layout) ─────────────────
+// Absolute values are valid only for an 8×6 vision grid; for live layouts
+// use `BrainLayout` to compute dynamic offsets.
 // The *tail* offsets (from `O_PREDICTOR_CONTEXT_WEIGHT` onward) are vision-independent:
 // `O_FOO - O_PREDICTOR_CONTEXT_WEIGHT` is the same regardless of vision size.
 
@@ -212,8 +214,10 @@ impl BrainLayout {
 }
 
 impl Default for BrainLayout {
+    /// Follows `BrainConfig::default()` so the two defaults can never drift.
     fn default() -> Self {
-        Self::new(8, 6)
+        let config = BrainConfig::default();
+        Self::new(config.vision_width, config.vision_height)
     }
 }
 
@@ -571,11 +575,21 @@ mod tests {
     #[test]
     fn default_layout_sensory_and_feature_counts() {
         let layout = BrainLayout::default();
-        // Default 8x6: 192 color + 48 depth + 27 non-visual = 267 sensory
-        assert_eq!(layout.sensory_stride, 267);
+        // Default 17×13: 884 color + 221 depth + 27 non-visual = 1132 sensory
+        assert_eq!(layout.sensory_stride, 1132);
         // Feature count excludes 2 non-visual fields (energy_delta, integrity_delta)
-        assert_eq!(layout.feature_count, 265);
+        assert_eq!(layout.feature_count, 1130);
         assert!(layout.sensory_stride >= layout.feature_count);
+    }
+
+    #[test]
+    fn reference_8x6_layout_counts() {
+        let layout = BrainLayout::new(8, 6);
+        // 8×6: 192 color + 48 depth + 27 non-visual = 267 sensory
+        assert_eq!(layout.sensory_stride, 267);
+        assert_eq!(layout.feature_count, 265);
+        // The static offset constants anchor to this reference layout.
+        assert_eq!(layout.brain_stride, BRAIN_STRIDE);
     }
 
     #[test]
@@ -622,13 +636,14 @@ mod tests {
     #[test]
     fn brain_layout_default_values() {
         let layout = BrainLayout::default();
-        assert_eq!(layout.vision_width, 8);
-        assert_eq!(layout.vision_height, 6);
-        assert_eq!(layout.vision_color_count, 192);
-        assert_eq!(layout.vision_depth_count, 48);
-        assert_eq!(layout.sensory_stride, 267);
-        assert_eq!(layout.feature_count, 265);
-        assert_eq!(layout.brain_stride, BRAIN_STRIDE);
+        let config = xagent_shared::BrainConfig::default();
+        assert_eq!(layout.vision_width, config.vision_width);
+        assert_eq!(layout.vision_height, config.vision_height);
+        let pixels = (config.vision_width * config.vision_height) as usize;
+        assert_eq!(layout.vision_color_count, pixels * 4);
+        assert_eq!(layout.vision_depth_count, pixels);
+        assert_eq!(layout.sensory_stride, pixels * 5 + NON_VISUAL_COUNT);
+        assert_eq!(layout.feature_count, pixels * 5 + 25);
     }
 
     #[test]

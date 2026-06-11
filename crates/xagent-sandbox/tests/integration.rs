@@ -1703,18 +1703,19 @@ const PROBE_GRID_SIDE: usize = 4;
 /// Spacing between probe agents. Greater than 2× the vision range (30) so
 /// no probe agent can ever see another agent or another agent's food item.
 const PROBE_AGENT_SPACING: f32 = 64.0;
-/// Horizontal agent→food distance. The lowest below-horizon vision ray row
-/// (vertical slope ≈ 0.18 on the default 8×6 grid) passes within the food
-/// hit radius (1.0) at this range before the ray strikes flat ground
-/// (≈ 5.5 units out), while staying beyond both the touch range (3.0) and
-/// the food consume radius (2.0) so a stationary agent neither touches nor
-/// eats its probe target.
+/// Horizontal agent→food distance. Comfortably inside the default
+/// 17×13 grid's full-bearing visibility band (the horizon ray row passes a
+/// constant 0.65 below eye level — within the 1.0 food hit radius — and at
+/// this range the per-column capture cones overlap, so any bearing inside
+/// the FOV sees the food), while staying beyond both the touch range (3.0)
+/// and the food consume radius (2.0) so a stationary agent neither touches
+/// nor eats its probe target.
 const PROBE_FOOD_DISTANCE: f32 = 5.0;
 /// Food bearing magnitude relative to the agent's initial facing.
-/// atan(3/7) aligns the food exactly with a ray column of the default
-/// 8-column vision grid (column offset u = ±3/7 at 45° half-FOV), which
+/// atan(3/8) aligns the food exactly with a ray column of the default
+/// 17-column vision grid (column offset u = ±3/8 at 45° half-FOV), which
 /// maximizes ray-hit reliability at the probe distance.
-const PROBE_FOOD_BEARING: f32 = 0.404_891_6;
+const PROBE_FOOD_BEARING: f32 = 0.358_770_67;
 /// Food rest height above flat terrain (matches the kernel's
 /// FOOD_HEIGHT_OFFSET).
 const PROBE_FOOD_Y: f32 = 0.35;
@@ -1746,6 +1747,11 @@ struct ProbeArena {
     kernel: xagent_brain::GpuKernel,
     agent_pos: Vec<glam::Vec3>,
     food_pos: Vec<(f32, f32, f32)>,
+    /// `food_pos` with every bearing sign flipped. Episodic training
+    /// alternates between the two layouts so a constant per-agent turn
+    /// bias earns nothing on average — only vision-conditional turning
+    /// pays off.
+    mirrored_food_pos: Vec<(f32, f32, f32)>,
     heights: Vec<f32>,
     biomes: Vec<u32>,
     agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
@@ -1754,15 +1760,26 @@ struct ProbeArena {
 impl ProbeArena {
     /// Reset every agent body to its spawn pose (full energy, facing +Z)
     /// and restore all food items, without touching learned brain state.
-    fn reset_bodies(&mut self) {
+    /// `mirror_food` selects the bearing-flipped food layout.
+    fn reset_bodies_with(&mut self, mirror_food: bool) {
+        let food = if mirror_food {
+            &self.mirrored_food_pos
+        } else {
+            &self.food_pos
+        };
         self.kernel.upload_world(
             &self.heights,
             &self.biomes,
-            &self.food_pos,
+            food,
             &vec![false; PROBE_AGENT_COUNT],
             &vec![0.0; PROBE_AGENT_COUNT],
         );
         self.kernel.upload_agents(&self.agent_data);
+    }
+
+    /// Reset with the canonical (unmirrored) food layout.
+    fn reset_bodies(&mut self) {
+        self.reset_bodies_with(false);
     }
 }
 
@@ -1787,6 +1804,7 @@ fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
 
     let mut agent_pos = Vec::with_capacity(PROBE_AGENT_COUNT);
     let mut food_pos = Vec::with_capacity(PROBE_AGENT_COUNT);
+    let mut mirrored_food_pos = Vec::with_capacity(PROBE_AGENT_COUNT);
     let grid_center = (PROBE_GRID_SIDE - 1) as f32 / 2.0;
     for ix in 0..PROBE_GRID_SIDE {
         for iz in 0..PROBE_GRID_SIDE {
@@ -1801,6 +1819,11 @@ fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
             };
             food_pos.push((
                 x + bearing.sin() * PROBE_FOOD_DISTANCE,
+                PROBE_FOOD_Y,
+                z + bearing.cos() * PROBE_FOOD_DISTANCE,
+            ));
+            mirrored_food_pos.push((
+                x - bearing.sin() * PROBE_FOOD_DISTANCE,
                 PROBE_FOOD_Y,
                 z + bearing.cos() * PROBE_FOOD_DISTANCE,
             ));
@@ -1823,6 +1846,7 @@ fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
         kernel,
         agent_pos,
         food_pos,
+        mirrored_food_pos,
         heights,
         biomes,
         agent_data,
@@ -2023,14 +2047,129 @@ fn learning_probe_free_run_foraging_baseline() {
     );
 }
 
-/// Phase-1 gate: episodic food-reaching practice must teach the policy to
-/// turn toward food. Agents repeatedly start from the same pose with food
-/// at a fixed bearing; eating produces the energy reward that TD(λ) credit
-/// propagates back through the eligibility traces to the approach turns.
-/// After training, a stationary evaluation (same metric as the baseline
-/// probe) must score above the chance band's upper edge.
+/// Vision-acuity check: the default 17×13 grid has a horizon-grazing ray
+/// row (odd row count) that passes a constant 0.65 below eye level —
+/// inside the 1.0 food hit radius — so ground-level food straight ahead is
+/// visible at every probed distance out to near the 30-unit vision range.
+/// The 8×6 control documents what the upgrade buys: its lowest
+/// below-horizon row strikes flat ground ≈ 5.5 units out, so food at 20 is
+/// geometrically invisible regardless of bearing.
 #[test]
-fn learning_probe_td_learns_turn_alignment() {
+fn vision_horizon_row_sees_food_at_range() {
+    use xagent_brain::buffers::PHYS_STRIDE;
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Probed agent→food distances (one agent per distance). 25 stays
+    /// inside the 30-unit ray-march range with sampling slack.
+    const PROBE_DISTANCES: [f32; 5] = [5.0, 10.0, 15.0, 20.0, 25.0];
+    /// Row spacing for the five probe agents: exactly 2× the vision range
+    /// (mutual invisibility) while keeping the outermost agents at x = ±120,
+    /// inside the ±128 world bound — an agent clamped at the boundary would
+    /// slide off its food's ray column.
+    const RANGE_PROBE_SPACING: f32 = 60.0;
+
+    // One agent per distance, on the same spaced grid as the learning
+    // probes, each with one food item straight ahead (+Z) on flat ground.
+    let build = |brain: &BrainConfig| -> (GpuKernel, Vec<usize>) {
+        let world_config = WorldConfig {
+            seed: 1,
+            ..Default::default()
+        };
+        let count = PROBE_DISTANCES.len();
+        let mut kernel = GpuKernel::new(count as u32, count, brain, &world_config);
+        kernel.reset_agents_seeded(brain, 29);
+        let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+        let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+        let mut agent_data = Vec::with_capacity(count);
+        let mut food_pos = Vec::with_capacity(count);
+        for (i, &dist) in PROBE_DISTANCES.iter().enumerate() {
+            let x = (i as f32 - (count - 1) as f32 / 2.0) * RANGE_PROBE_SPACING;
+            agent_data.push((
+                glam::Vec3::new(x, PROBE_AGENT_Y, 0.0),
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            ));
+            food_pos.push((x, PROBE_FOOD_Y, dist));
+        }
+        kernel.upload_world(
+            &heights,
+            &biomes,
+            &food_pos,
+            &vec![false; count],
+            &vec![0.0; count],
+        );
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_batch(0, 1);
+        let mut seen = Vec::new();
+        let state_alive: Vec<f32> = kernel.read_full_state_blocking().to_vec();
+        for i in 0..count {
+            assert!(
+                state_alive[i * PHYS_STRIDE + xagent_brain::buffers::P_ALIVE] > 0.5,
+                "probe agent {i} died during the single vision tick"
+            );
+            let telemetry = kernel.read_agent_telemetry_blocking(i as u32);
+            if count_food_pixels(&telemetry.vision_color) > 0 {
+                seen.push(i);
+            }
+        }
+        (kernel, seen)
+    };
+
+    // Default grid (17×13): every distance must be visible.
+    let default_brain = probe_brain_config();
+    let (_, seen_default) = build(&default_brain);
+    assert_eq!(
+        seen_default,
+        (0..PROBE_DISTANCES.len()).collect::<Vec<_>>(),
+        "default grid: food must be visible at every probed distance \
+         {PROBE_DISTANCES:?} (missing indices = blind distances)"
+    );
+
+    // 8×6 control: distal food must be geometrically invisible. If this
+    // ever starts passing, the control no longer documents the contrast.
+    let legacy_brain = BrainConfig {
+        vision_width: 8,
+        vision_height: 6,
+        ..probe_brain_config()
+    };
+    let (_, seen_legacy) = build(&legacy_brain);
+    assert!(
+        !seen_legacy.contains(&3),
+        "8×6 control: food at distance 20 should be invisible (vertical ray \
+         gap), but was seen — the control premise broke"
+    );
+    eprintln!(
+        "vision range probe: 17×13 sees {:?}, 8×6 sees {:?} (indices into {PROBE_DISTANCES:?})",
+        seen_default, seen_legacy
+    );
+}
+
+/// Honest directional probe (confound-free protocol).
+///
+/// Each training episode mirrors the food side, so a constant per-agent
+/// turn bias earns nothing on average — only genuinely vision-conditional
+/// turning ("turn toward where the food is seen") is rewarded. After
+/// training, the stationary alignment evaluation currently lands at chance:
+/// TD(λ) credit through the random-projection encoder does **not** yet
+/// teach vision-conditional steering. This test pins that honest baseline
+/// (same falsifiable pattern as `learning_probe_baseline_turn_alignment_is_chance`):
+/// a representation/credit change that finally produces directional
+/// steering will push the rate out of the chance band and trip this test,
+/// which is the signal to re-pin it upward.
+///
+/// (An earlier version mirrored nothing and reported ~0.64 "learning"; that
+/// number was inflated by per-agent side-consistency — each agent always
+/// saw food on one side in both training and eval — not by directional
+/// learning. See docs/superpowers/specs/2026-06-10-learning-baseline.md.)
+#[test]
+fn learning_probe_mirrored_steering_is_chance() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_FOOD_COUNT};
 
     if !xagent_brain::GpuKernel::is_available() {
@@ -2038,8 +2177,7 @@ fn learning_probe_td_learns_turn_alignment() {
         return;
     }
 
-    /// Training episodes. Each starts from the identical pose so the
-    /// food-approach experience repeats enough for value bootstrapping.
+    /// Training episodes, food side alternating each episode.
     const TRAIN_EPISODES: usize = 120;
     /// Ticks per episode: at single-tick strides and default speed an agent
     /// heading roughly toward its food (5 units away) eats within ~30
@@ -2049,9 +2187,6 @@ fn learning_probe_td_learns_turn_alignment() {
     const EVAL_TICKS: usize = 60;
     /// Minimum scored evaluation samples.
     const MIN_SCORED_SAMPLES: usize = 200;
-    /// The gate: the baseline chance band tops out at 0.62; trained
-    /// alignment must clear it.
-    const GATE_RATE: f64 = 0.62;
 
     // Training config: single-tick strides (fresh vision every tick —
     // densest TD transitions) with normal movement so food is reachable.
@@ -2063,29 +2198,22 @@ fn learning_probe_td_learns_turn_alignment() {
     let mut arena = build_probe_arena(&train_brain, 17);
 
     let mut tick_cursor = 0_u64;
-    let mut food_first_half = 0.0_f32;
-    let mut food_second_half = 0.0_f32;
+    let mut food_total = 0.0_f32;
     for episode in 0..TRAIN_EPISODES {
-        arena.reset_bodies();
+        // Alternate the food side so only vision-conditional turning pays.
+        arena.reset_bodies_with(episode % 2 == 1);
         arena.kernel.dispatch_batch(tick_cursor, EPISODE_TICKS);
         tick_cursor += u64::from(EPISODE_TICKS);
-
-        // Episode food count (upload_agents zeroes P_FOOD_COUNT each reset).
         let state = arena.kernel.read_full_state_blocking();
-        let mut episode_food = 0.0_f32;
         for a in 0..PROBE_AGENT_COUNT {
-            episode_food += state[a * PHYS_STRIDE + P_FOOD_COUNT];
-        }
-        if episode < TRAIN_EPISODES / 2 {
-            food_first_half += episode_food;
-        } else {
-            food_second_half += episode_food;
+            food_total += state[a * PHYS_STRIDE + P_FOOD_COUNT];
         }
     }
-    eprintln!(
-        "learning probe TD training: food first-half={food_first_half} \
-         second-half={food_second_half} (of {} possible per half)",
-        PROBE_AGENT_COUNT * TRAIN_EPISODES / 2
+    // Sanity: agents do reach food during training (the arena works and the
+    // policy is not paralyzed) — this is foraging, not directional steering.
+    assert!(
+        food_total > 0.0,
+        "no food eaten across {TRAIN_EPISODES} training episodes — arena broke"
     );
 
     // Evaluation: pin the agents (zero movement speed) via the heritable
@@ -2101,15 +2229,21 @@ fn learning_probe_td_learns_turn_alignment() {
     let (correct, scored) = score_turn_alignment(&mut arena, tick_cursor, EVAL_TICKS);
 
     let rate = correct as f64 / scored.max(1) as f64;
-    eprintln!("learning probe TD trained: turn/bearing alignment {correct}/{scored} = {rate:.3}");
+    eprintln!(
+        "mirrored steering probe: food={food_total}, turn/bearing alignment \
+         {correct}/{scored} = {rate:.3}"
+    );
     assert!(
         scored >= MIN_SCORED_SAMPLES,
         "only {scored} scored samples — evaluation geometry broke"
     );
+    // Honest baseline: vision-conditional steering is at chance. If a future
+    // change produces real directional steering, `rate` leaves this band and
+    // this assertion fires — re-pin it then.
     assert!(
-        rate > GATE_RATE,
-        "trained turn/bearing alignment {rate:.3} did not clear the gate {GATE_RATE} — \
-         TD credit is not reaching the food-approach turns"
+        (0.38..=0.62).contains(&rate),
+        "mirrored turn/bearing alignment {rate:.3} left the chance band [0.38, 0.62] — \
+         if directional steering emerged, re-pin this baseline upward"
     );
 }
 
@@ -2170,7 +2304,8 @@ fn td_critic_tracks_metabolic_drain() {
 #[test]
 fn td_traces_bounded_across_deaths() {
     use xagent_brain::buffers::{
-        O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, PHYS_STRIDE, P_DEATH_COUNT,
+        BrainLayout, ENCODED_DIMENSION, O_PREDICTOR_CONTEXT_WEIGHT, O_TRACE_CRITIC, O_TRACE_FWD,
+        O_TRACE_TURN, PHYS_STRIDE, PREDICTOR_DIMENSION, P_DEATH_COUNT,
     };
 
     if !xagent_brain::GpuKernel::is_available() {
@@ -2207,14 +2342,21 @@ fn td_traces_bounded_across_deaths() {
         "no deaths in the all-danger arena — the death path never ran"
     );
 
+    // Trace offsets, rebased onto the live layout: the tail deltas from
+    // O_PREDICTOR_CONTEXT_WEIGHT are vision-independent.
+    let layout = BrainLayout::new(brain.vision_width, brain.vision_height);
+    let tail_base = layout.feature_count * ENCODED_DIMENSION
+        + ENCODED_DIMENSION
+        + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
     for a in 0..PROBE_AGENT_COUNT {
         let brain_state = arena.kernel.read_agent_state(a as u32).brain_state;
-        for d in 0..xagent_brain::buffers::ENCODED_DIMENSION {
-            for (name, off) in [
+        for d in 0..ENCODED_DIMENSION {
+            for (name, static_off) in [
                 ("critic", O_TRACE_CRITIC),
                 ("fwd", O_TRACE_FWD),
                 ("turn", O_TRACE_TURN),
             ] {
+                let off = tail_base + (static_off - O_PREDICTOR_CONTEXT_WEIGHT);
                 let z = brain_state[off + d];
                 assert!(
                     z.is_finite() && z.abs() <= TRACE_BOUND,

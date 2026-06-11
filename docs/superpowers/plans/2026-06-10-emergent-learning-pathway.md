@@ -294,11 +294,13 @@ binding constraint — can the agent see food at range at all.
 
 ## Phase 3: Vision acuity — DONE (+ a more important discovery)
 
-- [x] **Step 1: Default 17×13** (better than the planned 16×12: odd counts
-  put a ray row on the horizon and a column straight ahead). Verified the
-  layout-aware paths end-to-end; pinned-count tests rebased onto the live
-  layout so default and reference (8×6) are both covered. Feature vector
-  grows 265 → 1130.
+- [x] **Step 1: 17×13 odd grid** (better than the planned 16×12: odd counts
+  put a ray row on the horizon and a column straight ahead). Implemented and
+  verified end-to-end, but the **default stays 8×6** — 17×13 costs 4.3× more
+  features (265 → 1130) with no measured behavioral win and the directional
+  learner can't use it yet, so shipping it as default would be an
+  unmeasured-benefit cost increase (same discipline as the Phase-2 revert).
+  The capability and its test are kept for when directional learning lands.
 - [x] **Step 2: Range-visibility test.** `vision_horizon_row_sees_food_at_range`
   places food at {5,10,15,20,25}: 17×13 sees all five, 8×6 sees only the
   nearest — proving the horizon row fixes the distal-food blindness.

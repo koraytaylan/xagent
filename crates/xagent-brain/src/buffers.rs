@@ -575,21 +575,22 @@ mod tests {
     #[test]
     fn default_layout_sensory_and_feature_counts() {
         let layout = BrainLayout::default();
-        // Default 17×13: 884 color + 221 depth + 27 non-visual = 1132 sensory
-        assert_eq!(layout.sensory_stride, 1132);
+        // Default 8×6: 192 color + 48 depth + 27 non-visual = 267 sensory
+        assert_eq!(layout.sensory_stride, 267);
         // Feature count excludes 2 non-visual fields (energy_delta, integrity_delta)
-        assert_eq!(layout.feature_count, 1130);
+        assert_eq!(layout.feature_count, 265);
         assert!(layout.sensory_stride >= layout.feature_count);
+        // The static offset constants anchor to the default layout.
+        assert_eq!(layout.brain_stride, BRAIN_STRIDE);
     }
 
     #[test]
-    fn reference_8x6_layout_counts() {
-        let layout = BrainLayout::new(8, 6);
-        // 8×6: 192 color + 48 depth + 27 non-visual = 267 sensory
-        assert_eq!(layout.sensory_stride, 267);
-        assert_eq!(layout.feature_count, 265);
-        // The static offset constants anchor to this reference layout.
-        assert_eq!(layout.brain_stride, BRAIN_STRIDE);
+    fn odd_grid_layout_counts() {
+        // 17×13 (the range-visibility grid): 884 color + 221 depth +
+        // 27 non-visual = 1132 sensory; feature_count drops the 2 deltas.
+        let layout = BrainLayout::new(17, 13);
+        assert_eq!(layout.sensory_stride, 1132);
+        assert_eq!(layout.feature_count, 1130);
     }
 
     #[test]

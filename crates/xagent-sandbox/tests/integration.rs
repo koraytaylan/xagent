@@ -1703,19 +1703,18 @@ const PROBE_GRID_SIDE: usize = 4;
 /// Spacing between probe agents. Greater than 2× the vision range (30) so
 /// no probe agent can ever see another agent or another agent's food item.
 const PROBE_AGENT_SPACING: f32 = 64.0;
-/// Horizontal agent→food distance. Comfortably inside the default
-/// 17×13 grid's full-bearing visibility band (the horizon ray row passes a
-/// constant 0.65 below eye level — within the 1.0 food hit radius — and at
-/// this range the per-column capture cones overlap, so any bearing inside
-/// the FOV sees the food), while staying beyond both the touch range (3.0)
-/// and the food consume radius (2.0) so a stationary agent neither touches
-/// nor eats its probe target.
+/// Horizontal agent→food distance. The lowest below-horizon vision ray row
+/// (vertical slope ≈ 0.18 on the default 8×6 grid) passes within the food
+/// hit radius (1.0) at this range before the ray strikes flat ground
+/// (≈ 5.5 units out), while staying beyond both the touch range (3.0) and
+/// the food consume radius (2.0) so a stationary agent neither touches nor
+/// eats its probe target.
 const PROBE_FOOD_DISTANCE: f32 = 5.0;
 /// Food bearing magnitude relative to the agent's initial facing.
-/// atan(3/8) aligns the food exactly with a ray column of the default
-/// 17-column vision grid (column offset u = ±3/8 at 45° half-FOV), which
+/// atan(3/7) aligns the food exactly with a ray column of the default
+/// 8-column vision grid (column offset u = ±3/7 at 45° half-FOV), which
 /// maximizes ray-hit reliability at the probe distance.
-const PROBE_FOOD_BEARING: f32 = 0.358_770_67;
+const PROBE_FOOD_BEARING: f32 = 0.404_891_6;
 /// Food rest height above flat terrain (matches the kernel's
 /// FOOD_HEIGHT_OFFSET).
 const PROBE_FOOD_Y: f32 = 0.35;
@@ -2122,18 +2121,23 @@ fn vision_horizon_row_sees_food_at_range() {
         (kernel, seen)
     };
 
-    // Default grid (17×13): every distance must be visible.
-    let default_brain = probe_brain_config();
-    let (_, seen_default) = build(&default_brain);
+    // The odd-grid 17×13: a horizon ray row makes every distance visible.
+    let odd_grid = BrainConfig {
+        vision_width: 17,
+        vision_height: 13,
+        ..probe_brain_config()
+    };
+    let (_, seen_odd) = build(&odd_grid);
     assert_eq!(
-        seen_default,
+        seen_odd,
         (0..PROBE_DISTANCES.len()).collect::<Vec<_>>(),
-        "default grid: food must be visible at every probed distance \
+        "17×13: food must be visible at every probed distance \
          {PROBE_DISTANCES:?} (missing indices = blind distances)"
     );
 
-    // 8×6 control: distal food must be geometrically invisible. If this
-    // ever starts passing, the control no longer documents the contrast.
+    // 8×6 (current default): distal food must be geometrically invisible —
+    // this is the information defect the odd grid fixes. If this ever starts
+    // passing, the contrast premise broke.
     let legacy_brain = BrainConfig {
         vision_width: 8,
         vision_height: 6,
@@ -2142,12 +2146,12 @@ fn vision_horizon_row_sees_food_at_range() {
     let (_, seen_legacy) = build(&legacy_brain);
     assert!(
         !seen_legacy.contains(&3),
-        "8×6 control: food at distance 20 should be invisible (vertical ray \
+        "8×6: food at distance 20 should be invisible (vertical ray \
          gap), but was seen — the control premise broke"
     );
     eprintln!(
         "vision range probe: 17×13 sees {:?}, 8×6 sees {:?} (indices into {PROBE_DISTANCES:?})",
-        seen_default, seen_legacy
+        seen_odd, seen_legacy
     );
 }
 

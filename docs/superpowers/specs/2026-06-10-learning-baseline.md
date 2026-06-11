@@ -161,21 +161,31 @@ cleared the "improves over Phase 1" bar, so it was reverted (see the plan's
 
 Two outcomes, one expected and one not.
 
-**1. Vision acuity (the planned work).** Default vision changed from 8×6 to
-**17×13**. The odd row/column counts put one ray row exactly on the horizon
+**1. Vision acuity (the planned work).** The **17×13** odd grid was
+implemented and measured, but the **default stays 8×6** (see the decision
+below). The odd row/column counts put one ray row exactly on the horizon
 (passing a constant 0.65 below eye level — inside the 1.0 food hit radius)
 and one column straight ahead. `vision_horizon_row_sees_food_at_range`
-proves the payoff: at 17×13 ground-level food is visible at distances
-{5,10,15,20,25}; at 8×6 only at distance 5 (the lowest below-horizon ray
-strikes flat ground ≈ 5.5 units out, so distal food falls between rows).
-This fixes a real information defect — agents previously could not see food
-at range *at all*. Cost: the feature vector grows 4.3× (265 → 1130).
+proves the payoff with explicit configs: at 17×13 ground-level food is
+visible at distances {5,10,15,20,25}; at 8×6 only at distance 5 (the lowest
+below-horizon ray strikes flat ground ≈ 5.5 units out, so distal food falls
+between rows). This is a real information defect the odd grid fixes.
 
 At evolution scale (16 generations, seed 42) the foraging-rate trend at
 17×13 (0.192 → 0.254) is **comparable to 8×6** (0.164 → 0.285) — no clear
-behavioral win from the extra visibility yet. Consistent with outcome 2:
-the information is now available, but the learner cannot yet act on
-directional vision, so it is not cashed in.
+behavioral win from the extra visibility. Consistent with outcome 2: the
+information is now available, but the learner cannot act on directional
+vision, so it is not cashed in.
+
+**Decision: default reverted to 8×6.** 17×13 costs 4.3× more features
+(265 → 1130) with no measured behavioral win, and the directional learner
+cannot use the added information yet — so shipping it as the default would
+be an unmeasured-benefit cost increase (the same discipline that reverted
+Phase 2). The odd-grid capability and its range-visibility test are kept;
+17×13 becomes the default once directional steering works and can exploit
+it. The information path is *proven fixable*, which is the prerequisite the
+journey's rule #1 ("verify the information path before optimizing the
+algorithm") asks for.
 
 **2. The directional-steering confound (unplanned, more important).**
 Validating Phase 1 at the new resolution surfaced that the 0.643 directional

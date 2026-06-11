@@ -377,10 +377,18 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
     }
 
-    let history_base = agent_id * HISTORY_STRIDE;
-    for (var i = 0u; i < HISTORY_STRIDE; i++) {
-        history_buffer[history_base + i] = 0.0;
+    // Reset TD transients: eligibility traces and the previous-state value
+    // are episodic — credit must never leak across the death boundary.
+    // The value weights themselves are learned knowledge and survive.
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        brain_state[brain_base + O_TRACE_CRITIC + i] = 0.0;
+        brain_state[brain_base + O_TRACE_FWD + i] = 0.0;
+        brain_state[brain_base + O_TRACE_TURN + i] = 0.0;
     }
+    brain_state[brain_base + O_TRACE_BIASES] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
+    brain_state[brain_base + O_PREV_VALUE] = 0.0;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -489,8 +497,8 @@ fn kernel_tick(
 
         // Death/respawn: thread 0. Re-broadcasts `s_alive` because respawn may
         // flip `P_ALIVE` back to 1. `storageBarrier()` is required because
-        // respawn rewrites `physics_state`, `brain_state`, `pattern_buffer`,
-        // and `history_buffer`, all of which are read by the cooperative
+        // respawn rewrites `physics_state`, `brain_state`, and
+        // `pattern_buffer`, all of which are read by the cooperative
         // passes in `brain_tick_inner` below.
         if (tid == 0u) {
             agent_death_respawn(agent_id, base_tick);

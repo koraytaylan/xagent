@@ -1739,17 +1739,35 @@ fn probe_brain_config() -> BrainConfig {
     }
 }
 
-/// Build a flat, hazard-free arena with one food item per agent at a fixed
-/// bearing (alternating right/left per agent index). Returns the kernel,
-/// the agent spawn positions, and the food positions.
-fn build_probe_arena(
-    brain: &BrainConfig,
-    brain_seed: u64,
-) -> (
-    xagent_brain::GpuKernel,
-    Vec<glam::Vec3>,
-    Vec<(f32, f32, f32)>,
-) {
+/// Flat, hazard-free probe arena: one food item per agent at a fixed
+/// bearing (alternating right/left per agent index), with everything
+/// needed to re-pin the bodies for episodic training.
+struct ProbeArena {
+    kernel: xagent_brain::GpuKernel,
+    agent_pos: Vec<glam::Vec3>,
+    food_pos: Vec<(f32, f32, f32)>,
+    heights: Vec<f32>,
+    biomes: Vec<u32>,
+    agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
+}
+
+impl ProbeArena {
+    /// Reset every agent body to its spawn pose (full energy, facing +Z)
+    /// and restore all food items, without touching learned brain state.
+    fn reset_bodies(&mut self) {
+        self.kernel.upload_world(
+            &self.heights,
+            &self.biomes,
+            &self.food_pos,
+            &vec![false; PROBE_AGENT_COUNT],
+            &vec![0.0; PROBE_AGENT_COUNT],
+        );
+        self.kernel.upload_agents(&self.agent_data);
+    }
+}
+
+/// Build the probe arena with freshly seeded brains.
+fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
     let world_config = WorldConfig {
         seed: 1,
         ..Default::default()
@@ -1789,13 +1807,6 @@ fn build_probe_arena(
         }
     }
 
-    kernel.upload_world(
-        &heights,
-        &biomes,
-        &food_pos,
-        &vec![false; PROBE_AGENT_COUNT],
-        &vec![0.0; PROBE_AGENT_COUNT],
-    );
     let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = agent_pos
         .iter()
         .map(|&pos| {
@@ -1808,8 +1819,68 @@ fn build_probe_arena(
             )
         })
         .collect();
-    kernel.upload_agents(&agent_data);
-    (kernel, agent_pos, food_pos)
+    let mut arena = ProbeArena {
+        kernel,
+        agent_pos,
+        food_pos,
+        heights,
+        biomes,
+        agent_data,
+    };
+    arena.reset_bodies();
+    arena
+}
+
+/// Run `ticks` single-tick batches and score the sign of each turn output
+/// against the food bearing at the moment the brain's vision frame was
+/// captured (single-tick sensory lag). Assumes stationary agents (zero
+/// movement speed). Returns (correct, scored). Skips the first two ticks
+/// (no real frame yet), bearings outside the reliable vision window, and
+/// exactly-zero motor values.
+fn score_turn_alignment(arena: &mut ProbeArena, start_tick: u64, ticks: usize) -> (usize, usize) {
+    use std::f32::consts::{PI, TAU};
+    use xagent_brain::buffers::{PHYS_STRIDE, P_MOTOR_TURN_OUT, P_YAW};
+
+    /// Bearing window for scoring. Above 0.6 rad the food nears the FOV
+    /// edge (0.785 rad half-FOV) where ray coverage degrades; below
+    /// 0.05 rad the correct turn direction is ambiguous.
+    const BEARING_MAX: f32 = 0.6;
+    const BEARING_MIN: f32 = 0.05;
+
+    let mut prev_yaw = vec![0.0_f32; PROBE_AGENT_COUNT];
+    let mut correct = 0_usize;
+    let mut scored = 0_usize;
+
+    for t in 0..ticks {
+        arena.kernel.dispatch_batch(start_tick + t as u64, 1);
+        let state = arena.kernel.read_full_state_blocking();
+        for a in 0..PROBE_AGENT_COUNT {
+            let base = a * PHYS_STRIDE;
+            let yaw = state[base + P_YAW];
+            let motor_turn = state[base + P_MOTOR_TURN_OUT];
+            if t >= 2 {
+                let dx = arena.food_pos[a].0 - arena.agent_pos[a].x;
+                let dz = arena.food_pos[a].2 - arena.agent_pos[a].z;
+                let world_bearing = dx.atan2(dz);
+                let mut bearing = world_bearing - prev_yaw[a];
+                while bearing > PI {
+                    bearing -= TAU;
+                }
+                while bearing < -PI {
+                    bearing += TAU;
+                }
+                if bearing.abs() >= BEARING_MIN && bearing.abs() <= BEARING_MAX && motor_turn != 0.0
+                {
+                    scored += 1;
+                    if (motor_turn > 0.0) == (bearing > 0.0) {
+                        correct += 1;
+                    }
+                }
+            }
+            prev_yaw[a] = yaw;
+        }
+    }
+    (correct, scored)
 }
 
 /// Count vision rays reporting the food color (lime green, matching the
@@ -1835,15 +1906,15 @@ fn learning_probe_food_is_visible() {
         return;
     }
     let brain = probe_brain_config();
-    let (mut kernel, _, _) = build_probe_arena(&brain, 7);
+    let mut arena = build_probe_arena(&brain, 7);
 
     // One single-tick batch: pass order is kernel → global (grid rebuild)
     // → vision, so the food grid is populated and one vision frame exists.
-    kernel.dispatch_batch(0, 1);
+    arena.kernel.dispatch_batch(0, 1);
 
     let mut blind_agents = Vec::new();
     for agent in 0..PROBE_AGENT_COUNT {
-        let telemetry = kernel.read_agent_telemetry_blocking(agent as u32);
+        let telemetry = arena.kernel.read_agent_telemetry_blocking(agent as u32);
         if count_food_pixels(&telemetry.vision_color) == 0 {
             blind_agents.push(agent);
         }
@@ -1862,9 +1933,6 @@ fn learning_probe_food_is_visible() {
 /// documents (and pins) today's chance-level baseline.
 #[test]
 fn learning_probe_baseline_turn_alignment_is_chance() {
-    use std::f32::consts::{PI, TAU};
-    use xagent_brain::buffers::{PHYS_STRIDE, P_MOTOR_TURN_OUT, P_YAW};
-
     if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
@@ -1872,56 +1940,14 @@ fn learning_probe_baseline_turn_alignment_is_chance() {
 
     /// Single-tick batches dispatched (= brain decisions sampled per agent).
     const PROBE_TICKS: usize = 60;
-    /// Bearing window for scoring. Above 0.6 rad the food nears the FOV
-    /// edge (0.785 rad half-FOV) where ray coverage degrades; below
-    /// 0.05 rad the correct turn direction is ambiguous.
-    const BEARING_MAX: f32 = 0.6;
-    const BEARING_MIN: f32 = 0.05;
     /// Minimum scored samples for the rate to be statistically meaningful
     /// (binomial σ ≈ 0.035 at n = 200).
     const MIN_SCORED_SAMPLES: usize = 200;
 
     let brain = probe_brain_config();
-    let (mut kernel, agent_pos, food_pos) = build_probe_arena(&brain, 11);
+    let mut arena = build_probe_arena(&brain, 11);
 
-    let mut prev_yaw = vec![0.0_f32; PROBE_AGENT_COUNT];
-    let mut correct = 0_usize;
-    let mut scored = 0_usize;
-
-    for t in 0..PROBE_TICKS {
-        kernel.dispatch_batch(t as u64, 1);
-        let state = kernel.read_full_state_blocking();
-        for a in 0..PROBE_AGENT_COUNT {
-            let base = a * PHYS_STRIDE;
-            let yaw = state[base + P_YAW];
-            let motor_turn = state[base + P_MOTOR_TURN_OUT];
-            // The motor value produced this tick was computed from the
-            // vision frame captured at the end of the previous tick, when
-            // the agent's yaw was `prev_yaw` (single-tick sensory lag).
-            // Skip the first two ticks: tick 0's brain saw zeroed senses
-            // and tick 1 is the first decision on a real frame.
-            if t >= 2 {
-                let dx = food_pos[a].0 - agent_pos[a].x;
-                let dz = food_pos[a].2 - agent_pos[a].z;
-                let world_bearing = dx.atan2(dz);
-                let mut bearing = world_bearing - prev_yaw[a];
-                while bearing > PI {
-                    bearing -= TAU;
-                }
-                while bearing < -PI {
-                    bearing += TAU;
-                }
-                if bearing.abs() >= BEARING_MIN && bearing.abs() <= BEARING_MAX && motor_turn != 0.0
-                {
-                    scored += 1;
-                    if (motor_turn > 0.0) == (bearing > 0.0) {
-                        correct += 1;
-                    }
-                }
-            }
-            prev_yaw[a] = yaw;
-        }
-    }
+    let (correct, scored) = score_turn_alignment(&mut arena, 0, PROBE_TICKS);
 
     let rate = correct as f64 / scored.max(1) as f64;
     eprintln!("learning probe baseline: turn/bearing alignment {correct}/{scored} = {rate:.3}");
@@ -1931,12 +1957,12 @@ fn learning_probe_baseline_turn_alignment_is_chance() {
          or the probe geometry broke"
     );
     // ±6σ band around chance for the sample sizes this probe produces.
-    // The current learner sits at ≈ 0.5; a working spatial learner must
-    // exceed the upper bound (re-pin the band when that lands).
+    // An untrained policy sits at ≈ 0.5; without reward events in this
+    // stationary arena, nothing should push it off chance.
     assert!(
         (0.38..=0.62).contains(&rate),
         "turn/bearing alignment {rate:.3} is outside the chance band [0.38, 0.62] — \
-         either learning emerged (update this baseline) or a directional bias crept in"
+         a directional bias crept into the untrained policy"
     );
 }
 
@@ -1961,20 +1987,20 @@ fn learning_probe_free_run_foraging_baseline() {
     const MAX_DEATH_TICK_GAP: f32 = 100.0;
 
     let brain = BrainConfig::default();
-    let (mut kernel, _, _) = build_probe_arena(&brain, 13);
+    let mut arena = build_probe_arena(&brain, 13);
 
-    let batch = kernel.kernel_batch_size();
+    let batch = arena.kernel.kernel_batch_size();
     assert!(
         RUN_TICKS % batch == 0,
         "RUN_TICKS {RUN_TICKS} must be a multiple of kernel_batch_size {batch}"
     );
     let mut tick = 0_u64;
     while tick < u64::from(RUN_TICKS) {
-        kernel.dispatch_batch(tick, batch);
+        arena.kernel.dispatch_batch(tick, batch);
         tick += u64::from(batch);
     }
 
-    let state = kernel.read_full_state_blocking();
+    let state = arena.kernel.read_full_state_blocking();
     let mut total_food = 0.0_f32;
     let mut total_deaths = 0.0_f32;
     for a in 0..PROBE_AGENT_COUNT {
@@ -1995,4 +2021,208 @@ fn learning_probe_free_run_foraging_baseline() {
         "learning probe baseline: food={total_food} deaths={total_deaths} \
          food/agent/1k-ticks={food_per_agent_per_1k:.3}"
     );
+}
+
+/// Phase-1 gate: episodic food-reaching practice must teach the policy to
+/// turn toward food. Agents repeatedly start from the same pose with food
+/// at a fixed bearing; eating produces the energy reward that TD(λ) credit
+/// propagates back through the eligibility traces to the approach turns.
+/// After training, a stationary evaluation (same metric as the baseline
+/// probe) must score above the chance band's upper edge.
+#[test]
+fn learning_probe_td_learns_turn_alignment() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_FOOD_COUNT};
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Training episodes. Each starts from the identical pose so the
+    /// food-approach experience repeats enough for value bootstrapping.
+    const TRAIN_EPISODES: usize = 120;
+    /// Ticks per episode: at single-tick strides and default speed an agent
+    /// heading roughly toward its food (5 units away) eats within ~30
+    /// ticks, leaving slack for indirect paths.
+    const EPISODE_TICKS: u32 = 100;
+    /// Evaluation ticks (same scale as the baseline probe).
+    const EVAL_TICKS: usize = 60;
+    /// Minimum scored evaluation samples.
+    const MIN_SCORED_SAMPLES: usize = 200;
+    /// The gate: the baseline chance band tops out at 0.62; trained
+    /// alignment must clear it.
+    const GATE_RATE: f64 = 0.62;
+
+    // Training config: single-tick strides (fresh vision every tick —
+    // densest TD transitions) with normal movement so food is reachable.
+    let train_brain = BrainConfig {
+        brain_tick_stride: 1,
+        vision_stride: 1,
+        ..Default::default()
+    };
+    let mut arena = build_probe_arena(&train_brain, 17);
+
+    let mut tick_cursor = 0_u64;
+    let mut food_first_half = 0.0_f32;
+    let mut food_second_half = 0.0_f32;
+    for episode in 0..TRAIN_EPISODES {
+        arena.reset_bodies();
+        arena.kernel.dispatch_batch(tick_cursor, EPISODE_TICKS);
+        tick_cursor += u64::from(EPISODE_TICKS);
+
+        // Episode food count (upload_agents zeroes P_FOOD_COUNT each reset).
+        let state = arena.kernel.read_full_state_blocking();
+        let mut episode_food = 0.0_f32;
+        for a in 0..PROBE_AGENT_COUNT {
+            episode_food += state[a * PHYS_STRIDE + P_FOOD_COUNT];
+        }
+        if episode < TRAIN_EPISODES / 2 {
+            food_first_half += episode_food;
+        } else {
+            food_second_half += episode_food;
+        }
+    }
+    eprintln!(
+        "learning probe TD training: food first-half={food_first_half} \
+         second-half={food_second_half} (of {} possible per half)",
+        PROBE_AGENT_COUNT * TRAIN_EPISODES / 2
+    );
+
+    // Evaluation: pin the agents (zero movement speed) via the heritable
+    // config patch — learned weights stay intact — and score alignment
+    // exactly like the baseline probe.
+    let eval_brain = probe_brain_config();
+    for a in 0..PROBE_AGENT_COUNT {
+        arena
+            .kernel
+            .write_agent_heritable_config(a as u32, &eval_brain);
+    }
+    arena.reset_bodies();
+    let (correct, scored) = score_turn_alignment(&mut arena, tick_cursor, EVAL_TICKS);
+
+    let rate = correct as f64 / scored.max(1) as f64;
+    eprintln!("learning probe TD trained: turn/bearing alignment {correct}/{scored} = {rate:.3}");
+    assert!(
+        scored >= MIN_SCORED_SAMPLES,
+        "only {scored} scored samples — evaluation geometry broke"
+    );
+    assert!(
+        rate > GATE_RATE,
+        "trained turn/bearing alignment {rate:.3} did not clear the gate {GATE_RATE} — \
+         TD credit is not reaching the food-approach turns"
+    );
+}
+
+/// The critic must learn that the steady metabolic drain makes every state
+/// slightly negative-valued: with stationary agents and no food events, the
+/// value telemetry should settle below zero, and every TD error must
+/// respect the MAX_TD_ERROR clamp.
+#[test]
+fn td_critic_tracks_metabolic_drain() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Enough ticks for the linear critic to converge on the constant-drain
+    /// signal (time constant ≈ 100 brain ticks at the critic rate).
+    const RUN_TICKS: usize = 300;
+
+    let brain = probe_brain_config();
+    let mut arena = build_probe_arena(&brain, 19);
+
+    for t in 0..RUN_TICKS {
+        arena.kernel.dispatch_batch(t as u64, 1);
+    }
+
+    let mut value_sum = 0.0_f32;
+    for a in 0..PROBE_AGENT_COUNT {
+        let telemetry = arena.kernel.read_agent_telemetry_blocking(a as u32);
+        assert!(
+            telemetry.value.is_finite() && telemetry.td_error.is_finite(),
+            "agent {a}: non-finite critic telemetry (value={}, td_error={})",
+            telemetry.value,
+            telemetry.td_error
+        );
+        assert!(
+            telemetry.td_error.abs() <= 1.0,
+            "agent {a}: td_error {} exceeds the MAX_TD_ERROR clamp",
+            telemetry.td_error
+        );
+        value_sum += telemetry.value;
+    }
+    let mean_value = value_sum / PROBE_AGENT_COUNT as f32;
+    eprintln!("td critic drain probe: mean value {mean_value:.5}");
+    assert!(
+        mean_value < -1e-4,
+        "mean value {mean_value:.5} did not go negative under constant drain — \
+         the critic is not learning"
+    );
+    assert!(
+        mean_value > -1.0,
+        "mean value {mean_value:.5} is implausibly negative for a drain of ~1e-3/tick"
+    );
+}
+
+/// Eligibility traces are episodic: after deaths they must have been reset
+/// (and rebuilt only from post-respawn experience), so they stay bounded by
+/// the geometric trace limit instead of accumulating across lives.
+#[test]
+fn td_traces_bounded_across_deaths() {
+    use xagent_brain::buffers::{
+        O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, PHYS_STRIDE, P_DEATH_COUNT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Hazard damage (1.0/tick at default rates) kills a 100-integrity
+    /// agent in ~100 ticks; 350 ticks guarantees repeated deaths.
+    const RUN_TICKS: usize = 350;
+    /// Geometric trace bound: |s_encoded| ≤ 1 per dim and noise ≤ 0.5, so
+    /// |z| ≤ 1/(1 − γλ) ≈ 7.9. Allow generous slack for the brief
+    /// post-respawn rebuild before asserting runaway accumulation.
+    const TRACE_BOUND: f32 = 50.0;
+
+    let brain = probe_brain_config();
+    let mut arena = build_probe_arena(&brain, 23);
+    // All-danger biome: every spawn fallback lands in hazard, so agents die
+    // on a ~100-tick cycle.
+    arena.biomes = vec![2_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    arena.reset_bodies();
+
+    for t in 0..RUN_TICKS {
+        arena.kernel.dispatch_batch(t as u64, 1);
+    }
+
+    let state = arena.kernel.read_full_state_blocking();
+    let mut total_deaths = 0.0_f32;
+    for a in 0..PROBE_AGENT_COUNT {
+        total_deaths += state[a * PHYS_STRIDE + P_DEATH_COUNT];
+    }
+    assert!(
+        total_deaths >= 1.0,
+        "no deaths in the all-danger arena — the death path never ran"
+    );
+
+    for a in 0..PROBE_AGENT_COUNT {
+        let brain_state = arena.kernel.read_agent_state(a as u32).brain_state;
+        for d in 0..xagent_brain::buffers::ENCODED_DIMENSION {
+            for (name, off) in [
+                ("critic", O_TRACE_CRITIC),
+                ("fwd", O_TRACE_FWD),
+                ("turn", O_TRACE_TURN),
+            ] {
+                let z = brain_state[off + d];
+                assert!(
+                    z.is_finite() && z.abs() <= TRACE_BOUND,
+                    "agent {a}: {name} trace[{d}] = {z} out of bounds after \
+                     {total_deaths} deaths — traces are leaking across lives"
+                );
+            }
+        }
+    }
+    eprintln!("td trace death probe: {total_deaths} deaths, traces bounded");
 }

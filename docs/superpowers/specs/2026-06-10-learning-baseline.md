@@ -73,3 +73,32 @@ counts.
   passes; alignment improves over Phase 1; TPS cost < 15%.
 - Phase 3 (vision acuity): food visible at range in the probe; food/life
   trends upward across generations.
+
+## Phase 1 results (TD(λ) actor-critic)
+
+Same lavapipe environment, same probe seeds. The windowed-REINFORCE credit
+path (history ring, deadzone, tonic fallback, pain amplifier) was replaced
+by a linear TD(λ) value head with per-dimension eligibility traces; the TD
+error δ is the sole credit signal for critic, both policy channels, and the
+encoder. New constants: `TD_DISCOUNT=0.97`, `TD_LAMBDA=0.9`,
+`CRITIC_LEARNING_RATE=0.01`, `TD_VECTOR_SCALE=1/ENCODED_DIMENSION`,
+`MAX_TD_ERROR=1.0`. Per-tick action-weight decay removed.
+
+| Metric | Test | Baseline | Phase 1 |
+|---|---|---|---|
+| Trained turn/bearing alignment | `learning_probe_td_learns_turn_alignment` | 0.498 (chance, untrained) | **0.643** after 120 episodes of food-reaching practice |
+| Episode food (first half → second half of training) | same test | — | **588 → 730** of 960/half (rising) |
+| Critic value under constant drain | `td_critic_tracks_metabolic_drain` | n/a | **−0.002** (correctly negative, finite, δ within clamp) |
+| Trace bound across deaths | `td_traces_bounded_across_deaths` | n/a | bounded after 16 deaths (no cross-life leak) |
+| Untrained stationary alignment | `learning_probe_baseline_turn_alignment_is_chance` | 0.498 | 0.50 (still chance — nothing to learn from with no reward events) |
+| Free-run foraging (debug adapter, single run) | `learning_probe_free_run_foraging_baseline` | 2 food | 7 food (noisy single-seed; not a gate) |
+
+The directional gate is the load-bearing result: with food visible and the
+TD reward arriving on contact, **alignment rises from chance (0.498) to
+0.643** — clearing the baseline chance band's upper edge (0.62). This is the
+first time the policy's turn direction has carried information about food
+bearing. The untrained stationary probe stays at chance, confirming the
+gain comes from reward-driven learning, not a directional bias artifact.
+
+TPS unchanged within noise (the serial history-ring credit loop is gone;
+the TD path is fully parallel across the 128 trace dimensions).

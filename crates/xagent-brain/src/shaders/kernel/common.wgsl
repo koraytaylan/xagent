@@ -30,7 +30,6 @@ const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
 override FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
-const ACTION_HISTORY_LEN: u32 = 64u;
 const ERROR_HISTORY_LEN: u32 = 128u;
 
 // ── Brain state offsets (derived from FEATURE_COUNT) ────────────────────────
@@ -65,11 +64,23 @@ override O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
 override O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
 override O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 
+// ── TD(λ) critic state ──────────────────────────────────────────────────────
+// Value head (learned, inherited) plus eligibility traces (episodic,
+// zeroed on death). Trace biases pack three scalars:
+// [critic_bias, forward_bias, turn_bias].
+
+override O_VALUE_WEIGHTS: u32 = O_MOVEMENT_SPEED + 1u;
+override O_VALUE_BIAS: u32 = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
+override O_PREV_VALUE: u32 = O_VALUE_BIAS + 1u;
+override O_TRACE_CRITIC: u32 = O_PREV_VALUE + 1u;
+override O_TRACE_FWD: u32 = O_TRACE_CRITIC + ENCODED_DIMENSION;
+override O_TRACE_TURN: u32 = O_TRACE_FWD + ENCODED_DIMENSION;
+override O_TRACE_BIASES: u32 = O_TRACE_TURN + ENCODED_DIMENSION;
+
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-override BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
+override BRAIN_STRIDE: u32 = O_TRACE_BIASES + 3u;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
-const HISTORY_STRIDE: u32 = O_HIST_LEN + 1u;
 override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
 const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
@@ -93,13 +104,6 @@ const O_PAT_ACTIVE: u32 = O_PAT_META + MEMORY_CAP * 3u;
 const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
 const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
 const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
-
-// ── Action history offsets ──────────────────────────────────────────────────
-
-const O_MOTOR_RING: u32 = 0u;
-const O_STATE_RING: u32 = ACTION_HISTORY_LEN * 5u;
-const O_HIST_CURSOR: u32 = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION;
-const O_HIST_LEN: u32 = O_HIST_CURSOR + 1u;
 
 // ── Config buffer offsets ───────────────────────────────────────────────────
 
@@ -264,20 +268,37 @@ const GRADIENT_WEIGHT_SLOW: f32 = 0.15;
 
 // ── Predict-and-act constants ───────────────────────────────────────────────
 
-const CREDIT_DECAY: f32 = 0.3;
 const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
-const PAIN_AMP: f32 = 3.0;
-const DEADZONE: f32 = 0.005;
 const MAX_WEIGHT_NORM: f32 = 2.0;
-const ACTION_WEIGHT_DECAY: f32 = 0.01;
-const TONIC_CREDIT_SCALE: f32 = 0.5;
 const ENCODER_CREDIT_SCALE: f32 = 0.1;
 const CREDIT_EPSILON: f32 = 1e-6;
 const KLINOTAXIS_SENSITIVITY: f32 = 500.0;
 const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 
+// ── TD(λ) credit constants ──────────────────────────────────────────────────
+
+// Per-brain-tick discount. Horizon 1/(1−γ) ≈ 33 brain ticks matches the
+// travel time from the edge of vision range to food at default speed.
+const TD_DISCOUNT: f32 = 0.97;
+// Eligibility trace decay. Combined per-tick trace retention is
+// TD_DISCOUNT × TD_LAMBDA ≈ 0.87; the critic's bootstrapping propagates
+// credit beyond the raw trace span across repeated experiences.
+const TD_LAMBDA: f32 = 0.9;
+// Critic learns 10× slower than the actor: the value estimate must be
+// stabler than the policy it evaluates.
+const CRITIC_LEARNING_RATE: f32 = 0.01;
+// Per-dimension trace updates scale inversely with the feature dimension:
+// the aggregate step (a sum of ENCODED_DIMENSION products of trace ×
+// feature, each O(1)) would otherwise grow with dimensionality and push
+// the bootstrapped critic past the linear-TD stability limit.
+const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
+// Bound on the TD error. No single transition is allowed to teach more
+// than this; protects against respawn/clamp artifacts (mirrors the intent
+// of MAX_HOMEOSTATIC_DELTA on the reward side).
+const MAX_TD_ERROR: f32 = 1.0;
+
 // ═══════════════════════════════════════════════════════════════════════════
-// Buffer bindings — 15 storage + 2 uniform, single bind group
+// Buffer bindings — 14 storage + 2 uniform, single bind group
 // ═══════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)  var<storage, read_write> physics_state:        array<f32>;
@@ -293,7 +314,6 @@ const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 @group(0) @binding(10) var<storage, read_write> sensory_buffer:       array<f32>;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
-@group(0) @binding(13) var<storage, read_write> history_buffer:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 

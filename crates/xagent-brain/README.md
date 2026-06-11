@@ -91,7 +91,7 @@ There is no separate reward signal. There is no loss function designed by a huma
 
 The brain has no concept of "good" or "bad" built in. Instead, `habituate_homeo.wgsl` tracks whether internal variables (energy, physical integrity) are trending toward or away from stability. This gradient -- positive means improving, negative means worsening -- modulates:
 
-- **Credit assignment**: the `predict_and_act.wgsl` pass uses the homeostatic gradient to assign credit/blame to recent actions in the 64-tick history ring
+- **Credit assignment**: the homeostatic gradient is the reward in a TD(λ) actor-critic — a value head learns the discounted return, and its TD error credits recent actions through per-dimension eligibility traces
 - **Urgency**: when energy or integrity drops critically low, urgency suppresses exploration in favor of exploitation
 
 This is analogous to how biological organisms don't have explicit goals -- they have homeostatic set points, and deviations from those set points drive behavior.
@@ -196,9 +196,8 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                               └───────────────────────────┘
 
   Persistent GPU buffers (live across ticks; sizes shown for default 8×6 vision, `ENCODED_DIMENSION = 128`):
-  ─── brain_state_buf ────  `BrainLayout::brain_stride` (51,381 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue)
+  ─── brain_state_buf ────  `BrainLayout::brain_stride` (51,898 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces)
   ─── pattern_buf ────────  `PATTERN_STRIDE` (17,539 f32/agent)            (128 patterns: states, norms, reinforcement, motor, meta, active)
-  ─── history_buf ────────  `HISTORY_STRIDE` (8,514 f32/agent)             (64-entry action history ring: motor+state snapshots)
   ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
   ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
   ─── sensory_buf ────────     per-agent     (raw vision + non-visual features written by vision pass)
@@ -245,7 +244,7 @@ A `dispatch_batch(start_tick, ticks_to_run)` call splits the work into one or mo
 | GPU → CPU | When `try_collect_state` is called | Position, vitals, motor cache, exploration/fatigue, death counts |
 | GPU → CPU | When `try_collect_telemetry` is called | One agent's vision + decision snapshot (selected agent only) |
 | GPU → CPU | When `try_collect_agent_state` is called | One agent's full `AgentBrainState` (for inheritance, debugging) |
-| GPU only | Per-tick simulation | Brain state, pattern memory, action history, physics state, food state, **sensory features** (written by the vision pass into `sensory_buf`) |
+| GPU only | Per-tick simulation | Brain state, pattern memory, physics state, food state, **sensory features** (written by the vision pass into `sensory_buf`) |
 
 The asymmetry is intentional. Sensory frames are not packed and uploaded per tick: the vision pass raycasts on the GPU from terrain/biome/food/agent buffers and writes the feature layout directly into `sensory_buf`. The brain stage in the next kernel-batch reads its inputs from that same `sensory_buf` — a one-batch sensory lag that amortizes the cost of vision + grid rebuild over `vision_stride` brain cycles.
 
@@ -257,13 +256,13 @@ The asymmetry is intentional. Sensory frames are not packed and uploaded per tic
 
 ### Buffer Allocation
 
-All buffers are created at `GpuKernel::new` with sizes proportional to `agent_count` and the vision dimensions encoded in `BrainLayout`. Persistent storage buffers (`brain_state`, `pattern_buffer`, `history_buffer`, `physics_state`, `food_state`, sensory) use `STORAGE | COPY_SRC | COPY_DST`, and transient working buffers use `STORAGE` only; the double-buffered world-config and the heritable brain-config are uniform buffers (`UNIFORM | COPY_DST`). Staging buffers for readback use `MAP_READ | COPY_DST` and are sized for the worst-case message (full state for `state_readback`, one agent's slice for the others).
+All buffers are created at `GpuKernel::new` with sizes proportional to `agent_count` and the vision dimensions encoded in `BrainLayout`. Persistent storage buffers (`brain_state`, `pattern_buffer`, `physics_state`, `food_state`, sensory) use `STORAGE | COPY_SRC | COPY_DST`, and transient working buffers use `STORAGE` only; the double-buffered world-config and the heritable brain-config are uniform buffers (`UNIFORM | COPY_DST`). Staging buffers for readback use `MAP_READ | COPY_DST` and are sized for the worst-case message (full state for `state_readback`, one agent's slice for the others).
 
 ---
 
 ## 5. Buffer Layout
 
-Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, `HISTORY_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAP`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
+Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAP`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
 
 ### Core Dimensions
 
@@ -273,10 +272,10 @@ Buffer offsets, strides, and dimension constants live in two coordinated source-
 | `BrainLayout::feature_count` | 265 = `VISION_RAYS * 5 + 25` | Feature vector size (192 RGBA + 48 depth + 25 derived non-visual; scales with `VISION_W`/`VISION_H`) |
 | `MEMORY_CAP` | 128 | Maximum patterns per agent |
 | `RECALL_K` | 16 | Top-K recalled patterns per tick |
-| `ACTION_HISTORY_LEN` | 64 | Credit-assignment lookback window |
 | `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
+| `TD_DISCOUNT` / `TD_LAMBDA` | 0.97 / 0.9 | TD(λ) credit horizon and trace decay |
 
-The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` and `HISTORY_STRIDE` do **not** — they are fixed `pub const`s derived from `MEMORY_CAP`, `ACTION_HISTORY_LEN`, and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 51,381` f32, with the fixed `PATTERN_STRIDE = 17,539` f32 and `HISTORY_STRIDE = 8,514` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
+The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 51,898` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
 
 ### Sensory Buffer Layout (GPU-produced)
 
@@ -288,22 +287,18 @@ The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configu
 
 Total for the default 8×6 vision: `SENSORY_STRIDE = 267` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, and up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
 
-### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,381 f32 for the default 8×6 layout)
+### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,898 f32 for the default 8×6 layout)
 
 Regions (in offset order; concrete offsets are dimension-dependent and emitted by `BrainLayout` — see `crates/xagent-brain/src/buffers.rs`):
 
 - `O_ENCODER_WEIGHTS` — `feature_count * ENCODED_DIMENSION` (= 33,920 for 8×6) encoder weight matrix.
 - `O_ENCODER_BIASES` — `ENCODED_DIMENSION` (128) per-dimension bias.
 - `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
-- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, and per-agent `movement_speed`.
+- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, per-agent `movement_speed`, and the TD critic state — value weights (`O_VALUE_WEIGHTS`, `ENCODED_DIMENSION`) + bias + previous value, the three eligibility-trace vectors (`O_TRACE_CRITIC` / `O_TRACE_FWD` / `O_TRACE_TURN`, `ENCODED_DIMENSION` each), and the three scalar trace biases (`O_TRACE_BIASES`).
 
 ### Pattern Memory Buffer (per agent: `PATTERN_STRIDE` = 17,539 f32, a fixed constant)
 
 Stores `MEMORY_CAP` (= 128) patterns. Regions: `O_PAT_STATES` (`MEMORY_CAP * ENCODED_DIMENSION` encoded-space states), `O_PAT_NORMS` (cached L2 norms), `O_PAT_REINF` (per-pattern reinforcement that decays over time), `O_PAT_MOTOR` (`[forward, turn, outcome_valence] * MEMORY_CAP`), `O_PAT_META` (`[created_at, last_accessed, activation_count] * MEMORY_CAP`), `O_PAT_ACTIVE` (active flag — recall is gated here, not on `O_PAT_REINF`), and `O_ACTIVE_COUNT` bookkeeping. The `O_PAT_*` offsets are fixed constants (derived from `MEMORY_CAP` and `ENCODED_DIMENSION`, independent of vision dimensions); see `crates/xagent-brain/src/buffers.rs`.
-
-### Action History Buffer (per agent: `HISTORY_STRIDE` = 8,514 f32, a fixed constant)
-
-A 64-entry ring of motor commands plus per-entry encoded-state snapshots. Regions: `O_MOTOR_RING` (`[forward, turn, tick, gradient, _pad] * ACTION_HISTORY_LEN`), `O_STATE_RING` (`[encoded_state(ENCODED_DIMENSION)] * ACTION_HISTORY_LEN` snapshots — `ENCODED_DIMENSION * ACTION_HISTORY_LEN` f32 in total), and `O_HIST_CURSOR` bookkeeping. The `O_HIST_*` offsets are fixed constants (derived from `ACTION_HISTORY_LEN` and `ENCODED_DIMENSION`, independent of vision dimensions); see `crates/xagent-brain/src/buffers.rs`.
 
 ### Integer Storage Convention
 
@@ -468,16 +463,30 @@ Predicts the next encoded state from the current habituated state and recalled c
 
 The `context_weight` parameter (stored at `O_PRED_CTX_WT`, initialized to 0.15) controls how much recalled patterns influence the prediction. It is itself adapted in pass 7.
 
-#### 6.6.3 Credit Assignment
+#### 6.6.3 Credit Assignment — TD(λ) actor-critic
 
-The homeostatic gradient is used to assign credit/blame to recent actions in the 64-entry history ring buffer. For each recorded action:
+A linear value head over the encoded state estimates the discounted
+homeostatic return; its TD error is the single credit signal for the
+critic, both policy channels, and the encoder. Per brain tick:
 
-1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.3`. The loop skips entries with `temporal < 0.01`, so actions older than ~15 ticks contribute negligibly.
-2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.005)`, the improvement is replaced by a tonic fallback `gradient * urgency * TONIC_CREDIT_SCALE (0.5)` instead of being skipped.
-3. **Pain amplification**: Negative improvements are multiplied by `PAIN_AMP = 3.0`, reflecting the biological reality that aversive stimuli produce stronger learning signals.
-4. **State-conditioned weight update**: `weights[d] += WEIGHT_LR * credit * recorded_motor * recorded_state[d]`. The recorded state snapshot from when the action was taken ensures credit is attributed to the correct sensory context.
+1. **Value estimate**: `v = dot(value_weights, encoded) + value_bias` (threads compute partial products in parallel; thread 0 reduces).
+2. **TD error**: `δ = clamp(reward + TD_DISCOUNT·v − prev_value, ±MAX_TD_ERROR)` where `reward` is the urgency-amplified homeostatic delta since the previous brain tick and `TD_DISCOUNT = 0.97` gives a ~33-brain-tick horizon (the travel time from the edge of vision range at default speed).
+3. **Weight updates through eligibility traces**: `w += lr · TD_VECTOR_SCALE · δ · z` for the critic (`CRITIC_LEARNING_RATE = 0.01`) and both actor channels (`ACTION_WEIGHT_LEARNING_RATE = 0.10`). `TD_VECTOR_SCALE = 1/ENCODED_DIMENSION` keeps the aggregate step inside the linear-TD stability limit regardless of dimensionality. Scalar biases update from scalar traces without the vector scale.
+4. **Trace update** (end of the pass, after the motor block produces this tick's exploration noise): `z ← TD_DISCOUNT·TD_LAMBDA·z + term`, where the critic trace accumulates `encoded[d]` and the actor traces accumulate `noise·encoded[d]` — the likelihood-ratio direction of the action actually taken. `TD_LAMBDA = 0.9`.
 
-**Weight normalization**: After credit assignment, forward and turn weight vectors are clipped to L2 norm <= `MAX_WEIGHT_NORM = 2.0` (synaptic homeostasis).
+There is no deadzone, no tonic fallback, no pain amplifier, and no history
+ring: credit reaches past actions through the traces, and the critic's
+bootstrapping propagates reward backwards across repeated experiences
+beyond the raw trace span. Traces and `prev_value` are episodic — zeroed on
+death — while the value weights are learned knowledge and survive respawn
+and inheritance.
+
+**Weight normalization**: forward, turn, and value weight vectors are
+clipped to L2 norm <= `MAX_WEIGHT_NORM = 2.0` (synaptic homeostasis). There
+is no per-tick weight decay: TD updates are surprise-driven and stop when
+δ calibrates to zero, so decay would only erase accumulated policy
+knowledge (including the initial forward bias that provides exploration
+mobility).
 
 #### 6.6.4 Policy Evaluation
 
@@ -538,11 +547,10 @@ When motor output is varied, fatigue factor is near 1.0 (no dampening). When out
 #### 6.6.8 Output Recording
 
 After computing final motor output:
-1. Records `[noise_fwd * exploration_rate, noise_trn * exploration_rate, tick, gradient, 0.0]` to the action history ring at `O_MOTOR_RING`. Storing the exploration noise (not the full motor) is what makes credit assignment a proper REINFORCE gradient -- see PR #97.
-2. Records the encoded (pre-habituation) state snapshot at `O_STATE_RING` for future credit assignment -- matches the features the policy and credit updates train against.
-3. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
-4. Increments `O_TICK_COUNT`.
-5. Writes `[prediction(32), credit_signal(32), fwd, trn, strafe, _pad]` to the decision buffer for pass 7 and CPU readback.
+1. Publishes `[noise_fwd * exploration_rate, noise_trn * exploration_rate]` to shared memory for the parallel eligibility-trace update at the end of the pass. The traces carry the exploration noise (not the full motor) so only noise directions that correlate with TD errors get reinforced.
+2. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
+3. Increments `O_TICK_COUNT`.
+4. Writes `[prediction(ENCODED_DIMENSION), credit_signal(ENCODED_DIMENSION), fwd, trn, strafe, td_error]` to the decision buffer for pass 7 and CPU readback.
 
 ---
 
@@ -568,15 +576,18 @@ The context weight is also adapted: `ctx_wt += learning_rate * 0.01 * (error_mag
 
 #### 6.7.2 Encoder Hebbian Credit Adaptation
 
-The encoder weights are adapted based on the credit signal from pass 6:
+The encoder weights are adapted based on the credit signal from pass 6
+(`credit_signal[i] = td_error * (forward_trace[i] + turn_trace[i])` — which
+encoded dimensions carried the policy's eligibility when the outcome
+arrived):
 
 ```
 for each (i, j) where |credit_signal[i]| > 1e-6:
-    weights[j * DIM + i] += learning_rate * credit_signal[i] * 0.001 * features[j]
+    weights[j * DIM + i] += learning_rate * credit_signal[i] * ENCODER_CREDIT_SCALE * features[j]
     weights[j * DIM + i] = clamp(weights, -2.0, 2.0)
 ```
 
-This is a Hebbian-style update: features that co-occur with strong credit signals have their encoder weights strengthened. The 0.001 scale factor makes encoder adaptation much slower than predictor learning, reflecting the intuition that the perceptual representation should change gradually while the prediction model adapts quickly.
+This is a Hebbian-style update: features that co-occur with strong credit signals have their encoder weights strengthened. The `ENCODER_CREDIT_SCALE = 0.1` factor makes encoder adaptation slower than action learning, reflecting the intuition that the perceptual representation should change gradually while the policy adapts quickly.
 
 #### 6.7.3 Memory Reinforcement
 
@@ -638,7 +649,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 ```rust
 pub struct GpuKernel {
     // wgpu device + queue
-    // Persistent buffers: brain_state, pattern_buffer, history_buffer,
+    // Persistent buffers: brain_state, pattern_buffer,
     //                     physics_state, food_state, world_config,
     //                     sensory + working buffers
     // Compute pipelines: physics, vision, brain, kernel, global, prepare
@@ -684,11 +695,10 @@ The method list below is the contract used by `xagent-sandbox`. See `gpu_kernel.
 pub struct AgentBrainState {
     pub brain_state: Vec<f32>,    // BRAIN_STRIDE, vision-dependent
     pub patterns: Vec<f32>,       // PATTERN_STRIDE
-    pub history: Vec<f32>,        // HISTORY_STRIDE
 }
 ```
 
-Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring), mutation, and DB persistence. The three vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` and `history` slices use the fixed `PATTERN_STRIDE` and `HISTORY_STRIDE` constants. The legacy `8,468 / 5,251 / 2,370` figures from the pre-fused era are no longer accurate (current 8×6 values: `51,381 / 17,539 / 8,514`).
+Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring) and mutation. The two vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` slice uses the fixed `PATTERN_STRIDE` constant. The learned policy and the TD value head live in `brain_state` and so are inherited; the episodic eligibility traces also live there but are zeroed on the first post-respawn tick of a new life.
 
 ### Death / Respawn on the GPU
 
@@ -697,7 +707,7 @@ Death detection and respawn live entirely in WGSL (`phase_death.wgsl`, invoked f
 1. **Spawn search**: tries up to 50 GPU-RNG samples for a non-Danger biome position; if all 50 attempts land in Danger biomes, the `!found` branch reuses the attempt-0 sample (RNG seed `tick * 256 + agent_id`, the same draw as attempt 0) and spawns there without re-checking the biome — so a fully Danger-blocked agent can land back in a Danger cell (see `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 2. **Physics reset**: full energy, full integrity, zero velocity, facing +Z; death count incremented; fitness counters (`food_count`, `ticks_alive`, `last_death_tick`) preserved.
 3. **Memory trauma**: all `O_PAT_REINF` entries are multiplied by `0.5`. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (which gates on `O_PAT_ACTIVE` in `brain_passes.wgsl`, not on reinforcement) is not cut off by this step. Halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest memories survive.
-4. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed and attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, action history zeroed.
+4. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed and attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, TD eligibility traces and previous-state value zeroed (the value weights survive — they are learned knowledge, not episodic state).
 
 The CPU only learns about a death by reading `physics_state[base + P_DEATH_COUNT]` on the next state readback.
 
@@ -835,19 +845,15 @@ Biological nervous systems track changes at multiple timescales -- immediate ref
 
 ### Why Continuous Motor Output Instead of Discrete Actions
 
-The old CPU architecture used a discrete 8-action space with a learned preference table. The GPU rewrite replaces this with continuous forward/turn output computed as `dot(weights, habituated) + bias`. This is both simpler (no action table, no softmax, no argmax tie-breaking) and more expressive (the agent can move at any speed and turn at any angle). Credit assignment updates the weight vectors directly via state-conditioned gradient, which is more natural for continuous outputs.
+The old CPU architecture used a discrete 8-action space with a learned preference table. The GPU rewrite replaces this with continuous forward/turn output computed as `dot(weights, encoded) + bias`. This is both simpler (no action table, no softmax, no argmax tie-breaking) and more expressive (the agent can move at any speed and turn at any angle). Credit assignment updates the weight vectors directly through eligibility traces, which is natural for continuous outputs.
 
-### Why Credit Deadzone Filters Metabolic Noise
+### Why TD(λ) Instead of Windowed REINFORCE
 
-Every tick, energy depletion produces a small negative homeostatic gradient (~0.006). Without a deadzone, this constant signal triggers credit assignment on every tick, treating normal metabolism as a negative outcome. The `DEADZONE = 0.01` threshold ensures only meaningful events -- food consumption (+0.03), damage (-0.02), death (-0.5) -- produce weight updates. This is analogous to sensory gating in biological systems, where constant background stimuli are filtered out to preserve signal clarity.
+The earlier learner credited a fixed window of recorded actions with the *change* in homeostatic gradient since each action, gated by a deadzone and a tonic fallback. Food, however, is a sparse reward that arrives ~30 brain ticks after the navigational turn that earned it — far outside any practical exponential-decay window — so the decisive turn was never credited (the core finding of issue #13). TD(λ) closes that gap two ways: a learned value head bootstraps, propagating the terminal food reward backwards across repeated experiences, and eligibility traces give every state-action a decaying claim on future TD errors. The deadzone, tonic fallback, and pain amplifier are gone — δ is a single signed signal that calibrates to zero when the critic is accurate, so steady metabolic drain stops producing spurious updates without any thresholding.
 
-### Why State-Conditioned Credit Assignment
+### Why No Per-Tick Weight Decay
 
-Naive credit assignment applies the same credit to all recent actions regardless of the state in which they were taken. This means dying in a danger zone penalizes actions taken in safe states equally -- the agent learns "forward is bad everywhere" instead of "forward-in-danger is bad." State-conditioned credit uses the recorded state snapshot from when each action was chosen, so the weight update is proportional to `recorded_state[d]`. High feature activation at action time --> full credit. Low activation --> minimal credit.
-
-### Why Pain Amplification (3x)
-
-Negative homeostatic gradients receive a 3x multiplier in credit assignment. This reflects the biological reality that amygdala neurons respond 2-3x more strongly to aversive stimuli. This is NOT hardcoded avoidance -- the brain must learn WHAT to do about the amplified signal. The amplification just ensures that negative outcomes produce louder learning signals than positive ones, which is necessary because damage is typically more catastrophic than the benefit of a single meal.
+TD updates are surprise-driven: they vanish when δ calibrates to zero, so weights settle rather than diverge, and the L2-ball clamps bound magnitude. Per-tick decay would instead bleed away accumulated policy knowledge every tick — including the initial forward bias that gives agents the mobility to explore — so it is omitted. The value head likewise keeps its learned landscape across the lifetime; only the episodic eligibility traces and previous-value scalar reset on death.
 
 ### Why Encoder Adaptation is Hebbian, Not Backpropagated
 

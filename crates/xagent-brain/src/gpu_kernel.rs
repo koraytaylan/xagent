@@ -202,17 +202,20 @@ pub struct AgentTelemetry {
     pub gradient: f32,
     pub prediction_error: f32,
     pub exploration_rate: f32,
+    /// Critic estimate of the discounted homeostatic return from the
+    /// agent's latest encoded state.
+    pub value: f32,
+    /// TD error of the latest transition — the unified credit signal.
+    pub td_error: f32,
 }
 
 /// In-flight async readback of a single agent's brain state.
 struct AgentStateReadback {
     brain_staging: wgpu::Buffer,
     pattern_staging: wgpu::Buffer,
-    history_staging: wgpu::Buffer,
     brain_size: u64,
     pattern_size: u64,
-    history_size: u64,
-    /// Shared completion/error state for all 3 `map_async` callbacks.
+    /// Shared completion/error state for both `map_async` callbacks.
     tracker: ReadbackTracker,
     brain_stride: usize,
 }
@@ -243,7 +246,6 @@ pub struct GpuKernel {
     sensory_buffer: wgpu::Buffer,
     brain_state_buffer: wgpu::Buffer,
     pattern_buffer: wgpu::Buffer,
-    history_buffer: wgpu::Buffer,
     brain_config_buffer: wgpu::Buffer,
 
     // ── Indirect dispatch ──
@@ -368,14 +370,12 @@ impl GpuKernel {
 
         let n = self.agent_count as usize;
 
-        // Fresh brain state, pattern memory, and action history.
+        // Fresh brain state and pattern memory.
         let mut brain_data = Vec::with_capacity(n * self.layout.brain_stride);
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
-        let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
             brain_data.extend_from_slice(&init_brain_state_for(brain_config, &self.layout, rng));
             pattern_data.extend_from_slice(&init_pattern_memory());
-            history_data.extend_from_slice(&init_action_history());
         }
         self.queue.write_buffer(
             &self.brain_state_buffer,
@@ -384,8 +384,6 @@ impl GpuKernel {
         );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
         self.queue.write_buffer(
             &self.brain_config_buffer,
             0,
@@ -597,12 +595,6 @@ impl GpuKernel {
             usage: storage_rw,
             mapped_at_creation: false,
         });
-        let history_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kernel_history"),
-            size: (n * HISTORY_STRIDE * 4) as u64,
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
         let brain_config_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_brain_config"),
             size: (CONFIG_SIZE * 4) as u64,
@@ -663,15 +655,12 @@ impl GpuKernel {
         let mut rng = rand::rng();
         let mut brain_data = Vec::with_capacity(n * layout.brain_stride);
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
-        let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
             brain_data.extend_from_slice(&init_brain_state_for(brain_config, &layout, &mut rng));
             pattern_data.extend_from_slice(&init_pattern_memory());
-            history_data.extend_from_slice(&init_action_history());
         }
         queue.write_buffer(&brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
         queue.write_buffer(&pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
-        queue.write_buffer(&history_buffer, 0, bytemuck::cast_slice(&history_data));
         queue.write_buffer(
             &brain_config_buffer,
             0,
@@ -747,7 +736,7 @@ impl GpuKernel {
             zero_initialize_workgroup_memory: true,
         };
 
-        // ── Explicit bind group layout (all 16 bindings) ──
+        // ── Explicit bind group layout (all 15 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
         // need a single shared layout so one bind group works for all 3 pipelines.
         use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
@@ -803,7 +792,6 @@ impl GpuKernel {
                 storage_rw_entry(10), // sensory
                 storage_rw_entry(11), // brain_state
                 storage_rw_entry(12), // pattern
-                storage_rw_entry(13), // history
                 uniform_entry(14),    // brain_config
                 storage_rw_entry(15), // dispatch_args
             ],
@@ -983,10 +971,6 @@ impl GpuKernel {
                         resource: pattern_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 13,
-                        resource: history_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
                         binding: 14,
                         resource: brain_config_buffer.as_entire_binding(),
                     },
@@ -1020,7 +1004,6 @@ impl GpuKernel {
             sensory_buffer,
             brain_state_buffer,
             pattern_buffer,
-            history_buffer,
             brain_config_buffer,
             dispatch_args_buffer,
             prepare_pipeline,
@@ -1589,15 +1572,6 @@ impl GpuKernel {
             &mut state.patterns,
         );
 
-        let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
-        let hist_size = (HISTORY_STRIDE * 4) as u64;
-        self.read_buffer_range(
-            &self.history_buffer,
-            hist_offset,
-            hist_size,
-            &mut state.history,
-        );
-
         state
     }
 
@@ -1618,13 +1592,6 @@ impl GpuKernel {
             &self.pattern_buffer,
             pat_offset,
             bytemuck::cast_slice(&state.patterns),
-        );
-
-        let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
-        self.queue.write_buffer(
-            &self.history_buffer,
-            hist_offset,
-            bytemuck::cast_slice(&state.history),
         );
     }
 
@@ -1689,7 +1656,6 @@ impl GpuKernel {
 
         let brain_size = (bs * 4) as u64;
         let pat_size = (PATTERN_STRIDE * 4) as u64;
-        let hist_size = (HISTORY_STRIDE * 4) as u64;
 
         let make_staging = |label, size| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1702,7 +1668,6 @@ impl GpuKernel {
 
         let brain_staging = make_staging("agent_state_brain_staging", brain_size);
         let pattern_staging = make_staging("agent_state_pattern_staging", pat_size);
-        let history_staging = make_staging("agent_state_history_staging", hist_size);
 
         let mut encoder = self
             .device
@@ -1726,30 +1691,19 @@ impl GpuKernel {
             0,
             pat_size,
         );
-        let hist_offset = (i * HISTORY_STRIDE * 4) as u64;
-        encoder.copy_buffer_to_buffer(
-            &self.history_buffer,
-            hist_offset,
-            &history_staging,
-            0,
-            hist_size,
-        );
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Aggregate completion/error for all 3 staging buffers in a single tracker.
-        let tracker = ReadbackTracker::new(3);
+        // Aggregate completion/error for both staging buffers in a single tracker.
+        let tracker = ReadbackTracker::new(2);
         tracker.install(brain_staging.slice(..));
         tracker.install(pattern_staging.slice(..));
-        tracker.install(history_staging.slice(..));
 
         self.agent_state_staging = Some(AgentStateReadback {
             brain_staging,
             pattern_staging,
-            history_staging,
             brain_size,
             pattern_size: pat_size,
-            history_size: hist_size,
             tracker,
             brain_stride: bs,
         });
@@ -1774,9 +1728,6 @@ impl GpuKernel {
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     rb.pattern_staging.unmap()
-                }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rb.history_staging.unmap()
                 }));
                 return Some(None);
             }
@@ -1804,15 +1755,6 @@ impl GpuKernel {
         drop(mapped);
         readback.pattern_staging.unmap();
 
-        let hist_data = readback.history_staging.slice(..readback.history_size);
-        let mapped = hist_data.get_mapped_range();
-        state.history.clear();
-        state
-            .history
-            .extend_from_slice(bytemuck::cast_slice(&mapped));
-        drop(mapped);
-        readback.history_staging.unmap();
-
         Some(Some(state))
     }
 
@@ -1830,7 +1772,6 @@ impl GpuKernel {
         let bs = self.layout.brain_stride;
         let mut brain_data = Vec::with_capacity(count * bs);
         let mut pattern_data = Vec::with_capacity(count * PATTERN_STRIDE);
-        let mut history_data = Vec::with_capacity(count * HISTORY_STRIDE);
 
         for i in 0..count {
             let s = states(i);
@@ -1850,22 +1791,12 @@ impl GpuKernel {
                 s.patterns.len(),
                 PATTERN_STRIDE
             );
-            debug_assert_eq!(
-                s.history.len(),
-                HISTORY_STRIDE,
-                "agent {}: history length {} != HISTORY_STRIDE {}",
-                i,
-                s.history.len(),
-                HISTORY_STRIDE
-            );
             brain_data.extend_from_slice(&s.brain_state);
             pattern_data.extend_from_slice(&s.patterns);
-            history_data.extend_from_slice(&s.history);
         }
 
         debug_assert_eq!(brain_data.len(), count * bs);
         debug_assert_eq!(pattern_data.len(), count * PATTERN_STRIDE);
-        debug_assert_eq!(history_data.len(), count * HISTORY_STRIDE);
 
         self.queue.write_buffer(
             &self.brain_state_buffer,
@@ -1874,8 +1805,6 @@ impl GpuKernel {
         );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
     }
 
     /// Non-blocking version of `reset_agents`. Returns false if async staging
@@ -1899,11 +1828,10 @@ impl GpuKernel {
 
         let n = self.agent_count as usize;
 
-        // Fresh brain state, pattern memory, and action history.
+        // Fresh brain state and pattern memory.
         let mut rng = rand::rng();
         let mut brain_data = Vec::with_capacity(n * self.layout.brain_stride);
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
-        let mut history_data = Vec::with_capacity(n * HISTORY_STRIDE);
         for _ in 0..n {
             brain_data.extend_from_slice(&init_brain_state_for(
                 brain_config,
@@ -1911,7 +1839,6 @@ impl GpuKernel {
                 &mut rng,
             ));
             pattern_data.extend_from_slice(&init_pattern_memory());
-            history_data.extend_from_slice(&init_action_history());
         }
         self.queue.write_buffer(
             &self.brain_state_buffer,
@@ -1920,8 +1847,6 @@ impl GpuKernel {
         );
         self.queue
             .write_buffer(&self.pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
-        self.queue
-            .write_buffer(&self.history_buffer, 0, bytemuck::cast_slice(&history_data));
         self.queue.write_buffer(
             &self.brain_config_buffer,
             0,
@@ -1985,6 +1910,8 @@ impl GpuKernel {
         let motor_base = DECISION_MOTOR;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
+        // Slot 2 is strafe (consumed by physics); slot 3 carries the TD error.
+        let td_error = decision[motor_base + 3];
 
         // Brain state: read key fields
         let bs = self.layout.brain_stride;
@@ -2004,6 +1931,7 @@ impl GpuKernel {
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PREDICTOR_CONTEXT_WEIGHT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PREDICTOR_CONTEXT_WEIGHT);
         let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_prev_value = dyn_pred_ctx_wt + (O_PREV_VALUE - O_PREDICTOR_CONTEXT_WEIGHT);
         // Habituation: mean of attenuation values (ENCODED_DIMENSION floats)
         let atten_sum: f32 = brain[dyn_hab_atten..dyn_hab_atten + ENCODED_DIMENSION]
             .iter()
@@ -2016,6 +1944,9 @@ impl GpuKernel {
         // Fatigue factor and floor
         let fatigue_factor = brain[dyn_fatigue_factor];
         let fatigue_floor = brain[dyn_fatigue_floor];
+
+        // Critic estimate for the latest encoded state
+        let value = brain[dyn_prev_value];
 
         // Staleness: raw spatial stagnation [0.0, 1.0] recovered by inverting the
         // shader formula: fatigue_factor = 1.0 - staleness * (1.0 - fatigue_floor).
@@ -2046,6 +1977,8 @@ impl GpuKernel {
             gradient,
             prediction_error,
             exploration_rate,
+            value,
+            td_error,
         }
     }
 
@@ -2177,6 +2110,7 @@ impl GpuKernel {
         let dyn_hab_atten = dyn_pred_ctx_wt + (O_HAB_ATTEN - O_PREDICTOR_CONTEXT_WEIGHT);
         let dyn_fatigue_factor = dyn_pred_ctx_wt + (O_FATIGUE_FACTOR - O_PREDICTOR_CONTEXT_WEIGHT);
         let dyn_fatigue_floor = dyn_pred_ctx_wt + (O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT);
+        let dyn_prev_value = dyn_pred_ctx_wt + (O_PREV_VALUE - O_PREDICTOR_CONTEXT_WEIGHT);
         // Sensory
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
@@ -2190,6 +2124,8 @@ impl GpuKernel {
         let motor_base = DECISION_MOTOR;
         let motor_fwd = decision[motor_base];
         let motor_turn = decision[motor_base + 1];
+        // Slot 2 is strafe (consumed by physics); slot 3 carries the TD error.
+        let td_error = decision[motor_base + 3];
         drop(decision_data);
         self.telemetry_staging.decision.unmap();
 
@@ -2210,6 +2146,9 @@ impl GpuKernel {
         // range regardless of fatigue_floor.
         let max_penalty = (1.0 - fatigue_floor).max(1e-6);
         let staleness = ((1.0 - fatigue_factor) / max_penalty).clamp(0.0, 1.0);
+
+        // Critic estimate for the latest encoded state
+        let value = brain[dyn_prev_value];
 
         drop(brain_data);
         self.telemetry_staging.brain.unmap();
@@ -2236,6 +2175,8 @@ impl GpuKernel {
             gradient,
             prediction_error,
             exploration_rate,
+            value,
+            td_error,
         };
         self.cached_telemetry = Some(tel.clone());
         Some(tel)

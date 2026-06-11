@@ -5,7 +5,7 @@ All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That 
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 75 lib unit + 3 bin unit + 47 integration tests (125 total)
+- `cargo test -p xagent-sandbox` — runs 75 lib unit + 3 bin unit + 50 integration tests (128 total)
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence
@@ -15,6 +15,7 @@ All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That 
 - `crates/xagent-brain/src/gpu_kernel.rs` — fused kernel: single dispatch(agent_count,1,1) per vision-stride cycle, the sole GPU abstraction for all simulation
 - `crates/xagent-brain/src/buffers.rs` — GPU buffer layout constants, sensory packing, AgentBrainState, AgentTelemetry
 - `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl` — fused per-agent kernel (physics + food detect + death/respawn + brain, looped over vision_stride cycles)
+- `crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl` — the 7 cooperative brain passes; credit assignment is a TD(λ) actor-critic (value head + eligibility traces in `brain_state`), no history ring
 - `crates/xagent-brain/src/shaders/kernel/global_tick.wgsl` — grid rebuild + collision pass (dispatched as (1,1,1))
 
 ## egui Gotchas

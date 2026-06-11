@@ -66,6 +66,14 @@ workgroup model.
 
 ### 4. Vision acuity — ADOPT at 16×12; 32×24 and stride changes measured separately
 
+> **Superseded by the Phase 3 outcome.** Building the Phase-0 probes showed
+> the *vertical* ray layout, not horizontal spacing, binds ground-food
+> visibility, so Phase 3 implemented a **17×13 odd grid** (one ray row on the
+> horizon + one column straight ahead, 221 rays — still under the 256-thread
+> workgroup) instead of the 16×12 analyzed below — and the **default stayed
+> 8×6** after measurement. The original 16×12 analysis is kept below as the
+> pre-measurement reasoning.
+
 At 8×6 over 90° FOV, ray spacing at distance 20 is ~3.9 units against a food
 diameter of 2 — distant food is usually invisible (issue #14: "Depth won't
 fix this"). At 16×12 (192 rays) spacing at distance 20 is ~2.0 units —

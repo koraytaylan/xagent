@@ -2047,11 +2047,11 @@ fn learning_probe_free_run_foraging_baseline() {
     );
 }
 
-/// Vision-acuity check: the default 17×13 grid has a horizon-grazing ray
+/// Vision-acuity check: the 17×13 odd grid has a horizon-grazing ray
 /// row (odd row count) that passes a constant 0.65 below eye level —
 /// inside the 1.0 food hit radius — so ground-level food straight ahead is
 /// visible at every probed distance out to near the 30-unit vision range.
-/// The 8×6 control documents what the upgrade buys: its lowest
+/// The 8×6 default documents what the upgrade buys: its lowest
 /// below-horizon row strikes flat ground ≈ 5.5 units out, so food at 20 is
 /// geometrically invisible regardless of bearing.
 #[test]

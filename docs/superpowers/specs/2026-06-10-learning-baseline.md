@@ -59,10 +59,11 @@ real hardware when convenient.
 ## Per-generation metrics (headless)
 
 `run_headless` now prints per generation:
-`Food | Deaths | Food/life | w_fwd | w_turn` — the behavioral signal plus
-the best agent's policy weight norms. For evolution-level A/B runs, use a
-fixed `--db` seed config and compare these lines across the same generation
-counts.
+`Food | Deaths | Food/1k-ticks | w_fwd | w_turn` — the behavioral signal
+(food per 1k alive-ticks; see the metric note in the evolution-scale
+section) plus the best agent's policy weight norms. For evolution-level A/B
+runs, use a fixed `--db` seed config and compare these lines across the same
+generation counts.
 
 ## Merge gates (from the plan)
 
@@ -71,8 +72,8 @@ counts.
   20-generation headless run, TPS within 10% of pre-change.
 - Phase 2 (encoder self-supervision): encoded-state separability test
   passes; alignment improves over Phase 1; TPS cost < 15%.
-- Phase 3 (vision acuity): food visible at range in the probe; food/life
-  trends upward across generations.
+- Phase 3 (vision acuity): food visible at range in the probe; foraging rate
+  (food per 1k alive-ticks) trends upward across generations.
 
 ## Phase 1 results (TD(λ) actor-critic)
 

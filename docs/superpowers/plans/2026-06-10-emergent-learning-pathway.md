@@ -161,8 +161,8 @@ Phase 3 measures whether tightening `vision_stride` pays for its cost.
 | `crates/xagent-brain/src/buffers.rs` | Modify | mirror offsets, `BRAIN_STRIDE`, init (value head small-random), drop history init |
 | `crates/xagent-brain/src/gpu_kernel.rs` | Modify | buffer sizing, telemetry (expose `value`, `td_error`), remove history buffer plumbing |
 | `crates/xagent-sandbox/tests/integration.rs` | Modify | Phase-0 probes + per-phase learning tests |
-| `crates/xagent-sandbox/src/headless.rs` | Modify | A/B metric logging (food-per-life, weight norms, δ stats) |
-| `crates/xagent-shared/src/config.rs` | Modify (Phase 3) | default `vision_width`/`vision_height` 8×6 → 16×12 |
+| `crates/xagent-sandbox/src/headless.rs` | Modify | A/B metric logging (food per 1k alive-ticks, weight norms) |
+| `crates/xagent-shared/src/config.rs` | Modify (Phase 3) | vision-grid doc guidance only — the default stays 8×6 (see Phase 3 outcome) |
 
 ---
 
@@ -186,8 +186,8 @@ review. So the gates come first.
   default config: food-per-agent-per-1k-ticks and deaths over 3000 ticks,
   with liveness accounting asserted.
 - [x] **Step 3: Headless A/B logging.** `run_headless` now prints per
-  generation: food, deaths, food-per-life, and the best agent's policy
-  weight norms (`w_fwd`, `w_turn`).
+  generation: food, deaths, food per 1k alive-ticks, and the best agent's
+  policy weight norms (`w_fwd`, `w_turn`).
 - [x] **Step 4: Record baseline numbers** —
   [`docs/superpowers/specs/2026-06-10-learning-baseline.md`](../specs/2026-06-10-learning-baseline.md):
   alignment 0.498 (chance), foraging 0.042 food/agent/1k-ticks, visibility
@@ -308,9 +308,9 @@ binding constraint — can the agent see food at range at all.
   foraging rate 0.192 → 0.254, comparable to 8×6 (no clear win — the learner
   can't yet use directional vision, so the added information isn't cashed in).
 
-**Gate result.** Food visible at range: **met**. "Rising food-per-life
-trend": already validated at evolution scale in Phase 1 (foraging rate +74%,
-fitness +62%) and reconfirmed at 17×13.
+**Gate result.** Food visible at range: **met**. Rising foraging-rate trend
+(food per 1k alive-ticks): already validated at evolution scale in Phase 1
+(+74%, fitness +62%) and reconfirmed at 17×13.
 
 **The unplanned discovery (more important than the acuity work).** Validating
 the directional probe at the new resolution exposed that the Phase-1 "0.643

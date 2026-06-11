@@ -269,11 +269,12 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
     );
 }
 
-/// Per-generation learning metrics: behavioral signal (food per life) plus
-/// the policy weight norms of the generation's best agent. These stay flat
-/// for a population that isn't learning and should trend upward once credit
-/// assignment reaches food-approach actions. Printed alongside the fitness
-/// line so headless runs double as before/after measurement records.
+/// Per-generation learning metrics: behavioral signal (food per 1k
+/// alive-ticks) plus the policy weight norms of the generation's best
+/// agent. These stay flat for a population that isn't learning and should
+/// trend upward once credit assignment reaches food-approach actions.
+/// Printed alongside the fitness line so headless runs double as
+/// before/after measurement records.
 fn log_learning_metrics(
     agents: &[Agent],
     best_state: Option<&AgentBrainState>,

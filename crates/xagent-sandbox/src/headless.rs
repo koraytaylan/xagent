@@ -226,7 +226,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         inherited_state = agents
             .get(best_idx)
             .map(|a| kernel.read_agent_state(a.brain_idx));
-        log_learning_metrics(&agents, inherited_state.as_ref(), &current_configs[0]);
+        // The weight-norm layout must come from the champion's own config —
+        // configs are per-agent, and a mismatched layout would misplace the
+        // tail offsets into the champion's brain_state.
+        let best_config = current_configs.get(best_idx).unwrap_or(&current_configs[0]);
+        log_learning_metrics(&agents, inherited_state.as_ref(), best_config);
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",

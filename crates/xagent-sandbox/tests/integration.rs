@@ -2145,9 +2145,10 @@ fn vision_horizon_row_sees_food_at_range() {
     };
     let (_, seen_legacy) = build(&legacy_brain);
     assert!(
-        !seen_legacy.contains(&3),
-        "8×6: food at distance 20 should be invisible (vertical ray \
-         gap), but was seen — the control premise broke"
+        seen_legacy.contains(&0) && !seen_legacy.contains(&3),
+        "8×6: the near food (distance 5) must be visible and the distance-20 \
+         food invisible (vertical ray gap); got {seen_legacy:?} — the \
+         contrast premise broke"
     );
     eprintln!(
         "vision range probe: 17×13 sees {:?}, 8×6 sees {:?} (indices into {PROBE_DISTANCES:?})",

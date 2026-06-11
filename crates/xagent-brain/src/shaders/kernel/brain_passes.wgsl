@@ -372,9 +372,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     // channels, and the encoder-credit vector through the per-dimension
     // eligibility traces — no deadzone, no tonic fallback, no history ring.
     {
-        // Value partial products: threads 0..ENCODED_DIMENSION.
+        // Value partial products: threads 0..ENCODED_DIMENSION. Reuses
+        // s_credit as ENCODED_DIMENSION-sized scratch — it is rewritten
+        // with the encoder-credit values later in this block, after the
+        // reduction below has consumed these partials.
         if (tid < ENCODED_DIMENSION) {
-            s_similarities[tid] =
+            s_credit[tid] =
                 brain_state[brain_base + O_VALUE_WEIGHTS + tid] * s_encoded[tid];
         }
         workgroupBarrier();
@@ -383,7 +386,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         if (tid == 0u) {
             var value: f32 = brain_state[brain_base + O_VALUE_BIAS];
             for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                value += s_similarities[d];
+                value += s_credit[d];
             }
             // Reward is the immediate urgency-amplified homeostatic delta
             // accrued since the previous brain tick.

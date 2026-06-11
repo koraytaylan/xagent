@@ -83,7 +83,7 @@ In this crate, prediction error is not just one signal among many -- it is the *
 - **Modulates learning rates**: higher error --> faster weight updates in predictor and encoder
 - **Drives exploration**: high error signals novelty --> the action policy increases exploration noise
 - **Reinforces memory**: patterns that co-occur with low prediction error get strengthened
-- **Guides prospection**: prediction confidence (inverse of error) controls how much weight the predicted future carries in action selection
+- **Tunes its own influence**: the predictor's recalled-context weight adapts toward whatever blend of memory and projection keeps the error low
 
 There is no separate reward signal. There is no loss function designed by a human. The agent learns because its predictions are wrong, and prediction error is metabolically expensive.
 
@@ -629,7 +629,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 | Phenomenon | How It Emerges | Contributing Stages |
 |------------|---------------|---------------------|
 | **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 265 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
-| **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | `coop_habituate_homeo`, `coop_predict_and_act` (credit + prospection) |
+| **Fear / Avoidance** | Negative homeostatic gradient --> negative TD error --> eligibility traces blame the recently active state-action directions --> policy weights learn to avoid danger-associated features, while the value head marks danger-correlated states as low-value so later TD errors penalize approaching them | `coop_habituate_homeo`, `coop_predict_and_act` (TD credit) |
 | **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | `coop_habituate_homeo`, `coop_predict_and_act` (exploration) |
 | **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | `coop_predict_and_act` (credit), `coop_learn_and_store` (reinforcement) |
 | **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | `coop_predict_and_act` (error + exploration) |

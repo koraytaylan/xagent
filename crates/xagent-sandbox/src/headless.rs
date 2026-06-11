@@ -277,9 +277,17 @@ fn log_learning_metrics(
 ) {
     let total_food: u64 = agents.iter().map(|a| u64::from(a.food_consumed)).sum();
     let total_deaths: u64 = agents.iter().map(|a| u64::from(a.death_count)).sum();
-    // Every agent lives at least once; each death starts another life.
-    let lives = agents.len() as u64 + total_deaths;
-    let food_per_life = total_food as f64 / lives.max(1) as f64;
+    // Foraging rate per 1k alive-ticks: total food normalized by the
+    // life-time the population actually accrued. Unlike food-per-life this is
+    // robust to death count — an active forager that dies often still scores
+    // its foraging honestly — so it is the cleaner cross-generation learning
+    // signal. (`total_ticks_alive` is preserved across respawn.)
+    let total_alive_ticks: u64 = agents.iter().map(|a| a.total_ticks_alive).sum();
+    let food_per_1k = if total_alive_ticks > 0 {
+        total_food as f64 / total_alive_ticks as f64 * 1000.0
+    } else {
+        0.0
+    };
 
     let mut weight_norms = String::new();
     if let Some(state) = best_state {
@@ -306,7 +314,7 @@ fn log_learning_metrics(
             );
         }
     }
-    println!("  Food: {total_food} | Deaths: {total_deaths} | Food/life: {food_per_life:.2}{weight_norms}");
+    println!("  Food: {total_food} | Deaths: {total_deaths} | Food/1k-ticks: {food_per_1k:.3}{weight_norms}");
 }
 
 /// Print evolution tree from database and exit.

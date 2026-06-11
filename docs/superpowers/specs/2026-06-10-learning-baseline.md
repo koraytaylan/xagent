@@ -103,6 +103,36 @@ gain comes from reward-driven learning, not a directional bias artifact.
 TPS unchanged within noise (the serial history-ring credit loop is gone;
 the TD path is fully parallel across the 128 trace dimensions).
 
+## Phase 1 at evolution scale (validation)
+
+The probe measures within-lifetime learning in isolation; the real question
+is whether it compounds across generations through inheritance. A 24-generation
+headless run (`--config` with `tick_budget=120000`, `population_size=12`,
+`patience` disabled, world seed 42) on lavapipe:
+
+| Signal | Gen 0 | Gen ~22 | Trend |
+|---|---|---|---|
+| Champion composite fitness (`survival·0.4 + foraging·0.3 + exploration·0.3`) | 0.239 | 0.386 | **+62%**, rising then plateauing |
+| Foraging rate (food per 1k alive-ticks, population) | 0.164 | 0.285 | **+74%**, monotone-ish |
+| Total food consumed (population) | ~240 | ~400 | **+60%** |
+| Inherited policy weight norms (`w_fwd` / `w_turn`) | ~0.005 | ~0.29 | monotone growth, bounded |
+
+The monotone growth of the inherited policy weight norms is the direct
+evidence that learned weights persist and **compound across generations** via
+the inherit/mutate path (not just within a lifetime). Champion fitness rising
++62% while the survival term is weighted 0.4 confirms the best lineage is
+genuinely improving, not just trading deaths for food.
+
+**Metric note.** An earlier population-aggregate *food-per-life* proxy
+(`food / (agents + deaths)`) *fell* over the same run because its denominator
+is dominated by the aggregate death count across all 12 agents (active
+foragers and exploratory mutants die often). It was replaced by
+**food-per-1k-alive-ticks**, which normalizes by accrued lifetime and is
+robust to death count — that is the metric `run_headless` now prints, and it
+rises as expected. Death rate climbing alongside foraging flags
+danger-avoidance / energy economics as a live tension (the next plausibly
+binding constraint), consistent with the journey's energy-economics notes.
+
 ## Phase 2 (encoder self-supervision) — negative result, not merged
 
 Tied-weight vision reconstruction was implemented and measured against the

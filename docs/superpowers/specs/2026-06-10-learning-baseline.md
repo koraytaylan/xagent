@@ -252,9 +252,11 @@ any exit. Timeouts (neither) possible but did not occur in baseline.
 | mean_exit_latency (of exits) | 145.0 | — |
 | death_fraction | 0.896 | 43/48 |
 
-**Pinned bands (in `hazard_probe_exit_latency_baseline`):** ±50% relative:
-exit_fraction [0.052, 0.156], mean_exit_latency [72.5, 217.5],
-death_fraction [0.448, 1.344].
+**Pinned bands (in `hazard_probe_exit_latency_baseline`):** ±50% relative
+around the post-grounding re-pinned values (see "Hazard probe re-measure
+after grounding" below for before/after):
+exit_fraction [0.094, 0.282], mean_exit_latency [68.6, 205.8],
+death_fraction [0.406, 1.218].
 
 **Gate:** workstream 0002 must move mean exit latency or death fraction
 outside the pinned bands to claim a behavioral win. (Exit fraction is
@@ -262,3 +264,64 @@ derivative; the primary economics signals are latency to escape and death
 rate under hazard exposure.) The same re-pin discipline as the steering
 probes: when the numbers move, update the bands + this spec + the inline
 comment.
+
+## Hazard probe re-measure after grounding (2026-06-12)
+
+Re-ran the probe (`cargo test -p xagent-sandbox --test integration
+hazard_probe_exit_latency_baseline -- --nocapture`) with the three grounding
+changes (`terminal-death-update`, `hazard-edge-touch`,
+`same-cycle-interoception`) in place on the same macOS Metal adapter.
+
+**Printed result:** `hazard probe baseline: trials=48 exit_fraction=0.188 mean_exit_latency=137.2 death_fraction=0.812`
+
+| Metric | Before (pre-grounding) | After (post-grounding) | Raw count (after) |
+|---|---|---|---|
+| exit_fraction | 0.104 | **0.188** | 9/48 |
+| mean_exit_latency (of exits) | 145.0 | 137.2 | — |
+| death_fraction | 0.896 | 0.812 | 39/48 |
+
+**Verdict: improved** beyond the original pinned bands (exit_fraction 0.188 > 0.156 upper edge; death fraction moved inward from 0.896). Grounding produced a clear behavioral shift on the direct probe: nearly double the escape rate, fewer deaths. The danger pathway now supplies a usable teaching signal (terminal TD on death + timely touch/interoception), satisfying the prerequisite. (Per the plan's mirrored-probe precedent, the signal existing does not guarantee that the policy will exploit it at evolution scale.)
+
+**Pinned bands re-pinned** (in test + this spec) to ±50% relative around the post-grounding values (now the baseline for subsequent work):
+
+exit_fraction [0.094, 0.282], mean_exit_latency [68.6, 205.8],
+death_fraction [0.406, 1.218].
+
+(The test asserts were updated to these bands during the grounding sub-tasks and confirmed on final re-measure.)
+
+## Evolution-scale check (post-grounding control)
+
+Generated `experiments/control.json` (edited per task: tick_budget=120000,
+population_size=12, max_generations=16, seed=42) and ran:
+
+```
+cargo run --release -p xagent-sandbox -- --no-render --config experiments/control.json --db experiments/control.db
+```
+
+(15 generations completed; wall ~87s on macOS Metal, ~20900 ticks/sec.)
+
+Key lines (`Food | Deaths | Food/1k-ticks`):
+
+- Gen 0: Food: 236 | Deaths: 516 | Food/1k-ticks: 0.164
+- Gen 1: 287 | 767 | 0.200
+- Gen 2: 273 | 843 | 0.190
+- Gen 3: 274 | 684 | 0.191
+- Gen 4: 316 | 997 | 0.220
+- Gen 5: 337 | 1201 | 0.235
+- Gen 6: 357 | 1268 | 0.249
+- Gen 7: 367 | 1951 | 0.257
+- Gen 8: 306 | 965 | 0.213
+- Gen 9: 360 | 1855 | 0.252
+- Gen 10: 375 | 2028 | 0.262
+- Gen 11: 338 | 1431 | 0.236
+- Gen 12: 379 | 2164 | 0.265
+- Gen 13: 396 | 2372 | 0.278
+- Gen 14: 397 | 2323 | 0.278
+
+**Comparison to Phase-1 numbers in this spec** (pre-grounding 24-gen reference, same config params, seed 42):
+
+- Gen 0 matches exactly (food ~240, rate 0.164).
+- Foraging rate rose to 0.278 by gen 14 (comparable to Phase-1's 0.285 at gen~22); total food ~397 vs Phase-1 ~400.
+- **Deaths did not trend down relative to food.** Deaths climbed (516 → 2323) while food rose modestly; deaths-per-food worsened from ~2.2 to ~5.8. The grounding/terminal lesson improved the within-episode probe (escape behavior), but at population/evolution scale the dynamics still show high mortality alongside foraging gains (consistent with the "live tension" noted in the Phase-1 section). The signal is present; selection pressure to exploit it for lower death may need more generations, larger pop, or adjusted fitness weights.
+
+The post-grounding control run is recorded here for the learning baseline.

@@ -230,3 +230,35 @@ and, more valuably, a confound-free directional probe that correctly reports
 the open problem. The TD(λ) critic and the evolution-scale foraging/fitness
 /survival gains from Phase 1 stand; the specific claim of learned directional
 steering does not.
+
+## Hazard probe baseline
+
+Half-plane danger arena (biome 2 for x < 0, food-rich for x ≥ 0) on the
+standard probe geometry (flat, 16 agents). Agents spawned at x =
+−HAZARD_PROBE_START_DEPTH (10 units inside danger), y=1, z-spread ±60 step 8,
+facing +Z (parallel to the x=0 boundary). Episode: 600 physics ticks
+(HAZARD_PROBE_EPISODE_TICKS), sampled every 5 ticks. 3 episodes (48 trials
+total).
+
+Hazard-exit latency = first sample tick where x ≥ 0 and still alive (death
+count unchanged from start of episode). Death = death count increased before
+any exit. Timeouts (neither) possible but did not occur in baseline.
+
+**Recorded numbers (2026-06-12, macOS Metal/wgpu adapter, seeds fixed in test):**
+
+| Metric | Value | Raw count |
+|---|---|---|
+| exit_fraction | 0.104 | 5/48 |
+| mean_exit_latency (of exits) | 145.0 | — |
+| death_fraction | 0.896 | 43/48 |
+
+**Pinned bands (in `hazard_probe_exit_latency_baseline`):** ±50% relative:
+exit_fraction [0.052, 0.156], mean_exit_latency [72.5, 217.5],
+death_fraction [0.448, 1.344].
+
+**Gate:** workstream 0002 must move mean exit latency or death fraction
+outside the pinned bands to claim a behavioral win. (Exit fraction is
+derivative; the primary economics signals are latency to escape and death
+rate under hazard exposure.) The same re-pin discipline as the steering
+probes: when the numbers move, update the bands + this spec + the inline
+comment.

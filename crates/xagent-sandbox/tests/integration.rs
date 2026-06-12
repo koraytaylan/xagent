@@ -2502,3 +2502,177 @@ fn td_traces_bounded_across_deaths() {
     }
     eprintln!("td trace death probe: {total_deaths} deaths, traces bounded");
 }
+
+// ── Hazard Probe Tests ──────────────────────────────────────────────
+//
+// A half-plane danger arena: danger biome for x < 0, food-rich for
+// x ≥ 0. Agents start 10 units inside the danger side, facing +Z
+// (parallel to the boundary, so straight-line walking never exits on
+// its own). Measured: hazard-exit latency (first tick with x ≥ 0,
+// alive, without dying first) and deaths. These pin the
+// danger-avoidance baseline the same way the mirrored steering probe
+// pins food-approach.
+
+/// Distance agents start inside the danger half-plane. Far enough that
+/// exit requires sustained directed movement (~15 ticks of straight-east
+/// walking at default speed), close enough that random walks exit within
+/// the episode often enough to measure a latency distribution.
+const HAZARD_PROBE_START_DEPTH: f32 = 10.0;
+/// Episode cap in physics ticks. At hazard damage 0.5/tick (rate 1.0 ×
+/// integrity_scale 0.5) an agent that never exits dies at tick 200, so
+/// 600 ticks cleanly separates "exited", "died", and "wandered".
+const HAZARD_PROBE_EPISODE_TICKS: u64 = 600;
+/// Position sampling interval — bounds latency resolution and readback
+/// cost.
+const HAZARD_PROBE_SAMPLE_TICKS: u32 = 5;
+/// Episodes per measurement.
+const HAZARD_PROBE_EPISODES: usize = 3;
+
+/// Outcome of one hazard episode for one agent.
+struct HazardEpisodeOutcome {
+    exit_latency_ticks: Option<u64>,
+    died: bool,
+}
+
+/// Run one hazard episode and classify each agent's outcome.
+fn run_hazard_episode(arena: &mut ProbeArena, start_tick: u64) -> Vec<HazardEpisodeOutcome> {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_DEATH_COUNT, P_POS_X};
+
+    let initial_state = arena.kernel.read_full_state_blocking().to_vec();
+    let initial_deaths: Vec<f32> = (0..PROBE_AGENT_COUNT)
+        .map(|a| initial_state[a * PHYS_STRIDE + P_DEATH_COUNT])
+        .collect();
+
+    let mut outcomes: Vec<HazardEpisodeOutcome> = (0..PROBE_AGENT_COUNT)
+        .map(|_| HazardEpisodeOutcome {
+            exit_latency_ticks: None,
+            died: false,
+        })
+        .collect();
+
+    let mut ticks_done: u64 = 0;
+    while ticks_done < HAZARD_PROBE_EPISODE_TICKS {
+        arena
+            .kernel
+            .dispatch_batch(start_tick + ticks_done, HAZARD_PROBE_SAMPLE_TICKS);
+        ticks_done += u64::from(HAZARD_PROBE_SAMPLE_TICKS);
+        let state = arena.kernel.read_full_state_blocking();
+        for (a, outcome) in outcomes.iter_mut().enumerate() {
+            if outcome.died || outcome.exit_latency_ticks.is_some() {
+                continue;
+            }
+            if state[a * PHYS_STRIDE + P_DEATH_COUNT] > initial_deaths[a] {
+                outcome.died = true;
+            } else if state[a * PHYS_STRIDE + P_POS_X] >= 0.0 {
+                outcome.exit_latency_ticks = Some(ticks_done);
+            }
+        }
+    }
+    outcomes
+}
+
+/// Build the half-plane danger arena on top of the standard probe
+/// arena: biome column < 128 (x < 0) is danger, the rest food-rich;
+/// agents are re-positioned to x = −HAZARD_PROBE_START_DEPTH, spread
+/// along z.
+fn build_hazard_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
+    let mut arena = build_probe_arena(brain, brain_seed);
+    let mut biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    for row in 0..PROBE_BIOME_RES {
+        for col in 0..PROBE_BIOME_RES / 2 {
+            biomes[row * PROBE_BIOME_RES + col] = 2;
+        }
+    }
+    arena.biomes = biomes;
+    for (index, agent) in arena.agent_data.iter_mut().enumerate() {
+        let z_spread = (index as f32 - (PROBE_AGENT_COUNT as f32 - 1.0) / 2.0) * 8.0;
+        agent.0 = glam::Vec3::new(-HAZARD_PROBE_START_DEPTH, PROBE_AGENT_Y, z_spread);
+    }
+    arena.reset_bodies();
+    arena
+}
+
+/// Baseline: untrained agents in the hazard arena. Prints exit
+/// fraction, mean exit latency, and death fraction; asserts structural
+/// sanity plus pinned falsifiable bands. Re-pin the bands when
+/// workstream 0002 improves escape (the same protocol as the steering
+/// probes).
+#[test]
+fn hazard_probe_exit_latency_baseline() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig {
+        brain_tick_stride: 1,
+        vision_stride: 1,
+        ..Default::default()
+    };
+    let mut arena = build_hazard_arena(&brain, 37);
+
+    let mut exits: Vec<u64> = Vec::new();
+    let mut deaths = 0_usize;
+    let mut tick_cursor = 0_u64;
+    for episode in 0..HAZARD_PROBE_EPISODES {
+        if episode > 0 {
+            arena.reset_bodies();
+        }
+        for outcome in run_hazard_episode(&mut arena, tick_cursor) {
+            if let Some(latency) = outcome.exit_latency_ticks {
+                exits.push(latency);
+            }
+            if outcome.died {
+                deaths += 1;
+            }
+        }
+        tick_cursor += HAZARD_PROBE_EPISODE_TICKS;
+    }
+
+    let trials = HAZARD_PROBE_EPISODES * PROBE_AGENT_COUNT;
+    let exit_fraction = exits.len() as f64 / trials as f64;
+    let death_fraction = deaths as f64 / trials as f64;
+    let mean_latency = if exits.is_empty() {
+        f64::from(u32::MAX)
+    } else {
+        exits.iter().sum::<u64>() as f64 / exits.len() as f64
+    };
+    eprintln!(
+        "hazard probe baseline: trials={trials} exit_fraction={exit_fraction:.3} \
+         mean_exit_latency={mean_latency:.1} death_fraction={death_fraction:.3}"
+    );
+
+    // Pinned baseline recorded 2026-06-12 on macOS/Metal (wgpu adapter):
+    // raw exit_fraction=0.104, mean_exit_latency=145.0, death_fraction=0.896
+    // (5/48 exits, mean of exits 145, 43/48 deaths). ±50% relative bands
+    // (per task spec) — generous for adapter noise, tight enough for real
+    // avoidance gains from workstream 0002 to trip. Re-pin on improvement
+    // (same protocol as steering probes).
+    assert!(
+        (0.052..=0.156).contains(&exit_fraction),
+        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.052, 0.156] — \
+         re-pin if 0002 improves escape"
+    );
+    assert!(
+        (72.5..=217.5).contains(&mean_latency),
+        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [72.5, 217.5] — \
+         re-pin if 0002 improves escape"
+    );
+    assert!(
+        (0.448..=1.344).contains(&death_fraction),
+        "hazard death_fraction {death_fraction:.3} outside pinned band [0.448, 1.344] — \
+         re-pin if 0002 improves escape"
+    );
+
+    // Structural sanity: every trial resolves into exit, death, or
+    // timeout.
+    assert!(exits.len() + deaths <= trials, "double-counted outcomes");
+    // Falsifiable floor: the arena must actually be dangerous — if
+    // nothing ever dies and everything exits instantly, the geometry
+    // broke.
+    assert!(
+        death_fraction > 0.0 || mean_latency > 50.0,
+        "arena is not hazardous: death_fraction={death_fraction}, \
+         mean_exit_latency={mean_latency}"
+    );
+}

@@ -1918,6 +1918,39 @@ fn count_food_pixels(vision_color: &[f32]) -> usize {
         .count()
 }
 
+/// The telemetry sensory tail must expose the packed non-visual senses
+/// (velocity 3, facing 3, angular 1, energy, integrity, energy delta,
+/// integrity delta, then 4 touch contacts × 4) so probes can assert on
+/// touch contacts and interoception without raw buffer plumbing.
+#[test]
+fn telemetry_exposes_non_visual_sensory_tail() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = probe_brain_config();
+    let mut arena = build_probe_arena(&brain, 31);
+    arena.kernel.dispatch_batch(0, 1);
+
+    let telemetry = arena.kernel.read_agent_telemetry_blocking(0);
+    let layout = xagent_brain::buffers::BrainLayout::new(brain.vision_width, brain.vision_height);
+    let expected_len =
+        layout.sensory_stride - layout.vision_color_count - layout.vision_depth_count;
+    assert_eq!(
+        telemetry.sensory_non_visual.len(),
+        expected_len,
+        "non-visual tail length must match the layout"
+    );
+    // Energy is packed normalized at index 7 of the tail and the agent
+    // is alive at full-ish energy after one tick.
+    let energy_normalized = telemetry.sensory_non_visual[7];
+    assert!(
+        (0.5..=1.0).contains(&energy_normalized),
+        "normalized energy {energy_normalized} not in (0.5, 1.0] after one tick"
+    );
+}
+
 /// Information-path check: the probe geometry must actually be visible.
 /// After one vision pass, every probe agent must have at least one ray
 /// reporting the food color. If this fails, the arena geometry (distance,

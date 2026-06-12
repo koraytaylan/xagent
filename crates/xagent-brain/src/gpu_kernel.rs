@@ -192,6 +192,11 @@ struct TelemetryStagingBuffers {
 #[derive(Clone, Debug)]
 pub struct AgentTelemetry {
     pub vision_color: Vec<f32>,
+    /// Non-visual sensory tail exactly as packed by `phase_vision_senses`:
+    /// [velocity(3), facing(3), angular(1), energy, integrity,
+    ///  energy_delta, integrity_delta, touch(4 contacts × 4)].
+    /// One vision batch stale, like all of `sensory_buffer`.
+    pub sensory_non_visual: Vec<f32>,
     pub motor_fwd: f32,
     pub motor_turn: f32,
     pub mean_attenuation: f32,
@@ -1901,6 +1906,8 @@ impl GpuKernel {
             &mut sensory,
         );
         let vision_color: Vec<f32> = sensory[..self.layout.vision_color_count].to_vec();
+        let non_visual_base = self.layout.vision_color_count + self.layout.vision_depth_count;
+        let sensory_non_visual: Vec<f32> = sensory[non_visual_base..].to_vec();
 
         // Decision: read motor outputs (last 4 floats of DECISION_STRIDE)
         let dec_offset = (i * DECISION_STRIDE * 4) as u64;
@@ -1967,6 +1974,7 @@ impl GpuKernel {
 
         AgentTelemetry {
             vision_color,
+            sensory_non_visual,
             motor_fwd,
             motor_turn,
             mean_attenuation,
@@ -2115,6 +2123,8 @@ impl GpuKernel {
         let sensory_data = self.telemetry_staging.sensory.slice(..).get_mapped_range();
         let sensory: &[f32] = bytemuck::cast_slice(&sensory_data);
         let vision_color: Vec<f32> = sensory[..self.layout.vision_color_count].to_vec();
+        let non_visual_base = self.layout.vision_color_count + self.layout.vision_depth_count;
+        let sensory_non_visual: Vec<f32> = sensory[non_visual_base..].to_vec();
         drop(sensory_data);
         self.telemetry_staging.sensory.unmap();
 
@@ -2165,6 +2175,7 @@ impl GpuKernel {
 
         let tel = AgentTelemetry {
             vision_color,
+            sensory_non_visual,
             motor_fwd,
             motor_turn,
             mean_attenuation,

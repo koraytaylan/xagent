@@ -377,6 +377,24 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
     }
 
+    // Terminal lesson: the transition into death is the one experience the
+    // within-lifetime learner must never miss. Apply one final TD update
+    // with the maximum negative error through the eligibility traces the
+    // dying life accumulated — then clear them below so no credit leaks
+    // into the next life. Without this, dying carries zero learning signal
+    // and the full-energy respawn makes death read as a free heal.
+    let terminal_value_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
+    let terminal_forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
+    let terminal_turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
+    brain_state[brain_base + O_VALUE_BIAS] += CRITIC_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
+    brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_forward_bias_trace;
+    brain_state[brain_base + O_ACT_BIASES + 1u] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_turn_bias_trace;
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        brain_state[brain_base + O_VALUE_WEIGHTS + i] += CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
+        brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
+        brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];
+    }
+
     // Reset TD transients: eligibility traces and the previous-state value
     // are episodic — credit must never leak across the death boundary.
     // The value weights themselves are learned knowledge and survive.

@@ -297,6 +297,13 @@ const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
 // of MAX_HOMEOSTATIC_DELTA on the reward side).
 const MAX_TD_ERROR: f32 = 1.0;
 
+// Terminal TD error applied through the dying episode's eligibility
+// traces at the moment of death, before they are cleared for the next
+// life. Death must be the single worst lesson the learner can receive,
+// but never stronger than the per-transition bound that protects
+// against artifacts.
+const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Buffer bindings — 13 storage + 2 uniform, single bind group
 // (binding 13 is intentionally unused; the numbering of the remaining

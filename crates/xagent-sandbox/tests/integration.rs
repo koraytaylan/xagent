@@ -2432,6 +2432,87 @@ fn td_critic_tracks_metabolic_drain() {
     );
 }
 
+/// Dying must apply one terminal TD update (δ = −MAX_TD_ERROR) through
+/// the dying life's eligibility traces before they are cleared. With
+/// preset traces the kick is exactly computable:
+/// Δvalue_bias = 0.01·(−1)·5 = −0.05 and Δactor_bias = 0.1·(−1)·1 =
+/// −0.10. The post-respawn brain tick in the same cycle applies δ
+/// through freshly zeroed traces, so it cannot move the biases — any
+/// deviation from the exact kick is a real defect.
+#[test]
+fn death_applies_terminal_td_update_through_traces() {
+    use xagent_brain::buffers::{
+        BrainLayout, ENCODED_DIMENSION, O_ACT_BIASES, O_PREDICTOR_CONTEXT_WEIGHT, O_TRACE_BIASES,
+        O_VALUE_BIAS, PHYS_STRIDE, PREDICTOR_DIMENSION, P_DEATH_COUNT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Hazard damage is rate (1.0) × integrity_scale per physics tick;
+    /// 200 wipes the full 100 integrity in a single tick inside a
+    /// danger biome.
+    const ONE_TICK_KILL_INTEGRITY_SCALE: f32 = 200.0;
+
+    let brain = BrainConfig {
+        integrity_scale: ONE_TICK_KILL_INTEGRITY_SCALE,
+        ..probe_brain_config()
+    };
+    // Warm-up happens on safe biome; then the world flips to all-danger.
+    let mut arena = build_probe_arena(&brain, 29);
+    arena.kernel.dispatch_batch(0, 1);
+    arena.biomes = vec![2_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    arena.reset_bodies();
+
+    let layout = BrainLayout::new(brain.vision_width, brain.vision_height);
+    let tail_base = layout.feature_count * ENCODED_DIMENSION
+        + ENCODED_DIMENSION
+        + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+    let value_bias_offset = tail_base + (O_VALUE_BIAS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let trace_biases_offset = tail_base + (O_TRACE_BIASES - O_PREDICTOR_CONTEXT_WEIGHT);
+    let act_biases_offset = tail_base + (O_ACT_BIASES - O_PREDICTOR_CONTEXT_WEIGHT);
+
+    let agent = 0_u32;
+    let mut state = arena.kernel.read_agent_state(agent);
+    state.brain_state[value_bias_offset] = 0.5;
+    state.brain_state[trace_biases_offset] = 5.0;
+    state.brain_state[trace_biases_offset + 1] = 1.0;
+    state.brain_state[trace_biases_offset + 2] = 1.0;
+    let forward_bias_before = state.brain_state[act_biases_offset];
+    let turn_bias_before = state.brain_state[act_biases_offset + 1];
+    arena.kernel.write_agent_state(agent, &state);
+
+    // This tick kills (integrity 100 → 0), respawns, and runs one
+    // post-respawn brain tick whose traces were just zeroed — so the
+    // only bias change in this tick is the terminal kick.
+    arena.kernel.dispatch_batch(1, 1);
+
+    let physics = arena.kernel.read_full_state_blocking();
+    assert!(
+        physics[agent as usize * PHYS_STRIDE + P_DEATH_COUNT] >= 1.0,
+        "agent did not die in the one-tick-kill arena"
+    );
+
+    let after = arena.kernel.read_agent_state(agent);
+    let value_bias = after.brain_state[value_bias_offset];
+    let forward_bias = after.brain_state[act_biases_offset];
+    let turn_bias = after.brain_state[act_biases_offset + 1];
+    assert!(
+        (value_bias - 0.45).abs() < 1e-3,
+        "value bias {value_bias} != 0.45: terminal critic kick missing or wrong"
+    );
+    assert!(
+        (forward_bias - (forward_bias_before - 0.10)).abs() < 1e-3,
+        "forward bias {forward_bias} (was {forward_bias_before}): terminal actor kick missing"
+    );
+    assert!(
+        (turn_bias - (turn_bias_before - 0.10)).abs() < 1e-3,
+        "turn bias {turn_bias} (was {turn_bias_before}): terminal actor kick missing"
+    );
+}
+
 /// Eligibility traces are episodic: after deaths they must have been reset
 /// (and rebuilt only from post-respawn experience), so they stay bounded by
 /// the geometric trace limit instead of accumulating across lives.
@@ -2643,24 +2724,24 @@ fn hazard_probe_exit_latency_baseline() {
     );
 
     // Pinned baseline recorded 2026-06-12 on macOS/Metal (wgpu adapter):
-    // raw exit_fraction=0.104, mean_exit_latency=145.0, death_fraction=0.896
-    // (5/48 exits, mean of exits 145, 43/48 deaths). ±50% relative bands
+    // raw exit_fraction=0.188, mean_exit_latency=137.2, death_fraction=0.812
+    // (9/48 exits, mean of exits 137.2, 39/48 deaths). ±50% relative bands
     // (per task spec) — generous for adapter noise, tight enough for real
     // avoidance gains from workstream 0002 to trip. Re-pin on improvement
     // (same protocol as steering probes).
     assert!(
-        (0.052..=0.156).contains(&exit_fraction),
-        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.052, 0.156] — \
+        (0.094..=0.282).contains(&exit_fraction),
+        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.094, 0.282] — \
          re-pin if 0002 improves escape"
     );
     assert!(
-        (72.5..=217.5).contains(&mean_latency),
-        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [72.5, 217.5] — \
+        (68.6..=205.8).contains(&mean_latency),
+        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [68.6, 205.8] — \
          re-pin if 0002 improves escape"
     );
     assert!(
-        (0.448..=1.344).contains(&death_fraction),
-        "hazard death_fraction {death_fraction:.3} outside pinned band [0.448, 1.344] — \
+        (0.406..=1.218).contains(&death_fraction),
+        "hazard death_fraction {death_fraction:.3} outside pinned band [0.406, 1.218] — \
          re-pin if 0002 improves escape"
     );
 

@@ -94,10 +94,23 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         s_features[fi] = sensory_buffer[s_base + fac_offset + 2u]; fi = fi + 1u;
         let ang_offset = fac_offset + 3u;
         s_features[fi] = sensory_buffer[s_base + ang_offset]; fi = fi + 1u;
-        s_features[fi] = sensory_buffer[s_base + ang_offset + 1u]; fi = fi + 1u;
-        s_features[fi] = sensory_buffer[s_base + ang_offset + 2u]; fi = fi + 1u;
-        s_features[fi] = sensory_buffer[s_base + ang_offset + 3u]; fi = fi + 1u;
-        s_features[fi] = sensory_buffer[s_base + ang_offset + 4u]; fi = fi + 1u;
+        // Interoception is read same-cycle from physics_state rather than
+        // from the batch-lagged sensory_buffer: pain and satiety must be
+        // felt at decision time, not one vision batch later. Same-cycle
+        // physics reads from thread 0 are the established pattern in
+        // coop_habituate_homeo. The packed sensory_buffer slots remain for
+        // CPU readback; the brain just stops consuming them. The deltas
+        // cover the last physics sub-tick, which is the one that contains
+        // any eat event or hazard damage from this cycle.
+        let interoception_base = agent_id * PHYS_STRIDE;
+        let current_max_energy = max(physics_state[interoception_base + P_MAX_ENERGY], 1e-6);
+        let current_max_integrity = max(physics_state[interoception_base + P_MAX_INTEGRITY], 1e-6);
+        let current_energy = physics_state[interoception_base + P_ENERGY];
+        let current_integrity = physics_state[interoception_base + P_INTEGRITY];
+        s_features[fi] = current_energy / current_max_energy; fi = fi + 1u;
+        s_features[fi] = current_integrity / current_max_integrity; fi = fi + 1u;
+        s_features[fi] = current_energy - physics_state[interoception_base + P_PREV_ENERGY]; fi = fi + 1u;
+        s_features[fi] = current_integrity - physics_state[interoception_base + P_PREV_INTEGRITY]; fi = fi + 1u;
         let touch_offset = ang_offset + 5u;
         for (var t: u32 = 0u; t < 4u; t = t + 1u) {
             let to = touch_offset + t * 4u;

@@ -617,7 +617,7 @@ Death detection and respawn run entirely inside the kernel — no per-death Rust
 2. **Spawn search**: up to 50 GPU-RNG samples pick a position in a non-Danger biome; if every attempt hits Danger the `!found` branch reuses the attempt-0 sample — it re-draws `(cx, cz)` with RNG seed `tick * 256 + agent_id` (identical to attempt 0) and skips the biome check entirely, so the agent can respawn in a Danger cell (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 3. **Reset physics row**: full energy, full integrity, zero velocity, facing +Z, alive flag restored. Death count is incremented; `food_count`, `ticks_alive`, and `last_death_tick` are preserved through the reset so CPU readback can attribute the death.
 4. **Trauma**: all pattern reinforcement values are multiplied by `0.5` in-place. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (which gates on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. The halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest survive.
-5. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed, attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, and action history zeroed.
+5. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed, attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, and the TD eligibility traces and previous-state value zeroed (the policy and value-head weights survive — they are learned knowledge, not episodic state).
 
 The CPU side learns about deaths only by reading `physics_state[P_DEATH_COUNT]` on the next state readback. When the count climbs, the sandbox updates `longest_life`, increments `Agent::death_count`, increments `Agent::generation`, and resets `life_start_tick`. There is no CPU-side respawn cooldown — the kernel respawns in the same tick the death is detected.
 
@@ -938,12 +938,12 @@ Brain state is preserved across deaths — it lives in GPU buffers and is mutate
 
 1. **Random respawn position** — `phase_death.wgsl` samples up to 50 biome positions before settling on a non-Danger spawn (falling back to the attempt-0 sample — RNG seed `tick * 256 + agent_id`, without the biome check — if all sampled cells are Danger, so the agent can reappear in a Danger cell). The agent reappears at an unpredictable location.
 2. **Memory trauma** — `O_PAT_REINF[i] *= 0.5` for every pattern slot. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off on the next tick. The halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest survive. The respawned agent retains learned representations but with weaker confidence.
-3. **Homeostasis + habituation + history reset** — the three-timescale gradient EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (fresh perceptual context), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the action history is zeroed. The respawned agent has no homeostatic memory of the previous life.
+3. **Homeostasis + habituation + credit reset** — the three-timescale gradient EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (fresh perceptual context), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the TD eligibility traces and previous-state value are zeroed. The respawned agent has no homeostatic memory of the previous life, and credit never leaks across the death boundary.
 
-The credit chain during danger encounters is unchanged from the pre-fused design:
+The credit chain during danger encounters:
 
 ```
-damage onset (gradient spike, 3× pain amplified) → death event (sudden prediction-error spike → halved reinforcement of currently-active patterns)
+damage onset (negative per-tick homeostatic delta → negative TD error blames recently eligible state-actions) → death event (sudden prediction-error spike → halved reinforcement of currently-active patterns)
 ```
 
 Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), delivers the strongest negative learning signal (halved reinforcement weakens whatever patterns the brain had associated with the lethal context), and the brain's core drive is minimizing prediction error.
@@ -1054,7 +1054,7 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 - **Per-agent kernel workgroup**: 256 threads per agent in `kernel_tick.wgsl`. Cooperative reductions (encoder dot products, similarity scoring, top-K) are amortized inside the workgroup.
 - **Agent-agent collision**: O(N²) pairwise check in `phase_collision.wgsl`, run once per global pass. At 100 agents that's 9,900 pairwise checks per global pass — trivial on GPU.
 - **Vision raycasting**: O(VISION_RAYS) per agent per global pass; with the default 48 rays and 100 agents that's 4,800 rays per global pass.
-- **Persistent GPU memory**: `BrainLayout::brain_stride + PATTERN_STRIDE + HISTORY_STRIDE` f32s per agent, plus the physics row and food state. The total is well under a few MB for the default config.
+- **Persistent GPU memory**: `BrainLayout::brain_stride + PATTERN_STRIDE + BrainLayout::sensory_stride + DECISION_STRIDE` f32s per agent, plus the physics row and food state. The total is well under a few MB for the default config.
 
 ### Vertex Buffer Rebuild Cost (CPU side)
 

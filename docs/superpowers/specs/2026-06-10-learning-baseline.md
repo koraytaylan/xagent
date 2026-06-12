@@ -150,13 +150,17 @@ Reconstruction was neutral-to-slightly-negative at every rate and never
 cleared the "improves over Phase 1" bar, so it was reverted (see the plan's
 "Phase 2 outcome" section for the mechanism analysis).
 
-> **Caveat (Phase 3).** This section's "TD(λ) already extracts the
-> food-direction signal" conclusion rested on the **confounded** 0.643
-> directional number. The confound-free probe shows directional steering at
-> chance, so the encoder/representation question is *not* settled — it is
-> re-opened under correct measurement. Reconstruction-as-implemented was
-> still neutral-to-negative, so reverting it remains correct; but "encoder is
-> not the binding constraint" no longer follows.
+> **Caveat (Phase 3) and resolution.** This section's "TD(λ) already
+> extracts the food-direction signal" conclusion rested on the
+> **confounded** 0.643 directional number, which briefly re-opened the
+> encoder question under the honest probe. Two follow-up measurements then
+> settled it: the `encoder_food_side_separability_diagnostic` probe shows
+> the random encoder *preserves* food-left/right separability (≈ 4× margin
+> over within-class nuisance in angular distance — see the Phase 3 section
+> for the numbers), and re-testing this reconstruction objective
+> against the honest mirrored gate landed at exactly chance (0.500). The
+> revert stands, and the encoder is confirmed not to be the binding
+> constraint — see the Phase 3 section for the measurements.
 
 ## Phase 3 (vision acuity) — range-visibility fixed; directional confound found
 
@@ -204,11 +208,22 @@ episode (`learning_probe_mirrored_steering_is_chance`):
 More training episodes do not move the mirrored number (120 → 0.523,
 240 → 0.516). **Genuine vision-conditional steering — "turn toward the side
 where food is seen" — is not being learned**, at either resolution. The
-likely cause is the one issue #13 and both reviews named: a random-projection
-encoder does not make "food-left" and "food-right" linearly separable for the
-policy's readout, so a constant bias is learnable but a conditional response
-is not. This re-opens the encoder/representation problem under a correct
-measurement (Phase 2 had dismissed it using the confounded metric).
+hypothesis this initially suggested — the one issue #13 and both reviews
+named — was that a random-projection encoder does not make "food-left" and
+"food-right" linearly separable for the policy's readout, so a constant bias
+is learnable but a conditional response is not. Two follow-up measurements
+**refuted** that hypothesis: the
+`encoder_food_side_separability_diagnostic` probe shows the random encoder
+*preserves* the food-side direction — comparing **angular distances**
+(acos of the cosine similarity), right-vs-left scenes are ≈ 0.085 rad apart
+(cosine 0.9964) while two same-side scenes at slightly different distances
+are ≈ 0.020 rad apart (cosine 0.9998), an ≈ 4× between/within margin — and
+re-testing tied-weight reconstruction against the honest mirrored gate
+landed at exactly chance (0.500), so a "better" encoder does not produce
+steering either. The open
+bottleneck is therefore the **credit/learning dynamics under movement
+nuisance** (the bearing the credit should explain changes as the agent
+moves, while the reward stays sparse and delayed), not representability.
 
 **Net:** Phase 3 delivers the information substrate (food visible at range)
 and, more valuably, a confound-free directional probe that correctly reports

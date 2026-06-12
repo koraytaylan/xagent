@@ -131,11 +131,11 @@ Each stage runs as a cooperative function inside the fused kernel, with all 256 
 
 3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
 
-4. **Recall Score** — Computes cosine similarity between the habituated state and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
+4. **Recall Score** — Computes cosine similarity between the encoded (pre-habituation) state and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
 
 5. **Recall Top-K** — Selects the 16 most similar patterns from the score vector and updates their recall metadata (timestamps, access counts).
 
-6. **Predict & Act** — Computes prediction error from the previous tick's prediction against the current encoded state. Performs credit assignment over recent action history weighted by homeostatic gradient. Evaluates the linear policy with prospection blending (predicted-future state + top-recalled-memory blend), applies exploration noise (adaptive rate 10–85%) and motor fatigue dampening (repetitive commands are attenuated, forcing loop-breaking).
+6. **Predict & Act** — Computes prediction error from the previous tick's prediction against the current habituated state. Runs TD(λ) credit assignment: a linear value head estimates the discounted homeostatic return from the encoded state, and its TD error updates the critic and both policy channels through per-dimension eligibility traces. Evaluates the linear policy on the encoded state, blends in valence-weighted motor commands from recalled memories, applies exploration noise (adaptive rate 10–85%), klinotaxis turn modulation, and motor fatigue dampening (spatially stagnant agents are attenuated, forcing loop-breaking).
 
 7. **Learn & Store** — Predictor gradient descent step, encoder Hebbian weight adaptation, memory reinforcement for patterns co-occurring with low error, pattern storage to the weakest slot, and per-pattern decay.
 
@@ -183,7 +183,7 @@ The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/
 - Sensory apparatus: 8×6 raycast vision (ray step 1.0, detects terrain, food, and other agents), touch contacts (up to 4 encoded into brain — the GPU vision pass currently emits food and other-agent contacts; terrain-edge and hazard tags are reserved in the shared contract but not yet emitted), proprioception, interoception
 - **Agent vision**: ray marching detects terrain (biome-colored), food items (lime green `[0.70, 0.95, 0.20, 1.0]`), and other agents (magenta `[0.9, 0.2, 0.6, 1.0]`) in the visual field
 - **Agent-agent collision**: physical collision resolution pushes overlapping agents apart (2-unit minimum separation)
-- Death occurs when energy or integrity reaches zero → respawn on the GPU with brain state preserved (encoder/predictor weights and pattern memory survive; only homeostasis, habituation, and history are reset — see *Brain Persistence & Death Guardrails* below)
+- Death occurs when energy or integrity reaches zero → respawn on the GPU with brain state preserved (encoder/predictor weights, policy and value-head weights, and pattern memory survive; only homeostasis, habituation, and the TD credit transients — eligibility traces and the previous-state value — are reset — see *Brain Persistence & Death Guardrails* below)
 
 ### Brain Persistence & Death Guardrails
 
@@ -191,7 +191,7 @@ Brain state lives in GPU buffers and is preserved across deaths. When `phase_dea
 
 1. **Random respawn position** — the shader tries up to 50 non-Danger biome samples; if all 50 attempts land in Danger biomes, the `!found` branch reuses the attempt-0 sample — it re-draws with RNG seed `tick * 256 + agent_id` (identical to attempt 0) and spawns there without re-checking the biome, so an agent that is wholly Danger-blocked can reappear in a Danger cell (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
 2. **Memory trauma** — pattern reinforcement values are halved in-place (`O_PAT_REINF[i] *= 0.5`). The death pass itself does not change any pattern's `O_PAT_ACTIVE` flag, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. Instead, halved reinforcement means subsequent decay (`O_PAT_REINF -= effective_rate` per brain cycle) reaches the `<= 0.0` deactivation point sooner for the weakest patterns; strongest survive. This models the cognitive cost of catastrophic discontinuity without wiping the brain.
-3. **Homeostasis + habituation + history reset** — the three-timescale homeostasis EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (so the next tick's perception starts fully un-attenuated), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and action history is zeroed. The respawned agent has no homeostatic memory of the previous life but keeps its encoder/predictor weights and pattern memory.
+3. **Homeostasis + habituation + credit reset** — the three-timescale homeostasis EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (so the next tick's perception starts fully un-attenuated), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the TD eligibility traces and previous-state value estimate are zeroed — credit never leaks across the death boundary. The respawned agent has no homeostatic memory of the previous life but keeps its encoder/predictor weights, its policy and value-head weights, and pattern memory.
 
 Suicide prevention is emergent: death produces a sudden, massive prediction error that the brain is wired to minimize, and the trauma pass weakens whatever patterns the brain had associated with the lethal context.
 

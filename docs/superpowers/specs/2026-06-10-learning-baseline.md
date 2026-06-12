@@ -156,7 +156,8 @@ cleared the "improves over Phase 1" bar, so it was reverted (see the plan's
 > encoder question under the honest probe. Two follow-up measurements then
 > settled it: the `encoder_food_side_separability_diagnostic` probe shows
 > the random encoder *preserves* food-left/right separability (≈ 4× margin
-> over within-class nuisance), and re-testing this reconstruction objective
+> over within-class nuisance in angular distance — see the Phase 3 section
+> for the numbers), and re-testing this reconstruction objective
 > against the honest mirrored gate landed at exactly chance (0.500). The
 > revert stands, and the encoder is confirmed not to be the binding
 > constraint — see the Phase 3 section for the measurements.
@@ -213,11 +214,13 @@ named — was that a random-projection encoder does not make "food-left" and
 is learnable but a conditional response is not. Two follow-up measurements
 **refuted** that hypothesis: the
 `encoder_food_side_separability_diagnostic` probe shows the random encoder
-*preserves* the food-side direction (between-class separation, cosine
-0.9964, is ≈ 4× the within-class nuisance of two same-side scenes at
-slightly different distances, cosine 0.9998), and re-testing tied-weight
-reconstruction against the honest mirrored gate landed at exactly chance
-(0.500) — a "better" encoder does not produce steering either. The open
+*preserves* the food-side direction — comparing **angular distances**
+(acos of the cosine similarity), right-vs-left scenes are ≈ 0.085 rad apart
+(cosine 0.9964) while two same-side scenes at slightly different distances
+are ≈ 0.020 rad apart (cosine 0.9998), an ≈ 4× between/within margin — and
+re-testing tied-weight reconstruction against the honest mirrored gate
+landed at exactly chance (0.500), so a "better" encoder does not produce
+steering either. The open
 bottleneck is therefore the **credit/learning dynamics under movement
 nuisance** (the bearing the credit should explain changes as the agent
 moves, while the reward stays sparse and delayed), not representability.

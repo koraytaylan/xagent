@@ -2757,3 +2757,85 @@ fn hazard_probe_exit_latency_baseline() {
          mean_exit_latency={mean_latency}"
     );
 }
+
+/// Standing in a danger biome must produce a TOUCH_HAZARD contact in
+/// the sensory buffer: zero planar direction (the hazard is underfoot),
+/// fixed intensity, tag 3/4. Mirrors the CPU reference in
+/// agent/senses.rs.
+#[test]
+fn gpu_touch_emits_hazard_contact_in_danger_biome() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = probe_brain_config();
+    let mut arena = build_probe_arena(&brain, 41);
+    arena.biomes = vec![2_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    arena.reset_bodies();
+    arena.kernel.dispatch_batch(0, 1);
+
+    let telemetry = arena.kernel.read_agent_telemetry_blocking(0);
+    // Touch slots start after [vel(3), facing(3), angular(1),
+    // interoception(4)] = 11.
+    let touch_base = 11;
+    let first_slot = &telemetry.sensory_non_visual[touch_base..touch_base + 4];
+    assert!(
+        (first_slot[3] - 0.75).abs() < 1e-3,
+        "first touch slot tag {} != 0.75 (TOUCH_HAZARD/4) — hazard contact missing",
+        first_slot[3]
+    );
+    assert!(
+        (first_slot[2] - 0.5).abs() < 1e-3,
+        "hazard contact intensity {} != 0.5",
+        first_slot[2]
+    );
+    assert!(
+        first_slot[0].abs() < 1e-6 && first_slot[1].abs() < 1e-6,
+        "hazard contact direction must be planar zero, got ({}, {})",
+        first_slot[0],
+        first_slot[1]
+    );
+}
+
+/// Standing within TOUCH_EDGE_RANGE of a world wall must produce a
+/// TOUCH_TERRAIN_EDGE contact pointing inward with closeness intensity.
+#[test]
+fn gpu_touch_emits_terrain_edge_contact_near_wall() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = probe_brain_config();
+    let mut arena = build_probe_arena(&brain, 43);
+    // World half-bound (WC_WORLD_HALF_BOUND = ws/2 - 1) gives the
+    // effective clamp; 1.5 units from the +X effective wall (pos = 125.5
+    // yields dist 1.5). Matches intensity calc in GPU touch code.
+    arena.agent_data[0].0 = glam::Vec3::new(125.5, PROBE_AGENT_Y, 0.0);
+    arena.reset_bodies();
+    arena.kernel.dispatch_batch(0, 1);
+
+    let telemetry = arena.kernel.read_agent_telemetry_blocking(0);
+    let touch_base = 11;
+    let mut edge_slot: Option<&[f32]> = None;
+    for contact in 0..4 {
+        let slot =
+            &telemetry.sensory_non_visual[touch_base + contact * 4..touch_base + contact * 4 + 4];
+        if (slot[3] - 0.5).abs() < 1e-3 {
+            edge_slot = Some(slot);
+            break;
+        }
+    }
+    let slot = edge_slot.expect("no TOUCH_TERRAIN_EDGE contact found near the +X wall");
+    assert!(
+        slot[0] < -0.9,
+        "edge contact must point inward (−X), got direction x = {}",
+        slot[0]
+    );
+    assert!(
+        (slot[2] - 0.5).abs() < 0.05,
+        "edge intensity {} != ~0.5 at 1.5 units from a 3-unit range wall",
+        slot[2]
+    );
+}

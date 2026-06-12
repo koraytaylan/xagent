@@ -229,6 +229,18 @@ fn phase_vision_senses(tid: u32) {
         sensory_buffer[touch_base + i] = 0.0;
     }
 
+    // Hazard contact first: present-moment damage must never be evicted by
+    // lower-stakes contacts when the four slots fill. Zero planar direction
+    // (the hazard is the ground underfoot), fixed intensity — mirrors the
+    // CPU reference in agent/senses.rs.
+    if (sample_biome(pos.x, pos.z) == BIOME_DANGER) {
+        sensory_buffer[touch_base]      = 0.0;
+        sensory_buffer[touch_base + 1u] = 0.0;
+        sensory_buffer[touch_base + 2u] = TOUCH_HAZARD_INTENSITY;
+        sensory_buffer[touch_base + 3u] = f32(TOUCH_HAZARD) / 4.0;
+        touch_count = 1u;
+    }
+
     let self_cx = cell_coord(pos.x) + grid_offset;
     let self_cz = cell_coord(pos.z) + grid_offset;
 
@@ -308,5 +320,32 @@ fn phase_vision_senses(tid: u32) {
             }
         }
         if touch_count >= MAX_TOUCH_CONTACTS { break; }
+    }
+
+    // Terrain-edge contacts: the world boundary pushes back. Direction
+    // points inward (away from the wall), intensity rises as the wall
+    // nears — mirrors the CPU reference in agent/senses.rs.
+    let world_half_for_touch = wc_f32(WC_WORLD_HALF_BOUND);
+    // `var` (not `let`): naga requires a mutable binding for dynamic
+    // indexing.
+    var wall_distances = array<f32, 4>(
+        pos.x + world_half_for_touch,   // distance to the −X wall
+        world_half_for_touch - pos.x,   // distance to the +X wall
+        pos.z + world_half_for_touch,   // distance to the −Z wall
+        world_half_for_touch - pos.z,   // distance to the +Z wall
+    );
+    var inward_x = array<f32, 4>(1.0, -1.0, 0.0, 0.0);
+    var inward_z = array<f32, 4>(0.0, 0.0, 1.0, -1.0);
+    for (var wall: u32 = 0u; wall < 4u; wall++) {
+        if (touch_count >= MAX_TOUCH_CONTACTS) { break; }
+        let wall_distance = wall_distances[wall];
+        if (wall_distance < TOUCH_EDGE_RANGE) {
+            let slot = touch_base + touch_count * 4u;
+            sensory_buffer[slot]      = inward_x[wall];
+            sensory_buffer[slot + 1u] = inward_z[wall];
+            sensory_buffer[slot + 2u] = 1.0 - max(wall_distance, 0.0) / TOUCH_EDGE_RANGE;
+            sensory_buffer[slot + 3u] = f32(TOUCH_TERRAIN_EDGE) / 4.0;
+            touch_count += 1u;
+        }
     }
 }

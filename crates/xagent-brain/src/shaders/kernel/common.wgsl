@@ -217,6 +217,12 @@ const TOUCH_FOOD_RANGE: f32 = 3.0;
 const TOUCH_AGENT_RANGE: f32 = 5.0;
 const TOUCH_EDGE_RANGE: f32 = 3.0;
 
+// Hazard contacts have no meaningful planar direction (the hazard is
+// the terrain underfoot), so they carry a fixed mid-scale intensity
+// instead of a closeness value. Matches the CPU reference in
+// agent/senses.rs.
+const TOUCH_HAZARD_INTENSITY: f32 = 0.5;
+
 // ── Biome type values ───────────────────────────────────────────────────────
 
 const BIOME_FOOD_RICH: u32 = 0u;

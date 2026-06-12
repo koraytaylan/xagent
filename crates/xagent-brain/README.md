@@ -358,7 +358,7 @@ Two independent subsystems combined into a single pass to reduce GPU dispatch co
 
 #### Habituation
 
-**What it does**: Attenuates repetitive encoded dimensions and produces a habituated state used by all downstream passes.
+**What it does**: Attenuates repetitive encoded dimensions and produces a habituated state consumed by the predictor path (prediction error, predictor matmul, predictor training). Memory recall, the policy, TD credit, and pattern storage operate on the raw encoded (pre-habituation) state so attenuation can never silence them.
 
 **How it works**:
 
@@ -406,17 +406,17 @@ When all dimensions are changing rapidly, mean attenuation is high and curiosity
 
 ### 6.4 Recall Scoring -- `coop_recall_score`
 
-**What it does**: Computes cosine similarity between the habituated state and all 128 memory patterns. Inactive slots receive a sentinel score of `-2.0`.
+**What it does**: Computes cosine similarity between the encoded (pre-habituation) state and all 128 memory patterns. Inactive slots receive a sentinel score of `-2.0`.
 
 **How it works**:
 
 ```
 For each pattern j in [0, MEMORY_CAP):
     if not active: sim[j] = -2.0
-    else: sim[j] = clamp(dot(habituated, pattern[j]) / (||habituated|| * ||pattern[j]||), -1.0, 1.0)
+    else: sim[j] = clamp(dot(encoded, pattern[j]) / (||encoded|| * ||pattern[j]||), -1.0, 1.0)
 ```
 
-Pattern norms are pre-cached in `O_PAT_NORMS` (written during pattern storage in pass 7), avoiding redundant norm computation. The query norm is computed once per agent at the start of the pass.
+Pattern norms are pre-cached in `O_PAT_NORMS` (written during pattern storage in pass 7), avoiding redundant norm computation. The query norm is computed once per agent at the start of the pass. Querying with the pre-habituation state keeps recall alive during sustained stimuli — attenuation would otherwise mute the query exactly when remembering matters most.
 
 **Why cosine similarity**: The encoder uses `tanh()`, so all values are in [-1, 1] -- magnitude carries less information than direction. Patterns with similar perceptual meaning should be similar regardless of activation strength.
 
@@ -591,7 +591,7 @@ This is a Hebbian-style update: features that co-occur with strong credit signal
 
 #### 6.7.3 Memory Reinforcement
 
-Active patterns with cosine similarity > 0.3 to the current habituated state are reinforced:
+Active patterns with cosine similarity > 0.3 to the current encoded (pre-habituation) state are reinforced:
 
 ```
 reinforcement[j] += sim * learning_rate * (1 - pred_error)
@@ -603,7 +603,7 @@ Low prediction error strengthens matching patterns more -- successful prediction
 
 #### 6.7.4 Pattern Storage
 
-Each tick, the current habituated state is stored to the weakest memory slot (the one with the lowest reinforcement, tracked at `O_MIN_REINF_IDX`):
+Each tick, the current encoded (pre-habituation) state is stored to the weakest memory slot (the one with the lowest reinforcement, tracked at `O_MIN_REINF_IDX`), keeping memory keys in the same space as the recall queries:
 
 - State vector and cached norm are written to the pattern slot.
 - Motor context `[fwd, trn, raw_gradient]` is stored.

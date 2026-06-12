@@ -1054,7 +1054,7 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 - **Per-agent kernel workgroup**: 256 threads per agent in `kernel_tick.wgsl`. Cooperative reductions (encoder dot products, similarity scoring, top-K) are amortized inside the workgroup.
 - **Agent-agent collision**: O(N²) pairwise check in `phase_collision.wgsl`, run once per global pass. At 100 agents that's 9,900 pairwise checks per global pass — trivial on GPU.
 - **Vision raycasting**: O(VISION_RAYS) per agent per global pass; with the default 48 rays and 100 agents that's 4,800 rays per global pass.
-- **Persistent GPU memory**: `BrainLayout::brain_stride + PATTERN_STRIDE` f32s per agent, plus the physics row and food state. The total is well under a few MB for the default config.
+- **Persistent GPU memory**: `BrainLayout::brain_stride + PATTERN_STRIDE + BrainLayout::sensory_stride + DECISION_STRIDE` f32s per agent, plus the physics row and food state. The total is well under a few MB for the default config.
 
 ### Vertex Buffer Rebuild Cost (CPU side)
 

@@ -155,7 +155,6 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let atten = clamp(new_ema * sensitivity, ATTEN_FLOOR, 1.0);
         brain_state[brain_base + O_HAB_ATTEN + tid] = atten;
         s_habituated[tid] = enc * atten;
-        brain_state[brain_base + O_PREV_ENCODED + tid] = enc;
     }
 
     if (tid == 0u) {
@@ -296,7 +295,8 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 6: Predict and act
-// Predictor matmul: threads 0..31; everything else: thread 0
+// Predictor train-then-predict (forward model): threads 0..PREDICTOR_DIMENSION;
+// rest (incl. novelty, TD credit, motor): thread 0
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_predict_and_act(agent_id: u32, tid: u32) {
@@ -306,11 +306,28 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     let tick_count = brain_state[brain_base + O_TICK_COUNT];
     let recall_count = u32(s_recall[RECALL_K]);
 
-    // ── Predictor matmul: threads 0..PREDICTOR_DIMENSION ────────────────
+    // ── Predictor: train then predict — threads 0..PREDICTOR_DIMENSION ──
+    // Train the forward model on the transition that just completed: the
+    // prediction made last brain tick (O_PREV_PREDICTION, not yet
+    // overwritten) against the state that actually arrived (s_encoded),
+    // with the gradient flowing through last tick's input (O_PREV_ENCODED,
+    // overwritten only at the end of pass 7). Training before predicting
+    // keeps each row's reads and writes within one thread — no barrier.
     if (tid < PREDICTOR_DIMENSION) {
+        let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + tid];
+        let transition_error = previous_prediction - s_encoded[tid];
+        let tanh_derivative = 1.0 - previous_prediction * previous_prediction;
+        let predictor_learning_rate = bc_f32(CFG_LEARNING_RATE);
+        for (var j: u32 = 0u; j < ENCODED_DIMENSION; j = j + 1u) {
+            let previous_input = brain_state[brain_base + O_PREV_ENCODED + j];
+            let grad = clamp(transition_error * tanh_derivative * previous_input, -1.0, 1.0);
+            var w = brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] - predictor_learning_rate * grad;
+            w = clamp(w, -3.0, 3.0);
+            brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] = w;
+        }
         var s: f32 = 0.0;
         for (var j: u32 = 0u; j < ENCODED_DIMENSION; j = j + 1u) {
-            s += s_habituated[j] * brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j];
+            s += s_encoded[j] * brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j];
         }
         s_prediction[tid] = s;
     }
@@ -337,7 +354,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         var err_sum: f32 = 0.0;
         for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
             let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + d];
-            let e = previous_prediction - s_habituated[d];
+            let e = previous_prediction - s_encoded[d];
             err_sum += e * e;
         }
         let prediction_error = sqrt(err_sum / f32(PREDICTOR_DIMENSION));
@@ -373,7 +390,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             s_prediction[d] = fast_tanh(s_prediction[d]);
         }
         // Pass prediction_error to the post-credit block via shared memory.
-        // s_pred_error is later overwritten for pass 7.
+        // (Kept for pass 7 as the single forward-error value; no overwrite.)
         s_pred_error = prediction_error;
     }
     workgroupBarrier();
@@ -652,14 +669,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         brain_state[brain_base + O_TICK_COUNT] = tick_count + 1.0;
 
-        // Store prediction_error for pass 7 (shared scalar)
-        var error_squared_sum: f32 = 0.0;
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            let e = s_prediction[d] - s_habituated[d];
-            error_squared_sum += e * e;
-        }
-        s_pred_error = clamp(sqrt(error_squared_sum), 0.0, 1.0);
-
         for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
             decision_buffer[decision_base + DECISION_PREDICTION + d] = s_prediction[d];
         }
@@ -715,8 +724,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 7: Learn and store
-// Predictor: threads 0..PREDICTOR_DIMENSION; Encoder credit: one encoded dim
-// per thread; Memory reinforcement / decay: threads 0..MEMORY_CAP.
+// Encoder credit: one encoded dim per thread; Memory reinforcement / decay:
+// threads 0..MEMORY_CAP. (Predictor training moved to pass 6.)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_learn_and_store(agent_id: u32, tid: u32) {
@@ -729,29 +738,13 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     let tick = brain_state[brain_base + O_TICK_COUNT];
     let raw_gradient = s_homeo[1u];
 
-    // ── 7a. Predictor learning: threads 0..PREDICTOR_DIMENSION ──────────
-    if (tid < PREDICTOR_DIMENSION) {
-        let predicted_dimension = decision_buffer[decision_base + DECISION_PREDICTION + tid];
-        let error_dimension = predicted_dimension - s_habituated[tid];
-        let tanh_deriv = 1.0 - predicted_dimension * predicted_dimension;
-        for (var j: u32 = 0u; j < ENCODED_DIMENSION; j = j + 1u) {
-            let grad = clamp(error_dimension * tanh_deriv * s_habituated[j], -1.0, 1.0);
-            var w = brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] - learning_rate * grad;
-            w = clamp(w, -3.0, 3.0);
-            brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] = w;
-        }
-    }
-
-    // Thread 0: context weight adaptation
+    // Thread 0: context weight adaptation, driven by the same forward
+    // prediction error that drives novelty.
     if (tid == 0u) {
-        var error_squared_sum: f32 = 0.0;
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            let e = decision_buffer[decision_base + DECISION_PREDICTION + d] - s_habituated[d];
-            error_squared_sum += e * e;
-        }
-        let error_mag = sqrt(error_squared_sum);
-        brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] += learning_rate * 0.01 * (error_mag - 0.5);
-        brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] = clamp(brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
+        brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] +=
+            learning_rate * 0.01 * (s_pred_error - 0.5);
+        brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] = clamp(
+            brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
 
     // ── 7b. Encoder credit: one encoded dimension per thread ────────────
@@ -864,5 +857,11 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
         }
         pattern_buffer[pattern_base + O_MIN_REINF_IDX] = f32(min_reinf_idx);
         pattern_buffer[pattern_base + O_ACTIVE_COUNT] = f32(active_count);
+    }
+
+    // ── 7g. Publish this tick's encoded state for the next tick's
+    // habituation delta and predictor training input ─────────────────────
+    if (tid < ENCODED_DIMENSION) {
+        brain_state[brain_base + O_PREV_ENCODED + tid] = s_encoded[tid];
     }
 }

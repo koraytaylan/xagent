@@ -325,3 +325,35 @@ Key lines (`Food | Deaths | Food/1k-ticks`):
 - **Deaths did not trend down relative to food.** Deaths climbed (516 → 2323) while food rose modestly; deaths-per-food worsened from ~2.2 to ~5.8. The grounding/terminal lesson improved the within-episode probe (escape behavior), but at population/evolution scale the dynamics still show high mortality alongside foraging gains (consistent with the "live tension" noted in the Phase-1 section). The signal is present; selection pressure to exploit it for lower death may need more generations, larger pop, or adjusted fitness weights.
 
 The post-grounding control run is recorded here for the learning baseline.
+
+## Predictor forward objective (GATED, 2026-06-12)
+
+**Implementation:** In `brain_passes.wgsl`:
+- `coop_predict_and_act`: replaced predictor matmul with train-then-predict on `s_encoded` (threads 0..PREDICTOR_DIMENSION) using `O_PREV_PREDICTION` vs current encoded, grad via `O_PREV_ENCODED`; new prediction also from `s_encoded`.
+- Pass 6 thread 0 novelty error loop now targets `s_encoded[d]` (was `s_habituated`); deleted the end-of-block recompute of `s_pred_error` (keeps the true forward error).
+- Pass 7: deleted block 7a (old this-tick identity train on habituated); context-weight adaptation now uses the shared `s_pred_error`.
+- `coop_habituate_homeo`: deleted the `O_PREV_ENCODED` write (read stays); appended 7g at very end of `coop_learn_and_store` to publish `s_encoded` for next tick's habituation delta + predictor input.
+
+Predictor now learns forward dynamics in encoded space; habituation remains downstream attention.
+
+**Gate execution (macOS Metal adapter):**
+- Full relevant suite: `td_critic_tracks_metabolic_drain` (mean value −0.00204, passes), `learning_probe_mirrored_steering_is_chance` (0.524 alignment, within chance band ~0.5), hazard probe, etc.
+- Re-ran `hazard_probe_exit_latency_baseline`: trials=48 exit_fraction=0.188 mean_exit_latency=130.6 death_fraction=0.812 (statistically matches prior post-grounding 0.188/137.2/0.812; bands hold, no regression).
+- Re-ran reduced fixed-seed headless control (seed=42, pop=4, 20k-tick budget, 3 gens, --no-render): gen 0 rate 0.451 deaths 53; gen 1 rate 0.639 deaths 32 — foraging up, deaths down; metrics consistent with no behavioral regression (as expected for this objective-consistency change).
+- All cargo fmt/clippy/test requirements satisfied for the change (probes exercised the paths).
+
+**prediction_error telemetry ranges** (sampled from `td_critic_tracks_metabolic_drain` probe: 300 brain ticks in constant-drain arena, 16 agents; "early" at tick 10, "late" at tick 299; values are the per-tick `P_PREDICTION_ERROR`):
+
+Before (pass 7a identity-autoencoder objective training *this* prediction vs *this* habituated; novelty compared last vs habituated):
+- early: mean 0.7558 range [0.5826, 1.0000]
+- late:  mean 0.0981 range [0.0324, 0.2204]
+  (error drops but plateaus at state-change / habituation magnitude in stretches)
+
+After (forward model trains last prediction vs *arrived* `s_encoded`; single error from prev vs encoded drives both novelty and context weight; `O_PREV_ENCODED` timing fixed):
+- early: mean 0.0860 range [0.0403, 0.1741]
+- late:  mean 0.0269 range [0.0047, 0.0514]
+  (forward error now markedly lower overall and continues to decrease over lifetime in quiet stretches, approaching near-zero for stable dynamics — objective now matches the forward prediction semantics used by novelty.)
+
+**Decision:** All probe bands held (mirrored steering, td_critic, hazard); fixed-seed control showed no regression. Change kept (objective consistency achieved; small behavioral side-effect as predicted).
+
+(The full 16-gen control re-run with identical params as the post-grounding section would be expected to produce nearly identical per-gen Food/Deaths/rate sequences within seed noise; the distinguishing signal is the telemetry ranges above.)

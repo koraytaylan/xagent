@@ -91,7 +91,7 @@ There is no separate reward signal. There is no loss function designed by a huma
 
 The brain has no concept of "good" or "bad" built in. Instead, `habituate_homeo.wgsl` tracks whether internal variables (energy, physical integrity) are trending toward or away from stability. This gradient -- positive means improving, negative means worsening -- modulates:
 
-- **Credit assignment**: the homeostatic gradient is the reward in a TD(λ) actor-critic — a value head learns the discounted return, and its TD error credits recent actions through per-dimension eligibility traces
+- **Credit assignment**: the urgency-amplified per-tick homeostatic delta is the reward in a TD(λ) actor-critic — a value head learns the discounted return, and its TD error credits recent actions through per-dimension eligibility traces
 - **Urgency**: when energy or integrity drops critically low, urgency suppresses exploration in favor of exploitation
 
 This is analogous to how biological organisms don't have explicit goals -- they have homeostatic set points, and deviations from those set points drive behavior.
@@ -629,7 +629,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 | Phenomenon | How It Emerges | Contributing Stages |
 |------------|---------------|---------------------|
 | **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 265 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
-| **Fear / Avoidance** | Negative homeostatic gradient --> negative TD error --> eligibility traces blame the recently active state-action directions --> policy weights learn to avoid danger-associated features, while the value head marks danger-correlated states as low-value so later TD errors penalize approaching them | `coop_habituate_homeo`, `coop_predict_and_act` (TD credit) |
+| **Fear / Avoidance** | Damage produces a negative per-tick homeostatic delta (urgency-amplified — the TD reward) --> negative TD error --> eligibility traces blame the recently active state-action directions --> policy weights learn to avoid danger-associated features, while the value head marks danger-correlated states as low-value so later TD errors penalize approaching them | `coop_habituate_homeo`, `coop_predict_and_act` (TD credit) |
 | **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | `coop_habituate_homeo`, `coop_predict_and_act` (exploration) |
 | **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | `coop_predict_and_act` (credit), `coop_learn_and_store` (reinforcement) |
 | **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | `coop_predict_and_act` (error + exploration) |

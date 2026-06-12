@@ -943,7 +943,7 @@ Brain state is preserved across deaths — it lives in GPU buffers and is mutate
 The credit chain during danger encounters:
 
 ```
-damage onset (negative homeostatic gradient → negative TD error blames recently eligible state-actions) → death event (sudden prediction-error spike → halved reinforcement of currently-active patterns)
+damage onset (negative per-tick homeostatic delta → negative TD error blames recently eligible state-actions) → death event (sudden prediction-error spike → halved reinforcement of currently-active patterns)
 ```
 
 Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), delivers the strongest negative learning signal (halved reinforcement weakens whatever patterns the brain had associated with the lethal context), and the brain's core drive is minimizing prediction error.

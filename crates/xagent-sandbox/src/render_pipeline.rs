@@ -144,10 +144,22 @@ impl App {
         let mut did_rebuild = false;
 
         if self.food_dirty && mesh_rebuild_due {
+            // Mesh the food from the authoritative GPU food state — already
+            // downloaded each frame for the mini-map — so eaten food
+            // disappears and respawned food relocates in the viewport. Fall
+            // back to the CPU food layout only before the first readback, the
+            // same prefer-GPU/fallback-CPU rule `update_world_snapshot` uses.
+            // The CPU `food_items` is never synced from the GPU during a live
+            // run, so meshing it left stale food on screen.
+            let gpu_food_mesh = self
+                .gpu_kernel
+                .as_ref()
+                .and_then(|kernel| kernel.cached_food_state())
+                .map(xagent_sandbox::world::entity::generate_food_mesh_from_state);
             if let (Some(renderer), Some(world), Some(food_gpu)) =
                 (&self.renderer, &self.world, &mut self.food_gpu)
             {
-                let fm = world.food_mesh();
+                let fm = gpu_food_mesh.unwrap_or_else(|| world.food_mesh());
                 food_gpu.update_from_mesh(&renderer.queue, &fm);
                 self.food_dirty = false;
                 did_rebuild = true;

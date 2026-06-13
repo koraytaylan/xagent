@@ -223,10 +223,10 @@ impl Default for BrainLayout {
 
 // ── Food buffer layout (per food item) ───────────────────────────────
 
-pub const F_POS_X: usize = 0;
-pub const F_POS_Y: usize = 1;
-pub const F_POS_Z: usize = 2;
-pub const F_RESPAWN_TIMER: usize = 3;
+pub const FOOD_POSITION_X: usize = 0;
+pub const FOOD_POSITION_Y: usize = 1;
+pub const FOOD_POSITION_Z: usize = 2;
+pub const FOOD_RESPAWN_TIMER: usize = 3;
 pub const FOOD_STATE_STRIDE: usize = 4;
 
 // ── Grid constants ───────────────────────────────────────────────────

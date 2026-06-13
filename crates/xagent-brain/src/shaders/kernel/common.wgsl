@@ -152,10 +152,10 @@ const P_LAST_DEATH_TICK: u32 = 31u;
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
 const FOOD_STATE_STRIDE: u32 = 4u;
-const F_POS_X: u32 = 0u;
-const F_POS_Y: u32 = 1u;
-const F_POS_Z: u32 = 2u;
-const F_RESPAWN_TIMER: u32 = 3u;
+const FOOD_POSITION_X: u32 = 0u;
+const FOOD_POSITION_Y: u32 = 1u;
+const FOOD_POSITION_Z: u32 = 2u;
+const FOOD_RESPAWN_TIMER: u32 = 3u;
 
 // ── Math constants ─────────────────────────────────────────────────────────
 

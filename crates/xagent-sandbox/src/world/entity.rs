@@ -6,7 +6,9 @@
 
 use glam::Vec3;
 use rand::Rng;
-use xagent_brain::buffers::{FOOD_STATE_STRIDE, F_POS_X, F_POS_Y, F_POS_Z, F_RESPAWN_TIMER};
+use xagent_brain::buffers::{
+    FOOD_POSITION_X, FOOD_POSITION_Y, FOOD_POSITION_Z, FOOD_RESPAWN_TIMER, FOOD_STATE_STRIDE,
+};
 
 use super::biome::{BiomeMap, BiomeType};
 use super::terrain::TerrainData;
@@ -109,13 +111,17 @@ pub fn generate_food_mesh_from_state(food_state: &[f32]) -> Mesh {
     let mut indices = Vec::new();
 
     for item in food_state.chunks_exact(FOOD_STATE_STRIDE) {
-        if item[F_RESPAWN_TIMER] > 0.0 {
+        if item[FOOD_RESPAWN_TIMER] > 0.0 {
             continue;
         }
         append_cube(
             &mut vertices,
             &mut indices,
-            Vec3::new(item[F_POS_X], item[F_POS_Y], item[F_POS_Z]),
+            Vec3::new(
+                item[FOOD_POSITION_X],
+                item[FOOD_POSITION_Y],
+                item[FOOD_POSITION_Z],
+            ),
             0.6,
             [0.1, 0.8, 0.2],
         );

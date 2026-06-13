@@ -71,9 +71,9 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
                     if atomicLoad(&food_flags[fidx]) != 0u { continue; }
 
                     let fbase = fidx * FOOD_STATE_STRIDE;
-                    let fx = food_state[fbase + F_POS_X];
-                    let fy = food_state[fbase + F_POS_Y];
-                    let fz = food_state[fbase + F_POS_Z];
+                    let fx = food_state[fbase + FOOD_POSITION_X];
+                    let fy = food_state[fbase + FOOD_POSITION_Y];
+                    let fz = food_state[fbase + FOOD_POSITION_Z];
 
                     let dx = ray_pos.x - fx;
                     let dy = ray_pos.y - fy;
@@ -264,8 +264,8 @@ fn phase_vision_senses(tid: u32) {
                 if atomicLoad(&food_flags[fidx]) != 0u { continue; }
 
                 let fbase = fidx * FOOD_STATE_STRIDE;
-                let fdx = food_state[fbase + F_POS_X] - pos.x;
-                let fdz = food_state[fbase + F_POS_Z] - pos.z;
+                let fdx = food_state[fbase + FOOD_POSITION_X] - pos.x;
+                let fdz = food_state[fbase + FOOD_POSITION_Z] - pos.z;
                 let dist = sqrt(fdx * fdx + fdz * fdz);
 
                 if dist < TOUCH_FOOD_RANGE {

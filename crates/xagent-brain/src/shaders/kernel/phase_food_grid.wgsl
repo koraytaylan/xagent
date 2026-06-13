@@ -12,8 +12,8 @@ fn phase_food_grid(tid: u32) {
 
         // Read position
         let base = i * FOOD_STATE_STRIDE;
-        let fx = food_state[base + F_POS_X];
-        let fz = food_state[base + F_POS_Z];
+        let fx = food_state[base + FOOD_POSITION_X];
+        let fz = food_state[base + FOOD_POSITION_Z];
 
         // Compute grid cell with offset
         let cx = cell_coord(fx) + grid_offset;

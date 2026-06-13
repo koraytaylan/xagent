@@ -27,7 +27,8 @@ defaults.
 | No single-letter variables outside closures, iterators, or trivial math (`x`, `y`). | `gw` → `grid_width`, `c` → `contact` |
 | No bare abbreviations. Spell out names so they read clearly. | `ppp` → `pixels_per_point`, `fc` → `feature_count` |
 | Domain abbreviations that are universal in the project may be used if documented here. | `buf` (buffer), `wt`/`wts` (weight/weights) |
-| Buffer layout constants (`O_*`, `P_*`, `CFG_*`), loop variables, and external API types are exempt. | |
+| Buffer-layout constants must spell out their descriptive words too — the no-abbreviation rule applies to them. `POS` → `POSITION`, no `IDX`/`CNT`/`ENC`. A short buffer-domain prefix is the only allowance, documented here: `FOOD_` (food state), `P_` (physics), `O_` (brain output state), `CFG_`/`WC_` (config uniforms). Shared Rust↔WGSL constants must be renamed in both languages and all concatenated shaders in the same commit. | `F_POS_Y` → `FOOD_POSITION_Y` |
+| Loop variables and external API types are exempt from the rules above. | |
 
 ### Magic Numbers
 
@@ -146,7 +147,12 @@ We do not require a big-bang rewrite. Existing code is cleaned up file-by-file
 as it is touched. Priority targets:
 
 1. `governor.rs` — extract magic numbers into named constants; split `advance()`.
-2. `buffers.rs` — replace short abbreviations (`gw`, `go`, `fc`).
+2. `buffers.rs` / kernel WGSL — replace short abbreviations (`gw`, `go`, `fc`)
+   and spell out the descriptive words in buffer-layout constants
+   (`P_POS_*` → `P_POSITION_*`; `O_*` abbreviations such as `ENC`, `HAB`,
+   `FWD`). These are shared with the shaders, so rename the Rust definition,
+   the WGSL definition, and every concatenated shader together. The food-state
+   constants (`FOOD_POSITION_*`, `FOOD_RESPAWN_TIMER`) are already done.
 3. `ui.rs` — rename `ppp`; extract inline RGB colors into a palette module.
 
 Files that already meet the standard (e.g., `config.rs`, `body.rs`) should be

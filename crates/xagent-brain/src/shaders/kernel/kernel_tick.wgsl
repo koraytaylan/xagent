@@ -226,8 +226,8 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         for (var f = tid; f < food_count; f += 256u) {
             if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
             let fbase = f * FOOD_STATE_STRIDE;
-            let dx = pos.x - food_state[fbase + F_POS_X];
-            let dz = pos.z - food_state[fbase + F_POS_Z];
+            let dx = pos.x - food_state[fbase + FOOD_POSITION_X];
+            let dz = pos.z - food_state[fbase + FOOD_POSITION_Z];
             let d_sq = dx * dx + dz * dz;
             if (d_sq < eat_radius_sq && d_sq < local_best_dist_sq) {
                 local_best_dist_sq = d_sq;

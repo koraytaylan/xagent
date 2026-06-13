@@ -9,7 +9,9 @@
 
 use std::time::Instant;
 
-use xagent_brain::buffers::{FOOD_STATE_STRIDE, F_POS_X, F_POS_Z, F_RESPAWN_TIMER};
+use xagent_brain::buffers::{
+    FOOD_POSITION_X, FOOD_POSITION_Z, FOOD_RESPAWN_TIMER, FOOD_STATE_STRIDE,
+};
 use xagent_sandbox::agent::Agent;
 use xagent_sandbox::ui::AgentSnapshot;
 
@@ -182,8 +184,8 @@ impl App {
         if let Some(food) = gpu_food {
             self.world_snapshot.food_positions = food
                 .chunks_exact(FOOD_STATE_STRIDE)
-                .filter(|c| c[F_RESPAWN_TIMER] <= 0.0)
-                .map(|c| [c[F_POS_X], c[F_POS_Z]])
+                .filter(|c| c[FOOD_RESPAWN_TIMER] <= 0.0)
+                .map(|c| [c[FOOD_POSITION_X], c[FOOD_POSITION_Z]])
                 .collect();
         } else {
             self.world_snapshot.food_positions = world

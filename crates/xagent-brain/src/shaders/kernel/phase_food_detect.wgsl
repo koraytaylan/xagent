@@ -50,8 +50,8 @@ fn phase_food_detect(tid: u32) {
                 if atomicLoad(&food_flags[fidx]) != 0u { continue; }
 
                 let fbase = fidx * FOOD_STATE_STRIDE;
-                let fx = food_state[fbase + F_POS_X];
-                let fz = food_state[fbase + F_POS_Z];
+                let fx = food_state[fbase + FOOD_POSITION_X];
+                let fz = food_state[fbase + FOOD_POSITION_Z];
 
                 let dx = ax - fx;
                 let dz = az - fz;

@@ -357,3 +357,56 @@ After (forward model trains last prediction vs *arrived* `s_encoded`; single err
 **Decision:** All probe bands held (mirrored steering, td_critic, hazard); fixed-seed control showed no regression. Change kept (objective consistency achieved; small behavioral side-effect as predicted).
 
 (The full 16-gen control re-run with identical params as the post-grounding section would be expected to produce nearly identical per-gen Food/Deaths/rate sequences within seed noise; the distinguishing signal is the telemetry ranges above.)
+
+## Stride/lag sweep — three-arm A/B at evolution scale (2026-06-13)
+
+Three headless arms, identical except for the stride pair (which together set
+the sensory lag = `vision_stride × brain_tick_stride`), run on the same
+release binary, macOS Metal adapter. Shared params: `world.seed = 42`,
+`governor.tick_budget = 120000`, `population_size = 12`,
+`max_generations = 16`, `patience = 5`. All three terminated identically at
+**15 generations** (patience, reproducible at seed 42), so the comparison is
+gen-for-gen fair. Configs: `experiments/{lag100-control,lag10,lag2}.json`.
+
+| Arm | `brain_tick_stride` | `vision_stride` | sensory lag | ticks/sec (mean) | cost vs control | Food/1k-ticks (gen0 → gen14, peak) | Deaths (gen0 → gen14) | deaths/food @ gen14 |
+|---|---|---|---|---|---|---|---|---|
+| `lag100-control` | 10 | 10 | 100 | **~21,500** | — | 0.187 → 0.257 (peak 0.276) | 599 → 1625 | **4.41** |
+| `lag10` | 2 | 5 | 10 | **~4,220** | **5.1× slower (~80%)** | 0.468 → 2.076 (peak 2.076) | 494 → 2410 | **0.81** |
+| `lag2` | 1 | 2 | 2 | **~1,710** | **12.6× slower (~92%)** | 0.536 → 3.712 (peak 5.443) | 619 → 1072 | **0.20** |
+
+**Two findings, both recorded:**
+
+1. **Cost: both lower-lag arms blow the TPS budget by an order of
+   magnitude.** The locked decision rule (SCOPE) adopts a lower-lag default
+   only if its ticks/sec cost versus control is **under ~30%** *and* it beats
+   control on the fixed seed. `lag10` runs at ~80% cost (5.1× slower), `lag2`
+   at ~92% cost (12.6× slower) — both far over the ~30% gate. The cost scales
+   as expected: lower `brain_tick_stride` multiplies brain ticks per physics
+   tick (×5 / ×10), lower lag multiplies vision passes (×10 / ×50).
+
+2. **Behavior: lower lag dramatically improves open-world foraging.** `lag10`
+   reaches ~8× and `lag2` ~14× the control's final food/1k-ticks, and the
+   kamikaze pattern (deaths ≫ food) collapses — deaths-per-food falls from
+   **4.41** (control) to **0.81** (`lag10`) to **0.20** (`lag2`). The effect
+   is large and consistent across generations (control 0.16–0.28 vs `lag2`
+   0.46–5.44, non-overlapping for most gens), not seed noise.
+
+**Decision (locked rule applied): no new default — lag 100 stays.** Neither
+lower-lag arm satisfies the hard `<30%` cost gate, so despite the strong
+behavioral win the default stride pair is unchanged. The corrected
+`TD_DISCOUNT` comment (real-time horizon formula) is the only code change;
+no `config.rs` default change, no test re-pin, no γ recalibration.
+
+**This is the answer to the reviews' lag experiment.** Timeliness of action
+on fresh sensory state is a *large* lever for open-world foraging efficiency
+(the agent stops blowing past food during the 100-tick blind window and acts
+on present-moment energy/touch). But this is a **separate axis** from the
+directional-steering deficit the mirrored probe isolates — that probe trains
+at lag 1 and still lands at chance, and nothing here changes that. So the
+reviews' dominant hypothesis ("remove the lag and learning appears") is
+half-right in a way the probe alone could not show: lag removal does not
+manufacture vision-conditional steering, but it does unlock a big chunk of
+foraging the lagged frame was leaving on the table. The TPS budget — not the
+behavior — is what keeps it out of the default. **Flag for future
+performance work:** if the kernel gets ~5× faster, `lag10` lands inside the
+budget and becomes a clear adopt; revisit then.

@@ -283,8 +283,14 @@ const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 
 // ── TD(λ) credit constants ──────────────────────────────────────────────────
 
-// Per-brain-tick discount. Horizon 1/(1−γ) ≈ 33 brain ticks matches the
-// travel time from the edge of vision range to food at default speed.
+// Per-brain-tick discount. Horizon 1/(1−γ) ≈ 33 brain ticks ≈ 11 s of
+// real time at the default strides (brain tick every 10 physics ticks
+// at 30 Hz) — several food approaches long. A vision-edge approach
+// itself is ~45 physics ticks ≈ 4.5 brain ticks at default speed; the
+// horizon is intentionally longer so the critic bridges sparse
+// encounters. At brain_tick_stride = 1 the same constant gives a 1.1 s
+// horizon — if the default stride changes, recalibrate γ to keep the
+// real-time horizon (γ ≈ 1 − stride/330).
 const TD_DISCOUNT: f32 = 0.97;
 // Eligibility trace decay. Combined per-tick trace retention is
 // TD_DISCOUNT × TD_LAMBDA ≈ 0.87; the critic's bootstrapping propagates

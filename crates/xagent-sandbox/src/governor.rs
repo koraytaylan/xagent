@@ -37,6 +37,36 @@ pub struct AgentFitness {
     pub composite_fitness: f32,
 }
 
+/// Composite fitness with survival as a multiplicative gate (Variant B).
+///
+/// Survival gates the whole score: an agent that forages by dying
+/// repeatedly no longer outscores one that forages carefully. The
+/// foraging/exploration weights inside the gate keep their prior 1:1 ratio
+/// (each 0.5). `food_target` and `total_grid_cells` are the per-axis
+/// denominators computed once per generation in [`Governor::evaluate`].
+///
+/// Adopted after the post-grounding data confirmed both fitness
+/// pathologies the additive `survival·0.4 + foraging·0.3 + exploration·0.3`
+/// formula allowed: kamikaze foraging (deaths-per-food rising with food) and
+/// within-lifetime learning staying invisible (`q1→q4` flat-to-declining
+/// while cross-generation foraging rose). See the stride/lag sweep and
+/// post-grounding control sections of the learning-baseline spec.
+fn composite_fitness(
+    death_count: u32,
+    food_consumed: u32,
+    cells_explored: u32,
+    food_target: f32,
+    total_grid_cells: f32,
+) -> f32 {
+    // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.67, 2 → 0.5
+    let survival = 1.0 / (1.0 + death_count as f32 * 0.5);
+    // Foraging: food per generation, capped at target
+    let foraging = (food_consumed as f32 / food_target).min(1.0);
+    // Exploration: fraction of reachable grid visited (25% of total = perfect)
+    let exploration = (cells_explored as f32 / total_grid_cells).min(1.0);
+    survival * (foraging * 0.5 + exploration * 0.5)
+}
+
 /// Result of `Governor::advance()` — tells the caller what to do next.
 pub enum AdvanceResult {
     /// Simulation continues — spawn the given configs for the next generation.
@@ -469,14 +499,13 @@ impl Governor {
         let food_target = (tick_budget / 1000.0).max(10.0);
 
         for r in &mut results {
-            // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.67, 2 → 0.5
-            let survival = 1.0 / (1.0 + r.death_count as f32 * 0.5);
-            // Foraging: food per generation, capped at target
-            let foraging = (r.food_consumed as f32 / food_target).min(1.0);
-            // Exploration: fraction of reachable grid visited (25% of total = perfect)
-            let exploration = (r.cells_explored as f32 / total_grid_cells).min(1.0);
-
-            r.composite_fitness = survival * 0.4 + foraging * 0.3 + exploration * 0.3;
+            r.composite_fitness = composite_fitness(
+                r.death_count,
+                r.food_consumed,
+                r.cells_explored,
+                food_target,
+                total_grid_cells,
+            );
         }
 
         // Insert agent_result records
@@ -1566,6 +1595,52 @@ mod tests {
             cells_explored: 4096,
             composite_fitness: fitness,
         }]
+    }
+
+    /// Variant B: survival gates the composite score multiplicatively, so
+    /// the same foraging scores strictly worse when bought with deaths.
+    /// Explicit denominators keep the expected values exact and independent
+    /// of `HEATMAP_RES`.
+    #[test]
+    fn composite_fitness_gates_score_multiplicatively_on_survival() {
+        let food_target = 100.0_f32;
+        let total_grid_cells = 1000.0_f32;
+
+        // Careful forager: no deaths, half the food target (0.5), a quarter
+        // of the grid (0.25). survival = 1.0 → 1.0 * (0.5*0.5 + 0.25*0.5) =
+        // 0.375.
+        let careful = composite_fitness(0, 50, 250, food_target, total_grid_cells);
+        assert!(
+            (careful - 0.375).abs() < 1e-5,
+            "careful forager fitness {careful} != 0.375"
+        );
+
+        // Kamikaze forager: identical foraging/exploration but four deaths.
+        // survival = 1/(1 + 4*0.5) = 1/3 → (1/3) * 0.375 = 0.125.
+        let kamikaze = composite_fitness(4, 50, 250, food_target, total_grid_cells);
+        assert!(
+            (kamikaze - 0.125).abs() < 1e-5,
+            "kamikaze fitness {kamikaze} != 0.125"
+        );
+
+        // The whole point of Variant B: dying to forage scores strictly
+        // worse than foraging carefully for the same food.
+        assert!(kamikaze < careful);
+
+        // No foraging and no exploration → zero regardless of survival, so
+        // an idle survivor cannot bank a survival-only score.
+        assert_eq!(
+            composite_fitness(0, 0, 0, food_target, total_grid_cells),
+            0.0
+        );
+
+        // Foraging is capped at the target: 200 food vs a 100 target still
+        // scores foraging = 1.0, not 2.0 → 1.0 * (1.0*0.5) = 0.5.
+        let capped = composite_fitness(0, 200, 0, food_target, total_grid_cells);
+        assert!(
+            (capped - 0.5).abs() < 1e-5,
+            "capped foraging fitness {capped} != 0.5"
+        );
     }
 
     /// Helper to read a node's status from the DB.

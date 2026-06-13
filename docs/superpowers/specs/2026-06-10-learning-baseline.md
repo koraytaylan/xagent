@@ -410,3 +410,57 @@ foraging the lagged frame was leaving on the table. The TPS budget — not the
 behavior — is what keeps it out of the default. **Flag for future
 performance work:** if the kernel gets ~5× faster, `lag10` lands inside the
 budget and becomes a clear adopt; revisit then.
+
+## Fitness rework — Variant B (multiplicative survival), 2026-06-13
+
+The post-grounding data confirmed **both** fitness pathologies the additive
+`survival·0.4 + foraging·0.3 + exploration·0.3` formula allowed:
+
+- **Kamikaze foraging.** The post-grounding control's deaths-per-food
+  *worsened* across the run (deaths climbed far faster than food), and the
+  stride sweep's control reproduced it (deaths-per-food 4.41 at gen 14).
+- **Within-lifetime learning invisible.** The new `Learn q1→q4` metric is
+  flat-to-declining every generation in the control (e.g. 0.251 → 0.164,
+  0.291 → 0.252) while cross-generation foraging rises — improvement is not
+  happening *within* a lifetime.
+
+Per the locked rule ("both confirmed → multiplicative first, improvement
+second, separately measured"), this task ships **Variant B** only; the
+improvement term (Variant A) is the separate gated follow-up.
+
+**Change.** `composite_fitness` (extracted as a pure, unit-tested helper in
+`governor.rs`) becomes:
+
+```rust
+survival * (foraging * 0.5 + exploration * 0.5)
+```
+
+Survival now gates the whole score multiplicatively instead of contributing
+an additive 0.4; the foraging/exploration split keeps their prior 1:1 ratio.
+`composite_fitness_gates_score_multiplicatively_on_survival` asserts the
+formula exactly (careful forager 0.375 vs same-foraging-but-4-deaths 0.125;
+foraging cap; zero-on-no-forage).
+
+**Fixed-seed comparison (seed 42, `tick_budget` 120000, pop 12, 15 gens, the
+same `experiments/lag100-control.json` config as the stride-sweep control,
+macOS Metal):**
+
+| Metric | Additive (before) | Variant B multiplicative (after) | Δ |
+|---|---|---|---|
+| Total deaths (Σ gens) | 20,336 | 8,546 | **−58%** |
+| Total food (Σ gens) | 5,056 | 3,836 | −24% |
+| **Deaths-per-food (run total)** | **4.02** | **2.23** | **−45%** |
+| Deaths gen0 → gen14 | 599 → 1625 | 555 → 738 | trend flattened |
+| Peak generation deaths | 2,036 (gen7) | 1,041 (gen13) | −49% |
+| Food/1k-ticks gen0 → gen14 | 0.187 → 0.257 | 0.180 → 0.196 | foraging slightly lower |
+
+**Verdict: Variant B does exactly what it is for.** Multiplicative survival
+nearly halves deaths-per-food and flattens the death trend; the population
+stops being rewarded for foraging by dying. Total food drops modestly
+(−24%) while deaths drop more than twice as much (−58%) — the intended
+trade. Inherited policy weight norms still grow (`w_fwd`/`w_turn`
+0.006 → 0.308), so the learning machinery is unaffected; the `Learn q1→q4`
+signal stays flat-to-declining, which is expected — Variant B targets the
+kamikaze economics, not within-lifetime learning. That remaining flatness is
+the standing case for the Variant A improvement term as the next separate
+measurement.

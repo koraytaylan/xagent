@@ -152,9 +152,8 @@ impl App {
             // The CPU `food_items` is never synced from the GPU during a live
             // run, so meshing it left stale food on screen.
             let gpu_food_mesh = self
-                .gpu_kernel
-                .as_ref()
-                .and_then(|kernel| kernel.cached_food_state())
+                .cached_food_state
+                .as_deref()
                 .map(xagent_sandbox::world::entity::generate_food_mesh_from_state);
             if let (Some(renderer), Some(world), Some(food_gpu)) =
                 (&self.renderer, &self.world, &mut self.food_gpu)

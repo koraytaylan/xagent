@@ -2839,3 +2839,224 @@ fn gpu_touch_emits_terrain_edge_contact_near_wall() {
         slot[2]
     );
 }
+
+// ── 0002: split compute dispatch from CPU-visible publication ─────────────
+
+/// Build a kernel with world + agents uploaded and deterministic brain state,
+/// ready for dispatch. Shared by the dispatch/publication split tests below.
+fn split_test_kernel(agent_count: usize, seed: u64) -> (xagent_brain::GpuKernel, WorldState) {
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 7,
+        ..Default::default()
+    };
+    let world = WorldState::new(world_config.clone());
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count as u32, food_count, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, seed);
+
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = (0..agent_count)
+        .map(|_| {
+            (
+                world.safe_spawn_position(),
+                100.0_f32,
+                100.0_f32,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+    kernel.upload_agents(&agent_data);
+    (kernel, world)
+}
+
+/// Poll the non-blocking snapshot collector until it reports fresh data or the
+/// bounded retry budget is exhausted.
+///
+/// `try_collect_state_snapshot` polls the device non-blockingly, so a brief
+/// sleep between attempts gives the GPU wall-time to finish the staging copy —
+/// the same cadence the real frame loop provides between redraws. Returns
+/// `false` only if no snapshot arrived within the (generous) bound.
+fn collect_snapshot(kernel: &mut xagent_brain::GpuKernel) -> bool {
+    for _ in 0..1000 {
+        if kernel.try_collect_state_snapshot() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    false
+}
+
+/// `dispatch_ticks` must advance GPU compute on its own, and — because it makes
+/// no snapshot request — leave the staging ring empty so nothing is collectable.
+#[test]
+fn dispatch_ticks_advances_compute_without_requesting_snapshot() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_TICKS_ALIVE};
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let (mut kernel, _world) = split_test_kernel(1, 12_345);
+
+    let ticks_before = kernel.read_full_state_blocking()[P_TICKS_ALIVE] as u64;
+
+    // Advance compute only — deliberately do NOT call request_state_snapshot.
+    kernel.dispatch_ticks(0, 60);
+
+    let ticks_after = kernel.read_full_state_blocking()[P_TICKS_ALIVE] as u64;
+    assert!(
+        ticks_after > ticks_before,
+        "dispatch_ticks must advance compute: ticks_alive {} -> {}",
+        ticks_before,
+        ticks_after
+    );
+    let _ = PHYS_STRIDE; // stride imported for symmetry with sibling tests
+
+    // No snapshot was requested, so the staging ring is empty and the
+    // non-blocking collector must report nothing to collect.
+    assert!(
+        !kernel.try_collect_state_snapshot(),
+        "no snapshot was requested, so none should be collectable"
+    );
+}
+
+/// After `dispatch_ticks`, an explicit `request_state_snapshot` must publish the
+/// advanced physics into `cached_state`, matching the authoritative blocking read.
+#[test]
+fn request_state_snapshot_publishes_advanced_state_to_cache() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_POS_X, P_POS_Z, P_TICKS_ALIVE};
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let (mut kernel, _world) = split_test_kernel(1, 999);
+
+    kernel.dispatch_ticks(0, 60);
+    assert!(
+        kernel.request_state_snapshot(),
+        "a free staging slot should accept the snapshot request"
+    );
+    assert!(
+        collect_snapshot(&mut kernel),
+        "the requested snapshot should become collectable"
+    );
+
+    let cached_ticks = kernel.cached_state()[P_TICKS_ALIVE] as u64;
+    assert!(
+        cached_ticks > 0,
+        "cached_state should reflect advanced compute, got ticks_alive {}",
+        cached_ticks
+    );
+
+    // The published snapshot must equal the authoritative blocking read, since
+    // no dispatch ran in between.
+    let cached_x = kernel.cached_state()[P_POS_X];
+    let cached_z = kernel.cached_state()[P_POS_Z];
+    let blocking = kernel.read_full_state_blocking();
+    assert!(
+        (cached_x - blocking[P_POS_X]).abs() < 1e-4 && (cached_z - blocking[P_POS_Z]).abs() < 1e-4,
+        "snapshot ({:.4},{:.4}) must match blocking read ({:.4},{:.4})",
+        cached_x,
+        cached_z,
+        blocking[P_POS_X],
+        blocking[P_POS_Z]
+    );
+    let _ = PHYS_STRIDE;
+}
+
+/// The compatibility wrapper `dispatch_batch` must still both advance compute
+/// and request a snapshot, so a single call followed by a collect publishes.
+#[test]
+fn dispatch_batch_wrapper_advances_and_publishes() {
+    use xagent_brain::buffers::P_TICKS_ALIVE;
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let (mut kernel, _world) = split_test_kernel(1, 2_024);
+
+    assert!(
+        kernel.dispatch_batch(0, 60),
+        "dispatch_batch should report ticks were submitted"
+    );
+    assert!(
+        collect_snapshot(&mut kernel),
+        "dispatch_batch must request a snapshot that later becomes collectable"
+    );
+    let cached_ticks = kernel.cached_state()[P_TICKS_ALIVE] as u64;
+    assert!(
+        cached_ticks > 0,
+        "dispatch_batch wrapper should publish advanced state, got ticks_alive {}",
+        cached_ticks
+    );
+}
+
+/// Poll the non-blocking telemetry collector until it yields a result or the
+/// bounded retry budget is exhausted.
+fn collect_telemetry(
+    kernel: &mut xagent_brain::GpuKernel,
+) -> Option<(u32, xagent_brain::AgentTelemetry)> {
+    for _ in 0..1000 {
+        if let Some(result) = kernel.try_collect_telemetry() {
+            return Some(result);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    None
+}
+
+/// `try_collect_telemetry` must report the agent the readback was *requested
+/// for*, and re-requesting a different agent (a selection change) must surface
+/// that new agent — never the superseded one. Without this, telemetry that
+/// completed for the previously-selected agent would be applied to the new one.
+#[test]
+fn try_collect_telemetry_tracks_requested_agent_across_reselection() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let (mut kernel, _world) = split_test_kernel(3, 4_242);
+    // Advance so the telemetry slices hold real data.
+    kernel.dispatch_ticks(0, 60);
+
+    // Straightforward case: request agent 1, collect, expect index 1.
+    kernel.request_agent_telemetry(1);
+    let (idx, _) = collect_telemetry(&mut kernel).expect("telemetry for agent 1");
+    assert_eq!(idx, 1, "collected telemetry must be labeled with agent 1");
+
+    // Selection-change race: request 0, then immediately re-request 2 before
+    // collecting. The kernel clears the superseded request; the collected
+    // telemetry must be for agent 2, not agent 0.
+    kernel.request_agent_telemetry(0);
+    kernel.request_agent_telemetry(2);
+    let (idx, _) = collect_telemetry(&mut kernel).expect("telemetry after re-request");
+    assert_eq!(
+        idx, 2,
+        "after re-requesting agent 2, collected telemetry must be for agent 2"
+    );
+}

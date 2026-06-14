@@ -12,12 +12,13 @@ use glam::Vec3;
 use rand::Rng;
 
 use xagent_brain::AgentBrainState;
-use xagent_sandbox::agent::{mutate_brain_state, mutate_config, Agent, MAX_AGENTS};
+use xagent_sandbox::agent::{mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{reset_database, AdvanceResult, Governor};
 use xagent_sandbox::ui::{EvolutionAction, EvolutionSnapshot, EvolutionState};
 use xagent_shared::BrainConfig;
 
-use crate::app::{App, GenTransition};
+use crate::app::{App, PendingGeneration};
+use crate::sim_runtime::{InheritedBrain, ResetRequest, SimCommand};
 
 impl App {
     /// Spawn a new agent with the given BrainConfig at a safe random position
@@ -72,11 +73,9 @@ impl App {
                         self.tps_last_reset = Instant::now();
                         self.tps_display = 0.0;
                         self.paused = false;
-                        self.gpu_kernel = None;
-                        self.pending_kernel = None;
-                        self.pending_upload = None;
+                        self.stop_sim_worker();
                         self.spawn_evolution_population();
-                        self.ensure_gpu_kernel();
+                        self.start_sim_worker();
                         self.log_msg("[EVOLUTION] Started new run".into());
                     }
                     Err(e) => {
@@ -100,11 +99,9 @@ impl App {
                     self.tps_last_reset = Instant::now();
                     self.tps_display = 0.0;
                     self.paused = false;
-                    self.gpu_kernel = None;
-                    self.pending_kernel = None;
-                    self.pending_upload = None;
+                    self.stop_sim_worker();
                     self.spawn_evolution_population();
-                    self.ensure_gpu_kernel();
+                    self.start_sim_worker();
                     self.log_msg("[EVOLUTION] Resumed from database".into());
                 }
                 Err(e) => {
@@ -131,9 +128,7 @@ impl App {
             }
             EvolutionAction::Reset => {
                 self.governor = None;
-                self.gpu_kernel = None;
-                self.pending_kernel = None;
-                self.pending_upload = None;
+                self.stop_sim_worker();
                 self.agents.clear();
                 self.next_agent_id = 0;
                 self.tick = 0;
@@ -230,11 +225,15 @@ impl App {
         }
     }
 
-    /// Evaluate the current generation and begin the async transition.
-    /// The actual GPU work (readback, reset, upload) spans multiple frames
-    /// via `poll_gen_transition`.
-    pub(crate) fn advance_generation(&mut self) {
-        // Persist the recording to SQLite before moving to the next generation
+    /// Handle the worker reaching the generation tick budget.
+    ///
+    /// The end-of-generation snapshot has already been applied to the CPU
+    /// agents by the event drain. Persist the recording, evaluate fitness, and
+    /// — when evolution continues — request the champion's brain state from the
+    /// worker so the next generation can inherit it. `Finished` results pause
+    /// the run (the worker has already paused itself at the budget).
+    pub(crate) fn on_generation_budget_reached(&mut self) {
+        // Persist the recording to SQLite before moving to the next generation.
         if let (Some(ref recording), Some(ref mut gov)) = (&self.recording, &mut self.governor) {
             gov.store_recording(recording);
         }
@@ -245,10 +244,7 @@ impl App {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
 
-        // Evaluate fitness and decide whether evolution continues.
-        // Only kick off the async brain-state readback when the result is
-        // Continue — when Finished, no readback is needed.
-        let (result, readback_requested) = {
+        let (result, champion_brain_idx) = {
             let gov = match self.governor.as_mut() {
                 Some(g) => g,
                 None => return,
@@ -260,214 +256,111 @@ impl App {
 
             let result = gov.advance(&fitness);
 
-            // Only read back the best agent's brain state when evolution
-            // continues — Finished needs no inherited state.
-            let mut readback_requested = false;
-            if matches!(result, AdvanceResult::Continue { .. }) {
-                let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-                if let Some(a) = self.agents.get(best_idx) {
-                    if let Some(mk) = self.gpu_kernel.as_mut() {
-                        if mk.request_agent_state(a.brain_idx) {
-                            readback_requested = true;
-                        }
-                    }
-                }
-            }
+            // The champion is the top-ranked agent; map its array index to its
+            // kernel brain index for the readback request.
+            let champion_brain_idx = if matches!(result, AdvanceResult::Continue { .. }) {
+                fitness
+                    .first()
+                    .map(|f| f.agent_index)
+                    .and_then(|idx| self.agents.get(idx))
+                    .map(|a| a.brain_idx)
+            } else {
+                None
+            };
 
-            (result, readback_requested)
+            (result, champion_brain_idx)
         };
 
         match result {
-            AdvanceResult::Continue { .. } if readback_requested => {
-                self.gen_transition = Some(GenTransition::AwaitingReadback { result });
-            }
             AdvanceResult::Continue { .. } => {
-                // No readback was issued (no best agent or no GPU kernel) —
-                // skip directly to reset to avoid deadlocking in AwaitingReadback.
-                self.gen_transition = Some(GenTransition::AwaitingReset {
-                    result,
-                    inherited_state: None,
-                    spawned: false,
-                });
-            }
-            AdvanceResult::Finished { .. } => {
-                // Skip readback phase entirely — go straight to finish.
-                self.gen_transition = Some(GenTransition::AwaitingReset {
-                    result,
-                    inherited_state: None,
-                    spawned: false,
-                });
-            }
-        }
-    }
-
-    /// Drive the multi-frame generation transition state machine.
-    /// Called every frame; returns true while a transition is still in progress.
-    pub(crate) fn poll_gen_transition(&mut self) -> bool {
-        let transition = match self.gen_transition.take() {
-            Some(t) => t,
-            None => return false,
-        };
-
-        match transition {
-            GenTransition::AwaitingReadback { result } => {
-                if self.gpu_kernel.is_none() {
-                    // No kernel — proceed without inherited state.
-                    self.gen_transition = Some(GenTransition::AwaitingReset {
-                        result,
-                        inherited_state: None,
-                        spawned: false,
-                    });
-                    return true;
-                }
-
-                // Poll for the async agent state readback.
-                let collected = self.gpu_kernel.as_mut().unwrap().try_collect_agent_state();
-
-                match collected {
-                    Some(Some(state)) => {
-                        // Readback complete — move to reset phase.
-                        self.gen_transition = Some(GenTransition::AwaitingReset {
-                            result,
-                            inherited_state: Some(state),
-                            spawned: false,
+                if let Some(brain_idx) = champion_brain_idx {
+                    let request_id = self.champion_request_counter;
+                    self.champion_request_counter += 1;
+                    if let Some(runtime) = &self.sim_runtime {
+                        runtime.send(SimCommand::RequestAgentState {
+                            agent_index: brain_idx,
+                            request_id,
                         });
                     }
-                    Some(None) => {
-                        // map_async error — proceed without inherited state
-                        // rather than hanging in AwaitingReadback forever.
-                        self.gen_transition = Some(GenTransition::AwaitingReset {
-                            result,
-                            inherited_state: None,
-                            spawned: false,
-                        });
-                    }
-                    None => {
-                        // Still waiting — re-enqueue for next frame.
-                        self.gen_transition = Some(GenTransition::AwaitingReadback { result });
-                    }
-                }
-                true
-            }
-            GenTransition::AwaitingReset {
-                result,
-                inherited_state,
-                spawned,
-            } => {
-                let (done, spawned) =
-                    self.try_finish_generation(&result, inherited_state.as_ref(), spawned);
-                if !done {
-                    // Reset not ready yet — re-enqueue for next frame.
-                    self.gen_transition = Some(GenTransition::AwaitingReset {
+                    self.pending_generation = Some(PendingGeneration {
                         result,
-                        inherited_state,
-                        spawned,
+                        champion_request_id: request_id,
                     });
-                    return true;
-                }
-                false
-            }
-        }
-    }
-
-    /// Try to complete a generation transition. Returns `(done, spawned)`
-    /// where `done` is false if the GPU staging buffers aren't ready yet
-    /// (caller should retry next frame), and `spawned` tracks whether
-    /// population has been spawned (to avoid re-spawning on retry).
-    pub(crate) fn try_finish_generation(
-        &mut self,
-        result: &AdvanceResult,
-        inherited_state: Option<&AgentBrainState>,
-        mut spawned: bool,
-    ) -> (bool, bool) {
-        match result {
-            AdvanceResult::Continue {
-                configs,
-                messages,
-                mutation_strength,
-            } => {
-                if !spawned {
-                    for msg in messages {
-                        self.log_msg(msg.clone());
-                    }
-                    self.spawn_population_from_configs(configs);
-                    spawned = true;
-                }
-                let repeats = self.governor_config.eval_repeats.max(1);
-
-                // Reuse existing kernel if population size matches,
-                // otherwise drop and recreate in background.
-                let can_reuse = self
-                    .gpu_kernel
-                    .as_ref()
-                    .is_some_and(|mk| mk.agent_count() == self.agents.len() as u32);
-
-                if can_reuse {
-                    let mk = self.gpu_kernel.as_mut().unwrap();
-                    // Non-blocking reset — return false to retry next frame
-                    // instead of falling back to a blocking busy-wait.
-                    if !mk.try_reset_agents(&self.brain_config) {
-                        return (false, spawned);
-                    }
-                    let agent_data: Vec<_> = self
-                        .agents
-                        .iter()
-                        .map(|a| {
-                            (
-                                a.body.body.position,
-                                a.body.body.internal.max_energy,
-                                a.body.body.internal.max_integrity,
-                                a.brain_config.memory_capacity,
-                                a.brain_config.processing_slots,
-                            )
-                        })
-                        .collect();
-                    mk.upload_agents(&agent_data);
                 } else {
-                    self.gpu_kernel = None;
-                    self.pending_kernel = None;
-                    self.pending_upload = None;
-                    self.ensure_gpu_kernel();
-                    // Kernel is being recreated in the background —
-                    // keep the transition active until it's ready.
-                    if self.gpu_kernel.is_none() {
-                        return (false, spawned);
-                    }
-                }
-
-                // Inherit learned weights: champions get exact brain state,
-                // mutants get perturbed weights for neuroevolution.
-                if let Some(state) = inherited_state {
-                    if let Some(ref mk) = self.gpu_kernel {
-                        let ms = *mutation_strength;
-                        let n = self.agents.len();
-                        // Pre-clone once for all champion slots to avoid
-                        // cloning inside the hot closure on every call.
-                        let champion = state.clone();
-                        mk.batch_write_agent_states(n, |i| {
-                            if i < repeats {
-                                champion.clone()
-                            } else {
-                                mutate_brain_state(state, ms)
-                            }
-                        });
-                    } else {
-                        // Kernel is being recreated in the background
-                        // (population size changed). Stash inherited state
-                        // so it can be applied once the kernel is ready.
-                        self.deferred_inherited = Some((state.clone(), *mutation_strength));
-                    }
+                    // No champion to inherit (no agents) — reset straight away.
+                    self.finish_generation_continue(result, None);
                 }
             }
             AdvanceResult::Finished { messages } => {
-                for msg in messages {
+                for msg in &messages {
                     self.log_msg(msg.clone());
                 }
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
             }
         }
-        (true, spawned)
+    }
+
+    /// Apply the worker's champion brain-state reply and start the next
+    /// generation, ignoring a reply whose id does not match the pending request.
+    pub(crate) fn on_champion_state(&mut self, request_id: u64, state: Option<AgentBrainState>) {
+        let Some(pending) = self.pending_generation.take() else {
+            return;
+        };
+        if pending.champion_request_id != request_id {
+            // Stale reply (a newer request superseded it) — keep waiting.
+            self.pending_generation = Some(pending);
+            return;
+        }
+        self.finish_generation_continue(pending.result, state);
+    }
+
+    /// Spawn the next generation and command the worker to reset to it.
+    ///
+    /// The first `eval_repeats` slots inherit the champion's exact brain state;
+    /// the rest inherit mutated copies. The worker applies the inheritance and
+    /// resumes (unless the user paused during the handoff).
+    fn finish_generation_continue(
+        &mut self,
+        result: AdvanceResult,
+        champion_state: Option<AgentBrainState>,
+    ) {
+        let AdvanceResult::Continue {
+            configs,
+            messages,
+            mutation_strength,
+        } = result
+        else {
+            self.pending_generation = None;
+            return;
+        };
+        for msg in &messages {
+            self.log_msg(msg.clone());
+        }
+        self.spawn_population_from_configs(&configs);
+
+        let Some(upload) = self.build_pending_upload() else {
+            self.pending_generation = None;
+            return;
+        };
+        let champion_slots = self.governor_config.eval_repeats.max(1);
+        let inherited = champion_state.map(|champion| InheritedBrain {
+            champion,
+            mutation_strength,
+            champion_slots,
+        });
+        let resume = !self.paused;
+        let request = ResetRequest {
+            upload,
+            brain_config: self.brain_config.clone(),
+            tick_budget: self.governor_config.tick_budget,
+            inherited,
+            resume,
+        };
+        if let Some(runtime) = &self.sim_runtime {
+            runtime.send(SimCommand::ResetPopulation(Box::new(request)));
+        }
+        self.pending_generation = None;
     }
 
     /// Spawn a child agent near a parent, with mutated config.

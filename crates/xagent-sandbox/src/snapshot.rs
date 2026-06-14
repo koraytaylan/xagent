@@ -177,10 +177,7 @@ impl App {
         let Some(world) = &self.world else {
             return;
         };
-        let gpu_food = self
-            .gpu_kernel
-            .as_ref()
-            .and_then(|mk| mk.cached_food_state());
+        let gpu_food = self.cached_food_state.as_deref();
         if let Some(food) = gpu_food {
             self.world_snapshot.food_positions = food
                 .chunks_exact(FOOD_STATE_STRIDE)

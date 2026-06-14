@@ -1,9 +1,14 @@
-//! GPU kernel lifecycle and world/agent upload staging.
+//! Main-thread orchestration of the simulation worker.
 //!
-//! Owns `App::ensure_gpu_kernel`, which drives creation of the fused
-//! `GpuKernel` on a background thread, collects its data on the main thread,
-//! and applies any brain state deferred from a generation transition that
-//! straddled the kernel recreation.
+//! The GPU kernel and all simulation-cadence scheduling live in the
+//! [`crate::sim_runtime`] worker thread. This module is the main-thread side of
+//! that boundary: it starts the worker for the current population, forwards
+//! control commands (speed, pause, selection) on change, drains worker events
+//! each frame, applies the newest state snapshot to the CPU-side agent caches,
+//! and records the per-snapshot overlays/histories/replay. It performs no GPU
+//! work and never calls `GpuKernel` directly.
+
+use std::time::{Duration, Instant};
 
 use glam::Vec3;
 
@@ -13,73 +18,19 @@ use xagent_brain::buffers::{
     P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
     P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
-use xagent_brain::GpuKernel;
-use xagent_sandbox::agent::mutate_brain_state;
+use xagent_brain::AgentTelemetry;
 
-use crate::app::{App, PendingUpload, SIM_DT};
+use crate::app::{App, PendingUpload};
+use crate::sim_runtime::{
+    partition_events, SimCommand, SimEvent, SimInit, SimRuntime, StateSnapshot,
+};
 
 impl App {
-    /// Ensure GpuKernel is initialized for the current population.
-    pub(crate) fn ensure_gpu_kernel(&mut self) {
-        if self.gpu_kernel.is_some() {
-            return;
-        }
-        if self.agents.is_empty() {
-            return;
-        }
-        let world = match &self.world {
-            Some(w) => w,
-            None => return,
-        };
-
-        // Check if background creation finished.
-        if let Some(ref handle) = self.pending_kernel {
-            if handle.is_finished() {
-                let handle = self.pending_kernel.take().unwrap();
-                let mk = handle
-                    .join()
-                    .expect("fused kernel background thread panicked");
-                // Upload world + agent data (fast, main thread).
-                if let Some(upload) = self.pending_upload.take() {
-                    mk.upload_world(
-                        &upload.heights,
-                        &upload.biomes,
-                        &upload.food_pos,
-                        &upload.food_consumed,
-                        &upload.food_timers,
-                    );
-                    mk.upload_agents(&upload.agent_data);
-                }
-                let ac = mk.agent_count();
-
-                // Apply deferred inherited state from a generation transition
-                // that occurred while the kernel was being recreated.
-                if let Some((ref state, mutation_strength)) = self.deferred_inherited.take() {
-                    let repeats = self.governor_config.eval_repeats.max(1);
-                    let n = self.agents.len();
-                    let champion = state.clone();
-                    mk.batch_write_agent_states(n, |i| {
-                        if i < repeats {
-                            champion.clone()
-                        } else {
-                            mutate_brain_state(state, mutation_strength)
-                        }
-                    });
-                }
-
-                self.gpu_kernel = Some(mk);
-                self.log_msg(format!("[GPU] GpuKernel ready ({} agents)", ac));
-            }
-            return; // still creating
-        }
-
-        // Collect data for upload (kept on main thread).
-        let agent_count = self.agents.len() as u32;
-        let food_count = world.food_items.len();
-        let brain_config = self.brain_config.clone();
-        let world_config = world.config.clone();
-
-        self.pending_upload = Some(PendingUpload {
+    /// Build the world + agent upload for the current population, or `None`
+    /// when there is no world. Shared by worker startup and generation reset.
+    pub(crate) fn build_pending_upload(&self) -> Option<PendingUpload> {
+        let world = self.world.as_ref()?;
+        Some(PendingUpload {
             heights: world.terrain.heights.clone(),
             biomes: world.biome_map.grid_as_u32(),
             food_pos: world
@@ -102,154 +53,174 @@ impl App {
                     )
                 })
                 .collect(),
-        });
-
-        // Spawn background thread for device + shader compilation.
-        self.pending_kernel = Some(std::thread::spawn(move || {
-            GpuKernel::new(agent_count, food_count, &brain_config, &world_config)
-        }));
-        self.log_msg("[GPU] Creating GpuKernel (background)...".into());
+        })
     }
 
-    /// Advance the simulation for one active frame: dispatch fixed-timestep
-    /// ticks, apply the latest GPU state readback, record per-tick
-    /// overlay/history data, and check for generation completion.
+    /// Start the simulation worker for the current world and population.
     ///
-    /// The entire step — including the readback and overlay/history recording —
-    /// is skipped while paused, while a generation transition is in flight (to
-    /// avoid GPU contention with the async readback/reset), and while the kernel
-    /// is being recreated in the background (to prevent a catch-up hitch when it
-    /// lands).
-    pub(crate) fn step_simulation(&mut self, dt: f32) {
-        let sim_active =
-            !self.paused && self.gen_transition.is_none() && self.pending_kernel.is_none();
-        if !sim_active {
+    /// Builds the initial world/agent upload and kernel-creation parameters,
+    /// spawns the worker, and seeds the forwarded-control cache so the first
+    /// `sync_worker_controls` only sends commands that actually changed. No-op
+    /// when there is no world or population yet.
+    pub(crate) fn start_sim_worker(&mut self) {
+        if self.agents.is_empty() {
             return;
         }
-
-        self.dispatch_sim_ticks(dt);
-
-        // Collect GPU staging data and update agent positions regardless of
-        // whether ticks were dispatched this frame, so visuals stay smooth at
-        // low speed multipliers where dispatches happen infrequently.
-        self.collect_state_readback();
-        self.record_overlays_and_histories();
-        self.heatmap_dirty = true;
-
-        // ── Generation completion check (after tick batch) ──
-        if self.gen_transition.is_none() {
-            if let Some(gov) = &self.governor {
-                if gov.generation_complete() {
-                    self.advance_generation();
-                }
-            }
-        }
-    }
-
-    /// Dispatch the fixed-timestep simulation batch for this frame.
-    ///
-    /// Accumulates wall time into a fixed-step budget and dispatches only when
-    /// at least one full brain-tick stride has accumulated, so every dispatch
-    /// includes a brain cycle and produces motor commands. The accumulator keeps
-    /// its fractional remainder across frames so no sim-time is lost.
-    fn dispatch_sim_ticks(&mut self, dt: f32) {
-        let sim_delta_time = SIM_DT as f64;
-        self.sim_accumulator += dt as f64 * self.speed_multiplier as f64;
-        // Only dispatch when the accumulator has enough for at least
-        // brain_tick_stride ticks; sub-stride dispatches would be physics-only
-        // (no brain cycles), leaving agents with stale motor outputs.
-        let min_dispatch = self
-            .gpu_kernel
-            .as_ref()
-            .map_or(10, |kernel| kernel.brain_tick_stride());
-        // Cap must allow at least min_dispatch ticks to accumulate, otherwise
-        // low speeds (1x, 2x) can never reach the dispatch threshold.
-        let max_accumulator =
-            sim_delta_time * (self.speed_multiplier as f64 * 3.0).max(min_dispatch as f64 + 2.0);
-        self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
-        let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32)
-            .min(self.gpu_tick_budget)
-            .min(500);
-        let ticks_to_run = if raw_ticks >= min_dispatch {
-            raw_ticks
-        } else {
-            0
+        let Some(upload) = self.build_pending_upload() else {
+            return;
+        };
+        let (food_count, world_config) = match &self.world {
+            Some(world) => (world.food_items.len(), world.config.clone()),
+            None => return,
         };
 
-        if ticks_to_run == 0 {
+        let agent_count = u32::try_from(self.agents.len()).unwrap_or(u32::MAX);
+        let selected_agent = self
+            .agents
+            .get(self.selected_agent_idx)
+            .map_or(0, |a| a.brain_idx);
+
+        let init = SimInit {
+            agent_count,
+            food_count,
+            brain_config: self.brain_config.clone(),
+            world_config,
+            upload,
+            tick_budget: self.governor_config.tick_budget,
+            speed_multiplier: self.speed_multiplier,
+            paused: self.paused,
+            selected_agent,
+        };
+
+        self.sim_runtime = Some(SimRuntime::start(init));
+        self.sent_speed = Some(self.speed_multiplier);
+        self.sent_paused = Some(self.paused);
+        self.sent_selected_agent = Some(selected_agent);
+        self.cached_food_state = None;
+        self.log_msg(format!("[GPU] sim worker starting ({agent_count} agents)"));
+    }
+
+    /// Drop the simulation worker, shutting down and joining its thread.
+    pub(crate) fn stop_sim_worker(&mut self) {
+        // Dropping the handle requests Shutdown and joins the worker thread.
+        self.sim_runtime = None;
+        self.sent_speed = None;
+        self.sent_paused = None;
+        self.sent_selected_agent = None;
+        self.pending_generation = None;
+        self.cached_food_state = None;
+    }
+
+    /// Forward speed, pause, and selection to the worker, but only on change.
+    ///
+    /// The worker pauses itself at a generation boundary and resumes only on
+    /// `ResetPopulation`, so while a handoff is pending the main thread keeps
+    /// the worker paused regardless of the user's running state.
+    pub(crate) fn sync_worker_controls(&mut self) {
+        if self.sim_runtime.is_none() {
             return;
         }
 
-        let mut dispatched = false;
-        if let Some(ref mut kernel) = self.gpu_kernel {
-            kernel.dispatch_batch(self.tick, ticks_to_run);
-
-            self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
-
-            self.gpu_tick_budget =
-                (self.gpu_tick_budget + self.gpu_tick_budget / 4 + 1).min(64_000);
-
-            self.tick += ticks_to_run as u64;
-            self.tps_tick_count += ticks_to_run as u64;
-            self.snap_dirty = true;
-
-            if let Some(gov) = &mut self.governor {
-                for _ in 0..ticks_to_run {
-                    gov.tick();
-                }
+        let speed = self.speed_multiplier;
+        if self.sent_speed != Some(speed) {
+            if let Some(runtime) = &self.sim_runtime {
+                runtime.send(SimCommand::SetSpeed(speed));
             }
-
-            // Async telemetry readback for the selected agent.
-            // `request_agent_telemetry` is gated internally: it no-ops if a
-            // readback for the same agent is already pending, and clears the old
-            // pending if the agent changed.
-            if self.selected_agent_idx < self.agents.len() {
-                let brain_idx = self.agents[self.selected_agent_idx].brain_idx;
-
-                kernel.request_agent_telemetry(brain_idx);
-
-                // Collect any completed readback (non-blocking)
-                if let Some(tel) = kernel.try_collect_telemetry() {
-                    let a = &mut self.agents[self.selected_agent_idx];
-                    // Only update fields NOT already populated by the every-frame
-                    // physics readback (collect_state_readback). Physics readback
-                    // sets: cached_motor, cached_gradient, cached_urgency,
-                    // cached_fatigue_factor, cached_prediction_error,
-                    // cached_exploration_rate.
-                    a.cached_frame.vision.color = tel.vision_color;
-                    a.cached_mean_attenuation = tel.mean_attenuation;
-                    a.cached_curiosity_bonus = tel.curiosity_bonus;
-                    a.cached_staleness = tel.staleness;
-                }
-            }
-
-            self.food_dirty = true;
-            dispatched = true;
+            self.sent_speed = Some(speed);
         }
 
-        if dispatched {
-            self.record_replay_tick();
+        let desired_paused = self.paused || self.pending_generation.is_some();
+        if self.sent_paused != Some(desired_paused) {
+            if let Some(runtime) = &self.sim_runtime {
+                runtime.send(SimCommand::SetPaused(desired_paused));
+            }
+            self.sent_paused = Some(desired_paused);
+        }
+
+        let selected_brain = self
+            .agents
+            .get(self.selected_agent_idx)
+            .map(|a| a.brain_idx);
+        if let Some(brain_idx) = selected_brain {
+            if self.sent_selected_agent != Some(brain_idx) {
+                if let Some(runtime) = &self.sim_runtime {
+                    runtime.send(SimCommand::SelectAgent(brain_idx));
+                }
+                self.sent_selected_agent = Some(brain_idx);
+            }
         }
     }
 
-    /// Apply the latest GPU physics readback to agent bodies when a new state
-    /// buffer is ready (no-op otherwise).
+    /// Drain all pending worker events, applying the newest snapshot and
+    /// processing control events (kernel-ready, telemetry, generation boundary,
+    /// champion state, logs) in order.
+    pub(crate) fn drain_sim_events(&mut self) {
+        let Some(runtime) = &self.sim_runtime else {
+            return;
+        };
+        let events = runtime.drain_events();
+        if events.is_empty() {
+            return;
+        }
+        let (latest_snapshot, control) = partition_events(events);
+
+        // Latest-wins: apply only the newest plain snapshot.
+        if let Some(snapshot) = latest_snapshot {
+            self.apply_state_snapshot(&snapshot);
+            self.on_fresh_snapshot();
+        }
+
+        for event in control {
+            match event {
+                SimEvent::KernelReady { agent_count } => {
+                    self.log_msg(format!(
+                        "[GPU] sim worker kernel ready ({agent_count} agents)"
+                    ));
+                }
+                // Plain snapshots are folded into latest-wins above.
+                SimEvent::Snapshot(_) => {}
+                SimEvent::Telemetry {
+                    agent_index,
+                    telemetry,
+                } => self.apply_telemetry(agent_index, telemetry),
+                SimEvent::GenerationBudgetReached(snapshot) => {
+                    self.apply_state_snapshot(&snapshot);
+                    self.on_fresh_snapshot();
+                    self.runtime_counters.generation_boundaries += 1;
+                    self.on_generation_budget_reached();
+                }
+                SimEvent::AgentState { request_id, state } => {
+                    self.on_champion_state(request_id, state);
+                }
+                SimEvent::Log(message) => self.log_msg(message),
+                SimEvent::Error(message) => self.log_msg(format!("[GPU] {message}")),
+            }
+        }
+    }
+
+    /// Apply a worker physics/food snapshot to the CPU-side agent caches.
     ///
     /// Authoritative for position/yaw/alive/energy/integrity/velocity and the
-    /// `cached_*` motor/gradient/urgency/prediction/exploration/fatigue fields.
-    fn collect_state_readback(&mut self) {
-        let Some(kernel) = self.gpu_kernel.as_mut() else {
-            return;
-        };
-        if !kernel.try_collect_state() {
-            return;
+    /// `cached_*` motor/gradient/urgency/prediction/exploration/fatigue fields,
+    /// plus the food state that backs the food mesh and mini-map.
+    fn apply_state_snapshot(&mut self, snapshot: &StateSnapshot) {
+        // The worker owns tick advancement, so derive the ticks/sec display from
+        // the delta between published snapshots (it resets to 0 across a
+        // generation boundary, which `saturating_sub` reports as no progress
+        // rather than a spurious spike).
+        self.tps_tick_count += snapshot.tick.saturating_sub(self.tick);
+        self.tick = snapshot.tick;
+        // Sync the governor's per-generation counter from the snapshot to keep
+        // the evolution UI's progress accurate.
+        if let Some(governor) = self.governor.as_mut() {
+            governor.gen_tick = snapshot.generation_tick;
         }
-        let state = kernel.cached_state();
+        let state = &snapshot.physics;
+        let death_reference_tick = snapshot.tick.saturating_sub(1);
         for i in 0..self.agents.len() {
             let base = i * PHYS_STRIDE;
             // Guard every physics field we read below. Use the stride's highest
-            // offset (PHYS_STRIDE - 1) so adding new fields doesn't silently
-            // leave the guard stale.
+            // offset so adding new fields doesn't silently leave the guard stale.
             if base + PHYS_STRIDE > state.len() {
                 break;
             }
@@ -274,7 +245,7 @@ impl App {
             a.total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
             let new_deaths = state[base + P_DEATH_COUNT] as u32;
             let gpu_death_tick = state[base + P_LAST_DEATH_TICK] as u64;
-            a.apply_death_count_readback(new_deaths, gpu_death_tick, self.tick.saturating_sub(1));
+            a.apply_death_count_readback(new_deaths, gpu_death_tick, death_reference_tick);
             a.body.body.facing = Vec3::new(
                 state[base + P_FACING_X],
                 state[base + P_FACING_Y],
@@ -289,10 +260,20 @@ impl App {
             a.cached_urgency = state[base + P_URGENCY_OUT];
         }
 
+        // Keep the previous food cache rather than overwriting with the empty
+        // vector the worker sends before its first food readback.
+        if !snapshot.food.is_empty() {
+            match &mut self.cached_food_state {
+                Some(food) => food.clone_from(&snapshot.food),
+                none => *none = Some(snapshot.food.clone()),
+            }
+        }
+
+        self.runtime_counters.snapshots_applied += 1;
         self.snap_dirty = true;
         self.hud_dirty = true;
 
-        // Diagnostic: log first readback Y vs terrain height
+        // Diagnostic: log first snapshot Y vs terrain height.
         if !self.readback_logged {
             if let Some(world) = &self.world {
                 let n = self.agents.len().min(5);
@@ -310,5 +291,54 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Sample per-snapshot CPU-side state that follows the published cadence:
+    /// overlays/histories, replay, and the food/heatmap dirty flags.
+    fn on_fresh_snapshot(&mut self) {
+        self.record_overlays_and_histories();
+        self.record_replay_tick();
+        self.heatmap_dirty = true;
+        self.food_dirty = true;
+    }
+
+    /// Apply selected-agent telemetry to the matching agent's derived caches.
+    ///
+    /// Telemetry owns only the selected agent's vision color and the derived
+    /// brain fields; the physics snapshot stays authoritative for everything
+    /// else. Ignored when the telemetry is for an agent that is no longer the
+    /// selected one (e.g. an in-flight readback after a selection change).
+    fn apply_telemetry(&mut self, agent_index: u32, telemetry: AgentTelemetry) {
+        let Some(a) = self.agents.get_mut(self.selected_agent_idx) else {
+            return;
+        };
+        if a.brain_idx != agent_index {
+            return;
+        }
+        a.cached_frame.vision.color = telemetry.vision_color;
+        a.cached_mean_attenuation = telemetry.mean_attenuation;
+        a.cached_curiosity_bonus = telemetry.curiosity_bonus;
+        a.cached_staleness = telemetry.staleness;
+    }
+
+    /// Emit the render-side runtime-decoupling counters at most once per second.
+    ///
+    /// The simulation-side counters are logged by the worker thread; together
+    /// the two log lines show simulation progress decoupled from render cadence.
+    /// Call once per rendered frame; the internal timer rate-limits the output.
+    pub(crate) fn log_runtime_counters(&mut self) {
+        /// Minimum wall-clock interval between runtime-counter log lines.
+        const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(1);
+        if self.last_counters_log.elapsed() < COUNTER_LOG_INTERVAL {
+            return;
+        }
+        self.last_counters_log = Instant::now();
+        let counters = &self.runtime_counters;
+        log::debug!(
+            "[RENDER] frames={} snapshots_applied={} generation_boundaries={}",
+            counters.frames_rendered,
+            counters.snapshots_applied,
+            counters.generation_boundaries,
+        );
     }
 }

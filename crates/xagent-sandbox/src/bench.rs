@@ -178,7 +178,7 @@ pub fn run_tick_loop_bench(
         };
 
         if ticks_to_run > 0 {
-            kernel.try_collect_state();
+            kernel.try_collect_state_snapshot();
             kernel.dispatch_batch(tick, ticks_to_run);
 
             accumulator -= ticks_to_run as f64 * SIM_DT;

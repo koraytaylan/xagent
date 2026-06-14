@@ -180,12 +180,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             ticks_done += remaining as u64;
 
             // Advance governor tick counter
-            for _ in 0..remaining {
-                governor.tick();
-            }
+            governor.advance_ticks(u64::from(remaining));
 
             // Drain async readback, then sample cached state for heatmap
-            while !kernel.try_collect_state() {
+            while !kernel.try_collect_state_snapshot() {
                 std::thread::yield_now();
             }
             let state = kernel.cached_state();

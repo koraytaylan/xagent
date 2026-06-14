@@ -463,9 +463,18 @@ impl Governor {
             && (self.generation + 1) as u64 >= self.config.max_generations
     }
 
-    /// Advance the generation tick counter.
+    /// Advance the generation tick counter by `ticks`.
+    ///
+    /// Equivalent to calling [`tick`](Self::tick) `ticks` times, but
+    /// constant-time so the sandbox loop does no CPU work proportional to the
+    /// number of simulated ticks. Saturates at `u64::MAX` rather than wrapping.
+    pub fn advance_ticks(&mut self, ticks: u64) {
+        self.gen_tick = self.gen_tick.saturating_add(ticks);
+    }
+
+    /// Advance the generation tick counter by one.
     pub fn tick(&mut self) {
-        self.gen_tick += 1;
+        self.advance_ticks(1);
     }
 
     /// Evaluate all agents and record results. Returns fitness scores sorted
@@ -1580,6 +1589,44 @@ mod tests {
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
+    }
+
+    // ─── advance_ticks tests ────────────────────────────────────────
+
+    /// `advance_ticks(n)` must leave `gen_tick` exactly where `n` calls to
+    /// `tick()` would, so the batched fast-path is observably identical to the
+    /// per-tick loop it replaces.
+    #[test]
+    fn advance_ticks_matches_repeated_tick() {
+        const STEPS: u64 = 1_234;
+        let mut looped = test_governor(5);
+        for _ in 0..STEPS {
+            looped.tick();
+        }
+        let mut batched = test_governor(5);
+        batched.advance_ticks(STEPS);
+        assert_eq!(looped.gen_tick, STEPS);
+        assert_eq!(batched.gen_tick, looped.gen_tick);
+    }
+
+    /// Successive `advance_ticks` calls accumulate, mirroring how the sandbox
+    /// loop advances the counter once per dispatched batch.
+    #[test]
+    fn advance_ticks_accumulates_across_calls() {
+        let mut gov = test_governor(5);
+        gov.advance_ticks(40);
+        gov.advance_ticks(60);
+        assert_eq!(gov.gen_tick, 100);
+    }
+
+    /// `advance_ticks` saturates at `u64::MAX` instead of wrapping, so a huge
+    /// requested batch can never silently roll the counter back to zero.
+    #[test]
+    fn advance_ticks_saturates_at_u64_max() {
+        let mut gov = test_governor(5);
+        gov.advance_ticks(u64::MAX - 1);
+        gov.advance_ticks(10);
+        assert_eq!(gov.gen_tick, u64::MAX);
     }
 
     // ─── advance tests ──────────────────────────────────────────────

@@ -1318,13 +1318,14 @@ impl GpuKernel {
         collected
     }
 
-    /// Dispatch ticks via fused kernel + global + vision passes.
+    /// Advance GPU compute by `ticks_to_run` simulated ticks.
     ///
-    /// Each kernel-batch runs `vision_stride` brain cycles in a single dispatch,
-    /// followed by one global (grid+collisions) and one vision (raycasting) pass.
-    /// Always dispatches — compute is decoupled from staging readback.
-    /// Staging copy is opportunistic (skipped when all slots are in-flight).
-    /// Always returns `true` (kept for API compatibility).
+    /// Runs the fused kernel / global / vision passes per `vision_stride` brain
+    /// cycle, plus a physics-only remainder for the trailing fragment, but does
+    /// **not** copy state into staging buffers: CPU-visible publication is the
+    /// separate concern of
+    /// [`request_state_snapshot`](Self::request_state_snapshot). Always returns
+    /// `true` (kept for API symmetry with the previous combined call).
     ///
     /// # Vision ordering guarantee
     ///
@@ -1350,10 +1351,7 @@ impl GpuKernel {
     /// (at the end of the batch). The batch covers
     /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
     /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
-    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
-        let n = self.agent_count as usize;
-        let buf_size = (n * PHYS_STRIDE * 4) as u64;
-
+    pub fn dispatch_ticks(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
@@ -1457,55 +1455,92 @@ impl GpuKernel {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Opportunistic staging copy: scan for any free slot.
-        // Compute dispatch above always runs — staging readback is
-        // decoupled so dispatch is never blocked by readback latency.
-        let write_slot = (0..STAGING_SLOTS)
-            .map(|offset| (self.staging_index + offset) % STAGING_SLOTS)
-            .find(|&slot| !self.staging_in_flight[slot]);
-        if let Some(slot_index) = write_slot {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dispatch_staging_copy"),
-                });
-            encoder.copy_buffer_to_buffer(
-                &self.agent_phys_buffer,
-                0,
-                &self.state_staging[slot_index],
-                0,
-                buf_size,
-            );
-            if self.food_count > 0 {
-                let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                encoder.copy_buffer_to_buffer(
-                    &self.food_state_buffer,
-                    0,
-                    &self.food_staging[slot_index],
-                    0,
-                    food_size,
-                );
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
-
-            self.staging_trackers[slot_index].reset();
-            self.staging_trackers[slot_index]
-                .install(self.state_staging[slot_index].slice(..buf_size));
-            if self.food_count > 0 {
-                let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
-                self.staging_trackers[slot_index]
-                    .install(self.food_staging[slot_index].slice(..food_size));
-            }
-            self.staging_in_flight[slot_index] = true;
-            self.staging_index = (slot_index + 1) % STAGING_SLOTS;
-        }
-
         self.active_config_index = 1 - self.active_config_index;
         true
     }
 
+    /// Request a CPU-visible snapshot of agent physics + food state.
+    ///
+    /// Scans the staging ring for a free slot and, when one is available,
+    /// submits a buffer-to-buffer copy of `agent_phys` (and `food_state` when
+    /// food exists) and installs the async `map_async` mapping, which
+    /// [`try_collect_state_snapshot`](Self::try_collect_state_snapshot) later
+    /// collects. Returns `false` when every staging slot is still in flight, in
+    /// which case the request is dropped (never queued) — stale snapshots are
+    /// never preferred over advancing compute. Independent from
+    /// [`dispatch_ticks`](Self::dispatch_ticks): compute may advance any number
+    /// of times between snapshot requests.
+    pub fn request_state_snapshot(&mut self) -> bool {
+        let n = self.agent_count as usize;
+        let buf_size = (n * PHYS_STRIDE * 4) as u64;
+
+        // Scan for any free slot. Compute and readback are decoupled, so a
+        // request is dropped rather than blocked when all slots are in flight.
+        let write_slot = (0..STAGING_SLOTS)
+            .map(|offset| (self.staging_index + offset) % STAGING_SLOTS)
+            .find(|&slot| !self.staging_in_flight[slot]);
+        let Some(slot_index) = write_slot else {
+            return false;
+        };
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("request_state_snapshot_copy"),
+            });
+        encoder.copy_buffer_to_buffer(
+            &self.agent_phys_buffer,
+            0,
+            &self.state_staging[slot_index],
+            0,
+            buf_size,
+        );
+        if self.food_count > 0 {
+            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+            encoder.copy_buffer_to_buffer(
+                &self.food_state_buffer,
+                0,
+                &self.food_staging[slot_index],
+                0,
+                food_size,
+            );
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        self.staging_trackers[slot_index].reset();
+        self.staging_trackers[slot_index].install(self.state_staging[slot_index].slice(..buf_size));
+        if self.food_count > 0 {
+            let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
+            self.staging_trackers[slot_index]
+                .install(self.food_staging[slot_index].slice(..food_size));
+        }
+        self.staging_in_flight[slot_index] = true;
+        self.staging_index = (slot_index + 1) % STAGING_SLOTS;
+        true
+    }
+
+    /// Advance compute and request a CPU-visible snapshot in one call.
+    ///
+    /// Compatibility wrapper preserving the original combined semantics:
+    /// [`dispatch_ticks`](Self::dispatch_ticks) advances GPU compute, then
+    /// [`request_state_snapshot`](Self::request_state_snapshot) opportunistically
+    /// stages a readback (skipped when all slots are in flight). New runtime code
+    /// should call the two separately so dispatch cadence and publication cadence
+    /// are scheduled independently. Returns whatever `dispatch_ticks` returns
+    /// (always `true`).
+    pub fn dispatch_batch(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let dispatched = self.dispatch_ticks(start_tick, ticks_to_run);
+        let _snapshot_requested = self.request_state_snapshot();
+        dispatched
+    }
+
     /// Non-blocking poll + read staging. Returns true if new data was collected.
-    pub fn try_collect_state(&mut self) -> bool {
+    ///
+    /// Collects whatever [`request_state_snapshot`](Self::request_state_snapshot)
+    /// previously staged; the snapshot lands in
+    /// [`cached_state`](Self::cached_state) (and
+    /// [`cached_food_state`](Self::cached_food_state) when food exists).
+    pub fn try_collect_state_snapshot(&mut self) -> bool {
         self.device.poll(wgpu::Maintain::Poll);
         self.try_collect_staging()
     }
@@ -2088,11 +2123,16 @@ impl GpuKernel {
     }
 
     /// Non-blocking poll: if telemetry readback is complete, parse the results
-    /// into `AgentTelemetry`, cache it, and return `Some`. Otherwise `None`.
+    /// into `AgentTelemetry`, cache it, and return `Some((agent_index, telemetry))`
+    /// where `agent_index` is the agent the readback was *requested for*.
+    /// Otherwise `None`.
+    ///
+    /// Returning the agent index lets callers reject telemetry that completed
+    /// for a previously-selected agent after the selection changed.
     ///
     /// If any map_async callback reported an error, clears the pending state
     /// so the next frame can retry.
-    pub fn try_collect_telemetry(&mut self) -> Option<AgentTelemetry> {
+    pub fn try_collect_telemetry(&mut self) -> Option<(u32, AgentTelemetry)> {
         self.device.poll(wgpu::Maintain::Poll);
 
         let pending = self.pending_telemetry.as_ref()?;
@@ -2108,7 +2148,7 @@ impl GpuKernel {
         }
 
         // All 4 mappings succeeded — consume pending state and read data.
-        let _pending = self.pending_telemetry.take().unwrap();
+        let agent_index = self.pending_telemetry.take().unwrap().agent_index;
 
         // Compute dynamic brain-state offsets from layout's feature_count.
         // All offsets past O_PREDICTOR_CONTEXT_WEIGHT have a fixed delta from that anchor.
@@ -2190,7 +2230,7 @@ impl GpuKernel {
             td_error,
         };
         self.cached_telemetry = Some(tel.clone());
-        Some(tel)
+        Some((agent_index, tel))
     }
 
     /// Returns the most recently collected telemetry, if any.

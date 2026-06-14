@@ -10,7 +10,13 @@ use xagent_sandbox::replay::{GenerationRecording, TickRecord};
 use crate::app::App;
 
 impl App {
-    /// Append the current frame's per-agent state to the active recording.
+    /// Append the latest published per-agent state to the active recording.
+    ///
+    /// Called once per *collected state snapshot* (bounded by
+    /// `STATE_SNAPSHOT_MAX_HZ`), not once per simulated tick: like the CPU
+    /// sparkline histories, the replay samples the latest published state, so a
+    /// generation's recording is a cadence-sampled trace rather than a dense
+    /// per-tick log.
     ///
     /// Position/yaw/alive/energy/integrity come from the latest async physics
     /// readback stored on each agent body. Motor outputs, gradient/urgency, and

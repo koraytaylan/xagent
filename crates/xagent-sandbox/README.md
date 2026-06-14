@@ -56,16 +56,25 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │       │  └──────────────────────────────────────┘              │          │
 │       │                                                        │          │
 │  ┌────┴──────────────────────────────────────────────┐         │          │
-│  │  Per-frame pipeline                               │         │          │
+│  │  Per-frame pipeline (render/UI thread)            │         │          │
 │  │  1. Input events → camera update                  │         │          │
-│  │  2. Ensure/collect fused GPU kernel readiness     │         │          │
-│  │  3. Dispatch GPU tick batch (physics+brain+world) │         │          │
-│  │  4. Async selected-agent telemetry readback       │         │          │
-│  │  5. Every-frame GPU state readback → agent cache  │         │          │
-│  │  6. Record replay + history/heatmap/trail updates │         │          │
-│  │  7. Generation transition + replay playback       │         │          │
-│  │  8. Rebuild meshes + HUD bars                     │         │          │
-│  │  9. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
+│  │  2. Drain sim-worker events → apply newest        │         │          │
+│  │     snapshot to agent caches (latest-wins)        │         │          │
+│  │  3. On fresh snapshot: replay + history/heatmap/  │         │          │
+│  │     trail updates                                 │         │          │
+│  │  4. Generation handoff events + replay playback   │         │          │
+│  │  5. Rebuild meshes + HUD bars                     │         │          │
+│  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
+│  │  7. Forward speed/pause/selection to worker       │                    │
+│  └───────────────────────────────────────────────────┘                    │
+│                                                                            │
+│  ┌───────────────────────────────────────────────────┐                    │
+│  │  Simulation worker (background thread, owns kernel)│                    │
+│  │  • Advance ticks on a wall-clock cadence           │                    │
+│  │  • Dispatch one kernel-batch per loop iteration    │                    │
+│  │  • Request state @60 Hz / telemetry @30 Hz         │                    │
+│  │  • Enforce generation tick budget                  │                    │
+│  │  • Publish snapshots/telemetry over channels       │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -76,7 +85,7 @@ External crates:
                   with all per-tick simulation in WGSL)
 ```
 
-> **Runtime contract.** The sandbox does not own a per-agent `Brain` object. Each `Agent` carries a `brain_idx` (its slot in the kernel's storage buffers) and a `BrainConfig` copy used for evolution and metabolic accounting. All per-tick computation — physics, vision, food detection, death/respawn, and the seven brain stages — runs inside `xagent_brain::GpuKernel`. The CPU side calls `dispatch_batch` to advance the simulation and `try_collect_state` / `try_collect_telemetry` to surface readbacks for the UI.
+> **Runtime contract.** The sandbox does not own a per-agent `Brain` object. Each `Agent` carries a `brain_idx` (its slot in the kernel's storage buffers) and a `BrainConfig` copy used for evolution and metabolic accounting. All per-tick computation — physics, vision, food detection, death/respawn, and the seven brain stages — runs inside `xagent_brain::GpuKernel`, which is owned by a **simulation worker thread** (`sim_runtime.rs`). The worker advances ticks on a simulation-owned cadence and calls `dispatch_ticks` to advance compute, `request_state_snapshot` to stage a CPU-visible state copy, and `try_collect_state_snapshot` / `try_collect_telemetry` to surface readbacks. It publishes the results to the render/UI thread as latest-wins `SimEvent::Snapshot` / `Telemetry` messages over a bounded channel; the render loop only drains events and renders the cached state — it never touches `GpuKernel` directly. (`dispatch_batch` remains as a wrapper that advances compute and requests a snapshot in one call, used by the headless and bench paths.)
 
 ---
 
@@ -567,10 +576,15 @@ renderer, camera, world, agents, logger, and simulation metadata.
 #### Event Loop Flow
 
 ```
-resumed()           → Create window, GPU, world, terrain mesh, spawn first agent
-window_event()      → Dispatch keyboard/mouse/redraw events
+resumed()           → Create window, renderer, world, terrain mesh, spawn first agent
+window_event()      → Handle keyboard/mouse; on redraw: drain sim-worker events,
+                      apply newest snapshot, render, forward control changes
 about_to_wait()     → Request continuous redraw
 ```
+
+Simulation itself runs on a separate worker thread (`sim_runtime.rs`) that owns
+the GPU kernel; the redraw path only consumes snapshots, so render cadence and
+simulation cadence are independent.
 
 #### Simulation Speed Controls
 
@@ -586,7 +600,7 @@ about_to_wait()     → Request continuous redraw
 | `8` | 100000 | 100k× |
 | `9` | 1000000 | 1000k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 1,000,000) in fast mode.
+The worker accumulates wall time × `speed_multiplier` into a tick budget and dispatches one kernel-batch (`vision_stride × brain_tick_stride` ticks) per loop iteration, draining any backlog at GPU speed. The accumulator is capped so a paused/stalled interval cannot dump a giant catch-up batch.
 
 #### Agent Spawning
 
@@ -757,71 +771,79 @@ cargo run -p xagent-sandbox -- --config my_config.json
 
 ## The Simulation Loop (Detailed)
 
+Simulation runs on a background worker thread (`sim_runtime.rs`) that owns the
+GPU kernel; the render/UI thread only consumes published state. The two run at
+independent cadences.
+
+### Simulation worker thread
+
+Each loop iteration (`Worker::step`):
+
+```
+1. Collect + publish any ready readbacks:
+   - try_collect_state_snapshot() → build an owned StateSnapshot (physics +
+     food + tick + generation_tick) and try_send it (latest-wins; dropped
+     under back-pressure).
+   - try_collect_telemetry() → send selected-agent telemetry.
+
+2. Request the next samples on their own cadence (decoupled from dispatch):
+   - state snapshot at ≤ 60 Hz, telemetry at ≤ 30 Hz (immediately on a
+     selection change). This is why the UI keeps refreshing even while the
+     GPU grinds a long dispatch.
+
+3. If not paused, advance compute:
+   a. Accumulate dt × speed_multiplier into sim_accumulator (capped so a
+      stall cannot dump a giant catch-up batch).
+   b. Dispatch one kernel-batch — min(accumulated, gpu_tick_budget,
+      kernel_batch_size) ticks, clamped to the remaining generation budget,
+      gated to ≥ brain_tick_stride so every dispatch holds a full brain cycle.
+      Capping at one kernel-batch keeps vision amortized (perception
+      unchanged) and lets state publish frequently. A backlog drains across
+      iterations rather than in one giant submit.
+   c. kernel.dispatch_ticks(tick, ticks_to_run); advance tick + gen_tick.
+
+4. When gen_tick reaches the generation tick budget, force a final snapshot,
+   emit GenerationBudgetReached, and pause until the handoff resets the
+   population (ResetPopulation command).
+
+The worker only sleeps when caught up or paused; otherwise it loops so the
+backlog drains at GPU speed (queue.submit back-pressure paces it).
+```
+
+### Render / UI thread
+
 Each frame, when the window requests a redraw:
 
 ```
-1. Compute dt = min(elapsed since last frame, 0.05s)
+1. Compute dt; update camera from held keys (WASD/E/Shift).
 
-2. Update camera position from held keys (WASD/E/Shift)
+2. drain_sim_events(): pull all pending worker events, apply the newest
+   StateSnapshot (latest-wins) to agent caches — position, yaw, energy,
+   integrity, velocity, facing, food_consumed, death count, and the cached
+   motor/gradient/urgency/prediction/exploration/fatigue fields — and sync
+   the governor's gen_tick for the UI. Telemetry events update the selected
+   agent's vision/derived fields.
 
-3. If not paused, dispatch a batched tick range on the GPU fused kernel
-   (physics + brain + food detection + death/respawn all run inside
-   `kernel_tick.wgsl`; no per-tick simulation work runs on the CPU,
-   though governor bookkeeping does — one `gov.tick()` per simulated
-   tick):
-   a. Accumulate `sim_accumulator` from real-time dt × speed multiplier
+3. On a fresh snapshot only: record a replay TickRecord, sample
+   heatmap/trail occupancy and per-agent sparkline histories, and mark the
+   food/heatmap caches dirty. (CPU histories and replay sample the published
+   state at publication cadence, not every simulated tick.)
 
-   b. Compute `raw_ticks` from `sim_accumulator / sim_delta_time`,
-      bounded by `gpu_tick_budget` (an internal warmup throttle that
-      grows by ~25% on each successful dispatch up to 64,000 so cold
-      starts don't dispatch giant batches) and the hard per-frame cap
-      of 500. Dispatch only when `raw_ticks >= brain_tick_stride()`
-      so the batch contains at least one full brain cycle; otherwise
-      skip and let the accumulator carry over to the next frame. There
-      is no rounding to a multiple of the stride — `ticks_to_run`
-      equals `raw_ticks` once the threshold is met.
+4. Generation handoff: a GenerationBudgetReached event evaluates fitness,
+   requests the champion's brain state from the worker, then sends
+   ResetPopulation for the next generation. Advance replay playback.
 
-   c. `kernel.dispatch_batch(self.tick, ticks_to_run)` — one submit
-      covers the whole range. `self.tick` is advanced by `ticks_to_run`
-      and `gov.tick()` is called once per simulated tick (CPU-side
-      bookkeeping only — no simulation work).
+5. Fix selected_agent_idx if agents were added/removed.
 
-   d. Request async agent telemetry readback for the selected agent.
-      Collect any completed telemetry (vision, curiosity, staleness)
-      without blocking.
+6. Rebuild dynamic GPU meshes (throttled to ~10 Hz): food mesh (if dirty),
+   agent mesh (combined).
 
-   e. Append a TickRecord to the active replay recording using
-      GPU-readback state + the per-agent `cached_*` telemetry.
-
-4. Every-frame non-blocking state readback (runs even when no ticks
-   were dispatched so the viewport stays responsive at low speeds):
-   `kernel.try_collect_state()` → update each agent's position, yaw,
-   energy, integrity, velocity, facing, food_consumed, death count,
-   and cached motor/gradient/urgency/prediction/exploration/fatigue.
-
-5. Heatmap + trail recording for every living agent (CPU sampling of
-   the latest GPU readback).
-
-6. Sparkline history updates per agent.
-
-7. Generation completion check → `advance_generation()` kicks off the
-   multi-frame transition state machine; `poll_gen_transition()` drives
-   it each frame.
-
-8. Advance replay playback if active.
-
-9. Fix selected_agent_idx if agents were added/removed.
-
-10. Rebuild dynamic GPU meshes (throttled to ~10 Hz):
-    ├─ Food mesh (if dirty)
-    └─ Agent mesh (combined)
-
-11. Build HUD bars for selected agent.
-
-12. Render:
+7. Build HUD bars; render:
     ├─ 3D pass: terrain + food + agents (depth-tested)
     ├─ HUD pass: background panels + status bars (alpha-blended)
     └─ Text pass: bitmap font labels (alpha-blended)
+
+8. Forward any speed/pause/selection changes to the worker (sent on change).
 ```
 
 ---
@@ -956,7 +978,7 @@ All per-tick simulation runs in `xagent_brain::GpuKernel` — physics, vision ra
 
 - **Vision resolution**: 8×6 by default (48 rays per agent per vision pass). Larger grids scale linearly with `VISION_RAYS` in both shader work and `BrainLayout::feature_count` (encoder weights).
 - **`vision_stride`**: how many physics+brain cycles run between global+vision passes (grid rebuild, food respawn, collision, raycasting). Higher values trade sensory freshness for brain throughput; the brain reads from the previous batch's vision output, so this is also the sensory-lag in brain cycles.
-- **Kernel-batching**: `dispatch_batch(start_tick, ticks_to_run)` splits work into full kernel-batches of `vision_stride * brain_tick_stride` ticks (one command buffer + `queue.submit()` per batch), plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Per-simulated-tick CPU cost is the world-config uniform write + command-encoder setup, divided by the batch size — small at any throughput.
+- **Kernel-batching**: `dispatch_ticks(start_tick, ticks_to_run)` (the compute half of the kernel API, wrapped by `dispatch_batch`) splits work into full kernel-batches of `vision_stride * brain_tick_stride` ticks (one command buffer + `queue.submit()` per batch), plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Per-simulated-tick CPU cost is the world-config uniform write + command-encoder setup, divided by the batch size — small at any throughput.
 - **Subgroup top-K** (when supported): the recall top-K reduction uses a subgroup-accelerated bitonic sort spliced in by `apply_subgroup_markers`. On hardware without `wgpu::Features::SUBGROUP`, the same code path falls back to a workgroup-memory bitonic sort.
 - **MAX_AGENTS**: 100. Per-agent storage scales linearly; `BrainLayout::brain_stride` × 100 × 4 bytes is the worst-case persistent allocation.
 
@@ -1064,9 +1086,9 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 
 ### When to Worry
 
-- **High speed_multiplier (1000×+)**: `raw_ticks` per frame is hard-capped at 500 in the main app loop (`main.rs`), and is also bounded by the adaptive `gpu_tick_budget`. Each `dispatch_batch` may submit several command buffers (one `queue.submit()` per kernel-batch of `vision_stride * brain_tick_stride` ticks, plus an optional physics-only remainder and a separate opportunistic staging copy), but the small per-frame tick cap keeps the worst-case submission count bounded.
+- **High speed_multiplier (1000×+)**: the simulation worker (`sim_runtime.rs`) caps each dispatch to one kernel-batch (`vision_stride * brain_tick_stride` ticks) — small enough that state publishes frequently, large enough to amortize per-dispatch overhead. A speed backlog drains across worker loop iterations (paced by `queue.submit` back-pressure) rather than in one giant submit, so achievable throughput is GPU-bound, not redraw-bound. The accumulator is capped so a stalled/paused interval cannot dump a catch-up batch.
 - **Large vision grids**: the encoder weight count scales linearly with `vision_rays` (= `VISION_W × VISION_H`), so doubling the `vision_rays` count roughly doubles both the encoder weights and the kernel cycle cost. Doubling *both* vision dimensions quadruples `vision_rays` (and therefore the encoder weights). Stay near the default 8×6 unless an experiment specifically needs higher resolution.
-- **Telemetry readback churn**: `request_agent_telemetry` issued every frame for every agent would serialize the kernel against the staging buffer mappings. The sandbox issues it once per frame for the *selected* agent only.
+- **Telemetry readback churn**: `request_agent_telemetry` issued every iteration for every agent would serialize the kernel against the staging buffer mappings. The worker issues it for the *selected* agent only, throttled to ≤ 30 Hz (and immediately on a selection change).
 
 ---
 

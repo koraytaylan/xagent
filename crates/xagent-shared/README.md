@@ -22,9 +22,9 @@ This crate is the **interface contract** between the brain and sandbox crates. I
      │  xagent-brain  │       │ xagent-sandbox      │
      │                │       │                     │
      │  GpuKernel     │       │  Builds world       │
-     │  uploads these │       │  state, calls       │
-     │  configs to    │       │  kernel             │
-     │  GPU buffers,  │       │  .dispatch_batch,   │
+     │  uploads these │       │  state, runs the    │
+     │  configs to    │       │  sim worker that    │
+     │  GPU buffers,  │       │  owns the kernel,   │
      │  runs the      │       │  reads back vitals  │
      │  fused per-    │       │  and telemetry for  │
      │  agent kernel  │       │  UI + replay        │
@@ -380,11 +380,11 @@ These shared types describe the *shape* of one tick's worth of sensory input and
 
 **Per-batch flow**:
 
-1. **Sandbox uploads world + agent state**: When the world geometry or an agent spec changes (startup, spawn, config edit), the sandbox uploads new terrain/biome/food data and `BodyState` / `BrainConfig` rows into the kernel's GPU **storage** buffers via `GpuKernel::upload_world` / `upload_agents` / `write_agent_*`. `WorldConfig` (tick window, vision/brain strides, phase mask) is a separate path — it lives in a double-buffered **uniform** buffer (`world_config_bufs`) that `upload_world_config[_masked]` rewrites once per kernel-batch from inside `dispatch_batch`.
+1. **Sandbox uploads world + agent state**: When the world geometry or an agent spec changes (startup, spawn, config edit), the sandbox uploads new terrain/biome/food data and `BodyState` / `BrainConfig` rows into the kernel's GPU **storage** buffers via `GpuKernel::upload_world` / `upload_agents` / `write_agent_*`. `WorldConfig` (tick window, vision/brain strides, phase mask) is a separate path — it lives in a double-buffered **uniform** buffer (`world_config_bufs`) that `upload_world_config[_masked]` rewrites once per kernel-batch from inside `dispatch_ticks`.
 
-2. **Sandbox dispatches a batch**: `kernel.dispatch_batch(start_tick, ticks_to_run)` runs many simulated ticks per submission. Inside the kernel, each agent's vision rays are raycast in WGSL, touch contacts are detected from the spatial grids, motor output is computed from the encoded state, and physics integrates position/velocity/energy/integrity — all without crossing the bus.
+2. **Simulation worker dispatches a batch**: the kernel is owned by a worker thread (`sim_runtime.rs`) that calls `kernel.dispatch_ticks(start_tick, ticks_to_run)` to run many simulated ticks per submission. Inside the kernel, each agent's vision rays are raycast in WGSL, touch contacts are detected from the spatial grids, motor output is computed from the encoded state, and physics integrates position/velocity/energy/integrity — all without crossing the bus. (`dispatch_batch` = `dispatch_ticks` + `request_state_snapshot`; the worker schedules the two separately so publication is rate-limited independently of compute.)
 
-3. **Sandbox reads back what it needs for UI**: Non-blocking `try_collect_state` / `try_collect_telemetry` calls produce snapshots that the sandbox reshapes back into `SensoryFrame`-like data for replay recording and `MotorCommand` for telemetry rendering. These are convenience reconstitutions of the shape — the authoritative per-tick state lives in GPU storage.
+3. **Sandbox reads back what it needs for UI**: Non-blocking `try_collect_state_snapshot` / `try_collect_telemetry` calls produce snapshots that the sandbox reshapes back into `SensoryFrame`-like data for replay recording and `MotorCommand` for telemetry rendering. These are convenience reconstitutions of the shape — the authoritative per-tick state lives in GPU storage.
 
 **What flows where**:
 

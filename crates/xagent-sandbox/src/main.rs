@@ -3,6 +3,7 @@ mod evolution;
 mod gpu_orchestration;
 mod render_pipeline;
 mod replay_coord;
+mod sim_runtime;
 mod snapshot;
 mod ui_chrome;
 
@@ -453,6 +454,7 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
+                self.runtime_counters.frames_rendered += 1;
                 // ── FPS tracking ──────────────────────────────────
                 self.frame_times.push_back(now);
                 while self.frame_times.len() > 300 {
@@ -486,16 +488,12 @@ impl ApplicationHandler for App {
                     self.camera.update(dt);
                 }
 
-                // Ensure background kernel creation is started if needed and
-                // collected when ready.
-                self.ensure_gpu_kernel();
-
-                // ── simulation ticks (fixed timestep) + every-frame readback ──
-                self.step_simulation(dt);
-
-                // Drive the multi-frame generation transition state machine
-                // (runs even when sim ticks are paused/skipped due to transition).
-                self.poll_gen_transition();
+                // ── consume simulation-worker events ──
+                // The worker owns the GPU kernel and advances ticks on its own
+                // cadence; the redraw path only drains events, applies the
+                // newest snapshot to CPU caches, and drives the generation
+                // handoff. No GPU dispatch, readback, or device poll happens here.
+                self.drain_sim_events();
 
                 // Advance replay playback
                 self.advance_replay_playback();
@@ -515,14 +513,15 @@ impl ApplicationHandler for App {
                 // ── render (3D offscreen + egui chrome) ──
                 let pending_evo_action = self.render_frame(event_loop);
 
-                // Poll GPU kernel device after rendering so map_async
-                // callbacks can complete before the next frame.
-                if let Some(ref kernel) = self.gpu_kernel {
-                    kernel.device().poll(wgpu::Maintain::Poll);
-                }
-
-                // Handle evolution actions (outside renderer borrow)
+                // Handle evolution actions (outside renderer borrow); may start,
+                // stop, or reconfigure the simulation worker.
                 self.handle_evolution_action(pending_evo_action);
+
+                // Forward any speed/pause/selection changes to the worker.
+                self.sync_worker_controls();
+
+                // Emit runtime-decoupling diagnostics (rate-limited internally).
+                self.log_runtime_counters();
             }
 
             _ => {}

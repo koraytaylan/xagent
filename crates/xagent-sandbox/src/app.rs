@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use winit::window::Window;
 
-use xagent_brain::{AgentBrainState, GpuKernel};
 use xagent_sandbox::agent::Agent;
 use xagent_sandbox::governor::{check_existing_session, AdvanceResult, Governor};
 use xagent_sandbox::renderer::camera::Camera;
@@ -44,18 +43,35 @@ pub(crate) struct PendingUpload {
     pub(crate) agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
 }
 
-/// State machine for non-blocking generation transitions.
-/// Each variant represents one phase of the multi-frame handoff.
-pub(crate) enum GenTransition {
-    /// Waiting for async readback of the best agent's brain state.
-    AwaitingReadback { result: AdvanceResult },
-    /// Readback collected; waiting for staging buffers to drain before reset.
-    AwaitingReset {
-        result: AdvanceResult,
-        inherited_state: Option<AgentBrainState>,
-        /// Whether population has already been spawned (prevents re-spawn on retry).
-        spawned: bool,
-    },
+/// Render-side instrumentation for the runtime-decoupling work.
+///
+/// The simulation half of the baseline (ticks advanced, dispatches, snapshot /
+/// telemetry requests and collections) lives in the worker thread (see
+/// `sim_runtime::Worker`). The main thread only counts what it observes:
+/// frames rendered and snapshots/generation-boundaries consumed. Together the
+/// two halves show simulation progress is independent of render cadence. These
+/// are diagnostic only — emitted through `log::debug!` roughly once per second
+/// (see `App::log_runtime_counters`) and carry no UI surface.
+#[derive(Default)]
+pub(crate) struct RuntimeCounters {
+    /// Frames rendered (redraw-handler invocations).
+    pub(crate) frames_rendered: u64,
+    /// State snapshots received from the worker and applied to CPU caches.
+    pub(crate) snapshots_applied: u64,
+    /// Generation-boundary events received from the worker.
+    pub(crate) generation_boundaries: u64,
+}
+
+/// In-flight generation handoff: the worker reached the tick budget and the
+/// main thread has evaluated fitness and requested the champion's brain state.
+///
+/// When the champion `AgentState` reply arrives, the main thread spawns the
+/// next population and sends `ResetPopulation` to the worker. `Finished`
+/// results complete immediately and never produce a pending handoff.
+pub(crate) struct PendingGeneration {
+    pub(crate) result: AdvanceResult,
+    /// Identifies the matching `RequestAgentState` / `AgentState` pair.
+    pub(crate) champion_request_id: u64,
 }
 
 pub(crate) struct App {
@@ -79,11 +95,9 @@ pub(crate) struct App {
 
     pub(crate) last_frame: Instant,
 
-    /// Fixed-timestep accumulator — simulation ticks run at SIM_RATE Hz,
-    /// decoupled from the render frame rate.
-    pub(crate) sim_accumulator: f64,
-
-    // Speed controls (multiplier for simulation rate)
+    // Speed controls (multiplier for simulation rate). The worker owns the
+    // tick accumulator; the main thread only owns the user's chosen speed and
+    // forwards it on change.
     pub(crate) speed_multiplier: u32,
     pub(crate) paused: bool,
     pub(crate) render_3d: bool,
@@ -144,27 +158,33 @@ pub(crate) struct App {
     pub(crate) db_path: String,
     pub(crate) governor_config: GovernorConfig,
 
-    // Non-blocking generation transition state machine
-    pub(crate) gen_transition: Option<GenTransition>,
+    // In-flight generation handoff (worker reached the tick budget; awaiting
+    // champion brain-state reply before sending the population reset).
+    pub(crate) pending_generation: Option<PendingGeneration>,
+    /// Monotonic id source pairing `RequestAgentState` with its `AgentState`.
+    pub(crate) champion_request_counter: u64,
 
-    // GPU fused kernel (all simulation computation in single dispatch)
-    pub(crate) gpu_kernel: Option<GpuKernel>,
-    pub(crate) pending_kernel: Option<std::thread::JoinHandle<GpuKernel>>,
-    /// Data collected for upload once the background kernel is ready.
-    pub(crate) pending_upload: Option<PendingUpload>,
-    /// Inherited brain state + mutation strength deferred until a background
-    /// kernel finishes creation (when population size changes at generation
-    /// boundary and `can_reuse` is false).
-    pub(crate) deferred_inherited: Option<(AgentBrainState, f32)>,
+    // Simulation worker — owns the GPU kernel and all simulation-cadence state.
+    // `None` until evolution starts; recreated on Start/Resume, dropped on Reset.
+    pub(crate) sim_runtime: Option<crate::sim_runtime::SimRuntime>,
+    /// Latest food state published by the worker, authoritative for the food
+    /// mesh and mini-map once a snapshot has arrived.
+    pub(crate) cached_food_state: Option<Vec<f32>>,
+    /// Last control values forwarded to the worker, so commands are sent only
+    /// on change (`None` until the first sync after the worker starts).
+    pub(crate) sent_speed: Option<u32>,
+    pub(crate) sent_paused: Option<bool>,
+    pub(crate) sent_selected_agent: Option<u32>,
 
     // egui_dock tab state
     pub(crate) dock_state: egui_dock::DockState<Tab>,
 
-    // Adaptive GPU tick budget — keeps dispatch under ~8ms wall time
-    pub(crate) gpu_tick_budget: u32,
-
-    // Diagnostic: log first readback Y vs terrain height
+    // Diagnostic: log first snapshot Y vs terrain height
     pub(crate) readback_logged: bool,
+
+    // Runtime-decoupling instrumentation (diagnostic-only, see RuntimeCounters)
+    pub(crate) runtime_counters: RuntimeCounters,
+    pub(crate) last_counters_log: Instant,
 
     // Sidebar sort mode
     pub(crate) sort_mode: SortMode,
@@ -239,7 +259,6 @@ impl App {
             food_dirty: true,
             food_gpu: None,
             last_frame: Instant::now(),
-            sim_accumulator: 0.0,
             speed_multiplier: 1,
             paused: true,
             render_3d: true,
@@ -248,6 +267,8 @@ impl App {
             chart_window: 120,
             orbit_mode: false,
             readback_logged: false,
+            runtime_counters: RuntimeCounters::default(),
+            last_counters_log: Instant::now(),
             agent_instance_buffer: None,
             agent_instance_count: 0,
             frame_times: VecDeque::new(),
@@ -276,13 +297,14 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            gen_transition: None,
-            gpu_kernel: None,
-            pending_kernel: None,
-            pending_upload: None,
-            deferred_inherited: None,
+            pending_generation: None,
+            champion_request_counter: 0,
+            sim_runtime: None,
+            cached_food_state: None,
+            sent_speed: None,
+            sent_paused: None,
+            sent_selected_agent: None,
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
-            gpu_tick_budget: 32,
             sort_mode: SortMode::Id,
             world_snapshot: WorldSnapshot::default(),
             recording: None,

@@ -5,14 +5,16 @@ All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That 
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 75 lib unit + 3 bin unit + 52 integration tests (130 total). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
+- `cargo test -p xagent-sandbox` — runs 83 lib unit + 11 bin unit + 60 integration tests (154 total). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence
 - `crates/xagent-sandbox/src/ui.rs` — egui 0.31 immediate-mode UI, `EvolutionSnapshot` bridges governor↔UI
-- `crates/xagent-sandbox/src/main.rs` — app loop, pipes governor data to snapshot before paint closure
+- `crates/xagent-sandbox/src/sim_runtime.rs` — simulation worker thread: owns `GpuKernel` and all sim-cadence scheduling, advances ticks on a wall-clock cadence, enforces the generation tick budget, and publishes CPU-visible state to the main thread via bounded `SimCommand`/`SimEvent` channels (latest-wins snapshots)
+- `crates/xagent-sandbox/src/main.rs` — app loop: drains worker events, applies the newest snapshot to CPU agent caches, drives the generation handoff, and renders (no GPU dispatch/readback in the redraw path)
+- `crates/xagent-sandbox/src/gpu_orchestration.rs` — main-thread side of the worker boundary: start/stop worker, drain events, apply snapshots, forward speed/pause/selection on change
 - DB migrations are idempotent: `let _ = db.execute_batch("ALTER TABLE ... ADD COLUMN ...");`
-- `crates/xagent-brain/src/gpu_kernel.rs` — fused kernel: single dispatch(agent_count,1,1) per vision-stride cycle, the sole GPU abstraction for all simulation
+- `crates/xagent-brain/src/gpu_kernel.rs` — fused kernel: single dispatch(agent_count,1,1) per vision-stride cycle, the sole GPU abstraction for all simulation. Compute (`dispatch_ticks`) is split from CPU-visible publication (`request_state_snapshot` / `try_collect_state_snapshot`); `dispatch_batch` is the combined compatibility wrapper
 - `crates/xagent-brain/src/buffers.rs` — GPU buffer layout constants, sensory packing, AgentBrainState, AgentTelemetry
 - `crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl` — fused per-agent kernel (physics + food detect + death/respawn + brain, looped over vision_stride cycles)
 - `crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl` — the 7 cooperative brain passes; credit assignment is a TD(λ) actor-critic (value head + eligibility traces in `brain_state`), no history ring

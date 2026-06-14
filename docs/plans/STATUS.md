@@ -10,5 +10,6 @@ _Last updated: 2026-06-14, against `develop`._
 |---|---|---|---|---|---|
 | 0001 | Survival Signal Grounding | ✅ Complete | 10/10 | Deaths-per-food 4.02 → 2.23 (−45%); `lag100` confirmed default. | [status](0001-Survival-Signal-Grounding/STATUS.md) |
 | 0002 | CPU/GPU Runtime Decoupling | ✅ Complete | 12/12 | Sim decoupled from redraw onto a GPU worker thread; shared-GPU render path rejected. | [status](0002-CPU-GPU-Runtime-Decoupling/STATUS.md) |
+| 0003 | Simulation Throughput Ceiling | 📋 Planned | 0/8 | Measure the per-batch limiter, then fuse kernel-batches into one submit to lift the ≈20 k tps / 1000× ceiling; `global`-pass rewrite gated on measurement. | [status](0003-Simulation-Throughput-Ceiling/STATUS.md) |
 
 **Status legend:** 📋 Planned (authored, not started) · 🚧 In progress (some tasks merged) · ✅ Complete (all tasks merged to `develop`) · ⛔ Blocked (waiting on a gate or upstream task) · 🗄️ Superseded (replaced or abandoned).

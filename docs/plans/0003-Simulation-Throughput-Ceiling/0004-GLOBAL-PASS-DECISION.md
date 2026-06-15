@@ -11,90 +11,85 @@
 
 ## Decision
 
-**Closed — not opened. The gate is unevaluated on target hardware and therefore
-not met; no `global`-pass rewrite ships under Plan 0003.** This satisfies the
-"record the negative and close the workstream" branch of the spike's `Done when`,
-with the explicit caveat that the negative is *"gate not demonstrated on target
-hardware,"* not *"global pass proven cheap on target hardware."* The path is
-reversible by the concrete condition in [When to revisit](#when-to-revisit).
+**REJECTED with on-target evidence. The `global` pass is NOT the residual
+ceiling — no rewrite ships.** On the macOS/Metal machine where the ≈20 k-tps /
+1000× ceiling was observed, the `--bench-phase-ab` isolation run shows skipping
+the `global` pass alone recovers only **+3%**, and skipping *both* `global` and
+`vision` recovers only **+7%** — so ≥93% of per-batch wall time is the
+`prepare`+`kernel` (fused brain) dispatch, which parallelizing `global` cannot
+touch. This satisfies the "rejects the path with measured evidence (negative
+recorded)" branch of the spike's `Done when`.
 
-The fused-submit work (0002) already removed the per-batch submit tax — the
-demonstrable, hardware-independent win (240 kernel-batches → 10 submits at
-`--bench-ticks 24000`). The `global`-pass rewrite is a *separate, larger* GPU
-change (multi-workgroup grid-clear/build, plus cross-cell-dependent collision
-atomics) and is only worth its risk if a target-hardware measurement fingers the
-`global` pass as the residual floor. That measurement does not yet exist.
+Fusion (0002) is engaged in this run (10 000 kernel-batches → 417 submits) yet
+baseline tps is still ≈23 k — confirming the limiter is neither CPU submit
+overhead (0002's target) nor the `global` pass (0004's target). The real ceiling
+is the fused **kernel/brain pass** itself; addressing it is a separate plan, not
+this workstream.
 
 ## The three paths
 
 | Path | What it is | Cost it removes | Risk / cost to build |
 |---|---|---|---|
-| A — leave single-workgroup | Status quo: `global_tick` runs on one 256-thread workgroup, `dispatch(1,1,1)`. | Nothing. | None. |
-| B — parallelize grid-clear + grid-build only | Dispatch `ceil(grid_cells / 256)` workgroups for `phase_clear` / `phase_food_grid` / `phase_agent_grid`; keep collision single-workgroup. | The ≈42 k serial grid stores per batch, if they dominate. | Medium: the grid build is embarrassingly parallel, but it must be split out of the fused `global` pass into its own dispatch(es) with correct barriers; collision still serial. |
-| C — fully parallelize, incl. collision | B plus multi-workgroup collision accumulate/apply. | All `global`-pass serial cost. | High: collision carries cross-cell read/write dependencies and atomics; multi-workgroup correctness is non-trivial and easy to get subtly wrong (determinism gate). |
+| A — leave single-workgroup | Status quo: `global_tick` runs on one 256-thread workgroup, `dispatch(1,1,1)`. | Nothing. | None. **← chosen.** |
+| B — parallelize grid-clear + grid-build only | Dispatch `ceil(grid_cells / 256)` workgroups for `phase_clear` / `phase_food_grid` / `phase_agent_grid`; keep collision single-workgroup. | The ≈42 k serial grid stores per batch — measured at **≤3%** of per-batch cost, so at most ~3% even if fully removed. | Medium. Not worth ≤3%. |
+| C — fully parallelize, incl. collision | B plus multi-workgroup collision accumulate/apply. | All `global`-pass serial cost — measured **≤3%**. | High (cross-cell atomics, determinism risk). Not worth ≤3%. |
 
-The spike, if opened, prototypes **B** (grid-build only), measures the per-batch
-GPU-complete delta against the 0001/0002 baselines, and decides whether **C** is
-worth a follow-up plan. See `ARCHITECTURE.md` §0004 for the construction sketch.
+The spike is not opened: even the *upper bound* of what B or C could recover
+(the entire `global` pass) is +3% on target, below any reasonable
+risk/reward bar. See `ARCHITECTURE.md` §0004 for the construction sketch, kept
+for the record.
 
 ## Measured evidence
 
-**On-target (macOS/Metal or discrete GPU): none yet.** This is the gap that
-keeps the gate unevaluated.
+**On-target — macOS/Metal, `--bench-phase-ab --bench-ticks 1000000
+--bench-agents 10` (THE adjudicating run):**
 
-**Mesa lavapipe (`llvmpipe`, CPU software rasterizer) — NON-ADJUDICATING.**
-`--bench --bench-ticks 24000 --bench-agents 1`, one run each (full table in
-`docs/superpowers/specs/2026-06-10-learning-baseline.md` → *Simulation throughput
-ceiling*):
-
-| Arm | Env | tps | submits | submit-return ns/batch |
+| Arm | tps | Δ vs baseline | batches | submits |
 |---|---|---|---|---|
-| (a) default | — | 10,754 | 10 | 8,794,589 |
-| (c) skip global+vision | `XAGENT_SKIP_GLOBAL_VISION=1` | 22,138 | 10 | 4,059,447 |
+| full (baseline) | 22,989 | — | 10,000 | 417 |
+| skip global | 23,595 | **+3%** | 10,000 | 417 |
+| skip vision | 24,422 | +6% | 10,000 | 417 |
+| skip global+vision | 24,710 | +7% | 10,000 | 417 |
 
-Arm (c)'s ~2× tps jump on lavapipe is **not** usable as the gate signal: lavapipe
-executes every shader on the CPU, so skipping global+vision removes CPU compute
-work, which is a different quantity from a discrete GPU's submit/back-pressure or
-single-workgroup-occupancy cost. The knob also skips *both* the global and vision
-passes together, so even a representative jump would not isolate the `global`
-pass alone without a vision-only control. lavapipe is used here only to prove the
-probe is wired correctly, not to decide this gate.
+The `global` pass is ≈3% of per-batch cost; vision ≈3–6%; the two together ≈7%.
+The residual ≈93% is the `prepare`+`kernel` dispatch (the fused brain). Fusion is
+fully engaged (417 submits for 10 000 batches ≈ ⌈10000/24⌉), and baseline tps
+≈23 k matches the originally observed ceiling — so removing submits did not move
+it either. Both 0002's and 0004's targets are ruled out by this single table.
 
-## Why reject (not-open) now
+**Mesa lavapipe (`llvmpipe`, CPU software rasterizer) — NON-ADJUDICATING,**
+retained for context. `--bench-phase-ab --bench-ticks 24000 --bench-agents 1`:
+skip global +7%, skip vision +8%, skip both +13% — likewise no single pass
+dominates, but CPU-rasterizer numbers do not transfer to the discrete GPU.
 
-1. **The gate is target-specific and unmeasured.** The ≈20 k-tps / 1000× ceiling
-   was observed on macOS/Metal; only a Metal (or other discrete-GPU) three-arm
-   run can show whether the `global` pass dominates the residual. This
-   environment has only lavapipe.
-2. **0002 already banked the safe, large win.** Submit fusion is bit-identical
-   and removed the per-batch submit tax (the mechanism the review located). The
-   `global`-pass rewrite is strictly higher-risk and should not be undertaken on
-   speculation.
-3. **Reversible.** Opening the spike later costs nothing that is lost by waiting;
-   shipping a speculative multi-workgroup collision rewrite risks the determinism
-   gate (`deterministic_across_batch_sizes`) for an unquantified gain.
+## Why reject
+
+1. **The gate explicitly failed.** The reopen condition was "`skip global` tps
+   jumps *materially*." +3% on target is not material; the entire `global` pass
+   is a ~3% cost, not the dominant floor.
+2. **The bottleneck is elsewhere.** ≥93% of per-batch time is the fused kernel
+   pass; no amount of `global`-pass parallelization addresses it. Building B/C
+   would risk the determinism gate for ≤3%.
+3. **Measure-before-build paid off.** This is precisely the speculative GPU
+   rewrite the plan gated; the on-target table shows it was the wrong target.
 
 ## When to revisit
 
-Reopen `parallelize-global-pass-spike` when, on the target hardware
-(macOS/Metal or a discrete GPU), the **`global`-only** arm fingers the pass.
-The isolation knobs and the one-command harness now make this directly
-measurable (no longer "skips both at once"):
+## When to revisit
+
+Effectively never, on current evidence — the `global` pass is a ~3% cost on the
+target GPU. Only reopen if the world/grid model changes such that the `global`
+pass's serial cost grows materially (e.g. a much larger collision grid or far
+higher agent density), in which case re-run:
 
 ```
-./target/release/xagent --bench-phase-ab --bench-ticks 1000000 --bench-agents 10
+./target/release/xagent --bench-phase-ab --bench-ticks 1000000 --bench-agents <N>
 ```
 
-prints four arms — `full` / `skip global` / `skip vision` / `skip global+vision`
-— each on a fresh kernel. (Equivalent env knobs for a manual run:
-`XAGENT_SKIP_GLOBAL=1`, `XAGENT_SKIP_VISION=1`, or the back-compat
-`XAGENT_SKIP_GLOBAL_VISION=1`.) Reopen when:
+and reopen only if the **`skip global`** arm then jumps materially over baseline
+while `skip vision` does not. The construction sketch is preserved in
+`ARCHITECTURE.md` §0004.
 
-- The **`skip global`** arm tps jumps **materially** over `full` — the
-  single-workgroup `global` pass is the residual floor — **and** the `skip
-  vision` arm does *not* (so the jump is the `global` pass, not vision).
-
-If, instead, `XAGENT_PROBE_GPU_WAIT=1` shows submit-return ≪ gpu-complete with
-neither skip arm moving tps much, the residual is Metal back-pressure / GPU
-execution elsewhere and this workstream stays closed. Construction sketch for the
-reopen: `ARCHITECTURE.md` §0004.
+The actual lead this run surfaced is the **fused kernel/brain pass** (≥93% of
+per-batch time, agent-count-independent → under-occupied / latency-bound serial
+brain chain at low agent counts). That is a new plan's subject, not this one.

@@ -502,31 +502,43 @@ submit-vs-complete split on a CPU rasterizer say nothing about the ≈20 k-tps /
 | (b) gpu-wait | `XAGENT_PROBE_GPU_WAIT=1` | 19,524 | 10 | 4,614,971 | 5,119,094 |
 | (c) skip g+v | `XAGENT_SKIP_GLOBAL_VISION=1` | 22,138 | 10 | 4,059,447 | — (not measured) |
 
-**Verdict — gathered numbers do NOT adjudicate the target ceiling.** lavapipe is
-a single-threaded CPU rasterizer, so the per-batch wall time is dominated by CPU
-shader execution, not by Metal submit/back-pressure; arm (c)'s ~2× tps jump is
-the cost of CPU-executing the global+vision passes, not evidence about a
-discrete-GPU submit ceiling. The authoritative three-arm run must be done on the
-macOS/Metal (or another discrete-GPU) machine where the ≈20 k-tps / 1000× ceiling
-was observed. Repro (release binary):
+These lavapipe numbers do not adjudicate the target ceiling (CPU rasterizer);
+they only validate the probe wiring. The adjudicating run was done on target.
+
+**On-target result — macOS/Metal, `--bench-phase-ab --bench-ticks 1000000
+--bench-agents 10` (THE adjudicating run, 2026-06-15):**
+
+| Arm | tps | Δ vs baseline | batches | submits |
+|---|---|---|---|---|
+| full (baseline) | 22,989 | — | 10,000 | 417 |
+| skip global | 23,595 | **+3%** | 10,000 | 417 |
+| skip vision | 24,422 | +6% | 10,000 | 417 |
+| skip global+vision | 24,710 | +7% | 10,000 | 417 |
+
+**Verdict — both 0002 and 0004 targets are ruled out; the kernel/brain pass is
+the ceiling.** Three facts from this one table:
+
+1. **Fusion is engaged** (417 submits for 10 000 batches ≈ ⌈10000/24⌉) yet
+   baseline tps ≈23 k still sits at the originally observed ≈20 k ceiling — so
+   collapsing submits (0002) did not move it. The limiter was never CPU submit
+   overhead (the `2026-06-14-grok-43.md` review's attribution is falsified).
+2. **The `global` pass is ≈3%** (skip-global +3%) and **global+vision together
+   ≈7%** — so the single-workgroup `global` pass is *not* the residual floor.
+   Workstream **0004 is REJECTED with on-target evidence** (see
+   `docs/plans/0003-Simulation-Throughput-Ceiling/0004-GLOBAL-PASS-DECISION.md`);
+   parallelizing it could recover ≤3%, not worth the determinism risk.
+3. **≥93% of per-batch wall time is the `prepare`+`kernel` (fused brain)
+   dispatch.** Combined with the long-standing observation that agent count
+   10→4 changes nothing, this points at a **latency-bound, GPU-under-occupied
+   serial brain chain** at low agent counts — a new plan's subject, outside 0003.
+
+Repro (release binary):
 
 ```
 cargo build --release -p xagent-sandbox
 # One-command pass-isolation A/B (full / skip global / skip vision / skip both):
 ./target/release/xagent --bench-phase-ab --bench-ticks 1000000 --bench-agents 10
-# Or arm-by-arm:
-./target/release/xagent --bench --bench-ticks 1000000 --bench-agents 10        # baseline
-XAGENT_PROBE_GPU_WAIT=1 ./target/release/xagent --bench --bench-ticks 1000000  # submit vs GPU-complete
-XAGENT_SKIP_GLOBAL=1    ./target/release/xagent --bench --bench-ticks 1000000  # global pass off
-XAGENT_SKIP_VISION=1    ./target/release/xagent --bench --bench-ticks 1000000  # vision pass off
-# or, for the true 1000× interactive cadence, run the GUI at 1000× with RUST_LOG=debug
-# and read the [SIM-PROBE] line (confirm submits ≪ kernel_batches = fusion engaged).
+# Equivalent env knobs for arm-by-arm runs:
+#   XAGENT_SKIP_GLOBAL=1 / XAGENT_SKIP_VISION=1 / XAGENT_PROBE_GPU_WAIT=1
+# GUI at 1000× with RUST_LOG=debug → read [SIM-PROBE] (submits ≪ kernel_batches).
 ```
-
-On target hardware: if the **`skip global`** arm tps jumps materially over
-baseline (and `skip vision` does not), the single-workgroup `global` pass
-dominates and workstream 0004 opens; if `XAGENT_PROBE_GPU_WAIT=1` shows
-submit-return ≪ gpu-complete with neither skip arm moving, Metal back-pressure
-dominates; if both are sub-millisecond yet tps stays ≈200 batches/sec, CPU
-recording dominates. Until that on-target table exists, 0004 stays closed — see
-`docs/plans/0003-Simulation-Throughput-Ceiling/0004-GLOBAL-PASS-DECISION.md`.

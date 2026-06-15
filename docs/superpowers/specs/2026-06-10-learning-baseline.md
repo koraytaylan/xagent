@@ -586,13 +586,12 @@ for k in 0 1 2 3 4 5 6 7; do \
 ./target/release/xagent --no-render --seed 42 --generations 8 --config <pop192.json>
 ```
 
-> ⚠️ **On-target numbers PENDING.** This branch was developed in a Linux
-> container with **no GPU adapter** (`GpuKernel::is_available()` == false), so
-> every dispatch self-skips and no tps/per-pass/evolution numbers could be
-> produced here — exactly the split the plan calls out ("harness wiring is
-> verified on lavapipe; throughput numbers require the target discrete GPU").
-> Run the commands above on the reference macOS/Metal machine and paste results
-> into the tables below.
+> **On-target status (2026-06-15):** (2) subgroup fact and (3) per-pass profile
+> are recorded below from a macOS/Metal run. (1) the occupancy sweep and (4) the
+> fixed-seed evolution comparison are still **pending** an on-target run — the
+> harness wiring was developed in a Linux container with no GPU adapter
+> (`GpuKernel::is_available()` == false). Run the (1)/(4) commands above on the
+> reference machine and paste results into those tables.
 
 **(1) Occupancy sweep — `--bench-agent-sweep --bench-ticks 200000`:**
 
@@ -613,26 +612,36 @@ N=1→50 (≈−9% across the 5× rise), useful throughput saturating at a knee 
 **Knee → shipped default = 192** (largest pre-plateau N, multiple of
 `eval_repeats`). Re-confirm the knee here and adjust the default if it moves.
 
-**(2) Subgroup top-K path on target:** _pending_ — record `subgroup-accelerated
-bitonic sort` or `workgroup-memory bitonic fallback (barrier-dense)`. This is
-the one fact that decides the first 0003 candidate (force subgroup path).
+**(2) Subgroup top-K path on target (2026-06-15, macOS/Metal):**
+`workgroup-memory bitonic fallback (barrier-dense)` — the subgroup-accelerated
+top-K path is **inactive** on this device. (Irrelevant in light of (3): the
+top-K pass is not the bottleneck.)
 
-**(3) Per-cooperative-pass cumulative cost (`XAGENT_KERNEL_PASS_LIMIT` sweep):**
+**(3) Per-cooperative-pass cumulative cost — `XAGENT_KERNEL_PASS_LIMIT` sweep,
+on target (macOS/Metal, `--bench-ticks 200000 --bench-agents 200`, 2026-06-15):**
 
-| limit (passes run) | tps | Δ tps vs prev = pass cost |
-|---|---|---|
-| 0 (none) | _pending_ | — |
-| 1 (+feature_extract) | _pending_ | _pending_ |
-| 2 (+encode) | _pending_ | _pending_ |
-| 3 (+habituate_homeo) | _pending_ | _pending_ |
-| 4 (+recall_score) | _pending_ | _pending_ |
-| 5 (+recall_topk) | _pending_ | _pending_ |
-| 6 (+predict_and_act) | _pending_ | _pending_ |
-| 7 (+learn_and_store, = full) | _pending_ | _pending_ |
+| limit | pass added | wall | tps | Δ wall = pass cost |
+|---|---|---|---|---|
+| 0 | — (physics+food+death+vision, no brain) | 1.66s | 120,165 | floor |
+| 1 | feature_extract | 1.66s | 120,501 | ~0.00s |
+| 2 | **encode** | 3.61s | 55,415 | **+1.95s** |
+| 3 | habituate_homeo | 3.60s | 55,537 | ~0.00s |
+| 4 | recall_score | 3.87s | 51,672 | +0.27s |
+| 5 | recall_topk | 4.14s | 48,334 | +0.27s |
+| 6 | **predict_and_act** | 9.59s | 20,853 | **+5.45s** (confounded) |
+| 7 | **learn_and_store** (= full) | 16.73s | 11,957 | **+7.14s** (confounded) |
 
-The largest consecutive tps drop names the dominant pass — the prime suspect is
-`recall_topk` (limit 4→5), the 7-stage bitonic sort with a barrier per
-stage/step. The dominant pass is the only one 0003 may touch.
+**Dominant passes: `learn_and_store`, `predict_and_act`, then `encode`** — the
+dense neural-net passes. The prime suspect `recall_topk` (the bitonic sort) is
+~1.6% — **not** the bottleneck; the subgroup-path candidate is ruled out.
+
+**Survival confound (limits 6–7).** `predict_and_act` (pass 5) is the first pass
+that emits motor output, so limits 0–5 run a non-acting brain → identical
+foraging/survival → the deltas through `recall_topk` are clean (`encode`≈2s and
+`recall`≈0.5s are solid). Enabling passes 5–6 lets agents actually survive/forage,
+raising how many agents are alive and doing work, so the `+5.45s`/`+7.14s` are
+**upper bounds** inflated by survival, not pure pass compute. Re-run with
+death/respawn churn suppressed to separate predict vs learn cleanly.
 
 **(4) Fixed-seed evolution — N=10 vs N=192 (same seed/budget/generations):**
 

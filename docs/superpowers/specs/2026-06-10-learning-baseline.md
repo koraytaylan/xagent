@@ -557,9 +557,9 @@ green with them unset, and `cargo fmt`/`clippy -D warnings`/`test` are green.
   `[1, 4, 10, 50, 100, 200, 400, 1000]` runs a fixed `--bench-ticks` through one
   fused `dispatch_batch(0, ticks)` and prints tps + agent-ticks/sec (tps × N),
   then flags the N that maximizes agent-ticks/sec as the occupancy knee.
-- `GovernorConfig::population_size` default 10 → **192** (sized to the knee;
+- `GovernorConfig::population_size` default 10 → **200** (sized to the knee;
   see `default_population_size` in `config.rs`), spending the unlocked capacity
-  on unique genomes (`eval_repeats` held at 2 → ~96 distinct configs/gen).
+  on unique genomes (`eval_repeats` held at 2 → 100 distinct configs/gen).
 - `GpuKernel::has_subgroup()` accessor + an explicit `[GpuKernel] top-K recall
   path: …` `log::info!` at construction (read off `RUST_LOG=info`).
 - `XAGENT_KERNEL_PASS_LIMIT=k` (default 7): runs only the first `k` of the seven
@@ -580,7 +580,7 @@ RUST_LOG=info ./target/release/xagent --bench --bench-ticks 1000 --bench-agents 
 for k in 0 1 2 3 4 5 6 7; do \
   echo "limit=$k"; XAGENT_KERNEL_PASS_LIMIT=$k \
   ./target/release/xagent --bench --bench-ticks 200000 --bench-agents 200; done
-# (4) Fixed-seed evolution comparison (no-regression check), N=10 vs N=192,
+# (4) Fixed-seed evolution comparison (no-regression check), N=10 vs N=200,
 #     same --seed / tick_budget / generations, headless:
 ./target/release/xagent --no-render --seed 42 --generations 8 --config <pop10.json>
 ./target/release/xagent --no-render --seed 42 --generations 8 --config <pop192.json>
@@ -593,24 +593,27 @@ for k in 0 1 2 3 4 5 6 7; do \
 > (`GpuKernel::is_available()` == false). Run the (1)/(4) commands above on the
 > reference machine and paste results into those tables.
 
-**(1) Occupancy sweep — `--bench-agent-sweep --bench-ticks 200000`:**
+**(1) Occupancy sweep — `--bench-agent-sweep --bench-ticks 200000`, on target
+(macOS/Metal, 2026-06-15):**
 
 | N | tps | agent-ticks/sec |
 |---|---|---|
-| 1 | _pending_ | _pending_ |
-| 4 | _pending_ | _pending_ |
-| 10 | _pending_ | _pending_ |
-| 50 | _pending_ | _pending_ |
-| 100 | _pending_ | _pending_ |
-| 200 | _pending_ | _pending_ |
-| 400 | _pending_ | _pending_ |
-| 1000 | _pending_ | _pending_ |
+| 1 | 23,253 | 23,253 |
+| 4 | 23,028 | 92,112 |
+| 10 | 22,935 | 229,348 |
+| 50 | 20,888 | 1,044,394 |
+| 100 | 17,218 | 1,721,793 |
+| **200** | **11,990** | **2,397,914 ← knee** |
+| 400 | 5,191 | 2,076,200 |
+| 1000 | 2,387 | 2,387,226 |
 
-Expected from the prior shell-loop sweep (origin of the 192 default): tps flat
-N=1→50 (≈−9% across the 5× rise), useful throughput saturating at a knee near
-**N≈200** (≈2.39 M agent-ticks/sec); N=1000 runs, N=5000 did not complete.
-**Knee → shipped default = 192** (largest pre-plateau N, multiple of
-`eval_repeats`). Re-confirm the knee here and adjust the default if it moves.
+tps is flat from N=1 to ~N=10 (latency-bound, GPU idle), then useful throughput
+(agent-ticks/sec) climbs to a peak at **N=200 (2.40 M)** and falls off beyond it
+(N=400 → 2.08 M). N=200 is the *smallest* N at peak useful throughput, so it also
+minimizes per-generation wall time (N=1000 matches its agent-ticks/sec but at ~5×
+the wall time). This is a ~10× useful-throughput gain over the old default of 10
+(229 k → 2.40 M). **Knee → shipped default = 200** (multiple of `eval_repeats` →
+100 unique genomes/gen). Safe max 1000 (runs; N=5000 did not complete).
 
 **(2) Subgroup top-K path on target (2026-06-15, macOS/Metal):**
 `workgroup-memory bitonic fallback (barrier-dense)` — the subgroup-accelerated
@@ -643,13 +646,13 @@ raising how many agents are alive and doing work, so the `+5.45s`/`+7.14s` are
 **upper bounds** inflated by survival, not pure pass compute. Re-run with
 death/respawn churn suppressed to separate predict vs learn cleanly.
 
-**(4) Fixed-seed evolution — N=10 vs N=192 (same seed/budget/generations):**
+**(4) Fixed-seed evolution — N=10 vs N=200 (same seed/budget/generations):**
 
 | Arm | unique genomes/gen | deaths-per-food | best fitness (final gen) |
 |---|---|---|---|
 | N=10 (old default) | 5 | _pending_ | _pending_ |
-| N=192 (new default) | 96 | _pending_ | _pending_ |
+| N=200 (new default) | 100 | _pending_ | _pending_ |
 
-Verdict (to fill): N=192 must be **no worse** on deaths-per-food / best fitness
+Verdict (to fill): N=200 must be **no worse** on deaths-per-food / best fitness
 at equal wall-clock-per-generation budget (expected better, from ~10× broader
 search). If it regresses, record the cause and raise `eval_repeats` in lockstep.

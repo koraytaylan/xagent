@@ -244,27 +244,28 @@ pub struct GovernorConfig {
 
 /// Default population sized to the GPU occupancy knee.
 ///
-/// Below this N the GPU is under-occupied — ticks/sec is flat from N=1 to N≈50
-/// because each agent is one 256-thread workgroup and a few workgroups do not
-/// fill the device, so the brain pass's single-workgroup barrier-chain latency,
-/// not parallel width, sets the wall time. Useful throughput (agent-ticks/sec =
-/// tps × N) climbs until an occupancy knee at N≈200 on the reference GPU, then
-/// plateaus while each generation's wall time keeps growing. Running at the knee
-/// keeps the GPU busy, so the same hardware does far more useful evolution work
-/// per second than it does at a handful of agents.
+/// Below this N the GPU is under-occupied — ticks/sec is flat from N=1 to ~N=10
+/// (23.3k → 22.9k tps on the reference GPU) because each agent is one 256-thread
+/// workgroup and a handful do not fill the device, so the brain pass's
+/// single-workgroup barrier-chain latency, not parallel width, sets the wall
+/// time. Useful throughput (agent-ticks/sec = tps × N) climbs as N rises and
+/// peaks at the occupancy knee N=200 (≈2.40 M agent-ticks/sec), then falls off
+/// (N=400 → ≈2.08 M). Running at the knee keeps the GPU busy: ~10× the useful
+/// evolution work per second versus a handful of agents (N=10 → ≈230 k).
 ///
-/// 192 is the largest N before the plateau, rounded to a multiple of
-/// [`default_eval_repeats`] (so `population_size / eval_repeats` is exact); with
-/// `eval_repeats = 2` that is 96 unique genomes per generation. The kernel
-/// rebuilds buffers for the population's N via the generation-handoff
-/// `GpuKernel::new` path, so only memory scales. Safe max: 1000 (verified to
-/// run; N=5000 did not complete on the reference GPU — do not raise this past
-/// 1000 without a fresh sweep). Reproduce the knee with `--bench-agent-sweep`;
-/// the recorded sweep lives in
+/// 200 is the smallest N at peak useful throughput, so it also minimizes each
+/// generation's wall time (N=1000 matches its agent-ticks/sec but at ~5× the
+/// wall time). It is a multiple of [`default_eval_repeats`] (so
+/// `population_size / eval_repeats` is exact); with `eval_repeats = 2` that is
+/// 100 unique genomes per generation. The kernel rebuilds buffers for the
+/// population's N via the generation-handoff `GpuKernel::new` path, so only
+/// memory scales. Safe max: 1000 (verified to run; N=5000 did not complete on
+/// the reference GPU — do not raise this past 1000 without a fresh sweep).
+/// Reproduce the knee with `--bench-agent-sweep`; the recorded sweep lives in
 /// docs/superpowers/specs/2026-06-10-learning-baseline.md and
 /// docs/reviews/2026-06-15-brain-pass-latency-ceiling.md.
 fn default_population_size() -> usize {
-    192
+    200
 }
 
 fn default_mutation_strength() -> f32 {

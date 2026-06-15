@@ -551,7 +551,9 @@ fn main() {
     let cli = Cli::parse();
 
     info!("xagent sandbox starting...");
-    println!("xagent v0.1.0 \u{2014} Emergent Cognitive Agent Sandbox");
+    // Banner goes to stderr so stdout stays pure for data-producing modes
+    // (notably `--dump-config`, whose stdout must be valid JSON for piping).
+    eprintln!("xagent v0.1.0 \u{2014} Emergent Cognitive Agent Sandbox");
 
     let mut config = resolve_config(&cli);
 

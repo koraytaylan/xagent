@@ -709,13 +709,7 @@ impl Worker {
         let probe_submits = self.kernel.probe_submit_count();
         let submit_nanos = self.kernel.probe_submit_return_nanos();
         let complete_nanos = self.kernel.probe_gpu_complete_nanos();
-        let per_batch = |total: u64| -> u64 {
-            if probe_batches == 0 {
-                0
-            } else {
-                total / probe_batches
-            }
-        };
+        let per_batch = |total: u64| total.checked_div(probe_batches).unwrap_or(0);
         log::debug!(
             "[SIM-PROBE] kernel_batches={} submits={} submit_return_ns={} \
              submit_return_ns_per_batch={} gpu_complete_ns={} \

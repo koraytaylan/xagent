@@ -115,7 +115,7 @@ const CFG_INTEGRITY_SCALE: u32 = 8u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 32u;
+const PHYS_STRIDE: u32 = 34u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -148,6 +148,8 @@ const P_MOTOR_TURN_OUT: u32 = 28u;
 const P_GRADIENT_OUT: u32 = 29u;
 const P_URGENCY_OUT: u32 = 30u;
 const P_LAST_DEATH_TICK: u32 = 31u;
+const P_NEAREST_FOOD_DISTANCE: u32 = 32u;
+const P_PREV_POTENTIAL: u32 = 33u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -202,6 +204,11 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
+// World-units radius within which food contributes to the approach potential Φ.
+// Set to VISION_MAX_DIST so Φ is a proxy for "nearest visible food"; the
+// potential-based shaping that consumes it is optimal-policy-invariant for any
+// state potential, so a radius proxy needs no FOV-visibility test.
+const SHAPING_RADIUS: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
@@ -263,6 +270,13 @@ const ATTEN_FLOOR: f32 = 0.1;
 const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
+// Approach-shaping gain: Φ(s) = −APPROACH_SHAPING_GAIN · d_norm, where d_norm is
+// the nearest in-range food distance normalized by SHAPING_RADIUS. Sized so the
+// per-brain-tick shaping term F = γΦ(s′) − Φ(s) dominates the ~2e-4 metabolic
+// drain (making closing distance the dominant within-tick steering signal) while
+// staying well below the ~0.12 contact-eat reward spike (so eating still anchors
+// the objective).
+const APPROACH_SHAPING_GAIN: f32 = 0.05;
 const GRADIENT_FAST_BLEND: f32 = 0.6;
 const GRADIENT_MEDIUM_BLEND: f32 = 0.04;
 const GRADIENT_SLOW_BLEND: f32 = 0.004;
@@ -304,6 +318,13 @@ const CRITIC_LEARNING_RATE: f32 = 0.01;
 // feature, each O(1)) would otherwise grow with dimensionality and push
 // the bootstrapped critic past the linear-TD stability limit.
 const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
+// Actor (forward/turn) weight-step scale, separate from the critic's
+// TD_VECTOR_SCALE. The 1/ENCODED_DIMENSION factor is a critic-bootstrapping
+// stability bound; applied to the actor it throttled the policy step to
+// 0.10/128 ≈ 8e-4. The actor only needs to stay inside the MAX_WEIGHT_NORM L2
+// ball (enforced every tick), so it can latch onto a sign-correct δ at a usable
+// rate. 1/16 lifts the step ~8× while staying well within that bound.
+const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
 // Bound on the TD error. No single transition is allowed to teach more
 // than this; protects against respawn/clamp artifacts (mirrors the intent
 // of MAX_HOMEOSTATIC_DELTA on the reward side).

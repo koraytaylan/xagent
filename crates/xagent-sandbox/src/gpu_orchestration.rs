@@ -260,6 +260,15 @@ impl App {
             a.cached_urgency = state[base + P_URGENCY_OUT];
         }
 
+        // Feed the population's cumulative foraging totals to the governor's
+        // within-life tracker (it snapshots them at each quarter of the tick
+        // budget). Summed before the mutable governor borrow below.
+        let cumulative_food: u64 = self.agents.iter().map(|a| u64::from(a.food_consumed)).sum();
+        let cumulative_alive: u64 = self.agents.iter().map(|a| a.total_ticks_alive).sum();
+        if let Some(governor) = self.governor.as_mut() {
+            governor.record_within_life_sample(cumulative_food, cumulative_alive);
+        }
+
         // Keep the previous food cache rather than overwriting with the empty
         // vector the worker sends before its first food readback.
         if !snapshot.food.is_empty() {

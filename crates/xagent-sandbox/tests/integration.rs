@@ -2068,6 +2068,315 @@ fn learning_probe_food_is_visible() {
     );
 }
 
+/// The food-detect pass must publish the planar distance to the nearest food
+/// within `SHAPING_RADIUS` (the approach-potential input) and fall back to the
+/// `SHAPING_RADIUS` sentinel when no food is in range. Single agent, single
+/// food, so no neighbouring food can leak into the reduction.
+#[test]
+fn nearest_food_distance_reports_in_range_and_sentinel() {
+    use xagent_brain::buffers::{P_ALIVE, P_NEAREST_FOOD_DISTANCE};
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Matches `SHAPING_RADIUS` in common.wgsl (= `VISION_MAX_DIST`).
+    const SHAPING_RADIUS: f32 = 30.0;
+    /// In shaping range, beyond the 2.0 eat radius so the food is measured,
+    /// not eaten on the first tick.
+    const IN_RANGE_DISTANCE: f32 = 12.0;
+
+    let brain = probe_brain_config();
+    let world_config = WorldConfig {
+        seed: 1,
+        ..Default::default()
+    };
+    let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 41);
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+    let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    let agent_data = vec![(
+        glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        100.0,
+        100.0,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    // Food straight ahead (+Z) at a known in-range distance.
+    kernel.upload_world(
+        &heights,
+        &biomes,
+        &[(0.0, PROBE_FOOD_Y, IN_RANGE_DISTANCE)],
+        &[false],
+        &[0.0],
+    );
+    kernel.upload_agents(&agent_data);
+    kernel.dispatch_batch(0, 1);
+    let state = kernel.read_full_state_blocking();
+    assert!(
+        state[P_ALIVE] > 0.5,
+        "probe agent died during the single tick"
+    );
+    let in_range = state[P_NEAREST_FOOD_DISTANCE];
+    assert!(
+        (in_range - IN_RANGE_DISTANCE).abs() < 0.1,
+        "nearest-food distance {in_range} != in-range food distance {IN_RANGE_DISTANCE}"
+    );
+
+    // Move the food beyond `SHAPING_RADIUS`: the slot must fall back to the
+    // sentinel (= no food in range).
+    kernel.upload_world(
+        &heights,
+        &biomes,
+        &[(0.0, PROBE_FOOD_Y, SHAPING_RADIUS + 10.0)],
+        &[false],
+        &[0.0],
+    );
+    kernel.upload_agents(&agent_data);
+    kernel.dispatch_batch(1, 1);
+    let state = kernel.read_full_state_blocking();
+    let out_of_range = state[P_NEAREST_FOOD_DISTANCE];
+    assert!(
+        (out_of_range - SHAPING_RADIUS).abs() < 0.01,
+        "nearest-food distance {out_of_range} != sentinel {SHAPING_RADIUS} when no food is in range"
+    );
+}
+
+/// Potential-based shaping must reward *closing* distance to in-range food. Two
+/// identical stationary agents share the same first tick (food at a common
+/// distance, so the same prior potential and the same metabolic energy delta),
+/// then on the second tick one has its food moved closer (approach) and the
+/// other farther (recede). Because the agent is stationary and never eats, the
+/// only term that can differ between the two homeostatic gradients is the
+/// shaping term, so the approaching agent's published gradient must exceed the
+/// receding agent's. Deleting the shaping fold makes the two equal — the test
+/// is red without it.
+#[test]
+fn shaped_reward_rewards_approach() {
+    use xagent_brain::buffers::P_GRADIENT_OUT;
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Common first-tick food distance (in shaping range, beyond eat radius).
+    const START_DISTANCE: f32 = 15.0;
+    /// Second-tick distances: nearer (approach) and farther (recede).
+    const NEAR_DISTANCE: f32 = 8.0;
+    const FAR_DISTANCE: f32 = 22.0;
+
+    // One stationary agent, one food straight ahead; read the published
+    // homeostatic gradient after a second tick whose food distance is `second`.
+    let gradient_after = |second: f32| -> f32 {
+        let brain = probe_brain_config();
+        let world_config = WorldConfig {
+            seed: 1,
+            ..Default::default()
+        };
+        let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 53);
+        let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+        let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+        let agent_data = vec![(
+            glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+            100.0,
+            100.0,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )];
+        kernel.upload_agents(&agent_data);
+
+        // Tick 0: shared starting distance — pins the prior potential and the
+        // metabolic energy delta identically for both arms.
+        kernel.upload_world(
+            &heights,
+            &biomes,
+            &[(0.0, PROBE_FOOD_Y, START_DISTANCE)],
+            &[false],
+            &[0.0],
+        );
+        kernel.dispatch_batch(0, 1);
+
+        // Tick 1: only the food moves (agent is stationary and never eats), so
+        // the gradient delta vs the other arm is purely the shaping term.
+        kernel.upload_world(
+            &heights,
+            &biomes,
+            &[(0.0, PROBE_FOOD_Y, second)],
+            &[false],
+            &[0.0],
+        );
+        kernel.dispatch_batch(1, 1);
+        kernel.read_full_state_blocking()[P_GRADIENT_OUT]
+    };
+
+    let approach = gradient_after(NEAR_DISTANCE);
+    let recede = gradient_after(FAR_DISTANCE);
+    eprintln!("shaped reward: approach gradient {approach:.6} vs recede {recede:.6}");
+    assert!(
+        approach > recede + 1e-4,
+        "approaching food ({approach:.6}) did not yield a higher gradient than \
+         receding ({recede:.6}); shaping term is absent or wrong-signed"
+    );
+}
+
+/// The actor (forward/turn) weight step must scale with `ACTOR_VECTOR_SCALE`
+/// (1/16), separate from the critic's `TD_VECTOR_SCALE` (1/128). One TD update
+/// adds `learning_rate · scale · δ · trace` to each weight dimension; reading
+/// the per-dimension weight delta against the snapshotted trace and δ recovers
+/// `learning_rate · scale` exactly. The ratio cancels δ and the trace, so it is
+/// robust to their magnitude. Mirrors of the in-shader constants are pinned
+/// here; a mismatch is a real divergence, not a tolerance issue.
+#[test]
+fn actor_step_scales_with_actor_vector_scale() {
+    use xagent_brain::buffers::{
+        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_TRACE_CRITIC,
+        O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS,
+    };
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    // Mirrors of common.wgsl. The actor weight step uses ACTOR_VECTOR_SCALE; the
+    // critic (value) step keeps TD_VECTOR_SCALE.
+    const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
+    const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
+    const CRITIC_LEARNING_RATE: f32 = 0.01;
+    const TD_VECTOR_SCALE: f32 = 1.0 / ENCODED_DIMENSION as f32;
+    const MAX_WEIGHT_NORM: f32 = 2.0;
+    /// Expected `Δw / (δ·trace)` for the actor and the critic.
+    const ACTOR_STEP: f32 = ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE;
+    const CRITIC_STEP: f32 = CRITIC_LEARNING_RATE * TD_VECTOR_SCALE;
+
+    // Stationary agent (no eat, no respawn), one food whose distance we drive to
+    // produce a clear shaping δ while exploration noise accumulates the traces.
+    let brain = probe_brain_config();
+    let world_config = WorldConfig {
+        seed: 1,
+        ..Default::default()
+    };
+    let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 67);
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+    let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    let agent_data = vec![(
+        glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        100.0,
+        100.0,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+
+    let place_food = |kernel: &mut GpuKernel, dist: f32| {
+        kernel.upload_world(
+            &heights,
+            &biomes,
+            &[(0.0, PROBE_FOOD_Y, dist)],
+            &[false],
+            &[0.0],
+        );
+    };
+
+    // Warm-up: build non-trivial eligibility traces.
+    const WARMUP_TICKS: u64 = 25;
+    for t in 0..WARMUP_TICKS {
+        place_food(&mut kernel, 12.0);
+        kernel.dispatch_batch(t, 1);
+    }
+    let before = kernel.read_agent_state(0);
+
+    // Measured tick: jump the food closer for a clear shaping δ.
+    place_food(&mut kernel, 6.0);
+    kernel.dispatch_batch(WARMUP_TICKS, 1);
+    let delta = kernel.read_agent_telemetry_blocking(0).td_error;
+    let after = kernel.read_agent_state(0);
+
+    // No-clamp precondition: if a weight family's L2 norm stayed below the
+    // MAX_WEIGHT_NORM ball this tick, the per-dimension delta is the raw TD step
+    // (the clamp never scaled it).
+    let l2 = |state: &[f32], base: usize| -> f32 {
+        (0..ENCODED_DIMENSION)
+            .map(|d| state[base + d] * state[base + d])
+            .sum::<f32>()
+            .sqrt()
+    };
+    for (base, name) in [
+        (O_ACTION_FORWARD_WEIGHTS, "forward"),
+        (O_ACTION_TURN_WEIGHTS, "turn"),
+        (O_VALUE_WEIGHTS, "value"),
+    ] {
+        let norm = l2(&after.brain_state, base);
+        assert!(
+            norm < MAX_WEIGHT_NORM - 1e-3,
+            "{name} weight norm {norm} reached the L2 ball; the no-clamp precondition broke"
+        );
+    }
+
+    assert!(
+        delta.abs() > 1e-5,
+        "TD error {delta} too small to test the step scale (would be a tautology)"
+    );
+
+    // For each weight family, measure Δw / (δ·trace) at the dimension with the
+    // largest |trace| (best conditioned) and compare to the expected step.
+    let recovered_step = |w_base: usize, trace_base: usize| -> (f32, f32) {
+        let d = (0..ENCODED_DIMENSION)
+            .max_by(|&a, &b| {
+                before.brain_state[trace_base + a]
+                    .abs()
+                    .total_cmp(&before.brain_state[trace_base + b].abs())
+            })
+            .unwrap();
+        let trace = before.brain_state[trace_base + d];
+        let dw = after.brain_state[w_base + d] - before.brain_state[w_base + d];
+        (dw / (delta * trace), (delta * trace).abs())
+    };
+
+    let (fwd_step, fwd_cond) = recovered_step(O_ACTION_FORWARD_WEIGHTS, O_TRACE_FWD);
+    let (turn_step, turn_cond) = recovered_step(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
+    let (val_step, val_cond) = recovered_step(O_VALUE_WEIGHTS, O_TRACE_CRITIC);
+    eprintln!(
+        "actor step: forward={fwd_step:.6} turn={turn_step:.6} value={val_step:.8} \
+         (expect actor {ACTOR_STEP:.6}, critic {CRITIC_STEP:.8})"
+    );
+
+    // Non-triviality: the conditioning factor δ·trace must be well above noise.
+    for (cond, name) in [
+        (fwd_cond, "forward"),
+        (turn_cond, "turn"),
+        (val_cond, "value"),
+    ] {
+        assert!(
+            cond > 1e-6,
+            "{name} δ·trace {cond} too small — ill-conditioned test"
+        );
+    }
+
+    // Actor steps use the 1/16 scale; the critic step keeps 1/128.
+    let rel = 0.05_f32;
+    assert!(
+        (fwd_step - ACTOR_STEP).abs() < ACTOR_STEP * rel,
+        "forward step {fwd_step} != actor scale {ACTOR_STEP} (critic scale is {CRITIC_STEP})"
+    );
+    assert!(
+        (turn_step - ACTOR_STEP).abs() < ACTOR_STEP * rel,
+        "turn step {turn_step} != actor scale {ACTOR_STEP}"
+    );
+    assert!(
+        (val_step - CRITIC_STEP).abs() < CRITIC_STEP * rel,
+        "value step {val_step} != critic scale {CRITIC_STEP} — the critic must keep TD_VECTOR_SCALE"
+    );
+}
+
 /// Baseline directional-learning probe: with the current learner, the sign
 /// of the turn output should be uncorrelated with the food's bearing —
 /// alignment ≈ chance. A learner that acquires food-approach behavior must
@@ -2280,18 +2589,23 @@ fn vision_horizon_row_sees_food_at_range() {
 /// Each training episode mirrors the food side, so a constant per-agent
 /// turn bias earns nothing on average — only genuinely vision-conditional
 /// turning ("turn toward where the food is seen") is rewarded. After
-/// training, the stationary alignment evaluation currently lands at chance:
-/// TD(λ) credit through the random-projection encoder does **not** yet
-/// teach vision-conditional steering. This test pins that honest baseline
-/// (same falsifiable pattern as `learning_probe_baseline_turn_alignment_is_chance`):
-/// a representation/credit change that finally produces directional
-/// steering will push the rate out of the chance band and trip this test,
-/// which is the signal to re-pin it upward.
+/// training, the stationary alignment evaluation lands at chance even with the
+/// potential-based approach reward and the split actor learning rate in place:
+/// the distance-closing shaping signal credits forward motion, and TD(λ) does
+/// not extract the turn channel's second-order contribution to approach into
+/// vision-conditional steering. The encoder is not the limit here — the
+/// food-side separability margin is well above the readout floor
+/// (`encoder_food_side_separability_diagnostic`); the credit/temporal path is.
+/// This test pins that honest baseline (same falsifiable pattern as
+/// `learning_probe_baseline_turn_alignment_is_chance`): a representation/credit
+/// change that finally produces directional steering will push the rate out of
+/// the chance band and trip this test, which is the signal to re-pin it upward.
+/// Extended shaped training (well past this test's budget) did not move it.
 ///
 /// (An earlier version mirrored nothing and reported ~0.64 "learning"; that
 /// number was inflated by per-agent side-consistency — each agent always
 /// saw food on one side in both training and eval — not by directional
-/// learning. See docs/superpowers/specs/2026-06-10-learning-baseline.md.)
+/// learning.)
 #[test]
 fn learning_probe_mirrored_steering_is_chance() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_FOOD_COUNT};
@@ -2466,19 +2780,24 @@ fn encoder_food_side_separability_diagnostic() {
     );
 }
 
-/// The critic must learn that the steady metabolic drain makes every state
-/// slightly negative-valued: with stationary agents and no food events, the
-/// value telemetry should settle below zero, and every TD error must
-/// respect the MAX_TD_ERROR clamp.
+/// The critic must converge on the arena's steady per-tick reward and respect
+/// the `MAX_TD_ERROR` clamp. With stationary agents and no eating, that steady
+/// reward is the net of the metabolic drain and the constant potential-based
+/// shaping residual `F = (γ−1)·Φ`: the probe food sits within `SHAPING_RADIUS`,
+/// so `Φ < 0` is constant and the residual is a small *positive* per-tick reward
+/// that dominates the ~1e-4 drain. The critic therefore settles to a small
+/// positive value (the discounted-potential artifact of PBRS — optimal-policy
+/// invariant, only an additive offset on the value landscape), and every TD
+/// error stays within the clamp.
 #[test]
-fn td_critic_tracks_metabolic_drain() {
+fn td_critic_tracks_steady_reward() {
     if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
 
-    /// Enough ticks for the linear critic to converge on the constant-drain
-    /// signal (time constant ≈ 100 brain ticks at the critic rate).
+    /// Enough ticks for the linear critic to converge on the constant steady
+    /// reward (time constant ≈ 100 brain ticks at the critic rate).
     const RUN_TICKS: usize = 300;
 
     let brain = probe_brain_config();
@@ -2505,15 +2824,15 @@ fn td_critic_tracks_metabolic_drain() {
         value_sum += telemetry.value;
     }
     let mean_value = value_sum / PROBE_AGENT_COUNT as f32;
-    eprintln!("td critic drain probe: mean value {mean_value:.5}");
+    eprintln!("td critic steady-reward probe: mean value {mean_value:.5}");
     assert!(
-        mean_value < -1e-4,
-        "mean value {mean_value:.5} did not go negative under constant drain — \
-         the critic is not learning"
+        mean_value > 1e-4,
+        "mean value {mean_value:.5} did not settle positive — the critic is not \
+         tracking the positive net steady reward (shaping residual + drain)"
     );
     assert!(
-        mean_value > -1.0,
-        "mean value {mean_value:.5} is implausibly negative for a drain of ~1e-3/tick"
+        mean_value < 1.0,
+        "mean value {mean_value:.5} is implausibly large for a steady reward of ~1e-3/tick"
     );
 }
 

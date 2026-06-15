@@ -684,3 +684,72 @@ The occupancy sweep/profile remain valuable infrastructure, but the default
 learner improves — and then with a world-size-invariant exploration metric and
 ideally independent per-genome arenas (so population becomes true parallel
 evaluation rather than shared-world competition).
+
+## 2026-06-15 — Plan 0004 approach-shaping pre-change baseline
+
+Pinned "before" numbers for the Plan 0004 approach-reward-shaping unlock,
+captured on `develop` @ `069ff8a` (Metal adapter, macOS), single-threaded:
+
+| Probe | Result |
+|---|---|
+| `learning_probe_baseline_turn_alignment_is_chance` | 285/573 = **0.497** (chance band `[0.38, 0.62]`) |
+| `learning_probe_free_run_foraging_baseline` | food=7, deaths=0, **food/agent/1k-ticks = 0.146** |
+| `learning_probe_mirrored_steering_is_chance` | food=1033, alignment 385/735 = **0.524** (chance) |
+| `encoder_food_side_separability_diagnostic` | within(right,right') cos=0.9998 (dist 0.0002); between(right,left) cos=0.9964 (dist **0.0036**) |
+
+The chance-band edge the shaped remeasure must beat is **0.62**
+(`learning_probe_baseline_turn_alignment_is_chance`).
+
+The separability diagnostic is the load-bearing context: the between-side encoded
+distance (0.0036) is ≈ 18× the within-side noise (0.0002), so the food side **is**
+linearly represented in `s_encoded`. That places the bottleneck on the
+credit/temporal path (the spatially-blind reward), not the encoder — the
+condition under which approach shaping is expected to unlock steering.
+
+## 2026-06-15 — Plan 0004 approach-shaping remeasure: prove-or-kill verdict
+
+Approach shaping (`Φ(s) = −0.05·d_norm`, `F = γΦ(s′) − Φ(s)` folded into
+`raw_gradient`) and the split actor learning rate (`ACTOR_VECTOR_SCALE = 1/16`,
+separate from the critic's `1/128`) are landed and mechanism-tested
+(`shaped_reward_rewards_approach`, `actor_step_scales_with_actor_vector_scale`).
+The falsification test is the mirrored-steering regime (only vision-conditional
+turning pays) trained with movement, then scored stationary.
+
+**Result — negative. The unlock did not land.** Stationary turn/bearing
+alignment held at chance across a generous shaped warm-up (default
+`APPROACH_SHAPING_GAIN` / `ACTOR_VECTOR_SCALE`, well past the implied warm-up):
+
+| Episodes trained (×100 ticks) | alignment |
+|---|---|
+| 100 | 417/878 = 0.475 |
+| 300 | 229/477 = 0.480 |
+| 600 | 155/322 = 0.481 |
+| 900 | 50/138 = 0.362 |
+| 1200 | 51/134 = 0.381 |
+
+No upward trend toward the 0.62 edge at any budget; the full sweep stayed inside
+`[0.36, 0.50]`. Free-run foraging was flat within single-seed noise
+(`food/agent/1k-ticks` ≈ 0.10–0.13 vs the 0.146 baseline — not a rise).
+
+**Refined next suspect (measurement over the review's guess).** The 2026-06-14
+review named the encoder as the next suspect on a negative. The baseline
+separability margin (between 0.0036 ≫ within 0.0002) contradicts that: the food
+side is represented adequately. The actual bottleneck is the credit/temporal
+path. The shaped reward rewards *closing distance*, which is dominated by forward
+motion; the turn channel's contribution to approach is a weak second-order
+effect, so the TD(λ) eligibility-trace credit cannot isolate "turn toward the
+seen food" into the turn weights. Closing the gap needs a turn-credit signal
+(e.g. a bearing-aligned reward term or an action-conditioned advantage), not an
+encoder change.
+
+**Gate decision.** Per the locked prove-or-kill rule, the gated workstreams
+`0002` (klinotaxis/valence), `0004` (heritable policy constants), and `0005`
+(lag/vision geometry) **do not open** — tuning or extending steering machinery is
+pointless until a change moves this probe. The PBRS-invariant shaping and the
+actor-scale split are kept (they cannot corrupt the eat objective and are the
+substrate for the next credit-path attempt). Workstream `0003`
+(selection-signal restoration) is unconditional and proceeds regardless.
+
+`learning_probe_mirrored_steering_is_chance` remains the falsifiable pin: it
+stays green at chance and will trip the day a credit-path change finally
+produces directional steering.

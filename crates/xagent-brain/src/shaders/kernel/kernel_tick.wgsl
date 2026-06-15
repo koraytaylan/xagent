@@ -33,6 +33,14 @@
 // (1 = alive, 0 = dead) so no atomics are needed. See SAFETY INVARIANT above.
 var<workgroup> s_alive: u32;
 
+// Squared-distance reduction scratch for the nearest food within
+// `SHAPING_RADIUS` — the approach-potential input. Reduced in parallel with the
+// eat candidate in `agent_food_detect`, reusing the same two barriers. Sized to
+// the reduction width (= MEMORY_CAP, half the 256-thread workgroup), matching
+// `s_similarities`. Distance only; no food index is needed because the nearest
+// in-range food is measured for steering, not eaten.
+var<workgroup> s_shaping_dist_sq: array<f32, MEMORY_CAP>;
+
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
 // ══════════════════════════════════════════════════════════════════════════
@@ -212,6 +220,9 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     // when the agent is dead (or a hypothetical divergence prevented the scan).
     var local_best_idx = 0xFFFFFFFFu;
     var local_best_dist_sq = 1e12;
+    // Nearest food within SHAPING_RADIUS, independent of the eat gate, for the
+    // approach potential. Same sentinel so the reduction runs safely when dead.
+    var local_best_shaping_dist_sq = 1e12;
 
     if (alive) {
         let pos = vec3f(
@@ -221,6 +232,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         let food_count = wc_u32(WC_FOOD_COUNT);
         let eat_radius = wc_f32(WC_FOOD_RADIUS);
         let eat_radius_sq = eat_radius * eat_radius;
+        let shaping_radius_sq = SHAPING_RADIUS * SHAPING_RADIUS;
 
         // Each thread scans a slice of food_state
         for (var f = tid; f < food_count; f += 256u) {
@@ -233,6 +245,11 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
                 local_best_dist_sq = d_sq;
                 local_best_idx = f;
             }
+            // Wider navigational reduction: nearest food in shaping range, no
+            // eat gate. SHAPING_RADIUS ≥ eat_radius, so this is a superset.
+            if (d_sq < shaping_radius_sq && d_sq < local_best_shaping_dist_sq) {
+                local_best_shaping_dist_sq = d_sq;
+            }
         }
     }
 
@@ -242,6 +259,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     if (tid < 128u) {
         s_similarities[tid] = local_best_dist_sq;
         shared_sort_indices[tid] = local_best_idx;
+        s_shaping_dist_sq[tid] = local_best_shaping_dist_sq;
     }
     workgroupBarrier();
 
@@ -252,18 +270,28 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             s_similarities[slot] = local_best_dist_sq;
             shared_sort_indices[slot] = local_best_idx;
         }
+        s_shaping_dist_sq[slot] = min(s_shaping_dist_sq[slot], local_best_shaping_dist_sq);
     }
     workgroupBarrier();
 
     if (tid == 0u && alive) {
         var best_idx = 0xFFFFFFFFu;
         var best_dist_sq = 1e12;
+        var best_shaping_dist_sq = 1e12;
         for (var i = 0u; i < 128u; i++) {
             if (s_similarities[i] < best_dist_sq) {
                 best_dist_sq = s_similarities[i];
                 best_idx = shared_sort_indices[i];
             }
+            best_shaping_dist_sq = min(best_shaping_dist_sq, s_shaping_dist_sq[i]);
         }
+        // Publish the nearest in-range food distance for the approach potential;
+        // SHAPING_RADIUS sentinel when none is within range.
+        let shaping_radius_sq = SHAPING_RADIUS * SHAPING_RADIUS;
+        physics_state[b + P_NEAREST_FOOD_DISTANCE] = select(
+            SHAPING_RADIUS,
+            sqrt(best_shaping_dist_sq),
+            best_shaping_dist_sq < shaping_radius_sq);
         if (best_idx != 0xFFFFFFFFu) {
             // Atomic: claim food (prevents double-eating across workgroups)
             let result = atomicCompareExchangeWeak(&food_flags[best_idx], 0u, 1u);
@@ -347,6 +375,11 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
     physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
+    // Approach-potential state: no food is "in range" until the next
+    // food-detect pass, and the previous potential must not carry across the
+    // death so the eat-respawn food teleport cannot inject a shaping reward.
+    physics_state[base + P_NEAREST_FOOD_DISTANCE] = SHAPING_RADIUS;
+    physics_state[base + P_PREV_POTENTIAL]        = 0.0;
 
     // 4. Reset brain state
     let brain_base = agent_id * BRAIN_STRIDE;
@@ -391,8 +424,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     brain_state[brain_base + O_ACT_BIASES + 1u] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_turn_bias_trace;
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_VALUE_WEIGHTS + i] += CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
-        brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
-        brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];
+        brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
+        brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];
     }
 
     // Reset TD transients: eligibility traces and the previous-state value

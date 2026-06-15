@@ -170,10 +170,6 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         let tick_budget = governor.config.tick_budget;
         let mut ticks_done: u64 = 0;
 
-        let quarter_length = (tick_budget / 4).max(1);
-        let mut quarter_samples: [(u64, u64); 4] = [(0, 0); 4];
-        let mut next_quarter: usize = 0;
-
         while ticks_done < tick_budget {
             let remaining = (tick_budget - ticks_done).min(HEATMAP_INTERVAL as u64) as u32;
             kernel.dispatch_batch(ticks_done, remaining);
@@ -200,17 +196,16 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 }
             }
 
-            while next_quarter < 4 && ticks_done >= quarter_length * (next_quarter as u64 + 1) {
-                let mut cumulative_food = 0_u64;
-                let mut cumulative_alive = 0_u64;
-                for i in 0..agents.len() {
-                    let base = i * PHYS_STRIDE;
-                    cumulative_food += state[base + P_FOOD_COUNT] as u64;
-                    cumulative_alive += state[base + P_TICKS_ALIVE] as u64;
-                }
-                quarter_samples[next_quarter] = (cumulative_food, cumulative_alive);
-                next_quarter += 1;
+            // Feed the governor's within-life tracker (it snapshots quarter
+            // boundaries from gen_tick).
+            let mut cumulative_food = 0_u64;
+            let mut cumulative_alive = 0_u64;
+            for i in 0..agents.len() {
+                let base = i * PHYS_STRIDE;
+                cumulative_food += state[base + P_FOOD_COUNT] as u64;
+                cumulative_alive += state[base + P_TICKS_ALIVE] as u64;
             }
+            governor.record_within_life_sample(cumulative_food, cumulative_alive);
 
             if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
                 let pct =
@@ -223,25 +218,19 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         // Extract fitness stats from final state
         let state = kernel.cached_state();
+        let mut final_food = 0_u64;
+        let mut final_alive = 0_u64;
         for i in 0..agents.len() {
             let base = i * PHYS_STRIDE;
             agents[i].food_consumed = state[base + P_FOOD_COUNT] as u32;
             agents[i].total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
             agents[i].death_count = state[base + P_DEATH_COUNT] as u32;
+            final_food += u64::from(agents[i].food_consumed);
+            final_alive += agents[i].total_ticks_alive;
         }
-
-        while next_quarter < 4 {
-            let mut cumulative_food = 0_u64;
-            let mut cumulative_alive = 0_u64;
-            for i in 0..agents.len() {
-                let base = i * PHYS_STRIDE;
-                cumulative_food += state[base + P_FOOD_COUNT] as u64;
-                cumulative_alive += state[base + P_TICKS_ALIVE] as u64;
-            }
-            quarter_samples[next_quarter] = (cumulative_food, cumulative_alive);
-            next_quarter += 1;
-        }
-        let (first_quarter_rate, last_quarter_rate) = quarter_rates(&quarter_samples);
+        // Final sample fills any quarter the chunk loop did not land on.
+        governor.record_within_life_sample(final_food, final_alive);
+        let (first_quarter_rate, last_quarter_rate) = governor.within_life_rates();
 
         println!();
         let gen_elapsed = gen_start.elapsed();
@@ -300,29 +289,6 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         total_time.as_secs_f64(),
         governor.generation,
     );
-}
-
-/// Food rates (per 1k alive-ticks) of the first and last generation
-/// quarters, from cumulative (food, alive_ticks) samples taken at the
-/// four quarter boundaries. The last-quarter rate uses the deltas
-/// between the third and fourth samples. Rising last-over-first is the
-/// direct signal that the population improves within a lifetime instead
-/// of only across generations.
-fn quarter_rates(samples: &[(u64, u64); 4]) -> (f64, f64) {
-    let (first_food, first_alive) = samples[0];
-    let first_quarter_rate = if first_alive > 0 {
-        first_food as f64 / first_alive as f64 * 1000.0
-    } else {
-        0.0
-    };
-    let last_food = samples[3].0.saturating_sub(samples[2].0);
-    let last_alive = samples[3].1.saturating_sub(samples[2].1);
-    let last_quarter_rate = if last_alive > 0 {
-        last_food as f64 / last_alive as f64 * 1000.0
-    } else {
-        0.0
-    };
-    (first_quarter_rate, last_quarter_rate)
 }
 
 /// Per-generation learning metrics: behavioral signal (food per 1k
@@ -428,30 +394,5 @@ pub fn dump_tree(db_path: &str) {
             "{}Gen {:>3} [{}] fitness={}{}{} ",
             indent, node.generation, node.id, fitness_str, mutation_str, status_marker,
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quarter_rates_computes_first_and_last_quarter_food_rates() {
-        // Cumulative (food, alive_ticks) samples at the four quarter
-        // boundaries: q1 ate 4 in 1000 alive-ticks (rate 4.0/1k); the
-        // last quarter ate 12−8 = 4 in 4000−3200 = 800 alive-ticks
-        // (rate 5.0/1k).
-        let samples = [(4_u64, 1000_u64), (6, 2100), (8, 3200), (12, 4000)];
-        let (first_quarter_rate, last_quarter_rate) = quarter_rates(&samples);
-        assert!((first_quarter_rate - 4.0).abs() < 1e-9);
-        assert!((last_quarter_rate - 5.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn quarter_rates_handles_zero_alive_ticks() {
-        let samples = [(0_u64, 0_u64), (0, 0), (0, 0), (0, 0)];
-        let (first_quarter_rate, last_quarter_rate) = quarter_rates(&samples);
-        assert_eq!(first_quarter_rate, 0.0);
-        assert_eq!(last_quarter_rate, 0.0);
     }
 }

@@ -156,7 +156,18 @@ pub const P_URGENCY_OUT: usize = 30;
 /// across the death/respawn reset so CPU readback can attribute the death to
 /// an exact tick instead of the end-of-batch upper bound.
 pub const P_LAST_DEATH_TICK: usize = 31;
-pub const PHYS_STRIDE: usize = 32;
+/// Planar distance (world units) to the nearest food within `SHAPING_RADIUS`,
+/// written by the food-detect pass each cycle; the `SHAPING_RADIUS` sentinel
+/// when no food is in range. Read same-cycle by the homeostasis pass to form
+/// the approach potential `Φ`. Per-agent live state, regenerated each run —
+/// never serialized or inherited.
+pub const P_NEAREST_FOOD_DISTANCE: usize = 32;
+/// Previous brain tick's approach potential `Φ(s)`, written by the homeostasis
+/// pass after forming the shaping term `F = γΦ(s′) − Φ(s)`. Reset on respawn so
+/// the food teleport-on-eat cannot inject a spurious shaping reward across a
+/// death.
+pub const P_PREV_POTENTIAL: usize = 33;
+pub const PHYS_STRIDE: usize = 34;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -883,6 +894,11 @@ mod tests {
         );
         assert_eq!(wgsl["P_FATIGUE_FACTOR_OUT"], P_FATIGUE_FACTOR_OUT as u32);
         assert_eq!(wgsl["P_LAST_DEATH_TICK"], P_LAST_DEATH_TICK as u32);
+        assert_eq!(
+            wgsl["P_NEAREST_FOOD_DISTANCE"],
+            P_NEAREST_FOOD_DISTANCE as u32
+        );
+        assert_eq!(wgsl["P_PREV_POTENTIAL"], P_PREV_POTENTIAL as u32);
     }
 
     #[test]
@@ -1063,6 +1079,8 @@ mod tests {
             P_GRADIENT_OUT,
             P_URGENCY_OUT,
             P_LAST_DEATH_TICK,
+            P_NEAREST_FOOD_DISTANCE,
+            P_PREV_POTENTIAL,
         ]
         .iter()
         .max()

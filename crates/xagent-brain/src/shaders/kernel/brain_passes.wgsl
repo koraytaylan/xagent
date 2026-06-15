@@ -167,7 +167,24 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let prev_integrity = brain_state[brain_base + O_HOMEO + 5u];
         let energy_delta = clamp(energy - prev_energy, -MAX_HOMEOSTATIC_DELTA, MAX_HOMEOSTATIC_DELTA);
         let integrity_delta = clamp(integrity - prev_integrity, -MAX_HOMEOSTATIC_DELTA, MAX_HOMEOSTATIC_DELTA);
-        let raw_gradient = energy_delta * ENERGY_WEIGHT + integrity_delta * INTEGRITY_WEIGHT;
+        // Potential-based approach shaping (optimal-policy-invariant). Φ(s) =
+        // −gain·d_norm rises toward 0 as the agent closes on in-range food;
+        // F = γΦ(s′) − Φ(s) telescopes over an episode, so it only accelerates
+        // credit toward the unchanged eat objective, never alters it. Folding F
+        // into raw_gradient here (not just the TD reward) propagates the
+        // approach signal to the reward, the homeostatic EMAs, and the memory
+        // valence in one place. P_NEAREST_FOOD_DISTANCE was written same-cycle by
+        // the food-detect pass; phys_base_homeo is already bound above.
+        let d_norm = clamp(
+            physics_state[phys_base_homeo + P_NEAREST_FOOD_DISTANCE] / SHAPING_RADIUS,
+            0.0, 1.0);
+        let potential = -APPROACH_SHAPING_GAIN * d_norm;
+        let prev_potential = physics_state[phys_base_homeo + P_PREV_POTENTIAL];
+        let shaping = TD_DISCOUNT * potential - prev_potential;
+        physics_state[phys_base_homeo + P_PREV_POTENTIAL] = potential;
+        let raw_gradient = energy_delta * ENERGY_WEIGHT
+            + integrity_delta * INTEGRITY_WEIGHT
+            + shaping;
         let gradient_fast = brain_state[brain_base + O_HOMEO + 0u] * (1.0 - GRADIENT_FAST_BLEND) + raw_gradient * GRADIENT_FAST_BLEND;
         let gradient_medium = brain_state[brain_base + O_HOMEO + 1u] * (1.0 - GRADIENT_MEDIUM_BLEND) + raw_gradient * GRADIENT_MEDIUM_BLEND;
         let gradient_slow = brain_state[brain_base + O_HOMEO + 2u] * (1.0 - GRADIENT_SLOW_BLEND) + raw_gradient * GRADIENT_SLOW_BLEND;
@@ -450,9 +467,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
             brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
                 CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * td_error * critic_trace;
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
-                ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * td_error * forward_trace;
+                ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * forward_trace;
             brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] +=
-                ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * td_error * turn_trace;
+                ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * turn_trace;
             // Encoder credit: which encoded dimensions carried the policy's
             // eligibility when this outcome arrived.
             s_credit[tid] = td_error * (forward_trace + turn_trace);

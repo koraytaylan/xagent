@@ -270,7 +270,11 @@ fn default_eval_repeats() -> usize {
 }
 
 fn default_num_islands() -> usize {
-    3
+    // One lineage by default. With a small shared-world population the per-island
+    // round-robin split the generation's already-thin foraging signal across
+    // separate trees; concentrating it in a single lineage gives selection the
+    // full population to compare each generation.
+    1
 }
 
 fn default_migration_interval() -> u32 {
@@ -291,7 +295,7 @@ impl Default for GovernorConfig {
             patience: 5,
             mutation_strength: 0.1,
             eval_repeats: 2,
-            num_islands: 3,
+            num_islands: 1,
             migration_interval: 5,
             momentum_decay: 0.9,
         }

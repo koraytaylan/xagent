@@ -702,9 +702,9 @@ impl Worker {
             self.kernel.kernel_batch_size(),
         );
 
-        // Per-batch throughput probe (workstream 0001): submit-return vs
-        // GPU-complete wall time and the submit/batch fusion ratio. The
-        // GPU-complete column is non-zero only under `XAGENT_PROBE_GPU_WAIT=1`.
+        // Per-batch throughput probe: submit-return vs GPU-complete wall time
+        // and the submit/batch fusion ratio. The GPU-complete column is
+        // non-zero only under `XAGENT_PROBE_GPU_WAIT=1`.
         let probe_batches = self.kernel.probe_kernel_batches();
         let probe_submits = self.kernel.probe_submit_count();
         let submit_nanos = self.kernel.probe_submit_return_nanos();

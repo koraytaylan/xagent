@@ -201,15 +201,15 @@ struct DispatchProbe {
     wait_for_gpu: bool,
     /// `XAGENT_SKIP_GLOBAL=1`: skip *recording* the single-workgroup `global`
     /// pass (grid rebuild + collisions). Isolates its GPU cost — if tps jumps
-    /// with this alone, the `global` pass is the residual ceiling (workstream
-    /// 0004). Produces incorrect simulation; measurement only.
+    /// with this alone, the `global` pass is the residual ceiling. Produces
+    /// incorrect simulation; measurement only.
     skip_global: bool,
     /// `XAGENT_SKIP_VISION=1`: skip *recording* the `vision` raycast pass.
     /// Isolates vision's GPU cost from the `global` pass. Measurement only.
     skip_vision: bool,
     /// `XAGENT_KERNEL_PASS_LIMIT=k` (default `7`): run only the first `k` of the
     /// seven cooperative passes in `brain_tick_inner` so their cumulative GPU
-    /// cost can be profiled pass-by-pass (workstream 0002). Carried into the
+    /// cost can be profiled pass-by-pass. Carried into the
     /// kernel via the second push-constant word (`KernelPushConstants.pass_limit`,
     /// `kernel_tick.wgsl`). The default `7` runs every pass ⇒ byte-identical
     /// results to a build without this knob (the determinism tests gate that);
@@ -221,8 +221,8 @@ struct DispatchProbe {
 impl DispatchProbe {
     /// Read the knobs once from the environment. A var set to `"1"` enables it;
     /// anything else (including unset) leaves it off. `XAGENT_SKIP_GLOBAL_VISION`
-    /// is kept as a back-compat alias that sets both skip flags so the combined
-    /// arm documented in the baseline spec still works.
+    /// is kept as an alias that sets both skip flags so the combined
+    /// global+vision skip arm still works.
     fn from_env() -> Self {
         fn flag(name: &str) -> bool {
             std::env::var(name).ok().as_deref() == Some("1")
@@ -423,11 +423,10 @@ impl GpuKernel {
     }
 
     /// Whether the subgroup-accelerated top-K recall path was spliced into the
-    /// brain shader on this device (workstream 0002 diagnostic). `true` means
-    /// `coop_recall_topk` uses the subgroup bitonic sort; `false` means the
-    /// barrier-dense workgroup-memory fallback. Gated on `wgpu::Features::SUBGROUP`
-    /// *and* a guaranteed subgroup width ≥ `MIN_SUBGROUP_WIDTH_FOR_BITONIC` — see
-    /// `subgroup_bitonic_supported`. Recorded on-target in the baseline spec.
+    /// brain shader on this device. `true` means `coop_recall_topk` uses the
+    /// subgroup bitonic sort; `false` means the barrier-dense workgroup-memory
+    /// fallback. Gated on `wgpu::Features::SUBGROUP` *and* a guaranteed subgroup
+    /// width ≥ `MIN_SUBGROUP_WIDTH_FOR_BITONIC` — see `subgroup_bitonic_supported`.
     pub fn has_subgroup(&self) -> bool {
         self.has_subgroup
     }
@@ -552,8 +551,8 @@ impl GpuKernel {
         } else {
             log::info!("[GpuKernel] No subgroup support — using shared-memory-only bitonic sort");
         }
-        // One-fact diagnostic (workstream 0002): name the active top-K recall
-        // path unambiguously so it can be read off `RUST_LOG=info` on target.
+        // Name the active top-K recall path unambiguously so it can be read off
+        // `RUST_LOG=info`.
         log::info!(
             "[GpuKernel] top-K recall path: {}",
             if has_subgroup {

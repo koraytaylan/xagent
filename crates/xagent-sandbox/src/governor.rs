@@ -45,12 +45,11 @@ pub struct AgentFitness {
 /// (each 0.5). `food_target` and `total_grid_cells` are the per-axis
 /// denominators computed once per generation in [`Governor::evaluate`].
 ///
-/// Adopted after the post-grounding data confirmed both fitness
-/// pathologies the additive `survival·0.4 + foraging·0.3 + exploration·0.3`
-/// formula allowed: kamikaze foraging (deaths-per-food rising with food) and
-/// within-lifetime learning staying invisible (`q1→q4` flat-to-declining
-/// while cross-generation foraging rose). See the stride/lag sweep and
-/// post-grounding control sections of the learning-baseline spec.
+/// This multiplicative shape closes two fitness pathologies that an additive
+/// `survival·0.4 + foraging·0.3 + exploration·0.3` formula allows: kamikaze
+/// foraging (deaths-per-food rising with food) and within-lifetime learning
+/// staying invisible (`q1→q4` flat-to-declining while cross-generation
+/// foraging rises).
 fn composite_fitness(
     death_count: u32,
     food_consumed: u32,
@@ -938,21 +937,13 @@ impl Governor {
             parent_fitness,
         );
 
-        // Compute unique config count for eval_repeats noise reduction.
-        //
-        // LOCKED DECISION (Plan 0005, workstream 0001): the extra population
-        // capacity unlocked by running at the GPU occupancy knee (default
-        // `population_size` 10 → 192) is spent on UNIQUE GENOMES — search
-        // breadth — by holding `eval_repeats` at its default while the
-        // population grows. With this formula that turns ~96 distinct configs
-        // (192 / 2) per generation, ~10× the old default's 5, so the ~10×
-        // agent-ticks/sec throughput win is routed straight into exploration.
-        // `eval_repeats` stays a SEPARATE, independently tunable noise-reduction
-        // knob: raise it to trade breadth back for per-config repeats, never as a
-        // throughput lever. No formula change is needed for the allocation —
-        // leaving `eval_repeats` fixed already routes the capacity here. Validated
-        // fixed-seed (no deaths-per-food / fitness regression vs N=10) in the
-        // Plan 0005 subsection of the learning-baseline spec.
+        // Split the population into unique configs × eval_repeats: the
+        // population is spent on search breadth (distinct genomes), while
+        // `eval_repeats` is an independent noise-reduction knob that trades
+        // breadth for per-config repeats. At the default 192 population and 2
+        // repeats this evaluates 96 distinct configs per generation, each run
+        // twice. Growing `population_size` (e.g. to fill the GPU) therefore buys
+        // more exploration without touching `eval_repeats`.
         let pop_size = self.config.population_size;
         let repeats = self.config.eval_repeats.max(1);
         let unique_count = (pop_size / repeats).max(1);

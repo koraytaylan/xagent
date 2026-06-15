@@ -212,8 +212,8 @@ pub struct FullConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernorConfig {
     /// Number of agents per generation. The default is sized to the GPU
-    /// occupancy knee (see [`default_population_size`]); configs that predate
-    /// the field deserialize to that same knee.
+    /// occupancy knee (see [`default_population_size`]); configs that omit the
+    /// field deserialize to that same knee.
     #[serde(default = "default_population_size")]
     pub population_size: usize,
     /// Simulation ticks per generation before evaluation.
@@ -250,19 +250,19 @@ pub struct GovernorConfig {
 /// not parallel width, sets the wall time. Useful throughput (agent-ticks/sec =
 /// tps × N) climbs until an occupancy knee at N≈200 on the reference GPU, then
 /// plateaus while each generation's wall time keeps growing. Running at the knee
-/// instead of the former default of 10 buys ≈10× more agent-ticks/sec — the same
-/// hardware doing ~10× more useful evolution work per second.
+/// keeps the GPU busy, so the same hardware does far more useful evolution work
+/// per second than it does at a handful of agents.
 ///
 /// 192 is the largest N before the plateau, rounded to a multiple of
 /// [`default_eval_repeats`] (so `population_size / eval_repeats` is exact); with
-/// `eval_repeats = 2` that is 96 unique genomes per generation (≈10× the search
-/// breadth of the old default). The kernel rebuilds buffers for the new N via
-/// the generation-handoff `GpuKernel::new` path, so only memory scales — no
-/// buffer-plumbing change. Safe max: 1000 (verified to run; N=5000 did not
-/// complete on the reference GPU — do not raise the default past 1000 without a
-/// fresh sweep). Measured via `--bench-agent-sweep`; see
-/// docs/reviews/2026-06-15-brain-pass-latency-ceiling.md and the Plan 0005
-/// subsection of docs/superpowers/specs/2026-06-10-learning-baseline.md.
+/// `eval_repeats = 2` that is 96 unique genomes per generation. The kernel
+/// rebuilds buffers for the population's N via the generation-handoff
+/// `GpuKernel::new` path, so only memory scales. Safe max: 1000 (verified to
+/// run; N=5000 did not complete on the reference GPU — do not raise this past
+/// 1000 without a fresh sweep). Reproduce the knee with `--bench-agent-sweep`;
+/// the recorded sweep lives in
+/// docs/superpowers/specs/2026-06-10-learning-baseline.md and
+/// docs/reviews/2026-06-15-brain-pass-latency-ceiling.md.
 fn default_population_size() -> usize {
     192
 }

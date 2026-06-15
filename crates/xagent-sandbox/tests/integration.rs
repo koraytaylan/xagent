@@ -698,7 +698,7 @@ fn deterministic_across_batch_sizes() {
     assert_eq!(pos_1000, pos_100, "10×100 diverged from 1×1000");
 }
 
-/// Proves the fused single-submit dispatch path (workstream 0002) is
+/// Proves the fused single-submit dispatch path is
 /// bit-identical to running the same ticks as many small `dispatch_ticks`
 /// calls.
 ///
@@ -2760,8 +2760,8 @@ fn build_hazard_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
 
 /// Baseline: untrained agents in the hazard arena. Prints exit
 /// fraction, mean exit latency, and death fraction; asserts structural
-/// sanity plus pinned falsifiable bands. Re-pin the bands when
-/// workstream 0002 improves escape (the same protocol as the steering
+/// sanity plus pinned falsifiable bands. Re-pin the bands when a
+/// change improves escape (the same protocol as the steering
 /// probes).
 #[test]
 fn hazard_probe_exit_latency_baseline() {
@@ -2810,24 +2810,23 @@ fn hazard_probe_exit_latency_baseline() {
 
     // Pinned baseline recorded 2026-06-12 on macOS/Metal (wgpu adapter):
     // raw exit_fraction=0.188, mean_exit_latency=137.2, death_fraction=0.812
-    // (9/48 exits, mean of exits 137.2, 39/48 deaths). ±50% relative bands
-    // (per task spec) — generous for adapter noise, tight enough for real
-    // avoidance gains from workstream 0002 to trip. Re-pin on improvement
-    // (same protocol as steering probes).
+    // (9/48 exits, mean of exits 137.2, 39/48 deaths). ±50% relative bands —
+    // generous for adapter noise, tight enough for real avoidance gains to
+    // trip. Re-pin on improvement (same protocol as steering probes).
     assert!(
         (0.094..=0.282).contains(&exit_fraction),
         "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.094, 0.282] — \
-         re-pin if 0002 improves escape"
+         re-pin if avoidance improves"
     );
     assert!(
         (68.6..=205.8).contains(&mean_latency),
         "hazard mean_exit_latency {mean_latency:.1} outside pinned band [68.6, 205.8] — \
-         re-pin if 0002 improves escape"
+         re-pin if avoidance improves"
     );
     assert!(
         (0.406..=1.218).contains(&death_fraction),
         "hazard death_fraction {death_fraction:.3} outside pinned band [0.406, 1.218] — \
-         re-pin if 0002 improves escape"
+         re-pin if avoidance improves"
     );
 
     // Structural sanity: every trial resolves into exit, death, or
@@ -2925,7 +2924,7 @@ fn gpu_touch_emits_terrain_edge_contact_near_wall() {
     );
 }
 
-// ── 0002: split compute dispatch from CPU-visible publication ─────────────
+// ── Split compute dispatch from CPU-visible publication ───────────────────
 
 /// Build a kernel with world + agents uploaded and deterministic brain state,
 /// ready for dispatch. Shared by the dispatch/publication split tests below.

@@ -39,7 +39,7 @@ pub fn run_bench(
     // batches fuse into chunked submits (≤ MAX_FUSED_BATCHES per submit).
     kernel.dispatch_batch(0, total_ticks as u32);
 
-    // Per-batch throughput probe (workstream 0001). Captured before the
+    // Per-batch throughput probe. Captured before the
     // readback so they reflect only the dispatch path. The GPU-complete column
     // is non-zero only under `XAGENT_PROBE_GPU_WAIT=1`; `XAGENT_SKIP_GLOBAL_VISION=1`
     // skips the global+vision passes (incorrect results, measurement only).
@@ -148,7 +148,7 @@ pub fn run_profile(
 /// `global` skipped, `vision` skipped, both skipped — each on a fresh kernel,
 /// and prints achieved tps plus the submit/batch fusion ratio per arm. A large
 /// tps jump when only `global` is skipped fingers the single-workgroup `global`
-/// pass as the residual ceiling (workstream 0004); a jump only when `vision` is
+/// pass as the residual ceiling; a jump only when `vision` is
 /// skipped points at vision instead; little movement in either means the
 /// limiter is elsewhere (CPU submit / queue back-pressure). Skipping passes
 /// corrupts results — this is a timing harness only.
@@ -199,10 +199,10 @@ pub fn run_phase_ab(
     }
 
     println!("[phase-ab] read: a large +% on 'skip global' ALONE => the single-workgroup");
-    println!("           global pass is the residual ceiling (opens workstream 0004).");
+    println!("           global pass is the residual ceiling.");
 }
 
-/// Sweep agent counts to locate the GPU occupancy knee (workstream 0001).
+/// Sweep agent counts to locate the GPU occupancy knee.
 ///
 /// For each `N` in `counts`, run a fixed `total_ticks` through the single fused
 /// `dispatch_batch(0, total_ticks)` path on a fresh kernel and print `N`, tps,
@@ -211,8 +211,8 @@ pub fn run_phase_ab(
 /// `N` that maximizes agent-ticks/sec as the knee: below it the GPU is idle
 /// (tps flat while N rises), at it useful throughput saturates, above it each
 /// generation's wall time grows for no extra useful work. Read-only
-/// measurement; ships no behavior change. The shipped default
-/// `population_size` is sized from this sweep on the reference GPU.
+/// measurement; it changes no simulation state. The default `population_size`
+/// is sized to the knee this reports on the reference GPU.
 pub fn run_agent_sweep(
     brain: BrainConfig,
     world_config: WorldConfig,

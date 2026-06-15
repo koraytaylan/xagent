@@ -424,7 +424,7 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     // See top-of-file SAFETY INVARIANT.
     let alive = s_alive != 0u;
 
-    // Measurement-only per-pass cap (workstream 0002): run only the first
+    // Measurement-only per-pass cap: run only the first
     // `limit` cooperative passes so their cumulative GPU cost can be profiled
     // pass-by-pass (sweep `XAGENT_KERNEL_PASS_LIMIT = 0..7`; consecutive deltas
     // are the per-pass costs). `limit` is the kernel push constant, so it is
@@ -498,8 +498,8 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // the uniform no longer needs to be rewritten per batch just to carry the
 // tick). The exact `u32` is strictly more precise than the former
 // `WC_TICK = (tick as f32)` round-trip and matches it for every tick ≤ 2^24.
-// `pass_limit` is the measurement-only per-cooperative-pass cap (workstream
-// 0002): `brain_tick_inner` runs only the first `pass_limit` of its seven
+// `pass_limit` is the measurement-only per-cooperative-pass cap:
+// `brain_tick_inner` runs only the first `pass_limit` of its seven
 // cooperative passes so their cumulative GPU cost can be profiled pass-by-pass.
 // It reuses the formerly-unused second push-constant word, so no uniform-slot
 // or `WORLD_CONFIG_SIZE` change is needed. The host sets it from

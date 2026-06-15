@@ -211,7 +211,10 @@ pub struct FullConfig {
 /// Configuration for the evolution governor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernorConfig {
-    /// Number of agents per generation.
+    /// Number of agents per generation. The default is sized to the GPU
+    /// occupancy knee (see [`default_population_size`]); configs that predate
+    /// the field deserialize to that same knee.
+    #[serde(default = "default_population_size")]
     pub population_size: usize,
     /// Simulation ticks per generation before evaluation.
     pub tick_budget: u64,
@@ -239,6 +242,31 @@ pub struct GovernorConfig {
     pub momentum_decay: f32,
 }
 
+/// Default population sized to the GPU occupancy knee.
+///
+/// Below this N the GPU is under-occupied — ticks/sec is flat from N=1 to N≈50
+/// because each agent is one 256-thread workgroup and a few workgroups do not
+/// fill the device, so the brain pass's single-workgroup barrier-chain latency,
+/// not parallel width, sets the wall time. Useful throughput (agent-ticks/sec =
+/// tps × N) climbs until an occupancy knee at N≈200 on the reference GPU, then
+/// plateaus while each generation's wall time keeps growing. Running at the knee
+/// instead of the former default of 10 buys ≈10× more agent-ticks/sec — the same
+/// hardware doing ~10× more useful evolution work per second.
+///
+/// 192 is the largest N before the plateau, rounded to a multiple of
+/// [`default_eval_repeats`] (so `population_size / eval_repeats` is exact); with
+/// `eval_repeats = 2` that is 96 unique genomes per generation (≈10× the search
+/// breadth of the old default). The kernel rebuilds buffers for the new N via
+/// the generation-handoff `GpuKernel::new` path, so only memory scales — no
+/// buffer-plumbing change. Safe max: 1000 (verified to run; N=5000 did not
+/// complete on the reference GPU — do not raise the default past 1000 without a
+/// fresh sweep). Measured via `--bench-agent-sweep`; see
+/// docs/reviews/2026-06-15-brain-pass-latency-ceiling.md and the Plan 0005
+/// subsection of docs/superpowers/specs/2026-06-10-learning-baseline.md.
+fn default_population_size() -> usize {
+    192
+}
+
 fn default_mutation_strength() -> f32 {
     0.1
 }
@@ -262,7 +290,7 @@ fn default_momentum_decay() -> f32 {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            population_size: 10,
+            population_size: default_population_size(),
             tick_budget: 1_000_000,
             elitism_count: 3,
             max_generations: 0,

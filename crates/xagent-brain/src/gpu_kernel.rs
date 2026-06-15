@@ -207,6 +207,15 @@ struct DispatchProbe {
     /// `XAGENT_SKIP_VISION=1`: skip *recording* the `vision` raycast pass.
     /// Isolates vision's GPU cost from the `global` pass. Measurement only.
     skip_vision: bool,
+    /// `XAGENT_KERNEL_PASS_LIMIT=k` (default `7`): run only the first `k` of the
+    /// seven cooperative passes in `brain_tick_inner` so their cumulative GPU
+    /// cost can be profiled pass-by-pass (workstream 0002). Carried into the
+    /// kernel via the second push-constant word (`KernelPushConstants.pass_limit`,
+    /// `kernel_tick.wgsl`). The default `7` runs every pass ⇒ byte-identical
+    /// results to a build without this knob (the determinism tests gate that);
+    /// any smaller value deliberately produces wrong results and is for timing
+    /// only — never on in tests or release.
+    kernel_pass_limit: u32,
 }
 
 impl DispatchProbe {
@@ -219,10 +228,18 @@ impl DispatchProbe {
             std::env::var(name).ok().as_deref() == Some("1")
         }
         let skip_both = flag("XAGENT_SKIP_GLOBAL_VISION");
+        // Per-cooperative-pass cap: default 7 (all passes ⇒ byte-identical).
+        // Anything unset/unparsable falls back to 7; values above 7 behave like
+        // 7 (the shader compares `pass_index < limit` for indices 0..6).
+        let kernel_pass_limit = std::env::var("XAGENT_KERNEL_PASS_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(7);
         Self {
             wait_for_gpu: flag("XAGENT_PROBE_GPU_WAIT"),
             skip_global: skip_both || flag("XAGENT_SKIP_GLOBAL"),
             skip_vision: skip_both || flag("XAGENT_SKIP_VISION"),
+            kernel_pass_limit,
         }
     }
 }
@@ -405,6 +422,16 @@ impl GpuKernel {
         self.agent_count
     }
 
+    /// Whether the subgroup-accelerated top-K recall path was spliced into the
+    /// brain shader on this device (workstream 0002 diagnostic). `true` means
+    /// `coop_recall_topk` uses the subgroup bitonic sort; `false` means the
+    /// barrier-dense workgroup-memory fallback. Gated on `wgpu::Features::SUBGROUP`
+    /// *and* a guaranteed subgroup width ≥ `MIN_SUBGROUP_WIDTH_FOR_BITONIC` — see
+    /// `subgroup_bitonic_supported`. Recorded on-target in the baseline spec.
+    pub fn has_subgroup(&self) -> bool {
+        self.has_subgroup
+    }
+
     /// Re-initialize all per-agent GPU state for a new generation without
     /// recreating the device, pipelines, or buffers.  The caller must also
     /// call `upload_agents` afterwards to set physics positions.
@@ -525,6 +552,16 @@ impl GpuKernel {
         } else {
             log::info!("[GpuKernel] No subgroup support — using shared-memory-only bitonic sort");
         }
+        // One-fact diagnostic (workstream 0002): name the active top-K recall
+        // path unambiguously so it can be read off `RUST_LOG=info` on target.
+        log::info!(
+            "[GpuKernel] top-K recall path: {}",
+            if has_subgroup {
+                "subgroup-accelerated bitonic sort"
+            } else {
+                "workgroup-memory bitonic fallback (barrier-dense)"
+            }
+        );
 
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_storage_buffer_binding_size =
@@ -1519,10 +1556,15 @@ impl GpuKernel {
                         let mut pass = encoder.begin_compute_pass(&Default::default());
                         pass.set_pipeline(&self.kernel_pipeline);
                         pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                        // Per-batch start_tick via push constant (exact u32).
+                        // Per-batch start_tick + measurement-only pass_limit via
+                        // push constant (both exact u32; pass_limit defaults to 7
+                        // = all passes ⇒ byte-identical).
                         pass.set_push_constants(
                             0,
-                            bytemuck::cast_slice(&[tick_cursor as u32, 0u32]),
+                            bytemuck::cast_slice(&[
+                                tick_cursor as u32,
+                                self.probe.kernel_pass_limit,
+                            ]),
                         );
                         pass.dispatch_workgroups(self.agent_count, 1, 1);
                     }
@@ -1578,7 +1620,10 @@ impl GpuKernel {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&[tick_cursor as u32, 0u32]));
+                pass.set_push_constants(
+                    0,
+                    bytemuck::cast_slice(&[tick_cursor as u32, self.probe.kernel_pass_limit]),
+                );
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
             }
             if !skip_global {

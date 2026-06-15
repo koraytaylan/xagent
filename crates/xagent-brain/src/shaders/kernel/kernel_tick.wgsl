@@ -424,25 +424,40 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     // See top-of-file SAFETY INVARIANT.
     let alive = s_alive != 0u;
 
-    if (alive) { coop_feature_extract(agent_id, tid); }
+    // Measurement-only per-pass cap (workstream 0002): run only the first
+    // `limit` cooperative passes so their cumulative GPU cost can be profiled
+    // pass-by-pass (sweep `XAGENT_KERNEL_PASS_LIMIT = 0..7`; consecutive deltas
+    // are the per-pass costs). `limit` is the kernel push constant, so it is
+    // uniform across the whole dispatch; `alive` is the broadcast `s_alive`, so
+    // `alive && (idx < limit)` is workgroup-uniform and every gated pass is
+    // reached together by all 256 threads — exactly like the bare `alive` guard.
+    // The barriers below stay UNCONDITIONAL, so barrier uniformity (the
+    // top-of-file SAFETY INVARIANT) holds whether a pass runs or is skipped: a
+    // skipped pass is skipped *with* all threads, never some. Default 7 runs all
+    // passes ⇒ byte-identical to a build without this knob (the determinism
+    // tests gate that). Setting it < 7 deliberately produces wrong results and
+    // is never on in tests or release.
+    let limit = kpc.pass_limit;
+
+    if (alive && 0u < limit) { coop_feature_extract(agent_id, tid); }
     workgroupBarrier();
 
-    if (alive) { coop_encode(agent_id, tid); }
+    if (alive && 1u < limit) { coop_encode(agent_id, tid); }
     workgroupBarrier();
 
-    if (alive) { coop_habituate_homeo(agent_id, tid); }
+    if (alive && 2u < limit) { coop_habituate_homeo(agent_id, tid); }
     storageBarrier(); workgroupBarrier();
 
-    if (alive) { coop_recall_score(agent_id, tid); }
+    if (alive && 3u < limit) { coop_recall_score(agent_id, tid); }
     workgroupBarrier();
 
-    if (alive) { coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */); }
+    if (alive && 4u < limit) { coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */); }
     storageBarrier(); workgroupBarrier();
 
-    if (alive) { coop_predict_and_act(agent_id, tid); }
+    if (alive && 5u < limit) { coop_predict_and_act(agent_id, tid); }
     storageBarrier(); workgroupBarrier();
 
-    if (alive) { coop_learn_and_store(agent_id, tid); }
+    if (alive && 6u < limit) { coop_learn_and_store(agent_id, tid); }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -483,9 +498,17 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // the uniform no longer needs to be rewritten per batch just to carry the
 // tick). The exact `u32` is strictly more precise than the former
 // `WC_TICK = (tick as f32)` round-trip and matches it for every tick ≤ 2^24.
+// `pass_limit` is the measurement-only per-cooperative-pass cap (workstream
+// 0002): `brain_tick_inner` runs only the first `pass_limit` of its seven
+// cooperative passes so their cumulative GPU cost can be profiled pass-by-pass.
+// It reuses the formerly-unused second push-constant word, so no uniform-slot
+// or `WORLD_CONFIG_SIZE` change is needed. The host sets it from
+// `XAGENT_KERNEL_PASS_LIMIT` (default 7 = all passes ⇒ byte-identical results;
+// the determinism tests gate this). It is a push constant, hence uniform across
+// the whole dispatch — see the gating in `brain_tick_inner`.
 struct KernelPushConstants {
     start_tick: u32,
-    _pad: u32,
+    pass_limit: u32,
 }
 var<push_constant> kpc: KernelPushConstants;
 

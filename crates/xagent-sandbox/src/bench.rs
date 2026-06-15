@@ -202,6 +202,61 @@ pub fn run_phase_ab(
     println!("           global pass is the residual ceiling (opens workstream 0004).");
 }
 
+/// Sweep agent counts to locate the GPU occupancy knee (workstream 0001).
+///
+/// For each `N` in `counts`, run a fixed `total_ticks` through the single fused
+/// `dispatch_batch(0, total_ticks)` path on a fresh kernel and print `N`, tps,
+/// and agent-ticks/sec (`tps × N` — the useful-work metric for evolution, since
+/// every agent in a generation advances in lockstep). After the sweep, flag the
+/// `N` that maximizes agent-ticks/sec as the knee: below it the GPU is idle
+/// (tps flat while N rises), at it useful throughput saturates, above it each
+/// generation's wall time grows for no extra useful work. Read-only
+/// measurement; ships no behavior change. The shipped default
+/// `population_size` is sized from this sweep on the reference GPU.
+pub fn run_agent_sweep(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    total_ticks: u64,
+    counts: &[usize],
+) {
+    println!(
+        "[agent-sweep] {} ticks per N — locating the GPU occupancy knee",
+        total_ticks
+    );
+    println!("  {:>7}  {:>14}  {:>18}", "N", "tps", "agent-ticks/sec");
+
+    let mut knee_n = 0usize;
+    let mut knee_atps = 0.0_f64;
+    for &n in counts {
+        if n == 0 {
+            continue;
+        }
+        let (mut kernel, _world) = create_kernel(&brain, &world_config, n);
+
+        let start = Instant::now();
+        // Single fused dispatch for all ticks, then a blocking readback so the
+        // wall time captures GPU execution, not just submit-return.
+        kernel.dispatch_batch(0, total_ticks as u32);
+        let _ = kernel.read_full_state_blocking();
+        let secs = start.elapsed().as_secs_f64();
+
+        let tps = total_ticks as f64 / secs;
+        let agent_ticks_per_sec = tps * n as f64;
+        if agent_ticks_per_sec > knee_atps {
+            knee_atps = agent_ticks_per_sec;
+            knee_n = n;
+        }
+        println!("  {n:>7}  {tps:>14.0}  {agent_ticks_per_sec:>18.0}");
+    }
+
+    println!("[agent-sweep] occupancy knee: N={knee_n} maximizes agent-ticks/sec ({knee_atps:.0})");
+    println!(
+        "[agent-sweep] read: tps stays flat across small N (latency-bound, GPU idle); \
+         agent-ticks/sec climbs until the knee, then plateaus while per-generation \
+         wall time keeps growing. Size the default population to the knee."
+    );
+}
+
 /// Simulate the real tick loop with accumulator and per-frame dispatch —
 /// no rendering. Prints DIAG lines every second and returns the result.
 pub fn run_tick_loop_bench(

@@ -102,6 +102,12 @@ struct Cli {
     /// locate the throughput ceiling. Honors --bench-ticks / --bench-agents.
     #[arg(long)]
     bench_phase_ab: bool,
+
+    /// Sweep agent counts to locate the GPU occupancy knee: prints, per N, tps
+    /// and agent-ticks/sec (tps × N) and flags the knee. Honors --bench-ticks /
+    /// --world-size (--bench-agents is ignored — the sweep sets N itself).
+    #[arg(long)]
+    bench_agent_sweep: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -577,6 +583,18 @@ fn main() {
             config.world.world_size = ws;
         }
         xagent_sandbox::bench::run_phase_ab(config.brain, config.world, agent_count, total_ticks);
+        return;
+    }
+
+    if cli.bench_agent_sweep {
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        // Default N list spans the latency-bound floor (1–50), the occupancy
+        // knee neighborhood (100–200), and the plateau (400–1000).
+        let counts = [1usize, 4, 10, 50, 100, 200, 400, 1000];
+        xagent_sandbox::bench::run_agent_sweep(config.brain, config.world, total_ticks, &counts);
         return;
     }
 

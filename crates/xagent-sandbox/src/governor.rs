@@ -938,7 +938,21 @@ impl Governor {
             parent_fitness,
         );
 
-        // Compute unique config count for eval_repeats noise reduction
+        // Compute unique config count for eval_repeats noise reduction.
+        //
+        // LOCKED DECISION (Plan 0005, workstream 0001): the extra population
+        // capacity unlocked by running at the GPU occupancy knee (default
+        // `population_size` 10 → 192) is spent on UNIQUE GENOMES — search
+        // breadth — by holding `eval_repeats` at its default while the
+        // population grows. With this formula that turns ~96 distinct configs
+        // (192 / 2) per generation, ~10× the old default's 5, so the ~10×
+        // agent-ticks/sec throughput win is routed straight into exploration.
+        // `eval_repeats` stays a SEPARATE, independently tunable noise-reduction
+        // knob: raise it to trade breadth back for per-config repeats, never as a
+        // throughput lever. No formula change is needed for the allocation —
+        // leaving `eval_repeats` fixed already routes the capacity here. Validated
+        // fixed-seed (no deaths-per-food / fitness regression vs N=10) in the
+        // Plan 0005 subsection of the learning-baseline spec.
         let pop_size = self.config.population_size;
         let repeats = self.config.eval_repeats.max(1);
         let unique_count = (pop_size / repeats).max(1);

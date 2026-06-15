@@ -542,3 +542,105 @@ cargo build --release -p xagent-sandbox
 #   XAGENT_SKIP_GLOBAL=1 / XAGENT_SKIP_VISION=1 / XAGENT_PROBE_GPU_WAIT=1
 # GUI at 1000× with RUST_LOG=debug → read [SIM-PROBE] (submits ≪ kernel_batches).
 ```
+
+## GPU occupancy & brain-pass profile (Plan 0005, 2026-06-15)
+
+Plan 0005 lands the measurement wiring for two levers the 0003 verdict above
+isolated (occupancy + per-workgroup barrier depth). All knobs default to a
+byte-identical dispatch; the determinism gate
+(`deterministic_across_batch_sizes` + `fused_dispatch_matches_split`) stays
+green with them unset, and `cargo fmt`/`clippy -D warnings`/`test` are green.
+
+**Wiring landed (this branch):**
+
+- `--bench-agent-sweep` (`bench::run_agent_sweep`): for each N in
+  `[1, 4, 10, 50, 100, 200, 400, 1000]` runs a fixed `--bench-ticks` through one
+  fused `dispatch_batch(0, ticks)` and prints tps + agent-ticks/sec (tps × N),
+  then flags the N that maximizes agent-ticks/sec as the occupancy knee.
+- `GovernorConfig::population_size` default 10 → **192** (sized to the knee;
+  see `default_population_size` in `config.rs`), spending the unlocked capacity
+  on unique genomes (`eval_repeats` held at 2 → ~96 distinct configs/gen).
+- `GpuKernel::has_subgroup()` accessor + an explicit `[GpuKernel] top-K recall
+  path: …` `log::info!` at construction (read off `RUST_LOG=info`).
+- `XAGENT_KERNEL_PASS_LIMIT=k` (default 7): runs only the first `k` of the seven
+  cooperative passes in `brain_tick_inner`, carried via the kernel push
+  constant's second word (`KernelPushConstants.pass_limit`). Default 7 ⇒
+  byte-identical; `0..6` deliberately corrupt results for timing only.
+
+**Repro (release binary, target macOS/Metal GPU required for numbers):**
+
+```
+cargo build --release -p xagent-sandbox
+# (1) Occupancy sweep — locate the knee:
+./target/release/xagent --bench-agent-sweep --bench-ticks 200000
+# (2) Subgroup top-K path fact:
+RUST_LOG=info ./target/release/xagent --bench --bench-ticks 1000 --bench-agents 10 2>&1 \
+  | grep 'top-K recall path'
+# (3) Per-cooperative-pass cumulative cost — sweep the limit 0..7:
+for k in 0 1 2 3 4 5 6 7; do \
+  echo "limit=$k"; XAGENT_KERNEL_PASS_LIMIT=$k \
+  ./target/release/xagent --bench --bench-ticks 200000 --bench-agents 200; done
+# (4) Fixed-seed evolution comparison (no-regression check), N=10 vs N=192,
+#     same --seed / tick_budget / generations, headless:
+./target/release/xagent --no-render --seed 42 --generations 8 --config <pop10.json>
+./target/release/xagent --no-render --seed 42 --generations 8 --config <pop192.json>
+```
+
+> ⚠️ **On-target numbers PENDING.** This branch was developed in a Linux
+> container with **no GPU adapter** (`GpuKernel::is_available()` == false), so
+> every dispatch self-skips and no tps/per-pass/evolution numbers could be
+> produced here — exactly the split the plan calls out ("harness wiring is
+> verified on lavapipe; throughput numbers require the target discrete GPU").
+> Run the commands above on the reference macOS/Metal machine and paste results
+> into the tables below.
+
+**(1) Occupancy sweep — `--bench-agent-sweep --bench-ticks 200000`:**
+
+| N | tps | agent-ticks/sec |
+|---|---|---|
+| 1 | _pending_ | _pending_ |
+| 4 | _pending_ | _pending_ |
+| 10 | _pending_ | _pending_ |
+| 50 | _pending_ | _pending_ |
+| 100 | _pending_ | _pending_ |
+| 200 | _pending_ | _pending_ |
+| 400 | _pending_ | _pending_ |
+| 1000 | _pending_ | _pending_ |
+
+Expected from the prior shell-loop sweep (origin of the 192 default): tps flat
+N=1→50 (≈−9% across the 5× rise), useful throughput saturating at a knee near
+**N≈200** (≈2.39 M agent-ticks/sec); N=1000 runs, N=5000 did not complete.
+**Knee → shipped default = 192** (largest pre-plateau N, multiple of
+`eval_repeats`). Re-confirm the knee here and adjust the default if it moves.
+
+**(2) Subgroup top-K path on target:** _pending_ — record `subgroup-accelerated
+bitonic sort` or `workgroup-memory bitonic fallback (barrier-dense)`. This is
+the one fact that decides the first 0003 candidate (force subgroup path).
+
+**(3) Per-cooperative-pass cumulative cost (`XAGENT_KERNEL_PASS_LIMIT` sweep):**
+
+| limit (passes run) | tps | Δ tps vs prev = pass cost |
+|---|---|---|
+| 0 (none) | _pending_ | — |
+| 1 (+feature_extract) | _pending_ | _pending_ |
+| 2 (+encode) | _pending_ | _pending_ |
+| 3 (+habituate_homeo) | _pending_ | _pending_ |
+| 4 (+recall_score) | _pending_ | _pending_ |
+| 5 (+recall_topk) | _pending_ | _pending_ |
+| 6 (+predict_and_act) | _pending_ | _pending_ |
+| 7 (+learn_and_store, = full) | _pending_ | _pending_ |
+
+The largest consecutive tps drop names the dominant pass — the prime suspect is
+`recall_topk` (limit 4→5), the 7-stage bitonic sort with a barrier per
+stage/step. The dominant pass is the only one 0003 may touch.
+
+**(4) Fixed-seed evolution — N=10 vs N=192 (same seed/budget/generations):**
+
+| Arm | unique genomes/gen | deaths-per-food | best fitness (final gen) |
+|---|---|---|---|
+| N=10 (old default) | 5 | _pending_ | _pending_ |
+| N=192 (new default) | 96 | _pending_ | _pending_ |
+
+Verdict (to fill): N=192 must be **no worse** on deaths-per-food / best fitness
+at equal wall-clock-per-generation budget (expected better, from ~10× broader
+search). If it regresses, record the cause and raise `eval_repeats` in lockstep.

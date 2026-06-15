@@ -173,6 +173,53 @@ fn replace_fenced(src: &str, begin: &str, end: &str, replacement: &str) -> Strin
 /// queue shallow enough that `queue.submit()` never blocks.
 const STAGING_SLOTS: usize = 6;
 
+/// Max full kernel-batches fused into one command buffer by
+/// [`GpuKernel::dispatch_ticks`].
+///
+/// With `start_tick` moved to a push constant, every full kernel-batch in a
+/// `dispatch_ticks` call shares one `world_config` uniform write, so they can
+/// be recorded into a single command encoder and submitted once — collapsing
+/// the former one-submit-per-100-tick tax. Each fused batch records 3 GPU
+/// passes (kernel + global + vision; `prepare` is hoisted once per chunk), so
+/// 24 batches ≈ 73 passes — well under the Metal command-buffer pass-count
+/// bound that `CYCLES_PER_CHUNK = 100` enforces on the masked path. Beyond this
+/// many batches, `dispatch_ticks` starts a new submit. The worker's dispatch
+/// cap is sized to this value so a high-speed backlog actually fuses.
+pub const MAX_FUSED_BATCHES: u32 = 24;
+
+/// Default-off per-batch timing / A-B knobs for the throughput-ceiling probe.
+///
+/// Both flags are read once from the environment at construction so the
+/// steady-state dispatch path stays branch-light, and both default off — with
+/// them off the dispatch path is byte-for-byte unchanged. They exist purely to
+/// measure where the high-speed-multiplier ticks/sec ceiling actually lives.
+struct DispatchProbe {
+    /// `XAGENT_PROBE_GPU_WAIT=1`: add one `Maintain::Wait` after the final
+    /// submit of each `dispatch_ticks` call to measure GPU-complete wall time
+    /// versus submit-return wall time. The gap between the two distinguishes
+    /// CPU submit/recording cost from queue back-pressure / GPU execution.
+    wait_for_gpu: bool,
+    /// `XAGENT_SKIP_GLOBAL_VISION=1`: skip *recording* the `global` and
+    /// `vision` passes so the residual submit/kernel cost can be measured.
+    /// Produces incorrect simulation while set — measurement only, never on in
+    /// tests or release.
+    skip_global_vision: bool,
+}
+
+impl DispatchProbe {
+    /// Read both knobs once from the environment. A var set to `"1"` enables it;
+    /// anything else (including unset) leaves it off.
+    fn from_env() -> Self {
+        fn flag(name: &str) -> bool {
+            std::env::var(name).ok().as_deref() == Some("1")
+        }
+        Self {
+            wait_for_gpu: flag("XAGENT_PROBE_GPU_WAIT"),
+            skip_global_vision: flag("XAGENT_SKIP_GLOBAL_VISION"),
+        }
+    }
+}
+
 /// Pending async readback of 4 staging buffers for telemetry.
 struct TelemetryReadback {
     /// Shared completion/error state for all 4 `map_async` callbacks.
@@ -294,6 +341,24 @@ pub struct GpuKernel {
     layout: BrainLayout,
     brain_tick_stride: u32,
     has_subgroup: bool, // retained for runtime diagnostics
+
+    // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
+    world_config_scratch: [f32; WORLD_CONFIG_SIZE],
+
+    // ── Per-batch throughput probe (default-off knobs + wall-time counters) ──
+    probe: DispatchProbe,
+    /// Accumulated wall nanoseconds from recording start to the last
+    /// `queue.submit` return, summed across `dispatch_ticks` calls.
+    probe_submit_nanos: u64,
+    /// Accumulated wall nanoseconds from recording start to GPU-complete
+    /// (`Maintain::Wait` returned), summed only while `probe.wait_for_gpu`.
+    probe_complete_nanos: u64,
+    /// Number of kernel-batches (full + remainder) recorded — the denominator
+    /// for per-batch averages.
+    probe_batches: u64,
+    /// Number of `queue.submit` calls made by `dispatch_ticks` — lets a reader
+    /// confirm full batches actually fuse (submits ≪ batches at high speed).
+    probe_submits: u64,
 }
 
 impl GpuKernel {
@@ -889,14 +954,28 @@ impl GpuKernel {
             }],
         });
 
-        // ── Create fused kernel pipeline (no push constants) ──
+        // ── Kernel pipeline layout (push constant carries per-batch start_tick) ──
+        // Mirrors physics_layout / global_layout: COMPUTE push constants, range
+        // 0..8. This is what frees the kernel from reading `start_tick` out of
+        // the per-batch world_config uniform, so full batches can share one
+        // uniform write and one submit.
+        let kernel_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kernel_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..8,
+            }],
+        });
+
+        // ── Create fused kernel pipeline (8-byte start_tick push constant) ──
         let kernel_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kernel_tick"),
             source: wgpu::ShaderSource::Wgsl(kernel_source.into()),
         });
         let kernel_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("kernel_tick"),
-            layout: Some(&brain_layout),
+            layout: Some(&kernel_layout),
             module: &kernel_module,
             entry_point: Some("kernel_tick"),
             compilation_options: override_options.clone(),
@@ -1039,6 +1118,12 @@ impl GpuKernel {
             agent_state_staging: None,
             brain_tick_stride,
             has_subgroup,
+            world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
+            probe: DispatchProbe::from_env(),
+            probe_submit_nanos: 0,
+            probe_complete_nanos: 0,
+            probe_batches: 0,
+            probe_submits: 0,
         }
     }
 
@@ -1117,53 +1202,63 @@ impl GpuKernel {
     }
 
     /// Write world config uniform with batch parameters.
-    pub fn upload_world_config(&self, start_tick: u64, ticks_to_run: u32) {
+    pub fn upload_world_config(&mut self, start_tick: u64, ticks_to_run: u32) {
         self.upload_world_config_masked(start_tick, ticks_to_run, 0x7);
     }
 
     /// Write world config with explicit phase mask.
     /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
-    pub fn upload_world_config_masked(&self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
-        let mut wc = build_world_config(
-            &self.world_config,
-            self.food_count,
-            self.agent_count as usize,
-            start_tick,
-            ticks_to_run,
-            self.vision_stride,
-            self.brain_tick_stride,
-        );
-        wc[WC_PHASE_MASK] = phase_mask as f32;
-        self.queue.write_buffer(
-            &self.world_config_bufs[self.active_config_index],
-            0,
-            bytemuck::cast_slice(&wc),
-        );
+    pub fn upload_world_config_masked(
+        &mut self,
+        start_tick: u64,
+        ticks_to_run: u32,
+        phase_mask: u32,
+    ) {
+        self.write_world_config_scratch(start_tick, ticks_to_run, phase_mask, self.vision_stride);
     }
 
     /// Write world config with explicit vision_stride override.
     /// Used by kernel dispatch to set the GPU loop count per batch.
     fn upload_world_config_with_cycles(
-        &self,
+        &mut self,
         start_tick: u64,
         ticks_to_run: u32,
         phase_mask: u32,
         vision_stride_override: u32,
     ) {
-        let mut wc = build_world_config(
+        self.write_world_config_scratch(
+            start_tick,
+            ticks_to_run,
+            phase_mask,
+            vision_stride_override,
+        );
+    }
+
+    /// Fill the reused world-config scratch in place and upload it to the active
+    /// uniform buffer — no per-batch heap allocation. Byte-identical to the
+    /// former `build_world_config` + `wc[WC_PHASE_MASK] = …` + `write_buffer`.
+    fn write_world_config_scratch(
+        &mut self,
+        start_tick: u64,
+        ticks_to_run: u32,
+        phase_mask: u32,
+        vision_stride: u32,
+    ) {
+        fill_world_config(
+            &mut self.world_config_scratch,
             &self.world_config,
             self.food_count,
             self.agent_count as usize,
             start_tick,
             ticks_to_run,
-            vision_stride_override,
+            vision_stride,
             self.brain_tick_stride,
         );
-        wc[WC_PHASE_MASK] = phase_mask as f32;
+        self.world_config_scratch[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(
             &self.world_config_bufs[self.active_config_index],
             0,
-            bytemuck::cast_slice(&wc),
+            bytemuck::cast_slice(&self.world_config_scratch),
         );
     }
 
@@ -1356,86 +1451,163 @@ impl GpuKernel {
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
 
+        // Measurement-only A-B knob (default off): skip recording the global +
+        // vision passes so the residual submit/kernel cost can be measured.
+        let skip_gv = self.probe.skip_global_vision;
+        // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to
+        // the optional GPU-complete time below distinguishes CPU submit/recording
+        // cost from queue back-pressure / GPU execution.
+        let probe_start = std::time::Instant::now();
         let mut tick_cursor = start_tick;
 
-        // Each kernel-batch gets its own encoder+submit to ensure the uniform
-        // write (world config with tick/vision_stride) is visible to its dispatches.
-        // Each batch is only 4 passes (prepare + kernel + global + vision).
-        let total_batches = kernel_batches + if remainder_cycles > 0 { 1 } else { 0 };
+        // ── Full kernel-batches: fused into chunked submits ──────────────────
+        // With `start_tick` carried by the kernel push constant, every full
+        // batch shares ONE world_config uniform write (vision_stride /
+        // brain_tick_stride / phase identical across full batches; WC_TICK is no
+        // longer read by the kernel) and ONE submit per chunk of
+        // MAX_FUSED_BATCHES batches — collapsing the former per-100-tick submit
+        // tax. wgpu-core inserts a storage barrier between read-write-storage
+        // dispatches even inside one command buffer (storage usage is EXCLUSIVE,
+        // not ORDERED), so batch i's physics/grid/sensory writes are visible to
+        // batch i+1 exactly as when each batch was its own submit. Fusing changes
+        // only the encoder/submit *grouping*, never the unit sequence.
+        if kernel_batches > 0 {
+            let full_ticks = self.vision_stride * self.brain_tick_stride;
+            self.upload_world_config_with_cycles(tick_cursor, full_ticks, 0x7, self.vision_stride);
 
-        for m in 0..total_batches {
-            let is_remainder = m == kernel_batches;
-            let cycles_this_batch = if is_remainder {
-                remainder_cycles
-            } else {
-                self.vision_stride
-            };
-            let ticks_this_batch = cycles_this_batch * self.brain_tick_stride;
+            let mut batch = 0u32;
+            while batch < kernel_batches {
+                let chunk_end = (batch + MAX_FUSED_BATCHES).min(kernel_batches);
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("dispatch_kernel_fused"),
+                        });
 
-            // Upload world config with vision_stride override for this batch
-            self.upload_world_config_with_cycles(
-                tick_cursor,
-                ticks_this_batch,
-                0x7,
-                cycles_this_batch,
-            );
+                // Prepare indirect dispatch args once per chunk: `dispatch_args`
+                // depends only on `agent_count` and is written by no other pass,
+                // so it stays valid for every vision dispatch in the chunk.
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.prepare_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+
+                for _ in batch..chunk_end {
+                    // Fused kernel: 1 dispatch, vision_stride brain cycles.
+                    // SAFETY: dispatch(agent_count, 1, 1) — one workgroup per
+                    // agent. Multi-thread passes may conditionally call
+                    // cooperative helpers that contain internal workgroup/storage
+                    // barriers, so barrier uniformity relies on the `alive` guard
+                    // being workgroup-uniform. The kernel makes this uniform by
+                    // construction: thread 0 (the sole writer of `P_ALIVE`)
+                    // broadcasts the post-write value into a `var<workgroup>
+                    // s_alive` before each workgroupBarrier(), and all other
+                    // threads read `s_alive` rather than `physics_state[P_ALIVE]`.
+                    // See the top-of-file SAFETY INVARIANT in kernel_tick.wgsl
+                    // before changing the dispatch shape or the alive contract.
+                    {
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.kernel_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        // Per-batch start_tick via push constant (exact u32).
+                        pass.set_push_constants(
+                            0,
+                            bytemuck::cast_slice(&[tick_cursor as u32, 0u32]),
+                        );
+                        pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    }
+
+                    if !skip_gv {
+                        // Global pass: grid rebuild + collisions.
+                        {
+                            let tick_for_global = tick_cursor + full_ticks as u64;
+                            let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                            let mut pass = encoder.begin_compute_pass(&Default::default());
+                            pass.set_pipeline(&self.global_pipeline);
+                            pass.set_bind_group(
+                                0,
+                                &self.bind_groups[self.active_config_index],
+                                &[],
+                            );
+                            pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        // Vision pass: raycasting.
+                        {
+                            let mut pass = encoder.begin_compute_pass(&Default::default());
+                            pass.set_pipeline(&self.vision_pipeline);
+                            pass.set_bind_group(
+                                0,
+                                &self.bind_groups[self.active_config_index],
+                                &[],
+                            );
+                            pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+                        }
+                    }
+
+                    tick_cursor += full_ticks as u64;
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+                self.probe_submits += 1;
+                batch = chunk_end;
+            }
+            self.probe_batches += u64::from(kernel_batches);
+        }
+
+        // ── Remainder-cycles batch: its own uniform write + submit ───────────
+        // It sets cycles = remainder_cycles, which changes WC_VISION_STRIDE in
+        // the uniform, so it cannot share the full-batch group's single write.
+        // At the default 100/1000-tick multiples remainder_cycles == 0.
+        if remainder_cycles > 0 {
+            let rem_ticks = remainder_cycles * self.brain_tick_stride;
+            self.upload_world_config_with_cycles(tick_cursor, rem_ticks, 0x7, remainder_cycles);
 
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dispatch_kernel"),
+                    label: Some("dispatch_kernel_remainder"),
                 });
-
-            // Prepare indirect dispatch args (for vision)
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.prepare_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-
-            // Fused kernel: 1 pass, cycles_this_batch brain cycles
-            // SAFETY: dispatch(agent_count, 1, 1) — one workgroup per agent.
-            // Multi-thread passes may conditionally call cooperative helpers
-            // that contain internal workgroup/storage barriers, so barrier
-            // uniformity relies on the `alive` guard being workgroup-uniform.
-            // The kernel makes this uniform by construction: thread 0 (the sole
-            // writer of `P_ALIVE`) broadcasts the post-write value into a
-            // `var<workgroup> s_alive` before each workgroupBarrier(), and all
-            // other threads read `s_alive` rather than `physics_state[P_ALIVE]`.
-            // See the top-of-file SAFETY INVARIANT in kernel_tick.wgsl before
-            // changing the dispatch shape or the alive-uniformity contract.
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&[tick_cursor as u32, 0u32]));
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
             }
-
-            // Global pass: grid rebuild + collisions
-            {
-                let tick_for_global = tick_cursor + ticks_this_batch as u64;
-                let gpc: [u32; 2] = [tick_for_global as u32, 0];
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.global_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                pass.dispatch_workgroups(1, 1, 1);
+            if !skip_gv {
+                {
+                    let tick_for_global = tick_cursor + rem_ticks as u64;
+                    let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.global_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+                }
             }
-
-            // Vision pass: raycasting
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.vision_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
-            }
-
             self.queue.submit(std::iter::once(encoder.finish()));
-            tick_cursor += ticks_this_batch as u64;
+            self.probe_submits += 1;
+            self.probe_batches += 1;
+            tick_cursor += rem_ticks as u64;
         }
 
-        // Physics-only remainder (ticks that don't fill a brain cycle)
+        // Physics-only remainder (ticks that don't fill a brain cycle). Its own
+        // phase mask (0x1) and submit, unchanged from before.
         let physics_remainder = ticks_to_run % self.brain_tick_stride;
         if physics_remainder > 0 {
             self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
@@ -1453,10 +1625,47 @@ impl GpuKernel {
                 pass.dispatch_workgroups(1, 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
+            self.probe_submits += 1;
+        }
+
+        // Probe: record submit-return wall time, and — only when the env knob is
+        // set — block once for GPU-complete wall time. The default path does no
+        // poll here.
+        self.probe_submit_nanos += probe_start.elapsed().as_nanos() as u64;
+        if self.probe.wait_for_gpu {
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            self.probe_complete_nanos += probe_start.elapsed().as_nanos() as u64;
         }
 
         self.active_config_index = 1 - self.active_config_index;
         true
+    }
+
+    /// Accumulated wall nanoseconds from recording start to the final
+    /// `queue.submit` return, summed across all `dispatch_ticks` calls. Always
+    /// collected; pairs with [`probe_kernel_batches`](Self::probe_kernel_batches)
+    /// for a per-batch average.
+    pub fn probe_submit_return_nanos(&self) -> u64 {
+        self.probe_submit_nanos
+    }
+
+    /// Accumulated wall nanoseconds to GPU-complete, summed only while
+    /// `XAGENT_PROBE_GPU_WAIT=1`; `0` otherwise (the wait is never issued).
+    pub fn probe_gpu_complete_nanos(&self) -> u64 {
+        self.probe_complete_nanos
+    }
+
+    /// Total kernel-batches (full + remainder) recorded — the denominator for
+    /// per-batch probe averages.
+    pub fn probe_kernel_batches(&self) -> u64 {
+        self.probe_batches
+    }
+
+    /// Total `queue.submit` calls made by `dispatch_ticks`. With fusion this is
+    /// far below [`probe_kernel_batches`](Self::probe_kernel_batches) at high
+    /// speed (one submit per ≤ `MAX_FUSED_BATCHES` full batches).
+    pub fn probe_submit_count(&self) -> u64 {
+        self.probe_submits
     }
 
     /// Request a CPU-visible snapshot of agent physics + food state.
@@ -1541,8 +1750,24 @@ impl GpuKernel {
     /// [`cached_state`](Self::cached_state) (and
     /// [`cached_food_state`](Self::cached_food_state) when food exists).
     pub fn try_collect_state_snapshot(&mut self) -> bool {
+        // `device.poll(Poll)` services *all* device-wide map_async callbacks, so
+        // there is nothing to do when both readback kinds are idle — skip the
+        // poll entirely on those iterations. Observationally identical.
+        if !(self.has_staging_in_flight() || self.has_pending_telemetry()) {
+            return false;
+        }
         self.device.poll(wgpu::Maintain::Poll);
         self.try_collect_staging()
+    }
+
+    /// True while any staging slot has an outstanding state readback.
+    pub fn has_staging_in_flight(&self) -> bool {
+        self.staging_in_flight.iter().any(|&b| b)
+    }
+
+    /// True while a selected-agent telemetry readback is pending.
+    pub fn has_pending_telemetry(&self) -> bool {
+        self.pending_telemetry.is_some()
     }
 
     /// Last collected agent physics state.
@@ -2133,6 +2358,11 @@ impl GpuKernel {
     /// If any map_async callback reported an error, clears the pending state
     /// so the next frame can retry.
     pub fn try_collect_telemetry(&mut self) -> Option<(u32, AgentTelemetry)> {
+        // Same union gate as `try_collect_state_snapshot`: the poll services the
+        // whole device, so skip it when nothing is in flight.
+        if !(self.has_staging_in_flight() || self.has_pending_telemetry()) {
+            return None;
+        }
         self.device.poll(wgpu::Maintain::Poll);
 
         let pending = self.pending_telemetry.as_ref()?;

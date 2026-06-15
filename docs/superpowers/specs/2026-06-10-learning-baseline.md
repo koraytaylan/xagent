@@ -464,3 +464,64 @@ signal stays flat-to-declining, which is expected — Variant B targets the
 kamikaze economics, not within-lifetime learning. That remaining flatness is
 the standing case for the Variant A improvement term as the next separate
 measurement.
+
+## Simulation throughput ceiling — submit fusion (Plan 0003, 2026-06-14)
+
+Plan 0003 instrumented the per-batch dispatch path (`DispatchProbe`, default-off
+`XAGENT_PROBE_GPU_WAIT` / `XAGENT_SKIP_GLOBAL_VISION` knobs, submit-return vs
+GPU-complete wall counters surfaced in `Worker::maybe_log_counters` as
+`[SIM-PROBE]` and in `bench::run_bench` as `[BENCH-PROBE]`), then moved the
+kernel's per-batch `start_tick` to a push constant so every full kernel-batch in
+a `dispatch_ticks` call shares one `world_config` uniform write and fuses into
+one command encoder + one submit per `MAX_FUSED_BATCHES` (= 24) batches. The
+worker dispatch cap was widened to `kernel_batch_size × MAX_FUSED_BATCHES` so a
+high-speed backlog actually fuses.
+
+**Bit-identical gate (passes):** `deterministic_across_batch_sizes` and the new
+`fused_dispatch_matches_split` (one fused `dispatch_ticks(0, 1037)` == ten
+one-batch calls + a final 37-tick call, exercising both the remainder-cycles and
+physics-remainder paths) assert byte-equal final physics state. Verified on Mesa
+lavapipe (`llvmpipe`).
+
+**Fusion ratio (hardware-independent):** `--bench --bench-ticks 24000
+--bench-agents 1` issues one `dispatch_ticks(0, 24000)` = 240 kernel-batches.
+After fusion it records **10 submits** (= ⌈240 / 24⌉) instead of the former
+**240** — the one-submit-per-100-tick tax is removed. This ratio does not depend
+on the GPU.
+
+**Three-arm wall-clock — Mesa lavapipe (`llvmpipe`, CPU software rasterizer),
+NOT representative of the target Metal/discrete GPU.** Recorded only to validate
+that the probe knobs are wired correctly end-to-end; absolute tps and the
+submit-vs-complete split on a CPU rasterizer say nothing about the ≈20 k-tps /
+1000× Metal ceiling this plan targets. `--bench --bench-ticks 24000
+--bench-agents 1`, one run each:
+
+| Arm | Env | tps | submits | submit-return ns/batch | gpu-complete ns/batch |
+|---|---|---|---|---|---|
+| (a) default | — | 10,754 | 10 | 8,794,589 | — (not measured) |
+| (b) gpu-wait | `XAGENT_PROBE_GPU_WAIT=1` | 19,524 | 10 | 4,614,971 | 5,119,094 |
+| (c) skip g+v | `XAGENT_SKIP_GLOBAL_VISION=1` | 22,138 | 10 | 4,059,447 | — (not measured) |
+
+**Verdict — gathered numbers do NOT adjudicate the target ceiling.** lavapipe is
+a single-threaded CPU rasterizer, so the per-batch wall time is dominated by CPU
+shader execution, not by Metal submit/back-pressure; arm (c)'s ~2× tps jump is
+the cost of CPU-executing the global+vision passes, not evidence about a
+discrete-GPU submit ceiling. The authoritative three-arm run must be done on the
+macOS/Metal (or another discrete-GPU) machine where the ≈20 k-tps / 1000× ceiling
+was observed. Repro (release binary):
+
+```
+cargo build --release -p xagent-sandbox
+./target/release/xagent --bench --bench-ticks 1000000 --bench-agents 10            # arm (a)
+XAGENT_PROBE_GPU_WAIT=1     ./target/release/xagent --bench --bench-ticks 1000000   # arm (b)
+XAGENT_SKIP_GLOBAL_VISION=1 ./target/release/xagent --bench --bench-ticks 1000000   # arm (c)
+# or, for the true 1000× interactive cadence, run the GUI at 1000× with RUST_LOG=debug
+# and read the [SIM-PROBE] line.
+```
+
+On target hardware: if arm (c) tps jumps materially over arm (a), the
+single-workgroup `global` pass dominates and workstream 0004 opens; if arm (b)
+shows submit-return ≪ gpu-complete, Metal back-pressure dominates; if both are
+sub-millisecond yet tps stays ≈200 batches/sec, CPU recording dominates. Until
+that on-target table exists, 0004 stays closed — see
+`docs/plans/0003-Simulation-Throughput-Ceiling/0004-GLOBAL-PASS-DECISION.md`.

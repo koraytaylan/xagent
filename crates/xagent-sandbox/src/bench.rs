@@ -35,8 +35,36 @@ pub fn run_bench(
 
     let start = Instant::now();
 
-    // Single dispatch for all ticks
+    // Single dispatch for all ticks — one `dispatch_ticks` call, so its full
+    // batches fuse into chunked submits (≤ MAX_FUSED_BATCHES per submit).
     kernel.dispatch_batch(0, total_ticks as u32);
+
+    // Per-batch throughput probe (workstream 0001). Captured before the
+    // readback so they reflect only the dispatch path. The GPU-complete column
+    // is non-zero only under `XAGENT_PROBE_GPU_WAIT=1`; `XAGENT_SKIP_GLOBAL_VISION=1`
+    // skips the global+vision passes (incorrect results, measurement only).
+    let probe_batches = kernel.probe_kernel_batches();
+    let probe_submits = kernel.probe_submit_count();
+    let probe_submit_ns = kernel.probe_submit_return_nanos();
+    let probe_complete_ns = kernel.probe_gpu_complete_nanos();
+    let per_batch = |total: u64| -> u64 {
+        if probe_batches == 0 {
+            0
+        } else {
+            total / probe_batches
+        }
+    };
+    println!(
+        "[BENCH-PROBE] kernel_batches={} submits={} submit_return_ns={} \
+         submit_return_ns_per_batch={} gpu_complete_ns={} gpu_complete_ns_per_batch={}",
+        probe_batches,
+        probe_submits,
+        probe_submit_ns,
+        per_batch(probe_submit_ns),
+        probe_complete_ns,
+        per_batch(probe_complete_ns),
+    );
+
     let state = kernel.read_full_state_blocking();
 
     let elapsed = start.elapsed();

@@ -24,7 +24,7 @@ pub mod buffers;
 pub mod gpu_kernel;
 
 pub use buffers::{AgentBrainState, BrainLayout};
-pub use gpu_kernel::{AgentTelemetry, GpuKernel};
+pub use gpu_kernel::{AgentTelemetry, GpuKernel, MAX_FUSED_BATCHES};
 
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
 #[inline(always)]

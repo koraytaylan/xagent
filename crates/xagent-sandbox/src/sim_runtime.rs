@@ -520,14 +520,29 @@ impl Worker {
         self.sim_accumulator += dt * self.speed_multiplier as f64;
 
         let min_dispatch = self.kernel.brain_tick_stride();
-        let max_accumulator =
-            sim_delta_time * (self.speed_multiplier as f64 * 3.0).max(min_dispatch as f64 + 2.0);
+
+        // Hand `dispatch_ticks` up to `MAX_FUSED_BATCHES` kernel-batches so a
+        // high-speed backlog fuses into one submit instead of paying the
+        // per-100-tick submit tax. The generation-budget clamp below stays
+        // UPSTREAM of `dispatch_ticks`, so a fused batch still stops exactly at
+        // `tick_budget`. At low speed `raw_ticks` stays small (the accumulator
+        // only fills at `dt * speed`), so a single batch still dispatches and
+        // interactive cadence is unchanged.
+        let dispatch_cap = self
+            .kernel
+            .kernel_batch_size()
+            .saturating_mul(xagent_brain::MAX_FUSED_BATCHES)
+            .max(min_dispatch);
+
+        // Raise the accumulator cap in lockstep so it can actually fill the
+        // wider dispatch cap at high multipliers; `dispatch_cap` already exceeds
+        // `min_dispatch`, preserving the original low-speed floor.
+        let max_accumulator = sim_delta_time
+            * (self.speed_multiplier as f64 * 3.0)
+                .max(dispatch_cap as f64)
+                .max(min_dispatch as f64 + 2.0);
         self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
 
-        // Cap at exactly one kernel-batch. No separate warmup throttle is needed:
-        // the cap already bounds the cold-start batch, and capping below the
-        // batch size would dispatch partial batches even when a full one is due.
-        let dispatch_cap = self.kernel.kernel_batch_size().max(min_dispatch);
         let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32).min(dispatch_cap);
         let mut ticks_to_run = if raw_ticks >= min_dispatch {
             raw_ticks
@@ -685,6 +700,32 @@ impl Worker {
             self.tick_budget,
             self.kernel.brain_tick_stride(),
             self.kernel.kernel_batch_size(),
+        );
+
+        // Per-batch throughput probe (workstream 0001): submit-return vs
+        // GPU-complete wall time and the submit/batch fusion ratio. The
+        // GPU-complete column is non-zero only under `XAGENT_PROBE_GPU_WAIT=1`.
+        let probe_batches = self.kernel.probe_kernel_batches();
+        let probe_submits = self.kernel.probe_submit_count();
+        let submit_nanos = self.kernel.probe_submit_return_nanos();
+        let complete_nanos = self.kernel.probe_gpu_complete_nanos();
+        let per_batch = |total: u64| -> u64 {
+            if probe_batches == 0 {
+                0
+            } else {
+                total / probe_batches
+            }
+        };
+        log::debug!(
+            "[SIM-PROBE] kernel_batches={} submits={} submit_return_ns={} \
+             submit_return_ns_per_batch={} gpu_complete_ns={} \
+             gpu_complete_ns_per_batch={}",
+            probe_batches,
+            probe_submits,
+            submit_nanos,
+            per_batch(submit_nanos),
+            complete_nanos,
+            per_batch(complete_nanos),
         );
     }
 

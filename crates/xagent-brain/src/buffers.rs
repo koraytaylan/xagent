@@ -406,7 +406,58 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut 
     }
 }
 
+/// Fill a caller-owned world-config buffer in place.
+///
+/// Writes the 24 world-config slots into `out` without allocating, so the
+/// per-batch GPU dispatch path can reuse one scratch array instead of heap-
+/// allocating a fresh `Vec` every batch. `out` is fully zeroed first so the
+/// result is byte-identical to [`build_world_config`]'s `vec![0.0; N]` init —
+/// the padding/`WC_PHASE_MASK` slots the caller sets afterward stay `0.0`.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_world_config(
+    out: &mut [f32; WORLD_CONFIG_SIZE],
+    config: &xagent_shared::WorldConfig,
+    food_count: usize,
+    agent_count: usize,
+    tick: u64,
+    ticks_to_run: u32,
+    vision_stride: u32,
+    brain_tick_stride: u32,
+) {
+    let gw = grid_width(config.world_size);
+    let go = gw / 2;
+    let terrain_step = config.world_size / 128.0;
+    out.fill(0.0);
+    out[WC_WORLD_SIZE] = config.world_size;
+    out[WC_DT] = 1.0 / config.tick_rate;
+    out[WC_ENERGY_DEPLETION] = config.energy_depletion_rate;
+    out[WC_MOVEMENT_COST] = config.movement_energy_cost;
+    out[WC_HAZARD_DAMAGE] = config.hazard_damage_rate;
+    out[WC_INTEGRITY_REGEN] = config.integrity_regen_rate;
+    out[WC_FOOD_ENERGY] = config.food_energy_value;
+    out[WC_FOOD_RADIUS] = 2.0;
+    out[WC_TERRAIN_VPS] = 129.0;
+    out[WC_TERRAIN_INV_STEP] = 1.0 / terrain_step;
+    out[WC_TERRAIN_HALF] = config.world_size / 2.0;
+    out[WC_BIOME_INV_CELL] = 256.0 / config.world_size;
+    out[WC_FOOD_COUNT] = food_count as f32;
+    out[WC_AGENT_COUNT] = agent_count as f32;
+    out[WC_TICK] = tick as f32;
+    out[WC_RNG_SEED] = config.seed as f32;
+    out[WC_WORLD_HALF_BOUND] = config.world_size / 2.0 - 1.0;
+    out[WC_BIOME_GRID_RES] = 256.0;
+    out[WC_GRID_WIDTH] = gw as f32;
+    out[WC_GRID_OFFSET] = go as f32;
+    out[WC_TICKS_TO_RUN] = ticks_to_run as f32;
+    out[WC_VISION_STRIDE] = vision_stride as f32;
+    out[WC_BRAIN_TICK_STRIDE] = brain_tick_stride as f32;
+}
+
 /// Build the world config uniform data.
+///
+/// Thin wrapper over [`fill_world_config`] for callers that want an owned
+/// `Vec` (tests, one-off uploads). The hot per-batch dispatch path uses
+/// `fill_world_config` against a reused scratch array instead.
 pub fn build_world_config(
     config: &xagent_shared::WorldConfig,
     food_count: usize,
@@ -416,34 +467,18 @@ pub fn build_world_config(
     vision_stride: u32,
     brain_tick_stride: u32,
 ) -> Vec<f32> {
-    let gw = grid_width(config.world_size);
-    let go = gw / 2;
-    let terrain_step = config.world_size / 128.0;
-    let mut wc = vec![0.0f32; WORLD_CONFIG_SIZE];
-    wc[WC_WORLD_SIZE] = config.world_size;
-    wc[WC_DT] = 1.0 / config.tick_rate;
-    wc[WC_ENERGY_DEPLETION] = config.energy_depletion_rate;
-    wc[WC_MOVEMENT_COST] = config.movement_energy_cost;
-    wc[WC_HAZARD_DAMAGE] = config.hazard_damage_rate;
-    wc[WC_INTEGRITY_REGEN] = config.integrity_regen_rate;
-    wc[WC_FOOD_ENERGY] = config.food_energy_value;
-    wc[WC_FOOD_RADIUS] = 2.0;
-    wc[WC_TERRAIN_VPS] = 129.0;
-    wc[WC_TERRAIN_INV_STEP] = 1.0 / terrain_step;
-    wc[WC_TERRAIN_HALF] = config.world_size / 2.0;
-    wc[WC_BIOME_INV_CELL] = 256.0 / config.world_size;
-    wc[WC_FOOD_COUNT] = food_count as f32;
-    wc[WC_AGENT_COUNT] = agent_count as f32;
-    wc[WC_TICK] = tick as f32;
-    wc[WC_RNG_SEED] = config.seed as f32;
-    wc[WC_WORLD_HALF_BOUND] = config.world_size / 2.0 - 1.0;
-    wc[WC_BIOME_GRID_RES] = 256.0;
-    wc[WC_GRID_WIDTH] = gw as f32;
-    wc[WC_GRID_OFFSET] = go as f32;
-    wc[WC_TICKS_TO_RUN] = ticks_to_run as f32;
-    wc[WC_VISION_STRIDE] = vision_stride as f32;
-    wc[WC_BRAIN_TICK_STRIDE] = brain_tick_stride as f32;
-    wc
+    let mut wc = [0.0f32; WORLD_CONFIG_SIZE];
+    fill_world_config(
+        &mut wc,
+        config,
+        food_count,
+        agent_count,
+        tick,
+        ticks_to_run,
+        vision_stride,
+        brain_tick_stride,
+    );
+    wc.to_vec()
 }
 
 /// Initialize brain_state buffer data for one agent from BrainConfig.

@@ -698,6 +698,91 @@ fn deterministic_across_batch_sizes() {
     assert_eq!(pos_1000, pos_100, "10×100 diverged from 1×1000");
 }
 
+/// Proves the fused single-submit dispatch path (workstream 0002) is
+/// bit-identical to running the same ticks as many small `dispatch_ticks`
+/// calls.
+///
+/// 1037 ticks at the default stride (vision_stride=10, brain_tick_stride=10,
+/// kernel_batch_size=100) decomposes as:
+///   - 10 full kernel-batches (1000 ticks)  → fused into chunked submits
+///   - 3 remainder cycles (30 ticks)        → own uniform write + submit
+///   - 7 physics-remainder ticks            → physics-only submit
+///
+/// so it exercises BOTH remainder paths that the exact-multiple
+/// `deterministic_across_batch_sizes` test never touches. The split run uses
+/// the identical unit sequence (ten one-batch calls + a final 37-tick call =
+/// 3 remainder cycles + 7 physics-remainder ticks), just ungrouped across
+/// submits, so any divergence is a fusion/ordering bug.
+#[test]
+fn fused_dispatch_matches_split() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{P_POS_X, P_POS_Y, P_POS_Z};
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    // Fresh kernel with deterministic brain state + identical initial world.
+    let make_kernel = || {
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel
+    };
+
+    let total: u32 = 1037;
+
+    // One fused dispatch_ticks call covering all 1037 ticks.
+    let mut fused = make_kernel();
+    fused.dispatch_ticks(0, total);
+    let fs = fused.read_full_state_blocking();
+    let fused_pos = [fs[P_POS_X], fs[P_POS_Y], fs[P_POS_Z]];
+
+    // Same 1037 ticks as ten one-batch calls + a final 37-tick call (3
+    // remainder cycles + 7 physics-remainder ticks): identical unit sequence,
+    // ungrouped across submits.
+    let mut split = make_kernel();
+    for i in 0..10u32 {
+        split.dispatch_ticks(u64::from(i) * 100, 100);
+    }
+    split.dispatch_ticks(1000, 37);
+    let ss = split.read_full_state_blocking();
+    let split_pos = [ss[P_POS_X], ss[P_POS_Y], ss[P_POS_Z]];
+
+    eprintln!("fused  1×1037:        {fused_pos:?}");
+    eprintln!("split  10×100 + 1×37: {split_pos:?}");
+    assert_eq!(
+        fused_pos, split_pos,
+        "fused dispatch diverged from split dispatch"
+    );
+}
+
 // ── GPU Tick Loop Tests ─────────────────────────────────────────────
 
 #[test]

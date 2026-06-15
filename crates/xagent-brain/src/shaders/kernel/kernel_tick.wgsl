@@ -477,6 +477,18 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
 // at the end of the batch, ready for the next batch's kernel.
 // ══════════════════════════════════════════════════════════════════════════
 
+// `start_tick` arrives per-batch via a push constant so that multiple
+// kernel-batches can share ONE `world_config` uniform write and ONE submit
+// (`vision_stride` / `brain_tick_stride` are constant across full batches, so
+// the uniform no longer needs to be rewritten per batch just to carry the
+// tick). The exact `u32` is strictly more precise than the former
+// `WC_TICK = (tick as f32)` round-trip and matches it for every tick ≤ 2^24.
+struct KernelPushConstants {
+    start_tick: u32,
+    _pad: u32,
+}
+var<push_constant> kpc: KernelPushConstants;
+
 @compute @workgroup_size(256)
 fn kernel_tick(
     @builtin(local_invocation_id) lid: vec3u,
@@ -487,7 +499,7 @@ fn kernel_tick(
     let tid = lid.x;
     let vision_stride = wc_u32(WC_VISION_STRIDE);
     let stride = wc_u32(WC_BRAIN_TICK_STRIDE);
-    let start_tick = wc_u32(WC_TICK);
+    let start_tick = kpc.start_tick;
 
     for (var cycle = 0u; cycle < vision_stride; cycle++) {
         let base_tick = start_tick + cycle * stride;

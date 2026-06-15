@@ -242,30 +242,23 @@ pub struct GovernorConfig {
     pub momentum_decay: f32,
 }
 
-/// Default population sized to the GPU occupancy knee.
+/// Default population (agents per generation).
 ///
-/// Below this N the GPU is under-occupied — ticks/sec is flat from N=1 to ~N=10
-/// (23.3k → 22.9k tps on the reference GPU) because each agent is one 256-thread
-/// workgroup and a handful do not fill the device, so the brain pass's
-/// single-workgroup barrier-chain latency, not parallel width, sets the wall
-/// time. Useful throughput (agent-ticks/sec = tps × N) climbs as N rises and
-/// peaks at the occupancy knee N=200 (≈2.40 M agent-ticks/sec), then falls off
-/// (N=400 → ≈2.08 M). Running at the knee keeps the GPU busy: ~10× the useful
-/// evolution work per second versus a handful of agents (N=10 → ≈230 k).
-///
-/// 200 is the smallest N at peak useful throughput, so it also minimizes each
-/// generation's wall time (N=1000 matches its agent-ticks/sec but at ~5× the
-/// wall time). It is a multiple of [`default_eval_repeats`] (so
-/// `population_size / eval_repeats` is exact); with `eval_repeats = 2` that is
-/// 100 unique genomes per generation. The kernel rebuilds buffers for the
-/// population's N via the generation-handoff `GpuKernel::new` path, so only
-/// memory scales. Safe max: 1000 (verified to run; N=5000 did not complete on
-/// the reference GPU — do not raise this past 1000 without a fresh sweep).
-/// Reproduce the knee with `--bench-agent-sweep`; the recorded sweep lives in
-/// docs/superpowers/specs/2026-06-10-learning-baseline.md and
-/// docs/reviews/2026-06-15-brain-pass-latency-ceiling.md.
+/// The GPU occupancy knee — where useful throughput (agent-ticks/sec) peaks —
+/// is far higher (≈200 on the reference GPU, ~10× the raw GPU throughput of a
+/// handful of agents; reproduce with `--bench-agent-sweep`). The default is
+/// nonetheless kept small because every agent shares one world: at a large
+/// population they compete for the world's finite food supply, which collapses
+/// per-capita foraging and multiplies deaths-per-food. Enlarging the world so
+/// per-agent food is preserved (`world_size ∝ √population`) removes that
+/// competition — per-capita behavior then matches this default — but evaluating
+/// more genomes per generation buys no measured fitness gain (the limiter is
+/// learner strength, not search breadth) while costing proportionally more wall
+/// time per generation. Until genomes are evaluated in independent arenas with a
+/// world-size-invariant fitness, a small population is the validated,
+/// fastest-per-generation choice.
 fn default_population_size() -> usize {
-    200
+    10
 }
 
 fn default_mutation_strength() -> f32 {

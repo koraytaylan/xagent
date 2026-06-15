@@ -557,9 +557,10 @@ green with them unset, and `cargo fmt`/`clippy -D warnings`/`test` are green.
   `[1, 4, 10, 50, 100, 200, 400, 1000]` runs a fixed `--bench-ticks` through one
   fused `dispatch_batch(0, ticks)` and prints tps + agent-ticks/sec (tps × N),
   then flags the N that maximizes agent-ticks/sec as the occupancy knee.
-- `GovernorConfig::population_size` default 10 → **200** (sized to the knee;
-  see `default_population_size` in `config.rs`), spending the unlocked capacity
-  on unique genomes (`eval_repeats` held at 2 → 100 distinct configs/gen).
+- `GovernorConfig::population_size` default stays at **10** — raising it to the
+  occupancy knee regresses evolution (shared-world food competition; see (4)).
+  The knee (≈200) is documented in `default_population_size` but not used for the
+  population until evaluation is arena-isolated.
 - `GpuKernel::has_subgroup()` accessor + an explicit `[GpuKernel] top-K recall
   path: …` `log::info!` at construction (read off `RUST_LOG=info`).
 - `XAGENT_KERNEL_PASS_LIMIT=k` (default 7): runs only the first `k` of the seven
@@ -646,13 +647,40 @@ raising how many agents are alive and doing work, so the `+5.45s`/`+7.14s` are
 **upper bounds** inflated by survival, not pure pass compute. Re-run with
 death/respawn churn suppressed to separate predict vs learn cleanly.
 
-**(4) Fixed-seed evolution — N=10 vs N=200 (same seed/budget/generations):**
+**(4) Fixed-seed evolution — population sweep (seed 42, tick_budget 120000,
+16 generations, on target 2026-06-15):**
 
-| Arm | unique genomes/gen | deaths-per-food | best fitness (final gen) |
-|---|---|---|---|
-| N=10 (old default) | 5 | _pending_ | _pending_ |
-| N=200 (new default) | 100 | _pending_ | _pending_ |
+| Arm | world | genomes/gen | food/1k | deaths-per-food | best fitness (mean / peak) | wall/gen |
+|---|---|---|---|---|---|---|
+| N=10 | 256 | 5 | 0.185 | 2.05 | 0.0201 / 0.0250 | 5.7s |
+| N=200 (unscaled) | 256 | 100 | 0.017 | 22.7 | 0.0175 / 0.0211 | 10.0s |
+| N=200 (scaled, area ∝ N) | 1145 | 100 | 0.200 | 1.89 | 0.0159 / 0.0198* | 10.4s |
 
-Verdict (to fill): N=200 must be **no worse** on deaths-per-food / best fitness
-at equal wall-clock-per-generation budget (expected better, from ~10× broader
-search). If it regresses, record the cause and raise `eval_repeats` in lockstep.
+\* fitness deflated by a measurement artifact, not behavior — see verdict.
+
+**Verdict — population default reverted to 10; scaling is premature.**
+
+1. **Naively raising the population regresses evolution.** At N=200 in the
+   unchanged world, `Food` pins at the world's supply cap (416 every generation),
+   per-capita foraging collapses 10× (food/1k 0.185 → 0.017) and deaths-per-food
+   blows up ~11× (2.05 → 22.7): the agents share one world and compete for finite
+   food, destroying the foraging selection signal.
+2. **Enlarging the world (area ∝ N, constant food density) removes the
+   competition.** `Food` varies again (3.5k–6k), and the world-size-invariant
+   per-capita metrics match N=10 — deaths-per-food **1.89** (≈ N=10's 2.05) and
+   food/1k **0.200** (≈ 0.185). The lower composite fitness is a measurement
+   artifact: the heatmap is a fixed `HEATMAP_RES²` grid spanning the world, so in
+   the 4.5×-bigger world each cell is coarser and the same physical travel covers
+   fewer cells (`cells` 400–700 → 120–500), deflating the exploration fitness
+   term. Within a run all agents share that scale, so selection is unaffected.
+3. **The population lever yields no benefit.** Champion fitness does not improve
+   over 15 generations in *any* arm — it wanders 0.01–0.02 and ends where it
+   began. Evaluating 100 genomes/gen instead of 5 buys nothing because the
+   bottleneck is learner strength, not search breadth; and N=200 costs ~1.8×
+   wall-time/gen (plus a 4.5× world when scaled).
+
+The occupancy sweep/profile remain valuable infrastructure, but the default
+`population_size` stays at **10**. Revisit population scaling only after the
+learner improves — and then with a world-size-invariant exploration metric and
+ideally independent per-genome arenas (so population becomes true parallel
+evaluation rather than shared-world competition).

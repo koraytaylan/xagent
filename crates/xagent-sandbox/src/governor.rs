@@ -939,11 +939,13 @@ impl Governor {
 
         // Split the population into unique configs × eval_repeats: the
         // population is spent on search breadth (distinct genomes), while
-        // `eval_repeats` is an independent noise-reduction knob that trades
-        // breadth for per-config repeats. At the default 200 population and 2
-        // repeats this evaluates 100 distinct configs per generation, each run
-        // twice. Growing `population_size` (e.g. to fill the GPU) therefore buys
-        // more exploration without touching `eval_repeats`.
+        // Split the population into unique configs × eval_repeats: population
+        // buys search breadth (distinct genomes), `eval_repeats` buys per-config
+        // noise reduction. At the default population of 10 and 2 repeats that is
+        // 5 distinct configs per generation, each run twice. Population is kept
+        // small deliberately — the agents share one world, so a large population
+        // competes for finite food and yields no measured fitness gain (see
+        // `default_population_size`).
         let pop_size = self.config.population_size;
         let repeats = self.config.eval_repeats.max(1);
         let unique_count = (pop_size / repeats).max(1);

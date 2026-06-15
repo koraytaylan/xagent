@@ -97,6 +97,11 @@ struct Cli {
     /// Run phase profiler: breaks down time by physics/vision/brain
     #[arg(long)]
     bench_profile: bool,
+
+    /// Run fused-dispatch pass-isolation A/B (full vs skip global/vision) to
+    /// locate the throughput ceiling. Honors --bench-ticks / --bench-agents.
+    #[arg(long)]
+    bench_phase_ab: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -562,6 +567,16 @@ fn main() {
             config.world.world_size = ws;
         }
         xagent_sandbox::bench::run_profile(config.brain, config.world, agent_count, total_ticks);
+        return;
+    }
+
+    if cli.bench_phase_ab {
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        xagent_sandbox::bench::run_phase_ab(config.brain, config.world, agent_count, total_ticks);
         return;
     }
 

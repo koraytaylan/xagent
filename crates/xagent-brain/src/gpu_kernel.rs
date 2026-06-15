@@ -199,23 +199,30 @@ struct DispatchProbe {
     /// versus submit-return wall time. The gap between the two distinguishes
     /// CPU submit/recording cost from queue back-pressure / GPU execution.
     wait_for_gpu: bool,
-    /// `XAGENT_SKIP_GLOBAL_VISION=1`: skip *recording* the `global` and
-    /// `vision` passes so the residual submit/kernel cost can be measured.
-    /// Produces incorrect simulation while set — measurement only, never on in
-    /// tests or release.
-    skip_global_vision: bool,
+    /// `XAGENT_SKIP_GLOBAL=1`: skip *recording* the single-workgroup `global`
+    /// pass (grid rebuild + collisions). Isolates its GPU cost — if tps jumps
+    /// with this alone, the `global` pass is the residual ceiling (workstream
+    /// 0004). Produces incorrect simulation; measurement only.
+    skip_global: bool,
+    /// `XAGENT_SKIP_VISION=1`: skip *recording* the `vision` raycast pass.
+    /// Isolates vision's GPU cost from the `global` pass. Measurement only.
+    skip_vision: bool,
 }
 
 impl DispatchProbe {
-    /// Read both knobs once from the environment. A var set to `"1"` enables it;
-    /// anything else (including unset) leaves it off.
+    /// Read the knobs once from the environment. A var set to `"1"` enables it;
+    /// anything else (including unset) leaves it off. `XAGENT_SKIP_GLOBAL_VISION`
+    /// is kept as a back-compat alias that sets both skip flags so the combined
+    /// arm documented in the baseline spec still works.
     fn from_env() -> Self {
         fn flag(name: &str) -> bool {
             std::env::var(name).ok().as_deref() == Some("1")
         }
+        let skip_both = flag("XAGENT_SKIP_GLOBAL_VISION");
         Self {
             wait_for_gpu: flag("XAGENT_PROBE_GPU_WAIT"),
-            skip_global_vision: flag("XAGENT_SKIP_GLOBAL_VISION"),
+            skip_global: skip_both || flag("XAGENT_SKIP_GLOBAL"),
+            skip_vision: skip_both || flag("XAGENT_SKIP_VISION"),
         }
     }
 }
@@ -1451,9 +1458,10 @@ impl GpuKernel {
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
 
-        // Measurement-only A-B knob (default off): skip recording the global +
-        // vision passes so the residual submit/kernel cost can be measured.
-        let skip_gv = self.probe.skip_global_vision;
+        // Measurement-only A-B knobs (default off): skip recording the global
+        // and/or vision passes, independently, to isolate each pass's GPU cost.
+        let skip_global = self.probe.skip_global;
+        let skip_vision = self.probe.skip_vision;
         // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to
         // the optional GPU-complete time below distinguishes CPU submit/recording
         // cost from queue back-pressure / GPU execution.
@@ -1519,32 +1527,22 @@ impl GpuKernel {
                         pass.dispatch_workgroups(self.agent_count, 1, 1);
                     }
 
-                    if !skip_gv {
-                        // Global pass: grid rebuild + collisions.
-                        {
-                            let tick_for_global = tick_cursor + full_ticks as u64;
-                            let gpc: [u32; 2] = [tick_for_global as u32, 0];
-                            let mut pass = encoder.begin_compute_pass(&Default::default());
-                            pass.set_pipeline(&self.global_pipeline);
-                            pass.set_bind_group(
-                                0,
-                                &self.bind_groups[self.active_config_index],
-                                &[],
-                            );
-                            pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                            pass.dispatch_workgroups(1, 1, 1);
-                        }
-                        // Vision pass: raycasting.
-                        {
-                            let mut pass = encoder.begin_compute_pass(&Default::default());
-                            pass.set_pipeline(&self.vision_pipeline);
-                            pass.set_bind_group(
-                                0,
-                                &self.bind_groups[self.active_config_index],
-                                &[],
-                            );
-                            pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
-                        }
+                    // Global pass: grid rebuild + collisions.
+                    if !skip_global {
+                        let tick_for_global = tick_cursor + full_ticks as u64;
+                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.global_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    // Vision pass: raycasting.
+                    if !skip_vision {
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.vision_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
                     }
 
                     tick_cursor += full_ticks as u64;
@@ -1583,22 +1581,20 @@ impl GpuKernel {
                 pass.set_push_constants(0, bytemuck::cast_slice(&[tick_cursor as u32, 0u32]));
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
             }
-            if !skip_gv {
-                {
-                    let tick_for_global = tick_cursor + rem_ticks as u64;
-                    let gpc: [u32; 2] = [tick_for_global as u32, 0];
-                    let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.global_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                    pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                    pass.dispatch_workgroups(1, 1, 1);
-                }
-                {
-                    let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.vision_pipeline);
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                    pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
-                }
+            if !skip_global {
+                let tick_for_global = tick_cursor + rem_ticks as u64;
+                let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.global_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            if !skip_vision {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.vision_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
             self.probe_submits += 1;
@@ -1666,6 +1662,15 @@ impl GpuKernel {
     /// speed (one submit per ≤ `MAX_FUSED_BATCHES` full batches).
     pub fn probe_submit_count(&self) -> u64 {
         self.probe_submits
+    }
+
+    /// Override the measurement-only pass-skip knobs at runtime so an A/B
+    /// harness can compare arms in one process without juggling env vars.
+    /// **Skipping a pass corrupts simulation results** — measurement only;
+    /// never call this from the runtime or tests that assert correctness.
+    pub fn set_probe_pass_skips(&mut self, skip_global: bool, skip_vision: bool) {
+        self.probe.skip_global = skip_global;
+        self.probe.skip_vision = skip_vision;
     }
 
     /// Request a CPU-visible snapshot of agent physics + food state.

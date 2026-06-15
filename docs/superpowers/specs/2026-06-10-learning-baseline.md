@@ -512,16 +512,21 @@ was observed. Repro (release binary):
 
 ```
 cargo build --release -p xagent-sandbox
-./target/release/xagent --bench --bench-ticks 1000000 --bench-agents 10            # arm (a)
-XAGENT_PROBE_GPU_WAIT=1     ./target/release/xagent --bench --bench-ticks 1000000   # arm (b)
-XAGENT_SKIP_GLOBAL_VISION=1 ./target/release/xagent --bench --bench-ticks 1000000   # arm (c)
+# One-command pass-isolation A/B (full / skip global / skip vision / skip both):
+./target/release/xagent --bench-phase-ab --bench-ticks 1000000 --bench-agents 10
+# Or arm-by-arm:
+./target/release/xagent --bench --bench-ticks 1000000 --bench-agents 10        # baseline
+XAGENT_PROBE_GPU_WAIT=1 ./target/release/xagent --bench --bench-ticks 1000000  # submit vs GPU-complete
+XAGENT_SKIP_GLOBAL=1    ./target/release/xagent --bench --bench-ticks 1000000  # global pass off
+XAGENT_SKIP_VISION=1    ./target/release/xagent --bench --bench-ticks 1000000  # vision pass off
 # or, for the true 1000× interactive cadence, run the GUI at 1000× with RUST_LOG=debug
-# and read the [SIM-PROBE] line.
+# and read the [SIM-PROBE] line (confirm submits ≪ kernel_batches = fusion engaged).
 ```
 
-On target hardware: if arm (c) tps jumps materially over arm (a), the
-single-workgroup `global` pass dominates and workstream 0004 opens; if arm (b)
-shows submit-return ≪ gpu-complete, Metal back-pressure dominates; if both are
-sub-millisecond yet tps stays ≈200 batches/sec, CPU recording dominates. Until
-that on-target table exists, 0004 stays closed — see
+On target hardware: if the **`skip global`** arm tps jumps materially over
+baseline (and `skip vision` does not), the single-workgroup `global` pass
+dominates and workstream 0004 opens; if `XAGENT_PROBE_GPU_WAIT=1` shows
+submit-return ≪ gpu-complete with neither skip arm moving, Metal back-pressure
+dominates; if both are sub-millisecond yet tps stays ≈200 batches/sec, CPU
+recording dominates. Until that on-target table exists, 0004 stays closed — see
 `docs/plans/0003-Simulation-Throughput-Ceiling/0004-GLOBAL-PASS-DECISION.md`.

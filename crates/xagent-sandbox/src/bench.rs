@@ -142,6 +142,66 @@ pub fn run_profile(
     println!("  total tps (full):  {:.0}", total_ticks as f64 / full);
 }
 
+/// A/B the fused dispatch path's GPU passes to locate the throughput ceiling.
+///
+/// Runs the same `total_ticks` through `dispatch_ticks` four times — full,
+/// `global` skipped, `vision` skipped, both skipped — each on a fresh kernel,
+/// and prints achieved tps plus the submit/batch fusion ratio per arm. A large
+/// tps jump when only `global` is skipped fingers the single-workgroup `global`
+/// pass as the residual ceiling (workstream 0004); a jump only when `vision` is
+/// skipped points at vision instead; little movement in either means the
+/// limiter is elsewhere (CPU submit / queue back-pressure). Skipping passes
+/// corrupts results — this is a timing harness only.
+pub fn run_phase_ab(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+) {
+    println!(
+        "[phase-ab] {} agents, {} ticks — fused-dispatch pass isolation",
+        agent_count, total_ticks
+    );
+
+    let arms: [(&str, bool, bool); 4] = [
+        ("full (baseline)", false, false),
+        ("skip global", true, false),
+        ("skip vision", false, true),
+        ("skip global+vision", true, true),
+    ];
+
+    let mut baseline_tps = 0.0_f64;
+    for (i, (label, skip_global, skip_vision)) in arms.iter().enumerate() {
+        let (mut kernel, _world) = create_kernel(&brain, &world_config, agent_count);
+        kernel.set_probe_pass_skips(*skip_global, *skip_vision);
+
+        let start = Instant::now();
+        kernel.dispatch_batch(0, total_ticks as u32);
+        // Blocking readback forces all GPU work to complete, so the wall time
+        // captures pass execution, not just submit-return.
+        let _ = kernel.read_full_state_blocking();
+        let secs = start.elapsed().as_secs_f64();
+        let tps = total_ticks as f64 / secs;
+        let batches = kernel.probe_kernel_batches();
+        let submits = kernel.probe_submit_count();
+
+        if i == 0 {
+            baseline_tps = tps;
+        }
+        let delta = if i == 0 || baseline_tps == 0.0 {
+            "—".to_string()
+        } else {
+            format!("{:+.0}% vs baseline", (tps / baseline_tps - 1.0) * 100.0)
+        };
+        println!(
+            "  {label:<20} {tps:>10.0} tps  ({batches:>5} batches / {submits:>4} submits)  {delta}"
+        );
+    }
+
+    println!("[phase-ab] read: a large +% on 'skip global' ALONE => the single-workgroup");
+    println!("           global pass is the residual ceiling (opens workstream 0004).");
+}
+
 /// Simulate the real tick loop with accumulator and per-frame dispatch —
 /// no rendering. Prints DIAG lines every second and returns the result.
 pub fn run_tick_loop_bench(

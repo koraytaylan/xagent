@@ -76,15 +76,25 @@ probe is wired correctly, not to decide this gate.
 
 ## When to revisit
 
-Reopen `parallelize-global-pass-spike` when **both** hold on the target hardware
-(macOS/Metal or a discrete GPU), measured per the repro in the baseline spec:
+Reopen `parallelize-global-pass-spike` when, on the target hardware
+(macOS/Metal or a discrete GPU), the **`global`-only** arm fingers the pass.
+The isolation knobs and the one-command harness now make this directly
+measurable (no longer "skips both at once"):
 
-- Arm (c) `XAGENT_SKIP_GLOBAL_VISION=1` tps jumps **materially** over arm (a)
-  default at 1000× (the `global`+`vision` passes are the residual floor), **and**
-- A vision-only control (skip vision but keep global, or vice-versa) attributes
-  the bulk of that jump to the **`global`** pass specifically rather than vision.
+```
+./target/release/xagent --bench-phase-ab --bench-ticks 1000000 --bench-agents 10
+```
 
-If, instead, arm (b) `XAGENT_PROBE_GPU_WAIT=1` shows submit-return ≪ gpu-complete
-with the global pass *not* dominating, the residual is Metal back-pressure / GPU
+prints four arms — `full` / `skip global` / `skip vision` / `skip global+vision`
+— each on a fresh kernel. (Equivalent env knobs for a manual run:
+`XAGENT_SKIP_GLOBAL=1`, `XAGENT_SKIP_VISION=1`, or the back-compat
+`XAGENT_SKIP_GLOBAL_VISION=1`.) Reopen when:
+
+- The **`skip global`** arm tps jumps **materially** over `full` — the
+  single-workgroup `global` pass is the residual floor — **and** the `skip
+  vision` arm does *not* (so the jump is the `global` pass, not vision).
+
+If, instead, `XAGENT_PROBE_GPU_WAIT=1` shows submit-return ≪ gpu-complete with
+neither skip arm moving tps much, the residual is Metal back-pressure / GPU
 execution elsewhere and this workstream stays closed. Construction sketch for the
 reopen: `ARCHITECTURE.md` §0004.

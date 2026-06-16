@@ -419,7 +419,7 @@ pub fn mutate_config_with_strength(
         integrity_scale: parent.integrity_scale,
         movement_speed: momentum
             .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
-            .clamp(20.0, 100.0),
+            .clamp(1.0, 100.0),
     }
 }
 
@@ -765,8 +765,8 @@ mod tests {
                 child.movement_speed,
             );
             assert!(
-                child.movement_speed >= 20.0,
-                "movement_speed must be >= 20.0, got {}",
+                child.movement_speed >= 1.0,
+                "movement_speed must be >= 1.0, got {}",
                 child.movement_speed,
             );
 
@@ -777,8 +777,8 @@ mod tests {
                 child.movement_speed,
             );
             assert!(
-                child.movement_speed >= 20.0,
-                "movement_speed must be >= 20.0, got {}",
+                child.movement_speed >= 1.0,
+                "movement_speed must be >= 1.0, got {}",
                 child.movement_speed,
             );
         }

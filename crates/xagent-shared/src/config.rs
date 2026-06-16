@@ -103,7 +103,7 @@ pub struct BrainConfig {
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
     /// Base movement speed (units per second). Default 20.0.
-    /// Heritable: mutated during breeding, clamped to [20.0, 100.0].
+    /// Heritable: mutated during breeding, clamped to [1.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
 }

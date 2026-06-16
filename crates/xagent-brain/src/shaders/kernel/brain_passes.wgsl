@@ -17,6 +17,12 @@
 
 const BRAIN_WORKGROUP_SIZE: u32 = 256u;
 
+// ── Dense tiling (plan 0006): same-dispatch cooperative parallelism ────────
+// 64 output rows × 4 inner lanes = 256 invocations, using the whole workgroup
+// while keeping one workgroup per agent.
+const DENSE_OUTPUT_TILE: u32 = 64u;
+const DENSE_INNER_LANES: u32 = 4u;
+
 // ── Shared memory (~2.5 KB at default 8×6; scales with FEATURE_COUNT) ──────
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
@@ -34,11 +40,54 @@ var<workgroup> s_td_error: f32;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 2>;
+// Reused cooperative dense-dot scratch, indexed by local invocation id; each
+// group of DENSE_INNER_LANES entries reduces one output row.
+var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
+
+// ── Scalars for parallel action-tail reductions (plan 0006 parallelization) ──
+// Each reduction writes its final scalar here so thread 0 can read without
+// barrier deadlock. All 256 threads participate in the reductions.
+var<workgroup> s_err_sum: f32;
+var<workgroup> s_value: f32;
+var<workgroup> s_fwd_norm_sq: f32;
+var<workgroup> s_trn_norm_sq: f32;
+var<workgroup> s_val_norm_sq: f32;
+var<workgroup> s_forward_dot: f32;
+var<workgroup> s_turn_dot: f32;
+var<workgroup> s_atten_sum: f32;
+var<workgroup> s_fwd_scale: f32;
+var<workgroup> s_trn_scale: f32;
+var<workgroup> s_val_scale: f32;
+
+// ── Encoded-vector norm shared by memory reinforcement and store (plan 0006) ──
+var<workgroup> s_enc_norm: f32;
+
+// ── Memory reinforcement tiling (plan 0006): 256 threads × 2 lanes per pattern ──
+var<workgroup> s_reinf_dot: array<f32, 256>;
+
+// ── Argmin tracking for parallel min reduction (plan 0006) ────────────────────
+var<workgroup> s_argmin_val: array<f32, MEMORY_CAP>;
+var<workgroup> s_argmin_idx: array<u32, MEMORY_CAP>;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn rand_f32_brain(seed: u32) -> f32 {
     return hash_to_float(pcg_hash(seed));
+}
+
+// Fixed-order tree reduction of s_dense_partials[0..ENCODED_DIMENSION) into [0].
+// Must be called by ALL workgroup invocations (barrier uniformity).
+// This is the parallel action-tail reduction helper (plan 0006).
+fn wg_reduce_dense(tid: u32) {
+    var stride: u32 = ENCODED_DIMENSION / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            s_dense_partials[tid] = s_dense_partials[tid] + s_dense_partials[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
 }
 
 // Cosine similarity using shared encoded state (pre-habituation)
@@ -123,17 +172,37 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 2: Encode (threads 0..31 — FEATURE_COUNT MADs each, coalesced access)
+// Pass 2: Encode (plan 0006 dense tiling: all 256 lanes, 64 output rows × 4 lanes)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_encode(agent_id: u32, tid: u32) {
-    if (tid < ENCODED_DIMENSION) {
-        let brain_base = agent_id * BRAIN_STRIDE;
-        var sum: f32 = brain_state[brain_base + O_ENC_BIASES + tid];
-        for (var f: u32 = 0u; f < FEATURE_COUNT; f = f + 1u) {
-            sum += s_features[f] * brain_state[brain_base + O_ENC_WEIGHTS + f * ENCODED_DIMENSION + tid];
+    let brain_base = agent_id * BRAIN_STRIDE;
+    let output_in_tile = tid / DENSE_INNER_LANES;   // 0..63
+    let lane = tid % DENSE_INNER_LANES;              // 0..3
+
+    for (var tile = 0u; tile < ENCODED_DIMENSION; tile += DENSE_OUTPUT_TILE) {
+        let dim = tile + output_in_tile;             // the output row this invocation serves
+
+        // Bias seeding: lane 0 starts with bias, others with 0
+        var partial: f32 = 0.0;
+        if (lane == 0u) {
+            partial = brain_state[brain_base + O_ENC_BIASES + dim];
         }
-        s_encoded[tid] = fast_tanh(sum);
+
+        // Each lane accumulates features with stride DENSE_INNER_LANES
+        for (var f = lane; f < FEATURE_COUNT; f += DENSE_INNER_LANES) {
+            partial += s_features[f] * brain_state[brain_base + O_ENC_WEIGHTS + f * ENCODED_DIMENSION + dim];
+        }
+        s_dense_partials[tid] = partial;
+        workgroupBarrier();
+
+        // Lane 0 reduces the 4 partials in ascending order and writes the result
+        if (lane == 0u) {
+            let base = tid; // When lane==0, tid = output_in_tile*4, which is the base
+            let reduced = s_dense_partials[base] + s_dense_partials[base + 1u] + s_dense_partials[base + 2u] + s_dense_partials[base + 3u];
+            s_encoded[dim] = fast_tanh(reduced);
+        }
+        workgroupBarrier();   // REQUIRED before the next tile overwrites s_dense_partials
     }
 }
 
@@ -316,37 +385,64 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 // rest (incl. novelty, TD credit, motor): thread 0
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn coop_predict_and_act(agent_id: u32, tid: u32) {
+fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let pattern_base = agent_id * PATTERN_STRIDE;
     let decision_base = agent_id * DECISION_STRIDE;
     let tick_count = brain_state[brain_base + O_TICK_COUNT];
     let recall_count = u32(s_recall[RECALL_K]);
 
-    // ── Predictor: train then predict — threads 0..PREDICTOR_DIMENSION ──
-    // Train the forward model on the transition that just completed: the
-    // prediction made last brain tick (O_PREV_PREDICTION, not yet
-    // overwritten) against the state that actually arrived (s_encoded),
-    // with the gradient flowing through last tick's input (O_PREV_ENCODED,
-    // overwritten only at the end of pass 7). Training before predicting
-    // keeps each row's reads and writes within one thread — no barrier.
-    if (tid < PREDICTOR_DIMENSION) {
-        let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + tid];
-        let transition_error = previous_prediction - s_encoded[tid];
-        let tanh_derivative = 1.0 - previous_prediction * previous_prediction;
+    // ── Predictor: train then predict — plan 0006 dense tiling ──
+    // ParallelTiled (use_scratch_prediction = true): phase_brain_predictor_tiled
+    // already trained O_PREDICTOR_WEIGHTS and wrote the row predictions into
+    // SCRATCH_PREDICTION across more workgroups, so the tail just loads them.
+    // Fused/SplitSerial (false): train+predict inline. `use_scratch_prediction`
+    // is a uniform argument, so the branch and its barriers are uniform.
+    if (use_scratch_prediction) {
+        let agent_scratch = agent_id * BRAIN_SCRATCH_STRIDE;
+        for (var i = tid; i < PREDICTOR_DIMENSION; i += BRAIN_WORKGROUP_SIZE) {
+            s_prediction[i] = brain_scratch[agent_scratch + SCRATCH_PREDICTION + i];
+        }
+        workgroupBarrier();
+    } else {
+        // All 256 threads participate: 64 rows × 4 lanes.
+        // Each lane updates disjoint weights, then we reduce predictions.
+        let output_in_tile = tid / DENSE_INNER_LANES;   // 0..63
+        let lane = tid % DENSE_INNER_LANES;              // 0..3
         let predictor_learning_rate = bc_f32(CFG_LEARNING_RATE);
-        for (var j: u32 = 0u; j < ENCODED_DIMENSION; j = j + 1u) {
-            let previous_input = brain_state[brain_base + O_PREV_ENCODED + j];
-            let grad = clamp(transition_error * tanh_derivative * previous_input, -1.0, 1.0);
-            var w = brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] - predictor_learning_rate * grad;
-            w = clamp(w, -3.0, 3.0);
-            brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j] = w;
+
+        for (var tile = 0u; tile < PREDICTOR_DIMENSION; tile += DENSE_OUTPUT_TILE) {
+            let dim = tile + output_in_tile;
+
+            // TRAIN sub-step: each lane updates disjoint weight columns
+            let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + dim];
+            let transition_error = previous_prediction - s_encoded[dim];
+            let tanh_derivative = 1.0 - previous_prediction * previous_prediction;
+
+            for (var j = lane; j < ENCODED_DIMENSION; j += DENSE_INNER_LANES) {
+                let previous_input = brain_state[brain_base + O_PREV_ENCODED + j];
+                let grad = clamp(transition_error * tanh_derivative * previous_input, -1.0, 1.0);
+                var w = brain_state[brain_base + O_PREDICTOR_WEIGHTS + dim * ENCODED_DIMENSION + j] - predictor_learning_rate * grad;
+                w = clamp(w, -3.0, 3.0);
+                brain_state[brain_base + O_PREDICTOR_WEIGHTS + dim * ENCODED_DIMENSION + j] = w;
+            }
+            workgroupBarrier(); // Weight writes must be visible before predict step
+
+            // PREDICT sub-step: each lane accumulates, lane 0 reduces
+            var partial: f32 = 0.0;
+            for (var j = lane; j < ENCODED_DIMENSION; j += DENSE_INNER_LANES) {
+                partial += s_encoded[j] * brain_state[brain_base + O_PREDICTOR_WEIGHTS + dim * ENCODED_DIMENSION + j];
+            }
+            s_dense_partials[tid] = partial;
+            workgroupBarrier();
+
+            if (lane == 0u) {
+                let base = tid; // When lane==0, tid = output_in_tile*4
+                let reduced = s_dense_partials[base] + s_dense_partials[base + 1u] + s_dense_partials[base + 2u] + s_dense_partials[base + 3u];
+                s_prediction[dim] = reduced;
+            }
+            workgroupBarrier(); // Required before next tile
         }
-        var s: f32 = 0.0;
-        for (var j: u32 = 0u; j < ENCODED_DIMENSION; j = j + 1u) {
-            s += s_encoded[j] * brain_state[brain_base + O_PREDICTOR_WEIGHTS + tid * ENCODED_DIMENSION + j];
-        }
-        s_prediction[tid] = s;
     }
 
     // ── Precompute recalled cosine similarities: threads 0..(RECALL_K-1) ──
@@ -362,30 +458,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     }
     workgroupBarrier();
 
-    // ── Thread 0: rest of predict + act ────────────────────────────────
-    if (tid == 0u) {
-        let gradient = s_homeo[0u];
-        let urgency = s_homeo[2u];
-
-        // Prediction error (computed in predictor space)
-        var err_sum: f32 = 0.0;
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + d];
-            let e = previous_prediction - s_encoded[d];
-            err_sum += e * e;
-        }
-        let prediction_error = sqrt(err_sum / f32(PREDICTOR_DIMENSION));
-
-        // Error ring
-        let err_cursor = u32(brain_state[brain_base + O_PREDICTION_ERROR_CURSOR]);
-        brain_state[brain_base + O_PREDICTION_ERROR_RING + err_cursor] = prediction_error;
-        brain_state[brain_base + O_PREDICTION_ERROR_CURSOR] = f32((err_cursor + 1u) % ERROR_HISTORY_LEN);
-        let err_count = brain_state[brain_base + O_PREDICTION_ERROR_COUNT];
-        if (err_count < f32(ERROR_HISTORY_LEN)) {
-            brain_state[brain_base + O_PREDICTION_ERROR_COUNT] = err_count + 1.0;
-        }
-
-        // Recalled context blend (uses precomputed similarities from s_recall_similarity)
+    // ── Per-dimension context blend and tanh: threads 0..PREDICTOR_DIMENSION ──
+    if (tid < PREDICTOR_DIMENSION) {
+        // Context blend contribution (per-dimension)
         if (recall_count > 0u) {
             let context_weight = brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT];
             var total_sim: f32 = 0.0;
@@ -396,16 +471,49 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
                 for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
                     let idx = u32(s_recall[k]);
                     let w = context_weight * max(s_recall_similarity[k], 0.0) / total_sim;
-                    for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-                        s_prediction[d] += pattern_buffer[pattern_base + d * MEMORY_CAP + idx] * w;
-                    }
+                    s_prediction[tid] += pattern_buffer[pattern_base + tid * MEMORY_CAP + idx] * w;
                 }
             }
         }
 
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            s_prediction[d] = fast_tanh(s_prediction[d]);
+        // Apply tanh to prediction
+        s_prediction[tid] = fast_tanh(s_prediction[tid]);
+    }
+    workgroupBarrier();
+
+    // ── Prediction error reduction (all threads, parallel tree reduce) ────────────────────────
+    // All 256 threads cooperatively sum squared prediction errors into s_dense_partials,
+    // then reduce into s_err_sum, which thread 0 uses for the error ring.
+    {
+        if (tid < PREDICTOR_DIMENSION) {
+            let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + tid];
+            let e = previous_prediction - s_encoded[tid];
+            s_dense_partials[tid] = e * e;
+        } else {
+            s_dense_partials[tid] = 0.0;
         }
+        workgroupBarrier();
+        wg_reduce_dense(tid);
+        if (tid == 0u) { s_err_sum = s_dense_partials[0]; }
+        workgroupBarrier();
+    }
+
+    // ── Thread 0: prediction error and error ring ────────────────────────────────
+    if (tid == 0u) {
+        let gradient = s_homeo[0u];
+        let urgency = s_homeo[2u];
+
+        let prediction_error = sqrt(s_err_sum / f32(PREDICTOR_DIMENSION));
+
+        // Error ring
+        let err_cursor = u32(brain_state[brain_base + O_PREDICTION_ERROR_CURSOR]);
+        brain_state[brain_base + O_PREDICTION_ERROR_RING + err_cursor] = prediction_error;
+        brain_state[brain_base + O_PREDICTION_ERROR_CURSOR] = f32((err_cursor + 1u) % ERROR_HISTORY_LEN);
+        let err_count = brain_state[brain_base + O_PREDICTION_ERROR_COUNT];
+        if (err_count < f32(ERROR_HISTORY_LEN)) {
+            brain_state[brain_base + O_PREDICTION_ERROR_COUNT] = err_count + 1.0;
+        }
+
         // Pass prediction_error to the post-credit block via shared memory.
         // (Kept for pass 7 as the single forward-error value; no overwrite.)
         s_pred_error = prediction_error;
@@ -429,12 +537,23 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         }
         workgroupBarrier();
 
-        // Thread 0: reduce value, form δ, update the scalar biases.
-        if (tid == 0u) {
-            var value: f32 = brain_state[brain_base + O_VALUE_BIAS];
-            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                value += s_credit[d];
+        // Value dot reduction (all threads, parallel tree reduce) — MUST happen before
+        // s_credit is overwritten with encoder-credit at the end of this block.
+        {
+            if (tid < ENCODED_DIMENSION) {
+                s_dense_partials[tid] = s_credit[tid];
+            } else {
+                s_dense_partials[tid] = 0.0;
             }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_value = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Thread 0: form δ (using s_value) and update the scalar biases.
+        if (tid == 0u) {
+            var value: f32 = brain_state[brain_base + O_VALUE_BIAS] + s_value;
             // Reward is the immediate urgency-amplified homeostatic delta
             // accrued since the previous brain tick.
             let reward = s_homeo[1u];
@@ -477,67 +596,153 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
     }
     storageBarrier(); workgroupBarrier();
 
-    // ── Thread 0: weight normalization, policy, exploration, motor ─────
+    // ── Weight normalization: L2 norm reductions (all threads, parallel tree reduce) ────────
+    // Reduce fwd_norm_sq and trn_norm_sq in parallel to compute rescale factors.
+    {
+        // Forward norm squared reduction
+        {
+            if (tid < ENCODED_DIMENSION) {
+                let fw = brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid];
+                s_dense_partials[tid] = fw * fw;
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_fwd_norm_sq = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Turn norm squared reduction
+        {
+            if (tid < ENCODED_DIMENSION) {
+                let tw = brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid];
+                s_dense_partials[tid] = tw * tw;
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_trn_norm_sq = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Value norm squared reduction
+        {
+            if (tid < ENCODED_DIMENSION) {
+                let vw = brain_state[brain_base + O_VALUE_WEIGHTS + tid];
+                s_dense_partials[tid] = vw * vw;
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_val_norm_sq = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Thread 0: compute rescale factors and publish them
+        if (tid == 0u) {
+            // Weight normalization. No per-tick decay: TD updates are
+            // surprise-driven (they stop when δ calibrates to zero), so decay
+            // would only erase accumulated policy knowledge — including the
+            // initial forward bias that provides exploration mobility. The
+            // L2 balls below are the sole magnitude bound.
+            brain_state[brain_base + O_ACT_BIASES] = clamp(brain_state[brain_base + O_ACT_BIASES], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+            brain_state[brain_base + O_ACT_BIASES + 1u] = clamp(brain_state[brain_base + O_ACT_BIASES + 1u], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+
+            var fwd_scale: f32 = 1.0;
+            let fwd_norm = sqrt(s_fwd_norm_sq);
+            if (fwd_norm > MAX_WEIGHT_NORM) {
+                fwd_scale = MAX_WEIGHT_NORM / fwd_norm;
+            }
+            s_fwd_scale = fwd_scale;
+
+            var trn_scale: f32 = 1.0;
+            let trn_norm = sqrt(s_trn_norm_sq);
+            if (trn_norm > MAX_WEIGHT_NORM) {
+                trn_scale = MAX_WEIGHT_NORM / trn_norm;
+            }
+            s_trn_scale = trn_scale;
+
+            // Value head: L2-ball clamp only — no per-tick decay. Decay would
+            // continuously erase the learned value landscape, and the critic
+            // must hold "states like this end well/badly" across episodes.
+            var val_scale: f32 = 1.0;
+            let val_norm = sqrt(s_val_norm_sq);
+            if (val_norm > MAX_WEIGHT_NORM) {
+                val_scale = MAX_WEIGHT_NORM / val_norm;
+            }
+            s_val_scale = val_scale;
+
+            brain_state[brain_base + O_VALUE_BIAS] = clamp(
+                brain_state[brain_base + O_VALUE_BIAS], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+        }
+        workgroupBarrier();
+    }
+
+    // ── Weight rescaling: all threads apply the rescale factors in parallel ────────────────
+    if (tid < ENCODED_DIMENSION) {
+        brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] *= s_fwd_scale;
+        brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] *= s_trn_scale;
+        brain_state[brain_base + O_VALUE_WEIGHTS + tid] *= s_val_scale;
+    }
+    workgroupBarrier();
+
+    // ── Policy dot product reductions (all threads, parallel tree reduce) ────────────────────
+    // Reduce forward and turn policy dot products separately.
+    {
+        // Forward policy dot reduction
+        {
+            if (tid < ENCODED_DIMENSION) {
+                s_dense_partials[tid] = brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] * s_encoded[tid];
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_forward_dot = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Turn policy dot reduction
+        {
+            if (tid < ENCODED_DIMENSION) {
+                s_dense_partials[tid] = brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] * s_encoded[tid];
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) { s_turn_dot = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+    }
+
+
+    // ── Attenuation sum reduction (all threads, parallel tree reduce) ───────────────────────
+    // Must be done before thread 0 uses it in the exploration block.
+    {
+        if (tid < ENCODED_DIMENSION) {
+            s_dense_partials[tid] = brain_state[brain_base + O_HAB_ATTEN + tid];
+        } else {
+            s_dense_partials[tid] = 0.0;
+        }
+        workgroupBarrier();
+        wg_reduce_dense(tid);
+        if (tid == 0u) { s_atten_sum = s_dense_partials[0]; }
+        workgroupBarrier();
+    }
+
+    // ── Thread 0: exploration, noise, motor, telemetry ─────────────────────────────────────
     if (tid == 0u) {
         let gradient = s_homeo[0u];
         let urgency = s_homeo[2u];
         let prediction_error = s_pred_error;
 
-        // Weight normalization. No per-tick decay: TD updates are
-        // surprise-driven (they stop when δ calibrates to zero), so decay
-        // would only erase accumulated policy knowledge — including the
-        // initial forward bias that provides exploration mobility. The
-        // L2 balls below are the sole magnitude bound.
-        brain_state[brain_base + O_ACT_BIASES] = clamp(brain_state[brain_base + O_ACT_BIASES], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
-        brain_state[brain_base + O_ACT_BIASES + 1u] = clamp(brain_state[brain_base + O_ACT_BIASES + 1u], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
-        var fwd_norm_sq: f32 = 0.0;
-        var trn_norm_sq: f32 = 0.0;
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            let fw = brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + d];
-            let tw = brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d];
-            fwd_norm_sq += fw * fw;
-            trn_norm_sq += tw * tw;
-        }
-        let fwd_norm = sqrt(fwd_norm_sq);
-        if (fwd_norm > MAX_WEIGHT_NORM) {
-            let scale = MAX_WEIGHT_NORM / fwd_norm;
-            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + d] *= scale;
-            }
-        }
-        let trn_norm = sqrt(trn_norm_sq);
-        if (trn_norm > MAX_WEIGHT_NORM) {
-            let scale = MAX_WEIGHT_NORM / trn_norm;
-            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d] *= scale;
-            }
-        }
-
-        // Value head: L2-ball clamp only — no per-tick decay. Decay would
-        // continuously erase the learned value landscape, and the critic
-        // must hold "states like this end well/badly" across episodes.
-        var val_norm_sq: f32 = 0.0;
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            let vw = brain_state[brain_base + O_VALUE_WEIGHTS + d];
-            val_norm_sq += vw * vw;
-        }
-        let val_norm = sqrt(val_norm_sq);
-        if (val_norm > MAX_WEIGHT_NORM) {
-            let scale = MAX_WEIGHT_NORM / val_norm;
-            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                brain_state[brain_base + O_VALUE_WEIGHTS + d] *= scale;
-            }
-        }
-        brain_state[brain_base + O_VALUE_BIAS] = clamp(
-            brain_state[brain_base + O_VALUE_BIAS], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
-
-        // Policy evaluation
-        var forward: f32 = brain_state[brain_base + O_ACT_BIASES];
-        var turn: f32 = brain_state[brain_base + O_ACT_BIASES + 1u];
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            forward += brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + d] * s_encoded[d];
-            turn += brain_state[brain_base + O_ACTION_TURN_WEIGHTS + d] * s_encoded[d];
-        }
+        // Policy evaluation with bias and dot products
+        var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
+        var turn: f32 = brain_state[brain_base + O_ACT_BIASES + 1u] + s_turn_dot;
 
         // Memory blend: recalled experiences influence motor output via valence.
         // Positive valence (food memory) + similar state → reproduce approach action.
@@ -568,11 +773,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
 
         // Exploration
         let max_curiosity = brain_state[brain_base + O_HAB_MAX_CURIOSITY];
-        var atten_sum: f32 = 0.0;
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            atten_sum += brain_state[brain_base + O_HAB_ATTEN + d];
-        }
-        let mean_atten = atten_sum / f32(ENCODED_DIMENSION);
+        let mean_atten = s_atten_sum / f32(ENCODED_DIMENSION);
         let curiosity = (1.0 - mean_atten) * max_curiosity;
         let novelty_bonus = min(prediction_error * 2.0, 0.4);
         let urgency_penalty = min(urgency * 0.4, 0.5);
@@ -680,18 +881,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         s_explore[0u] = noise_forward * exploration_rate;
         s_explore[1u] = noise_turn * exploration_rate;
 
-        // Save prediction + tick + decision buffer
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            brain_state[brain_base + O_PREV_PREDICTION + d] = s_prediction[d];
-        }
+        // Save tick + decision buffer motor
         brain_state[brain_base + O_TICK_COUNT] = tick_count + 1.0;
-
-        for (var d: u32 = 0u; d < PREDICTOR_DIMENSION; d = d + 1u) {
-            decision_buffer[decision_base + DECISION_PREDICTION + d] = s_prediction[d];
-        }
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            decision_buffer[decision_base + DECISION_CREDIT + d] = s_credit[d];
-        }
         decision_buffer[decision_base + DECISION_MOTOR] = forward;
         decision_buffer[decision_base + DECISION_MOTOR + 1u] = turn;
         // Slot 2 is consumed by the physics phase as strafe — keep it zero.
@@ -708,6 +899,18 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
         physics_state[phys_base + P_MOTOR_TURN_OUT] = turn;
         physics_state[phys_base + P_GRADIENT_OUT] = gradient;
         physics_state[phys_base + P_URGENCY_OUT] = urgency;
+    }
+    workgroupBarrier();
+
+    // ── Per-dimension vector copies: threads 0..PREDICTOR_DIMENSION ──
+    if (tid < PREDICTOR_DIMENSION) {
+        brain_state[brain_base + O_PREV_PREDICTION + tid] = s_prediction[tid];
+        decision_buffer[decision_base + DECISION_PREDICTION + tid] = s_prediction[tid];
+    }
+
+    // ── Per-dimension credit copy: threads 0..ENCODED_DIMENSION ──
+    if (tid < ENCODED_DIMENSION) {
+        decision_buffer[decision_base + DECISION_CREDIT + tid] = s_credit[tid];
     }
     workgroupBarrier();
 
@@ -745,7 +948,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32) {
 // threads 0..MEMORY_CAP. (Predictor training moved to pass 6.)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn coop_learn_and_store(agent_id: u32, tid: u32) {
+fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let pattern_base = agent_id * PATTERN_STRIDE;
     let decision_base = agent_id * DECISION_STRIDE;
@@ -764,43 +967,82 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
             brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
 
-    // ── 7b. Encoder credit: one encoded dimension per thread ────────────
+    // ── 7b. Encoder credit: plan 0006 dense tiling ──────────────────────
     // Task-driven nudge: features that co-occurred with TD-error eligibility
     // get their weights into this dimension strengthened.
-    if (tid < ENCODED_DIMENSION) {
-        let action_credit = decision_buffer[decision_base + DECISION_CREDIT + tid];
-        if (abs(action_credit) >= CREDIT_EPSILON) {
-            let scale = learning_rate * action_credit * ENCODER_CREDIT_SCALE;
-            for (var j: u32 = 0u; j < FEATURE_COUNT; j = j + 1u) {
-                var w = brain_state[brain_base + O_ENC_WEIGHTS + j * ENCODED_DIMENSION + tid] + scale * s_features[j];
-                w = clamp(w, -2.0, 2.0);
-                brain_state[brain_base + O_ENC_WEIGHTS + j * ENCODED_DIMENSION + tid] = w;
+    // Use the dense tiling: 64 output rows (encoded dims) × 4 inner lanes.
+    // Each lane updates disjoint features (columns) for its dimension.
+    // Skipped in ParallelTiled mode (run_encoder_credit=false): the tiled
+    // phase_brain_encoder_credit_tiled dispatch performs this update instead,
+    // reading SCRATCH_FEATURES rather than the workgroup s_features. No barrier
+    // lives in this block, so gating it on the uniform `run_encoder_credit` flag
+    // is barrier-uniformity-safe.
+    if (run_encoder_credit) {
+        let output_in_tile_enc = tid / DENSE_INNER_LANES;
+        let lane_enc = tid % DENSE_INNER_LANES;
+
+        for (var tile = 0u; tile < ENCODED_DIMENSION; tile += DENSE_OUTPUT_TILE) {
+            let dim = tile + output_in_tile_enc;
+
+            let action_credit = decision_buffer[decision_base + DECISION_CREDIT + dim];
+            if (abs(action_credit) >= CREDIT_EPSILON) {
+                let scale = learning_rate * action_credit * ENCODER_CREDIT_SCALE;
+                for (var j = lane_enc; j < FEATURE_COUNT; j += DENSE_INNER_LANES) {
+                    var w = brain_state[brain_base + O_ENC_WEIGHTS + j * ENCODED_DIMENSION + dim] + scale * s_features[j];
+                    w = clamp(w, -2.0, 2.0);
+                    brain_state[brain_base + O_ENC_WEIGHTS + j * ENCODED_DIMENSION + dim] = w;
+                }
             }
         }
     }
 
-    // ── 7c. Memory reinforcement: threads 0..127 ──────────────────────
+    // ── Compute encoded-vector norm ONCE (plan 0006 memory reinforcement tiling) ──
+    // All threads cooperate on the tree reduction; result is shared by 7c and 7d.
+    {
+        if (tid < ENCODED_DIMENSION) {
+            let e = s_encoded[tid];
+            s_dense_partials[tid] = e * e;
+        }
+        workgroupBarrier();
+        wg_reduce_dense(tid);
+        if (tid == 0u) { s_enc_norm = sqrt(s_dense_partials[0]); }
+        workgroupBarrier();
+    }
+
+    // ── 7c. Memory reinforcement: tiled with all 256 threads (plan 0006) ───────
     // Uses encoded (pre-habituation) state for memory similarity.
+    // All 256 threads compute partial dot products: pattern = tid % MEMORY_CAP,
+    // lane = tid / MEMORY_CAP (0 or 1). Each lane reduces over its stride-2 half
+    // of ENCODED_DIMENSION. Lane 0 combines and applies reinforcement logic;
+    // lane 1 only contributes the partial.
+    let pattern = tid % MEMORY_CAP;
+    let lane = tid / MEMORY_CAP;
+
+    // All 256 threads compute their partial dot product over their stride-2 dimension range
+    {
+        var dot: f32 = 0.0;
+        for (var d = lane; d < ENCODED_DIMENSION; d += 2u) {
+            dot += s_encoded[d] * pattern_buffer[pattern_base + d * MEMORY_CAP + pattern];
+        }
+        s_reinf_dot[tid] = dot;
+    }
+    workgroupBarrier();
+
+    // Lane 0 (tid < MEMORY_CAP): combine the two partials and apply reinforcement logic
     if (tid < MEMORY_CAP) {
-        if (pattern_buffer[pattern_base + O_PAT_ACTIVE + tid] >= 0.5) {
-            var e_norm_sq: f32 = 0.0;
-            var dot_val: f32 = 0.0;
-            for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                let e = s_encoded[d];
-                e_norm_sq += e * e;
-                dot_val += e * pattern_buffer[pattern_base + d * MEMORY_CAP + tid];
-            }
-            let e_norm = sqrt(e_norm_sq);
-            let p_norm = pattern_buffer[pattern_base + O_PAT_NORMS + tid];
-            if (e_norm >= 1e-8 && p_norm >= 1e-8) {
-                let sim = clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
-                if (sim > 0.3) {
-                    pattern_buffer[pattern_base + O_PAT_REINF + tid] += sim * learning_rate * (1.0 - s_pred_error);
-                    pattern_buffer[pattern_base + O_PAT_REINF + tid] = clamp(
-                        pattern_buffer[pattern_base + O_PAT_REINF + tid], 0.0, 20.0);
+        let dot_val = s_reinf_dot[tid] + s_reinf_dot[tid + MEMORY_CAP];
+        let e_norm = s_enc_norm;
+        let p_norm = pattern_buffer[pattern_base + O_PAT_NORMS + pattern];
+        if (e_norm >= 1e-8 && p_norm >= 1e-8) {
+            let sim = clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
+            if (sim > 0.3) {
+                if (pattern_buffer[pattern_base + O_PAT_ACTIVE + pattern] >= 0.5) {
+                    pattern_buffer[pattern_base + O_PAT_REINF + pattern] += sim * learning_rate * (1.0 - s_pred_error);
+                    pattern_buffer[pattern_base + O_PAT_REINF + pattern] = clamp(
+                        pattern_buffer[pattern_base + O_PAT_REINF + pattern], 0.0, 20.0);
                     let valence_lr = learning_rate * 0.3;
-                    let old_valence = pattern_buffer[pattern_base + O_PAT_MOTOR + tid * 3u + 2u];
-                    pattern_buffer[pattern_base + O_PAT_MOTOR + tid * 3u + 2u] +=
+                    let old_valence = pattern_buffer[pattern_base + O_PAT_MOTOR + pattern * 3u + 2u];
+                    pattern_buffer[pattern_base + O_PAT_MOTOR + pattern * 3u + 2u] +=
                         sim * valence_lr * (raw_gradient - old_valence);
                 }
             }
@@ -808,22 +1050,21 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     }
     storageBarrier(); workgroupBarrier();
 
-    // ── 7d. Memory store: thread 0 ─────────────────────────────────────
-    // Stores encoded (pre-habituation) state for consistent memory keys.
-    if (tid == 0u) {
-        let min_idx = u32(pattern_buffer[pattern_base + O_MIN_REINF_IDX]);
+    // ── 7d. Memory store: parallelized per-dimension writes + thread-0 scalars ──
+    // min_idx is read by all threads (same value everywhere); per-dimension writes
+    // use tid < ENCODED_DIMENSION; scalar writes stay on thread 0.
+    let min_idx = u32(pattern_buffer[pattern_base + O_MIN_REINF_IDX]);
 
-        // Store the actual motor command from the decision buffer.
-        // Negative-valence recall negates this → directed escape.
+    // Per-dimension encoded state write (threads 0..127)
+    if (tid < ENCODED_DIMENSION) {
+        pattern_buffer[pattern_base + tid * MEMORY_CAP + min_idx] = s_encoded[tid];
+    }
+
+    // Scalar writes (thread 0 only)
+    if (tid == 0u) {
         let motor_forward = decision_buffer[decision_base + DECISION_MOTOR];
         let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
-        var e_norm_sq: f32 = 0.0;
-        for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            let e = s_encoded[d];
-            e_norm_sq += e * e;
-            pattern_buffer[pattern_base + d * MEMORY_CAP + min_idx] = e;
-        }
-        pattern_buffer[pattern_base + O_PAT_NORMS + min_idx] = sqrt(e_norm_sq);
+        pattern_buffer[pattern_base + O_PAT_NORMS + min_idx] = s_enc_norm;
         pattern_buffer[pattern_base + O_PAT_REINF + min_idx] = 1.0;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u] = motor_forward;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_turn;
@@ -858,23 +1099,49 @@ fn coop_learn_and_store(agent_id: u32, tid: u32) {
     }
     workgroupBarrier();
 
-    // ── 7f. Min tracking + active count: thread 0 ──────────────────────
-    if (tid == 0u) {
-        var min_reinf: f32 = 999.0;
-        var min_reinf_idx: u32 = 0u;
-        var active_count: u32 = 0u;
-        for (var j: u32 = 0u; j < MEMORY_CAP; j = j + 1u) {
-            if (s_similarities[j] < 999.0) {
-                active_count += 1u;
-                if (s_similarities[j] < min_reinf) {
-                    min_reinf = s_similarities[j];
-                    min_reinf_idx = j;
-                }
+    // ── 7f. Min tracking + active count: parallel reduction ──────────────────
+    // Active count: parallel tree reduction counting entries < 999.0
+    {
+        if (tid < MEMORY_CAP) {
+            s_dense_partials[tid] = select(0.0, 1.0, s_similarities[tid] < 999.0);
+        }
+        workgroupBarrier();
+        wg_reduce_dense(tid);
+        if (tid == 0u) { pattern_buffer[pattern_base + O_ACTIVE_COUNT] = s_dense_partials[0]; }
+        workgroupBarrier();
+    }
+
+    // Argmin with first-minimum tie-break (all threads cooperate on binary-tree reduction)
+    // Load values and indices; argmin reduction yields (value, index) tuple that matches
+    // the serial scan (lower value wins; on tie, lower index wins).
+    if (tid < MEMORY_CAP) {
+        s_argmin_val[tid] = s_similarities[tid];
+        s_argmin_idx[tid] = tid;
+    }
+    workgroupBarrier();
+
+    // Binary-tree reduction (fixed-order loop, all threads participate uniformly)
+    var stride: u32 = MEMORY_CAP / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            let other = tid + stride;
+            let vo = s_argmin_val[other];
+            let vt = s_argmin_val[tid];
+            let io = s_argmin_idx[other];
+            let it = s_argmin_idx[tid];
+            // Lexicographic (value, index): lower value wins; on tie, lower index wins
+            // — exactly matching the serial first-minimum scan.
+            if (vo < vt || (vo == vt && io < it)) {
+                s_argmin_val[tid] = vo;
+                s_argmin_idx[tid] = io;
             }
         }
-        pattern_buffer[pattern_base + O_MIN_REINF_IDX] = f32(min_reinf_idx);
-        pattern_buffer[pattern_base + O_ACTIVE_COUNT] = f32(active_count);
+        workgroupBarrier();
+        stride = stride / 2u;
     }
+    if (tid == 0u) { pattern_buffer[pattern_base + O_MIN_REINF_IDX] = f32(s_argmin_idx[0]); }
+    workgroupBarrier();
 
     // ── 7g. Publish this tick's encoded state for the next tick's
     // habituation delta and predictor training input ─────────────────────

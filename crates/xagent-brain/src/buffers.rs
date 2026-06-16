@@ -184,6 +184,7 @@ pub struct BrainLayout {
     pub feature_count: usize,
     pub sensory_stride: usize,
     pub brain_stride: usize,
+    pub brain_scratch_stride: usize,
 }
 
 impl BrainLayout {
@@ -212,6 +213,16 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(PREDICTOR_DIMENSION * ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
             .expect("vision dimensions overflow brain stride");
+        let brain_scratch_stride = feature_count
+            .checked_add(ENCODED_DIMENSION) // encoded
+            .and_then(|v| v.checked_add(ENCODED_DIMENSION)) // habituated
+            .and_then(|v| v.checked_add(HOMEO_OUT_STRIDE)) // homeo (6)
+            .and_then(|v| v.checked_add(RECALL_IDX_STRIDE)) // recall (17)
+            .and_then(|v| v.checked_add(RECALL_K)) // recall similarity (16)
+            .and_then(|v| v.checked_add(PREDICTOR_DIMENSION)) // prediction
+            .and_then(|v| v.checked_add(ENCODED_DIMENSION)) // credit
+            .and_then(|v| v.checked_add(4)) // scalars
+            .expect("vision dimensions overflow brain scratch stride");
         Self {
             vision_width,
             vision_height,
@@ -220,6 +231,7 @@ impl BrainLayout {
             feature_count,
             sensory_stride,
             brain_stride,
+            brain_scratch_stride,
         }
     }
 }
@@ -293,6 +305,21 @@ pub const DECISION_PREDICTION: usize = 0;
 pub const DECISION_CREDIT: usize = ENCODED_DIMENSION;
 pub const DECISION_MOTOR: usize = ENCODED_DIMENSION + ENCODED_DIMENSION;
 pub const DECISION_STRIDE: usize = DECISION_MOTOR + 4;
+
+// ── Brain scratch buffer offsets (8×6 layout anchors) ──────────────────────────
+// Mirrors SCRATCH_* WGSL overrides for the default 8×6 layout; used for
+// testing offset consistency. Runtime layouts compute brain_scratch_stride
+// dynamically via BrainLayout::new.
+pub const SCRATCH_FEATURES: usize = 0;
+pub const SCRATCH_ENCODED: usize = SCRATCH_FEATURES + FEATURES_STRIDE;
+pub const SCRATCH_HABITUATED: usize = SCRATCH_ENCODED + ENCODED_DIMENSION;
+pub const SCRATCH_HOMEO: usize = SCRATCH_HABITUATED + ENCODED_DIMENSION;
+pub const SCRATCH_RECALL: usize = SCRATCH_HOMEO + HOMEO_OUT_STRIDE;
+pub const SCRATCH_RECALL_SIMILARITY: usize = SCRATCH_RECALL + RECALL_IDX_STRIDE;
+pub const SCRATCH_PREDICTION: usize = SCRATCH_RECALL_SIMILARITY + RECALL_K;
+pub const SCRATCH_CREDIT: usize = SCRATCH_PREDICTION + PREDICTOR_DIMENSION;
+pub const SCRATCH_SCALARS: usize = SCRATCH_CREDIT + ENCODED_DIMENSION;
+pub const BRAIN_SCRATCH_STRIDE: usize = SCRATCH_SCALARS + 4;
 
 // ── Config buffer layout ──────────────────────────────────────────────
 
@@ -628,6 +655,8 @@ mod tests {
         assert!(layout.sensory_stride >= layout.feature_count);
         // The static offset constants anchor to the default layout.
         assert_eq!(layout.brain_stride, BRAIN_STRIDE);
+        // Brain scratch stride at 8×6: 265 + 128 + 128 + 6 + 17 + 16 + 128 + 128 + 4 = 820
+        assert_eq!(layout.brain_scratch_stride, 820);
     }
 
     #[test]
@@ -637,6 +666,8 @@ mod tests {
         let layout = BrainLayout::new(17, 13);
         assert_eq!(layout.sensory_stride, 1132);
         assert_eq!(layout.feature_count, 1130);
+        // Brain scratch stride at 17×13: 1130 + 128 + 128 + 6 + 17 + 16 + 128 + 128 + 4 = 1685
+        assert_eq!(layout.brain_scratch_stride, 1685);
     }
 
     #[test]
@@ -651,6 +682,25 @@ mod tests {
     #[test]
     fn pattern_stride_is_consistent() {
         assert_eq!(PATTERN_STRIDE, O_LAST_STORED_IDX + 1);
+    }
+
+    #[test]
+    fn brain_scratch_stride_offset_chain() {
+        // Verify that BRAIN_SCRATCH_STRIDE equals the sum of all scratch offsets
+        // for the 8×6 default layout.
+        assert_eq!(SCRATCH_FEATURES, 0);
+        assert_eq!(SCRATCH_ENCODED, SCRATCH_FEATURES + FEATURES_STRIDE);
+        assert_eq!(SCRATCH_HABITUATED, SCRATCH_ENCODED + ENCODED_DIMENSION);
+        assert_eq!(SCRATCH_HOMEO, SCRATCH_HABITUATED + ENCODED_DIMENSION);
+        assert_eq!(SCRATCH_RECALL, SCRATCH_HOMEO + HOMEO_OUT_STRIDE);
+        assert_eq!(
+            SCRATCH_RECALL_SIMILARITY,
+            SCRATCH_RECALL + RECALL_IDX_STRIDE
+        );
+        assert_eq!(SCRATCH_PREDICTION, SCRATCH_RECALL_SIMILARITY + RECALL_K);
+        assert_eq!(SCRATCH_CREDIT, SCRATCH_PREDICTION + PREDICTOR_DIMENSION);
+        assert_eq!(SCRATCH_SCALARS, SCRATCH_CREDIT + ENCODED_DIMENSION);
+        assert_eq!(BRAIN_SCRATCH_STRIDE, SCRATCH_SCALARS + 4);
     }
 
     #[test]
@@ -1095,19 +1145,18 @@ mod tests {
     }
 
     #[test]
-    fn shader_has_15_bindings() {
+    fn shader_has_16_bindings() {
         let src = include_str!("shaders/kernel/common.wgsl");
         let binding_count = src
             .lines()
             .filter(|l| l.trim().starts_with("@group(0) @binding("))
             .count();
-        // Bindings 0-12, 14, 15. Binding 13 (the old action-history buffer)
-        // was removed when TD(λ) replaced the history ring; the numbering is
-        // intentionally non-contiguous so the remaining bindings keep their
-        // slots and the bind-group layout in gpu_kernel.rs stays aligned.
+        // Bindings 0-15: binding 13 is now brain_scratch; the numbering of
+        // the remaining bindings is stable so the bind-group layout in
+        // gpu_kernel.rs stays aligned.
         assert_eq!(
-            binding_count, 15,
-            "Expected 15 bindings (0-12, 14 uniforms/storage + 15 dispatch_args), found {binding_count}"
+            binding_count, 16,
+            "Expected 16 bindings (0-15: binding 13 is now brain_scratch), found {binding_count}"
         );
     }
 }

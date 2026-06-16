@@ -89,6 +89,21 @@ const DECISION_STRIDE: u32 = DECISION_MOTOR + 4u;
 const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 
+// ── Per-agent brain scratch (binding 13) offsets ────────────────────────────
+// Storage-backed intermediates so multi-workgroup brain phases (plan 0006) can
+// cooperate per agent across dispatch boundaries. Layout mirrors the fused
+// var<workgroup> arrays 1:1. override (transitively references FEATURES_STRIDE).
+override SCRATCH_FEATURES: u32 = 0u;
+override SCRATCH_ENCODED: u32 = SCRATCH_FEATURES + FEATURES_STRIDE;
+override SCRATCH_HABITUATED: u32 = SCRATCH_ENCODED + ENCODED_DIMENSION;
+override SCRATCH_HOMEO: u32 = SCRATCH_HABITUATED + ENCODED_DIMENSION;
+override SCRATCH_RECALL: u32 = SCRATCH_HOMEO + 6u;
+override SCRATCH_RECALL_SIMILARITY: u32 = SCRATCH_RECALL + RECALL_IDX_STRIDE;
+override SCRATCH_PREDICTION: u32 = SCRATCH_RECALL_SIMILARITY + RECALL_K;
+override SCRATCH_CREDIT: u32 = SCRATCH_PREDICTION + PREDICTOR_DIMENSION;
+override SCRATCH_SCALARS: u32 = SCRATCH_CREDIT + ENCODED_DIMENSION;
+override BRAIN_SCRATCH_STRIDE: u32 = SCRATCH_SCALARS + 4u;
+
 // ── Pattern memory offsets ──────────────────────────────────────────────────
 // O_PAT_STATES uses SoA (Structure-of-Arrays) layout: [dim][pattern]
 // Index as: pattern_base + d * MEMORY_CAP + pattern_idx
@@ -338,8 +353,8 @@ const MAX_TD_ERROR: f32 = 1.0;
 const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Buffer bindings — 13 storage + 2 uniform, single bind group
-// (binding 13 is intentionally unused; the numbering of the remaining
+// Buffer bindings — 14 storage + 2 uniform, single bind group
+// (binding 13 is now brain_scratch; the numbering of the remaining
 // bindings is stable so the bind-group layout in gpu_kernel.rs stays aligned)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -356,6 +371,7 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 @group(0) @binding(10) var<storage, read_write> sensory_buffer:       array<f32>;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
+@group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 

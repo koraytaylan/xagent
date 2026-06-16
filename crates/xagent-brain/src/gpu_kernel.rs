@@ -187,6 +187,25 @@ const STAGING_SLOTS: usize = 6;
 /// cap is sized to this value so a high-speed backlog actually fuses.
 pub const MAX_FUSED_BATCHES: u32 = 24;
 
+/// GPU brain execution strategy. FusedSerial is the shipping path; the split
+/// modes exist to measure and then unlock per-agent multi-workgroup brain math.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrainExecutionMode {
+    FusedSerial,
+    SplitSerial,
+    ParallelTiled,
+}
+
+impl BrainExecutionMode {
+    fn from_env() -> Self {
+        match std::env::var("XAGENT_BRAIN_EXECUTION_MODE").ok().as_deref() {
+            Some("split-serial") => BrainExecutionMode::SplitSerial,
+            Some("parallel-tiled") => BrainExecutionMode::ParallelTiled,
+            _ => BrainExecutionMode::FusedSerial,
+        }
+    }
+}
+
 /// Default-off per-batch timing / A-B knobs for the throughput-ceiling probe.
 ///
 /// Both flags are read once from the environment at construction so the
@@ -321,6 +340,7 @@ pub struct GpuKernel {
     collision_scratch_buffer: wgpu::Buffer,
     sensory_buffer: wgpu::Buffer,
     brain_state_buffer: wgpu::Buffer,
+    brain_scratch_buffer: wgpu::Buffer,
     pattern_buffer: wgpu::Buffer,
     brain_config_buffer: wgpu::Buffer,
 
@@ -332,6 +352,11 @@ pub struct GpuKernel {
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
     brain_pipeline: wgpu::ComputePipeline,
+    feature_pipeline: wgpu::ComputePipeline,
+    encode_tiled_pipeline: wgpu::ComputePipeline,
+    predictor_tiled_pipeline: wgpu::ComputePipeline,
+    encoder_credit_tiled_pipeline: wgpu::ComputePipeline,
+    tail_pipeline: wgpu::ComputePipeline,
     kernel_pipeline: wgpu::ComputePipeline,
     global_pipeline: wgpu::ComputePipeline,
     vision_stride: u32,
@@ -371,6 +396,8 @@ pub struct GpuKernel {
 
     // ── Per-batch throughput probe (default-off knobs + wall-time counters) ──
     probe: DispatchProbe,
+    /// Brain execution mode (FusedSerial, SplitSerial, or ParallelTiled).
+    execution_mode: BrainExecutionMode,
     /// Accumulated wall nanoseconds from recording start to the last
     /// `queue.submit` return, summed across `dispatch_ticks` calls.
     probe_submit_nanos: u64,
@@ -702,6 +729,12 @@ impl GpuKernel {
             usage: storage_rw,
             mapped_at_creation: false,
         });
+        let brain_scratch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kernel_brain_scratch"),
+            size: (n * layout.brain_scratch_stride * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
         let pattern_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_pattern"),
             size: (n * PATTERN_STRIDE * 4) as u64,
@@ -905,6 +938,7 @@ impl GpuKernel {
                 storage_rw_entry(10), // sensory
                 storage_rw_entry(11), // brain_state
                 storage_rw_entry(12), // pattern
+                storage_rw_entry(13), // brain_scratch
                 uniform_entry(14),    // brain_config
                 storage_rw_entry(15), // dispatch_args
             ],
@@ -964,6 +998,109 @@ impl GpuKernel {
             layout: Some(&brain_layout),
             module: &brain_module,
             entry_point: Some("brain_tick"),
+            compilation_options: override_options.clone(),
+            cache: None,
+        });
+
+        // ── Create feature-phase pipeline (plan 0006: copy features to scratch) ──
+        let feature_source = [
+            common_src,
+            include_str!("shaders/kernel/phase_brain_features.wgsl"),
+        ]
+        .join("\n");
+        let feature_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("phase_brain_features"),
+            source: wgpu::ShaderSource::Wgsl(feature_source.into()),
+        });
+        let feature_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("phase_brain_features"),
+            layout: Some(&brain_layout),
+            module: &feature_module,
+            entry_point: Some("phase_brain_features"),
+            compilation_options: override_options.clone(),
+            cache: None,
+        });
+
+        // ── Plan 0006 ParallelTiled phase pipelines ──
+        // encode_tiled + encoder_credit_tiled need only common.wgsl; the tail
+        // reuses the cooperative passes so it concatenates common + brain_passes
+        // (with subgroup markers, like brain_source) + the tail entry.
+        let encode_tiled_source = [
+            common_src,
+            include_str!("shaders/kernel/phase_brain_encode_tiled.wgsl"),
+        ]
+        .join("\n");
+        let encode_tiled_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("phase_brain_encode_tiled"),
+            source: wgpu::ShaderSource::Wgsl(encode_tiled_source.into()),
+        });
+        let encode_tiled_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("phase_brain_encode_tiled"),
+                layout: Some(&brain_layout),
+                module: &encode_tiled_module,
+                entry_point: Some("phase_brain_encode_tiled"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+
+        let predictor_tiled_source = [
+            common_src,
+            include_str!("shaders/kernel/phase_brain_predictor_tiled.wgsl"),
+        ]
+        .join("\n");
+        let predictor_tiled_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("phase_brain_predictor_tiled"),
+            source: wgpu::ShaderSource::Wgsl(predictor_tiled_source.into()),
+        });
+        let predictor_tiled_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("phase_brain_predictor_tiled"),
+                layout: Some(&brain_layout),
+                module: &predictor_tiled_module,
+                entry_point: Some("phase_brain_predictor_tiled"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+
+        let encoder_credit_tiled_source = [
+            common_src,
+            include_str!("shaders/kernel/phase_brain_encoder_credit_tiled.wgsl"),
+        ]
+        .join("\n");
+        let encoder_credit_tiled_module =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("phase_brain_encoder_credit_tiled"),
+                source: wgpu::ShaderSource::Wgsl(encoder_credit_tiled_source.into()),
+            });
+        let encoder_credit_tiled_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("phase_brain_encoder_credit_tiled"),
+                layout: Some(&brain_layout),
+                module: &encoder_credit_tiled_module,
+                entry_point: Some("phase_brain_encoder_credit_tiled"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+
+        let tail_source = apply_subgroup_markers(
+            &[
+                common_src,
+                include_str!("shaders/kernel/brain_passes.wgsl"),
+                include_str!("shaders/kernel/phase_brain_tail_from_scratch.wgsl"),
+            ]
+            .join("\n"),
+            has_subgroup,
+        );
+        let tail_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("phase_brain_tail_from_scratch"),
+            source: wgpu::ShaderSource::Wgsl(tail_source.into()),
+        });
+        let tail_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("phase_brain_tail_from_scratch"),
+            layout: Some(&brain_layout),
+            module: &tail_module,
+            entry_point: Some("phase_brain_tail_from_scratch"),
             compilation_options: override_options.clone(),
             cache: None,
         });
@@ -1098,6 +1235,10 @@ impl GpuKernel {
                         resource: pattern_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: brain_scratch_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 14,
                         resource: brain_config_buffer.as_entire_binding(),
                     },
@@ -1130,6 +1271,7 @@ impl GpuKernel {
             collision_scratch_buffer,
             sensory_buffer,
             brain_state_buffer,
+            brain_scratch_buffer,
             pattern_buffer,
             brain_config_buffer,
             dispatch_args_buffer,
@@ -1137,6 +1279,11 @@ impl GpuKernel {
             physics_pipeline,
             vision_pipeline,
             brain_pipeline,
+            feature_pipeline,
+            encode_tiled_pipeline,
+            predictor_tiled_pipeline,
+            encoder_credit_tiled_pipeline,
+            tail_pipeline,
             kernel_pipeline,
             global_pipeline,
             vision_stride: brain_config.vision_stride,
@@ -1163,6 +1310,7 @@ impl GpuKernel {
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
+            execution_mode: BrainExecutionMode::from_env(),
             probe_submit_nanos: 0,
             probe_complete_nanos: 0,
             probe_batches: 0,
@@ -1242,6 +1390,12 @@ impl GpuKernel {
     /// vision-pass frequency regardless of how the total is decomposed.
     pub fn kernel_batch_size(&self) -> u32 {
         self.vision_stride * self.brain_tick_stride
+    }
+
+    /// Override the brain execution mode (tests + benches). Default is read from
+    /// XAGENT_BRAIN_EXECUTION_MODE at construction.
+    pub fn set_execution_mode(&mut self, mode: BrainExecutionMode) {
+        self.execution_mode = mode;
     }
 
     /// Write world config uniform with batch parameters.
@@ -1490,6 +1644,21 @@ impl GpuKernel {
     /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
     /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
     pub fn dispatch_ticks(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        match self.execution_mode {
+            BrainExecutionMode::SplitSerial => {
+                self.dispatch_ticks_split_serial(start_tick, ticks_to_run)
+            }
+            BrainExecutionMode::ParallelTiled => {
+                self.dispatch_ticks_parallel_tiled(start_tick, ticks_to_run)
+            }
+            BrainExecutionMode::FusedSerial => {
+                self.dispatch_ticks_fused_serial(start_tick, ticks_to_run)
+            }
+        }
+    }
+
+    /// Fused serial execution: the original dispatch_ticks body.
+    fn dispatch_ticks_fused_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
@@ -1671,6 +1840,398 @@ impl GpuKernel {
         // Probe: record submit-return wall time, and — only when the env knob is
         // set — block once for GPU-complete wall time. The default path does no
         // poll here.
+        self.probe_submit_nanos += probe_start.elapsed().as_nanos() as u64;
+        if self.probe.wait_for_gpu {
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            self.probe_complete_nanos += probe_start.elapsed().as_nanos() as u64;
+        }
+
+        self.active_config_index = 1 - self.active_config_index;
+        true
+    }
+
+    /// Split-serial execution: each brain cycle is one kernel dispatch instead of
+    /// vision_stride cycles per dispatch. Byte-identical to fused serial.
+    fn dispatch_ticks_split_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let brain_cycles = ticks_to_run / self.brain_tick_stride;
+        let kernel_batches = brain_cycles / self.vision_stride;
+        let remainder_cycles = brain_cycles % self.vision_stride;
+
+        let skip_global = self.probe.skip_global;
+        let skip_vision = self.probe.skip_vision;
+        let probe_start = std::time::Instant::now();
+        let mut tick_cursor = start_tick;
+
+        // ── Full kernel-batches: chunked into submits with single-cycle dispatches ──
+        // Each full batch is split into vision_stride single-cycle kernel dispatches,
+        // then followed by one global and one vision pass (same sensory lag as fused).
+        if kernel_batches > 0 {
+            let full_ticks = self.vision_stride * self.brain_tick_stride;
+            // World config cycles=1 for all single-cycle dispatches in full batches.
+            self.upload_world_config_with_cycles(start_tick, full_ticks, 0x7, 1);
+
+            let passes_per_batch = self.vision_stride + 2; // vision_stride cycles + global + vision
+            let split_chunk = (MAX_FUSED_BATCHES * 3 / passes_per_batch).max(1);
+
+            let mut batch = 0u32;
+            while batch < kernel_batches {
+                let chunk_end = (batch + split_chunk).min(kernel_batches);
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("dispatch_kernel_split_serial"),
+                        });
+
+                // Prepare indirect dispatch args once per chunk.
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.prepare_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+
+                for b in batch..chunk_end {
+                    let batch_start = start_tick + u64::from(b) * u64::from(full_ticks);
+                    // For each cycle in this batch, dispatch one single-cycle kernel.
+                    for c in 0..self.vision_stride {
+                        let cycle_tick =
+                            batch_start + u64::from(c) * u64::from(self.brain_tick_stride);
+                        {
+                            let mut pass = encoder.begin_compute_pass(&Default::default());
+                            pass.set_pipeline(&self.kernel_pipeline);
+                            pass.set_bind_group(
+                                0,
+                                &self.bind_groups[self.active_config_index],
+                                &[],
+                            );
+                            pass.set_push_constants(
+                                0,
+                                bytemuck::cast_slice(&[
+                                    cycle_tick as u32,
+                                    self.probe.kernel_pass_limit,
+                                ]),
+                            );
+                            pass.dispatch_workgroups(self.agent_count, 1, 1);
+                        }
+                    }
+
+                    // Global pass once after all vision_stride cycles.
+                    if !skip_global {
+                        let tick_for_global = batch_start + u64::from(full_ticks);
+                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.global_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+
+                    // Vision pass once after global.
+                    if !skip_vision {
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.vision_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+                    }
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+                self.probe_submits += 1;
+                batch = chunk_end;
+            }
+            self.probe_batches += u64::from(kernel_batches);
+            tick_cursor = start_tick + u64::from(kernel_batches) * u64::from(full_ticks);
+        }
+
+        // ── Remainder-cycles batch: single-cycle dispatches ───────────────────
+        if remainder_cycles > 0 {
+            let rem_ticks = remainder_cycles * self.brain_tick_stride;
+            // World config cycles=1 for remainder single-cycle dispatches.
+            self.upload_world_config_with_cycles(tick_cursor, rem_ticks, 0x7, 1);
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_split_remainder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.prepare_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+
+            // Single-cycle dispatches for each remainder cycle.
+            for c in 0..remainder_cycles {
+                let cycle_tick = tick_cursor + u64::from(c) * u64::from(self.brain_tick_stride);
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.kernel_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.set_push_constants(
+                        0,
+                        bytemuck::cast_slice(&[cycle_tick as u32, self.probe.kernel_pass_limit]),
+                    );
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
+            }
+
+            if !skip_global {
+                let tick_for_global = tick_cursor + rem_ticks as u64;
+                let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.global_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            if !skip_vision {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.vision_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            self.probe_submits += 1;
+            self.probe_batches += 1;
+            tick_cursor += rem_ticks as u64;
+        }
+
+        // Physics-only remainder: byte-identical to fused.
+        let physics_remainder = ticks_to_run % self.brain_tick_stride;
+        if physics_remainder > 0 {
+            self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
+            let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_split_physics_remainder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            self.probe_submits += 1;
+        }
+
+        // Probe: same as fused.
+        self.probe_submit_nanos += probe_start.elapsed().as_nanos() as u64;
+        if self.probe.wait_for_gpu {
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            self.probe_complete_nanos += probe_start.elapsed().as_nanos() as u64;
+        }
+
+        self.active_config_index = 1 - self.active_config_index;
+        true
+    }
+
+    /// Record the per-cycle ParallelTiled phase sequence into `encoder`:
+    /// prefix (the existing fused kernel at `pass_limit = 0`, i.e. physics +
+    /// food detect + death/respawn, no brain) → feature-to-scratch → tiled
+    /// encode → single-workgroup tail (brain passes 2..6, encoder-credit
+    /// skipped) → tiled encoder-credit. wgpu inserts a storage barrier between
+    /// these read-write-storage dispatches, so each phase sees the previous
+    /// one's writes — the dispatch boundary supplies the cross-workgroup
+    /// visibility WGSL lacks inside one dispatch.
+    fn record_parallel_tiled_cycle(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        cycle_tick: u64,
+        enc_tiles: u32,
+    ) {
+        let bg = &self.bind_groups[self.active_config_index];
+        // 1. Prefix: physics + food + death/respawn, no brain (pass_limit = 0).
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.kernel_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.set_push_constants(0, bytemuck::cast_slice(&[cycle_tick as u32, 0u32]));
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // 2. Features → SCRATCH_FEATURES (one workgroup per agent).
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.feature_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // 3. Tiled encode → SCRATCH_ENCODED (enc_tiles workgroups per agent).
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.encode_tiled_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(self.agent_count, enc_tiles, 1);
+        }
+        // 3b. Tiled predictor train+predict → SCRATCH_PREDICTION (enc_tiles
+        //     workgroups per agent). Runs after encode (needs SCRATCH_ENCODED)
+        //     and before the tail (which reads SCRATCH_PREDICTION).
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.predictor_tiled_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(self.agent_count, enc_tiles, 1);
+        }
+        // 4. Tail: brain passes 2..6 (one workgroup per agent), no encoder-credit.
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.tail_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(self.agent_count, 1, 1);
+        }
+        // 5. Tiled encoder-credit → O_ENC_WEIGHTS (reads DECISION_CREDIT written
+        //    by the tail; runs last so encoder weights are not read again until
+        //    the next cycle's encode).
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.encoder_credit_tiled_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(self.agent_count, enc_tiles, 1);
+        }
+    }
+
+    /// ParallelTiled execution: the same brain semantics as FusedSerial but with
+    /// encode and encoder-credit split into multi-workgroup tiled dispatches and
+    /// the remaining passes in a single-workgroup tail. Same per-batch sensory
+    /// lag (global + vision once per `vision_stride` cycles) and the same
+    /// remainder / physics-remainder handling as the split-serial path. Reduction
+    /// order differs from fused (tiled lane reductions), so this path is
+    /// deterministic within mode and bounded-drift against fused, not byte-equal.
+    fn dispatch_ticks_parallel_tiled(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let brain_cycles = ticks_to_run / self.brain_tick_stride;
+        let kernel_batches = brain_cycles / self.vision_stride;
+        let remainder_cycles = brain_cycles % self.vision_stride;
+
+        let skip_global = self.probe.skip_global;
+        let skip_vision = self.probe.skip_vision;
+        let probe_start = std::time::Instant::now();
+        let mut tick_cursor = start_tick;
+        let enc_tiles = (ENCODED_DIMENSION as u32) / 16;
+
+        if kernel_batches > 0 {
+            let full_ticks = self.vision_stride * self.brain_tick_stride;
+            // cycles = 1 for every single-cycle phase sequence in the call.
+            self.upload_world_config_with_cycles(start_tick, self.brain_tick_stride, 0x7, 1);
+
+            // Each cycle records 6 dispatches (prefix, features, encode,
+            // predictor, tail, encoder-credit); per batch add global + vision.
+            let passes_per_batch = self.vision_stride * 6 + 2;
+            let tiled_chunk = (MAX_FUSED_BATCHES * 3 / passes_per_batch).max(1);
+
+            let mut batch = 0u32;
+            while batch < kernel_batches {
+                let chunk_end = (batch + tiled_chunk).min(kernel_batches);
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("dispatch_kernel_parallel_tiled"),
+                        });
+
+                // Prepare indirect dispatch args once per chunk.
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&self.prepare_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+
+                for b in batch..chunk_end {
+                    let batch_start = start_tick + u64::from(b) * u64::from(full_ticks);
+                    for c in 0..self.vision_stride {
+                        let cycle_tick =
+                            batch_start + u64::from(c) * u64::from(self.brain_tick_stride);
+                        self.record_parallel_tiled_cycle(&mut encoder, cycle_tick, enc_tiles);
+                    }
+
+                    if !skip_global {
+                        let tick_for_global = batch_start + u64::from(full_ticks);
+                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.global_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    if !skip_vision {
+                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&self.vision_pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                        pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+                    }
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+                self.probe_submits += 1;
+                batch = chunk_end;
+            }
+            self.probe_batches += u64::from(kernel_batches);
+            tick_cursor = start_tick + u64::from(kernel_batches) * u64::from(full_ticks);
+        }
+
+        if remainder_cycles > 0 {
+            let rem_ticks = remainder_cycles * self.brain_tick_stride;
+            self.upload_world_config_with_cycles(tick_cursor, rem_ticks, 0x7, 1);
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_parallel_tiled_remainder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.prepare_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            for c in 0..remainder_cycles {
+                let cycle_tick = tick_cursor + u64::from(c) * u64::from(self.brain_tick_stride);
+                self.record_parallel_tiled_cycle(&mut encoder, cycle_tick, enc_tiles);
+            }
+            if !skip_global {
+                let tick_for_global = tick_cursor + rem_ticks as u64;
+                let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.global_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            if !skip_vision {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.vision_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            self.probe_submits += 1;
+            self.probe_batches += 1;
+            tick_cursor += rem_ticks as u64;
+        }
+
+        // Physics-only remainder: identical to fused / split-serial.
+        let physics_remainder = ticks_to_run % self.brain_tick_stride;
+        if physics_remainder > 0 {
+            self.upload_world_config_masked(tick_cursor, physics_remainder, 0x1);
+            let pc: [u32; 2] = [tick_cursor as u32, physics_remainder];
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dispatch_kernel_parallel_tiled_physics_remainder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.physics_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                pass.set_push_constants(0, bytemuck::cast_slice(&pc));
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            self.probe_submits += 1;
+        }
+
         self.probe_submit_nanos += probe_start.elapsed().as_nanos() as u64;
         if self.probe.wait_for_gpu {
             self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
@@ -2515,6 +3076,47 @@ impl GpuKernel {
     /// Returns the most recently collected telemetry, if any.
     pub fn cached_telemetry(&self) -> Option<&AgentTelemetry> {
         self.cached_telemetry.as_ref()
+    }
+
+    /// Test-only: dispatch the feature-to-scratch phase once (one workgroup/agent)
+    /// and submit. Used to validate brain_scratch wiring before ParallelTiled lands.
+    pub fn dispatch_feature_phase_for_test(&mut self) {
+        let n = self.agent_count;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let bg = &self.bind_groups[self.active_config_index];
+        let mut cpass = encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.feature_pipeline);
+        cpass.set_bind_group(0, bg, &[]);
+        cpass.dispatch_workgroups(n, 1, 1);
+        drop(cpass);
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Test-only: blocking readback of the brain_scratch buffer (all agents).
+    pub fn read_brain_scratch_blocking(&mut self) -> Vec<f32> {
+        let n = self.agent_count as usize;
+        let buf_size = (n * self.layout.brain_scratch_stride * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kernel_blocking_brain_scratch_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&self.brain_scratch_buffer, 0, &staging, 0, buf_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        let result = floats.to_vec();
+        drop(data);
+        staging.unmap();
+        result
     }
 }
 

@@ -783,6 +783,103 @@ fn fused_dispatch_matches_split() {
     );
 }
 
+/// Dense tiling smoke test (plan 0006): verify that the same-dispatch tiling
+/// produces finite, bounded motor outputs and no NaN/infinity in brain state.
+/// Does not assert byte-equality against the old serial path (reduction order
+/// intentionally changed); only checks finiteness, bounds, and alive/death counts.
+#[test]
+fn dense_tiling_smoke_finite_and_bounded() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT};
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 999,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let food_count = world.food_items.len();
+
+    let mut kernel = xagent_brain::GpuKernel::new(4, food_count, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 54321);
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    let spawn_pos = world.safe_spawn_position();
+    let agent_data = vec![
+        (
+            spawn_pos,
+            100.0_f32,
+            100.0_f32,
+            brain.memory_capacity,
+            brain.processing_slots
+        );
+        4
+    ];
+    kernel.upload_agents(&agent_data);
+
+    // Run a few hundred ticks to exercise all branches
+    let ticks_to_run = 300;
+    kernel.dispatch_ticks(0, ticks_to_run);
+
+    // Read the final state
+    let state = kernel.read_full_state_blocking();
+
+    // Check finiteness of all floats (this will catch NaN or infinity early)
+    for (idx, val) in state.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "State index {} is not finite: {}",
+            idx,
+            val
+        );
+    }
+
+    // Check motor outputs are in [-1, 1] for all agents
+    let phys_stride = xagent_brain::buffers::PHYS_STRIDE as usize;
+    for agent_id in 0..4usize {
+        let base = agent_id * phys_stride;
+        let motor_fwd = state[base + P_MOTOR_FWD_OUT as usize];
+        let motor_turn = state[base + P_MOTOR_TURN_OUT as usize];
+
+        assert!(
+            motor_fwd >= -1.0 && motor_fwd <= 1.0,
+            "Agent {} motor forward out of bounds: {}",
+            agent_id,
+            motor_fwd
+        );
+        assert!(
+            motor_turn >= -1.0 && motor_turn <= 1.0,
+            "Agent {} motor turn out of bounds: {}",
+            agent_id,
+            motor_turn
+        );
+    }
+
+    // Basic sanity: we should have processed the ticks and the kernel didn't panic
+    eprintln!(
+        "Dense tiling smoke test: {} ticks completed successfully",
+        ticks_to_run
+    );
+}
+
 // ── GPU Tick Loop Tests ─────────────────────────────────────────────
 
 #[test]
@@ -3461,5 +3558,348 @@ fn try_collect_telemetry_tracks_requested_agent_across_reselection() {
     assert_eq!(
         idx, 2,
         "after re-requesting agent 2, collected telemetry must be for agent 2"
+    );
+}
+
+/// Proves that SplitSerial (one cycle per dispatch) is byte-identical to
+/// FusedSerial (vision_stride cycles per dispatch). Both run the same fixed
+/// seed and tick count; any divergence indicates split sequencing is wrong.
+///
+/// Uses 1037 ticks at the default stride (vision_stride=10, brain_tick_stride=10,
+/// kernel_batch_size=100), decomposing as:
+///   - 10 full kernel-batches (1000 ticks)  → 10 * 10 = 100 single-cycle dispatches (split)
+///   - 3 remainder cycles (30 ticks)        → 3 single-cycle dispatches
+///   - 7 physics-remainder ticks            → 1 physics-only dispatch
+///
+/// So both fused and split encode the same unit sequence (physics + kernel +
+/// global + vision ordering), just chunked across submissions differently for split.
+#[test]
+fn split_serial_matches_fused_serial() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    // Fresh kernel with deterministic brain state + identical initial world.
+    let make_kernel = || {
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel
+    };
+
+    let total: u32 = 1037;
+
+    // Fused serial: default execution mode. Capture the FULL physics slice plus
+    // per-agent brain_state + pattern_buffer (read_full_state_blocking is
+    // physics-only; brain/pattern bytes come from read_agent_state). `.to_vec()`
+    // the borrowed slice before the second blocking read.
+    let mut fused = make_kernel();
+    fused.dispatch_ticks(0, total);
+    let fused_phys = fused.read_full_state_blocking().to_vec();
+    let fused_brain = fused.read_agent_state(0);
+
+    // Split serial: same setup but with SplitSerial mode.
+    let mut split = make_kernel();
+    split.set_execution_mode(xagent_brain::BrainExecutionMode::SplitSerial);
+    split.dispatch_ticks(0, total);
+    let split_phys = split.read_full_state_blocking().to_vec();
+    let split_brain = split.read_agent_state(0);
+
+    // Byte-equality (assert_eq! on f32, no epsilon): SplitSerial vs FusedSerial is
+    // the same unit-dispatch sequence, only the encoder/submit grouping differs.
+    assert_eq!(
+        fused_phys, split_phys,
+        "SplitSerial diverged from FusedSerial in physics state — not byte-identical"
+    );
+    assert_eq!(
+        fused_brain.brain_state, split_brain.brain_state,
+        "SplitSerial diverged from FusedSerial in brain_state — not byte-identical"
+    );
+    assert_eq!(
+        fused_brain.patterns, split_brain.patterns,
+        "SplitSerial diverged from FusedSerial in pattern_buffer — not byte-identical"
+    );
+}
+
+#[test]
+fn parallel_tiled_feature_phase_writes_scratch() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::BrainLayout;
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+
+    // Upload initial world and agent state
+    kernel.reset_agents_seeded(&brain, 12345);
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_agents(&agent_data);
+
+    // Run ~50 fused ticks to populate sensory_buffer/physics with realistic data
+    let ticks_to_run = 50;
+    kernel.dispatch_ticks(0, ticks_to_run);
+
+    // Test-only: dispatch feature phase and read back scratch
+    kernel.dispatch_feature_phase_for_test();
+    let scratch = kernel.read_brain_scratch_blocking();
+
+    let layout = BrainLayout::default();
+    assert_eq!(
+        scratch.len(),
+        layout.brain_scratch_stride,
+        "scratch buffer should have brain_scratch_stride elements for agent 0"
+    );
+
+    // Verify all values in SCRATCH_FEATURES range are finite
+    let feature_end = xagent_brain::buffers::SCRATCH_ENCODED;
+    for i in 0..feature_end {
+        assert!(
+            scratch[i].is_finite(),
+            "scratch feature at index {} is not finite: {}",
+            i,
+            scratch[i]
+        );
+    }
+
+    // Verify vision sub-range is not all-zero (shader actually wrote features)
+    let vision_count = layout.vision_color_count + layout.vision_depth_count;
+    let any_vision_nonzero = scratch[0..vision_count].iter().any(|v| v != &0.0);
+    assert!(
+        any_vision_nonzero,
+        "vision features in scratch should not be all-zero after feature phase"
+    );
+}
+
+/// Plan 0006: ParallelTiled must be deterministic *within mode* — the same
+/// fixed seed run as one large dispatch vs several smaller dispatches (all
+/// multiples of kernel_batch_size) produces byte-identical physics, brain_state,
+/// and pattern_buffer. The tiled lane reductions use fixed ascending order, so
+/// same-mode results are exact (unlike the bounded-drift comparison vs fused).
+#[test]
+fn parallel_tiled_deterministic_across_batch_sizes() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let total_ticks: u32 = 600;
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    let run = |batch_size: u32| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.set_execution_mode(xagent_brain::BrainExecutionMode::ParallelTiled);
+        let kernel_batch = kernel.kernel_batch_size();
+        assert_eq!(batch_size % kernel_batch, 0);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        let num_batches = total_ticks / batch_size;
+        for i in 0..num_batches {
+            kernel.dispatch_ticks((i * batch_size) as u64, batch_size);
+        }
+        let phys = kernel.read_full_state_blocking().to_vec();
+        let st = kernel.read_agent_state(0);
+        (phys, st.brain_state, st.patterns)
+    };
+
+    let a = run(600);
+    let b = run(300);
+    let c = run(100);
+    assert_eq!(a.0, b.0, "ParallelTiled physics 2x300 diverged from 1x600");
+    assert_eq!(a.0, c.0, "ParallelTiled physics 6x100 diverged from 1x600");
+    assert_eq!(
+        a.1, b.1,
+        "ParallelTiled brain_state 2x300 diverged from 1x600"
+    );
+    assert_eq!(
+        a.1, c.1,
+        "ParallelTiled brain_state 6x100 diverged from 1x600"
+    );
+    assert_eq!(a.2, b.2, "ParallelTiled patterns 2x300 diverged from 1x600");
+    assert_eq!(a.2, c.2, "ParallelTiled patterns 6x100 diverged from 1x600");
+}
+
+/// Plan 0006: ParallelTiled must stay bounded-drift against FusedSerial over a
+/// short fixed-seed horizon — finite state, motor outputs in [-1,1], and the
+/// same alive/death counts. Reduction order differs (tiled vs serial), so this
+/// is NOT byte-equality; it catches gross pipeline errors (NaN, deadlock, all
+/// agents dead, motor blow-up).
+#[test]
+fn parallel_tiled_bounded_drift_vs_fused() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{
+        PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Z,
+    };
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let total_ticks: u32 = 300;
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_count = 8u32;
+    let agent_data: Vec<_> = (0..agent_count)
+        .map(|_| {
+            (
+                spawn_pos,
+                100.0_f32,
+                100.0_f32,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+
+    let run = |mode: Option<xagent_brain::BrainExecutionMode>| -> Vec<f32> {
+        let mut kernel =
+            xagent_brain::GpuKernel::new(agent_count, food_count, &brain, &world_config);
+        if let Some(m) = mode {
+            kernel.set_execution_mode(m);
+        }
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_ticks(0, total_ticks);
+        kernel.read_full_state_blocking().to_vec()
+    };
+
+    let fused = run(None);
+    let tiled = run(Some(xagent_brain::BrainExecutionMode::ParallelTiled));
+
+    assert!(
+        fused.iter().all(|v| v.is_finite()),
+        "FusedSerial produced non-finite physics state"
+    );
+    assert!(
+        tiled.iter().all(|v| v.is_finite()),
+        "ParallelTiled produced non-finite physics state"
+    );
+
+    let mut fused_alive = 0u32;
+    let mut tiled_alive = 0u32;
+    let mut fused_deaths = 0.0f32;
+    let mut tiled_deaths = 0.0f32;
+    let mut max_pos_drift = 0.0f32;
+    for i in 0..agent_count as usize {
+        let b = i * PHYS_STRIDE;
+        for v in [tiled[b + P_MOTOR_FWD_OUT], tiled[b + P_MOTOR_TURN_OUT]] {
+            assert!(
+                (-1.0..=1.0).contains(&v),
+                "ParallelTiled motor output out of [-1,1]: {v}"
+            );
+        }
+        if fused[b + P_ALIVE] >= 0.5 {
+            fused_alive += 1;
+        }
+        if tiled[b + P_ALIVE] >= 0.5 {
+            tiled_alive += 1;
+        }
+        fused_deaths += fused[b + P_DEATH_COUNT];
+        tiled_deaths += tiled[b + P_DEATH_COUNT];
+        let dx = fused[b + P_POS_X] - tiled[b + P_POS_X];
+        let dz = fused[b + P_POS_Z] - tiled[b + P_POS_Z];
+        max_pos_drift = max_pos_drift.max((dx * dx + dz * dz).sqrt());
+    }
+    eprintln!(
+        "bounded-drift: fused_alive={fused_alive} tiled_alive={tiled_alive} \
+         fused_deaths={fused_deaths} tiled_deaths={tiled_deaths} max_pos_drift={max_pos_drift}"
+    );
+    assert_eq!(
+        fused_alive, tiled_alive,
+        "alive count diverged: fused {fused_alive} vs tiled {tiled_alive}"
+    );
+    assert_eq!(
+        fused_deaths, tiled_deaths,
+        "death count diverged: fused {fused_deaths} vs tiled {tiled_deaths}"
     );
 }

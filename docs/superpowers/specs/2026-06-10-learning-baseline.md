@@ -753,3 +753,85 @@ substrate for the next credit-path attempt). Workstream `0003`
 `learning_probe_mirrored_steering_is_chance` remains the falsifiable pin: it
 stays green at chance and will trip the day a credit-path change finally
 produces directional steering.
+
+## 2026-06-15 — Plan 0006 N=10 budget (multi-workgroup brain parallelism)
+
+Task `n10-throughput-budget-baseline`. Target machine: Apple M3 Max, Metal 4.
+Release binary, `--bench --bench-ticks 1000000 --bench-agents 10`, sweeping
+`XAGENT_KERNEL_PASS_LIMIT`. The pass order (from the Plan 0005 N=200 table above)
+is: `feature_extract, encode, habituate_homeo, recall_score, recall_topk,
+predict_and_act, learn_and_store`.
+
+| mode | tps | batches | submits | submit_ns/batch | wall |
+|---|---|---|---|---|---|
+| full (all 7 passes) | **23,230** | 10000 | 417 | 4,161,716 | 43.05s |
+| pass-limit 0 (no brain) | **159,634** | 10000 | 417 | 605,375 | 6.26s |
+| pass-limit 2 (≤ encode) | 109,913 | 10000 | 417 | 879,213 | 9.10s |
+| pass-limit 5 (≤ recall_topk) | 90,440 | 10000 | 417 | 1,068,703 | 11.06s |
+| pass-limit 7 (full) | 23,374 | 10000 | 417 | 4,135,482 | 42.78s |
+
+(`read` = async readback, not measured under `--bench`; `gpu_complete_ns` is 0 by
+design in the bench probe.)
+
+**Brain-cost decomposition (1M ticks):** floor 6.26s, full 43.05s → brain = 36.79s.
+- passes 1–2 (`feature_extract`+`encode`): 6.26→9.10s = **+2.84s** (encode owns ~all)
+- passes 3–5 (`habituate_homeo`+`recall_score`+`recall_topk`): 9.10→11.06s = **+1.96s**
+- passes 6–7 (`predict_and_act`+`learn_and_store`): 11.06→42.78s = **+31.72s (86% of brain)**
+
+`encode` + `predict_and_act` + `learn_and_store` ≈ 34.56s = **94% of brain cost**,
+confirming the plan's breakthrough targets (tiled encode, predictor train+predict,
+encoder-credit learning, memory reinforcement). To hit 60k tps = 16.67s/1M, the
+brain budget is 16.67−6.26 = 10.41s, i.e. the 36.79s brain must shrink **3.53×**.
+
+**Decision (locked rule for this task):** pass-limit-0 floor = **159,634 tps ≥
+90,000** → **CONTINUE**: the non-brain floor comfortably supports 60k.
+`fused-food-grid-detect-floor-recovery` is **not** forced mandatory by this gate
+(it remains a closure dependency and is implemented either way, but its ≥20%
+floor-recovery bar does not apply since the floor is already 159,634 tps).
+
+### Plan 0006 task results (running)
+
+On-target N=10 / N=200, FusedSerial path unless noted. Baseline = pre-0002.
+
+| after task | N=10 tps | Δ vs baseline | step gain |
+|---|---:|---:|---:|
+| baseline (pre-0002) | 23,230 | — | — |
+| `same-dispatch-dense-tiling` (0002) | 34,001 | +46.4% | +46.4% |
+| `parallel-reduce-action-tail` (0004d) | 41,200 | +77.4% | +21.3% |
+| `multi-workgroup-memory-reinforcement` (0004e) | 44,680 | +92.3% | +8.4% |
+| 7c reinforcement dot (memory reinf complete) | **45,506** | **+95.9%** | +1.8% |
+
+**FINAL (closure): TARGET MISSED — 45,506 tps = 75.8% of 60k.** Fused N=200 =
+4,633,798 agent-ticks/sec (+93% vs baseline). The split multi-workgroup
+`ParallelTiled` path is a **measured negative** (N=10 42,780 = −6% vs fused;
+N=200 3,321,576 = −28%) — dispatch overhead exceeds the parallelism gain, so
+default stays `FusedSerial`. Owner of the 60k gap: the **10-workgroup occupancy
+ceiling at N=10** (irreducible matrix-vector FLOPs + barriers at ~25% GPU
+utilization; more workgroups needs the split, which the overhead blocks). Floor
+(pass-limit-0) = 157,910 tps → food scan is a measured non-owner. Learning
+unchanged (fused vs ParallelTiled Food/1k ≈ 0.27, best fitness ≈ 0.085–0.092,
+within single-seed noise; learning probes hold the chance baseline). Full
+analysis: `docs/plans/0006-Multi-Workgroup-Brain-Parallelism/0006-60K-CLOSURE.md`.
+
+0002 gate (≥25% N=10 AND N=200 not worse than −5%): **PASS** decisively. The
+same-dispatch 4-lane tiling of encode/predictor/encoder-credit (using all 256
+lanes instead of 128, cutting each dense MAD loop ~4×) already moves N=10 from
+23,230 to 34,001 tps; the split multi-workgroup path (0004) still has the larger
+remaining gap to 60k (need 16.67s/1M; currently 29.41s).
+
+**0003 split-serial overhead gate (M3 Max, N=10, 3 trials each, variance <0.2%):**
+
+| mode | N=10 tps | wall/1M | submits |
+|---|---:|---:|---:|
+| fused-serial | 34,000 | 29.41s | 417 |
+| split-serial (one kernel dispatch/cycle) | 28,761 | 34.78s | 1,667 |
+
+Overhead = **15.4% slower** → **JUST over the locked 15% gate.** SplitSerial is
+byte-identical (physics + brain_state + pattern_buffer) so the scaffold is
+correct; the tax is the 10× extra kernel dispatches/submits at N=10's tiny work
+size (dispatch/submit-bound, not compute-bound). Per the 0003 Done-when at >15%,
+the plan **prioritizes the same-dispatch (in-workgroup) optimizations
+[`parallel-reduce-action-tail` fused part, `fused-food-grid-detect-floor-recovery`]
+before any further split dispatches.** The finer-grained ParallelTiled phase
+split would incur strictly MORE dispatch overhead than this minimal per-cycle
+split, so the split multi-workgroup path is on the back foot for the 60k target.

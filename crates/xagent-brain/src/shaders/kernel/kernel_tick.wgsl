@@ -487,10 +487,10 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     if (alive && 4u < limit) { coop_recall_topk(agent_id, tid /* KERNEL_SUBGROUP_TOPK_ARGS */); }
     storageBarrier(); workgroupBarrier();
 
-    if (alive && 5u < limit) { coop_predict_and_act(agent_id, tid); }
+    if (alive && 5u < limit) { coop_predict_and_act(agent_id, tid, false); }
     storageBarrier(); workgroupBarrier();
 
-    if (alive && 6u < limit) { coop_learn_and_store(agent_id, tid); }
+    if (alive && 6u < limit) { coop_learn_and_store(agent_id, tid, true); }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

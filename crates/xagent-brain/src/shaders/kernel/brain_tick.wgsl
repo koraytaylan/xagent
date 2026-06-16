@@ -37,8 +37,8 @@ fn brain_tick(
     coop_recall_topk(agent_id, tid /* SUBGROUP_TOPK_ARGS */);
     storageBarrier(); workgroupBarrier();
 
-    coop_predict_and_act(agent_id, tid);
+    coop_predict_and_act(agent_id, tid, false);
     storageBarrier(); workgroupBarrier();
 
-    coop_learn_and_store(agent_id, tid);
+    coop_learn_and_store(agent_id, tid, true);
 }

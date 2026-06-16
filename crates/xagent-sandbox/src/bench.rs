@@ -35,8 +35,30 @@ pub fn run_bench(
 
     let start = Instant::now();
 
-    // Single dispatch for all ticks
+    // Single dispatch for all ticks — one `dispatch_ticks` call, so its full
+    // batches fuse into chunked submits (≤ MAX_FUSED_BATCHES per submit).
     kernel.dispatch_batch(0, total_ticks as u32);
+
+    // Per-batch throughput probe. Captured before the
+    // readback so they reflect only the dispatch path. The GPU-complete column
+    // is non-zero only under `XAGENT_PROBE_GPU_WAIT=1`; `XAGENT_SKIP_GLOBAL_VISION=1`
+    // skips the global+vision passes (incorrect results, measurement only).
+    let probe_batches = kernel.probe_kernel_batches();
+    let probe_submits = kernel.probe_submit_count();
+    let probe_submit_ns = kernel.probe_submit_return_nanos();
+    let probe_complete_ns = kernel.probe_gpu_complete_nanos();
+    let per_batch = |total: u64| total.checked_div(probe_batches).unwrap_or(0);
+    println!(
+        "[BENCH-PROBE] kernel_batches={} submits={} submit_return_ns={} \
+         submit_return_ns_per_batch={} gpu_complete_ns={} gpu_complete_ns_per_batch={}",
+        probe_batches,
+        probe_submits,
+        probe_submit_ns,
+        per_batch(probe_submit_ns),
+        probe_complete_ns,
+        per_batch(probe_complete_ns),
+    );
+
     let state = kernel.read_full_state_blocking();
 
     let elapsed = start.elapsed();
@@ -120,6 +142,121 @@ pub fn run_profile(
     println!("  total tps (full):  {:.0}", total_ticks as f64 / full);
 }
 
+/// A/B the fused dispatch path's GPU passes to locate the throughput ceiling.
+///
+/// Runs the same `total_ticks` through `dispatch_ticks` four times — full,
+/// `global` skipped, `vision` skipped, both skipped — each on a fresh kernel,
+/// and prints achieved tps plus the submit/batch fusion ratio per arm. A large
+/// tps jump when only `global` is skipped fingers the single-workgroup `global`
+/// pass as the residual ceiling; a jump only when `vision` is
+/// skipped points at vision instead; little movement in either means the
+/// limiter is elsewhere (CPU submit / queue back-pressure). Skipping passes
+/// corrupts results — this is a timing harness only.
+pub fn run_phase_ab(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+) {
+    println!(
+        "[phase-ab] {} agents, {} ticks — fused-dispatch pass isolation",
+        agent_count, total_ticks
+    );
+
+    let arms: [(&str, bool, bool); 4] = [
+        ("full (baseline)", false, false),
+        ("skip global", true, false),
+        ("skip vision", false, true),
+        ("skip global+vision", true, true),
+    ];
+
+    let mut baseline_tps = 0.0_f64;
+    for (i, (label, skip_global, skip_vision)) in arms.iter().enumerate() {
+        let (mut kernel, _world) = create_kernel(&brain, &world_config, agent_count);
+        kernel.set_probe_pass_skips(*skip_global, *skip_vision);
+
+        let start = Instant::now();
+        kernel.dispatch_batch(0, total_ticks as u32);
+        // Blocking readback forces all GPU work to complete, so the wall time
+        // captures pass execution, not just submit-return.
+        let _ = kernel.read_full_state_blocking();
+        let secs = start.elapsed().as_secs_f64();
+        let tps = total_ticks as f64 / secs;
+        let batches = kernel.probe_kernel_batches();
+        let submits = kernel.probe_submit_count();
+
+        if i == 0 {
+            baseline_tps = tps;
+        }
+        let delta = if i == 0 || baseline_tps == 0.0 {
+            "—".to_string()
+        } else {
+            format!("{:+.0}% vs baseline", (tps / baseline_tps - 1.0) * 100.0)
+        };
+        println!(
+            "  {label:<20} {tps:>10.0} tps  ({batches:>5} batches / {submits:>4} submits)  {delta}"
+        );
+    }
+
+    println!("[phase-ab] read: a large +% on 'skip global' ALONE => the single-workgroup");
+    println!("           global pass is the residual ceiling.");
+}
+
+/// Sweep agent counts to locate the GPU occupancy knee.
+///
+/// For each `N` in `counts`, run a fixed `total_ticks` through the single fused
+/// `dispatch_batch(0, total_ticks)` path on a fresh kernel and print `N`, tps,
+/// and agent-ticks/sec (`tps × N` — the useful-work metric for evolution, since
+/// every agent in a generation advances in lockstep). After the sweep, flag the
+/// `N` that maximizes agent-ticks/sec as the knee: below it the GPU is idle
+/// (tps flat while N rises), at it useful throughput saturates, above it each
+/// generation's wall time grows for no extra useful work. Read-only
+/// measurement; it changes no simulation state. The default `population_size`
+/// is sized to the knee this reports on the reference GPU.
+pub fn run_agent_sweep(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    total_ticks: u64,
+    counts: &[usize],
+) {
+    println!(
+        "[agent-sweep] {} ticks per N — locating the GPU occupancy knee",
+        total_ticks
+    );
+    println!("  {:>7}  {:>14}  {:>18}", "N", "tps", "agent-ticks/sec");
+
+    let mut knee_n = 0usize;
+    let mut knee_atps = 0.0_f64;
+    for &n in counts {
+        if n == 0 {
+            continue;
+        }
+        let (mut kernel, _world) = create_kernel(&brain, &world_config, n);
+
+        let start = Instant::now();
+        // Single fused dispatch for all ticks, then a blocking readback so the
+        // wall time captures GPU execution, not just submit-return.
+        kernel.dispatch_batch(0, total_ticks as u32);
+        let _ = kernel.read_full_state_blocking();
+        let secs = start.elapsed().as_secs_f64();
+
+        let tps = total_ticks as f64 / secs;
+        let agent_ticks_per_sec = tps * n as f64;
+        if agent_ticks_per_sec > knee_atps {
+            knee_atps = agent_ticks_per_sec;
+            knee_n = n;
+        }
+        println!("  {n:>7}  {tps:>14.0}  {agent_ticks_per_sec:>18.0}");
+    }
+
+    println!("[agent-sweep] occupancy knee: N={knee_n} maximizes agent-ticks/sec ({knee_atps:.0})");
+    println!(
+        "[agent-sweep] read: tps stays flat across small N (latency-bound, GPU idle); \
+         agent-ticks/sec climbs until the knee, then plateaus while per-generation \
+         wall time keeps growing. Size the default population to the knee."
+    );
+}
+
 /// Simulate the real tick loop with accumulator and per-frame dispatch —
 /// no rendering. Prints DIAG lines every second and returns the result.
 pub fn run_tick_loop_bench(
@@ -178,7 +315,7 @@ pub fn run_tick_loop_bench(
         };
 
         if ticks_to_run > 0 {
-            kernel.try_collect_state();
+            kernel.try_collect_state_snapshot();
             kernel.dispatch_batch(tick, ticks_to_run);
 
             accumulator -= ticks_to_run as f64 * SIM_DT;

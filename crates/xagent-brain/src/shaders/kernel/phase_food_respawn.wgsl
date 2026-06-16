@@ -11,11 +11,11 @@ fn phase_food_respawn(tid: u32, tick: u32) {
         if atomicLoad(&food_flags[i]) == 0u { continue; }
 
         let base = i * FOOD_STATE_STRIDE;
-        var timer = food_state[base + F_RESPAWN_TIMER];
+        var timer = food_state[base + FOOD_RESPAWN_TIMER];
 
         // Initialize timer on first tick after consumption
         if timer <= 0.0 {
-            food_state[base + F_RESPAWN_TIMER] = FOOD_RESPAWN_TIME;
+            food_state[base + FOOD_RESPAWN_TIMER] = FOOD_RESPAWN_TIME;
             continue;
         }
 
@@ -23,7 +23,7 @@ fn phase_food_respawn(tid: u32, tick: u32) {
         let dt = wc_f32(WC_DT);
         timer -= dt;
         if timer > 0.0 {
-            food_state[base + F_RESPAWN_TIMER] = timer;
+            food_state[base + FOOD_RESPAWN_TIMER] = timer;
             continue;
         }
 
@@ -32,8 +32,8 @@ fn phase_food_respawn(tid: u32, tick: u32) {
         let terrain_half = wc_f32(WC_TERRAIN_HALF);
         let spawn_half = terrain_half - 5.0;
 
-        var new_x = food_state[base + F_POS_X];
-        var new_z = food_state[base + F_POS_Z];
+        var new_x = food_state[base + FOOD_POSITION_X];
+        var new_z = food_state[base + FOOD_POSITION_Z];
         var found = false;
 
         for (var attempt: u32 = 0u; attempt < FOOD_RESPAWN_ATTEMPTS; attempt++) {
@@ -58,10 +58,10 @@ fn phase_food_respawn(tid: u32, tick: u32) {
         let new_y = sample_height(new_x, new_z) + FOOD_HEIGHT_OFFSET;
 
         // Update food state
-        food_state[base + F_POS_X] = new_x;
-        food_state[base + F_POS_Y] = new_y;
-        food_state[base + F_POS_Z] = new_z;
-        food_state[base + F_RESPAWN_TIMER] = 0.0;
+        food_state[base + FOOD_POSITION_X] = new_x;
+        food_state[base + FOOD_POSITION_Y] = new_y;
+        food_state[base + FOOD_POSITION_Z] = new_z;
+        food_state[base + FOOD_RESPAWN_TIMER] = 0.0;
 
         // Mark food as available
         atomicStore(&food_flags[i], 0u);

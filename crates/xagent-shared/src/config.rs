@@ -7,15 +7,47 @@
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the brain's capacity constraints.
+///
+/// Each field is tagged with its relationship to the live GPU kernel:
+///
+/// - **active** — directly shapes kernel behavior every tick.
+/// - **locked (compile-time)** — must equal a compile-time constant baked
+///   into the Rust/WGSL brain (e.g. `xagent_brain::buffers::ENCODED_DIMENSION`).
+///   The value in this struct is a read-only echo; the kernel ignores any
+///   other value and `build_config_for` logs a warning on mismatch.
+/// - **proxy (metabolic)** — only feeds the per-tick metabolic cost formula;
+///   the kernel's actual structural capacity is a compile-time constant and
+///   does not change with this value.
+/// - **legacy** — carried through config/UI/evolution for backwards
+///   compatibility but currently has no kernel-side effect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrainConfig {
-    /// Maximum number of patterns the memory can hold.
+    /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
+    /// via `metabolic_drain_per_tick` and `physics_state[P_MEMORY_CAP]`. The
+    /// kernel's actual pattern-memory size is fixed at
+    /// `xagent_brain::buffers::MEMORY_CAP = 128`, independent of this value.
+    /// Mutated by evolution; clamped to `[1, 2048]` at breeding time.
     pub memory_capacity: usize,
-    /// Maximum number of patterns that can be recalled/compared per tick.
+    /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
+    /// via `metabolic_drain_per_tick` and `physics_state[P_PROCESSING_SLOTS]`.
+    /// The kernel's actual recall width is fixed at
+    /// `xagent_brain::buffers::RECALL_K = 16`, independent of this value.
+    /// Mutated by evolution; clamped to `[1, 128]` at breeding time.
     pub processing_slots: usize,
-    /// Resolution of the visual encoder (downsampled from raw vision).
+    /// **Legacy.** Currently has no effect in the GPU kernel — there is no
+    /// visual-encoder downsampling stage that reads this field. Preserved
+    /// through breeding and serialization for backwards compatibility with
+    /// existing saved configs; will be either wired to a real encoder or
+    /// removed in a future release. Not mutated by evolution.
     pub visual_encoding_size: usize,
-    /// Length of the internal representation vector.
+    /// **Locked (compile-time).** Length of the internal representation
+    /// vector. Must equal `xagent_brain::buffers::ENCODED_DIMENSION` — the
+    /// kernel uses that constant to size encoder weights, predictor weights,
+    /// pattern rows, and workgroup arrays, none of which are resizable at
+    /// runtime. The value in this struct is a read-only echo of that
+    /// constant; `build_config_for` writes `ENCODED_DIMENSION` into the GPU
+    /// config slot regardless and logs a warning if the config value
+    /// disagrees. Not mutated by evolution and not exposed in the UI.
     #[serde(alias = "representation_dim")]
     pub representation_dimension: usize,
     /// Base learning rate for association updates.
@@ -38,19 +70,28 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
-    /// Visual field width in pixels. Default 8.
+    /// Visual field width in pixels. Default 8. Odd × odd grids (e.g. 17×13)
+    /// give the best distal-food visibility — an odd height puts a ray row on
+    /// the horizon and an odd width a column straight ahead — but the default
+    /// stays 8×6 until the learner can act on directional vision (see
+    /// `docs/superpowers/specs/2026-06-10-learning-baseline.md`).
     #[serde(default = "default_vision_width", alias = "vision_w")]
     pub vision_width: u32,
-    /// Visual field height in pixels. Default 6.
+    /// Visual field height in pixels. Default 6. See `vision_width` for the
+    /// odd-grid range-visibility note.
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
-    /// Default 10.
+    /// Default 10, clamped to `[1, MAX_BRAIN_TICK_STRIDE]` in the UI. Combined
+    /// with `vision_stride` this sets the one-batch sensory lag — see
+    /// [`BrainConfig::sensory_lag_ticks`].
     #[serde(default = "default_brain_tick_stride")]
     pub brain_tick_stride: u32,
     /// Brain cycles between global passes (grid rebuild, collisions, vision).
     /// Higher = more brain throughput, less frequent vision updates.
-    /// Default 10.
+    /// Default 10, clamped to `[1, MAX_VISION_STRIDE]` in the UI. Combined with
+    /// `brain_tick_stride` this sets the one-batch sensory lag — see
+    /// [`BrainConfig::sensory_lag_ticks`].
     #[serde(default = "default_vision_stride")]
     pub vision_stride: u32,
     /// Multiplier for all energy costs (metabolic + movement). Default 0.5.
@@ -62,7 +103,7 @@ pub struct BrainConfig {
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
     /// Base movement speed (units per second). Default 20.0.
-    /// Heritable: mutated during breeding, clamped to [20.0, 100.0].
+    /// Heritable: mutated during breeding, clamped to [1.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
 }
@@ -170,7 +211,10 @@ pub struct FullConfig {
 /// Configuration for the evolution governor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernorConfig {
-    /// Number of agents per generation.
+    /// Number of agents per generation. The default is sized to the GPU
+    /// occupancy knee (see [`default_population_size`]); configs that omit the
+    /// field deserialize to that same knee.
+    #[serde(default = "default_population_size")]
     pub population_size: usize,
     /// Simulation ticks per generation before evaluation.
     pub tick_budget: u64,
@@ -198,6 +242,25 @@ pub struct GovernorConfig {
     pub momentum_decay: f32,
 }
 
+/// Default population (agents per generation).
+///
+/// The GPU occupancy knee — where useful throughput (agent-ticks/sec) peaks —
+/// is far higher (≈200 on the reference GPU, ~10× the raw GPU throughput of a
+/// handful of agents; reproduce with `--bench-agent-sweep`). The default is
+/// nonetheless kept small because every agent shares one world: at a large
+/// population they compete for the world's finite food supply, which collapses
+/// per-capita foraging and multiplies deaths-per-food. Enlarging the world so
+/// per-agent food is preserved (`world_size ∝ √population`) removes that
+/// competition — per-capita behavior then matches this default — but evaluating
+/// more genomes per generation buys no measured fitness gain (the limiter is
+/// learner strength, not search breadth) while costing proportionally more wall
+/// time per generation. Until genomes are evaluated in independent arenas with a
+/// world-size-invariant fitness, a small population is the validated,
+/// fastest-per-generation choice.
+fn default_population_size() -> usize {
+    10
+}
+
 fn default_mutation_strength() -> f32 {
     0.1
 }
@@ -207,7 +270,11 @@ fn default_eval_repeats() -> usize {
 }
 
 fn default_num_islands() -> usize {
-    3
+    // One lineage by default. With a small shared-world population the per-island
+    // round-robin split the generation's already-thin foraging signal across
+    // separate trees; concentrating it in a single lineage gives selection the
+    // full population to compare each generation.
+    1
 }
 
 fn default_migration_interval() -> u32 {
@@ -221,14 +288,14 @@ fn default_momentum_decay() -> f32 {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            population_size: 10,
+            population_size: default_population_size(),
             tick_budget: 1_000_000,
             elitism_count: 3,
             max_generations: 0,
             patience: 5,
             mutation_strength: 0.1,
             eval_repeats: 2,
-            num_islands: 3,
+            num_islands: 1,
             migration_interval: 5,
             momentum_decay: 0.9,
         }
@@ -260,6 +327,61 @@ impl Default for BrainConfig {
 }
 
 impl BrainConfig {
+    /// Maximum `brain_tick_stride` (physics ticks per brain+vision cycle). The
+    /// UI `DragValue` clamps to this; configs loaded from JSON or mutated
+    /// programmatically are expected to respect it as well.
+    pub const MAX_BRAIN_TICK_STRIDE: u32 = 32;
+
+    /// Maximum `vision_stride` (brain cycles between vision passes). The UI
+    /// `DragValue` clamps to this.
+    pub const MAX_VISION_STRIDE: u32 = 50;
+
+    /// Upper bound on the one-batch sensory lag, in physics ticks.
+    ///
+    /// # The sensory-lag invariant
+    ///
+    /// The brain reads vision and proprioception from `sensory_buffer`, which the
+    /// global vision pass refreshes *after* each fused-kernel batch completes (see
+    /// `kernel_tick.wgsl` and `GpuKernel::dispatch_batch`). One batch covers
+    /// `vision_stride * brain_tick_stride` physics ticks, so the brain always acts
+    /// on visual state that is exactly one batch — [`sensory_lag_ticks`] ticks —
+    /// stale. The lag is intentional and constant across stride settings.
+    ///
+    /// # Why it is bounded
+    ///
+    /// Credit assignment pairs a motor command with the gradient that command
+    /// produced (CONTRIBUTING.md → State Invariants: temporal alignment). The
+    /// larger the lag, the more the visual evidence at decision time
+    /// desynchronizes from the action's actual outcome. The credit-assignment
+    /// bugs unraveled during the circling investigation (issue #13) were rooted in
+    /// exactly this kind of temporal mismatch, so bounding the product acts as a
+    /// tripwire: if a future change grows the strides — or makes them dynamic —
+    /// past what the design was validated for, the bound trips instead of silently
+    /// resurrecting those bugs.
+    ///
+    /// The bound is the largest lag the UI clamps permit
+    /// (`MAX_BRAIN_TICK_STRIDE * MAX_VISION_STRIDE`), so every in-range config is
+    /// accepted and anything larger signals a path that bypassed those clamps.
+    ///
+    /// See `docs/reviews/2026-04-15-gemini-31-pro.md` ("The One-Batch Sensory
+    /// Lag") and issue #115.
+    ///
+    /// [`sensory_lag_ticks`]: BrainConfig::sensory_lag_ticks
+    pub const MAX_SENSORY_LAG_TICKS: u32 = Self::MAX_BRAIN_TICK_STRIDE * Self::MAX_VISION_STRIDE;
+
+    /// The one-batch sensory lag for this config, in physics ticks
+    /// (`vision_stride * brain_tick_stride`).
+    ///
+    /// Saturates to [`u32::MAX`] if the product overflows (e.g. a corrupt config),
+    /// so a caller comparing against
+    /// [`MAX_SENSORY_LAG_TICKS`](Self::MAX_SENSORY_LAG_TICKS) still rejects it
+    /// rather than wrapping to a small value. See the
+    /// [`MAX_SENSORY_LAG_TICKS`](Self::MAX_SENSORY_LAG_TICKS) docs for the full
+    /// invariant and the rationale for the bound.
+    pub fn sensory_lag_ticks(&self) -> u32 {
+        self.vision_stride.saturating_mul(self.brain_tick_stride)
+    }
+
     /// Minimal capacity — interesting for observing constraints.
     pub fn tiny() -> Self {
         Self {
@@ -382,5 +504,54 @@ mod tests {
     fn governor_config_tuned_defaults() {
         let config = GovernorConfig::default();
         assert_eq!(config.tick_budget, 1_000_000);
+    }
+
+    #[test]
+    fn sensory_lag_is_product_of_strides() {
+        let config = BrainConfig {
+            brain_tick_stride: 7,
+            vision_stride: 9,
+            ..BrainConfig::default()
+        };
+        assert_eq!(config.sensory_lag_ticks(), 63);
+    }
+
+    #[test]
+    fn default_sensory_lag_is_within_bound() {
+        let config = BrainConfig::default();
+        // Default 10 * 10 = 100 ticks, well under the bound.
+        assert_eq!(config.sensory_lag_ticks(), 100);
+        assert!(config.sensory_lag_ticks() <= BrainConfig::MAX_SENSORY_LAG_TICKS);
+    }
+
+    #[test]
+    fn sensory_lag_bound_tracks_stride_clamps() {
+        // These mirror the UI DragValue clamps in ui.rs — keep them in sync.
+        assert_eq!(BrainConfig::MAX_BRAIN_TICK_STRIDE, 32);
+        assert_eq!(BrainConfig::MAX_VISION_STRIDE, 50);
+        assert_eq!(BrainConfig::MAX_SENSORY_LAG_TICKS, 1600);
+        // A config at both clamp ceilings hits exactly the bound (inclusive).
+        let config = BrainConfig {
+            brain_tick_stride: BrainConfig::MAX_BRAIN_TICK_STRIDE,
+            vision_stride: BrainConfig::MAX_VISION_STRIDE,
+            ..BrainConfig::default()
+        };
+        assert_eq!(
+            config.sensory_lag_ticks(),
+            BrainConfig::MAX_SENSORY_LAG_TICKS
+        );
+    }
+
+    #[test]
+    fn sensory_lag_saturates_on_overflow() {
+        // A corrupt/hand-edited config must not wrap to a small lag and sneak past
+        // the bound; the product saturates so the comparison still rejects it.
+        let config = BrainConfig {
+            brain_tick_stride: u32::MAX,
+            vision_stride: 2,
+            ..BrainConfig::default()
+        };
+        assert_eq!(config.sensory_lag_ticks(), u32::MAX);
+        assert!(config.sensory_lag_ticks() > BrainConfig::MAX_SENSORY_LAG_TICKS);
     }
 }

@@ -6,6 +6,9 @@
 
 use glam::Vec3;
 use rand::Rng;
+use xagent_brain::buffers::{
+    FOOD_POSITION_X, FOOD_POSITION_Y, FOOD_POSITION_Z, FOOD_RESPAWN_TIMER, FOOD_STATE_STRIDE,
+};
 
 use super::biome::{BiomeMap, BiomeType};
 use super::terrain::TerrainData;
@@ -84,6 +87,41 @@ pub fn generate_food_mesh(items: &[FoodItem]) -> Mesh {
             &mut vertices,
             &mut indices,
             item.position,
+            0.6,
+            [0.1, 0.8, 0.2],
+        );
+    }
+
+    Mesh { vertices, indices }
+}
+
+/// Build the food mesh from the authoritative GPU food state
+/// (`GpuKernel::cached_food_state`: `[pos_x, pos_y, pos_z, respawn_timer]`
+/// per item). Items awaiting respawn (`respawn_timer > 0`) are skipped, so the
+/// main viewport shows exactly the food the simulation currently has — the same
+/// source and filter the mini-map already uses in `update_world_snapshot`.
+///
+/// This replaces meshing the CPU-side `food_items`, which is uploaded once at
+/// startup and never synced back from the GPU during a live run, so it always
+/// rendered the original food layout (eaten food never disappeared, respawned
+/// food never relocated). Reuses the already-downloaded `food_cache` readback —
+/// no new GPU work, no new readback, the same per-frame cube build as before.
+pub fn generate_food_mesh_from_state(food_state: &[f32]) -> Mesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    for item in food_state.chunks_exact(FOOD_STATE_STRIDE) {
+        if item[FOOD_RESPAWN_TIMER] > 0.0 {
+            continue;
+        }
+        append_cube(
+            &mut vertices,
+            &mut indices,
+            Vec3::new(
+                item[FOOD_POSITION_X],
+                item[FOOD_POSITION_Y],
+                item[FOOD_POSITION_Z],
+            ),
             0.6,
             [0.1, 0.8, 0.2],
         );
@@ -186,5 +224,65 @@ fn append_cube(
         });
 
         indices.extend_from_slice(&[fb, fb + 1, fb + 2, fb, fb + 2, fb + 3]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xagent_brain::buffers::FOOD_STATE_STRIDE;
+
+    /// One cube is `6 faces × 4 verts = 24` vertices and `6 × 6 = 36`
+    /// indices (see `append_cube`).
+    const VERTS_PER_CUBE: usize = 24;
+    const INDICES_PER_CUBE: usize = 36;
+
+    /// The authoritative GPU food state meshes only food that is currently
+    /// available — items with `respawn_timer > 0` (eaten, awaiting respawn)
+    /// must be skipped, matching the mini-map's `update_world_snapshot`
+    /// filter so the viewport stops showing eaten food.
+    #[test]
+    fn food_mesh_from_state_skips_respawning_items() {
+        // Two records of [pos_x, pos_y, pos_z, respawn_timer]: one available
+        // at (3, 1, -2), one awaiting respawn at (7, 1, 4).
+        let state = [
+            3.0_f32, 1.0, -2.0, 0.0, // available → one cube
+            7.0, 1.0, 4.0, 5.0, // respawning → skipped
+        ];
+        assert_eq!(state.len(), 2 * FOOD_STATE_STRIDE);
+
+        let mesh = generate_food_mesh_from_state(&state);
+
+        assert_eq!(
+            mesh.vertices.len(),
+            VERTS_PER_CUBE,
+            "exactly one cube (the available item) should be meshed"
+        );
+        assert_eq!(mesh.indices.len(), INDICES_PER_CUBE);
+
+        // Every vertex must lie within ±half-size (0.3) of the available
+        // item at (x=3, z=-2) and none near the respawning item at (7, 4).
+        for v in &mesh.vertices {
+            assert!(
+                (v.position[0] - 3.0).abs() <= 0.3 + 1e-6,
+                "vertex x {} not near available item x=3.0",
+                v.position[0]
+            );
+            assert!(
+                (v.position[2] - (-2.0)).abs() <= 0.3 + 1e-6,
+                "vertex z {} not near available item z=-2.0",
+                v.position[2]
+            );
+        }
+    }
+
+    /// When every item is awaiting respawn, the viewport mesh is empty —
+    /// no stale food cubes linger.
+    #[test]
+    fn food_mesh_from_state_empty_when_all_respawning() {
+        let state = [0.0_f32, 1.0, 0.0, 2.0, 5.0, 1.0, 5.0, 9.0];
+        let mesh = generate_food_mesh_from_state(&state);
+        assert!(mesh.vertices.is_empty());
+        assert!(mesh.indices.is_empty());
     }
 }

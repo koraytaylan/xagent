@@ -1,15 +1,30 @@
-//! The cognitive architecture for xagent — a GPU-resident predictive processing brain.
+//! The cognitive runtime for xagent — a GPU-resident predictive processing brain.
 //!
-//! All brain computation runs on GPU via 7 WGSL compute shaders.
-//! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge
-//! from the interaction of capacity constraints, prediction error, and
-//! homeostatic pressure.
+//! All simulation runs inside [`GpuKernel`]. A call to
+//! [`GpuKernel::dispatch_batch`] splits the requested ticks into one or more
+//! kernel-batches; each batch encodes a `prepare → kernel → global → vision`
+//! sequence into its own command buffer and submits it. The per-agent `kernel`
+//! pass is a fused WGSL compute stage that **internally** loops `vision_stride`
+//! cycles of physics, food detection, death/respawn, and all seven cooperative
+//! brain stages inside a single `dispatch_workgroups(agent_count, 1, 1)`. So
+//! each kernel-batch issues exactly one kernel dispatch — the `vision_stride`
+//! cycles are a `for` loop inside the shader, not separate dispatches — while a
+//! single `dispatch_batch` call may submit several command buffers (one per
+//! full kernel-batch, an optional shorter remainder kernel-batch when
+//! `brain_cycles % vision_stride != 0`, an optional physics-only remainder
+//! for the trailing `ticks_to_run % brain_tick_stride` ticks, and an
+//! opportunistic state-staging copy when a readback slot is free).
+//!
+//! No behavior is hardcoded. Fear, curiosity, habit, and attention emerge from
+//! the interaction of capacity constraints, prediction error, and homeostatic
+//! pressure.
 
+pub(crate) mod async_readback;
 pub mod buffers;
 pub mod gpu_kernel;
 
 pub use buffers::{AgentBrainState, BrainLayout};
-pub use gpu_kernel::{AgentTelemetry, GpuKernel};
+pub use gpu_kernel::{AgentTelemetry, BrainExecutionMode, GpuKernel, MAX_FUSED_BATCHES};
 
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.
 #[inline(always)]

@@ -4,6 +4,27 @@
 
 use egui_wgpu::ScreenDescriptor;
 
+/// Tooltip explaining that `memory_capacity` only affects metabolic cost.
+/// The kernel's actual pattern memory size is fixed at `MEMORY_CAP = 128`
+/// (see `xagent_brain::buffers`), so this value is a cost proxy, not a
+/// capacity dial. See issue #106.
+const MEMORY_CAPACITY_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick energy drain only. \
+     Kernel pattern memory is fixed at MEMORY_CAP = 128.";
+
+/// Tooltip explaining that `processing_slots` only affects metabolic cost.
+/// The kernel's actual recall width is fixed at `RECALL_K = 16`
+/// (see `xagent_brain::buffers`), so this value is a cost proxy, not a
+/// recall dial. See issue #106.
+const PROCESSING_SLOTS_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick energy drain only. \
+     Kernel recall width is fixed at RECALL_K = 16.";
+
+/// Tooltip explaining that `visual_encoding_size` has no current kernel use.
+/// The field is preserved through breeding and serialization but no shader
+/// reads it. See issue #106.
+const VISUAL_ENCODING_SIZE_TOOLTIP: &str =
+    "Legacy: currently unused. No kernel stage reads this value — it is \
+     preserved only for config backwards compatibility.";
+
 /// Tab types for the dock area.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
@@ -1163,14 +1184,36 @@ impl<'a> TabContext<'a> {
             });
             ui.add_space(4.0);
 
+            let series_data: [(&str, &[f32], egui::Color32); 5] = [
+                (
+                    "Energy",
+                    &effective_snap.energy_history,
+                    egui::Color32::from_rgb(80, 200, 80),
+                ),
+                (
+                    "Integrity",
+                    &effective_snap.integrity_history,
+                    egui::Color32::from_rgb(100, 150, 255),
+                ),
+                (
+                    "Pred. Error",
+                    &effective_snap.prediction_error_history,
+                    egui::Color32::from_rgb(200, 140, 60),
+                ),
+                (
+                    "Exploration",
+                    &effective_snap.exploration_rate_history,
+                    egui::Color32::from_rgb(180, 100, 220),
+                ),
+                (
+                    "Fatigue",
+                    &effective_snap.fatigue_history,
+                    egui::Color32::from_rgb(220, 80, 80),
+                ),
+            ];
+
             ui.horizontal(|ui| {
-                for (label, color) in [
-                    ("Energy", egui::Color32::from_rgb(80, 200, 80)),
-                    ("Integrity", egui::Color32::from_rgb(100, 150, 255)),
-                    ("Pred. Error", egui::Color32::from_rgb(200, 140, 60)),
-                    ("Exploration", egui::Color32::from_rgb(180, 100, 220)),
-                    ("Fatigue", egui::Color32::from_rgb(220, 120, 60)),
-                ] {
+                for &(label, _, color) in &series_data {
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
@@ -1209,29 +1252,7 @@ impl<'a> TabContext<'a> {
             }
 
             let window = *chart_window;
-            let series_data: [(&[f32], egui::Color32); 5] = [
-                (
-                    &effective_snap.energy_history,
-                    egui::Color32::from_rgb(80, 200, 80),
-                ),
-                (
-                    &effective_snap.integrity_history,
-                    egui::Color32::from_rgb(100, 150, 255),
-                ),
-                (
-                    &effective_snap.prediction_error_history,
-                    egui::Color32::from_rgb(200, 140, 60),
-                ),
-                (
-                    &effective_snap.exploration_rate_history,
-                    egui::Color32::from_rgb(180, 100, 220),
-                ),
-                (
-                    &effective_snap.fatigue_history,
-                    egui::Color32::from_rgb(220, 120, 60),
-                ),
-            ];
-            for &(full_data, color) in &series_data {
+            for &(_, full_data, color) in &series_data {
                 let start = full_data.len().saturating_sub(window);
                 let data = &full_data[start..];
                 if data.len() < 2 {
@@ -1346,28 +1367,28 @@ impl<'a> TabContext<'a> {
                 .show(ui, |ui| {
                     let b = &mut evo.edit_brain;
 
-                    ui.label("memory_capacity");
+                    ui.label("memory_capacity")
+                        .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                     let mut mc = b.memory_capacity as i32;
-                    ui.add(egui::DragValue::new(&mut mc).range(4..=8192).speed(1));
+                    ui.add(egui::DragValue::new(&mut mc).range(4..=8192).speed(1))
+                        .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                     b.memory_capacity = mc.max(1) as usize;
                     ui.end_row();
 
-                    ui.label("processing_slots");
+                    ui.label("processing_slots")
+                        .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                     let mut ps = b.processing_slots as i32;
-                    ui.add(egui::DragValue::new(&mut ps).range(1..=256).speed(1));
+                    ui.add(egui::DragValue::new(&mut ps).range(1..=256).speed(1))
+                        .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                     b.processing_slots = ps.max(1) as usize;
                     ui.end_row();
 
-                    ui.label("visual_encoding_size");
+                    ui.label("visual_encoding_size (legacy)")
+                        .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                     let mut ve = b.visual_encoding_size as i32;
-                    ui.add(egui::DragValue::new(&mut ve).range(2..=512).speed(1));
+                    ui.add(egui::DragValue::new(&mut ve).range(2..=512).speed(1))
+                        .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                     b.visual_encoding_size = ve.max(1) as usize;
-                    ui.end_row();
-
-                    ui.label("representation_dimension");
-                    let mut rd = b.representation_dimension as i32;
-                    ui.add(egui::DragValue::new(&mut rd).range(4..=128).speed(1));
-                    b.representation_dimension = rd.max(1) as usize;
                     ui.end_row();
 
                     ui.label("learning_rate");
@@ -1408,16 +1429,20 @@ impl<'a> TabContext<'a> {
                     b.vision_height = vision_height.max(2) as u32;
                     ui.end_row();
 
+                    // Clamp ranges come from BrainConfig so the UI ceiling stays
+                    // tied to the sensory-lag bound (BrainConfig::MAX_SENSORY_LAG_TICKS).
+                    let max_bts = xagent_shared::BrainConfig::MAX_BRAIN_TICK_STRIDE as i32;
+                    let max_vs = xagent_shared::BrainConfig::MAX_VISION_STRIDE as i32;
                     ui.label("brain_tick_stride");
                     let mut bts = b.brain_tick_stride as i32;
-                    ui.add(egui::DragValue::new(&mut bts).range(1..=32).speed(1));
-                    b.brain_tick_stride = bts.clamp(1, 32) as u32;
+                    ui.add(egui::DragValue::new(&mut bts).range(1..=max_bts).speed(1));
+                    b.brain_tick_stride = bts.clamp(1, max_bts) as u32;
                     ui.end_row();
 
                     ui.label("vision_stride");
                     let mut vs = b.vision_stride as i32;
-                    ui.add(egui::DragValue::new(&mut vs).range(1..=50).speed(1));
-                    b.vision_stride = vs.clamp(1, 50) as u32;
+                    ui.add(egui::DragValue::new(&mut vs).range(1..=max_vs).speed(1));
+                    b.vision_stride = vs.clamp(1, max_vs) as u32;
                     ui.end_row();
 
                     ui.label("metabolic_rate");
@@ -1441,7 +1466,7 @@ impl<'a> TabContext<'a> {
                     ui.label("movement_speed");
                     ui.add(
                         egui::DragValue::new(&mut b.movement_speed)
-                            .range(20.0..=100.0)
+                            .range(1.0..=100.0)
                             .speed(1.0)
                             .max_decimals(1),
                     );
@@ -1518,17 +1543,17 @@ impl<'a> TabContext<'a> {
                     .num_columns(2)
                     .spacing([20.0, 4.0])
                     .show(ui, |ui| {
-                        ui.label("memory_capacity");
+                        ui.label("memory_capacity")
+                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                         ui.monospace(format!("{}", cfg.memory_capacity));
                         ui.end_row();
-                        ui.label("processing_slots");
+                        ui.label("processing_slots")
+                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                         ui.monospace(format!("{}", cfg.processing_slots));
                         ui.end_row();
-                        ui.label("visual_encoding_size");
+                        ui.label("visual_encoding_size (legacy)")
+                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                         ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
-                        ui.label("representation_dimension");
-                        ui.monospace(format!("{}", cfg.representation_dimension));
                         ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1693,17 +1718,17 @@ impl<'a> TabContext<'a> {
                                     .num_columns(2)
                                     .spacing([20.0, 4.0])
                                     .show(ui, |ui| {
-                                        ui.label("memory_capacity");
+                                        ui.label("memory_capacity")
+                                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                                         ui.monospace(format!("{}", cfg.memory_capacity));
                                         ui.end_row();
-                                        ui.label("processing_slots");
+                                        ui.label("processing_slots")
+                                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                                         ui.monospace(format!("{}", cfg.processing_slots));
                                         ui.end_row();
-                                        ui.label("visual_encoding_size");
+                                        ui.label("visual_encoding_size (legacy)")
+                                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                                         ui.monospace(format!("{}", cfg.visual_encoding_size));
-                                        ui.end_row();
-                                        ui.label("representation_dimension");
-                                        ui.monospace(format!("{}", cfg.representation_dimension));
                                         ui.end_row();
                                         ui.label("learning_rate");
                                         ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1729,17 +1754,17 @@ impl<'a> TabContext<'a> {
                         .num_columns(2)
                         .spacing([20.0, 4.0])
                         .show(ui, |ui| {
-                            ui.label("memory_capacity");
+                            ui.label("memory_capacity")
+                                .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                             ui.monospace(format!("{}", cfg.memory_capacity));
                             ui.end_row();
-                            ui.label("processing_slots");
+                            ui.label("processing_slots")
+                                .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                             ui.monospace(format!("{}", cfg.processing_slots));
                             ui.end_row();
-                            ui.label("visual_encoding_size");
+                            ui.label("visual_encoding_size (legacy)")
+                                .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                             ui.monospace(format!("{}", cfg.visual_encoding_size));
-                            ui.end_row();
-                            ui.label("representation_dimension");
-                            ui.monospace(format!("{}", cfg.representation_dimension));
                             ui.end_row();
                             ui.label("learning_rate");
                             ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1911,17 +1936,17 @@ impl<'a> TabContext<'a> {
                     .num_columns(2)
                     .spacing([20.0, 4.0])
                     .show(ui, |ui| {
-                        ui.label("memory_capacity");
+                        ui.label("memory_capacity")
+                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
                         ui.monospace(format!("{}", cfg.memory_capacity));
                         ui.end_row();
-                        ui.label("processing_slots");
+                        ui.label("processing_slots")
+                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                         ui.monospace(format!("{}", cfg.processing_slots));
                         ui.end_row();
-                        ui.label("visual_encoding_size");
+                        ui.label("visual_encoding_size (legacy)")
+                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
                         ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
-                        ui.label("representation_dimension");
-                        ui.monospace(format!("{}", cfg.representation_dimension));
                         ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));

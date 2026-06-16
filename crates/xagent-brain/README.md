@@ -1,24 +1,23 @@
 # xagent-brain
 
-A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU.
+A general-purpose cognitive architecture based on **predictive processing**, running entirely on GPU inside a fused compute kernel.
 
-The brain crate is the decision-making core of each xagent. It has no hardcoded behaviors -- no "hunger module", no "fear module", no goal system. Everything the agent does emerges from a single loop and a single principle:
+The brain crate is the decision-making core of each xagent. It has no hardcoded goals or domain modules -- no "hunger module", no "fear module", no reward function. The one exception is a single reactive substrate: `brain_passes.wgsl` applies a hardcoded klinotaxis turn-gain modulator (`klinotaxis_factor`, scaled by `KLINOTAXIS_SENSITIVITY` in `common.wgsl`) that lets prediction-error gradient nudge turn direction before policy learning has anything to say. Beyond that scaffolding, everything the agent does emerges from a single loop and a single principle:
 
 > **Prediction error drives everything.**
 
 ```
 sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> learn+store
   |         |           |              |                |           |              |
-  |    feature_extract  |     habituate_homeo    recall_score  predict_and_act  learn_and_store
-  |      (pass 1)   encode      (pass 3)        recall_topk     (pass 6)        (pass 7)
-  |                 (pass 2)                    (pass 4 & 5)
-  |                                                                              |
-CPU uploads                                                              CPU reads back
-sensory frames                                                          motor commands
-(~52KB / 50 agents)                                                    (~800B / 50 agents)
+  |    coop_feature_    |    coop_habituate_      coop_recall_  coop_predict_  coop_learn_
+  |      extract     coop_     homeo              score+topk      and_act      and_store
+  |                  encode
+  |
+  | All seven coop_* stages run inside `kernel_tick.wgsl` (or `brain_tick.wgsl` for
+  | brain-only entry points). One queue.submit() runs N fused ticks per batch.
 ```
 
-The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. Between those two endpoints, 7 WGSL compute shaders run on GPU in a single `queue.submit()`. All persistent brain state lives permanently in GPU storage buffers -- there is no CPU-side brain state, no per-tick marshaling bottleneck. The only CPU<-->GPU transfers per tick are sensory input upload and motor command readback.
+`GpuKernel` is the sole runtime. There is no CPU-side brain object, no `Brain::tick(frame) -> MotorCommand` API, and no swappable cognitive-architecture trait. At startup the CPU uploads world geometry (terrain heightmap, biome grid, food positions/timers/consumed flags) and the initial per-agent physics rows; thereafter the only thing the CPU writes per dispatch is the world-config uniform (`start_tick`, `ticks_to_run`, `vision_stride`, `brain_tick_stride`, phase mask). `kernel.dispatch_batch(start_tick, ticks_to_run)` splits the requested ticks into full kernel-batches of `vision_stride * brain_tick_stride` ticks, plus a shorter remainder kernel-batch (`remainder_cycles * brain_tick_stride` ticks) when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder of `ticks_to_run % brain_tick_stride` ticks for the trailing fragment that does not fill a brain cycle. Each kernel-batch submits one command buffer running the four passes `prepare → kernel → global → vision`; the physics-only remainder submits a single physics pass with the brain/vision phases masked off. The brain stage in step 2 reads its sensory inputs from the `sensory_buffer` that the *previous* batch's vision pass wrote — a one-batch sensory lag that lets the costly global+vision work amortize over `vision_stride` brain cycles. All persistent brain state lives permanently in GPU storage buffers; the only data that crosses the bus while the simulation is running is whatever the CPU side asks the kernel to read back (typically position/vitals for the UI and a sampled telemetry snapshot for the selected agent).
 
 ---
 
@@ -29,16 +28,16 @@ The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. B
 3. [Data Flow Diagram](#3-data-flow-diagram)
 4. [GPU-Resident Design](#4-gpu-resident-design)
 5. [Buffer Layout](#5-buffer-layout)
-6. [Component Deep Dive: The 7-Pass Pipeline](#6-component-deep-dive-the-7-pass-pipeline)
-   - [6.1 Feature Extraction (Pass 1)](#61-feature-extraction-pass-1--feature_extractwgsl)
-   - [6.2 Encoding (Pass 2)](#62-encoding-pass-2--encodewgsl)
-   - [6.3 Habituation + Homeostasis (Pass 3)](#63-habituation--homeostasis-pass-3--habituate_homeowgsl)
-   - [6.4 Recall Scoring (Pass 4)](#64-recall-scoring-pass-4--recall_scorewgsl)
-   - [6.5 Recall Top-K Selection (Pass 5)](#65-recall-top-k-selection-pass-5--recall_topkwgsl)
-   - [6.6 Prediction + Action Selection (Pass 6)](#66-prediction--action-selection-pass-6--predict_and_actwgsl)
-   - [6.7 Learning + Memory Storage (Pass 7)](#67-learning--memory-storage-pass-7--learn_and_storewgsl)
+6. [Component Deep Dive: The 7 Brain Stages](#6-component-deep-dive-the-7-brain-stages)
+   - [6.1 Feature Extraction](#61-feature-extraction----coop_feature_extract)
+   - [6.2 Encoding](#62-encoding----coop_encode)
+   - [6.3 Habituation + Homeostasis](#63-habituation--homeostasis----coop_habituate_homeo)
+   - [6.4 Recall Scoring](#64-recall-scoring----coop_recall_score)
+   - [6.5 Recall Top-K Selection](#65-recall-top-k-selection----coop_recall_topk)
+   - [6.6 Prediction + Action Selection](#66-prediction--action-selection----coop_predict_and_act)
+   - [6.7 Learning + Memory Storage](#67-learning--memory-storage----coop_learn_and_store)
 7. [Emergent Phenomena](#7-emergent-phenomena)
-8. [Host API (gpu_brain.rs)](#8-host-api-gpu_brainrs)
+8. [Host API (gpu_kernel.rs)](#8-host-api-gpu_kernelrs)
 9. [Configuration (BrainConfig)](#9-configuration-brainconfig)
 10. [Testing](#10-testing)
 11. [Design Decisions](#11-design-decisions)
@@ -50,18 +49,20 @@ The brain receives packed `SensoryFrame` data and emits `MotorCommand` values. B
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-The `SensoryFrame` that arrives from the sandbox has named fields -- `vision`, `touch_contacts`, `energy_signal`. But the brain never sees those names. `buffers::pack_sensory_frame()` flattens *everything* into a single `[f32; 267]` array, and `feature_extract.wgsl` further compresses it to 217 features. From that point on, the brain operates on opaque numerical vectors. It has no concept of "vision," no awareness that it has "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+In the live runtime sensory features are produced on-GPU: the vision pass raycasts colors and depths into `sensory_buffer`, and the same vision pipeline's `phase_vision_senses` (`src/shaders/kernel/phase_vision.wgsl`) appends per-agent proprioception, interoception, energy/integrity deltas, and touch contacts in a fixed positional layout — touch slots are filled in 3×3-cell discovery order (food cells first, then agent cells) up to `MAX_TOUCH_CONTACTS`, with each contact encoded as `(direction_x, direction_z, normalized_proximity, surface_tag / 4.0)`. The CPU-side `buffers::pack_sensory_frame()` is only exercised by `buffers` tests; it does not feed the live brain. The brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` then projects `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual) into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The packing is not free of inductive bias — the modality layout, contact-cap, and `surface_tag` category channel are all hand-chosen priors — but they live entirely in shader/packer code, not as named fields the brain reads. (The `surface_tag` enum reserves `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, and `TOUCH_AGENT`, but `phase_vision_senses` currently emits only `TOUCH_FOOD` and `TOUCH_AGENT` contacts.) From `coop_feature_extract` onward, the brain operates on opaque numerical vectors: no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 ```
-World --> SensoryFrame --> pack_sensory_frame() --> [267 f32] --> feature_extract.wgsl --> [217 f32]
-               |                                                        |
-      Named fields like                                        Brain sees only a
-      "vision", "energy"                                       flat array<f32>
+World --> GPU vision pass --> sensory_buffer [267 f32] --> coop_feature_extract --> [265 f32]
+              |                                                  |
+     phase_vision_raycast +                            Brain sees only a
+     phase_vision_senses (GPU)                         flat array<f32>
+
+(the test-only pack_sensory_frame() mirrors the same [267 f32] layout — not in the live path)
 ```
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
 
-This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." No hardcoded categories like "food," "hazard," or "friend." The `SensoryFrame` struct with its named fields is engineering scaffolding -- it's the "body's" wiring that collects data from the simulated world. The packing function strips all that structure away. What remains is prediction + homeostatic gradient + experience, and from these three ingredients, all meaning is discovered.
+This is the fundamental difference from traditional AI systems. There are no reward functions hand-crafted by engineers. No labeled feature vectors telling the model "this is vision, this is hunger." But the picture is not bias-free either: the fixed modality layout and the preserved `surface_tag` channel are hand-chosen priors that ride along with the otherwise opaque vector. The honest summary is that the shader boundary — the GPU vision pass, with the test-only `pack_sensory_frame()` mirroring its layout — strips struct labels but keeps positional structure; what the brain then sees is a numerically flattened interface, not a pristine raw signal. What remains downstream is prediction + homeostatic gradient + experience, and from these ingredients combined with that bounded prior, all meaning is discovered.
 
 ---
 
@@ -82,7 +83,7 @@ In this crate, prediction error is not just one signal among many -- it is the *
 - **Modulates learning rates**: higher error --> faster weight updates in predictor and encoder
 - **Drives exploration**: high error signals novelty --> the action policy increases exploration noise
 - **Reinforces memory**: patterns that co-occur with low prediction error get strengthened
-- **Guides prospection**: prediction confidence (inverse of error) controls how much weight the predicted future carries in action selection
+- **Tunes its own influence**: the predictor's recalled-context weight adapts toward whatever blend of memory and projection keeps the error low
 
 There is no separate reward signal. There is no loss function designed by a human. The agent learns because its predictions are wrong, and prediction error is metabolically expensive.
 
@@ -90,7 +91,7 @@ There is no separate reward signal. There is no loss function designed by a huma
 
 The brain has no concept of "good" or "bad" built in. Instead, `habituate_homeo.wgsl` tracks whether internal variables (energy, physical integrity) are trending toward or away from stability. This gradient -- positive means improving, negative means worsening -- modulates:
 
-- **Credit assignment**: the `predict_and_act.wgsl` pass uses the homeostatic gradient to assign credit/blame to recent actions in the 64-tick history ring
+- **Credit assignment**: the urgency-amplified per-tick homeostatic delta is the reward in a TD(λ) actor-critic — a value head learns the discounted return, and its TD error credits recent actions through per-dimension eligibility traces
 - **Urgency**: when energy or integrity drops critically low, urgency suppresses exploration in favor of exploitation
 
 This is analogous to how biological organisms don't have explicit goals -- they have homeostatic set points, and deviations from those set points drive behavior.
@@ -100,7 +101,7 @@ This is analogous to how biological organisms don't have explicit goals -- they 
 The brain has finite resources:
 - A fixed-size memory (`MEMORY_CAP = 128` patterns per agent)
 - A per-tick recall budget (`RECALL_K = 16` top patterns)
-- A fixed-dimension representation space (`DIM = 32`)
+- A fixed-dimension representation space (`ENCODED_DIMENSION = 128`)
 
 These constraints aren't limitations to be engineered around -- they are **generative**. Because the brain can't attend to everything, it must select. Because memory is finite, it must forget. Because the representation is compressed, it must abstract. These constraints give rise to attention, habit formation, chunking, and other cognitive phenomena without any of them being explicitly programmed.
 
@@ -110,38 +111,46 @@ These constraints aren't limitations to be engineered around -- they are **gener
 
 ```
 xagent-brain/src/
-  lib.rs              -- Re-exports, fast_tanh utility, BrainTelemetry, AgentTelemetry
-  gpu_brain.rs        -- GpuBrain struct, wgpu device/queue, 12 GPU buffers,
-                         7 compute pipelines, tick/submit/collect API,
-                         state read/write, death_signal, resize
-  gpu_kernel.rs  -- GpuKernel: fused dispatch, physics+brain in one kernel,
-                         async state readback, per-agent telemetry readback
-  buffers.rs          -- All buffer layout constants, sensory packing,
-                         initialization functions, AgentBrainState type
+  lib.rs              -- Re-exports: GpuKernel, AgentTelemetry, AgentBrainState,
+                         BrainLayout, fast_tanh, BrainTelemetry (stub for UI)
+  gpu_kernel.rs       -- GpuKernel: fused dispatch, shader composition,
+                         async state/telemetry readback, state read/write
+  async_readback.rs   -- ReadbackTracker state machine (non-blocking collection
+                         of mapped staging buffers)
+  buffers.rs          -- Buffer layout constants, sensory packing,
+                         initialization functions, AgentBrainState, BrainLayout
 
-xagent-brain/src/shaders/        -- 7-pass individual shaders (used by GpuBrain)
-  feature_extract.wgsl   -- Pass 1: raw sensory --> features
-  encode.wgsl            -- Pass 2: features --> encoded state
-  habituate_homeo.wgsl   -- Pass 3: habituation + homeostasis
-  recall_score.wgsl      -- Pass 4: cosine similarity scoring
-  recall_topk.wgsl       -- Pass 5: top-K pattern selection
-  predict_and_act.wgsl   -- Pass 6: prediction, credit, policy, fatigue
-  learn_and_store.wgsl   -- Pass 7: weight updates, memory store, decay
-
-xagent-brain/src/shaders/kernel/   -- Fused kernel shaders (used by GpuKernel)
-  common.wgsl            -- Shared constants and world-config layout
-  kernel_tick.wgsl         -- Fused per-agent kernel: physics + food detect +
-                            death/respawn + all 7 brain passes, looped over
-                            vision_stride cycles (dispatch: agent_count,1,1)
-  global_tick.wgsl       -- Grid rebuild + collision pass (dispatch: 1,1,1)
+xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
+  common.wgsl                   -- Shared constants, override cascade
+                                   (VISION_W/VISION_H), utility functions
+  brain_passes.wgsl             -- Cooperative brain-stage functions:
+                                   coop_feature_extract, coop_encode,
+                                   coop_habituate_homeo, coop_recall_score,
+                                   coop_recall_topk, coop_predict_and_act,
+                                   coop_learn_and_store
+  brain_tick.wgsl               -- Brain-only entry point (one tick, no physics).
+                                   Composed with brain_passes for the `brain`
+                                   pipeline used by unit tests.
+  kernel_tick.wgsl              -- Per-agent fused kernel entry. Composed with
+                                   brain_passes for the `kernel` pipeline. Loops
+                                   over vision_stride cycles internally.
+                                   Dispatch: (agent_count, 1, 1), 256 threads/workgroup.
+  global_tick.wgsl              -- Spatial-grid rebuild (food + agent), food
+                                   respawn/timer updates, and pairwise agent
+                                   collision resolution.
+                                   Dispatch: (1, 1, 1).
+  physics_tick.wgsl             -- Physics-only stride entry.
+  vision_tick.wgsl              -- Vision-only stride entry.
+  phase_*.wgsl                  -- Reusable phase fragments concatenated into
+                                   the entry shaders at composition time
+                                   (clear, food_grid, physics, death,
+                                   food_detect, food_respawn, agent_grid,
+                                   collision, vision, prepare_dispatch).
+  bitonic_sort_subgroup.wgsl    -- Subgroup-accelerated top-K sort, spliced in
+                                   when `wgpu::Features::SUBGROUP` is supported.
 ```
 
-Two dispatch modes are available:
-
-- **GpuBrain** orchestrates the 7 individual shader dispatches per tick, one thread per agent. Simple and inspectable.
-- **GpuKernel** fuses all per-agent computation into a single dispatch with 256 threads per agent workgroup. A separate global pass handles grid rebuild, collisions, and vision. The `vision_stride` parameter controls how many brain+physics cycles run between global passes (default 10). This achieves 60,000+ brain ticks/second at 10 agents — a 100× improvement.
-
-Both modes produce identical simulation results — the fused kernel is a performance optimization, not a behavioral change.
+`GpuKernel` is the only runtime. There is no alternative `GpuBrain` mode and no per-pass dispatch path — the seven cooperative brain functions in `brain_passes.wgsl` are inlined into a single fused entry point at pipeline creation. A single `dispatch_batch(start_tick, ticks_to_run)` call splits the work into full kernel-batches of `vision_stride * brain_tick_stride` ticks, plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch encodes its own command buffer with `prepare → kernel → global → vision` and submits it (`queue.submit()` once per batch); the physics-only remainder is a separate submit that masks brain/vision off. A separate opportunistic staging copy is appended. Per-agent state never leaves GPU memory unless the CPU explicitly requests a readback.
 
 ---
 
@@ -149,129 +158,126 @@ Both modes produce identical simulation results — the fused kernel is a perfor
 
 ```
                      ┌──────────────────────────────────────────────────────────────────┐
-                     │                    GPU: 7 compute passes                         │
+                     │  GpuKernel — one kernel-batch (queue.submit() x 1)               │
                      └──────────────────────────────────────────────────────────────────┘
 
-SensoryFrame                                                                  MotorCommand
-(packed on CPU                                                                (forward, turn)
- 267 f32/agent)                                                                     |
-      |                                                                             |
-      v                                                                             |
-┌─────────────┐  features   ┌──────────┐  encoded   ┌──────────────────┐            |
-│   Pass 1:   │  (217 f32)  │  Pass 2: │  (32 f32)  │     Pass 3:      │            |
-│   Feature   │────────────>│  Encode  │───────────>│  Habituate +     │            |
-│   Extract   │             │          │            │  Homeostasis     │            |
-└─────────────┘             └──────────┘            └────────┬─────────┘            |
-                                                  habituated |  homeo_out           |
-                                                  (32 f32)   |  (6 f32)             |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 4:      │             |
-                                                    │  Recall Score   │             |
-                                                    │ (cosine sim x   │             |
-                                                    │  128 patterns)  │             |
-                                                    └────────┬────────┘             |
-                                                   sims(128) |                      |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 5:      │             |
-                                                    │  Recall Top-K   │             |
-                                                    │ (best 16 of 128)│             |
-                                                    └────────┬────────┘             |
-                                              recall_idx(17) |                      |
-                                                             v                      |
-                                                    ┌─────────────────┐             |
-                                                    │    Pass 6:      │     decision|
-                                                    │  Predict + Act  │─────────────┘
-                                                    │ (predict, credit│     (motor +
-                                                    │  policy, fatigue│      prediction +
-                                                    │  exploration)   │      credit signal)
-                                                    └────────┬────────┘
-                                                   decision  |
-                                                             v
-                                                    ┌─────────────────┐
-                                                    │    Pass 7:      │
-                                                    │  Learn + Store  │
-                                                    │ (grad descent,  │
-                                                    │  Hebbian credit,│
-                                                    │  memory reinf., │
-                                                    │  pattern store, │
-                                                    │  decay)         │
-                                                    └─────────────────┘
+                                  uniform: WorldConfig (CPU → GPU, once per kernel-batch)
+                                          │
+                                          v
+                              ┌───────────────────────────┐
+                              │  prepare_dispatch.wgsl    │   dispatch: (1, 1, 1)
+                              │  (indirect-dispatch args) │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  kernel_tick.wgsl         │   dispatch: (agent_count, 1, 1)
+                              │  per-agent fused pass     │   256 threads per workgroup
+                              │  ─ loops vision_stride    │
+                              │    cycles ─────────────▶  │
+                              │      ┌── per cycle ──┐   │
+                              │      │  physics      │   │     reads sensory_buf written
+                              │      │  food_detect  │   │     by the *previous* batch
+                              │      │  death/respawn│   │     (one-batch sensory lag)
+                              │      │  brain (7-stg)│   │
+                              │      └───────────────┘   │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  global_tick.wgsl         │   dispatch: (1, 1, 1)
+                              │  grid rebuild (food+agent)│
+                              │  food respawn/timers      │
+                              │  pairwise collisions      │
+                              └─────────────┬─────────────┘
+                                            v
+                              ┌───────────────────────────┐
+                              │  vision_tick.wgsl         │   dispatch: (agent_count, 1, 1)
+                              │  raycasts terrain/food/   │
+                              │  agents → sensory_buf     │
+                              └───────────────────────────┘
 
-  Persistent GPU buffers (live across ticks):
-  ─── brain_state_buf ───  8,468 f32/agent  (encoder weights, predictor, habituation, homeo, action, fatigue)
-  ─── pattern_buf ────────  5,251 f32/agent  (128 patterns: states, norms, reinforcement, motor, meta, active)
-  ─── history_buf ────────  2,370 f32/agent  (64-entry action history ring: motor+state snapshots)
+  Persistent GPU buffers (live across ticks; sizes shown for default 8×6 vision, `ENCODED_DIMENSION = 128`):
+  ─── brain_state_buf ────  `BrainLayout::brain_stride` (51,898 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces)
+  ─── pattern_buf ────────  `PATTERN_STRIDE` (17,539 f32/agent)            (128 patterns: states, norms, reinforcement, motor, meta, active)
+  ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
+  ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
+  ─── sensory_buf ────────     per-agent     (raw vision + non-visual features written by vision pass)
+  ─── decision_buf ───────     per-agent     (motor + prediction error + credit, written by brain stage 6)
 
-  Transient GPU buffers (overwritten each tick):
-  sensory, features, encoded, habituated, homeo_out, similarities, recall_buf, decision
+  Transient GPU buffers (overwritten each cycle):
+  features, encoded, habituated, homeo_out, similarities, recall_buf
 ```
 
-### Tick Execution Order
+### Brain Stages Inside the Fused Kernel
+
+The `kernel_tick.wgsl` per-agent pass runs the seven cooperative brain functions back-to-back, all on the same workgroup and same agent slot. They are no longer separate dispatches:
 
 ```
-1. CPU packs SensoryFrames into flat f32 arrays (pack_sensory_frame)
-2. CPU uploads sensory buffer to GPU                           (~52KB for 50 agents)
-3. GPU Pass 1: feature_extract   (267 f32 --> 217 f32)        one thread per agent
-4. GPU Pass 2: encode            (217 f32 --> 32 f32)         one thread per agent
-5. GPU Pass 3: habituate_homeo   (habituation EMA + homeostatic gradient/urgency)
-6. GPU Pass 4: recall_score      (cosine sim vs 128 patterns)
-7. GPU Pass 5: recall_topk       (top-16 selection, metadata update)
-8. GPU Pass 6: predict_and_act   (prediction error, credit assignment, policy eval,
-                                  prospection, memory blend, exploration noise,
-                                  motor fatigue, history recording)
-9. GPU Pass 7: learn_and_store   (predictor gradient descent, encoder Hebbian credit,
-                                  memory reinforcement, pattern storage, decay)
-10. CPU reads back motor commands from decision buffer         (~800B for 50 agents)
+brain cycle (executed vision_stride times per kernel-batch):
+  1. coop_feature_extract   sensory_buf (`SENSORY_STRIDE`, 267 f32 for 8×6) → features (`BrainLayout::feature_count` = `VISION_RAYS * 5 + 25`, 265 f32 for 8×6)
+  2. coop_encode            features → encoded (`ENCODED_DIMENSION` = 128 f32)
+  3. coop_habituate_homeo   habituation EMA + homeostatic gradient/urgency
+  4. coop_recall_score      cosine similarity vs 128 patterns
+  5. coop_recall_topk       top-16 selection (subgroup or workgroup bitonic sort)
+  6. coop_predict_and_act   prediction error, credit, policy, fatigue, exploration
+                              → writes motor into decision_buf (consumed by the
+                                physics step in the next kernel cycle)
+  7. coop_learn_and_store   predictor gradient, Hebbian credit, memory reinforcement,
+                              pattern storage, decay
 ```
 
 ---
 
 ## 4. GPU-Resident Design
 
-The previous CPU architecture allocated brain state as heap objects. The GPU rewrite moves **all** brain state permanently onto GPU storage buffers. This eliminates the CPU<-->GPU marshaling bottleneck that would otherwise dominate per-tick cost.
+`GpuKernel` keeps **all** simulation state permanently on the GPU. The world geometry, food state, and per-agent physics rows live in GPU storage buffers; the CPU populates them through `upload_world` / `upload_agents` and then leaves them alone while batches run. This eliminates the CPU↔GPU marshalling bottleneck that would otherwise dominate per-tick cost.
 
-### Per-Tick I/O Budget
+### Per-Batch I/O Budget
 
-| Direction | What | Size (50 agents) |
-|-----------|------|-------------------|
-| CPU --> GPU | Sensory frames | ~52 KB (`50 * 267 * 4 bytes`) |
-| GPU --> CPU | Motor commands | ~800 B (`50 * 4 * 4 bytes`) |
-| GPU only | Brain state, patterns, history | 0 bytes transferred |
+A `dispatch_batch(start_tick, ticks_to_run)` call splits the work into one or more kernel-batches, each its own command buffer + `queue.submit()`. The CPU side only crosses the bus when:
 
-The asymmetry is extreme and intentional: sensory data is the only thing the GPU doesn't already have, and motor commands are the only thing the CPU needs back. Everything else -- the 8,468 f32s of brain state per agent, the 5,251 f32s of pattern memory, the 2,370 f32s of action history -- stays on GPU permanently.
+| Direction | When | What |
+|-----------|------|------|
+| CPU → GPU | At init / when terrain or food layout changes | `upload_world`: terrain heightmap, biome grid, food positions/consumed/timers |
+| CPU → GPU | At spawn / on evolution offspring | `upload_agents`: initial physics rows |
+| CPU → GPU | Once per kernel-batch | `upload_world_config`: world-config uniform with `start_tick`, `ticks_to_run`, `vision_stride`, `brain_tick_stride`, phase mask |
+| CPU → GPU | On heritable-config edit | `write_agent_state` / `write_agent_heritable_config` |
+| GPU → CPU | When `request_state_snapshot` has staged data and `try_collect_state_snapshot` is called | Position, vitals, motor cache, exploration/fatigue, death counts |
+| GPU → CPU | When `try_collect_telemetry` is called | One agent's vision + decision snapshot (selected agent only) |
+| GPU → CPU | When `try_collect_agent_state` is called | One agent's full `AgentBrainState` (for inheritance, debugging) |
+| GPU only | Per-tick simulation | Brain state, pattern memory, physics state, food state, **sensory features** (written by the vision pass into `sensory_buf`) |
 
-### Double-Buffered Readback
+The asymmetry is intentional. Sensory frames are not packed and uploaded per tick: the vision pass raycasts on the GPU from terrain/biome/food/agent buffers and writes the feature layout directly into `sensory_buf`. The brain stage in the next kernel-batch reads its inputs from that same `sensory_buf` — a one-batch sensory lag that amortizes the cost of vision + grid rebuild over `vision_stride` brain cycles.
 
-`GpuBrain` supports two usage patterns:
+### Non-Blocking Readback
 
-1. **Synchronous** (`tick(&frames) -> Vec<MotorCommand>`): Upload, dispatch all 7 passes, read back motor commands. Simple but blocks CPU until GPU finishes.
+`GpuKernel` never blocks for state. Three independent staging-buffer tracks (`state_readback`, `telemetry_readback`, `agent_state_readback`), each driven by an `async_readback::ReadbackTracker`, fence pending readbacks against GPU completion. The CPU calls `try_collect_*` each frame; if the buffer hasn't been mapped yet, the call returns without producing data and the UI uses the previous frame's cached snapshot. This decouples render-loop pacing from GPU completion time.
 
-2. **Asynchronous** (`submit(&frames)` / `collect() -> Vec<MotorCommand>`): Pipeline the motor readback with the next frame's sensory packing. Two staging buffers alternate: while one is being filled by the GPU, the other is mapped for CPU reading. This hides readback latency behind computation.
+`read_full_state_blocking` and `read_agent_telemetry_blocking` exist for tests and one-shot debugging — production code uses the non-blocking path.
 
 ### Buffer Allocation
 
-All buffers are created at initialization (`GpuBrain::new`) with sizes proportional to agent count. The 4 persistent buffers use `STORAGE | COPY_SRC | COPY_DST` flags (allowing shader access plus CPU read/write for state I/O). The 8 transient buffers use `STORAGE` only.
+All buffers are created at `GpuKernel::new` with sizes proportional to `agent_count` and the vision dimensions encoded in `BrainLayout`. Persistent storage buffers (`brain_state`, `pattern_buffer`, `physics_state`, `food_state`, sensory) use `STORAGE | COPY_SRC | COPY_DST`, and transient working buffers use `STORAGE` only; the double-buffered world-config and the heritable brain-config are uniform buffers (`UNIFORM | COPY_DST`). Staging buffers for readback use `MAP_READ | COPY_DST` and are sized for the worst-case message (full state for `state_readback`, one agent's slice for the others).
 
 ---
 
 ## 5. Buffer Layout
 
-All buffer offsets and stride constants are defined once in `buffers.rs` and auto-generated into WGSL via `wgsl_constants()`. This function emits a constants header that is prepended to every shader at pipeline creation time. The constants include all offsets, strides, and utility functions (`fast_tanh`, `pcg_hash`, `rand_f32`, `rand_normal`). Because both Rust and WGSL code derive from the same source of truth, offset mismatch bugs are impossible.
+Buffer offsets, strides, and dimension constants live in two coordinated source-of-truth slots: the Rust side in `crates/xagent-brain/src/buffers.rs` (`BrainLayout`, `PHYS_STRIDE`, `PATTERN_STRIDE`, the `O_*` offset constants, `ENCODED_DIMENSION`, `MEMORY_CAP`, …), and the WGSL side in `crates/xagent-brain/src/shaders/kernel/common.wgsl` as `override` constants (`override VISION_W: u32 = 8u; override SENSORY_STRIDE: u32 = …; override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION; …`). At pipeline creation time `gpu_kernel.rs` concatenates `common.wgsl` with the relevant phase fragments via `include_str!` and sets the matching `override` values on the `ComputePipelineDescriptor`, so the WGSL constants resolve to whatever the live `BrainLayout` produced from the configured vision dimensions.
 
 ### Core Dimensions
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `DIM` | 32 | Internal representation dimensionality |
-| `FEATURE_COUNT` | 217 | Extracted feature count (192 RGBA + 25 non-visual) |
+| Constant | Value (default 8×6) | Description |
+|----------|--------------------:|-------------|
+| `ENCODED_DIMENSION` | 128 | Internal encoded state dimensionality (`crates/xagent-brain/src/buffers.rs`) |
+| `BrainLayout::feature_count` | 265 = `VISION_RAYS * 5 + 25` | Feature vector size (192 RGBA + 48 depth + 25 derived non-visual; scales with `VISION_W`/`VISION_H`) |
 | `MEMORY_CAP` | 128 | Maximum patterns per agent |
 | `RECALL_K` | 16 | Top-K recalled patterns per tick |
-| `ACTION_HISTORY_LEN` | 64 | Credit assignment lookback window |
-| `ERROR_HISTORY_LEN` | 128 | Prediction error ring buffer size |
+| `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
+| `TD_DISCOUNT` / `TD_LAMBDA` | 0.97 / 0.9 | TD(λ) credit horizon and trace decay |
 
-### Sensory Input Layout (CPU --> GPU)
+The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 51,898` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
+
+### Sensory Buffer Layout (GPU-produced)
 
 ```
 [  192 RGBA vision  |  48 depth  |  vel(3)  fac(3)  ang(1)  e(1)  i(1)  ed(1)  id(1)  touch(16)  ]
@@ -279,50 +285,20 @@ All buffer offsets and stride constants are defined once in `buffers.rs` and aut
  0                   192          240                                                              267
 ```
 
-Total: `SENSORY_STRIDE = 267` f32 per agent. `pack_sensory_frame()` handles the CPU-side packing, including sorting touch contacts by intensity and zero-padding.
+Total for the default 8×6 vision: `SENSORY_STRIDE = 267` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, and up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
 
-### Brain State Buffer (per agent: `BRAIN_STRIDE = 8,468` f32)
+### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,898 f32 for the default 8×6 layout)
 
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Encoder weights | `O_ENC_WEIGHTS = 0` | 6,944 | `FEATURE_COUNT * DIM` weight matrix |
-| Encoder biases | `O_ENC_BIASES = 6944` | 32 | Per-dimension bias |
-| Predictor weights | `O_PRED_WEIGHTS = 6976` | 1,024 | `DIM * DIM` prediction matrix |
-| Predictor context weight | `O_PRED_CTX_WT = 8000` | 1 | Recall blending strength |
-| Prediction error ring | `O_PRED_ERR_RING = 8001` | 128 | Error history |
-| Habituation EMA | `O_HAB_EMA = 8131` | 32 | Per-dim change tracking |
-| Habituation attenuation | `O_HAB_ATTEN = 8163` | 32 | Per-dim dampening factor |
-| Previous encoded state | `O_PREV_ENCODED = 8195` | 32 | For habituation delta |
-| Homeostasis state | `O_HOMEO = 8227` | 6 | `[grad_fast, grad_med, grad_slow, urgency, prev_energy, prev_integrity]` |
-| Action forward weights | `O_ACT_FWD_WTS = 8233` | 32 | Policy weights for forward |
-| Action turn weights | `O_ACT_TURN_WTS = 8265` | 32 | Policy weights for turn |
-| Action biases | `O_ACT_BIASES = 8297` | 2 | `[fwd_bias, turn_bias]` |
-| Exploration rate | `O_EXPLORATION_RATE = 8299` | 1 | Current exploration level |
-| Fatigue rings | `O_FATIGUE_FWD_RING = 8300` | 128 | `[fwd(64), turn(64)]` |
-| Fatigue state | `O_FATIGUE_CURSOR = 8428` | 3 | `[cursor, factor, length]` |
-| Previous prediction | `O_PREV_PREDICTION = 8431` | 32 | For next-tick error |
-| Tick count | `O_TICK_COUNT = 8463` | 1 | Agent-local tick counter |
-| Heritable config | `O_HAB_SENSITIVITY = 8464` | 4 | `[hab_sens, max_curiosity, fatigue_recovery, fatigue_floor]` |
+Regions (in offset order; concrete offsets are dimension-dependent and emitted by `BrainLayout` — see `crates/xagent-brain/src/buffers.rs`):
 
-### Pattern Memory Buffer (per agent: `PATTERN_STRIDE = 5,251` f32)
+- `O_ENCODER_WEIGHTS` — `feature_count * ENCODED_DIMENSION` (= 33,920 for 8×6) encoder weight matrix.
+- `O_ENCODER_BIASES` — `ENCODED_DIMENSION` (128) per-dimension bias.
+- `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
+- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, per-agent `movement_speed`, and the TD critic state — value weights (`O_VALUE_WEIGHTS`, `ENCODED_DIMENSION`) + bias + previous value, the three eligibility-trace vectors (`O_TRACE_CRITIC` / `O_TRACE_FWD` / `O_TRACE_TURN`, `ENCODED_DIMENSION` each), and the three scalar trace biases (`O_TRACE_BIASES`).
 
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Pattern states | `O_PAT_STATES = 0` | 4,096 | `128 * 32` encoded state per pattern |
-| Norms | `O_PAT_NORMS = 4096` | 128 | Cached L2 norm per pattern |
-| Reinforcement | `O_PAT_REINF = 4224` | 128 | Strength (decays over time) |
-| Motor context | `O_PAT_MOTOR = 4352` | 384 | `[forward, turn, outcome_valence] * 128` |
-| Metadata | `O_PAT_META = 4736` | 384 | `[created_at, last_accessed, activation_count] * 128` |
-| Active flags | `O_PAT_ACTIVE = 5120` | 128 | `1.0` = active, `0.0` = empty |
-| Bookkeeping | `O_ACTIVE_COUNT = 5248` | 3 | `[active_count, min_reinf_idx, last_stored_idx]` |
+### Pattern Memory Buffer (per agent: `PATTERN_STRIDE` = 17,539 f32, a fixed constant)
 
-### Action History Buffer (per agent: `HISTORY_STRIDE = 2,370` f32)
-
-| Region | Offset | Size | Purpose |
-|--------|--------|------|---------|
-| Motor ring | `O_MOTOR_RING = 0` | 320 | `[forward, turn, tick, gradient, _pad] * 64` |
-| State ring | `O_STATE_RING = 320` | 2,048 | `[encoded_state(32)] * 64` snapshots |
-| Bookkeeping | `O_HIST_CURSOR = 2368` | 2 | `[cursor, length]` |
+Stores `MEMORY_CAP` (= 128) patterns. Regions: `O_PAT_STATES` (`MEMORY_CAP * ENCODED_DIMENSION` encoded-space states), `O_PAT_NORMS` (cached L2 norms), `O_PAT_REINF` (per-pattern reinforcement that decays over time), `O_PAT_MOTOR` (`[forward, turn, outcome_valence] * MEMORY_CAP`), `O_PAT_META` (`[created_at, last_accessed, activation_count] * MEMORY_CAP`), `O_PAT_ACTIVE` (active flag — recall is gated here, not on `O_PAT_REINF`), and `O_ACTIVE_COUNT` bookkeeping. The `O_PAT_*` offsets are fixed constants (derived from `MEMORY_CAP` and `ENCODED_DIMENSION`, independent of vision dimensions); see `crates/xagent-brain/src/buffers.rs`.
 
 ### Integer Storage Convention
 
@@ -330,57 +306,59 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ---
 
-## 6. Component Deep Dive: The 7-Pass Pipeline
+## 6. Component Deep Dive: The 7 Brain Stages
 
-### 6.1 Feature Extraction (Pass 1) -- `feature_extract.wgsl`
+> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The canonical dimensions and offsets are emitted by `BrainLayout` in `crates/xagent-brain/src/buffers.rs` and surfaced to WGSL via `common.wgsl`; for the default 8×6 vision they evaluate to `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = 265`. Any older `DIM = 32` / `FEATURE_COUNT = 217` literals in the §§6.1–6.7 prose are legacy — defer to `buffers.rs` and `common.wgsl` whenever the numbers disagree.
 
-**What it does**: Transforms raw sensory input (267 f32 per agent) into a feature vector (217 f32 per agent). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
+### 6.1 Feature Extraction -- `coop_feature_extract`
+
+**What it does**: Transforms raw sensory input (`SENSORY_STRIDE = 267` f32: 192 color + 48 depth + 27 non-visual) into the brain feature vector (`FEATURE_COUNT = 265` f32: 192 color + 48 depth + 25 derived non-visual). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
 
 **How it works**:
 
 1. **Vision RGBA**: Direct copy of 192 values (8x6 grid, 4 channels each). No spatial pooling -- the full color+alpha grid is preserved. This gives the brain per-pixel color access, critical for learning that "red ahead = danger zone" and "green ahead = food zone."
 
-2. **Velocity magnitude**: Computes `sqrt(vx^2 + vy^2 + vz^2)` from the 3-component velocity vector, collapsing direction into a single speed scalar.
+2. **Vision depth**: Direct copy of 48 depth values (one per pixel). The fused kernel includes depth in the feature buffer — not skipped.
 
-3. **Proprioception**: Copies facing direction (3), angular velocity (1).
+3. **Velocity magnitude**: Computes `sqrt(vx^2 + vy^2 + vz^2)` from the 3-component velocity vector, collapsing direction into a single speed scalar.
 
-4. **Interoception**: Copies energy (1), integrity (1), energy delta (1), integrity delta (1).
+4. **Proprioception**: Copies facing direction (3), angular velocity (1).
 
-5. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
+5. **Interoception**: Copies energy (1), integrity (1), energy delta (1), integrity delta (1).
 
-**Feature layout**: `[192 RGBA | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 217`
+6. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
 
-**Why depth is skipped**: The 48 depth values from the sensory frame are present in the upload buffer but not extracted as features. Vision RGBA already encodes biome-specific color, which is the primary discriminant. Depth would add dimensionality without proportional information gain for the current world complexity.
+**Feature layout**: `[192 RGBA | 48 depth | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 265`
 
 ---
 
-### 6.2 Encoding (Pass 2) -- `encode.wgsl`
+### 6.2 Encoding -- `coop_encode`
 
-**What it does**: Projects the 217-dimensional feature vector into a 32-dimensional encoded representation via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 217 inputs compressed to 32 outputs, forcing the brain to learn what matters.
+**What it does**: Projects the 265-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 265 inputs compressed to 128 outputs, forcing the brain to learn what matters.
 
 **How it works**:
 
 ```
-encoded[d] = fast_tanh( sum_f( features[f] * weights[f * DIM + d] ) + biases[d] )
+encoded[d] = fast_tanh( sum_f( features[f] * weights[f * ENCODED_DIMENSION + d] ) + biases[d] )
 ```
 
-For each of the 32 output dimensions, the shader computes a weighted sum across all 217 features (column-major weight layout: `weights[f * DIM + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
+For each of the 128 output dimensions, the shader computes a weighted sum across all 265 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
 
 **Weight initialization** (in `buffers::init_brain_state`): Xavier/Glorot uniform -- `uniform(-scale, scale)` where `scale = 1/sqrt(FEATURE_COUNT)`. This prevents tanh saturation at initialization.
 
-**Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x DIM]`, indexed as `[f * DIM + d]`). This layout means each output dimension's weights are scattered across memory at stride `DIM` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
+**Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x ENCODED_DIMENSION]`, indexed as `[f * ENCODED_DIMENSION + d]`). This layout means each output dimension's weights are scattered across memory at stride `ENCODED_DIMENSION` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
 
-**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA values + 25 non-visual features = 217 inputs compressed to 32 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
+**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA + 48 depth + 25 non-visual features = 265 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
 
 ---
 
-### 6.3 Habituation + Homeostasis (Pass 3) -- `habituate_homeo.wgsl`
+### 6.3 Habituation + Homeostasis -- `coop_habituate_homeo`
 
 Two independent subsystems combined into a single pass to reduce GPU dispatch count.
 
 #### Habituation
 
-**What it does**: Attenuates repetitive encoded dimensions and produces a habituated state used by all downstream passes.
+**What it does**: Attenuates repetitive encoded dimensions and produces a habituated state consumed by the predictor path (prediction error, predictor matmul, predictor training). Memory recall, the policy, TD credit, and pattern storage operate on the raw encoded (pre-habituation) state so attenuation can never silence them.
 
 **How it works**:
 
@@ -426,25 +404,25 @@ When all dimensions are changing rapidly, mean attenuation is high and curiosity
 
 ---
 
-### 6.4 Recall Scoring (Pass 4) -- `recall_score.wgsl`
+### 6.4 Recall Scoring -- `coop_recall_score`
 
-**What it does**: Computes cosine similarity between the habituated state and all 128 memory patterns. Inactive slots receive a sentinel score of `-2.0`.
+**What it does**: Computes cosine similarity between the encoded (pre-habituation) state and all 128 memory patterns. Inactive slots receive a sentinel score of `-2.0`.
 
 **How it works**:
 
 ```
 For each pattern j in [0, MEMORY_CAP):
     if not active: sim[j] = -2.0
-    else: sim[j] = clamp(dot(habituated, pattern[j]) / (||habituated|| * ||pattern[j]||), -1.0, 1.0)
+    else: sim[j] = clamp(dot(encoded, pattern[j]) / (||encoded|| * ||pattern[j]||), -1.0, 1.0)
 ```
 
-Pattern norms are pre-cached in `O_PAT_NORMS` (written during pattern storage in pass 7), avoiding redundant norm computation. The query norm is computed once per agent at the start of the pass.
+Pattern norms are pre-cached in `O_PAT_NORMS` (written during pattern storage in pass 7), avoiding redundant norm computation. The query norm is computed once per agent at the start of the pass. Querying with the pre-habituation state keeps recall alive during sustained stimuli — attenuation would otherwise mute the query exactly when remembering matters most.
 
 **Why cosine similarity**: The encoder uses `tanh()`, so all values are in [-1, 1] -- magnitude carries less information than direction. Patterns with similar perceptual meaning should be similar regardless of activation strength.
 
 ---
 
-### 6.5 Recall Top-K Selection (Pass 5) -- `recall_topk.wgsl`
+### 6.5 Recall Top-K Selection -- `coop_recall_topk`
 
 **What it does**: Selects the best K=16 patterns from the 128 similarity scores. Each selected pattern is marked with `-3.0` in the similarities buffer to exclude it from subsequent iterations.
 
@@ -461,9 +439,9 @@ A simple iterative argmax loop runs K times:
 
 ---
 
-### 6.6 Prediction + Action Selection (Pass 6) -- `predict_and_act.wgsl`
+### 6.6 Prediction + Action Selection -- `coop_predict_and_act`
 
-This is the largest and most complex pass (~360 lines). It combines what were previously 5 separate CPU components into a single GPU dispatch: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with prospection and memory blend, exploration noise, and motor fatigue.
+This is the largest and most complex stage. It combines what were previously 5 separate CPU components into a single cooperative function: prediction error computation, predictor matrix multiply, credit assignment, policy evaluation with memory blend, exploration noise, and motor fatigue.
 
 #### 6.6.1 Prediction Error
 
@@ -485,40 +463,43 @@ Predicts the next encoded state from the current habituated state and recalled c
 
 The `context_weight` parameter (stored at `O_PRED_CTX_WT`, initialized to 0.15) controls how much recalled patterns influence the prediction. It is itself adapted in pass 7.
 
-#### 6.6.3 Credit Assignment
+#### 6.6.3 Credit Assignment — TD(λ) actor-critic
 
-The homeostatic gradient is used to assign credit/blame to recent actions in the 64-entry history ring buffer. For each recorded action:
+A linear value head over the encoded state estimates the discounted
+homeostatic return; its TD error is the single credit signal for the
+critic, both policy channels, and the encoder. Per brain tick:
 
-1. **Temporal decay**: `temporal = exp(-age * CREDIT_DECAY)` where `CREDIT_DECAY = 0.04`. Actions older than ~60 ticks contribute negligibly.
-2. **Improvement signal**: `improvement = current_gradient - recorded_gradient`. If `|improvement| < DEADZONE (0.01)`, skip (filters metabolic noise).
-3. **Pain amplification**: Negative improvements are multiplied by `PAIN_AMP = 3.0`, reflecting the biological reality that aversive stimuli produce stronger learning signals.
-4. **State-conditioned weight update**: `weights[d] += WEIGHT_LR * credit * recorded_motor * recorded_state[d]`. The recorded state snapshot from when the action was taken ensures credit is attributed to the correct sensory context.
+1. **Value estimate**: `v = dot(value_weights, encoded) + value_bias` (threads compute partial products in parallel; thread 0 reduces).
+2. **TD error**: `δ = clamp(reward + TD_DISCOUNT·v − prev_value, ±MAX_TD_ERROR)` where `reward` is the urgency-amplified homeostatic delta since the previous brain tick and `TD_DISCOUNT = 0.97` gives a ~33-brain-tick horizon (the travel time from the edge of vision range at default speed).
+3. **Weight updates through eligibility traces**: `w += lr · TD_VECTOR_SCALE · δ · z` for the critic (`CRITIC_LEARNING_RATE = 0.01`) and both actor channels (`ACTION_WEIGHT_LEARNING_RATE = 0.10`). `TD_VECTOR_SCALE = 1/ENCODED_DIMENSION` keeps the aggregate step inside the linear-TD stability limit regardless of dimensionality. Scalar biases update from scalar traces without the vector scale.
+4. **Trace update** (end of the pass, after the motor block produces this tick's exploration noise): `z ← TD_DISCOUNT·TD_LAMBDA·z + term`, where the critic trace accumulates `encoded[d]` and the actor traces accumulate `noise·encoded[d]` — the likelihood-ratio direction of the action actually taken. `TD_LAMBDA = 0.9`.
 
-**Weight normalization**: After credit assignment, forward and turn weight vectors are clipped to L2 norm <= `MAX_WEIGHT_NORM = 2.0` (synaptic homeostasis).
+There is no deadzone, no tonic fallback, no pain amplifier, and no history
+ring: credit reaches past actions through the traces, and the critic's
+bootstrapping propagates reward backwards across repeated experiences
+beyond the raw trace span. Traces and `prev_value` are episodic — zeroed on
+death — while the value weights are learned knowledge and survive respawn
+and inheritance.
+
+**Weight normalization**: forward, turn, and value weight vectors are
+clipped to L2 norm <= `MAX_WEIGHT_NORM = 2.0` (synaptic homeostasis). There
+is no per-tick weight decay: TD updates are surprise-driven and stop when
+δ calibrates to zero, so decay would only erase accumulated policy
+knowledge (including the initial forward bias that provides exploration
+mobility).
 
 #### 6.6.4 Policy Evaluation
 
-Continuous motor output is computed as a dot product of learned weights with the habituated state:
+Continuous motor output is computed as a dot product of learned weights with the encoded state (pre-habituation), matching the features that credit assignment trains against:
 
 ```
-fwd = dot(fwd_weights, habituated) + fwd_bias
-trn = dot(trn_weights, habituated) + trn_bias
+fwd = dot(fwd_weights, encoded) + fwd_bias
+trn = dot(trn_weights, encoded) + trn_bias
 ```
 
 This is a continuous-output linear policy -- no discrete action table. The agent learns which features predict beneficial forward motion and which predict beneficial turning.
 
-#### 6.6.5 Prospective Evaluation
-
-The policy weights are applied not just to the current state but also to the predicted future state:
-
-```
-fwd += confidence * ANTICIPATION_WEIGHT * (fwd_future - fwd)
-trn += confidence * ANTICIPATION_WEIGHT * (trn_future - trn)
-```
-
-This is delta-based: it measures the *change* between current and predicted preferences, not the absolute predicted value. This eliminates fixed-point convergence problems. `confidence = 1 - clamp(pred_error, 0, 1)` -- low accuracy means short effective horizon.
-
-#### 6.6.6 Memory-Informed Motor Blend
+#### 6.6.5 Memory-Informed Motor Blend
 
 Recalled patterns contribute their stored motor commands weighted by similarity and outcome valence:
 
@@ -532,7 +513,7 @@ fwd = fwd * (1 - mix) + mem_fwd * mix
 - **Negative valence**: "do the opposite" -- the sign flip steers away from past mistakes
 - Memory contributes up to 40% of motor signal
 
-#### 6.6.7 Exploration Noise
+#### 6.6.6 Exploration Noise
 
 Exploration rate is computed dynamically:
 
@@ -543,9 +524,9 @@ policy_confidence = clamp((|fwd| + |trn|) / 2.0, 0.0, 1.0)
 exploration_rate = clamp(0.5 - policy_confidence * 0.25 + novelty_bonus + curiosity - urgency_penalty, 0.10, 0.85)
 ```
 
-Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG seeded by `(agent * 1000 + tick)`. The motor output is clamped to [-1, 1].
+Gaussian noise scaled by `exploration_rate` is added to the motor output, using `pcg_hash` GPU RNG with the exploration seed derived from `agent_id ^ (tick_u * 747796405u)` before hashing. The motor output is clamped to [-1, 1].
 
-#### 6.6.8 Motor Fatigue
+#### 6.6.7 Motor Fatigue
 
 A ring buffer of recent motor outputs (forward and turn separately) tracks motor variance. Low variance means repetitive output, which triggers dampening:
 
@@ -563,20 +544,19 @@ When motor output is varied, fatigue factor is near 1.0 (no dampening). When out
 | `fatigue_recovery_sensitivity` | 8.0 (default) | Per-agent, heritable |
 | `fatigue_floor` | 0.1 (default) | Per-agent, heritable |
 
-#### 6.6.9 Output Recording
+#### 6.6.8 Output Recording
 
 After computing final motor output:
-1. Records `[fwd, trn, tick, gradient, _pad]` to the action history ring at `O_MOTOR_RING`.
-2. Records the habituated state snapshot at `O_STATE_RING` for future credit assignment.
-3. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
-4. Increments `O_TICK_COUNT`.
-5. Writes `[prediction(32), credit_signal(32), fwd, trn, strafe, _pad]` to the decision buffer for pass 7 and CPU readback.
+1. Publishes `[noise_fwd * exploration_rate, noise_trn * exploration_rate]` to shared memory for the parallel eligibility-trace update at the end of the pass. The traces carry the exploration noise (not the full motor) so only noise directions that correlate with TD errors get reinforced.
+2. Saves the prediction to `O_PREV_PREDICTION` for next tick's error computation.
+3. Increments `O_TICK_COUNT`.
+4. Writes `[prediction(ENCODED_DIMENSION), credit_signal(ENCODED_DIMENSION), fwd, trn, strafe, td_error]` to the decision buffer for pass 7 and CPU readback.
 
 ---
 
-### 6.7 Learning + Memory Storage (Pass 7) -- `learn_and_store.wgsl`
+### 6.7 Learning + Memory Storage -- `coop_learn_and_store`
 
-Five learning operations packed into a single pass, using the prediction and credit signal from the decision buffer written by pass 6.
+Five learning operations packed into a single stage, using the prediction and credit signal produced by `coop_predict_and_act`.
 
 #### 6.7.1 Predictor Gradient Descent
 
@@ -596,19 +576,22 @@ The context weight is also adapted: `ctx_wt += learning_rate * 0.01 * (error_mag
 
 #### 6.7.2 Encoder Hebbian Credit Adaptation
 
-The encoder weights are adapted based on the credit signal from pass 6:
+The encoder weights are adapted based on the credit signal from pass 6
+(`credit_signal[i] = td_error * (forward_trace[i] + turn_trace[i])` — which
+encoded dimensions carried the policy's eligibility when the outcome
+arrived):
 
 ```
 for each (i, j) where |credit_signal[i]| > 1e-6:
-    weights[j * DIM + i] += learning_rate * credit_signal[i] * 0.001 * features[j]
+    weights[j * DIM + i] += learning_rate * credit_signal[i] * ENCODER_CREDIT_SCALE * features[j]
     weights[j * DIM + i] = clamp(weights, -2.0, 2.0)
 ```
 
-This is a Hebbian-style update: features that co-occur with strong credit signals have their encoder weights strengthened. The 0.001 scale factor makes encoder adaptation much slower than predictor learning, reflecting the intuition that the perceptual representation should change gradually while the prediction model adapts quickly.
+This is a Hebbian-style update: features that co-occur with strong credit signals have their encoder weights strengthened. The `ENCODER_CREDIT_SCALE = 0.1` factor makes encoder adaptation slower than action learning, reflecting the intuition that the perceptual representation should change gradually while the policy adapts quickly.
 
 #### 6.7.3 Memory Reinforcement
 
-Active patterns with cosine similarity > 0.3 to the current habituated state are reinforced:
+Active patterns with cosine similarity > 0.3 to the current encoded (pre-habituation) state are reinforced:
 
 ```
 reinforcement[j] += sim * learning_rate * (1 - pred_error)
@@ -620,7 +603,7 @@ Low prediction error strengthens matching patterns more -- successful prediction
 
 #### 6.7.4 Pattern Storage
 
-Each tick, the current habituated state is stored to the weakest memory slot (the one with the lowest reinforcement, tracked at `O_MIN_REINF_IDX`):
+Each tick, the current encoded (pre-habituation) state is stored to the weakest memory slot (the one with the lowest reinforcement, tracked at `O_MIN_REINF_IDX`), keeping memory keys in the same space as the recall queries:
 
 - State vector and cached norm are written to the pattern slot.
 - Motor context `[fwd, trn, raw_gradient]` is stored.
@@ -641,81 +624,104 @@ Patterns whose reinforcement drops to zero are deactivated. After decay, the slo
 
 ## 7. Emergent Phenomena
 
-None of these behaviors are explicitly programmed. They arise from the interaction of the 7 shader passes and their shared constraints:
+None of these behaviors are explicitly programmed. They arise from the interaction of the seven cooperative brain stages and their shared constraints (referenced by the `coop_*` function inlined into `kernel_tick.wgsl`):
 
-| Phenomenon | How It Emerges | Contributing Passes |
+| Phenomenon | How It Emerges | Contributing Stages |
 |------------|---------------|---------------------|
-| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (217 --> 32) compresses information | Pass 2, Pass 4-5 |
-| **Fear / Avoidance** | Negative homeostatic gradient --> pain amplifier (3x) makes damage signal loud --> credit assignment blames recent actions via state snapshots --> policy weights learn to avoid danger-associated features --> prospective evaluation applies these weights to the predicted future, anticipating danger before entering it | Pass 3, 6 (credit + prospection) |
-| **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | Pass 3 (habituation), Pass 6 (exploration) |
-| **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | Pass 6 (credit), Pass 7 (reinforcement) |
-| **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | Pass 6 (error + exploration) |
-| **Adaptation** | Prediction error decreases in stable environments --> exploration drops --> behavior stabilizes | Pass 6, Pass 7 (predictor learning) |
-| **Panic** | Low energy/integrity --> high urgency --> exploration suppressed --> agent falls back on policy weights | Pass 3 (urgency), Pass 6 (exploration) |
-| **Forgetting** | Patterns not recalled or reinforced decay below zero and are deactivated | Pass 7 (decay) |
-| **Boredom / Loop Breaking** | Monotonous input --> habituation attenuates repetitive dimensions --> curiosity rises --> exploration increases; simultaneously, low motor variance --> fatigue dampens output --> repeated action weakens | Pass 3 (habituation), Pass 6 (fatigue + exploration) |
-| **Contextual Memory** | Policy weights map encoded features to motor preferences -- different percepts trigger different behaviors; recalled patterns blend motor advice | Pass 6 (policy + memory blend) |
-| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | Pass 3 (homeostasis) |
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 265 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
+| **Fear / Avoidance** | Damage produces a negative per-tick homeostatic delta (urgency-amplified — the TD reward) --> negative TD error --> eligibility traces blame the recently active state-action directions --> policy weights learn to avoid danger-associated features, while the value head marks danger-correlated states as low-value so later TD errors penalize approaching them | `coop_habituate_homeo`, `coop_predict_and_act` (TD credit) |
+| **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | `coop_habituate_homeo`, `coop_predict_and_act` (exploration) |
+| **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | `coop_predict_and_act` (credit), `coop_learn_and_store` (reinforcement) |
+| **Startle / Surprise** | Sudden prediction error spike --> novelty bonus increases --> exploration spikes | `coop_predict_and_act` (error + exploration) |
+| **Adaptation** | Prediction error decreases in stable environments --> exploration drops --> behavior stabilizes | `coop_predict_and_act`, `coop_learn_and_store` (predictor learning) |
+| **Panic** | Low energy/integrity --> high urgency --> exploration suppressed --> agent falls back on policy weights | `coop_habituate_homeo` (urgency), `coop_predict_and_act` (exploration) |
+| **Forgetting** | Patterns not recalled or reinforced decay below zero and are deactivated | `coop_learn_and_store` (decay) |
+| **Boredom / Loop Breaking** | Monotonous input --> habituation attenuates repetitive dimensions --> curiosity rises --> exploration increases; simultaneously, low motor variance --> fatigue dampens output --> repeated action weakens | `coop_habituate_homeo`, `coop_predict_and_act` (fatigue + exploration) |
+| **Contextual Memory** | Policy weights map encoded features to motor preferences -- different percepts trigger different behaviors; recalled patterns blend motor advice | `coop_predict_and_act` (policy + memory blend) |
+| **Desensitization** | The slow EMA timescale integrates gradual changes; constant mild negative gradient eventually stops triggering strong reactions | `coop_habituate_homeo` (homeostasis) |
 
 ---
 
-## 8. Host API (gpu_brain.rs)
+## 8. Host API (gpu_kernel.rs)
 
-### GpuBrain
+### GpuKernel
 
 ```rust
-pub struct GpuBrain {
+pub struct GpuKernel {
     // wgpu device + queue
-    // 4 persistent buffers (brain_state, pattern, history, config)
-    // 8 transient buffers (sensory, features, encoded, habituated, homeo_out, similarities, recall, decision)
-    // 2 staging buffers for double-buffered motor readback
-    // 7 compute pipelines + bind groups
+    // Persistent buffers: brain_state, pattern_buffer,
+    //                     physics_state, food_state, world_config,
+    //                     sensory + working buffers
+    // Compute pipelines: physics, vision, brain, kernel, global, prepare
+    // Three staging-buffer tracks (state, telemetry, agent_state) each
+    // driven by an async_readback::ReadbackTracker
 }
 ```
 
 ### Public API
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `is_available` | `() -> bool` | Static probe: returns true if any wgpu adapter (real GPU or software fallback) exists. Used by tests to skip GPU work on headless CI |
-| `new` | `(agent_count: u32, config: &BrainConfig) -> Self` | Creates wgpu device (tries real GPU first, falls back to CPU/software adapter for headless CI), allocates all buffers, compiles all 7 shaders with auto-generated constants header |
-| `tick` | `(&mut self, frames: &[SensoryFrame]) -> Vec<MotorCommand>` | Synchronous: upload, dispatch all 7 passes, readback |
-| `submit` | `(&mut self, frames: &[SensoryFrame])` | Async step 1: upload sensory + dispatch all passes + copy motor to staging |
-| `collect` | `(&mut self) -> Vec<MotorCommand>` | Async step 2: map staging buffer, read motor commands |
-| `read_agent_state` | `(&mut self, index: u32) -> AgentBrainState` | Download one agent's full brain state from GPU for inspection/inheritance |
-| `write_agent_state` | `(&mut self, index: u32, state: &AgentBrainState)` | Upload one agent's brain state to GPU (for offspring initialization) |
-| `death_signal` | `(&mut self, index: u32)` | Halves all pattern reinforcements, resets homeostasis + exploration |
-| `resize` | `(&mut self, agent_count: u32)` | Rebuilds all buffers and pipelines for a new agent count |
+The method list below is the contract used by `xagent-sandbox`. See `gpu_kernel.rs` for the full set of helpers; everything per-tick that the sandbox needs is here.
+
+| Method | Description |
+|--------|-------------|
+| `is_available() -> bool` | Static probe: returns true if any wgpu adapter (real GPU or software fallback) exists. Used by tests to skip GPU work on headless CI. |
+| `new(agent_count, food_count, brain_config, world_config)` | Creates the wgpu device (requesting `PUSH_CONSTANTS`, optionally `SUBGROUP`), allocates all buffers and pipelines, and composes the fused shaders with subgroup markers and the `VISION_W`/`VISION_H` override cascade. |
+| `upload_world(terrain_heights, biome_grid, food_positions, food_consumed, food_timers)` | Writes the terrain heightmap, biome grid, and the food spatial buffers (positions, consumed flags, respawn timers) into GPU storage. Static-ish world data — call when the world is built or food layout changes. |
+| `upload_agents(&[(Vec3, f32, f32, usize, usize)])` | Writes initial physics rows `(position, max_energy, max_integrity, memory_capacity, processing_slots)` for the listed agents into `agent_phys` storage. Used when spawning a new generation. |
+| `upload_world_config(start_tick, ticks_to_run)` | Writes the per-batch world-config uniform consumed by all four passes inside a kernel-batch (start tick, batch size, stride parameters). Called internally by `dispatch_ticks`. |
+| `dispatch_ticks(start_tick, ticks_to_run) -> bool` | **Compute only.** Splits the work into full kernel-batches of `vision_stride * brain_tick_stride` ticks, plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Each kernel-batch is one command-buffer + `queue.submit()` running `prepare → kernel → global → vision`; the physics-only remainder is a separate submit that masks brain/vision off. Does **not** copy any state into staging — CPU-visible publication is `request_state_snapshot`'s job. Always returns `true`. |
+| `request_state_snapshot() -> bool` | **Publication only.** Scans the staging ring for a free slot and, when one exists, copies `agent_phys` (and `food_state` when food exists) into it and installs the async mapping that `try_collect_state_snapshot` later collects. Returns `false` when every slot is in flight — the request is dropped, never queued, so stale state is never preferred over advancing compute. Independent of `dispatch_ticks`: compute may advance many times between snapshot requests. |
+| `dispatch_batch(start_tick, ticks_to_run) -> bool` | Compatibility wrapper: calls `dispatch_ticks` then `request_state_snapshot`, preserving the original "advance compute and opportunistically stage a readback" behavior. New runtime code schedules the two separately so dispatch cadence and publication cadence are independent. Returns `dispatch_ticks`'s result (always `true`). |
+| `dispatch_batch_masked(start_tick, ticks_to_run, phase_mask)` | Variant for tests and benchmarks that gates which phases run per cycle (bit 0 = physics, bit 1 = vision, bit 2 = brain). Iterates cycles in chunks of 100 (Metal command-buffer deadlock workaround), appends a remainder physics-only pass, copies `agent_phys` to the active staging slot, then blocks on `device.poll(Wait)` for GPU completion. Does **not** run any global pass (no grid rebuild, food respawn, or collisions) and does **not** update `cached_state` — call sites read GPU buffers directly. |
+| `try_collect_state_snapshot() -> bool` | Non-blocking: polls all in-flight state-readback slots; if any is ready, copies the most recent into `cached_state` (and `cached_food_state` when food exists). Returns `true` on update. Collects whatever `request_state_snapshot` (or the `dispatch_batch` wrapper) previously staged. |
+| `cached_state() -> &[f32]` | Latest physics-state snapshot (positions, vitals, motor, death counts, telemetry slots). |
+| `cached_food_state() -> Option<&[f32]>` | Latest food-state snapshot when available. |
+| `read_full_state_blocking() -> &[f32]` | Test/debug only: blocks until the next state readback completes. |
+| `request_agent_telemetry(index)` | Schedules a one-agent telemetry readback (vision + decision snapshot). |
+| `try_collect_telemetry() -> Option<(u32, AgentTelemetry)>` | Non-blocking: returns `(agent_index, telemetry)` when the staged copy is mapped, where `agent_index` is the agent the readback was requested for (so callers can reject telemetry that completed after a selection change). |
+| `cached_telemetry() -> Option<&AgentTelemetry>` | Most recent telemetry snapshot. |
+| `request_agent_state(index) -> bool` | Schedules a full `AgentBrainState` readback for the named agent. |
+| `try_collect_agent_state() -> Option<Option<AgentBrainState>>` | Non-blocking collection of the scheduled `AgentBrainState`. |
+| `read_agent_state(index) -> AgentBrainState` | Blocking readback for tests / one-shot inspection. |
+| `write_agent_state(index, &AgentBrainState)` | Uploads one agent's full brain slice (used by evolution to seed offspring). |
+| `write_agent_heritable_config(index, &BrainConfig)` | Overwrites only the heritable config tail of one agent's brain slice. |
+| `batch_write_agent_states(count, F)` | Bulk variant of `write_agent_state` driven by a closure (one allocation, one submit). |
+| `try_reset_agents(&BrainConfig) -> bool` | Re-initializes every agent's brain + physics row from the given config. |
+| `reset_agents(&BrainConfig)` / `reset_agents_seeded(&BrainConfig, seed)` | Blocking variants used at startup. |
+| `brain_tick_stride() -> u32` | Returns `brain_config.brain_tick_stride` — the number of physics ticks per brain cycle. Sandbox uses it as the minimum batch size that contains a full brain cycle. |
+| `kernel_batch_size() -> u32` | Returns `vision_stride * brain_tick_stride` — the number of physics ticks in one full kernel-batch; dispatching in exact multiples guarantees deterministic global- and vision-pass cadence. |
 
 ### AgentBrainState
 
 ```rust
 pub struct AgentBrainState {
-    pub brain_state: Vec<f32>,   // BRAIN_STRIDE = 8,468 f32
-    pub patterns: Vec<f32>,      // PATTERN_STRIDE = 5,251 f32
-    pub history: Vec<f32>,       // HISTORY_STRIDE = 2,370 f32
+    pub brain_state: Vec<f32>,    // BRAIN_STRIDE, vision-dependent
+    pub patterns: Vec<f32>,       // PATTERN_STRIDE
 }
 ```
 
-Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring), mutation, and DB persistence. The three vectors are the exact GPU buffer contents for one agent slice.
+Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring) and mutation. The two vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` slice uses the fixed `PATTERN_STRIDE` constant. The learned policy and the TD value head live in `brain_state` and so are inherited; the episodic eligibility traces also live there but are zeroed on the first post-respawn tick of a new life.
 
-### death_signal Behavior
+### Death / Respawn on the GPU
 
-`death_signal(index)` performs three operations:
+Death detection and respawn live entirely in WGSL (`phase_death.wgsl`, invoked from `kernel_tick.wgsl` after the physics step). There is no `death_signal` Rust call. When the kernel decides an agent has died (energy ≤ 0 or integrity ≤ 0):
 
-1. **Trauma**: Halves all pattern reinforcements. Patterns with reinforcement below 0.5 are deactivated. The weakest memories are wiped while the strongest survive.
-2. **Homeostasis reset**: Zeros all gradient EMAs (`grad_fast`, `grad_med`, `grad_slow`), urgency, and previous energy/integrity. The respawned agent starts with no homeostatic memory.
-3. **Exploration reset**: Sets exploration rate to 0.5 (balanced start).
+1. **Spawn search**: tries up to 50 GPU-RNG samples for a non-Danger biome position; if all 50 attempts land in Danger biomes, the `!found` branch reuses the attempt-0 sample (RNG seed `tick * 256 + agent_id`, the same draw as attempt 0) and spawns there without re-checking the biome — so a fully Danger-blocked agent can land back in a Danger cell (see `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
+2. **Physics reset**: full energy, full integrity, zero velocity, facing +Z; death count incremented; fitness counters (`food_count`, `ticks_alive`, `last_death_tick`) preserved.
+3. **Memory trauma**: all `O_PAT_REINF` entries are multiplied by `0.5`. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (which gates on `O_PAT_ACTIVE` in `brain_passes.wgsl`, not on reinforcement) is not cut off by this step. Halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest memories survive.
+4. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed and attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, TD eligibility traces and previous-state value zeroed (the value weights survive — they are learned knowledge, not episodic state).
+
+The CPU only learns about a death by reading `physics_state[base + P_DEATH_COUNT]` on the next state readback.
+
+### AgentTelemetry
+
+`GpuKernel::request_agent_telemetry(index)` queues a one-shot copy of one agent's slice across **four** staging buffers — sensory, decision, brain_state, and phys — into the `telemetry_staging` group. The next `try_collect_telemetry()` that finds all four mappings ready returns an `AgentTelemetry` (see `gpu_kernel.rs::AgentTelemetry`) with: `vision_color` (`VISION_RAYS` RGBA floats, from sensory), `motor_fwd` and `motor_turn` (from decision), `mean_attenuation` and `curiosity_bonus` and `fatigue_factor` and `staleness` (derived from brain_state), and `urgency`, `gradient`, `prediction_error`, `exploration_rate` (from phys). There is no `motor_variance` field. The sandbox calls this once per frame for the selected agent — issuing it per-tick for all agents would negate the performance gains.
 
 ### BrainTelemetry
 
-Stub telemetry struct for UI/recording compatibility. Key fields: `prediction_error`, `memory_utilization`, `exploration_rate`, `homeostatic_gradient`, `homeostatic_urgency`, `fatigue_factor`, etc.
+`BrainTelemetry` (in `lib.rs`) is a stub struct retained for UI/recording compatibility. It is not populated by the kernel directly — the sandbox builds it from `AgentTelemetry` + cached state when it needs the old field shape for replay or sparkline charts.
 
-### AgentTelemetry (GpuKernel)
-
-`GpuKernel::read_agent_telemetry(index)` performs a blocking readback of one agent's sensory, decision, and brain-state buffers, returning an `AgentTelemetry` struct with: vision color (192 RGBA floats), motor forward/turn, mean habituation attenuation, curiosity bonus, fatigue factor, motor variance, urgency, and homeostatic gradient. Called once per frame for the selected agent — not per-tick for all agents, which would negate performance gains.
-
-The `behavior_phase()` method classifies agent state:
+`BrainTelemetry::behavior_phase()` classifies an agent's composite score:
 
 | Phase | Composite Score | Interpretation |
 |-------|----------------|----------------|
@@ -740,7 +746,7 @@ The `BrainConfig` struct (defined in `xagent-shared`) provides heritable paramet
 | `fatigue_recovery_sensitivity` | 8.0 | How fast fatigue lifts when motor output diversifies (heritable) |
 | `fatigue_floor` | 0.1 | Minimum motor output under full fatigue (heritable) |
 | `vision_rays` | 48 | Number of vision rays (W×H). Affects sensory buffer size |
-| `brain_tick_stride` | 4 | Physics ticks per brain+vision cycle. Higher → faster, less responsive |
+| `brain_tick_stride` | 10 | Physics ticks per brain+vision cycle. Higher → faster, less responsive |
 | `vision_stride` | 10 | Brain cycles between global passes (grid, collisions, vision). Higher → more throughput |
 | `metabolic_rate` | 1.0 | Multiplier for all energy costs. Lower → agents survive longer |
 | `integrity_scale` | 1.0 | Multiplier for integrity damage/regen. Higher → deadlier hazards |
@@ -786,15 +792,17 @@ Tests verify **behavioral properties**, not implementation details. They check t
 cargo test -p xagent-brain --lib
 ```
 
-### Test Categories (38 tests)
+### Test Modules
 
-| Module | Tests | What They Verify |
-|--------|-------|-----------------|
-| `buffers` | 6 | Sensory stride matches feature count, brain/pattern/history stride consistency, pack_sensory_frame fills buffer with finite values, init_brain_state produces correct-length output |
-| `gpu_brain` (buffer/init) | 2 | GPU brain initializes without panic, read/write state roundtrip preserves data |
-| `gpu_brain` (per-shader) | 7 | Feature extraction produces correct output, encode produces tanh-bounded output, habituation attenuates repeated input, recall_score computes cosine similarity, recall_topk selects best patterns, predict_and_act produces valid motor, learn_and_store modifies weights and stores patterns |
-| `gpu_brain` (integration) | 4 | Full tick produces valid motor commands, learning changes weights over 50 ticks, memory fills over time, resize changes agent count |
-| `gpu_brain` (behavioral) | 2 | Multi-agent variance (50 agents produce non-degenerate output), death_signal halves reinforcement |
+Tests live next to the code they cover. The lib test target compiles to a single binary with three inline modules:
+
+| Module | Scope |
+|--------|-------|
+| `buffers::tests` | Buffer layout invariants — sensory stride matches feature count, `BrainLayout` derives consistent offsets across vision sizes, `pack_sensory_frame` fills buffers with finite values, `init_brain_state` produces correctly-sized output, SoA/AoS pattern indexing covers identical regions. |
+| `gpu_kernel::tests` | Shader composition contract — subgroup markers present in every entry shader, vision dimensions feed the WGSL override cascade, the subgroup and non-subgroup paths each leave the composed source self-consistent (every `_PARAMS` placeholder has a matching `_ARGS` call site). Runs without requiring a GPU device. |
+| `async_readback::tests` | `ReadbackTracker` state-machine invariants — request/collect transitions, idempotent polling, mapped-buffer reuse. |
+
+GPU-dependent integration tests (full kernel-tick behavioral checks, deterministic benchmarks) live in the sandbox crate's integration tests so they can share the world setup and skip themselves cleanly on headless CI via the `GpuKernel::is_available` probe.
 
 ---
 
@@ -803,25 +811,25 @@ cargo test -p xagent-brain --lib
 ### Why GPU-Resident Over CPU
 
 The previous CPU implementation had one `Brain` struct per agent with heap-allocated weight matrices, pattern vectors, and ring buffers. At 50+ agents, the per-tick cost was dominated by:
-- 50 independent matrix multiplies (encoder: 217x32, predictor: 32x32)
+- 50 independent matrix multiplies (encoder: `feature_count x ENCODED_DIMENSION`, predictor: `ENCODED_DIMENSION x ENCODED_DIMENSION` — for the default 8×6 vision: 265x128 and 128x128)
 - 50 * 128 cosine similarity computations (recall scoring)
 - Scattered memory access patterns (each agent's data in different heap locations)
 
-Moving to GPU makes all 50 agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. The CPU's only job is packing sensory frames and reading motor commands.
+Moving to GPU makes all agents' matrix multiplies a single dispatch. More importantly, all brain state lives in contiguous GPU buffers with computed strides, eliminating pointer chasing entirely. Sensory features are now produced on-GPU by the vision pass (writing `sensory_buffer`) and motor commands are consumed on-GPU by the physics step (reading `decision_buffer`); the CPU does not pack sensory frames per tick and does not read motor commands per tick. The only routine bus traffic during the simulation is the per-batch world-config uniform write and asynchronous readbacks for telemetry and UI snapshots.
 
-### Why 7 Passes (GpuBrain) and Why a Fused Kernel (GpuKernel)
+### Why a Fused Kernel
 
-**GpuBrain uses 7 passes** because each shader reads from and writes to global storage buffers, keeping the working set per invocation small. The pipeline barriers between passes are cheap (all dispatches go into a single command encoder), and the data locality benefits of specialized shaders make the code inspectable and testable.
+The cognitive pipeline is conceptually 7 stages, but they all run inside a single fused compute kernel (`kernel_tick.wgsl`). An earlier design dispatched each stage as its own shader, but CPU↔GPU coordination overhead dominated at high tick rates: 11–19 dispatches per tick plus per-tick `write_buffer` calls and blocking motor-command readback capped throughput around 600 ticks/second.
 
-**GpuKernel fuses everything** because CPU↔GPU coordination overhead dominates at high tick rates. The 7-pass model achieved ~600 ticks/second due to 11–19 dispatches per tick, per-tick `write_buffer` calls, and blocking readback. The fused kernel runs N brain cycles in a single dispatch — 256 threads per agent, workgroup barriers between phases, shared memory for cooperative food detection. The CPU encodes a fixed number of passes regardless of brain cycle count, achieving 60,000+ ticks/second. The brain function code is composed from the same WGSL source files, so both modes execute identical math.
+The fused kernel runs N simulated ticks per dispatch with one workgroup per agent (256 threads). Workgroup barriers separate the stages, shared workgroup memory is used for cooperative reductions (similarity max, top-K, food detection), and physics + food detection + death/respawn + the seven brain stages all execute inline. The CPU encodes a single command buffer per batch regardless of `ticks_to_run`, lifting per-agent throughput past 60,000 ticks/second. The seven brain stages still exist as discrete cooperative functions in `brain_passes.wgsl` — they're just inlined into one shader at composition time rather than dispatched as separate passes.
 
 ### Why Flat array<f32> Instead of Structured Buffers
 
 WGSL's structured buffer support requires compile-time-known layouts. With per-agent strides computed from constants (e.g., `agent * BRAIN_STRIDE + O_ENC_WEIGHTS`), a flat `array<f32>` with computed offsets is simpler and more flexible than nested structs. The offset constants are auto-generated from Rust, so the "indexing math" is actually just named constants that read like field accesses.
 
-### Why wgsl_constants() Auto-Generation
+### Why Shared `override` Constants in `common.wgsl`
 
-Every shader needs the same set of 50+ offset constants, utility functions (`fast_tanh`, `pcg_hash`), and dimension values. Manually keeping these in sync between Rust and WGSL would be a maintenance nightmare. `wgsl_constants()` generates the shared header from Rust constants, which is prepended to each shader source at pipeline creation time. A single source of truth, zero chance of offset mismatch.
+Every shader in the kernel pipeline needs the same set of 50+ offset constants and dimension values (`SENSORY_STRIDE`, `FEATURE_COUNT`, `ENCODED_DIMENSION`, the `O_*` offsets, etc.). Manually keeping these in sync between Rust and WGSL would be a maintenance nightmare. The chosen mechanism: `common.wgsl` declares each constant as a WGSL `override` derived from `VISION_W`/`VISION_H` (`override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;`), `gpu_kernel.rs` concatenates `common.wgsl` with each phase fragment via `include_str!`, and the matching `BrainLayout`-derived values are bound to the pipeline as override values at pipeline creation time. Utility functions (`fast_tanh`, `pcg_hash`, `rand_f32`, `rand_normal`) live as plain WGSL functions inside `common.wgsl` and are inlined into every concatenated shader. A single source of truth (`BrainLayout` on the Rust side, the `override` declarations on the WGSL side), zero chance of offset mismatch as long as the override values are forwarded at pipeline creation.
 
 ### Why Cosine Similarity for Pattern Matching
 
@@ -839,19 +847,15 @@ Biological nervous systems track changes at multiple timescales -- immediate ref
 
 ### Why Continuous Motor Output Instead of Discrete Actions
 
-The old CPU architecture used a discrete 8-action space with a learned preference table. The GPU rewrite replaces this with continuous forward/turn output computed as `dot(weights, habituated) + bias`. This is both simpler (no action table, no softmax, no argmax tie-breaking) and more expressive (the agent can move at any speed and turn at any angle). Credit assignment updates the weight vectors directly via state-conditioned gradient, which is more natural for continuous outputs.
+The old CPU architecture used a discrete 8-action space with a learned preference table. The GPU rewrite replaces this with continuous forward/turn output computed as `dot(weights, encoded) + bias`. This is both simpler (no action table, no softmax, no argmax tie-breaking) and more expressive (the agent can move at any speed and turn at any angle). Credit assignment updates the weight vectors directly through eligibility traces, which is natural for continuous outputs.
 
-### Why Credit Deadzone Filters Metabolic Noise
+### Why TD(λ) Instead of Windowed REINFORCE
 
-Every tick, energy depletion produces a small negative homeostatic gradient (~0.006). Without a deadzone, this constant signal triggers credit assignment on every tick, treating normal metabolism as a negative outcome. The `DEADZONE = 0.01` threshold ensures only meaningful events -- food consumption (+0.03), damage (-0.02), death (-0.5) -- produce weight updates. This is analogous to sensory gating in biological systems, where constant background stimuli are filtered out to preserve signal clarity.
+The earlier learner credited a fixed window of recorded actions with the *change* in homeostatic gradient since each action, gated by a deadzone and a tonic fallback. Food, however, is a sparse reward that arrives ~30 brain ticks after the navigational turn that earned it — far outside any practical exponential-decay window — so the decisive turn was never credited (the core finding of issue #13). TD(λ) closes that gap two ways: a learned value head bootstraps, propagating the terminal food reward backwards across repeated experiences, and eligibility traces give every state-action a decaying claim on future TD errors. The deadzone, tonic fallback, and pain amplifier are gone — δ is a single signed signal that calibrates to zero when the critic is accurate, so steady metabolic drain stops producing spurious updates without any thresholding.
 
-### Why State-Conditioned Credit Assignment
+### Why No Per-Tick Weight Decay
 
-Naive credit assignment applies the same credit to all recent actions regardless of the state in which they were taken. This means dying in a danger zone penalizes actions taken in safe states equally -- the agent learns "forward is bad everywhere" instead of "forward-in-danger is bad." State-conditioned credit uses the recorded state snapshot from when each action was chosen, so the weight update is proportional to `recorded_state[d]`. High feature activation at action time --> full credit. Low activation --> minimal credit.
-
-### Why Pain Amplification (3x)
-
-Negative homeostatic gradients receive a 3x multiplier in credit assignment. This reflects the biological reality that amygdala neurons respond 2-3x more strongly to aversive stimuli. This is NOT hardcoded avoidance -- the brain must learn WHAT to do about the amplified signal. The amplification just ensures that negative outcomes produce louder learning signals than positive ones, which is necessary because damage is typically more catastrophic than the benefit of a single meal.
+TD updates are surprise-driven: they vanish when δ calibrates to zero, so weights settle rather than diverge, and the L2-ball clamps bound magnitude. Per-tick decay would instead bleed away accumulated policy knowledge every tick — including the initial forward bias that gives agents the mobility to explore — so it is omitted. The value head likewise keeps its learned landscape across the lifetime; only the episodic eligibility traces and previous-value scalar reset on death.
 
 ### Why Encoder Adaptation is Hebbian, Not Backpropagated
 
@@ -862,8 +866,6 @@ Backpropagating prediction error through the predictor and into the encoder weig
 ## 12. Known Limitations & Future Work
 
 ### Current Limitations
-
-- **GpuBrain uses single-threaded workgroups**: The 7-pass `GpuBrain` dispatches one thread per agent (`@workgroup_size(1)`). The `GpuKernel` addresses this with 256-thread workgroups and fused passes, but the 7-pass mode is retained for inspectability and testing.
 
 - **No hierarchical pattern abstraction**: All 128 patterns are stored at the same level of abstraction. There is no mechanism for forming higher-order patterns ("I'm in a corridor" from a sequence of wall-patterns) or chunking temporal sequences into reusable units.
 

@@ -43,6 +43,9 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     let max_integrity      = physics_state[base + P_MAX_INTEGRITY];
     let memory_cap         = physics_state[base + P_MEMORY_CAP];
     let processing_slots   = physics_state[base + P_PROCESSING_SLOTS];
+    // Preserve the physics-recorded death tick through the reset so CPU
+    // readback can attribute this death to its exact tick.
+    let saved_last_death_tick = physics_state[base + P_LAST_DEATH_TICK];
 
     // ── 3. Reset physics state ─────────────────────────────────────────────
     // Zero the full stride first, then write specific values.
@@ -70,6 +73,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     physics_state[base + P_FOOD_COUNT]      = saved_food_count;
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
+    physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
 
     // ── 4. Reset brain state ───────────────────────────────────────────────
     let brain_base = tid * BRAIN_STRIDE;
@@ -105,9 +109,34 @@ fn phase_death_respawn(tid: u32, tick: u32) {
         brain_state[brain_base + O_PREV_ENCODED + i] = 0.0;
     }
 
-    // Zero action history
-    let hist_base = tid * HISTORY_STRIDE;
-    for (var i = 0u; i < HISTORY_STRIDE; i++) {
-        history_buffer[hist_base + i] = 0.0;
+    // Terminal lesson: the transition into death is the one experience the
+    // within-lifetime learner must never miss. Apply one final TD update
+    // with the maximum negative error through the eligibility traces the
+    // dying life accumulated — then clear them below so no credit leaks
+    // into the next life. Without this, dying carries zero learning signal
+    // and the full-energy respawn makes death read as a free heal.
+    let terminal_value_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
+    let terminal_forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
+    let terminal_turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
+    brain_state[brain_base + O_VALUE_BIAS] += CRITIC_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
+    brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_forward_bias_trace;
+    brain_state[brain_base + O_ACT_BIASES + 1u] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_turn_bias_trace;
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        brain_state[brain_base + O_VALUE_WEIGHTS + i] += CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
+        brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
+        brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];
     }
+
+    // Reset TD transients: eligibility traces and the previous-state value
+    // are episodic — credit must never leak across the death boundary.
+    // The value weights themselves are learned knowledge and survive.
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        brain_state[brain_base + O_TRACE_CRITIC + i] = 0.0;
+        brain_state[brain_base + O_TRACE_FWD + i] = 0.0;
+        brain_state[brain_base + O_TRACE_TURN + i] = 0.0;
+    }
+    brain_state[brain_base + O_TRACE_BIASES] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
+    brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
+    brain_state[brain_base + O_PREV_VALUE] = 0.0;
 }

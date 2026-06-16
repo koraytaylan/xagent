@@ -126,6 +126,8 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 **Lesson:** Evolution must mutate things that affect fitness. If the genome is disconnected from the phenotype, selection has no signal.
 
+**Status (post-fused-kernel).** Of the five parameters named above, only `learning_rate` and `decay_rate` are kernel degrees of freedom today. Issue #106 reclassified the rest: `representation_dimension` (the canonical `BrainConfig` field name; the historical sections above call it `representation_dim`) is **locked** to the compile-time `ENCODED_DIMENSION` constant (the kernel ignores the config slot and warns once on disagreement), and `memory_capacity` / `processing_slots` are **metabolic proxies** that feed `metabolic_drain_per_tick` without changing pattern memory or recall width. The structural disconnect this issue described therefore now lives on two axes simultaneously: the config-to-kernel gap just described — evolution mutates the `memory_capacity` / `processing_slots` proxies, but their values move metabolic cost rather than memory shape, while the locked `representation_dimension` is read from a constant in place of the config slot — and the action-selector-vs-cognitive-stack split tracked in #107. See *Current Parameter Roles* below.
+
 ### 13. Agents Spawned in Death Zones
 
 **Symptom:** 30-40 deaths per generation, mostly from hazards.
@@ -238,7 +240,7 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 
 11. **Memory blend injected stale motor bias.** Recalled memories blended stored motor values (originally noise) directly into the policy. Surviving food-event memories had fixed random noise values that created a persistent turn injection. Fixed: replaced the old direct noise-injection blend with a constrained valence-weighted memory blend using actual motor commands. Memory now stores real approach actions and recall uses valence sign to produce escape (negative valence negates the approach direction).
 
-12. **Random walk in weight space.** Even with noise-only credit, each food/hazard event added a random-direction vector to action weights. After ~50 events, the accumulated drift produced a detectable turn bias. Weight decay (`ACTION_WEIGHT_DECAY=0.01`) prevents unbounded drift. The drift-vs-decay equilibrium keeps bias below noise level.
+12. **Random walk in weight space.** Even with noise-only credit, each food/hazard event added a random-direction vector to action weights. After ~50 events, the accumulated drift produced a detectable turn bias. Weight decay (`ACTION_WEIGHT_DECAY=0.01`) prevented unbounded drift; the drift-vs-decay equilibrium kept bias below noise level. *(Status note: both the windowed-credit path and `ACTION_WEIGHT_DECAY` were later removed when credit assignment moved to a TD(λ) actor-critic — δ-driven updates calibrate to zero instead of drifting, and the per-tick decay was erasing learned policy including the forward bias from item 13. See the status note under §20.)*
 
 13. **Forward bias for exploration.** With zero turn AND zero forward policy, agents random-walked in place (50% of steps backward, canceling forward progress). Added `INITIAL_FORWARD_BIAS=0.3` so agents default to moving forward. Learning adjusts turn direction; the forward drive provides the mobility for exploration.
 
@@ -251,6 +253,8 @@ Agents discover everything through experience. No behavior is hardcoded. The onl
 **Symptom:** After fixing all circling causes, agents wandered naturally but showed zero deliberate behavior. No food-seeking, no danger-avoidance, flat fitness across 21 generations. Food-per-death of 0.87 was consistent with random bumping.
 
 **Root cause:** The REINFORCE credit assignment can't learn spatial responses because: (A) the credit window (7 ticks at CREDIT_DECAY=0.3) is shorter than the time to reach visible food (~30 ticks), so the causal turn is outside the window when food is eaten; (B) the random encoder destroys spatial information, making "food left" and "food right" produce nearly identical encoded states.
+
+**Status note (post-TD(λ)).** Both halves of this root cause were later acted on, with different outcomes. (A) The windowed-REINFORCE path it names — `CREDIT_DECAY`, `DEADZONE`, the tonic fallback, the pain amplifier, and the action-history ring — was replaced wholesale by a TD(λ) actor-critic (value head + per-dimension eligibility traces in `brain_passes.wgsl`), and foraging rate and champion fitness now rise across generations. (B) turned out to be wrong as stated: a direct probe shows the random encoder *preserves* food-left/right separability (between-class separation ≈ 4× the within-class nuisance in angular distance, acos of the encoded-state cosine similarity), yet a confound-free mirrored-training probe shows vision-conditional steering still does not emerge — so the open bottleneck is the credit/learning dynamics under movement nuisance, not representability. Klinotaxis (below) remains the reactive navigation layer. Measurements and protocol corrections are in `docs/superpowers/specs/2026-06-10-learning-baseline.md`.
 
 **Insight from biology:** We skipped the two simplest spatial navigation strategies that evolution developed billions of years before directional steering:
 
@@ -273,7 +277,28 @@ Learning (credit assignment) then builds on this reactive foundation, associatin
 
 ---
 
-## The Disconnect (Current State)
+## Current Parameter Roles
+
+This section is a fixed point of reference for what each `BrainConfig` field does in the live fused-kernel architecture. The historical sections above and below treat several of these fields as a single class of "evolved brain parameters" — that framing pre-dates the issue #106 reconciliation. The canonical labels and docstrings live in [`crates/xagent-shared/src/config.rs`](crates/xagent-shared/src/config.rs); the table here mirrors them so readers do not have to cross-reference code to understand a section's claims.
+
+| Field | Role | Kernel reality |
+|---|---|---|
+| `learning_rate` | **Active** | Drives predictor weight updates, encoder-credit scaling, and pattern reinforcement / valence learning in [`shaders/kernel/brain_passes.wgsl`](crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl). Uploaded via `CFG_LEARNING_RATE`. Mutated by evolution. |
+| `decay_rate` | **Active** | Scales the per-tick pattern-memory decay rate in `shaders/kernel/brain_passes.wgsl`. Uploaded via `CFG_DECAY_RATE`. Mutated by evolution. |
+| `representation_dimension` | **Locked (compile-time)** | Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; WGSL workgroup arrays cannot resize at runtime. `build_config_for` writes `ENCODED_DIMENSION` into the GPU slot regardless and logs a one-shot warning on disagreement. Not mutated by evolution and not exposed in the UI. |
+| `memory_capacity` | **Proxy (metabolic)** | Kernel pattern memory is fixed at `MEMORY_CAP = 128`. The config value only feeds `metabolic_drain_per_tick` and `physics_state[P_MEMORY_CAP]`. Mutated by evolution as a metabolic-cost knob, not as a structural-capacity knob. |
+| `processing_slots` | **Proxy (metabolic)** | Kernel recall width is fixed at `RECALL_K = 16`. The config value only feeds metabolic drain and `physics_state[P_PROCESSING_SLOTS]`. Same status as `memory_capacity`. |
+| `visual_encoding_size` | **Legacy** | No stage in `crates/xagent-brain/src` reads this field today. Carried through breeding and serialization for backwards compatibility with existing saved configs; not mutated by evolution. Candidate for re-wiring to a real encoder stage or removal. |
+
+The other `BrainConfig` fields are all kernel-active: `distress_exponent`, `metabolic_rate`, and `integrity_scale` upload via the brain-config slot (`CFG_DISTRESS_EXP`, `CFG_METABOLIC_RATE`, `CFG_INTEGRITY_SCALE`); `habituation_sensitivity`, `max_curiosity_bonus`, `fatigue_floor`, and `movement_speed` upload as per-agent heritable state and are consumed every tick. None of those are subject to the locked / proxy / legacy caveats above.
+
+When a section below cites a parameter behavior that contradicts this table, the table is authoritative — the section is recording an earlier architectural era, not a current contract.
+
+---
+
+## The Disconnect (pre-fused-kernel snapshot)
+
+**Status note.** The diagram and dimension counts below (`32-dim compressed space`, `Raw features (201-dim)`, the five-parameter evolution lever set) describe the architecture **before** the fused-kernel landing and the #106 parameter reconciliation. The structural critique — that the evolved cognitive stack is disconnected from the action selector that determines behavior — is still the live motivating problem for open issue #107. The dimension numbers and the implication that all five `BrainConfig` parameters drive the cognitive stack are not current; see *Current Parameter Roles* above for what each field does in the present kernel.
 
 After all fixes, the architecture has a fundamental structural problem:
 
@@ -296,6 +321,8 @@ The action selector — which determines ALL behavior — is disconnected from t
 ## The Path Forward (A, B, C)
 
 ### A. Reunify the Brain
+
+**Status note (post-fused-kernel).** This proposal predates the issue #106 parameter taxonomy. The phrasing further down — "Evolution can influence behavior by tuning how fast the encoder adapts (learning_rate), how many patterns it can store (memory_capacity), and how rich the representation is (representation_dim)" — currently only holds for `learning_rate`. `representation_dimension` is locked to `ENCODED_DIMENSION`, and `memory_capacity` is a metabolic proxy (kernel pattern memory is fixed at `MEMORY_CAP`). Realizing the rest of this path requires either runtime-sized WGSL arrays / per-config shader recompilation (to unlock `representation_dimension`) or wiring `memory_capacity` to a real dynamic pattern buffer rather than the metabolic-drain formula. See *Current Parameter Roles* above; open issue #107 tracks the architectural reunification work.
 
 The action selector must work in the SAME representational space as memory and prediction. This means the encoder must be TRAINABLE — learning to produce representations that are useful for action selection, not just a frozen random projection.
 

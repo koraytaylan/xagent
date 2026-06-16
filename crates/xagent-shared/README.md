@@ -1,8 +1,8 @@
 # xagent-shared
 
-Shared types, traits, and configuration for the xagent cognitive agent platform.
+Shared types and configuration for the xagent cognitive agent platform.
 
-This crate is the **interface contract** between the brain and sandbox crates. It contains no logic — only data structures, the `CognitiveArchitecture` trait, and configuration with presets. Every type that crosses the brain↔sandbox boundary lives here, which keeps the dependency graph clean and makes it possible to swap cognitive architectures without touching the simulation.
+This crate is the **interface contract** between the brain and sandbox crates. It contains no logic — only data structures and configuration with presets. Every type that crosses the brain↔sandbox boundary lives here, which keeps the dependency graph clean.
 
 ```
                 ┌───────────────────────┐
@@ -13,22 +13,25 @@ This crate is the **interface contract** between the brain and sandbox crates. I
                 │  BodyState            │
                 │  BrainConfig          │
                 │  WorldConfig          │
-                │  CognitiveArchitecture│
                 └──────────┬────────────┘
                            │
               ┌────────────┼────────────┐
               │                         │
               ▼                         ▼
-     ┌────────────────┐       ┌──────────────────┐
-     │  xagent-brain  │       │ xagent-sandbox   │
-     │                │       │                  │
-     │  implements    │       │  uses types to   │
-     │  Cognitive-    │       │  build frames,   │
-     │  Architecture  │       │  interpret motor │
-     └────────────────┘       │  commands, track │
-                              │  body state      │
-                              └──────────────────┘
+     ┌────────────────┐       ┌─────────────────────┐
+     │  xagent-brain  │       │ xagent-sandbox      │
+     │                │       │                     │
+     │  GpuKernel     │       │  Builds world       │
+     │  uploads these │       │  state, runs the    │
+     │  configs to    │       │  sim worker that    │
+     │  GPU buffers,  │       │  owns the kernel,   │
+     │  runs the      │       │  reads back vitals  │
+     │  fused per-    │       │  and telemetry for  │
+     │  agent kernel  │       │  UI + replay        │
+     └────────────────┘       └─────────────────────┘
 ```
+
+> **Historical note.** Earlier versions of this crate documented `SensoryFrame` and `MotorCommand` as the per-tick interface — the sandbox would build a `SensoryFrame`, call a `Brain::tick(frame) -> MotorCommand` method, and apply the result. The runtime has since moved entirely onto the GPU (`xagent_brain::GpuKernel`). These types are still the canonical shape of one sensory snapshot and one motor command, used for `BrainConfig`/`WorldConfig` serialization, replay records, and unit-test fixtures — but they no longer cross the bus per tick. The sandbox builds world state and uploads it to GPU buffers; the kernel computes vision, motor output, and the rest in-place.
 
 ---
 
@@ -40,7 +43,6 @@ This crate is the **interface contract** between the brain and sandbox crates. I
    - [2.2 motor.rs — Motor Output](#22-motorrs--motor-output)
    - [2.3 body.rs — Physical Body State](#23-bodyrs--physical-body-state)
    - [2.4 config.rs — Configuration & Presets](#24-configrs--configuration--presets)
-   - [2.5 traits.rs — CognitiveArchitecture Trait](#25-traitsrs--cogitivearchitecture-trait)
 3. [Type Relationships & Data Flow](#3-type-relationships--data-flow)
 4. [Configuration Guide](#4-configuration-guide)
 5. [Adding New Types](#5-adding-new-types)
@@ -56,7 +58,6 @@ In many game/simulation architectures the "brain" and the "world" are tightly co
 | Principle | How xagent-shared achieves it |
 |---|---|
 | **Decoupling** | Brain and sandbox never import each other. They only import shared types. |
-| **Swappable brains** | Any struct implementing `CognitiveArchitecture` can serve as the agent's brain. You can drop in a neural network, a behavior tree, or a random-action generator without changing the sandbox. |
 | **Clean dependency graph** | `xagent-shared` has zero workspace dependencies. Both `xagent-brain` and `xagent-sandbox` depend on it, but never on each other. This prevents circular dependencies and keeps compile times predictable. |
 | **Serialization boundary** | Every type derives `Serialize`/`Deserialize`. Configuration can be loaded from JSON files, sensory frames can be logged to disk, and motor commands can be replayed — all because the interface types are data-only. |
 | **No hidden logic** | Shared contains no algorithms, no update loops, no mutable global state. It is a vocabulary crate: it defines the words that brain and sandbox use to talk to each other. |
@@ -268,10 +269,10 @@ Brain capacity parameters. These are not implementation details — they are the
 
 | Parameter | Default | Effect on Emergence |
 |---|---|---|
-| `memory_capacity` | 128 | Maximum number of patterns the memory can hold. Smaller values force the brain to forget more aggressively, leading to stronger habit formation and more stereotyped behavior. Larger values allow richer memory but slower convergence. The increased default (128) allows learning multiple survival skills while still maintaining capacity pressure — only the most reinforced patterns survive decay, which *is* emergent attention. |
-| `processing_slots` | 16 | Maximum number of patterns that can be recalled/compared per tick. This is the agent's "attention span" — with fewer slots, it makes faster but cruder decisions. More slots means better pattern matching but higher computational cost per tick. |
-| `visual_encoding_size` | 64 | Resolution of the visual encoder output (downsampled from raw vision). Smaller values force more aggressive compression, which means the brain sees less detail but processes faster. Larger values preserve more visual information. |
-| `representation_dimension` | 128 | Length of the internal representation vector. This is the dimensionality of the space in which the brain thinks. Smaller values force more abstraction — the brain must compress its experience into fewer numbers, leading to coarser but more generalizable representations. |
+| `memory_capacity` | 128 | **Proxy (metabolic cost).** Feeds the per-tick metabolic drain formula in `crates/xagent-sandbox/src/physics/mod.rs::metabolic_drain_per_tick` and the GPU kernel's `physics_state[P_MEMORY_CAP]` slot (`kernel_tick.wgsl:154-157`). The kernel's actual pattern-memory size is fixed at `xagent_brain::buffers::MEMORY_CAP = 128`, independent of this value. Larger configs simply cost more energy per tick without providing more storage. See issue #106. |
+| `processing_slots` | 16 | **Proxy (metabolic cost).** Feeds the per-tick metabolic drain formula and the GPU kernel's `physics_state[P_PROCESSING_SLOTS]` slot (`kernel_tick.wgsl:154-157`). The kernel's actual recall width is fixed at `xagent_brain::buffers::RECALL_K = 16` patterns/tick. Larger configs simply cost more energy per tick without widening recall. See issue #106. |
+| `visual_encoding_size` | 64 | **Legacy / unused.** No stage in `crates/xagent-brain/src` reads this field — the kernel has no downsampling encoder that varies with it. Preserved through breeding and serialization for backwards compatibility with saved configs; will be either wired to a real encoder or removed in a future release. See issue #106. |
+| `representation_dimension` | 128 | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The kernel sizes encoder weights, predictor weights, pattern rows, and workgroup arrays from that constant, so WGSL cannot resize them at runtime. `build_config_for` writes `ENCODED_DIMENSION` into the GPU config slot regardless of the struct field and logs a warning if the config value disagrees. Not mutated by evolution and not exposed in the UI (see issues #103, #106). |
 | `learning_rate` | 0.05 | Base learning rate for association updates. Higher rates mean faster adaptation but more instability (catastrophic forgetting). Lower rates mean more stable memory but slower learning. |
 | `decay_rate` | 0.001 | Decay rate for unreinforced patterns per tick. Patterns that aren't recalled or reinforced gradually lose strength. Higher decay means more aggressive forgetting — the brain only retains frequently-used patterns. |
 | `distress_exponent` | 2.0 | Exponent for the homeostatic distress curve. Higher values mean the agent stays calm longer but panics harder at critical levels. Heritable: mutated during breeding, clamped to [1.5, 5.0]. |
@@ -283,8 +284,8 @@ Brain capacity parameters. These are not implementation details — they are the
 **Presets**:
 
 - **`BrainConfig::default()`** — Balanced defaults. Good starting point for most experiments. 128 memory slots, 16 processing slots, moderate learning and decay. Enough capacity to learn multiple survival skills while still maintaining prioritization pressure.
-- **`BrainConfig::tiny()`** — Minimal capacity (24 memory, 8 processing, 32 visual, 16 representation). Use this to observe how severe constraints shape behavior: the agent forgets quickly, attends narrowly, and develops strong habits. Interesting for studying capacity-driven cognition.
-- **`BrainConfig::large()`** — More capacity (512 memory, 32 processing, 128 visual, 64 representation). Slower emergence but richer eventual behavior. The agent can maintain more patterns, recall more context, and form finer-grained representations. Use this when you want to see what the architecture can do without tight constraints.
+- **`BrainConfig::tiny()`** — Minimal capacity (24 memory, 8 processing, 32 visual). Use this to observe how severe constraints shape behavior: the agent forgets quickly, attends narrowly, and develops strong habits. Interesting for studying capacity-driven cognition. `representation_dimension` is locked to `ENCODED_DIMENSION = 128` across all presets (see issue #106).
+- **`BrainConfig::large()`** — More capacity (512 memory, 32 processing, 128 visual). Slower emergence but richer eventual behavior. The agent can maintain more patterns, recall more context, and form finer-grained representations. `representation_dimension` is locked to `ENCODED_DIMENSION = 128` across all presets (see issue #106).
 
 #### `WorldConfig`
 
@@ -354,82 +355,49 @@ pub struct FullConfig {
 
 Combined configuration for JSON serialization. Both fields have `#[serde(default)]` so you can provide partial JSON and get defaults for the rest.
 
-### 2.5 `traits.rs` — CognitiveArchitecture Trait
-
-```rust
-pub trait CognitiveArchitecture {
-    fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand;
-}
-```
-
-The single trait that makes the entire architecture swappable. Any struct that implements `CognitiveArchitecture` can serve as an agent's brain.
-
-**Why it exists**: The sandbox doesn't know or care what happens inside the brain. It only knows that each tick it provides a `SensoryFrame` and gets back a `MotorCommand`. This contract is what enables:
-
-- **Multiple brain implementations**: The default `Brain` in `xagent-brain` uses predictive processing, but you could implement a rule-based system, a neural network, a random agent, or a human-controlled agent — all using the same interface.
-- **A/B testing**: Run different cognitive architectures in the same world and compare their survival outcomes.
-- **Incremental development**: Build a simple reactive brain first, then gradually add prediction, memory, and learning without changing the sandbox.
-
-**How to implement a custom brain**:
-
-```rust
-use xagent_shared::{CognitiveArchitecture, SensoryFrame, MotorCommand};
-
-struct MyBrain {
-    // your internal state
-}
-
-impl CognitiveArchitecture for MyBrain {
-    fn tick(&mut self, frame: &SensoryFrame) -> MotorCommand {
-        // Process frame.vision, frame.energy_signal, etc.
-        // Return a MotorCommand with forward/strafe/turn/action
-        MotorCommand::idle()
-    }
-}
-```
-
-The `tick` method receives an immutable reference to the frame (the brain can read but not modify the world) and returns a `MotorCommand` by value. The brain can maintain any internal state it needs via `&mut self`.
-
 ---
 
 ## 3. Type Relationships & Data Flow
 
-The types in this crate form a clean data-flow pipeline:
+These shared types describe the *shape* of one tick's worth of sensory input and motor output. The actual per-tick computation happens inside the GPU kernel — the structures here are the contract the host code uses to set up that kernel and read its results.
 
 ```
-  Sandbox                     Shared Types                     Brain
-  ───────                     ────────────                     ─────
+  Sandbox                                   Shared Types                          GpuKernel (GPU)
+  ───────                                   ────────────                          ───────────────
 
-  Physics engine     ──►   BodyState          ──►   (internal tracking)
-  Sensory extraction ──►   SensoryFrame       ──►   brain.tick(frame)
-                           MotorCommand       ◄──   return value
-  Physics engine     ◄──   MotorCommand
+  Builds initial agent specs        ──►   BodyState, BrainConfig    ──►   upload_agents / upload_world
+  Updates world configuration       ──►   WorldConfig               ──►   upload_world_config
+                                            │
+                                            │ (descriptor types — never marshalled per tick)
+                                            ▼
+                                          Per-agent storage buffer rows
+                                          (physics_state, brain_state, …)
+                                            │
+  Reads back vitals + telemetry     ◄──   normalized copies of      ◄──   state readback into shared
+                                          SensoryFrame fields and          types for UI + replay
+                                          MotorCommand for display
 ```
 
-**Per-tick flow**:
+**Per-batch flow**:
 
-1. **Sandbox builds `SensoryFrame`**: The sandbox reads the agent's `BodyState`, renders low-res vision from the agent's viewpoint, gathers touch contacts, normalizes physiological signals, and packages everything into a `SensoryFrame`.
+1. **Sandbox uploads world + agent state**: When the world geometry or an agent spec changes (startup, spawn, config edit), the sandbox uploads new terrain/biome/food data and `BodyState` / `BrainConfig` rows into the kernel's GPU **storage** buffers via `GpuKernel::upload_world` / `upload_agents` / `write_agent_*`. `WorldConfig` (tick window, vision/brain strides, phase mask) is a separate path — it lives in a double-buffered **uniform** buffer (`world_config_bufs`) that `upload_world_config[_masked]` rewrites once per kernel-batch from inside `dispatch_ticks`.
 
-2. **Brain processes `SensoryFrame`**: The brain's `tick()` method receives the frame. It encodes the sensory data, recalls relevant patterns from memory, predicts what will happen next, measures prediction error, updates its internal model, and selects an action.
+2. **Simulation worker dispatches a batch**: the kernel is owned by a worker thread (`sim_runtime.rs`) that calls `kernel.dispatch_ticks(start_tick, ticks_to_run)` to run many simulated ticks per submission. Inside the kernel, each agent's vision rays are raycast in WGSL, touch contacts are detected from the spatial grids, motor output is computed from the encoded state, and physics integrates position/velocity/energy/integrity — all without crossing the bus. (`dispatch_batch` = `dispatch_ticks` + `request_state_snapshot`; the worker schedules the two separately so publication is rate-limited independently of compute.)
 
-3. **Brain returns `MotorCommand`**: The brain's output is a `MotorCommand` specifying how the agent wants to move and what (if any) discrete action to perform.
-
-4. **Sandbox executes `MotorCommand`**: The physics engine applies the motor command to the agent's `BodyState` — updating position, velocity, and facing based on the thrust/strafe/turn values. If a discrete action is specified, it's executed (e.g., consuming food in front).
-
-5. **Sandbox updates `BodyState`**: Energy is depleted, integrity is damaged or regenerated, collisions are resolved, and the alive flag is checked. The updated `BodyState` feeds into the next tick's `SensoryFrame`.
+3. **Sandbox reads back what it needs for UI**: Non-blocking `try_collect_state_snapshot` / `try_collect_telemetry` calls produce snapshots that the sandbox reshapes back into `SensoryFrame`-like data for replay recording and `MotorCommand` for telemetry rendering. These are convenience reconstitutions of the shape — the authoritative per-tick state lives in GPU storage.
 
 **What flows where**:
 
-| Type | Direction | Description |
+| Type | Role | Where it actually lives |
 |---|---|---|
-| `SensoryFrame` | sandbox → brain | Complete sensory snapshot for one tick |
-| `MotorCommand` | brain → sandbox | The brain's intended actions |
-| `BodyState` | sandbox-internal | Physical state; sandbox reads/writes, brain never sees directly |
-| `InternalState` | sandbox-internal | Physiological variables; normalized copies appear in `SensoryFrame` |
-| `BrainConfig` | config → brain | Capacity constraints, set at startup |
-| `WorldConfig` | config → sandbox | World parameters, set at startup |
+| `SensoryFrame` | Snapshot of one tick's sensory inputs (shape contract) | Reconstituted from GPU readback for replay / unit-test fixtures. Not uploaded per tick. |
+| `MotorCommand` | Snapshot of one tick's motor output (shape contract) | Reconstituted from GPU readback for the UI/replay. Not returned per tick from a Rust call. |
+| `BodyState` | Physical state at spawn / on inspection | Uploaded into the physics-state buffer when a new agent is spawned; read back when the CPU needs position/vitals. |
+| `InternalState` | Physiological variables | Held inside `BodyState`; reconstituted from physics readback. |
+| `BrainConfig` | Heritable capacity + tuning parameters | Uploaded into the brain-state tail per agent at spawn or after evolution mutation. |
+| `WorldConfig` | World parameters | Uploaded into the double-buffered world-config uniform buffer; rewritten once per kernel-batch by `upload_world_config[_masked]`. |
 
-Note that the brain **never** receives `BodyState` directly — it only gets the normalized, noisy signals in `SensoryFrame`. The brain doesn't know its exact energy level, only its `energy_signal` (a float between 0 and 1). This information asymmetry is deliberate: it forces the brain to build internal models of its own state rather than having perfect self-knowledge.
+Note that the brain stages still **never** see `BodyState` directly — they read the normalized fields (`energy_signal`, `integrity_signal`, deltas) the physics phase writes into the sensory layout. The brain doesn't know its exact energy level, only the normalized signal. This information asymmetry is preserved on the GPU side too: the encoder reads the same opaque buffer of floats regardless of how the physics phase produced them.
 
 ---
 
@@ -536,5 +504,5 @@ To add a new discrete action:
 |---|---|
 | **Dependencies** | `glam` (vec math), `serde` (serialization) |
 | **Dependents** | `xagent-brain`, `xagent-sandbox` |
-| **Logic** | None — data structures and trait definitions only |
+| **Logic** | None — data structures only |
 | **Unsafe** | None |

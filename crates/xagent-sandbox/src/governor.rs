@@ -37,6 +37,109 @@ pub struct AgentFitness {
     pub composite_fitness: f32,
 }
 
+/// Foraging rate (food consumed per 1000 alive ticks) that earns a full
+/// foraging score. Around the per-capita break-even rate where an agent
+/// sustains its own energy, so a competent forager maxes this axis.
+const FORAGING_RATE_TARGET: f32 = 1.5;
+/// Lower bound on the survival multiplier. Deaths still penalize, but the
+/// multiplier never drives the foraging signal below this fraction the way an
+/// unbounded `1/(1+deaths·k)` gate did at hundreds of deaths per generation —
+/// that collapse pushed the whole population into the eval-noise floor and
+/// blinded selection to real foraging differences.
+const SURVIVAL_FLOOR: f32 = 0.25;
+/// Per-death penalty inside the survival multiplier.
+const DEATH_PENALTY: f32 = 0.5;
+/// Foraging is the primary objective; exploration is a smaller secondary term.
+const FORAGING_WEIGHT: f32 = 0.85;
+const EXPLORATION_WEIGHT: f32 = 0.15;
+
+/// Significance threshold (in pooled standard errors) a generation's mean must
+/// clear over its parent to count as a real improvement. One stderr keeps the
+/// spawn bar from ratcheting on eval noise — the dominant cause of the
+/// near-zero success rate and high cross-repeat winner disagreement — while
+/// still accepting genuine one-σ gains. Only applied when there are enough
+/// repeats to estimate the noise.
+const K_SIGNIF: f32 = 1.0;
+
+/// Composite fitness: foraging-primary with a bounded survival multiplier.
+///
+/// The primary axis is `food_per_1k_alive_ticks` (food consumed normalized by
+/// the agent's actual lived time), so a generation's real foraging variance
+/// drives selection. Survival is a multiplier bounded below by
+/// [`SURVIVAL_FLOOR`]: dying still costs score — a careful forager outscores a
+/// kamikaze one with the same food — but a high death count can no longer
+/// collapse the composite into the noise floor where foraging variance is
+/// invisible. Exploration is a smaller secondary term. `total_grid_cells` is
+/// the per-generation exploration denominator from [`Governor::evaluate`].
+fn composite_fitness(
+    death_count: u32,
+    food_consumed: u32,
+    cells_explored: u32,
+    ticks_alive: u64,
+    total_grid_cells: f32,
+) -> f32 {
+    // Guard the divisor: a generation always advances at least a few ticks.
+    let alive_thousands = (ticks_alive as f32 / 1000.0).max(1e-3);
+    // Foraging rate, normalized to the target rate and capped at a full score.
+    let food_per_1k = food_consumed as f32 / alive_thousands;
+    let foraging = (food_per_1k / FORAGING_RATE_TARGET).min(1.0);
+    // Exploration: fraction of reachable grid visited (25% of total = perfect).
+    let exploration = (cells_explored as f32 / total_grid_cells).min(1.0);
+    // Bounded survival multiplier: 1.0 at zero deaths, asymptotes to the floor.
+    let survival =
+        SURVIVAL_FLOOR + (1.0 - SURVIVAL_FLOOR) / (1.0 + death_count as f32 * DEATH_PENALTY);
+    survival * (foraging * FORAGING_WEIGHT + exploration * EXPLORATION_WEIGHT)
+}
+
+/// First- and last-quarter within-life food rates (food per 1000 alive ticks),
+/// from cumulative `(food, alive_ticks)` samples taken at the four quarter
+/// boundaries of a generation's tick budget. The last-quarter rate uses the
+/// deltas between the third and fourth samples; a rising last-over-first is the
+/// within-life learning signal. Shared by the headless tool and the governor's
+/// production-path persistence so both compute the metric identically.
+pub(crate) fn quarter_food_rates(samples: &[(u64, u64); 4]) -> (f64, f64) {
+    let (first_food, first_alive) = samples[0];
+    let first_rate = if first_alive > 0 {
+        first_food as f64 / first_alive as f64 * 1000.0
+    } else {
+        0.0
+    };
+    let last_food = samples[3].0.saturating_sub(samples[2].0);
+    let last_alive = samples[3].1.saturating_sub(samples[2].1);
+    let last_rate = if last_alive > 0 {
+        last_food as f64 / last_alive as f64 * 1000.0
+    } else {
+        0.0
+    };
+    (first_rate, last_rate)
+}
+
+/// Per-generation within-life foraging tracker. Snapshots cumulative
+/// `(food, alive_ticks)` at the four quarter boundaries of the tick budget so a
+/// rising q1→q4 food rate (within-life learning) is visible on the production
+/// governor path, not only in the headless side-tool.
+#[derive(Clone, Debug, Default)]
+struct WithinLifeTracker {
+    /// `(cumulative_food, cumulative_alive_ticks)` snapshot at each quarter.
+    quarter_samples: [(u64, u64); 4],
+    /// Quarter boundaries snapshotted so far this generation.
+    recorded: usize,
+    /// Most recent sample, used to fill any quarter no state read landed on.
+    latest: (u64, u64),
+}
+
+impl WithinLifeTracker {
+    /// Quarter samples with any boundary that no read landed on filled from the
+    /// latest sample, matching the headless end-of-generation fill.
+    fn filled(&self) -> [(u64, u64); 4] {
+        let mut samples = self.quarter_samples;
+        for slot in samples.iter_mut().skip(self.recorded) {
+            *slot = self.latest;
+        }
+        samples
+    }
+}
+
 /// Result of `Governor::advance()` — tells the caller what to do next.
 pub enum AdvanceResult {
     /// Simulation continues — spawn the given configs for the next generation.
@@ -102,6 +205,8 @@ pub struct Governor {
     recording_sender: Option<SyncSender<RecordingPayload>>,
     /// Handle to the background writer thread (joined on drop).
     writer_thread: Option<JoinHandle<()>>,
+    /// Within-life foraging quarter samples for the current generation.
+    within_life: WithinLifeTracker,
 }
 
 /// Spawn a background thread that owns a dedicated SQLite connection and
@@ -312,6 +417,7 @@ impl Governor {
             momentums,
             recording_sender,
             writer_thread,
+            within_life: WithinLifeTracker::default(),
         })
     }
 
@@ -325,6 +431,8 @@ impl Governor {
 
         // Run migrations for any new columns (idempotent — silently ignores duplicates)
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
+        let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q1_food_rate REAL;");
+        let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q4_food_rate REAL;");
 
         let (run_id, governor_json, spawn_parent_id, momentum_json): (
             i64,
@@ -403,6 +511,7 @@ impl Governor {
             momentums,
             recording_sender,
             writer_thread,
+            within_life: WithinLifeTracker::default(),
         };
         gov.refresh_best_score();
         Ok(gov)
@@ -433,9 +542,18 @@ impl Governor {
             && (self.generation + 1) as u64 >= self.config.max_generations
     }
 
-    /// Advance the generation tick counter.
+    /// Advance the generation tick counter by `ticks`.
+    ///
+    /// Equivalent to calling [`tick`](Self::tick) `ticks` times, but
+    /// constant-time so the sandbox loop does no CPU work proportional to the
+    /// number of simulated ticks. Saturates at `u64::MAX` rather than wrapping.
+    pub fn advance_ticks(&mut self, ticks: u64) {
+        self.gen_tick = self.gen_tick.saturating_add(ticks);
+    }
+
+    /// Advance the generation tick counter by one.
     pub fn tick(&mut self) {
-        self.gen_tick += 1;
+        self.advance_ticks(1);
     }
 
     /// Evaluate all agents and record results. Returns fitness scores sorted
@@ -463,20 +581,18 @@ impl Governor {
             .collect();
 
         // Absolute fitness scoring — no intra-generational normalization.
-        // Each axis uses a meaningful denominator so scores reflect real quality.
-        let tick_budget = self.config.tick_budget as f32;
+        // The exploration denominator is the reachable quarter of the heatmap
+        // grid; foraging is a rate normalized by each agent's own lived time.
         let total_grid_cells = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
-        let food_target = (tick_budget / 1000.0).max(10.0);
 
         for r in &mut results {
-            // Survival: penalize dying. 0 deaths → 1.0, 1 → 0.67, 2 → 0.5
-            let survival = 1.0 / (1.0 + r.death_count as f32 * 0.5);
-            // Foraging: food per generation, capped at target
-            let foraging = (r.food_consumed as f32 / food_target).min(1.0);
-            // Exploration: fraction of reachable grid visited (25% of total = perfect)
-            let exploration = (r.cells_explored as f32 / total_grid_cells).min(1.0);
-
-            r.composite_fitness = survival * 0.4 + foraging * 0.3 + exploration * 0.3;
+            r.composite_fitness = composite_fitness(
+                r.death_count,
+                r.food_consumed,
+                r.cells_explored,
+                r.total_ticks_alive,
+                total_grid_cells,
+            );
         }
 
         // Insert agent_result records
@@ -553,11 +669,91 @@ impl Governor {
         groups
     }
 
+    /// Pooled within-config standard error of this generation's mean fitness.
+    ///
+    /// Groups the per-agent results by config exactly as [`reduce_fitness`]
+    /// does, pools the across-repeat (within-config) variance, and returns the
+    /// standard error of the generation mean. This is the eval-noise scale the
+    /// significance guard compares improvements against. Returns `None` when
+    /// there are too few repeats (or samples) to estimate the noise, in which
+    /// case the caller falls back to the bare mean comparison.
+    fn pooled_stderr(&self, fitness: &[AgentFitness]) -> Option<f32> {
+        let repeats = self.config.eval_repeats.max(1);
+        if repeats < 2 {
+            return None;
+        }
+        let mut ordered = fitness.to_vec();
+        ordered.sort_by_key(|f| f.agent_index);
+        let mut pooled_sum_sq = 0.0_f32;
+        let mut total_samples = 0_usize;
+        let mut group_count = 0_usize;
+        for chunk in ordered.chunks(repeats) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let mean = chunk.iter().map(|f| f.composite_fitness).sum::<f32>() / chunk.len() as f32;
+            pooled_sum_sq += chunk
+                .iter()
+                .map(|f| (f.composite_fitness - mean).powi(2))
+                .sum::<f32>();
+            total_samples += chunk.len();
+            group_count += 1;
+        }
+        // Need at least one residual degree of freedom across the pool.
+        if group_count == 0 || total_samples <= group_count {
+            return None;
+        }
+        let pooled_variance = pooled_sum_sq / (total_samples - group_count) as f32;
+        Some((pooled_variance / total_samples as f32).sqrt())
+    }
+
+    /// Record a within-life foraging sample for the current generation.
+    ///
+    /// Callers driving the tick loop pass the population's cumulative food and
+    /// alive-tick totals each time they read GPU state; this snapshots them at
+    /// each quarter boundary of the tick budget (deciding boundaries from
+    /// `gen_tick`), so the q1→q4 within-life food rate is captured on every
+    /// governor run, not just the headless side-tool.
+    pub fn record_within_life_sample(&mut self, cumulative_food: u64, cumulative_alive: u64) {
+        self.within_life.latest = (cumulative_food, cumulative_alive);
+        let quarter_length = (self.config.tick_budget / 4).max(1);
+        while self.within_life.recorded < 4
+            && self.gen_tick >= quarter_length * (self.within_life.recorded as u64 + 1)
+        {
+            self.within_life.quarter_samples[self.within_life.recorded] =
+                (cumulative_food, cumulative_alive);
+            self.within_life.recorded += 1;
+        }
+    }
+
+    /// First- and last-quarter within-life food rates for the generation so
+    /// far, filling any unhit quarter from the latest sample. Read before
+    /// [`Governor::advance`] persists and resets the tracker.
+    pub fn within_life_rates(&self) -> (f64, f64) {
+        quarter_food_rates(&self.within_life.filled())
+    }
+
+    /// Persist the current generation's q1→q4 within-life food rates to its
+    /// node row, then reset the tracker for the next generation.
+    fn persist_within_life(&mut self) {
+        if let Some(node_id) = self.current_node_id {
+            let (q1_rate, q4_rate) = self.within_life_rates();
+            let _ = self.db.execute(
+                "UPDATE node SET q1_food_rate = ?2, q4_food_rate = ?3 WHERE id = ?1",
+                params![node_id, q1_rate, q4_rate],
+            );
+        }
+        self.within_life = WithinLifeTracker::default();
+    }
+
     /// Process the evaluation results and advance to the next generation.
     ///
     /// Call this after `evaluate()`. Returns configs for the next population
     /// and log messages describing what happened.
     pub fn advance(&mut self, fitness: &[AgentFitness]) -> AdvanceResult {
+        // Persist this generation's within-life food rates to its node before
+        // any spawn-parent change, then reset the tracker for the next one.
+        self.persist_within_life();
         let reduced = self.reduce_fitness(fitness);
         let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
@@ -580,13 +776,20 @@ impl Governor {
         let parent_fitness = self.spawn_parent_fitness();
         let parent_config_for_momentum = self.spawn_parent_config();
 
+        // Score this generation against its parent (not the all-time best).
+        // Require the generation mean to beat the parent by at least K_SIGNIF
+        // pooled standard errors, so the spawn bar advances on real signal
+        // rather than eval noise. With too few repeats to estimate the noise,
+        // fall back to the bare mean comparison. Computed before the island
+        // mutable borrow below.
+        let accepted = match self.pooled_stderr(fitness) {
+            Some(stderr) if stderr > 0.0 => gen_avg - parent_fitness > K_SIGNIF * stderr,
+            _ => gen_avg >= parent_fitness,
+        };
+
         let island = &mut self.islands[self.active_island];
 
-        // Score this generation against its parent (not the all-time best).
-        // Both sides use the same metric (population average) so a generation
-        // can only succeed when its overall quality genuinely meets or exceeds
-        // the parent's.
-        if gen_avg >= parent_fitness {
+        if accepted {
             // ★ Success — this generation's average meets or exceeds its parent's
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = ?2 WHERE id = ?1",
@@ -900,7 +1103,15 @@ impl Governor {
             parent_fitness,
         );
 
-        // Compute unique config count for eval_repeats noise reduction
+        // Split the population into unique configs × eval_repeats: the
+        // population is spent on search breadth (distinct genomes), while
+        // Split the population into unique configs × eval_repeats: population
+        // buys search breadth (distinct genomes), `eval_repeats` buys per-config
+        // noise reduction. At the default population of 10 and 2 repeats that is
+        // 5 distinct configs per generation, each run twice. Population is kept
+        // small deliberately — the agents share one world, so a large population
+        // competes for finite food and yields no measured fitness gain (see
+        // `default_population_size`).
         let pop_size = self.config.population_size;
         let repeats = self.config.eval_repeats.max(1);
         let unique_count = (pop_size / repeats).max(1);
@@ -1017,8 +1228,10 @@ impl Governor {
         if let Some(best_config) = fitness.first() {
             let c = &best_config.config;
             println!("╠{}╣", bar);
+            // `mem_cost` / `proc_cost`: metabolic-cost proxies — kernel widths
+            // are fixed at MEMORY_CAP=128, RECALL_K=16 (see issue #106).
             let cfg_line = format!(
-                "  Config: mem={} slots={} dim={} lr={:.4} decay={:.4}",
+                "  Config: mem_cost={} proc_cost={} dim={} lr={:.4} decay={:.4}",
                 c.memory_capacity,
                 c.processing_slots,
                 c.representation_dimension,
@@ -1448,6 +1661,10 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add island_id if missing
     let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
 
+    // Backwards-compatible migration: per-generation within-life food rates.
+    let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q1_food_rate REAL;");
+    let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q4_food_rate REAL;");
+
     // Recording persistence: one little-endian f32 BLOB per generation
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS generation_recording (
@@ -1551,6 +1768,44 @@ mod tests {
         Governor::new(":memory:", config, &brain, "{}").unwrap()
     }
 
+    // ─── advance_ticks tests ────────────────────────────────────────
+
+    /// `advance_ticks(n)` must leave `gen_tick` exactly where `n` calls to
+    /// `tick()` would, so the batched fast-path is observably identical to the
+    /// per-tick loop it replaces.
+    #[test]
+    fn advance_ticks_matches_repeated_tick() {
+        const STEPS: u64 = 1_234;
+        let mut looped = test_governor(5);
+        for _ in 0..STEPS {
+            looped.tick();
+        }
+        let mut batched = test_governor(5);
+        batched.advance_ticks(STEPS);
+        assert_eq!(looped.gen_tick, STEPS);
+        assert_eq!(batched.gen_tick, looped.gen_tick);
+    }
+
+    /// Successive `advance_ticks` calls accumulate, mirroring how the sandbox
+    /// loop advances the counter once per dispatched batch.
+    #[test]
+    fn advance_ticks_accumulates_across_calls() {
+        let mut gov = test_governor(5);
+        gov.advance_ticks(40);
+        gov.advance_ticks(60);
+        assert_eq!(gov.gen_tick, 100);
+    }
+
+    /// `advance_ticks` saturates at `u64::MAX` instead of wrapping, so a huge
+    /// requested batch can never silently roll the counter back to zero.
+    #[test]
+    fn advance_ticks_saturates_at_u64_max() {
+        let mut gov = test_governor(5);
+        gov.advance_ticks(u64::MAX - 1);
+        gov.advance_ticks(10);
+        assert_eq!(gov.gen_tick, u64::MAX);
+    }
+
     // ─── advance tests ──────────────────────────────────────────────
 
     /// Create a mock AgentFitness slice with a single entry at the given fitness.
@@ -1564,6 +1819,254 @@ mod tests {
             cells_explored: 4096,
             composite_fitness: fitness,
         }]
+    }
+
+    /// A governor with a configurable number of eval repeats so the
+    /// significance guard (which needs ≥ 2 repeats to estimate noise) can be
+    /// exercised.
+    fn test_governor_repeats(repeats: usize) -> Governor {
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: repeats,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        Governor::new(":memory:", config, &brain, "{}").unwrap()
+    }
+
+    /// One config evaluated over `values.len()` repeats with the given
+    /// per-repeat fitnesses (sequential agent indices).
+    fn mock_fitness_repeats(values: &[f32]) -> Vec<AgentFitness> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| AgentFitness {
+                agent_index: i,
+                config: BrainConfig::default(),
+                total_ticks_alive: 50000,
+                death_count: 0,
+                food_consumed: 50,
+                cells_explored: 4096,
+                composite_fitness: f,
+            })
+            .collect()
+    }
+
+    /// `pooled_stderr` returns the standard error of the generation mean from
+    /// the within-config repeat spread, and `None` when repeats are too few to
+    /// estimate the noise.
+    #[test]
+    fn pooled_stderr_estimates_eval_noise() {
+        // Single repeat → cannot estimate noise.
+        let gov1 = test_governor_repeats(1);
+        assert!(gov1.pooled_stderr(&mock_fitness_repeats(&[0.3])).is_none());
+
+        // Four repeats, deviations of ±0.01: sample variance =
+        // 4·0.0001/3 = 1.333e-4; SEM = sqrt(1.333e-4 / 4) ≈ 0.005774.
+        let gov4 = test_governor_repeats(4);
+        let stderr = gov4
+            .pooled_stderr(&mock_fitness_repeats(&[0.31, 0.29, 0.31, 0.29]))
+            .expect("4 repeats must yield a stderr");
+        assert!(
+            (stderr - 0.005_774).abs() < 1e-4,
+            "pooled stderr {stderr} != expected ≈ 0.005774"
+        );
+
+        // Zero spread → zero stderr (the guard then falls back to bare compare).
+        let zero = gov4
+            .pooled_stderr(&mock_fitness_repeats(&[0.3, 0.3, 0.3, 0.3]))
+            .expect("4 repeats yields Some");
+        assert!(zero.abs() < 1e-7, "zero-spread stderr {zero} != 0");
+    }
+
+    /// The accept rule requires the generation mean to beat the parent by more
+    /// than `K_SIGNIF` pooled standard errors. The two arms straddle exactly one
+    /// stderr — a gain of 0.8·stderr is rejected and 1.2·stderr is accepted — so
+    /// the test pins the threshold near `K_SIGNIF = 1.0`, not merely "some
+    /// positive bar": a `K_SIGNIF` below 0.8 or above 1.2 fails it.
+    #[test]
+    fn significance_guard_pins_one_stderr_threshold() {
+        // A symmetric ±DEV spread over 4 repeats gives, for one config group,
+        // pooled_stderr = DEV / sqrt(3) (= sqrt((4·DEV²/3) / 4)). Both arms reuse
+        // this spread so their stderr matches, and the parent is gen 0's mean.
+        const DEV: f32 = 0.01;
+        let stderr = DEV / 3.0_f32.sqrt();
+        let parent = 0.30_f32;
+        // Four repeats centred on `mean` with the canonical spread.
+        let arm = |mean: f32| [mean + DEV, mean - DEV, mean + DEV, mean - DEV];
+
+        // Sub-threshold child: gain 0.8·stderr (< 1·stderr) → reject.
+        let mut gov = test_governor_repeats(4);
+        let root = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness_repeats(&[parent, parent, parent, parent])); // parent = 0.30
+        let gen1 = gov.current_node_id.unwrap();
+        assert_ne!(gen1, root);
+        gov.advance(&mock_fitness_repeats(&arm(parent + 0.8 * stderr)));
+        assert_eq!(
+            node_status(&gov, gen1),
+            "failed",
+            "a 0.8·stderr gain is below the one-stderr bar and must not advance it"
+        );
+
+        // Super-threshold child: gain 1.2·stderr (> 1·stderr) → accept.
+        let mut gov = test_governor_repeats(4);
+        gov.advance(&mock_fitness_repeats(&[parent, parent, parent, parent]));
+        let gen1 = gov.current_node_id.unwrap();
+        gov.advance(&mock_fitness_repeats(&arm(parent + 1.2 * stderr)));
+        assert_eq!(
+            node_status(&gov, gen1),
+            "successful",
+            "a 1.2·stderr gain clears the one-stderr bar and must advance it"
+        );
+    }
+
+    /// The shared quarter-rate helper computes the first-quarter food rate from
+    /// the first sample and the last-quarter rate from the q3→q4 delta.
+    #[test]
+    fn quarter_food_rates_computes_first_and_last_quarter_rates() {
+        // q1 ate 4 in 1000 alive-ticks (rate 4.0/1k); the last quarter ate
+        // 12−8 = 4 in 4000−3200 = 800 alive-ticks (rate 5.0/1k).
+        let samples = [(4_u64, 1000_u64), (6, 2100), (8, 3200), (12, 4000)];
+        let (first, last) = quarter_food_rates(&samples);
+        assert!((first - 4.0).abs() < 1e-9);
+        assert!((last - 5.0).abs() < 1e-9);
+
+        // Zero alive ticks → zero rate, never a divide-by-zero.
+        let zero = [(0_u64, 0_u64); 4];
+        assert_eq!(quarter_food_rates(&zero), (0.0, 0.0));
+    }
+
+    /// Sampling cumulative foraging across a generation and advancing persists
+    /// the q1→q4 within-life food rates to the generation's node row; a rising
+    /// rate records q4 > q1, a flat one records q4 ≈ q1.
+    #[test]
+    fn within_life_metric_persists_q1_to_q4() {
+        // test_governor has tick_budget = 100 → quarter boundaries at 25/50/75/100.
+        let mut gov = test_governor(5);
+        let node = gov.current_node_id.unwrap();
+
+        // Rising cumulative food: q1 rate 1/1600·1000 = 0.625; q4 rate
+        // (8−5)/(6400−4800)·1000 = 1.875.
+        gov.advance_ticks(25);
+        gov.record_within_life_sample(1, 1600);
+        gov.advance_ticks(25);
+        gov.record_within_life_sample(3, 3200);
+        gov.advance_ticks(25);
+        gov.record_within_life_sample(5, 4800);
+        gov.advance_ticks(25);
+        gov.record_within_life_sample(8, 6400);
+        gov.advance(&mock_fitness(0.1));
+
+        let (q1, q4): (f64, f64) = gov
+            .db
+            .query_row(
+                "SELECT q1_food_rate, q4_food_rate FROM node WHERE id = ?1",
+                params![node],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!((q1 - 0.625).abs() < 1e-6, "q1 rate {q1} != 0.625");
+        assert!((q4 - 1.875).abs() < 1e-6, "q4 rate {q4} != 1.875");
+        assert!(q4 > q1, "a rising within-life rate must record q4 > q1");
+
+        // A flat forager (constant per-quarter rate) records q4 ≈ q1.
+        let mut gov = test_governor(5);
+        let node = gov.current_node_id.unwrap();
+        for (tick_step, (food, alive)) in [
+            (25u64, (2u64, 1000u64)),
+            (25, (4, 2000)),
+            (25, (6, 3000)),
+            (25, (8, 4000)),
+        ] {
+            gov.advance_ticks(tick_step);
+            gov.record_within_life_sample(food, alive);
+        }
+        gov.advance(&mock_fitness(0.1));
+        let (q1, q4): (f64, f64) = gov
+            .db
+            .query_row(
+                "SELECT q1_food_rate, q4_food_rate FROM node WHERE id = ?1",
+                params![node],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (q4 - q1).abs() < 1e-6,
+            "a flat within-life rate must record q4 ≈ q1 ({q1} vs {q4})"
+        );
+    }
+
+    /// Foraging is the primary axis and survival is a bounded multiplier:
+    /// more food scores higher, more deaths score lower, dying-to-forage loses
+    /// to careful foraging for the same food, and — the point of the rework —
+    /// realistic high-death tuples keep meaningful dynamic range instead of
+    /// collapsing into the eval-noise floor.
+    #[test]
+    fn composite_fitness_is_foraging_primary_with_bounded_survival() {
+        let cells = 250;
+        let grid = 1000.0_f32;
+        // ~budget-scale lived time so food_per_1k reflects the rate, not a tiny
+        // alive window.
+        let ticks = 100_000_u64;
+
+        // (a) More food at equal deaths scores strictly higher.
+        let low_food = composite_fitness(2, 100, cells, ticks, grid);
+        let high_food = composite_fitness(2, 300, cells, ticks, grid);
+        assert!(
+            high_food > low_food,
+            "more food must score higher: {high_food} !> {low_food}"
+        );
+
+        // (b) More deaths at equal food scores strictly lower (anti-kamikaze).
+        let few_deaths = composite_fitness(1, 200, cells, ticks, grid);
+        let many_deaths = composite_fitness(50, 200, cells, ticks, grid);
+        assert!(
+            few_deaths > many_deaths,
+            "more deaths must score lower: {few_deaths} !> {many_deaths}"
+        );
+
+        // (c) Dynamic range survives high death counts. The old multiplicative
+        // gate drove a 200-death generation to ~0.003 (below eval noise); the
+        // bounded multiplier keeps it well above, and two foragers differing
+        // only in food rate stay clearly separable.
+        let forager_lean = composite_fitness(200, 30, cells, ticks, grid);
+        let forager_rich = composite_fitness(200, 60, cells, ticks, grid);
+        assert!(
+            forager_lean > 0.04,
+            "high-death forager collapsed into the noise floor: {forager_lean}"
+        );
+        assert!(
+            forager_rich - forager_lean > 0.02,
+            "foraging difference compressed below resolution: {forager_lean} vs {forager_rich}"
+        );
+
+        // Survival is bounded below: even an extreme death count keeps at least
+        // the floor fraction of the foraging score, never zero-by-gate.
+        let extreme = composite_fitness(1_000_000, 200, cells, ticks, grid);
+        let alive = composite_fitness(0, 200, cells, ticks, grid);
+        assert!(
+            extreme > alive * (SURVIVAL_FLOOR - 0.01),
+            "survival multiplier fell through its floor: {extreme} vs alive {alive}"
+        );
+
+        // Idle agent: no foraging, no exploration → zero regardless of survival.
+        assert_eq!(composite_fitness(0, 0, 0, ticks, grid), 0.0);
+
+        // Foraging rate is capped: 2× the target rate still scores a full
+        // foraging term, not double.
+        let capped = composite_fitness(0, 300, 0, ticks, grid);
+        let at_target = composite_fitness(0, 150, 0, ticks, grid);
+        assert!(
+            (capped - at_target).abs() < 1e-6,
+            "foraging above target must cap: {capped} vs {at_target}"
+        );
     }
 
     /// Helper to read a node's status from the DB.
@@ -2441,10 +2944,11 @@ mod tests {
 
     #[test]
     fn momentum_persists_across_resume() {
-        use std::fs;
-
-        let db_path = "/tmp/xagent_test_momentum_persist.db";
-        let _ = fs::remove_file(db_path);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let db_path_buf = temp_dir.path().join("momentum_persists_across_resume.db");
+        let db_path = db_path_buf
+            .to_str()
+            .expect("temp DB path must be valid UTF-8");
 
         let config = GovernorConfig {
             population_size: 10,
@@ -2483,8 +2987,6 @@ mod tests {
                 || gov.momentums[1].get("decay_rate") != 0.0;
             assert!(has_data, "momentum should have been persisted and restored");
         }
-
-        let _ = fs::remove_file(db_path);
     }
 
     #[test]

@@ -16,7 +16,6 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
 | egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
-| CSV telemetry recording | `recording.rs` |
 | Per-generation replay recording & playback | `replay.rs` |
 | Event loop & orchestration | `main.rs` |
 
@@ -29,10 +28,10 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  main.rs  (winit ApplicationHandler – event loop & orchestration)         │
 │                                                                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ recording  │  │
+│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │   replay   │  │
 │  │          │  │          │  │          │  │          │  │            │  │
-│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │recording.rs│  │
-│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │ replay.rs  │  │
+│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │  replay.rs │  │
+│  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
@@ -50,33 +49,43 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │       │                           │             │              │          │
 │       │  ┌──────────────────────────────────────┤              │          │
 │       │  │         Agent                        │              │          │
-│       │  │  .body: AgentBody  (position,yaw,…)  │              │          │
-│       │  │  .brain: Brain     (xagent-brain)    │              │          │
+│       │  │  .body: AgentBody  (position, yaw…)  │              │          │
+│       │  │  .brain_idx: u32   (slot in kernel)  │              │          │
+│       │  │  .brain_config: BrainConfig          │              │          │
 │       │  │  .color, .generation, .death_count   │              │          │
 │       │  └──────────────────────────────────────┘              │          │
 │       │                                                        │          │
 │  ┌────┴──────────────────────────────────────────────┐         │          │
-│  │  Per-frame pipeline                               │         │          │
+│  │  Per-frame pipeline (render/UI thread)            │         │          │
 │  │  1. Input events → camera update                  │         │          │
-│  │  2. For each tick:                                │         │          │
-│  │     a. extract_senses() → SensoryFrame            │         │          │
-│  │     b. brain.tick(frame) → MotorCommand            │         │          │
-│  │     c. physics::step(agent, motor, world)         │         │          │
-│  │     d. Record tick data + food events to replay   │         │          │
-│  │     e. death/respawn/reproduction checks          │         │          │
-│  │  3. Advance replay playback (if active)           │         │          │
-│  │  4. Rebuild meshes (agents, food)                 │         │          │
-│  │  5. Build HUD bars                                │         │          │
+│  │  2. Drain sim-worker events → apply newest        │         │          │
+│  │     snapshot to agent caches (latest-wins)        │         │          │
+│  │  3. On fresh snapshot: replay + history/heatmap/  │         │          │
+│  │     trail updates                                 │         │          │
+│  │  4. Generation handoff events + replay playback   │         │          │
+│  │  5. Rebuild meshes + HUD bars                     │         │          │
 │  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
-│  │  7. Log telemetry to CSV                          │                    │
+│  │  7. Forward speed/pause/selection to worker       │                    │
+│  └───────────────────────────────────────────────────┘                    │
+│                                                                            │
+│  ┌───────────────────────────────────────────────────┐                    │
+│  │  Simulation worker (background thread, owns kernel)│                    │
+│  │  • Advance ticks on a wall-clock cadence           │                    │
+│  │  • Dispatch one kernel-batch per loop iteration    │                    │
+│  │  • Request state @60 Hz / telemetry @30 Hz         │                    │
+│  │  • Enforce generation tick budget                  │                    │
+│  │  • Publish snapshots/telemetry over channels       │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
 
 External crates:
   xagent-shared   BodyState, InternalState, SensoryFrame, MotorCommand,
-                  WorldConfig, BrainConfig, FullConfig, CognitiveArchitecture
-  xagent-brain    Brain (implements CognitiveArchitecture)
+                  WorldConfig, BrainConfig, FullConfig
+  xagent-brain    GpuKernel (sole runtime — fused per-agent compute kernel
+                  with all per-tick simulation in WGSL)
 ```
+
+> **Runtime contract.** The sandbox does not own a per-agent `Brain` object. Each `Agent` carries a `brain_idx` (its slot in the kernel's storage buffers) and a `BrainConfig` copy used for evolution and metabolic accounting. All per-tick computation — physics, vision, food detection, death/respawn, and the seven brain stages — runs inside `xagent_brain::GpuKernel`, which is owned by a **simulation worker thread** (`sim_runtime.rs`). The worker advances ticks on a simulation-owned cadence and calls `dispatch_ticks` to advance compute, `request_state_snapshot` to stage a CPU-visible state copy, and `try_collect_state_snapshot` / `try_collect_telemetry` to surface readbacks. It publishes the results to the render/UI thread as latest-wins `SimEvent::Snapshot` / `Telemetry` messages over a bounded channel; the render loop only drains events and renders the cached state — it never touches `GpuKernel` directly. (`dispatch_batch` remains as a wrapper that advances compute and requests a snapshot in one call, used by the headless and bench paths.)
 
 ---
 
@@ -380,24 +389,45 @@ Initialized with `energy = integrity = 100.0`, `facing = Vec3::Z`, `alive = true
 pub struct Agent {
     pub id: u32,
     pub body: AgentBody,
-    pub brain: Brain,
-    pub color: [f32; 3],       // static palette color (matches sidebar)
+    pub brain_idx: u32,            // slot in GpuKernel's storage buffers
+    pub brain_config: BrainConfig, // heritable config (kept on CPU for evolution)
+    pub color: [f32; 3],           // static palette color (matches sidebar)
     pub birth_tick: u64,
     pub death_count: u32,
-    pub generation: u32,       // life iteration (incremented on each death/respawn)
-    pub life_start_tick: u64,  // reset on respawn
+    pub generation: u32,           // life iteration (incremented on each death/respawn)
+    pub life_start_tick: u64,      // reset on respawn
     pub longest_life: u64,
-    pub respawn_cooldown: u32, // frames to wait before respawning
-    pub persist_brain: bool,   // if true, brain survives death
-    pub has_reproduced: bool,  // once per life
-    pub cached_motor: MotorCommand, // latest motor command from brain
-    pub decision_log: VecDeque<DecisionSnapshot>, // last 256 brain decisions (ring buffer)
-    pub food_consumed: u32,    // cumulative food consumed
-    pub total_ticks_alive: u64, // cumulative ticks alive across all lives
+    pub respawn_cooldown: u32,      // legacy/unused — always 0 in current runtime (respawn is GPU-immediate; see Death & Respawn). `Agent` is not serialized, so this is not retained for any wire/DB format.
+    pub has_reproduced: bool,
+    pub food_consumed: u32,        // cumulative food consumed
+    pub total_ticks_alive: u64,    // cumulative ticks alive across all lives
+    pub heatmap: Vec<u32>,         // position visit counts
+    pub trail: Vec<[f32; 3]>,      // distance-sampled trail points (current life)
+    pub trail_dirty: bool,
+    // CPU-side caches of the most recent GPU readbacks (used by sidebar/HUD
+    // when the GPU state buffer hasn't been re-read this frame):
+    pub cached_motor: MotorCommand,
+    pub cached_prediction_error: f32,
+    pub cached_exploration_rate: f32,
+    pub cached_fatigue_factor: f32,
+    pub cached_urgency: f32,
+    pub cached_gradient: f32,
+    pub cached_mean_attenuation: f32,
+    pub cached_curiosity_bonus: f32,
+    pub cached_staleness: f32,
+    // History rings for sparkline charts (sized for the sidebar's lookback).
+    pub prediction_error_history: VecDeque<f32>,
+    pub exploration_rate_history: VecDeque<f32>,
+    pub energy_history: VecDeque<f32>,
+    pub integrity_history: VecDeque<f32>,
+    pub fatigue_history: VecDeque<f32>,
+    pub cached_frame: SensoryFrame, // pre-allocated buffer reused per frame
 }
 ```
 
-**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
+The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation, evolution mutation, and JSON serialization.
+
+**Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 
 **Agent mesh** — 2.0-unit cube with 6-face shading (each face darkened by factors
 1.0, 0.9, 0.8, 0.7, 0.85, 0.75). Combined into a single vertex buffer for all agents.
@@ -484,31 +514,9 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Recording, Telemetry & Replay (`recording.rs`, `replay.rs`)
+### 3.5 Telemetry & Replay (`replay.rs`)
 
-#### CSV Format
-
-File name: `xagent_log_YYYY-MM-DD_HH-MM-SS.csv` (UTC, no chrono dependency).
-
-Columns (29 total):
-
-```
-agent_id, tick, prediction_error, avg_prediction_error, memory_utilization,
-memory_capacity, exploration_rate, homeostatic_gradient,
-energy, max_energy, integrity, max_integrity,
-position_x, position_y, position_z, facing_x, facing_z,
-biome, action_forward, action_strafe, action_turn, action_discrete, alive,
-exploitation_ratio, decision_quality, behavior_phase, death_count, life_ticks,
-generation
-```
-
-#### Flush Strategy
-
-- Writes are buffered via `BufWriter<File>`.
-- **Flushed every 100 ticks** for crash safety.
-- Final flush on session exit (`print_session_summary()`).
-
-#### Per-Generation Replay Recording (`replay.rs`)
+#### Per-Generation Replay Recording
 
 The replay system captures per-tick agent state during evolution runs, enabling
 post-hoc playback of any completed generation.
@@ -568,10 +576,15 @@ renderer, camera, world, agents, logger, and simulation metadata.
 #### Event Loop Flow
 
 ```
-resumed()           → Create window, GPU, world, terrain mesh, spawn first agent
-window_event()      → Dispatch keyboard/mouse/redraw events
+resumed()           → Create window, renderer, world, terrain mesh, spawn first agent
+window_event()      → Handle keyboard/mouse; on redraw: drain sim-worker events,
+                      apply newest snapshot, render, forward control changes
 about_to_wait()     → Request continuous redraw
 ```
+
+Simulation itself runs on a separate worker thread (`sim_runtime.rs`) that owns
+the GPU kernel; the redraw path only consumes snapshots, so render cadence and
+simulation cadence are independent.
 
 #### Simulation Speed Controls
 
@@ -587,7 +600,7 @@ about_to_wait()     → Request continuous redraw
 | `8` | 100000 | 100k× |
 | `9` | 1000000 | 1000k× |
 
-Max ticks per frame is capped at `speed × 2` (up to 4000) in 3D mode, or `speed × 10` (up to 1,000,000) in fast mode.
+The worker accumulates wall time × `speed_multiplier` into a tick budget and dispatches one kernel-batch (`vision_stride × brain_tick_stride` ticks) per loop iteration, draining any backlog at GPU speed. The accumulator is capped so a paused/stalled interval cannot dump a giant catch-up batch.
 
 #### Agent Spawning
 
@@ -612,20 +625,15 @@ When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) an
 
 #### Death & Respawn
 
-1. On death: **death signal** fired first — `brain.death_signal()` sends a calibrated
-   negative credit event (effective gradient ≈ -0.36) to the action selector, retroactively
-   penalizing recent actions in the 64-tick history buffer. Calibrated to ~30× a single
-   damage tick — enough to learn from death without obliterating positive learned behaviors.
-2. Record `longest_life`, increment `death_count`, increment `generation`,
-   log cause ("energy depletion" or "integrity failure"), set `respawn_cooldown = 60` frames.
-3. Cooldown decrements each tick. At 0:
-   - New `AgentBody` at random position.
-   - **Partial health**: 50% energy, 70% integrity (not full health — no "free heal").
-   - `life_start_tick` reset, `has_reproduced` cleared.
-   - If `persist_brain` is true, the `Brain` is kept (learning survives death),
-     and `brain.trauma(0.2)` is applied — 20% reinforcement decay that wipes the
-     weakest memories while preserving the strongest.
-   - If false, a fresh `Brain` is created from the same config.
+Death detection and respawn run entirely inside the kernel — no per-death Rust call into the brain. `phase_death.wgsl` is invoked after each per-agent physics step:
+
+1. **Detect**: If `physics_state[P_ENERGY] ≤ 0` or `P_INTEGRITY ≤ 0`, the agent is marked dead.
+2. **Spawn search**: up to 50 GPU-RNG samples pick a position in a non-Danger biome; if every attempt hits Danger the `!found` branch reuses the attempt-0 sample — it re-draws `(cx, cz)` with RNG seed `tick * 256 + agent_id` (identical to attempt 0) and skips the biome check entirely, so the agent can respawn in a Danger cell (see the `!found` branch in `phase_death.wgsl` / `kernel_tick.wgsl::agent_death_respawn`).
+3. **Reset physics row**: full energy, full integrity, zero velocity, facing +Z, alive flag restored. Death count is incremented; `food_count`, `ticks_alive`, and `last_death_tick` are preserved through the reset so CPU readback can attribute the death.
+4. **Trauma**: all pattern reinforcement values are multiplied by `0.5` in-place. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (which gates on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off immediately. The halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest survive.
+5. **Brain reset**: homeostasis EMAs zeroed, exploration rate set to `0.5`, habituation EMAs zeroed, attenuation reset to `1.0`, fatigue factor reset to `1.0`, position-ring staleness state cleared, and the TD eligibility traces and previous-state value zeroed (the policy and value-head weights survive — they are learned knowledge, not episodic state).
+
+The CPU side learns about deaths only by reading `physics_state[P_DEATH_COUNT]` on the next state readback. When the count climbs, the sandbox updates `longest_life`, increments `Agent::death_count`, increments `Agent::generation`, and resets `life_start_tick`. There is no CPU-side respawn cooldown — the kernel respawns in the same tick the death is detected.
 
 #### Headless Mode
 
@@ -662,10 +670,10 @@ On death the agent is respawned with a **fresh brain** (no persistence in headle
 
 | Field | Tiny | Default | Large | Description |
 |---|---|---|---|---|
-| `memory_capacity` | 24 | 128 | 512 | Max stored patterns |
-| `processing_slots` | 8 | 16 | 32 | Max patterns recalled per tick |
-| `visual_encoding_size` | 32 | 64 | 128 | Downsampled visual vector size |
-| `representation_dimension` | 128 | 128 | 128 | Internal representation length |
+| `memory_capacity` | 24 | 128 | 512 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
+| `processing_slots` | 8 | 16 | 32 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
+| `visual_encoding_size` | 32 | 64 | 128 | **Legacy / unused.** No kernel stage reads this field. Preserved only for config backwards compatibility (see issue #106). |
+| `representation_dimension` | 128 | 128 | 128 | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; mismatched config values log a warning and are ignored (see issues #103, #106). |
 | `learning_rate` | 0.08 | 0.05 | 0.03 | Association update rate |
 | `decay_rate` | 0.002 | 0.001 | 0.0005 | Unreinforced pattern decay per tick |
 
@@ -763,54 +771,79 @@ cargo run -p xagent-sandbox -- --config my_config.json
 
 ## The Simulation Loop (Detailed)
 
+Simulation runs on a background worker thread (`sim_runtime.rs`) that owns the
+GPU kernel; the render/UI thread only consumes published state. The two run at
+independent cadences.
+
+### Simulation worker thread
+
+Each loop iteration (`Worker::step`):
+
+```
+1. Collect + publish any ready readbacks:
+   - try_collect_state_snapshot() → build an owned StateSnapshot (physics +
+     food + tick + generation_tick) and try_send it (latest-wins; dropped
+     under back-pressure).
+   - try_collect_telemetry() → send selected-agent telemetry.
+
+2. Request the next samples on their own cadence (decoupled from dispatch):
+   - state snapshot at ≤ 60 Hz, telemetry at ≤ 30 Hz (immediately on a
+     selection change). This is why the UI keeps refreshing even while the
+     GPU grinds a long dispatch.
+
+3. If not paused, advance compute:
+   a. Accumulate dt × speed_multiplier into sim_accumulator (capped so a
+      stall cannot dump a giant catch-up batch).
+   b. Dispatch one kernel-batch — min(accumulated, gpu_tick_budget,
+      kernel_batch_size) ticks, clamped to the remaining generation budget,
+      gated to ≥ brain_tick_stride so every dispatch holds a full brain cycle.
+      Capping at one kernel-batch keeps vision amortized (perception
+      unchanged) and lets state publish frequently. A backlog drains across
+      iterations rather than in one giant submit.
+   c. kernel.dispatch_ticks(tick, ticks_to_run); advance tick + gen_tick.
+
+4. When gen_tick reaches the generation tick budget, force a final snapshot,
+   emit GenerationBudgetReached, and pause until the handoff resets the
+   population (ResetPopulation command).
+
+The worker only sleeps when caught up or paused; otherwise it loops so the
+backlog drains at GPU speed (queue.submit back-pressure paces it).
+```
+
+### Render / UI thread
+
 Each frame, when the window requests a redraw:
 
 ```
-1. Compute dt = min(elapsed since last frame, 0.05s)
+1. Compute dt; update camera from held keys (WASD/E/Shift).
 
-2. Update camera position from held keys (WASD/E/Shift)
+2. drain_sim_events(): pull all pending worker events, apply the newest
+   StateSnapshot (latest-wins) to agent caches — position, yaw, energy,
+   integrity, velocity, facing, food_consumed, death count, and the cached
+   motor/gradient/urgency/prediction/exploration/fatigue fields — and sync
+   the governor's gen_tick for the UI. Telemetry events update the selected
+   agent's vision/derived fields.
 
-3. If not paused, run as many simulation ticks as the current speed/mode allows,
-   bounded by the per-frame tick time budget and `max_ticks_per_frame`
-   (currently up to 4000 in 3D mode and up to 1,000,000 in fast mode):
-   a. Collect all agent positions into a snapshot (Vec<(Vec3, bool)>)
+3. On a fresh snapshot only: record a replay TickRecord, sample
+   heatmap/trail occupancy and per-agent sparkline histories, and mark the
+   food/heatmap caches dirty. (CPU histories and replay sample the published
+   state at publication cadence, not every simulated tick.)
 
-   b. For each living agent i:
-      ├─ extract_senses_with_positions(agent.body, world, tick, positions, i)
-      │   → produces SensoryFrame
-      ├─ brain.tick(&frame)
-      │   → produces MotorCommand
-      ├─ agent.cached_motor = motor
-      ├─ physics::step(&mut agent.body, &motor, &mut world, dt)
-      │   → updates position, velocity, energy, integrity, alive
-      └─ If selected agent: log to CSV, accumulate prediction error
+4. Generation handoff: a GenerationBudgetReached event evaluates fitness,
+   requests the champion's brain state from the worker, then sends
+   ResetPopulation for the next generation. Advance replay playback.
 
-   d. world.update(dt) — decrement food respawn timers, relocate respawned food
+5. Fix selected_agent_idx if agents were added/removed.
 
-   e. Death/respawn processing:
-      ├─ Dead agent with cooldown == 0 → log death, set cooldown = 60
-      └─ Dead agent with cooldown > 0 → decrement; if 0 → respawn
+6. Rebuild dynamic GPU meshes (throttled to ~10 Hz): food mesh (if dirty),
+   agent mesh (combined).
 
-   f. Increment global tick counter, mark food mesh as dirty
+7. Build HUD bars; render:
+    ├─ 3D pass: terrain + food + agents (depth-tested)
+    ├─ HUD pass: background panels + status bars (alpha-blended)
+    └─ Text pass: bitmap font labels (alpha-blended)
 
-   g. Reproduction check:
-      ├─ Find agents where can_reproduce() && !has_reproduced
-      └─ For each: set has_reproduced, spawn_child (mutated config)
-
-   h. Every 100 ticks: print telemetry to console
-
-4. Fix selected_agent_idx if agents were added/removed
-
-5. Rebuild dynamic GPU meshes:
-   ├─ Food mesh (if dirty)
-   └─ Agent mesh (combined, rebuilt every frame)
-
-6. Build HUD bars for selected agent
-
-7. Render:
-   ├─ 3D pass: terrain + food + agents (depth-tested)
-   ├─ HUD pass: background panels + status bars (alpha-blended)
-   └─ Text pass: bitmap font labels (alpha-blended)
+8. Forward any speed/pause/selection changes to the worker (sent on change).
 ```
 
 ---
@@ -881,7 +914,7 @@ access to the current agent.
 
 ### Agent Palette Colors
 
-Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.25, 0.25, 0.25]`.
+Each agent is assigned a **static palette color** at spawn. The same color appears in the 3D viewport (converted from sRGB to linear for correct GPU rendering) and in the egui sidebar's colored dot. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 
 ### Selection Marker
 
@@ -920,40 +953,34 @@ marker floating above it in the 3D viewport. Its data drives:
 - **Bottom console**: scrollable log of evolution events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
-- CSV logging
 
 ### Death & Respawn Guardrails
 
-When brain persistence is enabled (default), death triggers four mechanisms:
+Brain state is preserved across deaths — it lives in GPU buffers and is mutated (not destroyed) by the respawn pass. Three guardrails make death costly without making it terminal:
 
-1. **Death signal** — `brain.death_signal()` fires a calibrated negative credit event
-   (effective gradient ≈ -0.36, ~30× a single damage tick). Updates state-dependent
-   weights only, NOT global action biases — prevents catastrophic global bias
-   destruction that causes "learned helplessness" straight-line walking.
-2. **Partial respawn energy** — 50% energy, 70% integrity. No "free heal" from dying.
-3. **Random respawn position** — unpredictable location.
-4. **Memory trauma** — `brain.trauma(0.2)` applies 20% reinforcement decay. Weakest memories are wiped; strongest survive. Models the cognitive cost of catastrophic discontinuity.
+1. **Random respawn position** — `phase_death.wgsl` samples up to 50 biome positions before settling on a non-Danger spawn (falling back to the attempt-0 sample — RNG seed `tick * 256 + agent_id`, without the biome check — if all sampled cells are Danger, so the agent can reappear in a Danger cell). The agent reappears at an unpredictable location.
+2. **Memory trauma** — `O_PAT_REINF[i] *= 0.5` for every pattern slot. The death pass leaves `O_PAT_ACTIVE` untouched, so recall (gated on `O_PAT_ACTIVE` in `brain_passes.wgsl`) is not cut off on the next tick. The halved reinforcement only makes subsequent decay reach the `<= 0.0` deactivation point sooner for the weakest patterns; the strongest survive. The respawned agent retains learned representations but with weaker confidence.
+3. **Homeostasis + habituation + credit reset** — the three-timescale gradient EMAs and habituation EMAs are zeroed, habituation attenuation is reset to `1.0` (fresh perceptual context), exploration rate is reset to `0.5`, fatigue factor is reset to `1.0`, the position-ring staleness state is cleared, and the TD eligibility traces and previous-state value are zeroed. The respawned agent has no homeostatic memory of the previous life, and credit never leaks across the death boundary.
 
-The credit chain during danger encounters is:
+The credit chain during danger encounters:
 
 ```
-damage onset (gradient spike, 3× pain amplified) → death event (calibrated retroactive punishment)
+damage onset (negative per-tick homeostatic delta → negative TD error blames recently eligible state-actions) → death event (sudden prediction-error spike → halved reinforcement of currently-active patterns)
 ```
 
-Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), delivers the strongest negative learning signal, and the brain's core drive is minimizing prediction error.
+Suicide prevention is emergent: death is maximally unpredictable (massive prediction error), delivers the strongest negative learning signal (halved reinforcement weakens whatever patterns the brain had associated with the lethal context), and the brain's core drive is minimizing prediction error.
 
 ---
 
-## CPU Performance Optimizations
+## Performance Characteristics
 
-Several optimizations keep the simulation fast at scale:
+All per-tick simulation runs in `xagent_brain::GpuKernel` — physics, vision raycasting, food detection, agent-agent collision, death/respawn, and the full brain pipeline. The CPU side only encodes dispatches and reads back UI state. The main throughput knobs are:
 
-- **Vision resolution**: reduced from 16×12 to 8×6 (48 pixels vs 192)
-- **Ray march step**: increased from 0.5 to 1.0 units
-- **Sky ray early-out**: rays that miss terrain exit immediately
-- **Reused `others_buf`**: pre-allocated buffer for inter-agent data, reused each sim loop tick
-- **Agent-agent collision**: O(n²) pairwise check using simple squared-distance math
-- **MAX_AGENTS**: raised from 20 → 100
+- **Vision resolution**: 8×6 by default (48 rays per agent per vision pass). Larger grids scale linearly with `VISION_RAYS` in both shader work and `BrainLayout::feature_count` (encoder weights).
+- **`vision_stride`**: how many physics+brain cycles run between global+vision passes (grid rebuild, food respawn, collision, raycasting). Higher values trade sensory freshness for brain throughput; the brain reads from the previous batch's vision output, so this is also the sensory-lag in brain cycles.
+- **Kernel-batching**: `dispatch_ticks(start_tick, ticks_to_run)` (the compute half of the kernel API, wrapped by `dispatch_batch`) splits work into full kernel-batches of `vision_stride * brain_tick_stride` ticks (one command buffer + `queue.submit()` per batch), plus a shorter remainder kernel-batch of `remainder_cycles * brain_tick_stride` ticks when `brain_cycles % vision_stride != 0`, plus an optional physics-only remainder for the trailing `ticks_to_run % brain_tick_stride` ticks that do not fill a brain cycle. Per-simulated-tick CPU cost is the world-config uniform write + command-encoder setup, divided by the batch size — small at any throughput.
+- **Subgroup top-K** (when supported): the recall top-K reduction uses a subgroup-accelerated bitonic sort spliced in by `apply_subgroup_markers`. On hardware without `wgpu::Features::SUBGROUP`, the same code path falls back to a workgroup-memory bitonic sort.
+- **MAX_AGENTS**: 100. Per-agent storage scales linearly; `BrainLayout::brain_stride` × 100 × 4 bytes is the worst-case persistent allocation.
 
 ---
 
@@ -1042,30 +1069,26 @@ optimization at this scale.
 
 ## Performance Considerations
 
-### What Scales Linearly with Agent Count
+### What Scales with Agent Count
 
-- **Sensory extraction**: O(N²) for inter-agent touch (each agent checks all others).
-  With N ≤ 20 this is at most 380 distance checks per tick.
-- **Brain processing**: O(N) ticks per frame, each involving memory search, prediction,
-  and motor generation. This is the **dominant cost**.
-- **Agent mesh rebuild**: O(N × 24 vertices) per frame — trivial.
+All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical limits are:
 
-### Vertex Buffer Rebuild Cost
+- **Per-agent kernel workgroup**: 256 threads per agent in `kernel_tick.wgsl`. Cooperative reductions (encoder dot products, similarity scoring, top-K) are amortized inside the workgroup.
+- **Agent-agent collision**: O(N²) pairwise check in `phase_collision.wgsl`, run once per global pass. At 100 agents that's 9,900 pairwise checks per global pass — trivial on GPU.
+- **Vision raycasting**: O(VISION_RAYS) per agent per global pass; with the default 48 rays and 100 agents that's 4,800 rays per global pass.
+- **Persistent GPU memory**: `BrainLayout::brain_stride + PATTERN_STRIDE + BrainLayout::sensory_stride + DECISION_STRIDE` f32s per agent, plus the physics row and food state. The total is well under a few MB for the default config.
+
+### Vertex Buffer Rebuild Cost (CPU side)
 
 - Terrain mesh: built **once** at startup (16,641 vertices). Never rebuilt.
-- Food mesh: rebuilt when `food_dirty` flag is set (any tick that runs). At default
-  density ≈ 200–400 food items × 24 vertices = ~5K–10K vertices.
-- Agent mesh: rebuilt every frame. ≤ 20 agents × 24 vertices = ≤ 480 vertices.
+- Food mesh: rebuilt when `food_dirty` flag is set (any tick that runs). At default density ≈ 200–400 food items × 24 vertices = ~5K–10K vertices.
+- Agent mesh: rebuilt every frame. ≤ 100 agents × 24 vertices = ≤ 2,400 vertices.
 
 ### When to Worry
 
-- **>20 agents**: The inter-agent perception cost becomes O(N²) and brain ticks
-  multiply. The hard cap prevents this.
-- **High speed_multiplier (1000×+)**: 1000 brain ticks per frame at 60 fps = 60,000 brain
-  ticks/second per agent. With 20 agents = 1,200,000 brain ticks/second. Max ticks per frame
-  cap scales with speed (`speed × 2`, capped at 4000 in 3D; `speed × 10`, capped at 1,000,000 in fast mode).
-- **Large BrainConfig**: `memory_capacity=1000` with `processing_slots=32` means
-  searching 32 patterns per tick, each compared against a 64-dim vector.
+- **High speed_multiplier (1000×+)**: the simulation worker (`sim_runtime.rs`) caps each dispatch to one kernel-batch (`vision_stride * brain_tick_stride` ticks) — small enough that state publishes frequently, large enough to amortize per-dispatch overhead. A speed backlog drains across worker loop iterations (paced by `queue.submit` back-pressure) rather than in one giant submit, so achievable throughput is GPU-bound, not redraw-bound. The accumulator is capped so a stalled/paused interval cannot dump a catch-up batch.
+- **Large vision grids**: the encoder weight count scales linearly with `vision_rays` (= `VISION_W × VISION_H`), so doubling the `vision_rays` count roughly doubles both the encoder weights and the kernel cycle cost. Doubling *both* vision dimensions quadruples `vision_rays` (and therefore the encoder weights). Stay near the default 8×6 unless an experiment specifically needs higher resolution.
+- **Telemetry readback churn**: `request_agent_telemetry` issued every iteration for every agent would serialize the kernel against the staging buffer mappings. The worker issues it for the *selected* agent only, throttled to ≤ 30 Hz (and immediately on a selection change).
 
 ---
 

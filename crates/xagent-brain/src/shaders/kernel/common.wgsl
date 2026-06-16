@@ -1,74 +1,108 @@
 // ── Kernel common definitions ──────────────────────────────────────────
 // Shared constants, buffer bindings, and helper functions for all phases.
-// Values MUST match buffers.rs and the per-shader constants injected by
-// wgsl_constants() / wgsl_physics_constants().
+// Values MUST match buffers.rs and any WGSL `override` constants supplied
+// by the Rust host at pipeline creation via
+// `PipelineCompilationOptions::constants`.
 
-// ── Vision grid (string-replaced at shader compile time) ───────────────────
+// ── Vision grid (pipeline-overridable constants) ──────────────────────────
+// VISION_W and VISION_H are supplied by the Rust host at pipeline creation
+// time via `PipelineCompilationOptions::constants`. Defaults below keep the
+// shader standalone-compilable (LSP tooling, WGSL validators) at the 8×6 grid.
+// See `gpu_kernel.rs::vision_override_constants()` for the canonical override map.
 
-const VISION_W: u32 = 8u;
-const VISION_H: u32 = 6u;
+override VISION_W: u32 = 8u;
+override VISION_H: u32 = 6u;
 
 // ── Derived vision / sensory constants ─────────────────────────────────────
+// Expressions that read `override` inputs must themselves be `override` —
+// they are evaluated at pipeline creation time, not shader-module creation.
 
-const VISION_RAYS: u32 = VISION_W * VISION_H;
-const VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
-const VISION_DEPTH_COUNT: u32 = VISION_RAYS;
+override VISION_RAYS: u32 = VISION_W * VISION_H;
+override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
+override VISION_DEPTH_COUNT: u32 = VISION_RAYS;
 const MAX_TOUCH_CONTACTS: u32 = 4u;
-const SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
+override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
 const ENCODED_DIMENSION: u32 = 128u;
 const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
-const FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
+override FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
-const ACTION_HISTORY_LEN: u32 = 64u;
 const ERROR_HISTORY_LEN: u32 = 128u;
 
 // ── Brain state offsets (derived from FEATURE_COUNT) ────────────────────────
+// These must be `override` because they transitively reference FEATURE_COUNT.
 
 const O_ENC_WEIGHTS: u32 = 0u;
-const O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION;
-const O_PREDICTOR_WEIGHTS: u32 = O_ENC_BIASES + ENCODED_DIMENSION;
-const O_PREDICTOR_CONTEXT_WEIGHT: u32 = O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
-const O_PREDICTION_ERROR_RING: u32 = O_PREDICTOR_CONTEXT_WEIGHT + 1u;
-const O_PREDICTION_ERROR_CURSOR: u32 = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
-const O_PREDICTION_ERROR_COUNT: u32 = O_PREDICTION_ERROR_CURSOR + 1u;
-const O_HAB_EMA: u32 = O_PREDICTION_ERROR_COUNT + 1u;
-const O_HAB_ATTEN: u32 = O_HAB_EMA + ENCODED_DIMENSION;
-const O_PREV_ENCODED: u32 = O_HAB_ATTEN + ENCODED_DIMENSION;
-const O_HOMEO: u32 = O_PREV_ENCODED + ENCODED_DIMENSION;
-const O_ACTION_FORWARD_WEIGHTS: u32 = O_HOMEO + 6u;
-const O_ACTION_TURN_WEIGHTS: u32 = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
-const O_ACT_BIASES: u32 = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
-const O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
+override O_ENC_BIASES: u32 = FEATURE_COUNT * ENCODED_DIMENSION;
+override O_PREDICTOR_WEIGHTS: u32 = O_ENC_BIASES + ENCODED_DIMENSION;
+override O_PREDICTOR_CONTEXT_WEIGHT: u32 = O_PREDICTOR_WEIGHTS + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+override O_PREDICTION_ERROR_RING: u32 = O_PREDICTOR_CONTEXT_WEIGHT + 1u;
+override O_PREDICTION_ERROR_CURSOR: u32 = O_PREDICTION_ERROR_RING + ERROR_HISTORY_LEN;
+override O_PREDICTION_ERROR_COUNT: u32 = O_PREDICTION_ERROR_CURSOR + 1u;
+override O_HAB_EMA: u32 = O_PREDICTION_ERROR_COUNT + 1u;
+override O_HAB_ATTEN: u32 = O_HAB_EMA + ENCODED_DIMENSION;
+override O_PREV_ENCODED: u32 = O_HAB_ATTEN + ENCODED_DIMENSION;
+override O_HOMEO: u32 = O_PREV_ENCODED + ENCODED_DIMENSION;
+override O_ACTION_FORWARD_WEIGHTS: u32 = O_HOMEO + 6u;
+override O_ACTION_TURN_WEIGHTS: u32 = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
+override O_ACT_BIASES: u32 = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
+override O_EXPLORATION_RATE: u32 = O_ACT_BIASES + 2u;
 const POS_RING_LEN: u32 = 16u;
-const O_POS_RING_X: u32 = O_EXPLORATION_RATE + 1u;
-const O_POS_RING_Z: u32 = O_POS_RING_X + POS_RING_LEN;
-const O_POS_RING_CURSOR: u32 = O_POS_RING_Z + POS_RING_LEN;
-const O_POS_RING_LEN: u32 = O_POS_RING_CURSOR + 1u;
-const O_ACCUM_FWD: u32 = O_POS_RING_LEN + 1u;
-const O_FATIGUE_FACTOR: u32 = O_ACCUM_FWD + 1u;
-const O_PREV_PREDICTION: u32 = O_FATIGUE_FACTOR + 1u;
-const O_TICK_COUNT: u32 = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
-const O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
-const O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
-const O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
-const O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
+override O_POS_RING_X: u32 = O_EXPLORATION_RATE + 1u;
+override O_POS_RING_Z: u32 = O_POS_RING_X + POS_RING_LEN;
+override O_POS_RING_CURSOR: u32 = O_POS_RING_Z + POS_RING_LEN;
+override O_POS_RING_LEN: u32 = O_POS_RING_CURSOR + 1u;
+override O_ACCUM_FWD: u32 = O_POS_RING_LEN + 1u;
+override O_FATIGUE_FACTOR: u32 = O_ACCUM_FWD + 1u;
+override O_PREV_PREDICTION: u32 = O_FATIGUE_FACTOR + 1u;
+override O_TICK_COUNT: u32 = O_PREV_PREDICTION + PREDICTOR_DIMENSION;
+override O_HAB_SENSITIVITY: u32 = O_TICK_COUNT + 1u;
+override O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
+override O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
+override O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
+
+// ── TD(λ) critic state ──────────────────────────────────────────────────────
+// Value head (learned, inherited) plus eligibility traces (episodic,
+// zeroed on death). Trace biases pack three scalars:
+// [critic_bias, forward_bias, turn_bias].
+
+override O_VALUE_WEIGHTS: u32 = O_MOVEMENT_SPEED + 1u;
+override O_VALUE_BIAS: u32 = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
+override O_PREV_VALUE: u32 = O_VALUE_BIAS + 1u;
+override O_TRACE_CRITIC: u32 = O_PREV_VALUE + 1u;
+override O_TRACE_FWD: u32 = O_TRACE_CRITIC + ENCODED_DIMENSION;
+override O_TRACE_TURN: u32 = O_TRACE_FWD + ENCODED_DIMENSION;
+override O_TRACE_BIASES: u32 = O_TRACE_TURN + ENCODED_DIMENSION;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-const BRAIN_STRIDE: u32 = O_MOVEMENT_SPEED + 1u;
+override BRAIN_STRIDE: u32 = O_TRACE_BIASES + 3u;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
-const HISTORY_STRIDE: u32 = O_HIST_LEN + 1u;
-const FEATURES_STRIDE: u32 = FEATURE_COUNT;
+override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
 const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
 const DECISION_MOTOR: u32 = ENCODED_DIMENSION + ENCODED_DIMENSION;
 const DECISION_STRIDE: u32 = DECISION_MOTOR + 4u;
 const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
+
+// ── Per-agent brain scratch (binding 13) offsets ────────────────────────────
+// Storage-backed intermediates so multi-workgroup brain phases (plan 0006) can
+// cooperate per agent across dispatch boundaries. Layout mirrors the fused
+// var<workgroup> arrays 1:1. override (transitively references FEATURES_STRIDE).
+override SCRATCH_FEATURES: u32 = 0u;
+override SCRATCH_ENCODED: u32 = SCRATCH_FEATURES + FEATURES_STRIDE;
+override SCRATCH_HABITUATED: u32 = SCRATCH_ENCODED + ENCODED_DIMENSION;
+override SCRATCH_HOMEO: u32 = SCRATCH_HABITUATED + ENCODED_DIMENSION;
+override SCRATCH_RECALL: u32 = SCRATCH_HOMEO + 6u;
+override SCRATCH_RECALL_SIMILARITY: u32 = SCRATCH_RECALL + RECALL_IDX_STRIDE;
+override SCRATCH_PREDICTION: u32 = SCRATCH_RECALL_SIMILARITY + RECALL_K;
+override SCRATCH_CREDIT: u32 = SCRATCH_PREDICTION + PREDICTOR_DIMENSION;
+override SCRATCH_SCALARS: u32 = SCRATCH_CREDIT + ENCODED_DIMENSION;
+override BRAIN_SCRATCH_STRIDE: u32 = SCRATCH_SCALARS + 4u;
 
 // ── Pattern memory offsets ──────────────────────────────────────────────────
 // O_PAT_STATES uses SoA (Structure-of-Arrays) layout: [dim][pattern]
@@ -86,13 +120,6 @@ const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
 const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
 const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
 
-// ── Action history offsets ──────────────────────────────────────────────────
-
-const O_MOTOR_RING: u32 = 0u;
-const O_STATE_RING: u32 = ACTION_HISTORY_LEN * 5u;
-const O_HIST_CURSOR: u32 = O_STATE_RING + ACTION_HISTORY_LEN * ENCODED_DIMENSION;
-const O_HIST_LEN: u32 = O_HIST_CURSOR + 1u;
-
 // ── Config buffer offsets ───────────────────────────────────────────────────
 
 const CFG_LEARNING_RATE: u32 = 4u;
@@ -103,7 +130,7 @@ const CFG_INTEGRITY_SCALE: u32 = 8u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 31u;
+const PHYS_STRIDE: u32 = 34u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -135,14 +162,17 @@ const P_MOTOR_FWD_OUT: u32 = 27u;
 const P_MOTOR_TURN_OUT: u32 = 28u;
 const P_GRADIENT_OUT: u32 = 29u;
 const P_URGENCY_OUT: u32 = 30u;
+const P_LAST_DEATH_TICK: u32 = 31u;
+const P_NEAREST_FOOD_DISTANCE: u32 = 32u;
+const P_PREV_POTENTIAL: u32 = 33u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
 const FOOD_STATE_STRIDE: u32 = 4u;
-const F_POS_X: u32 = 0u;
-const F_POS_Y: u32 = 1u;
-const F_POS_Z: u32 = 2u;
-const F_RESPAWN_TIMER: u32 = 3u;
+const FOOD_POSITION_X: u32 = 0u;
+const FOOD_POSITION_Y: u32 = 1u;
+const FOOD_POSITION_Z: u32 = 2u;
+const FOOD_RESPAWN_TIMER: u32 = 3u;
 
 // ── Math constants ─────────────────────────────────────────────────────────
 
@@ -189,6 +219,11 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
+// World-units radius within which food contributes to the approach potential Φ.
+// Set to VISION_MAX_DIST so Φ is a proxy for "nearest visible food"; the
+// potential-based shaping that consumes it is optimal-policy-invariant for any
+// state potential, so a radius proxy needs no FOV-visibility test.
+const SHAPING_RADIUS: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
@@ -203,6 +238,12 @@ const TOUCH_AGENT: u32 = 4u;
 const TOUCH_FOOD_RANGE: f32 = 3.0;
 const TOUCH_AGENT_RANGE: f32 = 5.0;
 const TOUCH_EDGE_RANGE: f32 = 3.0;
+
+// Hazard contacts have no meaningful planar direction (the hazard is
+// the terrain underfoot), so they carry a fixed mid-scale intensity
+// instead of a closeness value. Matches the CPU reference in
+// agent/senses.rs.
+const TOUCH_HAZARD_INTENSITY: f32 = 0.5;
 
 // ── Biome type values ───────────────────────────────────────────────────────
 
@@ -244,6 +285,13 @@ const ATTEN_FLOOR: f32 = 0.1;
 const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
+// Approach-shaping gain: Φ(s) = −APPROACH_SHAPING_GAIN · d_norm, where d_norm is
+// the nearest in-range food distance normalized by SHAPING_RADIUS. Sized so the
+// per-brain-tick shaping term F = γΦ(s′) − Φ(s) dominates the ~2e-4 metabolic
+// drain (making closing distance the dominant within-tick steering signal) while
+// staying well below the ~0.12 contact-eat reward spike (so eating still anchors
+// the objective).
+const APPROACH_SHAPING_GAIN: f32 = 0.05;
 const GRADIENT_FAST_BLEND: f32 = 0.6;
 const GRADIENT_MEDIUM_BLEND: f32 = 0.04;
 const GRADIENT_SLOW_BLEND: f32 = 0.004;
@@ -255,21 +303,59 @@ const GRADIENT_WEIGHT_SLOW: f32 = 0.15;
 
 // ── Predict-and-act constants ───────────────────────────────────────────────
 
-const CREDIT_DECAY: f32 = 0.3;
 const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
-const PAIN_AMP: f32 = 3.0;
-const DEADZONE: f32 = 0.005;
 const MAX_WEIGHT_NORM: f32 = 2.0;
-const ACTION_WEIGHT_DECAY: f32 = 0.01;
-const ANTICIPATION_WEIGHT: f32 = 0.5;
-const TONIC_CREDIT_SCALE: f32 = 0.5;
 const ENCODER_CREDIT_SCALE: f32 = 0.1;
 const CREDIT_EPSILON: f32 = 1e-6;
 const KLINOTAXIS_SENSITIVITY: f32 = 500.0;
 const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 
+// ── TD(λ) credit constants ──────────────────────────────────────────────────
+
+// Per-brain-tick discount. Horizon 1/(1−γ) ≈ 33 brain ticks ≈ 11 s of
+// real time at the default strides (brain tick every 10 physics ticks
+// at 30 Hz) — several food approaches long. A vision-edge approach
+// itself is ~45 physics ticks ≈ 4.5 brain ticks at default speed; the
+// horizon is intentionally longer so the critic bridges sparse
+// encounters. At brain_tick_stride = 1 the same constant gives a 1.1 s
+// horizon — if the default stride changes, recalibrate γ to keep the
+// real-time horizon (γ ≈ 1 − stride/330).
+const TD_DISCOUNT: f32 = 0.97;
+// Eligibility trace decay. Combined per-tick trace retention is
+// TD_DISCOUNT × TD_LAMBDA ≈ 0.87; the critic's bootstrapping propagates
+// credit beyond the raw trace span across repeated experiences.
+const TD_LAMBDA: f32 = 0.9;
+// Critic learns 10× slower than the actor: the value estimate must be
+// stabler than the policy it evaluates.
+const CRITIC_LEARNING_RATE: f32 = 0.01;
+// Per-dimension trace updates scale inversely with the feature dimension:
+// the aggregate step (a sum of ENCODED_DIMENSION products of trace ×
+// feature, each O(1)) would otherwise grow with dimensionality and push
+// the bootstrapped critic past the linear-TD stability limit.
+const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
+// Actor (forward/turn) weight-step scale, separate from the critic's
+// TD_VECTOR_SCALE. The 1/ENCODED_DIMENSION factor is a critic-bootstrapping
+// stability bound; applied to the actor it throttled the policy step to
+// 0.10/128 ≈ 8e-4. The actor only needs to stay inside the MAX_WEIGHT_NORM L2
+// ball (enforced every tick), so it can latch onto a sign-correct δ at a usable
+// rate. 1/16 lifts the step ~8× while staying well within that bound.
+const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
+// Bound on the TD error. No single transition is allowed to teach more
+// than this; protects against respawn/clamp artifacts (mirrors the intent
+// of MAX_HOMEOSTATIC_DELTA on the reward side).
+const MAX_TD_ERROR: f32 = 1.0;
+
+// Terminal TD error applied through the dying episode's eligibility
+// traces at the moment of death, before they are cleared for the next
+// life. Death must be the single worst lesson the learner can receive,
+// but never stronger than the per-transition bound that protects
+// against artifacts.
+const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
+
 // ═══════════════════════════════════════════════════════════════════════════
-// Buffer bindings — 15 storage + 2 uniform, single bind group
+// Buffer bindings — 14 storage + 2 uniform, single bind group
+// (binding 13 is now brain_scratch; the numbering of the remaining
+// bindings is stable so the bind-group layout in gpu_kernel.rs stays aligned)
 // ═══════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)  var<storage, read_write> physics_state:        array<f32>;
@@ -285,7 +371,7 @@ const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 @group(0) @binding(10) var<storage, read_write> sensory_buffer:       array<f32>;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
-@group(0) @binding(13) var<storage, read_write> history_buffer:       array<f32>;
+@group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 

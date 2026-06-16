@@ -9,7 +9,9 @@ use log::info;
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
-    PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
+    BrainLayout, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS,
+    O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE, P_DEATH_COUNT,
+    P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
@@ -174,12 +176,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             ticks_done += remaining as u64;
 
             // Advance governor tick counter
-            for _ in 0..remaining {
-                governor.tick();
-            }
+            governor.advance_ticks(u64::from(remaining));
 
             // Drain async readback, then sample cached state for heatmap
-            while !kernel.try_collect_state() {
+            while !kernel.try_collect_state_snapshot() {
                 std::thread::yield_now();
             }
             let state = kernel.cached_state();
@@ -196,6 +196,17 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 }
             }
 
+            // Feed the governor's within-life tracker (it snapshots quarter
+            // boundaries from gen_tick).
+            let mut cumulative_food = 0_u64;
+            let mut cumulative_alive = 0_u64;
+            for i in 0..agents.len() {
+                let base = i * PHYS_STRIDE;
+                cumulative_food += state[base + P_FOOD_COUNT] as u64;
+                cumulative_alive += state[base + P_TICKS_ALIVE] as u64;
+            }
+            governor.record_within_life_sample(cumulative_food, cumulative_alive);
+
             if governor.gen_tick % (governor.config.tick_budget / 10).max(1) == 0 {
                 let pct =
                     (governor.gen_tick as f32 / governor.config.tick_budget as f32 * 100.0) as u32;
@@ -207,12 +218,19 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         // Extract fitness stats from final state
         let state = kernel.cached_state();
+        let mut final_food = 0_u64;
+        let mut final_alive = 0_u64;
         for i in 0..agents.len() {
             let base = i * PHYS_STRIDE;
             agents[i].food_consumed = state[base + P_FOOD_COUNT] as u32;
             agents[i].total_ticks_alive = state[base + P_TICKS_ALIVE] as u64;
             agents[i].death_count = state[base + P_DEATH_COUNT] as u32;
+            final_food += u64::from(agents[i].food_consumed);
+            final_alive += agents[i].total_ticks_alive;
         }
+        // Final sample fills any quarter the chunk loop did not land on.
+        governor.record_within_life_sample(final_food, final_alive);
+        let (first_quarter_rate, last_quarter_rate) = governor.within_life_rates();
 
         println!();
         let gen_elapsed = gen_start.elapsed();
@@ -224,6 +242,17 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         inherited_state = agents
             .get(best_idx)
             .map(|a| kernel.read_agent_state(a.brain_idx));
+        // The weight-norm layout must come from the champion's own config —
+        // configs are per-agent, and a mismatched layout would misplace the
+        // tail offsets into the champion's brain_state.
+        let best_config = current_configs.get(best_idx).unwrap_or(&current_configs[0]);
+        log_learning_metrics(
+            &agents,
+            inherited_state.as_ref(),
+            best_config,
+            first_quarter_rate,
+            last_quarter_rate,
+        );
         governor.log_generation(&fitness);
         println!(
             "  Time: {:.1}s | {:.0} ticks/sec",
@@ -259,6 +288,64 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         "\nTotal wall time: {:.1}s | {} generations",
         total_time.as_secs_f64(),
         governor.generation,
+    );
+}
+
+/// Per-generation learning metrics: behavioral signal (food per 1k
+/// alive-ticks) plus the policy weight norms of the generation's best
+/// agent. These stay flat for a population that isn't learning and should
+/// trend upward once credit assignment reaches food-approach actions.
+/// Printed alongside the fitness line so headless runs double as
+/// before/after measurement records.
+fn log_learning_metrics(
+    agents: &[Agent],
+    best_state: Option<&AgentBrainState>,
+    config: &BrainConfig,
+    first_quarter_rate: f64,
+    last_quarter_rate: f64,
+) {
+    let total_food: u64 = agents.iter().map(|a| u64::from(a.food_consumed)).sum();
+    let total_deaths: u64 = agents.iter().map(|a| u64::from(a.death_count)).sum();
+    // Foraging rate per 1k alive-ticks: total food normalized by the
+    // life-time the population actually accrued. Unlike food-per-life this is
+    // robust to death count — an active forager that dies often still scores
+    // its foraging honestly — so it is the cleaner cross-generation learning
+    // signal. (`total_ticks_alive` is preserved across respawn.)
+    let total_alive_ticks: u64 = agents.iter().map(|a| a.total_ticks_alive).sum();
+    let food_per_1k = if total_alive_ticks > 0 {
+        total_food as f64 / total_alive_ticks as f64 * 1000.0
+    } else {
+        0.0
+    };
+
+    let mut weight_norms = String::new();
+    if let Some(state) = best_state {
+        let layout = BrainLayout::new(config.vision_width, config.vision_height);
+        // Tail offsets are vision-independent deltas from the context-weight
+        // slot; rebase them onto this layout's dynamic position.
+        let tail_base = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let forward_base = tail_base + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let turn_base = tail_base + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        if state.brain_state.len() >= turn_base + ENCODED_DIMENSION {
+            let l2_norm = |base: usize| -> f32 {
+                state.brain_state[base..base + ENCODED_DIMENSION]
+                    .iter()
+                    .map(|w| w * w)
+                    .sum::<f32>()
+                    .sqrt()
+            };
+            weight_norms = format!(
+                " | w_fwd {:.3} | w_turn {:.3}",
+                l2_norm(forward_base),
+                l2_norm(turn_base),
+            );
+        }
+    }
+    println!(
+        "  Food: {total_food} | Deaths: {total_deaths} | Food/1k-ticks: {food_per_1k:.3} \
+| Learn q1→q4: {first_quarter_rate:.3} → {last_quarter_rate:.3}{weight_norms}"
     );
 }
 

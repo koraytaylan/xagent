@@ -27,7 +27,8 @@ defaults.
 | No single-letter variables outside closures, iterators, or trivial math (`x`, `y`). | `gw` → `grid_width`, `c` → `contact` |
 | No bare abbreviations. Spell out names so they read clearly. | `ppp` → `pixels_per_point`, `fc` → `feature_count` |
 | Domain abbreviations that are universal in the project may be used if documented here. | `buf` (buffer), `wt`/`wts` (weight/weights) |
-| Buffer layout constants (`O_*`, `P_*`, `CFG_*`), loop variables, and external API types are exempt. | |
+| Buffer-layout constants must spell out their descriptive words too — the no-abbreviation rule applies to them. `POS` → `POSITION`, no `IDX`/`CNT`/`ENC`. A short buffer-domain prefix is the only allowance, documented here: `FOOD_` (food state), `P_` (physics), `O_` (brain output state), `CFG_`/`WC_` (config uniforms). Shared Rust↔WGSL constants must be renamed in both languages and all concatenated shaders in the same commit. | `F_POS_Y` → `FOOD_POSITION_Y` |
+| Loop variables and external API types are exempt from the rules above. | |
 
 ### Magic Numbers
 
@@ -56,7 +57,10 @@ reviewed and refactored as part of normal code review.
 - Distinguish "start operation" from "poll/collect operation" in API naming. A function that both starts and polls should document that clearly.
 - Keep PR descriptions synchronized with code. Constant values, radius sizes, and architectural claims must reflect what the code actually does.
 - No commented-out code or tombstone comments. Delete removed code completely — git history preserves everything.
-- No stale TODOs. If the referenced work is done or abandoned, delete the TODO.
+- No TODO comments. Track pending or planned work in the issue tracker, not in the source — delete any TODO you encounter.
+- Inline code comments must describe the code as it currently is. They must not reference GitHub issue/PR numbers, past implementations ("was previously…", "before the refactor…"), or planned future adjustments ("will be replaced once…"). Put that history in commit messages, PR descriptions, and the issue tracker instead — `git blame` traces any line to its commit, and the commit message and any PR are where the issue reference belongs.
+- The rule above covers comments only. Keeping `Closes #N` or `Refs #N` in commit messages and PR descriptions is expected — that is the intended home for the reference. Runtime log/error message strings that surface an issue number to operators are out of scope. Strip pre-existing comment references file-by-file under [Incremental Cleanup](#incremental-cleanup) as code is touched, not in one big-bang pass.
+- Source must be agnostic of the planning process — of any plan past or present. Never name an internal plan, task, workstream, decision doc, or spec section (e.g. "Plan 0005", "workstream 0002", "the occupancy-sweep task", "the baseline spec subsection") anywhere in source: not in comments, not in doc-comments, and — unlike the issue-number exception above — not in runtime log/error/assert strings either. Describe only what the code is and does at present; if a value or behavior needs justifying, state the technical reason in place (and, when a measurement backs it, cite the result, not the plan that scheduled it). The planning rationale lives in commit messages, PR descriptions, and the planning docs themselves. Strip pre-existing plan/task references file-by-file as code is touched, same as the comment-reference cleanup above.
 - Do not write values to buffers or fields that nothing reads. Unused writes waste bandwidth and mislead readers about data flow.
 - We plan to enable `#![warn(missing_docs)]` incrementally per crate.
 
@@ -144,7 +148,12 @@ We do not require a big-bang rewrite. Existing code is cleaned up file-by-file
 as it is touched. Priority targets:
 
 1. `governor.rs` — extract magic numbers into named constants; split `advance()`.
-2. `buffers.rs` — replace short abbreviations (`gw`, `go`, `fc`).
+2. `buffers.rs` / kernel WGSL — replace short abbreviations (`gw`, `go`, `fc`)
+   and spell out the descriptive words in buffer-layout constants
+   (`P_POS_*` → `P_POSITION_*`; `O_*` abbreviations such as `ENC`, `HAB`,
+   `FWD`). These are shared with the shaders, so rename the Rust definition,
+   the WGSL definition, and every concatenated shader together. The food-state
+   constants (`FOOD_POSITION_*`, `FOOD_RESPAWN_TIMER`) are already done.
 3. `ui.rs` — rename `ppp`; extract inline RGB colors into a palette module.
 
 Files that already meet the standard (e.g., `config.rs`, `body.rs`) should be

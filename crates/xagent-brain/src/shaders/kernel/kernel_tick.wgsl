@@ -168,14 +168,16 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // Biome damage
     let integrity_scale = bc_f32(CFG_INTEGRITY_SCALE);
     let biome_type = sample_biome(pos.x, pos.z);
-    // Note: the danger flag is inverted from the biome comparison because of how the kernel is structured.
-    // When biome_type == BIOME_DANGER, the agent is in danger and should take damage.
+    // P_IN_DANGER_BIOME is navigational telemetry consumed by danger_exit_probe
+    // and behavior_metric danger-dwell, which read >0.5 as "in danger". Publish
+    // 1.0 while the agent is in a danger biome (and taking hazard damage), 0.0
+    // otherwise — the flag must match the agent's actual current biome.
     let in_danger = (biome_type == BIOME_DANGER);
     if in_danger {
         physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
-        physics_state[b + P_IN_DANGER_BIOME] = 0.0;
-    } else {
         physics_state[b + P_IN_DANGER_BIOME] = 1.0;
+    } else {
+        physics_state[b + P_IN_DANGER_BIOME] = 0.0;
     }
 
     // Integrity regen when energy > 50%

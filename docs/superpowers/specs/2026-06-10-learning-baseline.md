@@ -835,3 +835,48 @@ the plan **prioritizes the same-dispatch (in-workgroup) optimizations
 before any further split dispatches.** The finer-grained ParallelTiled phase
 split would incur strictly MORE dispatch overhead than this minimal per-cycle
 split, so the split multi-workgroup path is on the back foot for the 60k target.
+
+## Plan 0007 — Learning Control Grounding (landed `c40dcb7`, 2026-06-16)
+
+Continuity append (not a replacement). Plan 0007 made the live runtime truthful
+and behavior measurable before asking evolution to amplify behavior. What landed:
+
+- **Runtime genome authority.** The interactive worker now applies per-agent
+  heritable brain-state genes after upload *and* after generation inheritance
+  (`patch_agent_configs` in `sim_runtime.rs`, parallel to the headless path), and
+  `record_mutations` now records `movement_speed` provenance.
+- **Behavior telemetry.** Recording format v2 (legacy 15-float blobs still load),
+  new all-agent physics slots `P_NEAREST_FOOD_BEARING` / `P_IN_DANGER_BIOME` /
+  turn-persistence, and a per-node `behavior_metric` table.
+- **Control-rate curriculum.** `BrainConfig::learning_curriculum()`
+  (`movement_speed=8.0`, `brain_tick_stride=2`, `vision_stride=5`) bounds
+  full-forward sensory-lag travel to ~2.7 world units (vs ~66.7 at the old
+  defaults); breeding speed clamp lowered `[20.0, 100.0] → [4.0, 30.0]`.
+- **Klinotaxis repair.** Multiplier-only turn scaling replaced with a
+  worsening-gradient + turn-persistence-gated sign-breaking escape path; the
+  noise-based eligibility-trace invariant is preserved.
+- **Emergence probes.** Food-closure, danger-exit, and anti-circle GPU probes are
+  red-green control/telemetry gates under the curriculum.
+
+**Post-merge correction (caught by the repo-root full-workspace gate the
+per-task gates skip):** `P_IN_DANGER_BIOME` was published **inverted** (`0.0`
+while *in* a danger biome), which let `danger_exit_probe` pass vacuously (agent
+appeared never in danger). Fixed to `1.0` = in danger; the danger telemetry tests
+now assert the flag against the biome at the agent's actual readback position
+(CPU `biome_at` and GPU `sample_biome` index the same 256×256 grid identically),
+so they are deterministic and red-green for the inversion. With the corrected
+flag, `danger_exit_probe` measures a real danger-dwell fraction of **0.7**
+(previously a vacuous ~0.3). A separate first full-workspace run had also reported
+spurious failures from a stale `xagent-brain` rlib (its `include_str!`'d shaders
+were baked from an intermediate merge state); a clean rebuild compiled the
+squashed source correctly — no source defect there.
+
+**Gate (repo root, post-fix):** `cargo fmt`/`clippy` clean; `cargo test
+--workspace --no-fail-fast` = 232 passed / 0 failed (51 brain + 87 sandbox-lib +
+13 bin + 75 integration + 6 shared); GPU tests ran against a real adapter.
+
+The 20-generation fixed-seed evolution comparison against this DB's late baseline
+remains an **offline** run, deferred via
+`docs/plans/0007-Learning-Control-Grounding/DECISION-short-evolution-gate.md`
+(must use a build at/after the danger-flag fix, since pre-fix danger-dwell is
+inverted and not comparable to the baseline here).

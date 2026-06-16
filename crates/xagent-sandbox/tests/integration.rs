@@ -4131,7 +4131,7 @@ fn danger_biome_flag_marks_hazardous_locations() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
-    use xagent_brain::buffers::P_IN_DANGER_BIOME;
+    use xagent_brain::buffers::{P_IN_DANGER_BIOME, P_POS_X, P_POS_Z};
 
     // Find a danger biome location by testing different seeds
     let mut danger_pos = Vec3::new(0.0, 1.0, 0.0);
@@ -4212,18 +4212,29 @@ fn danger_biome_flag_marks_hazardous_locations() {
 
     let state = kernel.read_full_state_blocking();
     let danger_flag = state[P_IN_DANGER_BIOME];
+    // P_IN_DANGER_BIOME is recomputed every physics tick, and the agent drifts
+    // while the probe runs, so verify the flag against the biome at its *actual*
+    // readback position rather than where it spawned. CPU `biome_at` and GPU
+    // `sample_biome` index the same 256x256 grid identically, so this is
+    // deterministic and catches a polarity inversion regardless of drift.
+    let readback_x = state[P_POS_X];
+    let readback_z = state[P_POS_Z];
+    let actual_is_danger = world.biome_map.biome_at(readback_x, readback_z)
+        == xagent_sandbox::world::biome::BiomeType::Danger;
+    let expected_flag = if actual_is_danger { 1.0 } else { 0.0 };
 
     eprintln!(
-        "Agent in danger biome at ({}, {})",
-        danger_pos.x, danger_pos.z
+        "Spawned danger at ({:.2}, {:.2}); readback ({:.2}, {:.2}); actual_is_danger={}; danger_flag={}",
+        danger_pos.x, danger_pos.z, readback_x, readback_z, actual_is_danger, danger_flag
     );
-    eprintln!("Danger flag: {}", danger_flag);
 
-    // Should be 1.0 when in danger biome
     assert!(
-        (danger_flag - 1.0).abs() < 1e-5,
-        "Danger flag should be 1.0 in danger biome, got {}",
-        danger_flag
+        (danger_flag - expected_flag).abs() < 1e-5,
+        "Danger flag {} does not match actual biome at readback ({:.2}, {:.2}) (expected {})",
+        danger_flag,
+        readback_x,
+        readback_z,
+        expected_flag
     );
 }
 
@@ -4233,7 +4244,7 @@ fn safe_biome_flag_marks_safe_locations() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
-    use xagent_brain::buffers::P_IN_DANGER_BIOME;
+    use xagent_brain::buffers::{P_IN_DANGER_BIOME, P_POS_X, P_POS_Z};
 
     let world_config = WorldConfig {
         seed: 42,
@@ -4277,15 +4288,28 @@ fn safe_biome_flag_marks_safe_locations() {
 
     let state = kernel.read_full_state_blocking();
     let danger_flag = state[P_IN_DANGER_BIOME];
+    // Verify the flag against the biome at the agent's actual readback position
+    // (see danger_biome_flag_marks_hazardous_locations for why): the agent may
+    // drift out of the safe spawn region while the probe runs, so the flag is
+    // checked against where it actually ended up, not where it spawned.
+    let readback_x = state[P_POS_X];
+    let readback_z = state[P_POS_Z];
+    let actual_is_danger = world.biome_map.biome_at(readback_x, readback_z)
+        == xagent_sandbox::world::biome::BiomeType::Danger;
+    let expected_flag = if actual_is_danger { 1.0 } else { 0.0 };
 
-    eprintln!("Agent in safe biome at ({}, {})", safe_pos.x, safe_pos.z);
-    eprintln!("Danger flag: {}", danger_flag);
+    eprintln!(
+        "Spawned safe at ({:.2}, {:.2}); readback ({:.2}, {:.2}); actual_is_danger={}; danger_flag={}",
+        safe_pos.x, safe_pos.z, readback_x, readback_z, actual_is_danger, danger_flag
+    );
 
-    // Should be 0.0 when in safe biome
     assert!(
-        danger_flag.abs() < 1e-5,
-        "Danger flag should be 0.0 in safe biome, got {}",
-        danger_flag
+        (danger_flag - expected_flag).abs() < 1e-5,
+        "Danger flag {} does not match actual biome at readback ({:.2}, {:.2}) (expected {})",
+        danger_flag,
+        readback_x,
+        readback_z,
+        expected_flag
     );
 }
 

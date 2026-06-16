@@ -3547,7 +3547,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xagent-brain"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "glam",
@@ -3560,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "xagent-sandbox"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "clap",
@@ -3587,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "xagent-shared"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "glam",

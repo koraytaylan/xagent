@@ -53,6 +53,16 @@ const DEATH_PENALTY: f32 = 0.5;
 const FORAGING_WEIGHT: f32 = 0.85;
 const EXPLORATION_WEIGHT: f32 = 0.15;
 
+/// Recording format version 1: legacy format with implicit 15-float stride.
+#[allow(dead_code)]
+const RECORDING_FORMAT_V1: i64 = 1;
+/// Recording format version 2: versioned format with explicit stride in database.
+const RECORDING_FORMAT_V2: i64 = 2;
+/// Stride (floats per agent per tick) for recording format v1.
+const RECORDING_STRIDE_V1: usize = 15;
+/// Stride (floats per agent per tick) for recording format v2.
+const RECORDING_STRIDE_V2: usize = 15;
+
 /// Significance threshold (in pooled standard errors) a generation's mean must
 /// clear over its parent to count as a real improvement. One stderr keeps the
 /// spawn bar from ratcheting on eval noise — the dominant cause of the
@@ -240,13 +250,15 @@ fn spawn_recording_writer(db_path: &str) -> Option<(SyncSender<RecordingPayload>
             for payload in rx {
                 if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO generation_recording \
-                     (node_id, agent_count, tick_count, data) \
-                     VALUES (?1, ?2, ?3, ?4)",
+                     (node_id, agent_count, tick_count, data, format_version, record_stride) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         payload.node_id,
                         payload.agent_count,
                         payload.tick_count,
-                        payload.data
+                        payload.data,
+                        RECORDING_FORMAT_V2,
+                        RECORDING_STRIDE_V2 as i64
                     ],
                 ) {
                     log::error!("[recording-writer] DB write failed: {e}");
@@ -1278,7 +1290,7 @@ impl Governor {
         // energy, integrity, alive, motor_fwd, motor_turn,
         // prediction_error, exploration_rate, gradient, urgency,
         // fatigue_factor, staleness).
-        let record_stride = 15usize;
+        let record_stride = RECORDING_STRIDE_V2;
         let tick_count_usize = match usize::try_from(tick_count) {
             Ok(v) => v,
             Err(_) => return,
@@ -1350,28 +1362,43 @@ impl Governor {
 
     /// Load a generation's recording from the database.
     /// Returns `(agent_count, tick_count, Vec<f32>)` or `None` if not
-    /// found or the blob is malformed.
+    /// found or the blob is malformed. Supports both legacy v1 (implicit 15-float stride)
+    /// and v2 (explicit stride and version in database).
     pub fn load_recording(&self, node_id: i64) -> Option<(usize, u64, Vec<f32>)> {
-        let row: (i64, i64, Vec<u8>) = self
+        // Try to query with format_version and record_stride columns.
+        // If they don't exist, treat as legacy v1.
+        let row: (i64, i64, Vec<u8>, Option<i64>, Option<i64>) = self
             .db
             .query_row(
-                "SELECT agent_count, tick_count, data \
+                "SELECT agent_count, tick_count, data, format_version, record_stride \
                  FROM generation_recording WHERE node_id = ?1",
                 params![node_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3).ok(),
+                        row.get(4).ok(),
+                    ))
+                },
             )
             .ok()?;
-        let (agent_count, tick_count, blob) = row;
+        let (agent_count, tick_count, blob, _format_version_opt, record_stride_opt) = row;
         let agent_count = usize::try_from(agent_count).ok()?;
         let tick_count = usize::try_from(tick_count).ok()?;
+
+        // Default to v1 with stride 15 if columns are missing.
+        let record_stride = match record_stride_opt {
+            Some(stride) => usize::try_from(stride).ok()?,
+            None => RECORDING_STRIDE_V1,
+        };
 
         let float_size = std::mem::size_of::<f32>();
         if blob.len() % float_size != 0 {
             return None;
         }
 
-        // Keep record_stride in sync with store_recording().
-        let record_stride = 15usize;
         let actual_float_count = blob.len() / float_size;
         let expected_float_count = agent_count
             .checked_mul(tick_count)?
@@ -1672,6 +1699,31 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             agent_count INTEGER NOT NULL,
             tick_count  INTEGER NOT NULL,
             data        BLOB NOT NULL
+        );",
+    )?;
+
+    // Backwards-compatible migration: add format_version if missing
+    let _ = db.execute_batch(
+        "ALTER TABLE generation_recording ADD COLUMN format_version INTEGER DEFAULT 1;",
+    );
+
+    // Backwards-compatible migration: add record_stride if missing
+    let _ = db.execute_batch(
+        "ALTER TABLE generation_recording ADD COLUMN record_stride INTEGER DEFAULT 15;",
+    );
+
+    // Per-generation behavior summary derived from recording and physics state
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS behavior_metric (
+            node_id INTEGER PRIMARY KEY REFERENCES node(id),
+            sample_count INTEGER NOT NULL,
+            mean_abs_turn REAL NOT NULL,
+            turn_sign_persistence REAL NOT NULL,
+            straightness REAL NOT NULL,
+            food_distance_delta REAL,
+            food_bearing_alignment REAL,
+            danger_dwell_fraction REAL,
+            danger_exit_latency_ticks REAL
         );",
     )?;
 
@@ -3237,5 +3289,167 @@ mod tests {
                 node.id
             );
         }
+    }
+
+    #[test]
+    fn generation_recording_v2_loads_legacy_and_new_stride() {
+        use rusqlite::params;
+
+        let config = GovernorConfig {
+            population_size: 2,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let _gov_init = Governor::new(":memory:", config.clone(), &brain, "{}").unwrap();
+
+        let node_id = 1i64;
+        let agent_count = 2i64;
+        let tick_count = 3i64;
+        let record_stride_v1 = RECORDING_STRIDE_V1;
+
+        // Build a legacy v1 recording: agent_count * tick_count * stride floats
+        let total_floats = (agent_count as usize) * (tick_count as usize) * record_stride_v1;
+        let mut legacy_data = Vec::new();
+        for i in 0..total_floats {
+            let val = (i as f32) * 1.5;
+            legacy_data.extend_from_slice(&val.to_le_bytes());
+        }
+
+        // Load the legacy recording — should work without format_version/record_stride
+        let gov_load = Governor::new(":memory:", config.clone(), &brain, "{}").unwrap();
+        let db_load = &gov_load.db;
+
+        // Disable foreign keys temporarily so we can insert test data without a valid node
+        db_load.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        db_load
+            .execute(
+                "INSERT INTO generation_recording (node_id, agent_count, tick_count, data) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![node_id, agent_count, tick_count, legacy_data.clone()],
+            )
+            .unwrap();
+        db_load.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let (loaded_agent_count, loaded_tick_count, floats) = gov_load
+            .load_recording(node_id)
+            .expect("legacy recording should load");
+        assert_eq!(loaded_agent_count, 2);
+        assert_eq!(loaded_tick_count, 3);
+        assert_eq!(floats.len(), total_floats);
+
+        // Verify the data matches
+        for i in 0..total_floats {
+            let expected = (i as f32) * 1.5;
+            assert!((floats[i] - expected).abs() < 1e-6);
+        }
+
+        // Now test a v2 recording with explicit stride
+        let node_id_v2 = 2i64;
+        let record_stride_v2 = RECORDING_STRIDE_V2;
+        let total_floats_v2 = (agent_count as usize) * (tick_count as usize) * record_stride_v2;
+        let mut v2_data = Vec::new();
+        for i in 0..total_floats_v2 {
+            let val = (i as f32) * 2.5;
+            v2_data.extend_from_slice(&val.to_le_bytes());
+        }
+
+        // Insert a v2 row with explicit format_version and record_stride
+        db_load.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        db_load
+            .execute(
+                "INSERT INTO generation_recording \
+                 (node_id, agent_count, tick_count, data, format_version, record_stride) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    node_id_v2,
+                    agent_count,
+                    tick_count,
+                    v2_data.clone(),
+                    RECORDING_FORMAT_V2,
+                    record_stride_v2 as i64
+                ],
+            )
+            .unwrap();
+        db_load.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let (loaded_agent_count_v2, loaded_tick_count_v2, floats_v2) = gov_load
+            .load_recording(node_id_v2)
+            .expect("v2 recording should load");
+        assert_eq!(loaded_agent_count_v2, 2);
+        assert_eq!(loaded_tick_count_v2, 3);
+        assert_eq!(floats_v2.len(), total_floats_v2);
+
+        // Verify the v2 data matches
+        for i in 0..total_floats_v2 {
+            let expected = (i as f32) * 2.5;
+            assert!((floats_v2[i] - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn behavior_metric_table_persists_danger_metrics() {
+        use rusqlite::params;
+
+        let config = GovernorConfig {
+            population_size: 2,
+            tick_budget: 100,
+            elitism_count: 1,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let brain = BrainConfig::default();
+        let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
+
+        let node_id = 1i64;
+        let danger_dwell_fraction = 0.35;
+        let danger_exit_latency_ticks = 150.0;
+
+        // Insert a behavior_metric row with danger values
+        gov.db.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        gov.db
+            .execute(
+                "INSERT INTO behavior_metric \
+                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, \
+                  danger_dwell_fraction, danger_exit_latency_ticks) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    node_id,
+                    100i64,
+                    0.3f64,
+                    0.5f64,
+                    0.6f64,
+                    danger_dwell_fraction,
+                    danger_exit_latency_ticks
+                ],
+            )
+            .unwrap();
+        gov.db.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Verify the row was inserted
+        let (persisted_dwell, persisted_latency): (f64, f64) = gov
+            .db
+            .query_row(
+                "SELECT danger_dwell_fraction, danger_exit_latency_ticks \
+                 FROM behavior_metric WHERE node_id = ?1",
+                params![node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("behavior_metric row should exist");
+
+        assert!((persisted_dwell - danger_dwell_fraction).abs() < 1e-6);
+        assert!((persisted_latency - danger_exit_latency_ticks).abs() < 1e-6);
     }
 }

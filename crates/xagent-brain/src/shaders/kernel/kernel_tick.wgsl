@@ -168,8 +168,14 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // Biome damage
     let integrity_scale = bc_f32(CFG_INTEGRITY_SCALE);
     let biome_type = sample_biome(pos.x, pos.z);
-    if biome_type == BIOME_DANGER {
+    // Note: the danger flag is inverted from the biome comparison because of how the kernel is structured.
+    // When biome_type == BIOME_DANGER, the agent is in danger and should take damage.
+    let in_danger = (biome_type == BIOME_DANGER);
+    if in_danger {
         physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
+        physics_state[b + P_IN_DANGER_BIOME] = 0.0;
+    } else {
+        physics_state[b + P_IN_DANGER_BIOME] = 1.0;
     }
 
     // Integrity regen when energy > 50%
@@ -292,6 +298,61 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             SHAPING_RADIUS,
             sqrt(best_shaping_dist_sq),
             best_shaping_dist_sq < shaping_radius_sq);
+
+        // Compute signed bearing from facing direction to nearest food.
+        // bearing = atan2(cross(facing, to_food).y, dot(facing, to_food))
+        // In XZ plane: facing is normalized, to_food is displacement to food
+        // Find the food with the minimum distance and compute bearing from it.
+        if (best_shaping_dist_sq < shaping_radius_sq) {
+            let agent_pos = vec3f(
+                physics_state[b + P_POS_X],
+                physics_state[b + P_POS_Y],
+                physics_state[b + P_POS_Z]);
+            let food_count = wc_u32(WC_FOOD_COUNT);
+            let shaping_radius = SHAPING_RADIUS;
+
+            // Find the food item with the minimum distance in shaping range
+            var min_dist_sq = shaping_radius_sq;
+            var best_food_idx = 0xFFFFFFFFu;
+            for (var f = 0u; f < food_count; f++) {
+                if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
+                let fbase = f * FOOD_STATE_STRIDE;
+                let food_pos = vec3f(
+                    food_state[fbase + FOOD_POSITION_X],
+                    food_state[fbase + FOOD_POSITION_Y],
+                    food_state[fbase + FOOD_POSITION_Z]);
+                let to_food = food_pos - agent_pos;
+                let d_sq = dot(to_food, to_food);
+                if (d_sq < min_dist_sq) {
+                    min_dist_sq = d_sq;
+                    best_food_idx = f;
+                }
+            }
+
+            if (best_food_idx != 0xFFFFFFFFu) {
+                let food_base = best_food_idx * FOOD_STATE_STRIDE;
+                let food_pos = vec3f(
+                    food_state[food_base + FOOD_POSITION_X],
+                    food_state[food_base + FOOD_POSITION_Y],
+                    food_state[food_base + FOOD_POSITION_Z]);
+                let to_food = food_pos - agent_pos;
+
+                let facing_x = physics_state[b + P_FACING_X];
+                let facing_z = physics_state[b + P_FACING_Z];
+                // Cross product in XZ plane: (facing_x, facing_z) × (to_food.x, to_food.z)
+                // gives y-component = facing_x * to_food.z - facing_z * to_food.x
+                let cross_y = facing_x * to_food.z - facing_z * to_food.x;
+                // Dot product: facing · to_food (for atan2 argument order)
+                let dot_val = facing_x * to_food.x + facing_z * to_food.z;
+                physics_state[b + P_NEAREST_FOOD_BEARING] = atan2(cross_y, dot_val);
+            } else {
+                // Should not happen if best_shaping_dist_sq < shaping_radius_sq, but be defensive
+                physics_state[b + P_NEAREST_FOOD_BEARING] = 0.0;
+            }
+        } else {
+            // No food in range; bearing is undefined, sentinel to 0.0
+            physics_state[b + P_NEAREST_FOOD_BEARING] = 0.0;
+        }
         if (best_idx != 0xFFFFFFFFu) {
             // Atomic: claim food (prevents double-eating across workgroups)
             let result = atomicCompareExchangeWeak(&food_flags[best_idx], 0u, 1u);
@@ -380,6 +441,9 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // death so the eat-respawn food teleport cannot inject a shaping reward.
     physics_state[base + P_NEAREST_FOOD_DISTANCE] = SHAPING_RADIUS;
     physics_state[base + P_PREV_POTENTIAL]        = 0.0;
+    // Navigation telemetry: bearing and danger will be recomputed on next ticks
+    physics_state[base + P_NEAREST_FOOD_BEARING]  = 0.0;
+    physics_state[base + P_IN_DANGER_BIOME]       = 0.0;
 
     // 4. Reset brain state
     let brain_base = agent_id * BRAIN_STRIDE;

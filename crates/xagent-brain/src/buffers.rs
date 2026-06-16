@@ -167,7 +167,15 @@ pub const P_NEAREST_FOOD_DISTANCE: usize = 32;
 /// the food teleport-on-eat cannot inject a spurious shaping reward across a
 /// death.
 pub const P_PREV_POTENTIAL: usize = 33;
-pub const PHYS_STRIDE: usize = 34;
+/// Signed bearing (radians) from current facing direction to the nearest
+/// in-range food, computed in agent_food_detect. Sentinel value is 0.0 when no
+/// food is in range. Zero-mean: positive = food to the right, negative = food
+/// to the left. Written by the food-detect pass each cycle; per-agent live state.
+pub const P_NEAREST_FOOD_BEARING: usize = 34;
+/// Whether the agent is currently in a danger biome. Written by agent_physics
+/// when sampling biome type. 1.0 for danger, 0.0 for safe.
+pub const P_IN_DANGER_BIOME: usize = 35;
+pub const PHYS_STRIDE: usize = 36;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -949,6 +957,11 @@ mod tests {
             P_NEAREST_FOOD_DISTANCE as u32
         );
         assert_eq!(wgsl["P_PREV_POTENTIAL"], P_PREV_POTENTIAL as u32);
+        assert_eq!(
+            wgsl["P_NEAREST_FOOD_BEARING"],
+            P_NEAREST_FOOD_BEARING as u32
+        );
+        assert_eq!(wgsl["P_IN_DANGER_BIOME"], P_IN_DANGER_BIOME as u32);
     }
 
     #[test]
@@ -1131,6 +1144,8 @@ mod tests {
             P_LAST_DEATH_TICK,
             P_NEAREST_FOOD_DISTANCE,
             P_PREV_POTENTIAL,
+            P_NEAREST_FOOD_BEARING,
+            P_IN_DANGER_BIOME,
         ]
         .iter()
         .max()

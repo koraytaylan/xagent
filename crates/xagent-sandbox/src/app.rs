@@ -41,6 +41,7 @@ pub(crate) struct PendingUpload {
     pub(crate) food_consumed: Vec<bool>,
     pub(crate) food_timers: Vec<f32>,
     pub(crate) agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
+    pub(crate) agent_configs: Vec<BrainConfig>,
 }
 
 /// Render-side instrumentation for the runtime-decoupling work.

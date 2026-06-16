@@ -53,6 +53,11 @@ impl App {
                     )
                 })
                 .collect(),
+            agent_configs: self
+                .agents
+                .iter()
+                .map(|agent| agent.brain_config.clone())
+                .collect(),
         })
     }
 

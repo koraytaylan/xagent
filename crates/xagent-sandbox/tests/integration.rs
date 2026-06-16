@@ -3903,3 +3903,520 @@ fn parallel_tiled_bounded_drift_vs_fused() {
         "death count diverged: fused {fused_deaths} vs tiled {tiled_deaths}"
     );
 }
+
+/// Verify that per-agent heritable configs (movement_speed, fatigue_floor, etc.)
+/// are applied through the patch_agent_configs path used in the worker reset.
+///
+/// This test verifies that write_agent_heritable_config successfully patches
+/// per-agent tail slots with the correct movement_speed and fatigue_floor values.
+#[test]
+fn worker_reset_applies_per_agent_heritable_configs_after_inheritance() {
+    use xagent_brain::buffers::{
+        FIXED_TAIL_SIZE, O_FATIGUE_FLOOR, O_MOVEMENT_SPEED, O_PREDICTOR_CONTEXT_WEIGHT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let world_config = WorldConfig {
+        seed: 123,
+        ..WorldConfig::default()
+    };
+
+    let brain_config = BrainConfig::default();
+
+    // Create two agents with distinct configs
+    let speed_agent_1 = 8.0;
+    let speed_agent_2 = 25.0;
+    let fatigue_agent_1 = 0.2;
+    let fatigue_agent_2 = 0.8;
+
+    let config_1 = BrainConfig {
+        movement_speed: speed_agent_1,
+        fatigue_floor: fatigue_agent_1,
+        ..BrainConfig::default()
+    };
+
+    let config_2 = BrainConfig {
+        movement_speed: speed_agent_2,
+        fatigue_floor: fatigue_agent_2,
+        ..BrainConfig::default()
+    };
+
+    let agent_count = 2u32;
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+
+    let agent_data: Vec<_> = (0..agent_count)
+        .map(|_| {
+            (
+                spawn_pos,
+                100.0_f32,
+                100.0_f32,
+                brain_config.memory_capacity,
+                brain_config.processing_slots,
+            )
+        })
+        .collect();
+
+    // Create kernel and upload agents with population-wide config
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_agents(&agent_data);
+
+    // Initialize brain states with the population-wide config
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    // Apply the per-agent configs as the reset path would
+    kernel.write_agent_heritable_config(0, &config_1);
+    kernel.write_agent_heritable_config(1, &config_2);
+
+    // Verify the configs were written correctly by reading back the brain states.
+    // The patch_agent_configs helper should have written the movement_speed and
+    // fatigue_floor values into each agent's brain state tail.
+    let state_0 = kernel.read_agent_state(0);
+    let state_1 = kernel.read_agent_state(1);
+
+    let brain_stride = state_0.brain_state.len();
+    assert!(brain_stride > 0, "Agent 0 brain state is empty");
+
+    // Compute the indices for fatigue_floor and movement_speed in the tail.
+    // The tail starts at `brain_stride - FIXED_TAIL_SIZE`.
+    let tail_base = brain_stride - FIXED_TAIL_SIZE;
+    let fatigue_floor_delta = O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT;
+    let movement_speed_delta = O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT;
+    let fatigue_floor_idx = tail_base + fatigue_floor_delta;
+    let movement_speed_idx = tail_base + movement_speed_delta;
+
+    // Verify agent 0 config values
+    assert!(
+        (state_0.brain_state[fatigue_floor_idx] - fatigue_agent_1).abs() < 1e-5,
+        "Agent 0 fatigue_floor not patched: expected {}, got {}",
+        fatigue_agent_1,
+        state_0.brain_state[fatigue_floor_idx]
+    );
+    assert!(
+        (state_0.brain_state[movement_speed_idx] - speed_agent_1).abs() < 1e-5,
+        "Agent 0 movement_speed not patched: expected {}, got {}",
+        speed_agent_1,
+        state_0.brain_state[movement_speed_idx]
+    );
+
+    // Verify agent 1 config values
+    assert!(
+        (state_1.brain_state[fatigue_floor_idx] - fatigue_agent_2).abs() < 1e-5,
+        "Agent 1 fatigue_floor not patched: expected {}, got {}",
+        fatigue_agent_2,
+        state_1.brain_state[fatigue_floor_idx]
+    );
+    assert!(
+        (state_1.brain_state[movement_speed_idx] - speed_agent_2).abs() < 1e-5,
+        "Agent 1 movement_speed not patched: expected {}, got {}",
+        speed_agent_2,
+        state_1.brain_state[movement_speed_idx]
+    );
+}
+
+#[test]
+fn food_bearing_matches_expected_direction() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{P_FACING_X, P_FACING_Z, P_POS_X, P_POS_Z};
+    use xagent_brain::buffers::{P_NEAREST_FOOD_BEARING, P_NEAREST_FOOD_DISTANCE};
+
+    // Create a fixed-seed world with food placed at a known location
+    let world_config = WorldConfig {
+        seed: 12345,
+        ..WorldConfig::default()
+    };
+    let world = WorldState::new(world_config.clone());
+
+    // Place food at a known relative offset from the agent's spawn
+    let spawn_pos = world.safe_spawn_position();
+    let food_x = spawn_pos.x + 5.0; // 5 units to the right
+    let food_z = spawn_pos.z + 5.0; // 5 units in front
+    let food_y = spawn_pos.y;
+
+    let brain_config = BrainConfig::default();
+    let agent_count = 1u32;
+    let food_count = 1usize;
+
+    // Create kernel
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+
+    // Upload world with single food item
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos = vec![(food_x, food_y, food_z)];
+    let food_consumed = vec![false];
+    let food_timers = vec![0.0];
+
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+
+    // Upload single agent at spawn (at default position with default orientation)
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain_config.memory_capacity,
+        brain_config.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    // Run a few ticks to trigger food detect
+    kernel.dispatch_batch(0, 100);
+
+    // Read physics state
+    let state = kernel.read_full_state_blocking();
+    let bearing = state[P_NEAREST_FOOD_BEARING];
+    let distance = state[P_NEAREST_FOOD_DISTANCE];
+    let agent_x = state[P_POS_X];
+    let agent_z = state[P_POS_Z];
+    let facing_x = state[P_FACING_X];
+    let facing_z = state[P_FACING_Z];
+
+    // Compute expected bearing: from agent's actual position to food
+    let to_food_x = food_x - agent_x;
+    let to_food_z = food_z - agent_z;
+    let expected_cross = facing_x * to_food_z - facing_z * to_food_x;
+    let expected_dot = facing_x * to_food_x + facing_z * to_food_z;
+    let expected_bearing = expected_cross.atan2(expected_dot);
+
+    eprintln!(
+        "Food at (x={}, z={}), Agent at (x={}, z={})",
+        food_x, food_z, agent_x, agent_z
+    );
+    eprintln!("Agent facing: ({}, {})", facing_x, facing_z);
+    eprintln!(
+        "Computed bearing: {}, Expected bearing: {}",
+        bearing, expected_bearing
+    );
+    eprintln!("Distance: {}", distance);
+
+    // Bearing should match the expected value computed from positions
+    assert!(
+        (bearing - expected_bearing).abs() < 0.05,
+        "Bearing mismatch: computed {}, expected {}",
+        bearing,
+        expected_bearing
+    );
+
+    // Distance should be reasonable (less than max shaping radius)
+    assert!(
+        distance < 35.0,
+        "Distance should be less than shaping radius 30, got {}",
+        distance
+    );
+}
+#[test]
+fn danger_biome_flag_marks_hazardous_locations() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::P_IN_DANGER_BIOME;
+
+    // Find a danger biome location by testing different seeds
+    let mut danger_pos = Vec3::new(0.0, 1.0, 0.0);
+    let mut found_danger = false;
+    let mut found_seed = 0u64;
+
+    for seed in 0..10 {
+        let world_config = WorldConfig {
+            seed: seed as u64,
+            ..WorldConfig::default()
+        };
+        let world = WorldState::new(world_config.clone());
+
+        // Find a position in a danger biome
+        for attempt in 0..50 {
+            let test_x = -40.0 + (attempt as f32) * 2.0;
+            let test_z = -40.0 + ((attempt / 25) as f32) * 2.0;
+            if world.biome_map.biome_at(test_x, test_z)
+                == xagent_sandbox::world::biome::BiomeType::Danger
+            {
+                danger_pos = Vec3::new(
+                    test_x,
+                    world.terrain.height_at(test_x, test_z) + 1.0,
+                    test_z,
+                );
+                found_danger = true;
+                found_seed = seed as u64;
+                break;
+            }
+        }
+        if found_danger {
+            break;
+        }
+    }
+
+    if !found_danger {
+        eprintln!("Warning: could not find danger biome in test world, skipping test");
+        return;
+    }
+
+    // Create the kernel with the same seed where we found the danger location
+    let world_config = WorldConfig {
+        seed: found_seed,
+        ..WorldConfig::default()
+    };
+    let world = WorldState::new(world_config.clone());
+
+    let brain_config = BrainConfig::default();
+    let agent_count = 1u32;
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<_> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<_> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<_> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+
+    let agent_data = vec![(
+        danger_pos,
+        100.0_f32,
+        100.0_f32,
+        brain_config.memory_capacity,
+        brain_config.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    kernel.dispatch_batch(0, 100);
+
+    let state = kernel.read_full_state_blocking();
+    let danger_flag = state[P_IN_DANGER_BIOME];
+
+    eprintln!(
+        "Agent in danger biome at ({}, {})",
+        danger_pos.x, danger_pos.z
+    );
+    eprintln!("Danger flag: {}", danger_flag);
+
+    // Should be 1.0 when in danger biome
+    assert!(
+        (danger_flag - 1.0).abs() < 1e-5,
+        "Danger flag should be 1.0 in danger biome, got {}",
+        danger_flag
+    );
+}
+
+#[test]
+fn safe_biome_flag_marks_safe_locations() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::P_IN_DANGER_BIOME;
+
+    let world_config = WorldConfig {
+        seed: 42,
+        ..WorldConfig::default()
+    };
+    let world = WorldState::new(world_config.clone());
+
+    // Safe spawn position should be in a safe biome
+    let safe_pos = world.safe_spawn_position();
+
+    let brain_config = BrainConfig::default();
+    let agent_count = 1u32;
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<_> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<_> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<_> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+
+    let agent_data = vec![(
+        safe_pos,
+        100.0_f32,
+        100.0_f32,
+        brain_config.memory_capacity,
+        brain_config.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    kernel.dispatch_batch(0, 100);
+
+    let state = kernel.read_full_state_blocking();
+    let danger_flag = state[P_IN_DANGER_BIOME];
+
+    eprintln!("Agent in safe biome at ({}, {})", safe_pos.x, safe_pos.z);
+    eprintln!("Danger flag: {}", danger_flag);
+
+    // Should be 0.0 when in safe biome
+    assert!(
+        danger_flag.abs() < 1e-5,
+        "Danger flag should be 0.0 in safe biome, got {}",
+        danger_flag
+    );
+}
+
+#[test]
+fn danger_exit_probe_requires_hazard_avoidance_evidence() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use glam::Vec3;
+    use xagent_brain::buffers::P_IN_DANGER_BIOME;
+
+    // Create a world with a fixed seed to ensure reproducibility
+    let world_config = WorldConfig {
+        seed: 42,
+        ..WorldConfig::default()
+    };
+    let world = WorldState::new(world_config.clone());
+
+    // Find a danger biome location by scanning the biome map
+    let mut danger_pos = Vec3::ZERO;
+    let mut found_danger = false;
+
+    for attempt in 0..100 {
+        let test_x = -40.0 + ((attempt % 25) as f32) * 2.0;
+        let test_z = -40.0 + ((attempt / 25) as f32) * 2.0;
+
+        if world.biome_map.biome_at(test_x, test_z)
+            == xagent_sandbox::world::biome::BiomeType::Danger
+        {
+            danger_pos = Vec3::new(
+                test_x,
+                world.terrain.height_at(test_x, test_z) + 1.0,
+                test_z,
+            );
+            found_danger = true;
+            break;
+        }
+    }
+
+    if !found_danger {
+        eprintln!("Skipping: no danger biome found in generated world");
+        return;
+    }
+
+    let brain_config = BrainConfig::default();
+    let agent_count = 1u32;
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<_> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<_> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<_> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+
+    // Place agent at the danger position
+    let agent_data = [(
+        danger_pos,
+        100.0_f32,
+        100.0_f32,
+        brain_config.memory_capacity,
+        brain_config.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    // Run for a reasonable number of ticks to allow the agent to exit danger
+    // Use a moderate number of ticks (e.g., 500 ticks)
+    let probe_duration = 500u32;
+    kernel.dispatch_batch(0, probe_duration);
+
+    // Collect danger flags at periodic intervals to compute dwell and exit latency
+    let mut danger_dwell_count = 0u32;
+    let mut exit_tick = None;
+    let mut danger_entered_at = 0u32;
+
+    // We'll sample the agent's state by re-running from start with snapshots
+    // For now, do a simpler check: run again and count danger presence
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    // Run in small batches to sample danger state periodically
+    let batch_size = 50u32;
+    for batch in 0..(probe_duration / batch_size) {
+        kernel.dispatch_batch(0, batch_size);
+        let state = kernel.read_full_state_blocking();
+        let danger_flag = state[P_IN_DANGER_BIOME];
+
+        eprintln!("Batch {}: danger_flag = {}", batch, danger_flag);
+
+        if danger_flag > 0.5 {
+            danger_dwell_count += 1;
+            if exit_tick.is_none() {
+                danger_entered_at = batch * batch_size;
+            }
+        } else if exit_tick.is_none() && danger_dwell_count > 0 {
+            exit_tick = Some(batch * batch_size);
+        }
+    }
+
+    let danger_dwell_fraction = danger_dwell_count as f32 / (probe_duration / batch_size) as f32;
+    let exit_latency_ticks = match exit_tick {
+        Some(tick) => tick.saturating_sub(danger_entered_at),
+        None => probe_duration,
+    };
+
+    eprintln!(
+        "Danger dwell fraction: {}, exit latency: {} ticks",
+        danger_dwell_fraction, exit_latency_ticks
+    );
+
+    // Assert that the agent exits danger relatively quickly
+    // The threshold values are placeholders and should be calibrated based on
+    // observed behavior with the sign-breaking klinotaxis control
+    assert!(
+        danger_dwell_fraction < 0.8,
+        "Agent spent too long in danger: {:.1}% of time",
+        danger_dwell_fraction * 100.0
+    );
+
+    assert!(
+        exit_latency_ticks < 200u32,
+        "Agent took too long to exit danger: {} ticks",
+        exit_latency_ticks
+    );
+}

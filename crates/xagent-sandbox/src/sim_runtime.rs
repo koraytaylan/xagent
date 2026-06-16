@@ -312,6 +312,21 @@ struct Worker {
     last_counters_log: Instant,
 }
 
+/// Patch per-agent heritable config tail slots into the GPU kernel.
+/// Called after world/agent uploads and after inherited brain states are written,
+/// because write_agent_state overwrites the entire brain-state buffer.
+fn patch_agent_configs(kernel: &GpuKernel, configs: &[BrainConfig]) {
+    for (index, config) in configs.iter().enumerate() {
+        let Ok(agent_index) = u32::try_from(index) else {
+            break;
+        };
+        if agent_index >= kernel.agent_count() {
+            break;
+        }
+        kernel.write_agent_heritable_config(agent_index, config);
+    }
+}
+
 impl Worker {
     /// Create the kernel and upload the initial world + agents.
     fn new(init: SimInit) -> Self {
@@ -329,6 +344,7 @@ impl Worker {
             &init.upload.food_timers,
         );
         kernel.upload_agents(&init.upload.agent_data);
+        patch_agent_configs(&kernel, &init.upload.agent_configs);
         Self {
             kernel,
             brain_config: init.brain_config,
@@ -443,6 +459,7 @@ impl Worker {
                 }
             });
         }
+        patch_agent_configs(&self.kernel, &request.upload.agent_configs);
 
         self.tick_budget = request.tick_budget;
         self.tick = 0;
@@ -905,6 +922,7 @@ mod tests {
                 BrainConfig::default().memory_capacity,
                 BrainConfig::default().processing_slots,
             )],
+            agent_configs: vec![BrainConfig::default()],
         };
         (upload, world.food_items.len())
     }

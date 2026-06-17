@@ -148,6 +148,16 @@ pub struct Agent {
     pub food_consumed: u32,
     /// Total ticks spent alive across all lives (cumulative for evolution scoring).
     pub total_ticks_alive: u64,
+    /// Total distance traveled in this generation (cumulative for effort telemetry).
+    pub distance_traveled: f32,
+    /// Total energy spent in this generation (cumulative for effort telemetry).
+    pub energy_spent: f32,
+    /// Total distance traveled through danger in this generation (cumulative for effort telemetry).
+    pub danger_path_length: f32,
+    /// Count of ticks where danger was in sense range (for avoidance-intent metric).
+    pub avoidance_sense_range_ticks: f32,
+    /// Count of ticks where danger was in sense range AND motor turn opposed bearing (for avoidance-intent metric).
+    pub avoidance_turns_opposing: f32,
     /// Position visit counts for heatmap visualization.
     pub heatmap: Vec<u32>,
     /// Distance-sampled control points for trail visualization (current life only).
@@ -196,6 +206,11 @@ impl Agent {
             has_reproduced: false,
             food_consumed: 0,
             total_ticks_alive: 0,
+            distance_traveled: 0.0,
+            energy_spent: 0.0,
+            danger_path_length: 0.0,
+            avoidance_sense_range_ticks: 0.0,
+            avoidance_turns_opposing: 0.0,
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],
             trail: Vec::with_capacity(256),
             trail_dirty: false,
@@ -430,8 +445,14 @@ pub fn mutate_config_with_strength(
         movement_speed: momentum
             .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
             .clamp(1.0, 100.0),
+        // Speed-cost exponent is locked per batch (not heritable); pass through.
+        speed_cost_exponent: parent.speed_cost_exponent,
         // Visual-cortex gate is locked per batch (not heritable); pass through.
         visual_cortex_enabled: parent.visual_cortex_enabled,
+        // Danger-percept gate is locked per batch (not heritable); pass through.
+        danger_percept_enabled: parent.danger_percept_enabled,
+        // Effort-rebased fitness gate is locked per batch (not heritable); pass through.
+        effort_rebased_fitness: parent.effort_rebased_fitness,
         // Heritable visual-genome genes (plan 0008). Each is perturbed with
         // momentum and clamped to the same bounds the shader re-imposes after
         // reading the gene. `orientation_offset` has no hard clamp — orientation
@@ -596,8 +617,14 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.movement_speed
         },
+        // Speed-cost exponent is locked per batch (not heritable); take from `a`.
+        speed_cost_exponent: a.speed_cost_exponent,
         // Visual-cortex gate is locked per batch (not heritable); take from `a`.
         visual_cortex_enabled: a.visual_cortex_enabled,
+        // Danger-percept gate is locked per batch (not heritable); take from `a`.
+        danger_percept_enabled: a.danger_percept_enabled,
+        // Effort-rebased fitness gate is locked per batch (not heritable); take from `a`.
+        effort_rebased_fitness: a.effort_rebased_fitness,
         // Heritable visual-genome genes (plan 0008): uniform per-gene crossover.
         gabor_wavelength: if rng.random::<f32>() < 0.5 {
             a.gabor_wavelength

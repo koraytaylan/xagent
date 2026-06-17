@@ -46,6 +46,13 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Preserve the physics-recorded death tick through the reset so CPU
     // readback can attribute this death to its exact tick.
     let saved_last_death_tick = physics_state[base + P_LAST_DEATH_TICK];
+    // Preserve cumulative effort telemetry
+    let saved_distance     = physics_state[base + P_DISTANCE_TRAVELED];
+    let saved_energy_spent = physics_state[base + P_ENERGY_SPENT];
+    let saved_danger_path  = physics_state[base + P_DANGER_PATH_LENGTH];
+    // Preserve cumulative avoidance intent counters (generation-cumulative)
+    let saved_avoidance_sense_range = physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
+    let saved_avoidance_turns_opposing = physics_state[base + P_AVOIDANCE_TURNS_OPPOSING];
 
     // ── 3. Reset physics state ─────────────────────────────────────────────
     // Zero the full stride first, then write specific values.
@@ -74,6 +81,20 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
     physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
+    // Restore cumulative effort telemetry (generation-cumulative, never reset)
+    physics_state[base + P_DISTANCE_TRAVELED]  = saved_distance;
+    physics_state[base + P_ENERGY_SPENT]       = saved_energy_spent;
+    physics_state[base + P_DANGER_PATH_LENGTH] = saved_danger_path;
+    // Restore cumulative avoidance intent (generation-cumulative, never reset)
+    physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS] = saved_avoidance_sense_range;
+    physics_state[base + P_AVOIDANCE_TURNS_OPPOSING] = saved_avoidance_turns_opposing;
+    // Danger percept telemetry: reset to sentinel values, will be recomputed
+    physics_state[base + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
+    physics_state[base + P_NEAREST_DANGER_BEARING]  = 0.0;
+    // Potential-based shaping state: reset so respawn cannot inject spurious rewards.
+    // Food approach and danger-avoidance potentials both reset to zero.
+    physics_state[base + P_PREV_POTENTIAL]          = 0.0;
+    physics_state[base + P_PREV_DANGER_POTENTIAL]   = 0.0;
 
     // ── 4. Reset brain state ───────────────────────────────────────────────
     let brain_base = tid * BRAIN_STRIDE;

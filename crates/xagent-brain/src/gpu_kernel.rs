@@ -126,6 +126,21 @@ fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
             0.0
         },
     );
+    // Danger-percept encoder-input selector (plan 0009 danger-percept-sense).
+    // Feeds the WGSL `DANGER_PERCEPT_FEATURES_ACTIVE` override, which expands
+    // `NON_VISUAL_FEATURE_COUNT` from 25 to 27 (bearing + distance) and thus
+    // `FEATURE_COUNT` by 2. `layout.danger_percept_enabled` mirrors
+    // `BrainConfig::danger_percept_enabled` and the runtime
+    // `WC_DANGER_PERCEPT_ENABLED` uniform slot, so buffer sizing and per-pass
+    // behavior agree by construction.
+    map.insert(
+        "DANGER_PERCEPT_FEATURES_ACTIVE".to_string(),
+        if layout.danger_percept_enabled {
+            1.0
+        } else {
+            0.0
+        },
+    );
     map
 }
 
@@ -421,7 +436,9 @@ pub struct GpuKernel {
     world_config: WorldConfig,
     layout: BrainLayout,
     brain_tick_stride: u32,
+    speed_cost_exponent: f32,
     has_subgroup: bool, // retained for runtime diagnostics
+    danger_percept_enabled: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
     world_config_scratch: [f32; WORLD_CONFIG_SIZE],
@@ -1339,6 +1356,8 @@ impl GpuKernel {
             layout,
             agent_state_staging: None,
             brain_tick_stride,
+            speed_cost_exponent: brain_config.speed_cost_exponent,
+            danger_percept_enabled: brain_config.danger_percept_enabled,
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
@@ -1482,6 +1501,8 @@ impl GpuKernel {
             ticks_to_run,
             vision_stride,
             self.brain_tick_stride,
+            self.speed_cost_exponent,
+            self.danger_percept_enabled,
         );
         self.world_config_scratch[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(

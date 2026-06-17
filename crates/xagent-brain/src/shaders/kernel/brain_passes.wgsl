@@ -227,6 +227,25 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
             s_features[fi] = sensory_buffer[s_base + to + 2u]; fi = fi + 1u;
             s_features[fi] = sensory_buffer[s_base + to + 3u]; fi = fi + 1u;
         }
+        // Danger percept (plan 0009 danger-percept-sense): when enabled, pack
+        // the nearest-danger distance and bearing from `physics_state` into the
+        // two extra feature slots. These are read same-cycle from physics —
+        // exactly the pattern used for interoception above — rather than from
+        // the batch-lagged sensory_buffer. `DANGER_PERCEPT_FEATURES_ACTIVE` is
+        // a pipeline override constant (0u or 1u), so `NON_VISUAL_FEATURE_COUNT`
+        // already accounts for the 2 extra slots when the flag is on and the
+        // write is always in-bounds. With the flag off, this block is unreachable
+        // (NON_VISUAL_FEATURE_COUNT == 25u, fi stays at non_visual_base + 25).
+        if (DANGER_PERCEPT_FEATURES_ACTIVE != 0u) {
+            let phys_danger_base = agent_id * PHYS_STRIDE;
+            // Distance: normalized to [0, 1] over DANGER_SENSE_RADIUS; 1.0 means
+            // the sentinel "no danger in range" — the furthest possible reading.
+            let raw_dist = physics_state[phys_danger_base + P_NEAREST_DANGER_DISTANCE];
+            s_features[fi] = raw_dist / max(DANGER_SENSE_RADIUS, EPSILON); fi = fi + 1u;
+            // Bearing: already a signed angle in [-π, π]; normalize to [-1, 1].
+            let raw_bearing = physics_state[phys_danger_base + P_NEAREST_DANGER_BEARING];
+            s_features[fi] = raw_bearing / max(PI, EPSILON); fi = fi + 1u;
+        }
     }
 }
 
@@ -784,9 +803,27 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let prev_potential = physics_state[phys_base_homeo + P_PREV_POTENTIAL];
         let shaping = TD_DISCOUNT * potential - prev_potential;
         physics_state[phys_base_homeo + P_PREV_POTENTIAL] = potential;
+
+        // Avoidance potential shaping (plan 0009 danger-avoidance-potential):
+        // Φ_d(s) = -(1 - nearest_danger_distance / DANGER_SENSE_RADIUS).
+        // More negative as danger nears; shaping reward adds γ·Φ_d(s') − Φ_d(s),
+        // so moving away yields positive increment, moving toward yields negative.
+        // Behind danger_percept_enabled flag (default false).
+        var danger_shaping: f32 = 0.0;
+        if (bc_f32(CFG_DANGER_PERCEPT_ENABLED) != 0.0) {
+            let danger_dist = physics_state[phys_base_homeo + P_NEAREST_DANGER_DISTANCE];
+            let danger_d_norm = clamp(
+                danger_dist / max(DANGER_SENSE_RADIUS, EPSILON),
+                0.0, 1.0);
+            let danger_potential = -(1.0 - danger_d_norm);
+            let prev_danger_potential = physics_state[phys_base_homeo + P_PREV_DANGER_POTENTIAL];
+            danger_shaping = TD_DISCOUNT * danger_potential - prev_danger_potential;
+            physics_state[phys_base_homeo + P_PREV_DANGER_POTENTIAL] = danger_potential;
+        }
         let raw_gradient = energy_delta * ENERGY_WEIGHT
             + integrity_delta * INTEGRITY_WEIGHT
-            + shaping;
+            + shaping
+            + danger_shaping;
         let gradient_fast = brain_state[brain_base + O_HOMEO + 0u] * (1.0 - GRADIENT_FAST_BLEND) + raw_gradient * GRADIENT_FAST_BLEND;
         let gradient_medium = brain_state[brain_base + O_HOMEO + 1u] * (1.0 - GRADIENT_MEDIUM_BLEND) + raw_gradient * GRADIENT_MEDIUM_BLEND;
         let gradient_slow = brain_state[brain_base + O_HOMEO + 2u] * (1.0 - GRADIENT_SLOW_BLEND) + raw_gradient * GRADIENT_SLOW_BLEND;

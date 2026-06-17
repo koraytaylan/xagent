@@ -199,9 +199,37 @@ pub const P_NEAREST_FOOD_BEARING: usize = 34;
 /// Whether the agent is currently in a danger biome. Written by agent_physics
 /// when sampling biome type. 1.0 for danger, 0.0 for safe.
 pub const P_IN_DANGER_BIOME: usize = 35;
-pub const PHYS_STRIDE: usize = 36;
+/// Cumulative distance traveled over the generation. Σ planar |Δpos| since spawn.
+pub const P_DISTANCE_TRAVELED: usize = 36;
+/// Cumulative energy spent over the generation. Σ movement + metabolic drain since spawn.
+pub const P_ENERGY_SPENT: usize = 37;
+/// Cumulative distance traveled while in danger. Σ planar |Δpos| while in_danger.
+pub const P_DANGER_PATH_LENGTH: usize = 38;
+/// Distance to the nearest in-range danger cell. Sentinel value is DANGER_SENSE_RADIUS
+/// when no danger is in range.
+pub const P_NEAREST_DANGER_DISTANCE: usize = 39;
+/// Signed bearing (radians) from current facing direction to the nearest in-range
+/// danger biome cell. Computed like P_NEAREST_FOOD_BEARING. Sentinel value is 0.0
+/// when no danger is in range.
+pub const P_NEAREST_DANGER_BEARING: usize = 40;
+/// Previous avoidance potential, used for potential-based shaping. Mirrors
+/// P_PREV_POTENTIAL's pattern for danger avoidance. Reset on respawn.
+pub const P_PREV_DANGER_POTENTIAL: usize = 41;
+/// Cumulative count of ticks where danger was in sense range. Used to compute
+/// the fraction of ticks where avoidance decision was made.
+pub const P_AVOIDANCE_SENSE_RANGE_TICKS: usize = 42;
+/// Cumulative count of ticks where danger was in sense range AND the motor turn
+/// opposed the danger bearing (deliberate turn-away). Used to compute avoidance intent.
+pub const P_AVOIDANCE_TURNS_OPPOSING: usize = 43;
+pub const PHYS_STRIDE: usize = 44;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
+
+// ── Sensory constants ───────────────────────────────────────────────────────
+
+/// World-units radius within which danger biome cells are sensed for avoidance
+/// potential and bearing calculation. Symmetric to SHAPING_RADIUS (food).
+pub const DANGER_SENSE_RADIUS: f32 = 30.0;
 
 // ── Runtime layout for configurable vision dimensions ─────────────────
 
@@ -230,6 +258,13 @@ pub struct BrainLayout {
     /// match `BrainConfig::visual_cortex_enabled` and the WGSL FEATURE_COUNT
     /// pipeline override (`vision_override_constants`). Locked per batch.
     pub visual_cortex_enabled: bool,
+    /// Whether this layout sizes the sensory/feature buffers to include the
+    /// dedicated danger percept (plan 0009). When `true`, non-visual feature
+    /// count grows by 2 (danger bearing + distance). Must match
+    /// `BrainConfig::danger_percept_enabled` and the WGSL
+    /// `DANGER_PERCEPT_FEATURES_ACTIVE` pipeline override (`vision_override_constants`).
+    /// Locked per batch.
+    pub danger_percept_enabled: bool,
     pub feature_count: usize,
     pub sensory_stride: usize,
     pub brain_stride: usize,
@@ -262,6 +297,7 @@ impl BrainLayout {
             config.retina_width,
             config.retina_height,
             config.visual_cortex_enabled,
+            config.danger_percept_enabled,
         )
     }
 
@@ -279,6 +315,7 @@ impl BrainLayout {
             vision_height,
             retina_width,
             retina_height,
+            false,
             false,
         )
     }
@@ -299,6 +336,7 @@ impl BrainLayout {
         retina_width: usize,
         retina_height: usize,
         visual_cortex_enabled: bool,
+        danger_percept_enabled: bool,
     ) -> Self {
         let retina_pixel_count = retina_width
             .checked_mul(retina_height)
@@ -320,8 +358,15 @@ impl BrainLayout {
                 .checked_add(depth_count)
                 .expect("vision dimensions overflow visual block")
         };
+        // Danger features (bearing + distance) are read same-cycle from
+        // `physics_state` by `coop_feature_extract` (mirroring the interoception
+        // reads), so they do NOT travel through the sensory buffer.  Only the
+        // encoder input width (`feature_count`) grows; `sensory_stride` (the
+        // per-agent sensory buffer slot count) is unchanged regardless of the flag.
+        let danger_feature_width = if danger_percept_enabled { 2 } else { 0 };
         let feature_count = visual_block
             .checked_add(NON_VISUAL_FEATURE_COUNT)
+            .and_then(|v| v.checked_add(danger_feature_width))
             .expect("vision dimensions overflow feature count");
         let sensory_stride = color_count
             .checked_add(depth_count)
@@ -355,6 +400,7 @@ impl BrainLayout {
             retina_height,
             retina_pixel_count,
             visual_cortex_enabled,
+            danger_percept_enabled,
             feature_count,
             sensory_stride,
             brain_stride,
@@ -417,7 +463,13 @@ pub const WC_TICKS_TO_RUN: usize = 20;
 pub const WC_PHASE_MASK: usize = 21; // bit0=physics, bit1=vision, bit2=brain
 pub const WC_VISION_STRIDE: usize = 22;
 pub const WC_BRAIN_TICK_STRIDE: usize = 23;
-pub const WORLD_CONFIG_SIZE: usize = 24; // padded to 6 × vec4
+pub const WC_SPEED_COST_EXPONENT: usize = 24;
+/// Danger percept gate flag (plan 0009). `1.0` = pack nearest-danger bearing and
+/// distance into non-visual features, `0.0` = no-op (feature count unchanged).
+/// Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is unchanged.
+/// Mirrored by `WC_DANGER_PERCEPT_ENABLED` in `common.wgsl`.
+pub const WC_DANGER_PERCEPT_ENABLED: usize = 25;
+pub const WORLD_CONFIG_SIZE: usize = 28; // padded to 7 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
 
@@ -463,6 +515,12 @@ pub const CFG_INTEGRITY_SCALE: usize = 8;
 /// previously-unused padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by
 /// `CFG_VISUAL_CORTEX_ENABLED` in `common.wgsl`.
 pub const CFG_VISUAL_CORTEX_ENABLED: usize = 9;
+/// Danger-avoidance potential shaping gate flag (plan 0009). `1.0` = compute danger
+/// avoidance potential shaping and add to raw_gradient, `0.0` = no-op (danger
+/// telemetry still computed, but potential shaping gated off). Uses a previously-unused
+/// padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by `CFG_DANGER_PERCEPT_ENABLED`
+/// in `common.wgsl`.
+pub const CFG_DANGER_PERCEPT_ENABLED: usize = 10;
 pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
@@ -592,6 +650,8 @@ pub fn fill_world_config(
     ticks_to_run: u32,
     vision_stride: u32,
     brain_tick_stride: u32,
+    speed_cost_exponent: f32,
+    danger_percept_enabled: bool,
 ) {
     let gw = grid_width(config.world_size);
     let go = gw / 2;
@@ -620,6 +680,8 @@ pub fn fill_world_config(
     out[WC_TICKS_TO_RUN] = ticks_to_run as f32;
     out[WC_VISION_STRIDE] = vision_stride as f32;
     out[WC_BRAIN_TICK_STRIDE] = brain_tick_stride as f32;
+    out[WC_SPEED_COST_EXPONENT] = speed_cost_exponent;
+    out[WC_DANGER_PERCEPT_ENABLED] = if danger_percept_enabled { 1.0 } else { 0.0 };
 }
 
 /// Build the world config uniform data.
@@ -635,6 +697,8 @@ pub fn build_world_config(
     ticks_to_run: u32,
     vision_stride: u32,
     brain_tick_stride: u32,
+    speed_cost_exponent: f32,
+    danger_percept_enabled: bool,
 ) -> Vec<f32> {
     let mut wc = [0.0f32; WORLD_CONFIG_SIZE];
     fill_world_config(
@@ -646,6 +710,8 @@ pub fn build_world_config(
         ticks_to_run,
         vision_stride,
         brain_tick_stride,
+        speed_cost_exponent,
+        danger_percept_enabled,
     );
     wc.to_vec()
 }
@@ -778,6 +844,11 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     cfg[CFG_METABOLIC_RATE] = config.metabolic_rate;
     cfg[CFG_INTEGRITY_SCALE] = config.integrity_scale;
     cfg[CFG_VISUAL_CORTEX_ENABLED] = if config.visual_cortex_enabled {
+        1.0
+    } else {
+        0.0
+    };
+    cfg[CFG_DANGER_PERCEPT_ENABLED] = if config.danger_percept_enabled {
         1.0
     } else {
         0.0
@@ -1157,6 +1228,29 @@ mod tests {
             P_NEAREST_FOOD_BEARING as u32
         );
         assert_eq!(wgsl["P_IN_DANGER_BIOME"], P_IN_DANGER_BIOME as u32);
+        assert_eq!(wgsl["P_DISTANCE_TRAVELED"], P_DISTANCE_TRAVELED as u32);
+        assert_eq!(wgsl["P_ENERGY_SPENT"], P_ENERGY_SPENT as u32);
+        assert_eq!(wgsl["P_DANGER_PATH_LENGTH"], P_DANGER_PATH_LENGTH as u32);
+        assert_eq!(
+            wgsl["P_NEAREST_DANGER_DISTANCE"],
+            P_NEAREST_DANGER_DISTANCE as u32
+        );
+        assert_eq!(
+            wgsl["P_NEAREST_DANGER_BEARING"],
+            P_NEAREST_DANGER_BEARING as u32
+        );
+        assert_eq!(
+            wgsl["P_PREV_DANGER_POTENTIAL"],
+            P_PREV_DANGER_POTENTIAL as u32
+        );
+        assert_eq!(
+            wgsl["P_AVOIDANCE_SENSE_RANGE_TICKS"],
+            P_AVOIDANCE_SENSE_RANGE_TICKS as u32
+        );
+        assert_eq!(
+            wgsl["P_AVOIDANCE_TURNS_OPPOSING"],
+            P_AVOIDANCE_TURNS_OPPOSING as u32
+        );
     }
 
     #[test]
@@ -1345,6 +1439,14 @@ mod tests {
             P_PREV_POTENTIAL,
             P_NEAREST_FOOD_BEARING,
             P_IN_DANGER_BIOME,
+            P_DISTANCE_TRAVELED,
+            P_ENERGY_SPENT,
+            P_DANGER_PATH_LENGTH,
+            P_NEAREST_DANGER_DISTANCE,
+            P_NEAREST_DANGER_BEARING,
+            P_PREV_DANGER_POTENTIAL,
+            P_AVOIDANCE_SENSE_RANGE_TICKS,
+            P_AVOIDANCE_TURNS_OPPOSING,
         ]
         .iter()
         .max()
@@ -1372,5 +1474,49 @@ mod tests {
             binding_count, 16,
             "Expected 16 bindings (0-15: binding 13 is now brain_scratch), found {binding_count}"
         );
+    }
+
+    // ── World config buffer invariants ───────────────────────────────────
+
+    #[test]
+    fn world_config_size_fits_vec4_alignment() {
+        assert_eq!(
+            WORLD_CONFIG_SIZE % 4,
+            0,
+            "WORLD_CONFIG_SIZE must be a multiple of 4 (vec4 alignment)"
+        );
+        assert_eq!(
+            WORLD_CONFIG_SIZE, 28,
+            "WORLD_CONFIG_SIZE should be 28 (7 × vec4)"
+        );
+    }
+
+    #[test]
+    fn world_config_indices_within_bounds() {
+        assert!(WC_WORLD_SIZE < WORLD_CONFIG_SIZE);
+        assert!(WC_DT < WORLD_CONFIG_SIZE);
+        assert!(WC_ENERGY_DEPLETION < WORLD_CONFIG_SIZE);
+        assert!(WC_MOVEMENT_COST < WORLD_CONFIG_SIZE);
+        assert!(WC_HAZARD_DAMAGE < WORLD_CONFIG_SIZE);
+        assert!(WC_INTEGRITY_REGEN < WORLD_CONFIG_SIZE);
+        assert!(WC_FOOD_ENERGY < WORLD_CONFIG_SIZE);
+        assert!(WC_FOOD_RADIUS < WORLD_CONFIG_SIZE);
+        assert!(WC_TERRAIN_VPS < WORLD_CONFIG_SIZE);
+        assert!(WC_TERRAIN_INV_STEP < WORLD_CONFIG_SIZE);
+        assert!(WC_TERRAIN_HALF < WORLD_CONFIG_SIZE);
+        assert!(WC_BIOME_INV_CELL < WORLD_CONFIG_SIZE);
+        assert!(WC_FOOD_COUNT < WORLD_CONFIG_SIZE);
+        assert!(WC_AGENT_COUNT < WORLD_CONFIG_SIZE);
+        assert!(WC_TICK < WORLD_CONFIG_SIZE);
+        assert!(WC_RNG_SEED < WORLD_CONFIG_SIZE);
+        assert!(WC_WORLD_HALF_BOUND < WORLD_CONFIG_SIZE);
+        assert!(WC_BIOME_GRID_RES < WORLD_CONFIG_SIZE);
+        assert!(WC_GRID_WIDTH < WORLD_CONFIG_SIZE);
+        assert!(WC_GRID_OFFSET < WORLD_CONFIG_SIZE);
+        assert!(WC_TICKS_TO_RUN < WORLD_CONFIG_SIZE);
+        assert!(WC_PHASE_MASK < WORLD_CONFIG_SIZE);
+        assert!(WC_VISION_STRIDE < WORLD_CONFIG_SIZE);
+        assert!(WC_BRAIN_TICK_STRIDE < WORLD_CONFIG_SIZE);
+        assert!(WC_SPEED_COST_EXPONENT < WORLD_CONFIG_SIZE);
     }
 }

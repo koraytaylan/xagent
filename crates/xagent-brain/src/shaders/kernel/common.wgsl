@@ -141,15 +141,6 @@ override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 const ENCODED_DIMENSION: u32 = 128u;
 const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
 
-// Non-visual feature tail (plan 0008 wire-visual-features-into-encoder): the
-// proprioception / interoception / touch features `coop_feature_extract` writes
-// after the visual block — velocity magnitude(1) + facing(3) + angular(1) +
-// energy ratio(1) + integrity ratio(1) + energy delta(1) + integrity delta(1) +
-// touch(16) = 25. Single canonical source, mirrored by `NON_VISUAL_FEATURE_COUNT`
-// in `buffers.rs`. It is the same in both encoder layouts (flag on/off); only the
-// leading visual block changes width.
-const NON_VISUAL_FEATURE_COUNT: u32 = 25u;
-
 // Visual-cortex encoder-input selector (plan 0008 wire-visual-features-into-encoder).
 // Supplied by the Rust host at pipeline creation via `vision_override_constants()`
 // from `BrainConfig::visual_cortex_enabled` (1u = on, 0u = off). It is the SAME
@@ -162,6 +153,24 @@ const NON_VISUAL_FEATURE_COUNT: u32 = 25u;
 // they agree by construction. Locked per batch.
 override VISUAL_CORTEX_FEATURES_ACTIVE: u32 = 0u;
 
+// Danger percept encoder-input selector (plan 0009 danger-percept-sense).
+// Supplied by the Rust host at pipeline creation via the world-config bit
+// `WC_DANGER_PERCEPT_ENABLED` (1u = on, 0u = off). When on, the non-visual
+// feature tail width grows to include danger bearing + distance (25 -> 27);
+// the encoder input width `FEATURE_COUNT` thus grows by 2 to match. Locked
+// per batch, independent of the visual-cortex flag.
+override DANGER_PERCEPT_FEATURES_ACTIVE: u32 = 0u;
+
+// Non-visual feature tail (plan 0008 wire-visual-features-into-encoder): the
+// proprioception / interoception / touch features `coop_feature_extract` writes
+// after the visual block — velocity magnitude(1) + facing(3) + angular(1) +
+// energy ratio(1) + integrity ratio(1) + energy delta(1) + integrity delta(1) +
+// touch(16) = 25 base. When danger_percept is enabled (plan 0009), add danger
+// bearing(1) + distance(1) = 27 total. Single canonical source, mirrored by
+// `NON_VISUAL_FEATURE_COUNT` in `buffers.rs`. The base is constant but the
+// tail width changes with the danger-percept flag; the leading visual block
+// changes independently with the cortex flag.
+override NON_VISUAL_FEATURE_COUNT: u32 = 25u + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
 // Encoder input width. Flag off: the legacy raw-vision slice
 // (VISION_COLOR_COUNT + VISION_DEPTH_COUNT) + the non-visual tail — byte-identical
 // to the pre-cortex build. Flag on: the compact complex-cell vector
@@ -285,10 +294,11 @@ const CFG_INTEGRITY_SCALE: u32 = 8u;
 // Visual-cortex gate flag (plan 0008): 1.0 runs the Hubel-Wiesel cortex pass,
 // 0.0 is a no-op passthrough. Mirrors `CFG_VISUAL_CORTEX_ENABLED` in buffers.rs.
 const CFG_VISUAL_CORTEX_ENABLED: u32 = 9u;
+const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 36u;
+const PHYS_STRIDE: u32 = 44u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -325,6 +335,22 @@ const P_NEAREST_FOOD_DISTANCE: u32 = 32u;
 const P_PREV_POTENTIAL: u32 = 33u;
 const P_NEAREST_FOOD_BEARING: u32 = 34u;
 const P_IN_DANGER_BIOME: u32 = 35u;
+const P_DISTANCE_TRAVELED: u32 = 36u;
+const P_ENERGY_SPENT: u32 = 37u;
+const P_DANGER_PATH_LENGTH: u32 = 38u;
+/// Distance to the nearest in-range danger cell. Sentinel value is DANGER_SENSE_RADIUS
+/// when no danger is in range.
+const P_NEAREST_DANGER_DISTANCE: u32 = 39u;
+/// Signed bearing (radians) from current facing direction to the nearest in-range
+/// danger biome cell. Sentinel value is 0.0 when no danger is in range.
+const P_NEAREST_DANGER_BEARING: u32 = 40u;
+/// Previous avoidance potential, used for potential-based shaping. Mirrors
+/// P_PREV_POTENTIAL's pattern for danger avoidance.
+const P_PREV_DANGER_POTENTIAL: u32 = 41u;
+/// Cumulative count of ticks where danger was in sense range.
+const P_AVOIDANCE_SENSE_RANGE_TICKS: u32 = 42u;
+/// Cumulative count of ticks where danger was in sense range AND motor turn opposed bearing.
+const P_AVOIDANCE_TURNS_OPPOSING: u32 = 43u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -388,6 +414,9 @@ const VISION_MAX_DIST: f32 = 30.0;
 // potential-based shaping that consumes it is optimal-policy-invariant for any
 // state potential, so a radius proxy needs no FOV-visibility test.
 const SHAPING_RADIUS: f32 = 30.0;
+// World-units radius within which danger (biome cells) are sensed for avoidance
+// potential and bearing calculation. Symmetric to SHAPING_RADIUS.
+const DANGER_SENSE_RADIUS: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
@@ -441,6 +470,8 @@ const WC_TICKS_TO_RUN: u32 = 20u;
 const WC_PHASE_MASK: u32 = 21u;  // bit0=physics, bit1=vision, bit2=brain
 const WC_VISION_STRIDE: u32 = 22u;
 const WC_BRAIN_TICK_STRIDE: u32 = 23u;
+const WC_SPEED_COST_EXPONENT: u32 = 24u;
+const WC_DANGER_PERCEPT_ENABLED: u32 = 25u;
 
 // ── Habituation / homeostasis constants ─────────────────────────────────────
 
@@ -526,7 +557,7 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 @group(0) @binding(1)  var<storage, read_write> decision_buffer:      array<f32>;
 @group(0) @binding(2)  var<storage, read>       heightmap:         array<f32>;
 @group(0) @binding(3)  var<storage, read>       biome_grid:        array<u32>;
-@group(0) @binding(4)  var<uniform>             wconfig:           array<vec4<f32>, 6>;
+@group(0) @binding(4)  var<uniform>             wconfig:           array<vec4<f32>, 7>;
 @group(0) @binding(5)  var<storage, read_write> food_state:        array<f32>;
 @group(0) @binding(6)  var<storage, read_write> food_flags:        array<atomic<u32>>;
 @group(0) @binding(7)  var<storage, read_write> food_grid:         array<atomic<u32>>;

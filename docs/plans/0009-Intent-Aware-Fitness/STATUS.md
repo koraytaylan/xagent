@@ -3,9 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned (authored, not started). SCOPE / ARCHITECTURE / TASKS
-authored; no task branches cut yet.
-_Last updated: 2026-06-17, against `develop`._
+**Status:** ✅ Complete. 17/18 tasks landed; `default-flip-gate` deliberately held (GATED — awaits measured speed-decoupling confirmation). All landed tasks squash-merged into `claude/sweet-golick-78e294` as `b314da1`.
+_Last updated: 2026-06-18, against `claude/sweet-golick-78e294`._
 
 - **Goal:** Make evolutionary fitness reward *deliberate* foraging and
   *deliberate* danger avoidance instead of the accidental by-products of raw
@@ -34,16 +33,16 @@ _Last updated: 2026-06-17, against `develop`._
   effort-rebased fitness (food/energy + cells/distance), (D) danger percept +
   symmetric avoidance potential + sensed-then-turned intent metric — measured and
   default-flipped by a headless speed-decoupling gate.
-- **Outcome:** _pending implementation._
+- **Outcome:** 17/18 tasks landed on `implement-plan/0009` and squash-merged into `claude/sweet-golick-78e294` (`b314da1`). All four layers implemented and behind flags: (A) super-linear locomotor energetics, (B) dwell-invariant path-length hazard, (C) effort-rebased fitness, (D) danger percept + avoidance potential + intent metric. Speed-decoupling validation run (`speed-decoupling-validation`) completed. `default-flip-gate` deliberately held — gated on the measured decoupling numbers before flipping defaults.
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Effort & exposure telemetry | `phys-accumulator-slots`, `effort-telemetry-fused`, `effort-telemetry-split`, `effort-telemetry-readback`, `populate-danger-dwell-metric` | 📋 Planned |
-| 0002 | Dwell-invariant hazard (Layer B) | `path-length-hazard-fused`, `path-length-hazard-split` | 📋 Planned |
-| 0003 | Super-linear locomotor energetics (Layer A) | `speed-cost-exponent-config`, `super-linear-drag-fused`, `super-linear-drag-split` | 📋 Planned |
-| 0004 | Effort-rebased fitness (Layer C) | `composite-fitness-effort-rebase`, `fitness-calibration-replay` | 📋 Planned |
-| 0005 | Danger percept + avoidance + intent metric (Layer D) | `nearest-danger-telemetry`, `danger-percept-sense`, `danger-avoidance-potential`, `avoidance-intent-metric` | 📋 Planned |
-| 0006 | Validation & default-flip gate | `speed-decoupling-validation`, `default-flip-gate` (GATED) | 📋 Planned |
+| 0001 | Effort & exposure telemetry | `phys-accumulator-slots`, `effort-telemetry-fused`, `effort-telemetry-split`, `effort-telemetry-readback`, `populate-danger-dwell-metric` | ✅ Done |
+| 0002 | Dwell-invariant hazard (Layer B) | `path-length-hazard-fused`, `path-length-hazard-split` | ✅ Done |
+| 0003 | Super-linear locomotor energetics (Layer A) | `speed-cost-exponent-config`, `super-linear-drag-fused`, `super-linear-drag-split` | ✅ Done |
+| 0004 | Effort-rebased fitness (Layer C) | `composite-fitness-effort-rebase`, `fitness-calibration-replay` | ✅ Done |
+| 0005 | Danger percept + avoidance + intent metric (Layer D) | `nearest-danger-telemetry`, `danger-percept-sense`, `danger-avoidance-potential`, `avoidance-intent-metric` | ✅ Done |
+| 0006 | Validation & default-flip gate | `speed-decoupling-validation` ✅ Done, `default-flip-gate` ⛔ Gated (not run) | 🚧 In progress |
 
 ## Verification
 

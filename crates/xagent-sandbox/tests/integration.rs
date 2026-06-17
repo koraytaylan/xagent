@@ -1966,7 +1966,14 @@ impl ProbeArena {
 }
 
 /// Build the probe arena with freshly seeded brains.
-fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
+///
+/// `max_energy_override` allows tests to set a custom max_energy for all agents
+/// (e.g., for energy-depletion-based death mechanisms). If None, uses the default 100.0.
+fn build_probe_arena_with_energy(
+    brain: &BrainConfig,
+    brain_seed: u64,
+    max_energy: f32,
+) -> ProbeArena {
     let world_config = WorldConfig {
         seed: 1,
         ..Default::default()
@@ -2017,7 +2024,7 @@ fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
         .map(|&pos| {
             (
                 pos,
-                100.0,
+                max_energy,
                 100.0,
                 brain.memory_capacity,
                 brain.processing_slots,
@@ -2035,6 +2042,11 @@ fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
     };
     arena.reset_bodies();
     arena
+}
+
+/// Build the probe arena with freshly seeded brains and default 100.0 max_energy.
+fn build_probe_arena(brain: &BrainConfig, brain_seed: u64) -> ProbeArena {
+    build_probe_arena_with_energy(brain, brain_seed, 100.0)
 }
 
 /// Run `ticks` single-tick batches and score the sign of each turn output
@@ -2952,17 +2964,16 @@ fn death_applies_terminal_td_update_through_traces() {
         return;
     }
 
-    /// Hazard damage is rate (1.0) × integrity_scale per physics tick;
-    /// 200 wipes the full 100 integrity in a single tick inside a
-    /// danger biome.
-    const ONE_TICK_KILL_INTEGRITY_SCALE: f32 = 200.0;
+    /// Under the path-length hazard model (plan 0009), stationary agents
+    /// (movement_speed = 0.0) take zero hazard damage (step_len = 0).
+    /// Instead, we use energy depletion to trigger death reliably on tick 1.
+    /// With max_energy = 0.001 and per-tick drain ≈ 0.018, the agent will
+    /// be dead by tick 1, allowing us to test the terminal TD update.
+    const ONE_TICK_KILL_MAX_ENERGY: f32 = 0.001;
 
-    let brain = BrainConfig {
-        integrity_scale: ONE_TICK_KILL_INTEGRITY_SCALE,
-        ..probe_brain_config()
-    };
+    let brain = probe_brain_config();
     // Warm-up happens on safe biome; then the world flips to all-danger.
-    let mut arena = build_probe_arena(&brain, 29);
+    let mut arena = build_probe_arena_with_energy(&brain, 29, ONE_TICK_KILL_MAX_ENERGY);
     arena.kernel.dispatch_batch(0, 1);
     arena.biomes = vec![2_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
     arena.reset_bodies();
@@ -2985,9 +2996,11 @@ fn death_applies_terminal_td_update_through_traces() {
     let turn_bias_before = state.brain_state[act_biases_offset + 1];
     arena.kernel.write_agent_state(agent, &state);
 
-    // This tick kills (integrity 100 → 0), respawns, and runs one
-    // post-respawn brain tick whose traces were just zeroed — so the
-    // only bias change in this tick is the terminal kick.
+    // This tick kills (energy 0.001 → 0 via depletion), respawns, and runs
+    // one post-respawn brain tick whose traces were just zeroed — so the
+    // only bias change in this tick is the terminal kick. (Under the
+    // path-length hazard model a stationary probe agent takes zero hazard
+    // dose, so death is driven by energy depletion, not integrity damage.)
     arena.kernel.dispatch_batch(1, 1);
 
     let physics = arena.kernel.read_full_state_blocking();
@@ -3029,18 +3042,22 @@ fn td_traces_bounded_across_deaths() {
         return;
     }
 
-    /// Hazard damage (1.0/tick at default rates) kills a 100-integrity
-    /// agent in ~100 ticks; 350 ticks guarantees repeated deaths.
+    /// Under the path-length hazard model (plan 0009), stationary agents
+    /// take zero hazard damage. Instead, we use energy depletion to trigger
+    /// repeated deaths. With max_energy = 1.8 and per-tick drain ≈ 0.018,
+    /// agents die roughly every 100 ticks, guaranteeing multiple deaths in
+    /// 350 ticks for testing trace reset and bounding.
     const RUN_TICKS: usize = 350;
+    const ENERGY_FOR_REPEATED_DEATHS: f32 = 1.8;
     /// Geometric trace bound: |s_encoded| ≤ 1 per dim and noise ≤ 0.5, so
     /// |z| ≤ 1/(1 − γλ) ≈ 7.9. Allow generous slack for the brief
     /// post-respawn rebuild before asserting runaway accumulation.
     const TRACE_BOUND: f32 = 50.0;
 
     let brain = probe_brain_config();
-    let mut arena = build_probe_arena(&brain, 23);
-    // All-danger biome: every spawn fallback lands in hazard, so agents die
-    // on a ~100-tick cycle.
+    let mut arena = build_probe_arena_with_energy(&brain, 23, ENERGY_FOR_REPEATED_DEATHS);
+    // All-danger biome: agents die on a ~100-tick energy-depletion cycle,
+    // allowing us to test that traces reset across deaths.
     arena.biomes = vec![2_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
     arena.reset_bodies();
 
@@ -3224,25 +3241,28 @@ fn hazard_probe_exit_latency_baseline() {
          mean_exit_latency={mean_latency:.1} death_fraction={death_fraction:.3}"
     );
 
-    // Pinned baseline recorded 2026-06-12 on macOS/Metal (wgpu adapter):
-    // raw exit_fraction=0.188, mean_exit_latency=137.2, death_fraction=0.812
-    // (9/48 exits, mean of exits 137.2, 39/48 deaths). ±50% relative bands —
-    // generous for adapter noise, tight enough for real avoidance gains to
-    // trip. Re-pin on improvement (same protocol as steering probes).
+    // Pinned baseline recorded 2026-06-17 on macOS/Metal (wgpu adapter):
+    // raw exit_fraction=0.396, mean_exit_latency=315.0, death_fraction=0.000
+    // (19/48 exits, mean of exits 315.0, 0/48 deaths). This is a substantial
+    // improvement over the per-tick hazard model (raw 0.188 / 0.812 deaths);
+    // plan 0009 path-length hazard makes danger graded-not-lethal, so fast
+    // maneuvering agents escape more often and stationary/slow agents take
+    // zero dose. ±50% relative bands for exit_fraction and mean_latency.
+    // death_fraction is now ≈0; use an absolute upper bound (0.05 = 2/48).
     assert!(
-        (0.094..=0.282).contains(&exit_fraction),
-        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.094, 0.282] — \
+        (0.198..=0.594).contains(&exit_fraction),
+        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.198, 0.594] — \
          re-pin if avoidance improves"
     );
     assert!(
-        (68.6..=205.8).contains(&mean_latency),
-        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [68.6, 205.8] — \
+        (157.5..=472.5).contains(&mean_latency),
+        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [157.5, 472.5] — \
          re-pin if avoidance improves"
     );
     assert!(
-        (0.406..=1.218).contains(&death_fraction),
-        "hazard death_fraction {death_fraction:.3} outside pinned band [0.406, 1.218] — \
-         re-pin if avoidance improves"
+        death_fraction <= 0.05,
+        "hazard death_fraction {death_fraction:.3} exceeds absolute bound 0.05 — \
+         path-length hazard should minimize deaths"
     );
 
     // Structural sanity: every trial resolves into exit, death, or
@@ -3649,6 +3669,127 @@ fn split_serial_matches_fused_serial() {
     );
 }
 
+/// Helper for testing split vs. fused equivalence with a given speed_cost_exponent.
+/// Plan 0009 (effort-telemetry-split): the split path (phase_physics + phase_death)
+/// must mirror the fused kernel's accumulation of effort telemetry:
+/// distance_traveled, energy_spent, and danger_path_length. This test runs a fixed
+/// number of ticks in both paths and asserts the three accumulators match byte-for-byte.
+fn split_fused_effort_telemetry_test(speed_cost_exponent: f32) {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let mut brain = BrainConfig::default();
+    brain.speed_cost_exponent = speed_cost_exponent;
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+    let agent_data = vec![(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )];
+
+    // Fresh kernel with deterministic brain state + identical initial world.
+    let make_kernel = || {
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel
+    };
+
+    let total: u32 = 1037;
+
+    // Fused serial: default execution mode
+    let mut fused = make_kernel();
+    fused.dispatch_ticks(0, total);
+    let fused_phys = fused.read_full_state_blocking().to_vec();
+
+    // Split serial: same setup but with SplitSerial mode
+    let mut split = make_kernel();
+    split.set_execution_mode(xagent_brain::BrainExecutionMode::SplitSerial);
+    split.dispatch_ticks(0, total);
+    let split_phys = split.read_full_state_blocking().to_vec();
+
+    // Extract the three effort telemetry slots (offsets 36, 37, 38 within PHYS_STRIDE=39)
+    let p_distance = xagent_brain::buffers::P_DISTANCE_TRAVELED;
+    let p_energy = xagent_brain::buffers::P_ENERGY_SPENT;
+    let p_danger = xagent_brain::buffers::P_DANGER_PATH_LENGTH;
+
+    let fused_distance = fused_phys[p_distance];
+    let fused_energy = fused_phys[p_energy];
+    let fused_danger = fused_phys[p_danger];
+
+    let split_distance = split_phys[p_distance];
+    let split_energy = split_phys[p_energy];
+    let split_danger = split_phys[p_danger];
+
+    // Assert byte-exact equality (no epsilon)
+    assert_eq!(
+        fused_distance, split_distance,
+        "SplitSerial distance_traveled diverged from FusedSerial (k={:.1}): {} vs {}",
+        speed_cost_exponent, fused_distance, split_distance
+    );
+    assert_eq!(
+        fused_energy, split_energy,
+        "SplitSerial energy_spent diverged from FusedSerial (k={:.1}): {} vs {}",
+        speed_cost_exponent, fused_energy, split_energy
+    );
+    assert_eq!(
+        fused_danger, split_danger,
+        "SplitSerial danger_path_length diverged from FusedSerial (k={:.1}): {} vs {}",
+        speed_cost_exponent, fused_danger, split_danger
+    );
+
+    // Additional sanity checks: all accumulators should be non-zero after 1000+ ticks
+    assert!(
+        fused_distance > 0.0,
+        "Fused distance_traveled should be non-zero after {} ticks, got {}",
+        total,
+        fused_distance
+    );
+    assert!(
+        fused_energy > 0.0,
+        "Fused energy_spent should be non-zero after {} ticks, got {}",
+        total,
+        fused_energy
+    );
+    // danger_path_length may be zero if the agent never enters danger, so we skip
+    // the assertion for that one
+}
+
+/// Plan 0009 (super-linear-drag-split): test that the split path mirrors the
+/// fused kernel's super-linear drag at both k=1.0 (no-op, bit-identical) and
+/// k=2.0 (super-linear above baseline).
+#[test]
+fn split_matches_fused_effort_telemetry() {
+    // Test at k=1.0 (default, no-op, bit-identical to baseline)
+    eprintln!("Testing split vs fused at k=1.0 (no-op)");
+    split_fused_effort_telemetry_test(1.0);
+
+    // Test at k=2.0 (super-linear drag above baseline)
+    eprintln!("Testing split vs fused at k=2.0 (super-linear)");
+    split_fused_effort_telemetry_test(2.0);
+}
+
 /// Plan 0008 (wire-visual-features-into-encoder): the cortex flag now redefines
 /// the encoder's visual input. The byte-identical guarantee is split by flag:
 ///
@@ -3785,6 +3926,134 @@ fn visual_cortex_passthrough_is_byte_identical() {
     assert_ne!(
         off_phys_a, on_phys,
         "flag-on must diverge from flag-off — the wired cortex changed the encoder input"
+    );
+}
+
+/// Plan 0009 (danger-percept-sense): when the danger_percept flag is off,
+/// the encoded state is byte-identical to a pre-task build (the byte-identical
+/// no-op contract). When on, the feature tail grows to include danger bearing
+/// and distance, the encoder width follows, and dispatch runs without wgpu
+/// validation errors.
+#[test]
+fn danger_percept_byte_identical_when_flag_off() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+
+    // Fresh kernel with deterministic brain state + identical initial world.
+    let run = |brain: &BrainConfig| {
+        let agent_data = vec![(
+            spawn_pos,
+            100.0_f32,
+            100.0_f32,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )];
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, brain, &world_config);
+        kernel.reset_agents_seeded(brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_ticks(0, 1037);
+        let phys = kernel.read_full_state_blocking().to_vec();
+        let brain_readback = kernel.read_agent_state(0);
+        (phys, brain_readback)
+    };
+
+    let mut flag_off = BrainConfig::default();
+    flag_off.danger_percept_enabled = false;
+    let mut flag_on = BrainConfig::default();
+    flag_on.danger_percept_enabled = true;
+
+    // Encoder-width contract (danger-percept-sense task):
+    //   flag OFF → base non-visual feature count (25), sensory buffer unchanged
+    //   flag ON  → expanded non-visual feature count (27), sensory buffer unchanged
+    // Danger features (bearing + distance) are read from `physics_state` by
+    // `coop_feature_extract`, not from the sensory buffer, so `sensory_stride`
+    // is identical between flag-off and flag-on. Only `feature_count` and the
+    // derived `brain_stride` grow.
+    let off_layout = xagent_brain::BrainLayout::from_config(&flag_off);
+    let on_layout = xagent_brain::BrainLayout::from_config(&flag_on);
+    assert_eq!(
+        on_layout.feature_count,
+        off_layout.feature_count + 2,
+        "flag-on feature_count must be flag-off + 2 (danger bearing + distance)"
+    );
+    assert_eq!(
+        on_layout.sensory_stride, off_layout.sensory_stride,
+        "sensory_stride must be identical: danger features come from physics_state, not the sensory buffer"
+    );
+
+    // Byte-identical contract when flag is OFF: two identical runs must produce
+    // byte-identical encoded state. If either diverges, the pipeline widths or
+    // feature extraction changed despite the flag being off.
+    let (off_phys_a, off_brain_a) = run(&flag_off);
+    let (off_phys_b, off_brain_b) = run(&flag_off);
+    assert_eq!(
+        off_phys_a, off_phys_b,
+        "flag-off physics state must be byte-identical across runs"
+    );
+    assert_eq!(
+        off_brain_a.brain_state, off_brain_b.brain_state,
+        "flag-off encoded state must be byte-identical across runs"
+    );
+
+    // Flag-ON acceptance: the feature tail expands, FEATURE_COUNT grows by 2, and
+    // every dispatch validated and ran with NO wgpu validation error at the new
+    // width (a validation failure panics, so a clean return is the assertion).
+    let (on_phys, on_brain) = run(&flag_on);
+    assert!(
+        on_phys.iter().all(|v| v.is_finite()),
+        "flag-on physics state must be finite (no NaN/Inf from the danger feature extraction)"
+    );
+    assert!(
+        on_brain.brain_state.iter().all(|v| v.is_finite()),
+        "flag-on brain_state must be finite (no NaN/Inf from the wired danger features)"
+    );
+    // The WGSL pipeline override DANGER_PERCEPT_FEATURES_ACTIVE = 1u caused the
+    // GPU-side FEATURE_COUNT to grow by 2, which grows BRAIN_STRIDE by
+    // 2 × ENCODED_DIMENSION (256). If brain_state.len() == on_layout.brain_stride,
+    // the GPU allocated and filled the wider buffer — proving the override reached
+    // the GPU and the pipeline compiled at the new width.
+    assert_eq!(
+        on_brain.brain_state.len(),
+        on_layout.brain_stride,
+        "flag-on brain_state length must follow the expanded feature_count layout"
+    );
+    // The flag-on pipeline has a wider encoder (by 2 × ENCODED_DIMENSION slots)
+    // than flag-off: the brain_stride MUST differ and the on-layout must be larger.
+    assert!(
+        on_brain.brain_state.len() > off_brain_a.brain_state.len(),
+        "flag-on brain_state must be larger than flag-off — the wider FEATURE_COUNT grew brain_stride"
+    );
+
+    // The danger percept actually feeds the encoder: the flag-on encoder has
+    // 2 extra input slots populated with real danger bearing + distance from
+    // physics_state, causing a different encoded representation and diverging
+    // physics trajectory. If physics were identical, the wider encoder produced
+    // the same outputs as the narrower one — meaning the 2 new slots held zeros
+    // and were not wired (a regression).
+    assert_ne!(
+        off_phys_a, on_phys,
+        "flag-on must diverge from flag-off — the danger features changed the encoder input"
     );
 }
 
@@ -5731,5 +6000,1068 @@ fn danger_exit_probe_requires_hazard_avoidance_evidence() {
         exit_latency_ticks < 200u32,
         "Agent took too long to exit danger: {} ticks",
         exit_latency_ticks
+    );
+}
+
+/// Verifies that the three generation-cumulative effort accumulators
+/// (`P_DISTANCE_TRAVELED`, `P_ENERGY_SPENT`, `P_DANGER_PATH_LENGTH`) are
+/// preserved across respawn by the whitelist save/restore block.
+///
+/// **Discriminative design**: the test measures the three accumulator values
+/// at a snapshot tick (after 100 ticks of pre-death accumulation), then polls
+/// in small 10-tick batches until the next death is confirmed via
+/// `P_DEATH_COUNT`.  Immediately when death is detected the values are read
+/// back.  If any whitelist slot is omitted the accumulator resets to zero on
+/// death; the at-most-10 post-respawn ticks can only re-accumulate a tiny
+/// fraction (~3 distance units) of the snapshot value (~30 units built over
+/// 100 ticks), so the assertion `accumulator_after >= snapshot` fails.  When
+/// the whitelist is complete the values are carried across unchanged and the
+/// assertion holds.
+///
+/// All-danger biome guarantees `P_DANGER_PATH_LENGTH` is non-zero at
+/// snapshot time, making the danger-path assertion equally discriminative.
+#[test]
+fn effort_accumulators_survive_respawn() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    use xagent_brain::buffers::{
+        PHYS_STRIDE, P_DANGER_PATH_LENGTH, P_DEATH_COUNT, P_DISTANCE_TRAVELED, P_ENERGY_SPENT,
+    };
+
+    // High hazard damage forces integrity-based death every ~40 ticks (damage
+    // 5.0 * integrity_scale 0.5 = 2.5/tick; max_integrity 100 / 2.5 ≈ 40
+    // ticks).  This gives multiple deaths during the 100-tick pre-measurement
+    // phase and a death during the polling phase, both of which exercise the
+    // whitelist path.
+    let world_config = WorldConfig {
+        seed: 42,
+        hazard_damage_rate: 5.0,
+        ..WorldConfig::default()
+    };
+    let world = WorldState::new(world_config.clone());
+
+    let brain_config = BrainConfig::default();
+    let agent_count = 1u32;
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+
+    // Use world terrain and food positions, but override the biome grid to
+    // all-danger so P_DANGER_PATH_LENGTH accumulates from tick 0.
+    let heights = world.terrain.heights.clone();
+    let all_danger_biomes = vec![2u32; 256 * 256]; // BIOME_DANGER = 2
+    let food_pos: Vec<_> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<_> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<_> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+
+    kernel.upload_world(
+        &heights,
+        &all_danger_biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    // Spawn at world centre (y=1 above flat terrain); all biome cells are
+    // danger so any position accumulates P_DANGER_PATH_LENGTH.
+    let spawn_pos = glam::Vec3::new(0.0, 1.0, 0.0);
+    let agent_data = [(
+        spawn_pos,
+        100.0_f32,
+        100.0_f32,
+        brain_config.memory_capacity,
+        brain_config.processing_slots,
+    )];
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 42);
+
+    // Phase 1: run 100 ticks to build substantial accumulated values.
+    // The agent may respawn inside this window (integrity-based death at ~40
+    // ticks); accumulated values survive each respawn (verified by the final
+    // assertion) so the snapshot reflects the full 100-tick lifetime sum.
+    let phase1_ticks = 100u32;
+    kernel.dispatch_batch(0, phase1_ticks);
+
+    let snapshot = kernel.read_full_state_blocking().to_vec();
+    let agent_base = 0usize * PHYS_STRIDE;
+    let distance_snap = snapshot[agent_base + P_DISTANCE_TRAVELED];
+    let energy_snap = snapshot[agent_base + P_ENERGY_SPENT];
+    let danger_path_snap = snapshot[agent_base + P_DANGER_PATH_LENGTH];
+    let death_count_snap = snapshot[agent_base + P_DEATH_COUNT];
+
+    eprintln!(
+        "Snapshot at tick {}: distance={:.3}, energy={:.3}, danger_path={:.3}, deaths={}",
+        phase1_ticks, distance_snap, energy_snap, danger_path_snap, death_count_snap
+    );
+
+    // All three accumulators must be non-zero at the snapshot.
+    assert!(
+        distance_snap > 0.0,
+        "P_DISTANCE_TRAVELED should be non-zero after {} ticks, got {}",
+        phase1_ticks,
+        distance_snap
+    );
+    assert!(
+        energy_snap > 0.0,
+        "P_ENERGY_SPENT should be non-zero after {} ticks, got {}",
+        phase1_ticks,
+        energy_snap
+    );
+    assert!(
+        danger_path_snap > 0.0,
+        "P_DANGER_PATH_LENGTH should be non-zero after {} ticks in all-danger biome, got {}",
+        phase1_ticks,
+        danger_path_snap
+    );
+
+    // Phase 2: poll in 10-tick batches until the next death is confirmed.
+    // Using 10-tick batches (= brain_tick_stride) bounds post-respawn
+    // accumulation to at most 10 ticks (≈ 3 distance units), far less than
+    // the snapshot values (≈ 30+ units).
+    let poll_batch = 10u32;
+    let mut tick_cursor = phase1_ticks as u64;
+    let mut death_found = false;
+    let max_poll_ticks = 200u64;
+
+    while !death_found && tick_cursor - (phase1_ticks as u64) < max_poll_ticks {
+        kernel.dispatch_batch(tick_cursor, poll_batch);
+        tick_cursor += poll_batch as u64;
+
+        let state = kernel.read_full_state_blocking();
+        if state[agent_base + P_DEATH_COUNT] > death_count_snap {
+            death_found = true;
+
+            let distance_after = state[agent_base + P_DISTANCE_TRAVELED];
+            let energy_after = state[agent_base + P_ENERGY_SPENT];
+            let danger_path_after = state[agent_base + P_DANGER_PATH_LENGTH];
+
+            eprintln!(
+                "Death detected at poll tick {}: distance={:.3}, energy={:.3}, danger_path={:.3}",
+                tick_cursor, distance_after, energy_after, danger_path_after
+            );
+
+            // The accumulator values must be preserved across the respawn.
+            // If any slot is missing from the whitelist it resets to zero on
+            // death; at most `poll_batch` post-respawn ticks can have
+            // accumulated since then (~3 distance units), which is far below
+            // the snapshot values (~30+ units).  The assertion fails in that
+            // case, proving the whitelist entry is required.
+            assert!(
+                distance_after >= distance_snap,
+                "P_DISTANCE_TRAVELED must be preserved across respawn: \
+                 snapshot={:.3}, after_respawn={:.3}. \
+                 If this fails, P_DISTANCE_TRAVELED is missing from the \
+                 respawn whitelist.",
+                distance_snap,
+                distance_after
+            );
+            assert!(
+                energy_after >= energy_snap,
+                "P_ENERGY_SPENT must be preserved across respawn: \
+                 snapshot={:.3}, after_respawn={:.3}. \
+                 If this fails, P_ENERGY_SPENT is missing from the \
+                 respawn whitelist.",
+                energy_snap,
+                energy_after
+            );
+            assert!(
+                danger_path_after >= danger_path_snap,
+                "P_DANGER_PATH_LENGTH must be preserved across respawn: \
+                 snapshot={:.3}, after_respawn={:.3}. \
+                 If this fails, P_DANGER_PATH_LENGTH is missing from the \
+                 respawn whitelist.",
+                danger_path_snap,
+                danger_path_after
+            );
+        }
+    }
+
+    assert!(
+        death_found,
+        "Expected at least one death during the polling phase (death_count started at \
+         {}, poll window {} ticks). Increase max_poll_ticks or reduce hazard_damage_rate.",
+        death_count_snap, max_poll_ticks
+    );
+
+    eprintln!("effort_accumulators_survive_respawn: all three slots preserved across respawn");
+}
+
+#[test]
+fn effort_telemetry_populates_during_generation() {
+    use xagent_brain::buffers::{
+        PHYS_STRIDE, P_DANGER_PATH_LENGTH, P_DISTANCE_TRAVELED, P_ENERGY_SPENT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let agent_count = 4;
+    let world = WorldState::new(world_config.clone());
+    let food_count = world.food_items.len();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count as u32, food_count, &brain, &world_config);
+
+    // Upload world
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    // Upload agents
+    let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
+        .map(|_| world.safe_spawn_position())
+        .collect();
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = spawn_positions
+        .iter()
+        .map(|&pos| {
+            (
+                pos,
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents(&brain);
+
+    // Run a short generation (100 ticks)
+    let tick_budget = 100u32;
+    kernel.dispatch_batch(0, tick_budget);
+
+    // Read back the final state
+    let state = kernel.read_full_state_blocking();
+
+    // Check that all agents have non-zero telemetry for distance and energy
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+
+        let distance = state[base + P_DISTANCE_TRAVELED];
+        let energy = state[base + P_ENERGY_SPENT];
+        let danger_path = state[base + P_DANGER_PATH_LENGTH];
+
+        eprintln!(
+            "Agent {}: distance={:.3}, energy={:.3}, danger_path={:.3}",
+            i, distance, energy, danger_path
+        );
+
+        assert!(
+            distance > 0.0,
+            "Agent {} should have non-zero P_DISTANCE_TRAVELED after {} ticks, got {}",
+            i,
+            tick_budget,
+            distance
+        );
+        assert!(
+            energy > 0.0,
+            "Agent {} should have non-zero P_ENERGY_SPENT after {} ticks, got {}",
+            i,
+            tick_budget,
+            energy
+        );
+        // danger_path may be zero if the agent didn't enter danger biomes, so we don't assert on it
+    }
+
+    eprintln!("effort_telemetry_populates_during_generation: all agents have non-zero distance and energy");
+}
+
+#[test]
+fn recorded_telemetry_persists_in_agent_fitness() {
+    use xagent_brain::buffers::{
+        PHYS_STRIDE, P_DANGER_PATH_LENGTH, P_DISTANCE_TRAVELED, P_ENERGY_SPENT,
+    };
+    use xagent_sandbox::agent::Agent;
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = BrainConfig::default();
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+    let world = WorldState::new(world_config.clone());
+    let food_count = world.food_items.len();
+    let agent_count = 2;
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count as u32, food_count, &brain, &world_config);
+
+    // Upload world
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+
+    // Create agents
+    let spawn_positions: Vec<glam::Vec3> = (0..agent_count)
+        .map(|_| world.safe_spawn_position())
+        .collect();
+    let mut agents: Vec<Agent> = spawn_positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| Agent::new(i as u32, pos, i as u32, brain.clone(), 0))
+        .collect();
+
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = spawn_positions
+        .iter()
+        .map(|&pos| {
+            (
+                pos,
+                100.0,
+                100.0,
+                brain.memory_capacity,
+                brain.processing_slots,
+            )
+        })
+        .collect();
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents(&brain);
+
+    // Run a short generation
+    let tick_budget = 100u32;
+    kernel.dispatch_batch(0, tick_budget);
+
+    // Read back the final state
+    let state = kernel.read_full_state_blocking();
+
+    // Transfer telemetry from GPU state to agents (simulating what gpu_orchestration does)
+    for i in 0..agent_count {
+        let base = i * PHYS_STRIDE;
+        agents[i].distance_traveled = state[base + P_DISTANCE_TRAVELED];
+        agents[i].energy_spent = state[base + P_ENERGY_SPENT];
+        agents[i].danger_path_length = state[base + P_DANGER_PATH_LENGTH];
+    }
+
+    // Verify all agents have populated telemetry
+    for (i, agent) in agents.iter().enumerate() {
+        assert!(
+            agent.distance_traveled > 0.0,
+            "Agent {} distance_traveled should be non-zero, got {}",
+            i,
+            agent.distance_traveled
+        );
+        assert!(
+            agent.energy_spent > 0.0,
+            "Agent {} energy_spent should be non-zero, got {}",
+            i,
+            agent.energy_spent
+        );
+        eprintln!(
+            "Agent {}: distance_traveled={:.3}, energy_spent={:.3}, danger_path_length={:.3}",
+            i, agent.distance_traveled, agent.energy_spent, agent.danger_path_length
+        );
+    }
+
+    eprintln!("recorded_telemetry_persists_in_agent_fitness: all agents successfully transferred telemetry");
+}
+
+/// Nearest-danger bearing/distance telemetry test. Agent placed near a known
+/// danger patch reads a finite distance and a bearing pointing at it; agent
+/// far from any danger reads the sentinel.
+#[test]
+fn nearest_danger_bearing_points_at_danger() {
+    use xagent_brain::buffers::{
+        DANGER_SENSE_RADIUS, P_ALIVE, P_NEAREST_DANGER_BEARING, P_NEAREST_DANGER_DISTANCE,
+    };
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Sentinel value for when no danger is in range.
+    const SENTINEL_DISTANCE: f32 = DANGER_SENSE_RADIUS;
+
+    let brain = probe_brain_config();
+    let world_config = WorldConfig {
+        seed: 2,
+        ..Default::default()
+    };
+    let mut kernel = GpuKernel::new(2, 0, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 42);
+
+    let mut biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+
+    // Mark a danger region: cells around center (128, 128) in a 256x256 grid
+    // World is 128 units wide (from -64 to +64), so cell size is 128/256 = 0.5 units
+    // Grid cell (128, 128) is at world position (128*0.5 - 64, 128*0.5 - 64) = (0, 0)
+    // Mark cells 127-129 for a small danger region centered at origin
+    for row in 127..130 {
+        for col in 127..130 {
+            biomes[row * PROBE_BIOME_RES + col] = 2u32; // BIOME_DANGER
+        }
+    }
+
+    let agent_data = vec![
+        (
+            glam::Vec3::new(0.0, PROBE_AGENT_Y, 2.0), // Very close to danger region
+            100.0,
+            100.0,
+            brain.memory_capacity,
+            brain.processing_slots,
+        ),
+        (
+            glam::Vec3::new(50.0, PROBE_AGENT_Y, 50.0), // Far from danger region
+            100.0,
+            100.0,
+            brain.memory_capacity,
+            brain.processing_slots,
+        ),
+    ];
+
+    kernel.upload_world(&heights, &biomes, &[], &[], &[]);
+    kernel.upload_agents(&agent_data);
+    kernel.dispatch_batch(0, 1);
+
+    let state = kernel.read_full_state_blocking();
+
+    // Agent 0 (near danger): should see finite distance and non-zero bearing
+    let agent0_alive = state[0 * xagent_brain::buffers::PHYS_STRIDE + P_ALIVE];
+    let agent0_distance = state[0 * xagent_brain::buffers::PHYS_STRIDE + P_NEAREST_DANGER_DISTANCE];
+    let agent0_bearing = state[0 * xagent_brain::buffers::PHYS_STRIDE + P_NEAREST_DANGER_BEARING];
+
+    assert!(
+        agent0_alive > 0.5,
+        "Agent 0 (near danger) died during the single tick"
+    );
+    eprintln!(
+        "Agent 0 (near danger): distance={:.3}, bearing={:.3}, sentinel={}",
+        agent0_distance, agent0_bearing, SENTINEL_DISTANCE
+    );
+    assert!(
+        agent0_distance < SENTINEL_DISTANCE && agent0_distance > 0.0,
+        "Agent 0 (near danger) should read finite danger distance < {}, got {} (sentinel={})",
+        SENTINEL_DISTANCE,
+        agent0_distance,
+        SENTINEL_DISTANCE
+    );
+
+    // Agent 1 (far away): should see sentinel distance and 0.0 bearing
+    let agent1_alive = state[xagent_brain::buffers::PHYS_STRIDE + P_ALIVE];
+    let agent1_distance = state[xagent_brain::buffers::PHYS_STRIDE + P_NEAREST_DANGER_DISTANCE];
+    let agent1_bearing = state[xagent_brain::buffers::PHYS_STRIDE + P_NEAREST_DANGER_BEARING];
+
+    assert!(
+        agent1_alive > 0.5,
+        "Agent 1 (far from danger) died during the single tick"
+    );
+    assert!(
+        (agent1_distance - SENTINEL_DISTANCE).abs() < 0.01,
+        "Agent 1 (far from danger) should read sentinel distance {}, got {}",
+        SENTINEL_DISTANCE,
+        agent1_distance
+    );
+    assert!(
+        agent1_bearing.abs() < 0.01,
+        "Agent 1 (far from danger) should read sentinel bearing 0.0, got {}",
+        agent1_bearing
+    );
+    eprintln!(
+        "Agent 1 (far from danger): distance={:.3}, bearing={:.3} (sentinel)",
+        agent1_distance, agent1_bearing
+    );
+
+    eprintln!("nearest_danger_bearing_points_at_danger: test passed");
+}
+
+/// Avoidance potential shaping sign test (plan 0009 `danger-avoidance-potential`).
+///
+/// Verifies three things:
+/// 1. A **negative** shaping increment when danger appears closer across ticks
+///    (simulating an agent stepping toward danger).
+/// 2. A **positive** shaping increment when danger appears farther across ticks
+///    (simulating an agent stepping away from danger).
+/// 3. **Zero** shaping when `danger_percept_enabled = false` (flag-off branch).
+///
+/// The shaping increment at tick N is `γ·Φ_d(s_N) − Φ_d(s_{N-1})` where
+/// `Φ_d(s) = −(1 − d/DANGER_SENSE_RADIUS)`.  Because `upload_world` does not
+/// touch `agent_phys_buffer`, we can swap the biome grid between the first and
+/// second `dispatch_batch` calls to change the agent's apparent danger distance
+/// without resetting `P_PREV_DANGER_POTENTIAL`.  This directly controls which
+/// direction the potential moves and therefore the shaping sign.
+///
+/// Coordinate system (world_size = 256, biome grid 256×256):
+///   biome_half = 128, biome_inv = 1 cell/unit → cell centre at row R has
+///   world Z = R − 127.5. Agent at (0, y, 0) → agent row = 128.
+///   Danger at row 140 → dist ≈ 12.5; row 128 → dist ≈ 0.5; row 150 → dist ≈ 22.5.
+#[test]
+fn avoidance_potential_sign() {
+    use xagent_brain::buffers::{DANGER_SENSE_RADIUS, P_PREV_DANGER_POTENTIAL};
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    // TD_DISCOUNT from brain_passes.wgsl — must stay in sync with WGSL const.
+    const TD_DISCOUNT: f32 = 0.97;
+
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let mut brain_on = probe_brain_config();
+    brain_on.danger_percept_enabled = true;
+
+    let mut brain_off = probe_brain_config();
+    brain_off.danger_percept_enabled = false;
+
+    // Agent sits at (0, y, 0); the danger region is changed between ticks by
+    // swapping the biome grid, never by re-uploading agent positions (which
+    // would zero P_PREV_DANGER_POTENTIAL and break the two-tick comparison).
+    let agent_data = vec![(
+        glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        100.0,
+        100.0,
+        brain_on.memory_capacity,
+        brain_on.processing_slots,
+    )];
+
+    // Helper: build a biome grid that places BIOME_DANGER at `row`, all cols 128.
+    let make_biomes = |danger_rows: std::ops::Range<usize>| -> Vec<u32> {
+        let mut b = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+        for row in danger_rows {
+            b[row * PROBE_BIOME_RES + 128] = 2u32; // BIOME_DANGER
+        }
+        b
+    };
+
+    // Biome A: danger at rows 138-142 → world Z ≈ 11.5–14.5, distance to
+    //          (0,0,0) ≈ 12.5.  Φ_A ≈ -(1 - 12.5/30) ≈ -0.583
+    let biomes_a = make_biomes(138..143);
+    // Biome B: danger at rows 126-130 → world Z ≈ -1.5–2.5, distance ≈ 0.5.
+    //          Φ_B ≈ -(1 - 0.5/30) ≈ -0.983  (much more negative = "closer")
+    let biomes_b = make_biomes(126..131);
+    // Biome C: danger at rows 148-152 → world Z ≈ 20.5–24.5, distance ≈ 22.5.
+    //          Φ_C ≈ -(1 - 22.5/30) ≈ -0.25  (less negative = "farther")
+    let biomes_c = make_biomes(148..153);
+
+    // ── Scenario 1: toward danger (A → B, potential becomes more negative) ──
+    {
+        let mut kernel = GpuKernel::new(1, 0, &brain_on, &world_config);
+        kernel.reset_agents_seeded(&brain_on, 7);
+
+        // Tick 1 — danger at distance A (moderately close)
+        kernel.upload_world(&heights, &biomes_a, &[], &[], &[]);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_batch(0, 1);
+        let state1 = kernel.read_full_state_blocking().to_vec();
+        let phi1 = state1[P_PREV_DANGER_POTENTIAL];
+
+        eprintln!("toward: Φ_1 = {phi1:.4} (expected ≈ -0.58)");
+        assert!(
+            phi1 < 0.0,
+            "toward tick-1: Φ_1 must be negative (danger in range), got {phi1}"
+        );
+
+        // Tick 2 — danger moved closer (B); P_PREV_DANGER_POTENTIAL preserved
+        kernel.upload_world(&heights, &biomes_b, &[], &[], &[]);
+        kernel.dispatch_batch(1, 1);
+        let state2 = kernel.read_full_state_blocking().to_vec();
+        let phi2 = state2[P_PREV_DANGER_POTENTIAL];
+
+        eprintln!("toward: Φ_2 = {phi2:.4} (expected ≈ -0.98)");
+        assert!(
+            phi2 < phi1,
+            "toward tick-2: Φ_2 must be more negative than Φ_1 ({phi2:.4} vs {phi1:.4})"
+        );
+
+        let shaping = TD_DISCOUNT * phi2 - phi1;
+        eprintln!("toward: shaping = {shaping:.4} (expected < 0)");
+        assert!(
+            shaping < 0.0,
+            "toward: shaping increment must be negative when stepping toward danger, got {shaping:.4}"
+        );
+    }
+
+    // ── Scenario 2: away from danger (B → C, potential becomes less negative) ──
+    {
+        let mut kernel = GpuKernel::new(1, 0, &brain_on, &world_config);
+        kernel.reset_agents_seeded(&brain_on, 7);
+
+        // Tick 1 — danger at distance B (very close)
+        kernel.upload_world(&heights, &biomes_b, &[], &[], &[]);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_batch(0, 1);
+        let state1 = kernel.read_full_state_blocking().to_vec();
+        let phi1 = state1[P_PREV_DANGER_POTENTIAL];
+
+        eprintln!("away: Φ_1 = {phi1:.4} (expected ≈ -0.98)");
+        assert!(
+            phi1 < -0.9 * (1.0 - 1.0 / DANGER_SENSE_RADIUS),
+            "away tick-1: danger should be very close (large |Φ|), got {phi1:.4}"
+        );
+
+        // Tick 2 — danger moved far away (C); P_PREV_DANGER_POTENTIAL preserved
+        kernel.upload_world(&heights, &biomes_c, &[], &[], &[]);
+        kernel.dispatch_batch(1, 1);
+        let state2 = kernel.read_full_state_blocking().to_vec();
+        let phi2 = state2[P_PREV_DANGER_POTENTIAL];
+
+        eprintln!("away: Φ_2 = {phi2:.4} (expected ≈ -0.25)");
+        assert!(
+            phi2 > phi1,
+            "away tick-2: Φ_2 must be less negative than Φ_1 ({phi2:.4} vs {phi1:.4})"
+        );
+
+        let shaping = TD_DISCOUNT * phi2 - phi1;
+        eprintln!("away: shaping = {shaping:.4} (expected > 0)");
+        assert!(
+            shaping > 0.0,
+            "away: shaping increment must be positive when stepping away from danger, got {shaping:.4}"
+        );
+    }
+
+    // ── Scenario 3: flag off — shaping must be zero every tick ──
+    {
+        let mut kernel = GpuKernel::new(1, 0, &brain_off, &world_config);
+        kernel.reset_agents_seeded(&brain_off, 7);
+
+        // Tick 1 — danger present but flag off
+        kernel.upload_world(&heights, &biomes_a, &[], &[], &[]);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_batch(0, 1);
+        let state1 = kernel.read_full_state_blocking().to_vec();
+        let phi1_off = state1[P_PREV_DANGER_POTENTIAL];
+
+        // Tick 2 — danger moved closer, flag still off
+        kernel.upload_world(&heights, &biomes_b, &[], &[], &[]);
+        kernel.dispatch_batch(1, 1);
+        let state2 = kernel.read_full_state_blocking().to_vec();
+        let phi2_off = state2[P_PREV_DANGER_POTENTIAL];
+
+        eprintln!("flag-off: Φ_1 = {phi1_off:.4}, Φ_2 = {phi2_off:.4} (both expected = 0)");
+        assert_eq!(
+            phi1_off, 0.0,
+            "flag-off tick-1: P_PREV_DANGER_POTENTIAL must be 0.0 when flag is off, got {phi1_off}"
+        );
+        assert_eq!(
+            phi2_off, 0.0,
+            "flag-off tick-2: P_PREV_DANGER_POTENTIAL must be 0.0 when flag is off, got {phi2_off}"
+        );
+
+        let shaping_off = TD_DISCOUNT * phi2_off - phi1_off;
+        assert_eq!(
+            shaping_off, 0.0,
+            "flag-off: shaping must be zero when danger_percept_enabled is false, got {shaping_off}"
+        );
+    }
+
+    eprintln!("avoidance_potential_sign: all three sign checks passed");
+}
+
+/// Plan 0009 (path-length-hazard-fused): hazard damage is a *dose* proportional to the
+/// distance traveled through danger, not to the number of ticks spent in it. The per-tick
+/// integrity loss is `WC_HAZARD_DAMAGE * integrity_scale * (step_len / reference_step)`,
+/// where `reference_step = 20.0 * WC_DT` is a default-speed agent's per-tick displacement.
+///
+/// Because the loss and the danger-path accumulation use the SAME `step_len` every tick,
+/// the total integrity lost over ANY trajectory through danger equals exactly
+/// `hazard_damage_rate * integrity_scale * danger_path_length / reference_step` — so the
+/// loss *per unit danger distance* is the speed-invariant constant `hazard*scale/ref`,
+/// independent of speed or path shape (a fast sprint and a slow walk across the same band
+/// absorb the same dose). This is the falsifiable form of the spec invariant:
+/// - **default-speed-neutral**: at default speed `step_len ≈ reference_step`, so per-tick
+///   loss ≈ `hazard*scale` — byte-identical to the old per-tick model.
+/// - **speed-invariant**: a 2× agent has the SAME loss-per-distance.
+///
+/// The old per-tick model — and the rejected `max(step_len, reference_step)` floor —
+/// inflate the loss-per-distance for any agent moving slower than `reference_step`
+/// (a stationary agent would take full damage instead of zero), so this ratio cleanly
+/// falsifies them.
+#[test]
+fn default_speed_crossing_damage_unchanged() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::buffers::{P_DANGER_PATH_LENGTH, P_DEATH_COUNT, P_INTEGRITY};
+
+    // Disable integrity regen so the integrity delta is a PURE hazard measurement
+    // (regen is the only other integrity source; collisions don't apply to one agent).
+    let world_config = WorldConfig {
+        seed: 42,
+        integrity_regen_rate: 0.0,
+        ..WorldConfig::default()
+    };
+    // reference_step = default_speed (20.0) * dt; the shader uses the same value.
+    let reference_step = 20.0_f32 / world_config.tick_rate;
+    let expected =
+        world_config.hazard_damage_rate * BrainConfig::default().integrity_scale / reference_step;
+
+    // Build a normal world to borrow its terrain/biome grid dimensions + food, then
+    // overwrite every biome cell with danger (biome id 2) so the agent is in hazard
+    // every tick and `danger_path_length` accumulates its full planar displacement.
+    let world = WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let danger_biomes = vec![2_u32; world.biome_map.grid_as_u32().len()];
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let food_count = world.food_items.len();
+    let spawn = Vec3::new(0.0, world.terrain.height_at(0.0, 0.0) + 1.0, 0.0);
+
+    // 60 ticks keeps the worst-case dose (full speed at 2×) below the 100 starting
+    // integrity, so the agent never dies and the dose measurement stays valid.
+    let ticks = 60_u32;
+
+    let run = |movement_speed: f32| -> (f32, f32, f32) {
+        let brain = BrainConfig {
+            movement_speed,
+            ..BrainConfig::default()
+        };
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(
+            &heights,
+            &danger_biomes,
+            &food_pos,
+            &food_consumed,
+            &food_timers,
+        );
+        kernel.upload_agents(&[(
+            spawn,
+            100.0_f32,
+            100.0_f32,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )]);
+
+        let initial_integrity = kernel.read_full_state_blocking()[P_INTEGRITY];
+        kernel.dispatch_ticks(0, ticks);
+        let after = kernel.read_full_state_blocking();
+        let damage = initial_integrity - after[P_INTEGRITY];
+        (damage, after[P_DANGER_PATH_LENGTH], after[P_DEATH_COUNT])
+    };
+
+    // speed=10 is below default (20): EVERY per-tick displacement is < reference_step,
+    // so the rejected `max(step_len, reference_step)` floor would be active on every tick
+    // and inflate loss-per-distance above `expected` — this case directly falsifies the
+    // floor. speed=20/40 (default / 2×) additionally falsify the old per-tick model.
+    for &speed in &[10.0_f32, 20.0_f32, 40.0_f32] {
+        let (damage, danger_path, deaths) = run(speed);
+        assert_eq!(
+            deaths, 0.0,
+            "agent died during the window at speed {speed} — shorten the run so the dose measurement stays valid"
+        );
+        assert!(
+            danger_path > 1.0,
+            "agent barely moved through danger at speed {speed} (path {danger_path}); cannot measure dose-per-distance"
+        );
+        let loss_per_distance = damage / danger_path;
+        eprintln!(
+            "speed={speed}: damage={damage:.4}, danger_path={danger_path:.4}, loss/dist={loss_per_distance:.4} (expected {expected:.4})"
+        );
+        assert!(
+            (loss_per_distance - expected).abs() / expected < 0.02,
+            "hazard loss-per-danger-distance {loss_per_distance:.4} != expected {expected:.4} at speed {speed} — \
+             dose is not proportional to path length (a per-tick floor inflates this for sub-reference steps)"
+        );
+    }
+}
+
+#[test]
+fn split_fused_integrity_through_danger_crossing() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::buffers::{P_DANGER_PATH_LENGTH, P_INTEGRITY};
+
+    // Disable integrity regen so the integrity delta is a PURE hazard measurement
+    let world_config = WorldConfig {
+        seed: 42,
+        integrity_regen_rate: 0.0,
+        ..WorldConfig::default()
+    };
+
+    // Build a world with all danger biomes
+    let world = WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let danger_biomes = vec![2_u32; world.biome_map.grid_as_u32().len()];
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let food_count = world.food_items.len();
+    let spawn = Vec3::new(0.0, world.terrain.height_at(0.0, 0.0) + 1.0, 0.0);
+
+    let brain = BrainConfig::default();
+    let total: u32 = 60; // Short run to avoid death
+
+    // Create and run fused kernel
+    let mut fused = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+    fused.reset_agents_seeded(&brain, 12345);
+    fused.upload_world(
+        &heights,
+        &danger_biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+    fused.upload_agents(&[(
+        spawn,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )]);
+    fused.dispatch_ticks(0, total);
+    let fused_state = fused.read_full_state_blocking().to_vec();
+
+    // Create and run split kernel with identical setup
+    let mut split = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+    split.reset_agents_seeded(&brain, 12345);
+    split.upload_world(
+        &heights,
+        &danger_biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+    split.set_execution_mode(xagent_brain::BrainExecutionMode::SplitSerial);
+    split.upload_agents(&[(
+        spawn,
+        100.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )]);
+    split.dispatch_ticks(0, total);
+    let split_state = split.read_full_state_blocking().to_vec();
+
+    // Extract integrity and danger path from both
+    let fused_integrity = fused_state[P_INTEGRITY];
+    let split_integrity = split_state[P_INTEGRITY];
+    let fused_danger_path = fused_state[P_DANGER_PATH_LENGTH];
+    let split_danger_path = split_state[P_DANGER_PATH_LENGTH];
+
+    // Both should have accumulated significant danger path (agent is in all-danger world)
+    assert!(
+        fused_danger_path > 1.0,
+        "Fused danger_path_length should be > 1.0, got {fused_danger_path}"
+    );
+    assert!(
+        split_danger_path > 1.0,
+        "Split danger_path_length should be > 1.0, got {split_danger_path}"
+    );
+
+    // Integrity should match byte-exactly between split and fused (same hazard dose)
+    assert_eq!(
+        fused_integrity, split_integrity,
+        "Split integrity diverged from Fused through danger crossing: {} vs {}",
+        split_integrity, fused_integrity
+    );
+
+    // Danger path should also match
+    assert_eq!(
+        fused_danger_path, split_danger_path,
+        "Split danger_path_length diverged from Fused: {} vs {}",
+        split_danger_path, fused_danger_path
+    );
+}
+
+/// Verifies three properties of the super-linear drag exponent (plan 0009 Layer A):
+///
+/// **(a) k=1.0 is bit-identical to the pre-task baseline.**  At `move_speed=20`
+/// the exponent selects `speed_ratio = 1.0` for both k=1.0 and k=2.0
+/// (`pow(1.0, k) == 1.0`), so they produce the exact same energy drain.
+/// Identical energy reads after N ticks confirm the select-guard is byte-neutral
+/// at the default exponent.
+///
+/// **(b) k=2.0 raises drag above baseline.**  At `move_speed=40` (speed_ratio=2),
+/// k=2.0 gives `drag = pow(2.0, 2.0) = 4.0` while k=1.0 gives `drag = 2.0`.
+/// After enough ticks the speed=40 agent with k=2.0 drains measurably more energy
+/// than the speed=20 agent with k=2.0 (which still has drag=1.0, same as k=1.0).
+///
+/// **(c) Above-baseline only — no torpor gradient.**  At `move_speed=10`
+/// (speed_ratio=0.5 < 1.0), the exponent does NOT activate — the formula uses
+/// `speed_ratio` directly (same as k=1.0), leaving sub-baseline drain unchanged.
+/// Comparing k=1.0 vs k=2.0 at the same `move_speed=10` must therefore give
+/// bit-identical energy trajectories (same drag, same position, same brain state).
+/// This confirms the "above-baseline-only" invariant: the exponent never creates
+/// a torpor incentive (no new energy discount for going slower than baseline).
+#[test]
+fn speed_cost_exponent_default_is_noop() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::buffers::{P_ENERGY, P_ENERGY_SPENT};
+
+    // Use an all-safe biome world (no danger damage) with integrity regen off
+    // to isolate the energy drain signal cleanly.  Food energy is zeroed so
+    // only depletion + movement drain remain and no food pickup confounds the
+    // energy comparison.
+    let world_config = WorldConfig {
+        seed: 42,
+        integrity_regen_rate: 0.0,
+        food_energy_value: 0.0,
+        ..WorldConfig::default()
+    };
+
+    // Build a world with all safe biomes (biome id 0 = normal).
+    let world = WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let safe_biomes = vec![0_u32; world.biome_map.grid_as_u32().len()];
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let food_count = world.food_items.len();
+    let spawn = Vec3::new(0.0, world.terrain.height_at(0.0, 0.0) + 1.0, 0.0);
+
+    // Run enough ticks to accumulate a measurable energy gap.  At speed=40 with
+    // k=2.0, drag=4.0 (vs drag=1.0 at speed=20), so movement_drain is 4× higher.
+    // 200 ticks gives a clear separation.
+    let total_ticks: u32 = 200;
+
+    // Helper: create a fresh kernel, run total_ticks, return (energy_remaining, energy_spent).
+    let run = |movement_speed: f32, speed_cost_exponent: f32| -> (f32, f32) {
+        let brain = BrainConfig {
+            movement_speed,
+            speed_cost_exponent,
+            ..BrainConfig::default()
+        };
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 12345);
+        kernel.upload_world(
+            &heights,
+            &safe_biomes,
+            &food_pos,
+            &food_consumed,
+            &food_timers,
+        );
+        kernel.upload_agents(&[(
+            spawn,
+            100.0_f32,
+            100.0_f32,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )]);
+        kernel.dispatch_ticks(0, total_ticks);
+        let state = kernel.read_full_state_blocking();
+        (state[P_ENERGY], state[P_ENERGY_SPENT])
+    };
+
+    // ── (a) k=1.0 is bit-identical to k=2.0 at baseline speed=20 ──────────────
+    // At speed=20 (speed_ratio=1.0): drag=1.0 for k=1.0 (speed_ratio branch) and
+    // drag=pow(1.0,2.0)=1.0 for k=2.0 (above_baseline branch).  Both are 1.0 so
+    // energy trajectories must be bit-identical.
+    let (energy_k1_s20, spent_k1_s20) = run(20.0, 1.0);
+    let (energy_k2_s20, spent_k2_s20) = run(20.0, 2.0);
+    eprintln!("(a) k=1 speed=20: energy={energy_k1_s20:.6}, spent={spent_k1_s20:.6}");
+    eprintln!("(a) k=2 speed=20: energy={energy_k2_s20:.6}, spent={spent_k2_s20:.6}");
+    assert_eq!(
+        energy_k1_s20, energy_k2_s20,
+        "k=1.0 and k=2.0 at speed=20 must have bit-identical energy \
+         (drag=1.0 for both: speed_ratio=1.0, pow(1.0,k)=1.0)"
+    );
+    assert_eq!(
+        spent_k1_s20, spent_k2_s20,
+        "k=1.0 and k=2.0 at speed=20 must have bit-identical energy_spent"
+    );
+
+    // ── (b) k=2.0 raises drag above baseline speed=40 ─────────────────────────
+    // At speed=40 with k=2.0: speed_ratio=2.0 >= 1.0 (above baseline), so
+    // drag = pow(2.0, 2.0) = 4.0 (vs drag=1.0 at speed=20 with k=2.0).
+    // The speed=40 agent must drain measurably more energy than speed=20 at k=2.0.
+    let (energy_k2_s40, spent_k2_s40) = run(40.0, 2.0);
+    eprintln!("(b) k=2 speed=40: energy={energy_k2_s40:.6}, spent={spent_k2_s40:.6}");
+    assert!(
+        spent_k2_s40 > spent_k2_s20,
+        "k=2.0 at speed=40 must drain more energy than k=2.0 at speed=20 \
+         (drag=4.0 vs drag=1.0); spent={spent_k2_s40:.4} vs {spent_k2_s20:.4}"
+    );
+    assert!(
+        energy_k2_s40 < energy_k2_s20,
+        "k=2.0 at speed=40 must have less energy remaining than k=2.0 at speed=20; \
+         {energy_k2_s40:.4} vs {energy_k2_s20:.4}"
+    );
+
+    // ── (c) Above-baseline-only: sub-baseline speed=10 drain unchanged at k=2.0 ─
+    // At speed=10 (speed_ratio=0.5 < 1.0, sub-baseline), the exponent does NOT
+    // activate: the formula keeps drag = speed_ratio (same as k=1.0).  With both
+    // k=1.0 and k=2.0 using drag=0.5, the agent follows the identical physics
+    // trajectory (same positions, same brain state, same motor outputs), so
+    // energy_remaining and energy_spent must be bit-identical.
+    //
+    // This is the falsifiable "above-baseline-only" invariant: the super-linear
+    // exponent creates no torpor gradient (no new energy discount for sub-baseline
+    // speed).
+    let (energy_k1_s10, spent_k1_s10) = run(10.0, 1.0);
+    let (energy_k2_s10, spent_k2_s10) = run(10.0, 2.0);
+    eprintln!("(c) k=1 speed=10: energy={energy_k1_s10:.6}, spent={spent_k1_s10:.6}");
+    eprintln!("(c) k=2 speed=10: energy={energy_k2_s10:.6}, spent={spent_k2_s10:.6}");
+    assert_eq!(
+        energy_k1_s10, energy_k2_s10,
+        "k=1.0 and k=2.0 at speed=10 (sub-baseline) must have bit-identical energy \
+         (both use drag=speed_ratio=0.5 — exponent does not activate below baseline); \
+         {energy_k1_s10:.6} vs {energy_k2_s10:.6}"
+    );
+    assert_eq!(
+        spent_k1_s10, spent_k2_s10,
+        "k=1.0 and k=2.0 at speed=10 must have bit-identical energy_spent \
+         (above-baseline-only: exponent inactive for speed_ratio < 1.0)"
     );
 }

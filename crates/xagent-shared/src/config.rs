@@ -118,6 +118,12 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [1.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
+    /// Exponent for speed-cost drag curve in the fused kernel's energy drain.
+    /// Default 1.0 (no-op: cost is linear in speed). Values > 1.0 make drag
+    /// super-linear above baseline speed. Applied to `pow(max(speed/20, 1.0), k)`.
+    /// Locked per batch, not heritable (plan 0003 / 0006 gate).
+    #[serde(default = "default_speed_cost_exponent")]
+    pub speed_cost_exponent: f32,
     /// Gate flag for the Hubel-Wiesel visual cortex pass (plan 0008). When
     /// `false` the cortex pass is a no-op passthrough and the encoder consumes
     /// the legacy raw-vision slice, so the run is byte-identical to the
@@ -126,6 +132,21 @@ pub struct BrainConfig {
     /// throughput regression is within budget. Locked per batch, not heritable.
     #[serde(default)]
     pub visual_cortex_enabled: bool,
+    /// Gate flag for the dedicated danger percept sense (plan 0009). When
+    /// `false` the danger bearing and distance are not packed into the sensory
+    /// feature vector, so the encoder input width and the encoded state match
+    /// the pre-percept build (byte-identical). The default flips to `true` only
+    /// once the speed-decoupling gate passes. Locked per batch, not heritable.
+    #[serde(default)]
+    pub danger_percept_enabled: bool,
+    /// Gate flag for effort-rebased fitness (plan 0009). When `false` the
+    /// composite fitness uses the legacy time-denominated formula (food per
+    /// time, exploration as fraction of cells). When `true` it re-bases both
+    /// axes onto effort: foraging = food/energy, exploration = min(coverage,
+    /// cells/distance). The default stays `false` until the speed-decoupling
+    /// gate passes. Locked per batch, not heritable.
+    #[serde(default)]
+    pub effort_rebased_fitness: bool,
     /// **Heritable (visual genome, plan 0008).** V1 Gabor carrier wavelength λ
     /// in retina pixels for the whole simple-cell bank. The envelope σ is tied
     /// as `0.56·λ` (≈ 1-octave V1 bandwidth, Jones & Palmer 1987). Seed 5.0;
@@ -266,6 +287,10 @@ fn default_integrity_scale() -> f32 {
 
 fn default_movement_speed() -> f32 {
     20.0
+}
+
+fn default_speed_cost_exponent() -> f32 {
+    1.0
 }
 
 /// Seed carrier wavelength λ for the Gabor bank (plan 0008). Mirrors
@@ -436,7 +461,10 @@ impl Default for BrainConfig {
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
+            danger_percept_enabled: false,
+            effort_rebased_fitness: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -523,7 +551,10 @@ impl BrainConfig {
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
+            danger_percept_enabled: false,
+            effort_rebased_fitness: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -553,7 +584,10 @@ impl BrainConfig {
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
+            danger_percept_enabled: false,
+            effort_rebased_fitness: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -733,5 +767,53 @@ mod tests {
         };
         assert_eq!(config.sensory_lag_ticks(), u32::MAX);
         assert!(config.sensory_lag_ticks() > BrainConfig::MAX_SENSORY_LAG_TICKS);
+    }
+
+    #[test]
+    fn speed_cost_exponent_round_trips() {
+        // Test that speed_cost_exponent serializes and deserializes correctly,
+        // and that the default is 1.0 (no-op).
+        let config = BrainConfig::default();
+        assert_eq!(config.speed_cost_exponent, 1.0);
+
+        // Test custom values round-trip through JSON.
+        let config = BrainConfig {
+            speed_cost_exponent: 2.5,
+            ..BrainConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("config serializes");
+        let deserialized: BrainConfig = serde_json::from_str(&json).expect("config deserializes");
+        assert_eq!(deserialized.speed_cost_exponent, 2.5);
+
+        // Test that old configs without speed_cost_exponent deserialize with the default.
+        let json_without_field = r#"{
+            "memory_capacity": 128,
+            "processing_slots": 16,
+            "visual_encoding_size": 64,
+            "representation_dimension": 128,
+            "learning_rate": 0.05,
+            "decay_rate": 0.001,
+            "distress_exponent": 2.0,
+            "habituation_sensitivity": 20.0,
+            "max_curiosity_bonus": 0.6,
+            "fatigue_floor": 0.1,
+            "vision_width": 8,
+            "vision_height": 6,
+            "retina_width": 32,
+            "retina_height": 32,
+            "brain_tick_stride": 10,
+            "vision_stride": 10,
+            "metabolic_rate": 0.5,
+            "integrity_scale": 0.5,
+            "movement_speed": 20.0,
+            "visual_cortex_enabled": false,
+            "gabor_wavelength": 5.0,
+            "gabor_aspect_ratio": 0.5,
+            "dog_surround_ratio": 1.6,
+            "orientation_offset": 0.0
+        }"#;
+        let deserialized: BrainConfig = serde_json::from_str(json_without_field)
+            .expect("config without speed_cost_exponent loads with default");
+        assert_eq!(deserialized.speed_cost_exponent, 1.0);
     }
 }

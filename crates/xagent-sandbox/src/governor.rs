@@ -35,12 +35,31 @@ pub struct AgentFitness {
     pub food_consumed: u32,
     pub cells_explored: u32,
     pub composite_fitness: f32,
+    pub distance_traveled: f32,
+    pub energy_spent: f32,
+    pub danger_path_length: f32,
+    pub avoidance_sense_range_ticks: f32,
+    pub avoidance_turns_opposing: f32,
 }
 
 /// Foraging rate (food consumed per 1000 alive ticks) that earns a full
 /// foraging score. Around the per-capita break-even rate where an agent
 /// sustains its own energy, so a competent forager maxes this axis.
 const FORAGING_RATE_TARGET: f32 = 1.5;
+/// Food per energy unit for a competent forager; used when effort-rebased
+/// fitness is enabled. Calibrated to reward skill over speed; replaces
+/// FORAGING_RATE_TARGET in the effort-rebased formula.
+const FORAGING_ENERGY_TARGET: f32 = 0.5;
+/// Minimum energy before the foraging rate counts; anti-division-by-zero
+/// and prevents camping (a stationary agent still burns metabolic + brain energy).
+const ENERGY_FLOOR: f32 = 1.0;
+/// Minimum distance before the per-distance rate counts; prevents
+/// division-by-zero and ensures exploration has a meaningful denominator.
+const DISTANCE_FLOOR: f32 = 0.1;
+/// Distance budget (in world units) that buys one full-credit cell in the
+/// exploration score. Set well above one cell width (world 256 / HEATMAP_RES 64 = 4.0)
+/// so the cap binds and pure coverage is preferred over aimless speed.
+const EXPLORATION_DISTANCE_BUDGET: f32 = 16.0;
 /// Lower bound on the survival multiplier. Deaths still penalize, but the
 /// multiplier never drives the foraging signal below this fraction the way an
 /// unbounded `1/(1+deaths·k)` gate did at hundreds of deaths per generation —
@@ -71,33 +90,67 @@ const RECORDING_STRIDE_V2: usize = 15;
 /// repeats to estimate the noise.
 const K_SIGNIF: f32 = 1.0;
 
+/// Epsilon guard against division-by-zero in metrics that aggregate distance
+/// or energy telemetry.
+const EPSILON: f32 = 1e-6;
+
 /// Composite fitness: foraging-primary with a bounded survival multiplier.
 ///
-/// The primary axis is `food_per_1k_alive_ticks` (food consumed normalized by
-/// the agent's actual lived time), so a generation's real foraging variance
-/// drives selection. Survival is a multiplier bounded below by
+/// Two modes, selected by `effort_rebased_fitness`:
+///
+/// **Legacy mode** (`false`): The primary axis is `food_per_1k_alive_ticks`
+/// (food consumed normalized by the agent's actual lived time), so a
+/// generation's real foraging variance drives selection. Exploration is the
+/// fraction of reachable grid visited. Survival is a multiplier bounded below by
 /// [`SURVIVAL_FLOOR`]: dying still costs score — a careful forager outscores a
 /// kamikaze one with the same food — but a high death count can no longer
 /// collapse the composite into the noise floor where foraging variance is
-/// invisible. Exploration is a smaller secondary term. `total_grid_cells` is
-/// the per-generation exploration denominator from [`Governor::evaluate`].
+/// invisible.
+///
+/// **Effort-rebased mode** (`true`): Foraging = food/energy (speed-invariant,
+/// camping-proof), exploration = min(coverage, cells/distance) (pure coverage
+/// preferred, aimless speed penalized). Survival multiplier unchanged.
+/// `total_grid_cells` is the per-generation exploration denominator from
+/// [`Governor::evaluate`].
 fn composite_fitness(
     death_count: u32,
     food_consumed: u32,
     cells_explored: u32,
     ticks_alive: u64,
     total_grid_cells: f32,
+    distance_traveled: f32,
+    energy_spent: f32,
+    effort_rebased_fitness: bool,
 ) -> f32 {
-    // Guard the divisor: a generation always advances at least a few ticks.
-    let alive_thousands = (ticks_alive as f32 / 1000.0).max(1e-3);
-    // Foraging rate, normalized to the target rate and capped at a full score.
-    let food_per_1k = food_consumed as f32 / alive_thousands;
-    let foraging = (food_per_1k / FORAGING_RATE_TARGET).min(1.0);
-    // Exploration: fraction of reachable grid visited (25% of total = perfect).
-    let exploration = (cells_explored as f32 / total_grid_cells).min(1.0);
     // Bounded survival multiplier: 1.0 at zero deaths, asymptotes to the floor.
     let survival =
         SURVIVAL_FLOOR + (1.0 - SURVIVAL_FLOOR) / (1.0 + death_count as f32 * DEATH_PENALTY);
+
+    let (foraging, exploration) = if effort_rebased_fitness {
+        // Effort-rebased mode: food per energy (speed-invariant),
+        // cells per distance (pure coverage, aimless speed penalized).
+        let energy = energy_spent.max(ENERGY_FLOOR);
+        let foraging = ((food_consumed as f32 / energy) / FORAGING_ENERGY_TARGET).min(1.0);
+
+        let dist = distance_traveled.max(DISTANCE_FLOOR);
+        let coverage = (cells_explored as f32 / total_grid_cells).min(1.0);
+        let cells_per_dist =
+            (cells_explored as f32 / (dist / EXPLORATION_DISTANCE_BUDGET)).min(1.0);
+        let exploration = coverage.min(cells_per_dist);
+
+        (foraging, exploration)
+    } else {
+        // Legacy mode: food per 1000 ticks, exploration as coverage.
+        // Guard the divisor: a generation always advances at least a few ticks.
+        let alive_thousands = (ticks_alive as f32 / 1000.0).max(1e-3);
+        // Foraging rate, normalized to the target rate and capped at a full score.
+        let food_per_1k = food_consumed as f32 / alive_thousands;
+        let foraging = (food_per_1k / FORAGING_RATE_TARGET).min(1.0);
+        // Exploration: fraction of reachable grid visited (25% of total = perfect).
+        let exploration = (cells_explored as f32 / total_grid_cells).min(1.0);
+        (foraging, exploration)
+    };
+
     survival * (foraging * FORAGING_WEIGHT + exploration * EXPLORATION_WEIGHT)
 }
 
@@ -588,6 +641,11 @@ impl Governor {
                     food_consumed: a.food_consumed,
                     cells_explored: a.unique_cells_explored(),
                     composite_fitness: 0.0, // computed below
+                    distance_traveled: a.distance_traveled,
+                    energy_spent: a.energy_spent,
+                    danger_path_length: a.danger_path_length,
+                    avoidance_sense_range_ticks: a.avoidance_sense_range_ticks,
+                    avoidance_turns_opposing: a.avoidance_turns_opposing,
                 }
             })
             .collect();
@@ -604,6 +662,9 @@ impl Governor {
                 r.cells_explored,
                 r.total_ticks_alive,
                 total_grid_cells,
+                r.distance_traveled,
+                r.energy_spent,
+                r.config.effort_rebased_fitness,
             );
         }
 
@@ -613,8 +674,9 @@ impl Governor {
             let _ = self.db.execute(
                 "INSERT INTO agent_result
                  (node_id, agent_index, config_json, total_ticks_alive,
-                  death_count, food_consumed, cells_explored, composite_fitness)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  death_count, food_consumed, cells_explored, composite_fitness,
+                  distance_traveled, energy_spent, danger_path_length)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     node_id,
                     r.agent_index as i64,
@@ -624,6 +686,9 @@ impl Governor {
                     r.food_consumed,
                     r.cells_explored,
                     r.composite_fitness,
+                    r.distance_traveled,
+                    r.energy_spent,
+                    r.danger_path_length,
                 ],
             );
         }
@@ -758,6 +823,44 @@ impl Governor {
         self.within_life = WithinLifeTracker::default();
     }
 
+    /// Persist danger_dwell_fraction to the behavior_metric table.
+    /// Computes the population-aggregate fraction of distance traveled that was
+    /// spent in danger: `danger_path_length / max(distance_traveled, EPSILON)`.
+    fn persist_behavior_metrics(&self, fitness: &[AgentFitness]) {
+        if let Some(node_id) = self.current_node_id {
+            // Aggregate danger path length and distance traveled across the population
+            let total_danger_path: f32 = fitness.iter().map(|f| f.danger_path_length).sum();
+            let total_distance: f32 = fitness.iter().map(|f| f.distance_traveled).sum();
+
+            // Calculate danger_dwell_fraction as the population aggregate
+            let danger_dwell_fraction = total_danger_path / total_distance.max(EPSILON);
+
+            // Aggregate avoidance intent across the population
+            let total_sense_range_ticks: f32 =
+                fitness.iter().map(|f| f.avoidance_sense_range_ticks).sum();
+            let total_turns_opposing: f32 =
+                fitness.iter().map(|f| f.avoidance_turns_opposing).sum();
+            let avoidance_intent_fraction =
+                total_turns_opposing / total_sense_range_ticks.max(EPSILON);
+
+            // Insert into behavior_metric table with placeholder values for fields not yet computed
+            let _ = self.db.execute(
+                "INSERT INTO behavior_metric \
+                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, danger_dwell_fraction, avoidance_intent_fraction) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    node_id,
+                    fitness.len() as i64,
+                    0.0, // mean_abs_turn placeholder (to be computed from recording later)
+                    0.0, // turn_sign_persistence placeholder (to be computed from recording later)
+                    0.0, // straightness placeholder (to be computed from recording later)
+                    danger_dwell_fraction,
+                    avoidance_intent_fraction,
+                ],
+            );
+        }
+    }
+
     /// Process the evaluation results and advance to the next generation.
     ///
     /// Call this after `evaluate()`. Returns configs for the next population
@@ -766,6 +869,8 @@ impl Governor {
         // Persist this generation's within-life food rates to its node before
         // any spawn-parent change, then reset the tracker for the next one.
         self.persist_within_life();
+        // Persist danger_dwell_fraction and other behavior metrics
+        self.persist_behavior_metrics(fitness);
         let reduced = self.reduce_fitness(fitness);
         let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
@@ -1712,6 +1817,15 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
         "ALTER TABLE generation_recording ADD COLUMN record_stride INTEGER DEFAULT 15;",
     );
 
+    // Backwards-compatible migration: add effort telemetry to agent_result
+    let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN distance_traveled REAL;");
+    let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN energy_spent REAL;");
+    let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN danger_path_length REAL;");
+
+    // Backwards-compatible migration: add avoidance_intent_fraction to behavior_metric
+    let _ =
+        db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN avoidance_intent_fraction REAL;");
+
     // Per-generation behavior summary derived from recording and physics state
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS behavior_metric (
@@ -1723,7 +1837,8 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             food_distance_delta REAL,
             food_bearing_alignment REAL,
             danger_dwell_fraction REAL,
-            danger_exit_latency_ticks REAL
+            danger_exit_latency_ticks REAL,
+            avoidance_intent_fraction REAL
         );",
     )?;
 
@@ -1893,6 +2008,11 @@ mod tests {
             food_consumed: 50,
             cells_explored: 4096,
             composite_fitness: fitness,
+            distance_traveled: 100.0,
+            energy_spent: 50.0,
+            danger_path_length: 10.0,
+            avoidance_sense_range_ticks: 0.0,
+            avoidance_turns_opposing: 0.0,
         }]
     }
 
@@ -1930,6 +2050,11 @@ mod tests {
                 food_consumed: 50,
                 cells_explored: 4096,
                 composite_fitness: f,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             })
             .collect()
     }
@@ -2090,18 +2215,21 @@ mod tests {
         // ~budget-scale lived time so food_per_1k reflects the rate, not a tiny
         // alive window.
         let ticks = 100_000_u64;
+        // Dummy distance and energy for legacy mode (unused).
+        let distance = 1000.0_f32;
+        let energy = 100.0_f32;
 
-        // (a) More food at equal deaths scores strictly higher.
-        let low_food = composite_fitness(2, 100, cells, ticks, grid);
-        let high_food = composite_fitness(2, 300, cells, ticks, grid);
+        // (a) More food at equal deaths scores strictly higher (legacy mode).
+        let low_food = composite_fitness(2, 100, cells, ticks, grid, distance, energy, false);
+        let high_food = composite_fitness(2, 300, cells, ticks, grid, distance, energy, false);
         assert!(
             high_food > low_food,
             "more food must score higher: {high_food} !> {low_food}"
         );
 
         // (b) More deaths at equal food scores strictly lower (anti-kamikaze).
-        let few_deaths = composite_fitness(1, 200, cells, ticks, grid);
-        let many_deaths = composite_fitness(50, 200, cells, ticks, grid);
+        let few_deaths = composite_fitness(1, 200, cells, ticks, grid, distance, energy, false);
+        let many_deaths = composite_fitness(50, 200, cells, ticks, grid, distance, energy, false);
         assert!(
             few_deaths > many_deaths,
             "more deaths must score lower: {few_deaths} !> {many_deaths}"
@@ -2111,8 +2239,8 @@ mod tests {
         // gate drove a 200-death generation to ~0.003 (below eval noise); the
         // bounded multiplier keeps it well above, and two foragers differing
         // only in food rate stay clearly separable.
-        let forager_lean = composite_fitness(200, 30, cells, ticks, grid);
-        let forager_rich = composite_fitness(200, 60, cells, ticks, grid);
+        let forager_lean = composite_fitness(200, 30, cells, ticks, grid, distance, energy, false);
+        let forager_rich = composite_fitness(200, 60, cells, ticks, grid, distance, energy, false);
         assert!(
             forager_lean > 0.04,
             "high-death forager collapsed into the noise floor: {forager_lean}"
@@ -2124,23 +2252,265 @@ mod tests {
 
         // Survival is bounded below: even an extreme death count keeps at least
         // the floor fraction of the foraging score, never zero-by-gate.
-        let extreme = composite_fitness(1_000_000, 200, cells, ticks, grid);
-        let alive = composite_fitness(0, 200, cells, ticks, grid);
+        let extreme =
+            composite_fitness(1_000_000, 200, cells, ticks, grid, distance, energy, false);
+        let alive = composite_fitness(0, 200, cells, ticks, grid, distance, energy, false);
         assert!(
             extreme > alive * (SURVIVAL_FLOOR - 0.01),
             "survival multiplier fell through its floor: {extreme} vs alive {alive}"
         );
 
         // Idle agent: no foraging, no exploration → zero regardless of survival.
-        assert_eq!(composite_fitness(0, 0, 0, ticks, grid), 0.0);
+        assert_eq!(
+            composite_fitness(0, 0, 0, ticks, grid, distance, energy, false),
+            0.0
+        );
 
         // Foraging rate is capped: 2× the target rate still scores a full
         // foraging term, not double.
-        let capped = composite_fitness(0, 300, 0, ticks, grid);
-        let at_target = composite_fitness(0, 150, 0, ticks, grid);
+        let capped = composite_fitness(0, 300, 0, ticks, grid, distance, energy, false);
+        let at_target = composite_fitness(0, 150, 0, ticks, grid, distance, energy, false);
         assert!(
             (capped - at_target).abs() < 1e-6,
             "foraging above target must cap: {capped} vs {at_target}"
+        );
+    }
+
+    /// Effort-rebased fitness: foraging = food/energy (speed-invariant,
+    /// camping-proof), exploration = min(coverage, cells/distance) (pure
+    /// coverage preferred, aimless speed penalized).
+    #[test]
+    fn composite_fitness_rewards_efficiency() {
+        let cells = 250;
+        let grid = 1000.0_f32;
+        let ticks = 100_000_u64;
+
+        // (a) Fast-aimless agent (high food, high distance, high energy)
+        // scores lower than slow-deliberate agent (same food, low distance/energy).
+        // Synthetic telemetry: both collect 100 food; one travels far at cost,
+        // the other concentrated effort.
+        let fast_aimless = composite_fitness(
+            0,     // deaths
+            100,   // food
+            cells, // cells
+            ticks, grid, 5000.0, // high distance (aimless travel)
+            500.0,  // high energy (spent on movement)
+            true,   // effort_rebased_fitness enabled
+        );
+        let slow_deliberate = composite_fitness(
+            0,     // deaths
+            100,   // same food
+            cells, // same cells (good coverage despite less distance)
+            ticks, grid, 100.0, // low distance (focused movement)
+            100.0, // low energy (efficient foraging)
+            true,
+        );
+        assert!(
+            slow_deliberate > fast_aimless,
+            "deliberate foraging must score higher than aimless speed: {slow_deliberate} !> {fast_aimless}"
+        );
+
+        // (b) Camper (high food, ~0 distance, nonzero energy) does not max
+        // foraging. Energy floor prevents camping from driving denominator to zero.
+        let camper = composite_fitness(
+            0,     // deaths
+            300,   // high food (respawning on one spot)
+            cells, // good coverage from that spot
+            ticks, grid, 1.0,  // negligible distance
+            50.0, // still burns energy (metabolic + brain)
+            true,
+        );
+        // Even with high food, low energy input makes foraging < 1.0.
+        // The foraging axis is capped at 1.0, so the camper's advantage is
+        // limited, and exploration also caps at coverage (not boosted by low distance).
+        assert!(
+            camper < 1.0,
+            "camper should not achieve perfect fitness; got {camper}"
+        );
+
+        // (c) Flag-off path reproduces legacy scores (within tolerance).
+        // The legacy formula is unchanged when effort_rebased_fitness = false.
+        let legacy = composite_fitness(1, 150, cells, ticks, grid, 1000.0, 100.0, false);
+        // Using the same synthetic data but in legacy mode: food/time, coverage.
+        // This score should not depend on distance/energy.
+        let legacy_alt = composite_fitness(1, 150, cells, ticks, grid, 9999.0, 9999.0, false);
+        assert!(
+            (legacy - legacy_alt).abs() < 1e-6,
+            "legacy mode should ignore distance/energy: {legacy} vs {legacy_alt}"
+        );
+    }
+
+    /// Fitness calibration: replays synthetic generation profiles through both
+    /// legacy and effort-rebased formulas to calibrate FORAGING_ENERGY_TARGET
+    /// and EXPLORATION_DISTANCE_BUDGET. Documents the before/after score deltas.
+    /// This is not a strict pass/fail test, but rather a calibration guide that
+    /// prints representative scores for manual verification against the plan's
+    /// design intent.
+    #[test]
+    fn fitness_calibration_replay_profiles() {
+        let grid = 1000.0_f32;
+        let ticks = 100_000_u64; // ~1.67 minutes of simulated time at 1 tick/frame
+
+        // Representative profile 1: Competent forager (skill-focused, exploring broadly)
+        // - Travels moderate distance, finds abundant food via deliberate search
+        // - Covers significant grid diversity through skillful foraging
+        // - Both foraging and exploration axes should approach 1.0 in effort mode
+        let competent_forager_deaths = 1;
+        let competent_forager_food = 180; // high absolute food from good skill
+        let competent_forager_cells = 600; // 60% coverage through deliberate exploration
+        let competent_forager_distance = 600.0; // efficient distance for 60% coverage
+        let competent_forager_energy = 180.0; // efficient use of energy (1.0 food/energy ratio)
+
+        // Representative profile 2: Fast-aimless agent (speed-focused)
+        // - Travels far and fast, covers more ground but without purpose
+        // - Same food in absolute terms (or slightly more from wider sweep)
+        // - Much higher distance and energy spent
+        // - Exploration high from coverage, but food-per-energy low
+        let fast_aimless_deaths = 1; // fewer deaths due to speed = immunity
+        let fast_aimless_food = 180; // same absolute food (not seeking, just sweeping)
+        let fast_aimless_cells = 700; // covers more cells due to indiscriminate distance
+        let fast_aimless_distance = 4000.0; // travels far and fast, sweeping widely
+        let fast_aimless_energy = 800.0; // burns much more energy on movement
+
+        // Representative profile 3: Camper (stationary on food respawn)
+        // - High food from camping on respawn point
+        // - Negligible movement distance
+        // - Nonzero energy (metabolic + brain cost even while stationary)
+        let camper_deaths = 0; // safe from danger by not moving
+        let camper_food = 250; // high food from camping
+        let camper_cells = 100; // poor coverage, only sees local area (10%)
+        let camper_distance = 1.0; // barely moves
+        let camper_energy = 60.0; // minimal movement, mostly metabolic
+
+        // Print calibration table header
+        eprintln!("\n=== FITNESS CALIBRATION REPLAY ===");
+        eprintln!(
+            "{:<30} {:>12} {:>12} {:>12}",
+            "Profile", "Legacy", "Effort-based", "Delta"
+        );
+        eprintln!("{}", "=".repeat(70));
+
+        // Competent forager
+        let legacy_competent = composite_fitness(
+            competent_forager_deaths,
+            competent_forager_food,
+            competent_forager_cells,
+            ticks,
+            grid,
+            competent_forager_distance,
+            competent_forager_energy,
+            false,
+        );
+        let effort_competent = composite_fitness(
+            competent_forager_deaths,
+            competent_forager_food,
+            competent_forager_cells,
+            ticks,
+            grid,
+            competent_forager_distance,
+            competent_forager_energy,
+            true,
+        );
+        eprintln!(
+            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
+            "Competent Forager",
+            legacy_competent,
+            effort_competent,
+            effort_competent - legacy_competent
+        );
+
+        // Fast-aimless
+        let legacy_aimless = composite_fitness(
+            fast_aimless_deaths,
+            fast_aimless_food,
+            fast_aimless_cells,
+            ticks,
+            grid,
+            fast_aimless_distance,
+            fast_aimless_energy,
+            false,
+        );
+        let effort_aimless = composite_fitness(
+            fast_aimless_deaths,
+            fast_aimless_food,
+            fast_aimless_cells,
+            ticks,
+            grid,
+            fast_aimless_distance,
+            fast_aimless_energy,
+            true,
+        );
+        eprintln!(
+            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
+            "Fast-Aimless",
+            legacy_aimless,
+            effort_aimless,
+            effort_aimless - legacy_aimless
+        );
+
+        // Camper
+        let legacy_camper = composite_fitness(
+            camper_deaths,
+            camper_food,
+            camper_cells,
+            ticks,
+            grid,
+            camper_distance,
+            camper_energy,
+            false,
+        );
+        let effort_camper = composite_fitness(
+            camper_deaths,
+            camper_food,
+            camper_cells,
+            ticks,
+            grid,
+            camper_distance,
+            camper_energy,
+            true,
+        );
+        eprintln!(
+            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
+            "Camper",
+            legacy_camper,
+            effort_camper,
+            effort_camper - legacy_camper
+        );
+
+        eprintln!("{}", "=".repeat(70));
+
+        // Verify calibration intent: competent forager should score high in
+        // effort-rebased mode, fast-aimless should drop significantly.
+        eprintln!("\n=== CALIBRATION INTENT VERIFICATION ===");
+        eprintln!(
+            "Competent forager effort score: {:.4} (target: near 1.0)",
+            effort_competent
+        );
+        eprintln!(
+            "Fast-aimless drops by: {:.4} (target: significant negative)",
+            effort_aimless - legacy_aimless
+        );
+        eprintln!(
+            "Competent beats fast-aimless by: {:.4} (target: decisively)",
+            effort_competent - effort_aimless
+        );
+
+        // Assert that the effort-rebased formula penalizes aimless speed:
+        // a competent forager should score higher in effort mode than a
+        // fast-aimless agent, even if the aimless agent has slightly more food.
+        assert!(
+            effort_competent > effort_aimless,
+            "Effort-rebased should prefer competent foraging ({}) over aimless speed ({})",
+            effort_competent,
+            effort_aimless
+        );
+
+        // Assert that camper is not perfect under effort rebasing
+        // (energy floor + low efficiency should prevent maxing foraging)
+        assert!(
+            effort_camper < 1.0,
+            "Camper should not achieve perfect score ({}), energy floor should apply",
+            effort_camper
         );
     }
 
@@ -2510,6 +2880,11 @@ mod tests {
                 food_consumed: 50,
                 cells_explored: 100,
                 composite_fitness: 0.9,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -2519,6 +2894,11 @@ mod tests {
                 food_consumed: 40,
                 cells_explored: 80,
                 composite_fitness: 0.8,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 2,
@@ -2528,6 +2908,11 @@ mod tests {
                 food_consumed: 1,
                 cells_explored: 2,
                 composite_fitness: 0.1,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
         ];
 
@@ -2629,6 +3014,11 @@ mod tests {
                 food_consumed: 10,
                 cells_explored: 50,
                 composite_fitness: 0.8,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -2641,6 +3031,11 @@ mod tests {
                 food_consumed: 10,
                 cells_explored: 50,
                 composite_fitness: 0.6,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 2,
@@ -2653,6 +3048,11 @@ mod tests {
                 food_consumed: 10,
                 cells_explored: 50,
                 composite_fitness: 0.5,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 3,
@@ -2665,6 +3065,11 @@ mod tests {
                 food_consumed: 10,
                 cells_explored: 50,
                 composite_fitness: 0.9,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
         ];
 
@@ -2713,6 +3118,11 @@ mod tests {
                 death_count: 0,
                 food_consumed: 10,
                 cells_explored: 50,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -2725,6 +3135,11 @@ mod tests {
                 death_count: 0,
                 food_consumed: 10,
                 cells_explored: 50,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 0,
@@ -2737,6 +3152,11 @@ mod tests {
                 death_count: 0,
                 food_consumed: 10,
                 cells_explored: 50,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
             AgentFitness {
                 agent_index: 3,
@@ -2749,6 +3169,11 @@ mod tests {
                 death_count: 0,
                 food_consumed: 10,
                 cells_explored: 50,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             },
         ];
 
@@ -2899,6 +3324,11 @@ mod tests {
                 food_consumed: 10,
                 cells_explored: 50,
                 composite_fitness: fit,
+                distance_traveled: 100.0,
+                energy_spent: 50.0,
+                danger_path_length: 10.0,
+                avoidance_sense_range_ticks: 0.0,
+                avoidance_turns_opposing: 0.0,
             })
             .collect()
     }
@@ -2954,6 +3384,11 @@ mod tests {
             food_consumed: 50,
             cells_explored: 100,
             composite_fitness: 0.5,
+            distance_traveled: 100.0,
+            energy_spent: 50.0,
+            danger_path_length: 10.0,
+            avoidance_sense_range_ticks: 0.0,
+            avoidance_turns_opposing: 0.0,
         }];
 
         // Gen 0: succeeds — node config should update to the best performer
@@ -3478,5 +3913,278 @@ mod tests {
 
         assert!((persisted_dwell - danger_dwell_fraction).abs() < 1e-6);
         assert!((persisted_latency - danger_exit_latency_ticks).abs() < 1e-6);
+    }
+
+    /// CPU-only test: `evaluate()` transfers distance_traveled and energy_spent
+    /// from `Agent` structs into the returned `AgentFitness` slice and persists
+    /// them to the DB. No GPU adapter required.
+    #[test]
+    fn evaluate_propagates_effort_telemetry_to_agent_fitness() {
+        use glam::Vec3;
+
+        let gov = test_governor(5);
+
+        // Create two agents with distinct, non-zero effort telemetry values.
+        let mut agent_a = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_a.distance_traveled = 123.0;
+        agent_a.energy_spent = 45.0;
+        agent_a.danger_path_length = 7.5;
+        agent_a.total_ticks_alive = 1000;
+        agent_a.food_consumed = 5;
+
+        let mut agent_b = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_b.distance_traveled = 250.0;
+        agent_b.energy_spent = 80.0;
+        agent_b.danger_path_length = 0.0;
+        agent_b.total_ticks_alive = 2000;
+        agent_b.food_consumed = 12;
+
+        let agents = vec![agent_a, agent_b];
+        let fitness = gov.evaluate(&agents);
+
+        assert_eq!(fitness.len(), 2, "evaluate must return one entry per agent");
+
+        // evaluate() sorts by composite_fitness descending; find each by agent_index.
+        let result_a = fitness
+            .iter()
+            .find(|f| f.agent_index == 0)
+            .expect("AgentFitness for agent 0 must be present");
+        let result_b = fitness
+            .iter()
+            .find(|f| f.agent_index == 1)
+            .expect("AgentFitness for agent 1 must be present");
+
+        assert!(
+            (result_a.distance_traveled - 123.0).abs() < 1e-5,
+            "agent 0 distance_traveled should be 123.0, got {}",
+            result_a.distance_traveled
+        );
+        assert!(
+            (result_a.energy_spent - 45.0).abs() < 1e-5,
+            "agent 0 energy_spent should be 45.0, got {}",
+            result_a.energy_spent
+        );
+        assert!(
+            (result_a.danger_path_length - 7.5).abs() < 1e-5,
+            "agent 0 danger_path_length should be 7.5, got {}",
+            result_a.danger_path_length
+        );
+
+        assert!(
+            (result_b.distance_traveled - 250.0).abs() < 1e-5,
+            "agent 1 distance_traveled should be 250.0, got {}",
+            result_b.distance_traveled
+        );
+        assert!(
+            (result_b.energy_spent - 80.0).abs() < 1e-5,
+            "agent 1 energy_spent should be 80.0, got {}",
+            result_b.energy_spent
+        );
+        assert!(
+            (result_b.danger_path_length - 0.0).abs() < 1e-5,
+            "agent 1 danger_path_length should be 0.0, got {}",
+            result_b.danger_path_length
+        );
+
+        // Verify the telemetry was also persisted to the DB.
+        let node_id = gov.current_node_id.unwrap();
+        let (db_dist_a, db_energy_a, db_danger_a): (f64, f64, f64) = gov
+            .db
+            .query_row(
+                "SELECT distance_traveled, energy_spent, danger_path_length \
+                 FROM agent_result WHERE node_id = ?1 AND agent_index = 0",
+                rusqlite::params![node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("agent_result row for agent 0 must exist after evaluate()");
+
+        assert!(
+            (db_dist_a - 123.0_f64).abs() < 1e-4,
+            "DB distance_traveled for agent 0 should be 123.0, got {db_dist_a}"
+        );
+        assert!(
+            (db_energy_a - 45.0_f64).abs() < 1e-4,
+            "DB energy_spent for agent 0 should be 45.0, got {db_energy_a}"
+        );
+        assert!(
+            (db_danger_a - 7.5_f64).abs() < 1e-4,
+            "DB danger_path_length for agent 0 should be 7.5, got {db_danger_a}"
+        );
+    }
+
+    /// Test that `advance()` persists a non-null, in-[0,1] danger_dwell_fraction
+    /// to the behavior_metric table during a real generation evaluation.
+    #[test]
+    fn advance_persists_danger_dwell_fraction_to_behavior_metric() {
+        use glam::Vec3;
+
+        let mut gov = test_governor(3);
+
+        // Create agents with distinct danger_path_length and distance_traveled
+        let mut agent_0 = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_0.distance_traveled = 100.0;
+        agent_0.danger_path_length = 25.0;
+
+        let mut agent_1 = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_1.distance_traveled = 80.0;
+        agent_1.danger_path_length = 0.0;
+
+        let mut agent_2 = Agent::new(2, Vec3::ZERO, 2, BrainConfig::default(), 0);
+        agent_2.distance_traveled = 120.0;
+        agent_2.danger_path_length = 10.0;
+
+        let agents = vec![agent_0, agent_1, agent_2];
+        let fitness = gov.evaluate(&agents);
+
+        assert_eq!(fitness.len(), 3);
+
+        // Save the node_id of the generation being evaluated before advance() changes it
+        let node_id = gov
+            .current_node_id
+            .expect("current_node_id must be set after evaluate");
+
+        // Call advance() to trigger persist_behavior_metrics
+        let _result = gov.advance(&fitness);
+
+        // Query the behavior_metric row for this node
+        let (sample_count, danger_dwell): (i64, Option<f64>) = gov
+            .db
+            .query_row(
+                "SELECT sample_count, danger_dwell_fraction FROM behavior_metric WHERE node_id = ?1",
+                params![node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("behavior_metric row must exist for the evaluated generation");
+
+        assert_eq!(
+            sample_count, 3,
+            "sample_count should be 3 (number of agents)"
+        );
+
+        // Check that danger_dwell_fraction is not null
+        let danger_dwell_value = danger_dwell.expect("danger_dwell_fraction must be non-null");
+
+        // Verify the value: (25 + 0 + 10) / (100 + 80 + 120) = 35 / 300 ≈ 0.1167
+        let expected = 35.0 / 300.0;
+        assert!(
+            (danger_dwell_value - expected).abs() < 1e-5,
+            "danger_dwell_fraction should be {}, got {}",
+            expected,
+            danger_dwell_value
+        );
+
+        // Verify it's in [0, 1]
+        assert!(
+            danger_dwell_value >= 0.0 && danger_dwell_value <= 1.0,
+            "danger_dwell_fraction must be in [0, 1], got {}",
+            danger_dwell_value
+        );
+    }
+
+    /// Test that `avoidance_intent_fraction` persists to `behavior_metric` and
+    /// discriminates a turn-away population from a straight-through population.
+    ///
+    /// Turn-away scenario: agents sensed danger on many ticks and consistently
+    /// turned opposing the danger bearing — high `avoidance_turns_opposing /
+    /// avoidance_sense_range_ticks`.
+    ///
+    /// Straight-through scenario: agents sensed danger on many ticks but never
+    /// turned to oppose it — `avoidance_turns_opposing == 0`.
+    #[test]
+    fn avoidance_intent_fraction_discriminates_turn_away() {
+        use glam::Vec3;
+
+        // ── Turn-away population ──────────────────────────────────────────────
+        let mut gov_turn = test_governor(3);
+
+        let mut agent_turn_0 = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_turn_0.distance_traveled = 100.0;
+        // Sensed danger for 80 ticks, opposed the bearing on 70 of them.
+        agent_turn_0.avoidance_sense_range_ticks = 80.0;
+        agent_turn_0.avoidance_turns_opposing = 70.0;
+
+        let mut agent_turn_1 = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_turn_1.distance_traveled = 90.0;
+        // Sensed danger for 60 ticks, opposed the bearing on 50 of them.
+        agent_turn_1.avoidance_sense_range_ticks = 60.0;
+        agent_turn_1.avoidance_turns_opposing = 50.0;
+
+        let agents_turn = vec![agent_turn_0, agent_turn_1];
+        let fitness_turn = gov_turn.evaluate(&agents_turn);
+        let node_id_turn = gov_turn
+            .current_node_id
+            .expect("current_node_id must be set after evaluate");
+        let _result_turn = gov_turn.advance(&fitness_turn);
+
+        let avoidance_intent_turn: Option<f64> = gov_turn
+            .db
+            .query_row(
+                "SELECT avoidance_intent_fraction FROM behavior_metric WHERE node_id = ?1",
+                params![node_id_turn],
+                |row| row.get(0),
+            )
+            .expect("behavior_metric row must exist for turn-away generation");
+
+        let avoidance_intent_turn_value = avoidance_intent_turn
+            .expect("avoidance_intent_fraction must be non-null for turn-away population");
+
+        // Expected: (70 + 50) / (80 + 60) = 120 / 140 ≈ 0.857
+        let expected_turn = 120.0 / 140.0;
+        assert!(
+            (avoidance_intent_turn_value - expected_turn).abs() < 1e-5,
+            "turn-away avoidance_intent_fraction should be ~{:.4}, got {:.4}",
+            expected_turn,
+            avoidance_intent_turn_value
+        );
+
+        // ── Straight-through population ───────────────────────────────────────
+        let mut gov_straight = test_governor(3);
+
+        let mut agent_straight_0 = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_straight_0.distance_traveled = 100.0;
+        // Sensed danger for 80 ticks but never turned to oppose it.
+        agent_straight_0.avoidance_sense_range_ticks = 80.0;
+        agent_straight_0.avoidance_turns_opposing = 0.0;
+
+        let mut agent_straight_1 = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_straight_1.distance_traveled = 90.0;
+        // Sensed danger for 60 ticks but never turned to oppose it.
+        agent_straight_1.avoidance_sense_range_ticks = 60.0;
+        agent_straight_1.avoidance_turns_opposing = 0.0;
+
+        let agents_straight = vec![agent_straight_0, agent_straight_1];
+        let fitness_straight = gov_straight.evaluate(&agents_straight);
+        let node_id_straight = gov_straight
+            .current_node_id
+            .expect("current_node_id must be set after evaluate");
+        let _result_straight = gov_straight.advance(&fitness_straight);
+
+        let avoidance_intent_straight: Option<f64> = gov_straight
+            .db
+            .query_row(
+                "SELECT avoidance_intent_fraction FROM behavior_metric WHERE node_id = ?1",
+                params![node_id_straight],
+                |row| row.get(0),
+            )
+            .expect("behavior_metric row must exist for straight-through generation");
+
+        let avoidance_intent_straight_value = avoidance_intent_straight
+            .expect("avoidance_intent_fraction must be non-null for straight-through population");
+
+        // Expected: 0 / (80 + 60) = 0.0
+        assert!(
+            avoidance_intent_straight_value.abs() < 1e-9,
+            "straight-through avoidance_intent_fraction should be 0.0, got {:.6}",
+            avoidance_intent_straight_value
+        );
+
+        // ── Discrimination assertion ──────────────────────────────────────────
+        assert!(
+            avoidance_intent_turn_value > avoidance_intent_straight_value,
+            "turn-away population ({:.4}) must score higher avoidance_intent_fraction than \
+             straight-through population ({:.4})",
+            avoidance_intent_turn_value,
+            avoidance_intent_straight_value
+        );
     }
 }

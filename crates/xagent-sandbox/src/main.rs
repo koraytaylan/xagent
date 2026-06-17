@@ -115,6 +115,15 @@ struct Cli {
     /// retina dimensions come from the brain preset / --config.
     #[arg(long)]
     bench_visual_cortex: bool,
+
+    /// Run speed-decoupling validation (plan 0009): A/B test with all 0009 flags
+    /// off (baseline) vs on, measuring speed↔fitness correlation and other metrics.
+    #[arg(long)]
+    validate_speed_decoupling: bool,
+
+    /// Number of generations for speed-decoupling validation (default: 10)
+    #[arg(long, default_value_t = 10)]
+    validation_generations: u64,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -640,6 +649,11 @@ fn main() {
 
     if cli.dump_tree {
         headless::dump_tree(&cli.db);
+        return;
+    }
+
+    if cli.validate_speed_decoupling {
+        headless::validate_speed_decoupling(config, cli.validation_generations);
         return;
     }
 

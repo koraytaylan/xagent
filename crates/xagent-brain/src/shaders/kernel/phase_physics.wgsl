@@ -113,20 +113,55 @@ fn phase_physics(tid: u32, tick: u32) {
     physics_state[b + P_POS_Y] = pos.y;
     physics_state[b + P_POS_Z] = pos.z;
 
+    // Accumulate distance traveled (planar displacement this tick)
+    let step_len = length(vec2<f32>(pos.x - last_pos.x, pos.z - last_pos.z));
+    physics_state[b + P_DISTANCE_TRAVELED] += step_len;
+
     // Energy depletion (scaled by metabolic_rate from brain config)
     let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
-    // Normalize by default speed (20.0) so baseline energy drain is unchanged;
-    // faster agents pay proportionally more, slower agents pay less.
-    let movement_mag = min(abs(motor_forward) + abs(motor_strafe), 1.414) * (move_speed / 20.0);
+    // Super-linear drag (plan 0009, Layer A): above-baseline-only cost exponent.
+    // Mirror of the identical block in kernel_tick.wgsl — both paths MUST match.
+    // The exponent only activates when speed_ratio >= 1.0 (above baseline). Below
+    // baseline the drag is exactly speed_ratio (same as k=1.0), so sub-baseline
+    // drain is unchanged between k=1.0 and k>1.0: no torpor gradient.
+    //
+    //   k=1.0:                  drag = speed_ratio          (exact old expression, always)
+    //   k>1.0, speed_ratio < 1: drag = speed_ratio          (unchanged from k=1.0)
+    //   k>1.0, speed_ratio >= 1: drag = pow(speed_ratio, k) (super-linear above baseline)
+    let speed_ratio = move_speed / 20.0;
+    let speed_cost_exponent = wc_f32(WC_SPEED_COST_EXPONENT);
+    let above_baseline = speed_ratio >= 1.0;
+    let super_linear_drag = select(speed_ratio, pow(speed_ratio, speed_cost_exponent), above_baseline);
+    let drag = select(super_linear_drag, speed_ratio, speed_cost_exponent == 1.0);
+    let movement_mag = min(abs(motor_forward) + abs(motor_strafe), 1.414) * drag;
     var energy = physics_state[b + P_ENERGY];
-    energy -= wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
-    energy -= movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;
+    let depletion_drain = wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
+    let movement_drain = movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;
+    energy -= depletion_drain;
+    energy -= movement_drain;
+    // Accumulate total energy spent this tick
+    physics_state[b + P_ENERGY_SPENT] += depletion_drain + movement_drain;
 
     // Biome damage (scaled by integrity_scale from brain config)
     let integrity_scale = bc_f32(CFG_INTEGRITY_SCALE);
     let biome_type = sample_biome(pos.x, pos.z);
-    if biome_type == BIOME_DANGER {
-        physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY] - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale;
+    let in_danger = (biome_type == BIOME_DANGER);
+    if in_danger {
+        // Path-length hazard dose (plan 0009, Layer B): integrity loss is proportional
+        // to the distance traveled through danger this tick, not to the number of ticks
+        // spent in it. reference_step is a default-speed agent's per-tick displacement
+        // (default_speed * dt = 20.0 * WC_DT), so a default-speed agent (step_len ≈
+        // reference_step) takes byte-identical per-tick damage to the old per-tick model,
+        // a 2× agent pays 2× per tick over half the ticks (the same dose per crossing),
+        // and a stationary agent (step_len = 0) takes zero dose. NO floor on step_len:
+        // dose is strictly proportional to path length.
+        let reference_step = 20.0 * wc_f32(WC_DT);
+        physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY]
+            - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale * (step_len / max(reference_step, EPSILON));
+        physics_state[b + P_IN_DANGER_BIOME] = 1.0;
+        physics_state[b + P_DANGER_PATH_LENGTH] += step_len;
+    } else {
+        physics_state[b + P_IN_DANGER_BIOME] = 0.0;
     }
 
     // Integrity regen when energy > 50%
@@ -157,5 +192,75 @@ fn phase_physics(tid: u32, tick: u32) {
     } else {
         // Increment ticks alive (stored as f32, safe for integers up to 2^24)
         physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;
+    }
+
+    // Danger detection: scan biome grid for nearest danger cell
+    let biome_inv = wc_f32(WC_BIOME_INV_CELL);
+    let biome_half = wc_f32(WC_TERRAIN_HALF);
+
+    let sense_radius = DANGER_SENSE_RADIUS;
+    let cell_size = 1.0 / biome_inv;
+    let max_cell_delta = u32(ceil(sense_radius / cell_size)) + 1u;
+
+    var best_distance = sense_radius;
+    var best_bearing = 0.0;
+    var found_danger = false;
+
+    // Scan square region of cells around agent
+    let agent_col_i = i32((pos.x + biome_half) * biome_inv);
+    let agent_row_i = i32((pos.z + biome_half) * biome_inv);
+
+    for (var dr = -i32(max_cell_delta); dr <= i32(max_cell_delta); dr++) {
+        for (var dc = -i32(max_cell_delta); dc <= i32(max_cell_delta); dc++) {
+            let row = u32(clamp(agent_row_i + dr, 0, 255));
+            let col = u32(clamp(agent_col_i + dc, 0, 255));
+
+            if (sample_biome(f32(col) / biome_inv - biome_half + 0.5 / biome_inv,
+                             f32(row) / biome_inv - biome_half + 0.5 / biome_inv) == BIOME_DANGER) {
+                // Compute world position of cell center
+                let cell_x = (f32(col) + 0.5) / biome_inv - biome_half;
+                let cell_z = (f32(row) + 0.5) / biome_inv - biome_half;
+                let to_danger = vec3f(cell_x - pos.x, 0.0, cell_z - pos.z);
+                let dist = length(to_danger);
+
+                if (dist < best_distance && dist < sense_radius) {
+                    best_distance = dist;
+                    found_danger = true;
+
+                    // Compute signed bearing from facing direction
+                    let facing_x = physics_state[b + P_FACING_X];
+                    let facing_z = physics_state[b + P_FACING_Z];
+                    let cross_y = facing_x * to_danger.z - facing_z * to_danger.x;
+                    let dot_val = facing_x * to_danger.x + facing_z * to_danger.z;
+                    best_bearing = atan2(cross_y, dot_val);
+                }
+            }
+        }
+    }
+
+    if (found_danger) {
+        physics_state[b + P_NEAREST_DANGER_DISTANCE] = best_distance;
+        physics_state[b + P_NEAREST_DANGER_BEARING] = best_bearing;
+    } else {
+        physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
+        physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
+    }
+
+    // Avoidance intent: accumulate fraction of ticks where danger was in sense range
+    // and motor turn opposed the danger bearing (deliberate turn-away).
+    let danger_distance = physics_state[b + P_NEAREST_DANGER_DISTANCE];
+    let danger_bearing = physics_state[b + P_NEAREST_DANGER_BEARING];
+    if danger_distance < DANGER_SENSE_RADIUS {
+        // Danger is in sense range; count this tick
+        physics_state[b + P_AVOIDANCE_SENSE_RANGE_TICKS] += 1.0;
+
+        // Check if motor turn opposes the danger bearing (turn away = negative product)
+        // motor_turn is in [-1, 1], positive = turn right, negative = turn left
+        // danger_bearing is signed: positive = danger to the right, negative = danger to the left
+        // Turn-away means motor_turn and danger_bearing have opposite signs
+        let turn_opposes_bearing = (motor_turn * danger_bearing) < 0.0;
+        if turn_opposes_bearing {
+            physics_state[b + P_AVOIDANCE_TURNS_OPPOSING] += 1.0;
+        }
     }
 }

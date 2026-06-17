@@ -541,6 +541,16 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     if (alive && 0u < limit) { coop_feature_extract(agent_id, tid); }
     workgroupBarrier();
 
+    // Visual cortex (plan 0008): inserted between feature extraction and encode.
+    // It belongs to the early-visual stage, so it shares feature-extract's
+    // profiling slot (`0u < limit`) rather than consuming a new `pass_limit`
+    // index — keeping the seven counted passes (0..6) and the default limit of 7
+    // unchanged. With `CFG_VISUAL_CORTEX_ENABLED` off (or in the passthrough
+    // skeleton) it is a no-op, so the encoded state stays byte-identical to the
+    // pre-task build. The guard is workgroup-uniform and precedes the barrier.
+    if (alive && 0u < limit) { coop_visual_cortex(agent_id, tid); }
+    workgroupBarrier();
+
     if (alive && 1u < limit) { coop_encode(agent_id, tid); }
     workgroupBarrier();
 

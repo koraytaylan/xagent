@@ -108,6 +108,13 @@ struct Cli {
     /// --world-size (--bench-agents is ignored — the sweep sets N itself).
     #[arg(long)]
     bench_agent_sweep: bool,
+
+    /// A/B the visual-cortex pass cost: full-pipeline tps with
+    /// visual_cortex_enabled OFF vs. ON at the configured retina resolution
+    /// (plan 0008). Honors --bench-ticks / --bench-agents / --world-size; the
+    /// retina dimensions come from the brain preset / --config.
+    #[arg(long)]
+    bench_visual_cortex: bool,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -597,6 +604,21 @@ fn main() {
         // knee neighborhood (100–200), and the plateau (400–1000).
         let counts = [1usize, 4, 10, 50, 100, 200, 400, 1000];
         xagent_sandbox::bench::run_agent_sweep(config.brain, config.world, total_ticks, &counts);
+        return;
+    }
+
+    if cli.bench_visual_cortex {
+        let agent_count = cli.bench_agents;
+        let total_ticks = cli.bench_ticks;
+        if let Some(ws) = cli.world_size {
+            config.world.world_size = ws;
+        }
+        xagent_sandbox::bench::run_visual_cortex_ab(
+            config.brain,
+            config.world,
+            agent_count,
+            total_ticks,
+        );
         return;
     }
 

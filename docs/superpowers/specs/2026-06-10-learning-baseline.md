@@ -880,3 +880,69 @@ remains an **offline** run, deferred via
 `docs/plans/0007-Learning-Control-Grounding/DECISION-short-evolution-gate.md`
 (must use a build at/after the danger-flag fix, since pre-fix danger-dwell is
 inverted and not comparable to the baseline here).
+
+## Plan 0008 — Hubel-Wiesel Visual Encoder (landed 2026-06-17)
+
+Continuity append (not a replacement). Plan 0008 gives the brain a
+biologically-seeded early-visual-cortex front end: a new cooperative
+`coop_visual_cortex` pass (between `coop_feature_extract` and `coop_encode`) runs
+a dense luminance retina (curriculum default **32×32**) → Difference-of-Gaussians
+center-surround → an oriented **4 × 2 × 2** (orientation × scale × quadrature
+phase) Gabor simple-cell bank → quadrature-energy + 4×4 MAX-pooled complex cells
+= **128 features** (`VISUAL_FEATURE_COUNT`). Four heritable global-bank genes
+(`gabor_wavelength`, `gabor_aspect_ratio`, `dog_surround_ratio`,
+`orientation_offset`) were wired end-to-end (defaults/presets, mutation+clamps,
+crossover, momentum, provenance, brain-state tail, UI), invariants re-imposed
+after mutation (DoG zero-sum, Gabor DC-balance). `visual_encoding_size` retired
+(closes #106). The live worker re-applies the genome via plan 0007's
+`patch_agent_configs`. All behind `visual_cortex_enabled` (default **`false`**).
+
+**Probes — PASS (mechanical correctness; M3 Max / Metal, real adapter, not
+self-skipped).** These are the scientific acceptance criteria, red-green:
+
+| Probe | Threshold | Measured | Result |
+|---|---|---:|---|
+| orientation selectivity — vertical bar, preferred ÷ orthogonal energy | ≥ 3.0× | **6.97×** | PASS |
+| orientation selectivity — swept tuning curve | unimodal, peak at vertical | peak at vertical, tail < peak/3 | PASS |
+| orientation selectivity — isotropic control | ≪ 3× | **1.0×** | PASS (discriminating) |
+| complex-cell phase invariance — half-λ carrier shift | < 10% | **≈ 1.6e-7** | PASS |
+| complex-cell phase invariance — single-phase control | ≥ 10% (must break) | breaks | PASS (discriminating) |
+| complex-cell position tolerance — 1 px shift | < 15% | **≈ 7.8%** | PASS |
+| complex-cell position tolerance — 8 px far-shift control | > 15% (must break) | **≈ 39.8%** | PASS (discriminating) |
+
+The Hubel & Wiesel result holds mechanically: a vertical bar drives the
+vertical-tuned simple cell ~7× the orthogonal cell with a unimodal tuning curve,
+and complex cells are phase-invariant (~5 significant figures) and position-
+tolerant while still discriminating a real translation.
+
+**Throughput — gate HELD (default not flipped).** Full-pipeline tps,
+`--bench-visual-cortex --bench-agents 10 --bench-ticks 20000`, retina 32×32,
+4×2×2 Gabor bank → 128 complex features, M3 Max / Metal, `--release`:
+
+| Arm | tps | Retained vs OFF |
+|---|---:|---|
+| `visual_cortex_enabled` OFF (0006-fused baseline) | ≈ **34,000** | — |
+| `visual_cortex_enabled` ON (retina 32×32, 128-feature bank) | ≈ **81** | **≈ 0.24%** (≈ 420× slower) |
+
+0.24% retained is ~210× under the ≥50% budget, so the gated
+`visual-encoder-default-gate` **HOLDS** `visual_cortex_enabled` at `false` (the
+gate is the conjunction probes **AND** throughput; one failing condition holds).
+The cost is structural — a 1024-pixel DoG, then 16 Gabor convolutions over the
+retina, then energy + MAX pooling, all serial in one 256-thread workgroup per
+agent — not a hot-loop inefficiency, so it must be *designed* down. The cortex
+ships complete and proven-correct behind the flag (flag-off is byte-identical to
+the pre-plan build via `visual_cortex_passthrough_is_byte_identical`).
+
+Per SCOPE, this plan's success is **mechanical, not an evolutionary fitness
+gain** (the outer loop is still stalled per plan 0007). Follow-up
+(cheapest-first, each re-running this same gate): shrink the retina (16×16/24×24,
+curriculum-gated), cheaper pooling / smaller bank, separable convolution.
+Per-filter genome widening stays separately gated on a *demonstrated evolutionary
+signal* on the four bank genes. Decision artifact:
+`docs/plans/0008-Hubel-Wiesel-Visual-Encoder/0008-VISUAL-CORTEX-BASELINE.md`.
+
+**Gate (repo root, isolated target dir to avoid the stale `xagent-brain` rlib
+trap):** `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace --no-fail-fast` =
+68 brain + 88 sandbox-lib + 14 bin + 83 integration + 7 doctest, **0 failed**;
+GPU probes ran on the real Metal adapter.

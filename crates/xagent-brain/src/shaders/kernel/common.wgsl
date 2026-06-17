@@ -13,6 +13,119 @@
 override VISION_W: u32 = 8u;
 override VISION_H: u32 = 6u;
 
+// ── Retina grid (pipeline-overridable constants) ───────────────────────────
+// RETINA_WIDTH / RETINA_HEIGHT are the retinotopic luminance grid dimensions
+// (config `retina_width` / `retina_height`, plan 0008). They are locked per
+// batch and independent of the legacy VISION_W × VISION_H sensory grid.
+// Supplied by the Rust host at pipeline creation via `vision_override_constants()`;
+// the defaults below keep the shader standalone-compilable at the 32×32 retina.
+// RETINA_PIXEL_COUNT is derived as RETINA_WIDTH × RETINA_HEIGHT — it is the
+// single canonical source for sizing the cortex workgroup scratch, and the
+// visual-cortex stages reconstruct 2-D pixel coordinates from the width so no
+// stride is hardcoded.
+override RETINA_WIDTH: u32 = 32u;
+override RETINA_HEIGHT: u32 = 32u;
+override RETINA_PIXEL_COUNT: u32 = RETINA_WIDTH * RETINA_HEIGHT;
+
+// ── DoG center-surround seed constants (plan 0008 center-surround-dog) ───────
+// Stage 1 of the visual cortex is a zero-sum Difference-of-Gaussians:
+//   DoG(x,y) = G(x,y; σ_center) − G(x,y; σ_surround),  σ_surround = ratio·σ_center
+// with unit-volume Gaussians so ∑ DoG = 0 exactly (a local-contrast / edge
+// operator, Rodieck 1965; Marr & Hildreth 1980). σ_center is a fixed per-batch
+// seed; the surround ratio seed is 1.6 (Marr & Hildreth) and becomes the
+// heritable `dog_surround_ratio` gene in plan 0003 — until then the seed is read
+// here. These literals are the single canonical source, mirrored by the Rust
+// `dog` module constants and exercised by the `dog_kernel_sums_to_zero` probe.
+const DOG_SIGMA_CENTER: f32 = 1.0;
+const DOG_SURROUND_RATIO_SEED: f32 = 1.6;
+// Kernel truncation radius: 3σ of the larger (surround) Gaussian, the standard
+// edge-operator support. Half-width in pixels = ceil(3·σ_surround).
+const DOG_SUPPORT_SIGMAS: f32 = 3.0;
+// Surround-ratio clamp (the plan-0003 `dog_surround_ratio` gene bounds, re-imposed
+// in `coop_visual_cortex` after reading the gene). The MIN keeps the kernel an
+// edge operator (below ~1.2 the DoG degenerates into a blur); the MAX bounds the
+// kernel support so the convolution loop stays finite even when the heritable gene
+// grows the surround sigma. Mirror the Rust `dog::DOG_SURROUND_RATIO_{MIN,MAX}`.
+const DOG_SURROUND_RATIO_MIN: f32 = 1.2;
+const DOG_SURROUND_RATIO_MAX: f32 = 3.0;
+// Worst-case kernel half-width (radius), ≥ the seeded kernel. It clamps the
+// convolution radius so the per-tap loop is bounded:
+//   radius = ceil(DOG_SUPPORT_SIGMAS · DOG_SURROUND_RATIO_MAX · DOG_SIGMA_CENTER)
+//          = ceil(3·3·1) = 9  (side 19, ≤ 361 taps).
+const DOG_KERNEL_MAX_RADIUS: u32 = 9u;
+
+// ── Gabor simple-cell bank seed constants (plan 0008 gabor-simple-cells) ─────
+// Stage 2 of the visual cortex is an orientation-selective Gabor bank — the
+// validated quantitative model of a V1 simple-cell receptive field (Jones &
+// Palmer 1987); the elongated alternating ON/OFF lobes are Hubel & Wiesel's
+// (1962) "aligned row of LGN inputs". Each filter is a DC-balanced 2-D Gabor:
+//   x' =  x·cosθ + y·sinθ ,   y' = −x·sinθ + y·cosθ
+//   Gabor(x,y) = exp( −(x'² + γ²·y'²)/(2σ²) ) · cos( 2π·x'/λ + ψ )
+// computed analytically per tap and mean-subtracted so ∑ Gabor = 0 (the DC
+// balance the `gabor_kernels_are_dc_balanced` probe pins). These literals are
+// the single canonical source, mirrored by the Rust `gabor` module and read in
+// `brain_passes.wgsl::coop_visual_cortex` Stage 2.
+//
+// Bank dimensions: orientations tiled over [0, π) (HMAX S1, Riesenhuber & Poggio
+// 1999), scales one octave apart, and a single quadrature phase pair (even ψ=0,
+// odd ψ=π/2). The complex-cell energy step pools over scale and position but
+// NEVER over the two phases, so GABOR_PHASES stays 2.
+const GABOR_ORIENTATIONS: u32 = 4u;   // 0, 45, 90, 135°
+const GABOR_SCALES: u32 = 2u;
+const GABOR_PHASES: u32 = 2u;          // quadrature pair {0, π/2}
+// Carrier wavelength λ seed in retina pixels (heritable `gabor_wavelength` gene,
+// plan 0003; seed read here until then). Envelope σ = GABOR_SIGMA_LAMBDA_RATIO·λ.
+const GABOR_WAVELENGTH_SEED: f32 = 5.0;
+// Envelope aspect ratio γ seed (long axis / short axis; heritable
+// `gabor_aspect_ratio` gene, plan 0003).
+const GABOR_ASPECT_RATIO_SEED: f32 = 0.5;
+// Whole-bank orientation offset seed in radians, added to the even [0,π) tiling
+// (heritable `orientation_offset` gene, plan 0003).
+const GABOR_ORIENTATION_OFFSET_SEED: f32 = 0.0;
+// σ as a fraction of λ — 0.56 gives the ≈1-octave V1 spatial-frequency bandwidth.
+const GABOR_SIGMA_LAMBDA_RATIO: f32 = 0.56;
+// Wavelength ratio between successive scale bands (one octave per band).
+const GABOR_SCALE_STEP: f32 = 2.0;
+// Kernel truncation radius in sigmas (3σ of the envelope).
+const GABOR_SUPPORT_SIGMAS: f32 = 3.0;
+// Gene clamps (plan-0003 `gabor_wavelength` / `gabor_aspect_ratio` bounds),
+// re-imposed in the shader after reading the genes so a mutated value can never
+// undersample the carrier or grow the kernel support past the worst-case radius.
+const GABOR_WAVELENGTH_MIN: f32 = 2.0;
+const GABOR_WAVELENGTH_MAX: f32 = 12.0;
+const GABOR_ASPECT_RATIO_MIN: f32 = 0.25;
+const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
+// Worst-case kernel half-width (radius), ≥ the largest seeded kernel. Bounds the
+// per-tap convolution loop:
+//   λ_max band = min(GABOR_WAVELENGTH_MAX · GABOR_SCALE_STEP, GABOR_WAVELENGTH_MAX)
+//              = 12 (clamped); σ = 0.56·12 = 6.72; radius = ceil(3·6.72) = 21
+// (side 43). The seeded bank's largest band is λ = 10 → σ = 5.6 → radius 17.
+const GABOR_KERNEL_MAX_RADIUS: u32 = 21u;
+
+// ── Complex-cell MAX-pool grid (plan 0008 complex-cell-energy-pool) ─────────
+// Stage 3 MAX-pools the per-pixel quadrature energy E_{θ,λ}(x,y) over a coarse
+// POOL_ROWS × POOL_COLS spatial grid (HMAX C1 position tolerance, Riesenhuber &
+// Poggio 1999). Each pool cell covers a contiguous block of the retina and the
+// blocks overlap ~50% (the half-block-margin in `pool_bounds`), so a small
+// position shift of an oriented bar stays inside the same cell — the
+// `complex_cell_position_tolerance` probe (0005) pins this. 4 × 4 = 16 cells
+// per (orientation, scale) is the standard HMAX C1 grid. Single canonical source
+// mirrored by `POOL_ROWS` / `POOL_COLS` in the Rust `complex` module.
+const POOL_ROWS: u32 = 4u;
+const POOL_COLS: u32 = 4u;
+
+// ── Visual cortex feature vector size (plan 0008) ──────────────────────────
+// VISUAL_FEATURE_COUNT is the length of the complex-cell output the visual
+// cortex pass writes back to the head of `s_features`:
+// GABOR_ORIENTATIONS × GABOR_SCALES × POOL_ROWS × POOL_COLS (4 × 2 × 4 × 4
+// = 128). It is the canonical source for sizing the cortex workgroup scratch and
+// is derived from the bank/pool constants (no longer a bare literal) so the bank
+// or pool grid can grow without a stale length drifting from the math. Mirrored
+// by `VISUAL_FEATURE_COUNT` in the Rust `complex` module and echoed-and-validated
+// against `BrainLayout` (the `representation_dimension` precedent).
+const VISUAL_FEATURE_COUNT: u32 =
+    GABOR_ORIENTATIONS * GABOR_SCALES * POOL_ROWS * POOL_COLS;
+
 // ── Derived vision / sensory constants ─────────────────────────────────────
 // Expressions that read `override` inputs must themselves be `override` —
 // they are evaluated at pipeline creation time, not shader-module creation.
@@ -27,7 +140,39 @@ override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 
 const ENCODED_DIMENSION: u32 = 128u;
 const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
-override FEATURE_COUNT: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 25u;
+
+// Non-visual feature tail (plan 0008 wire-visual-features-into-encoder): the
+// proprioception / interoception / touch features `coop_feature_extract` writes
+// after the visual block — velocity magnitude(1) + facing(3) + angular(1) +
+// energy ratio(1) + integrity ratio(1) + energy delta(1) + integrity delta(1) +
+// touch(16) = 25. Single canonical source, mirrored by `NON_VISUAL_FEATURE_COUNT`
+// in `buffers.rs`. It is the same in both encoder layouts (flag on/off); only the
+// leading visual block changes width.
+const NON_VISUAL_FEATURE_COUNT: u32 = 25u;
+
+// Visual-cortex encoder-input selector (plan 0008 wire-visual-features-into-encoder).
+// Supplied by the Rust host at pipeline creation via `vision_override_constants()`
+// from `BrainConfig::visual_cortex_enabled` (1u = on, 0u = off). It is the SAME
+// boolean as the runtime `CFG_VISUAL_CORTEX_ENABLED` uniform, but the encoder
+// input WIDTH (`FEATURE_COUNT`, which sizes the encoder weight matrix and every
+// brain buffer) must be fixed at pipeline-creation time, not read per tick — so
+// the width is selected by this pipeline override while the per-pass behavior
+// (where `coop_feature_extract` places the non-visual tail, whether the cortex
+// runs) is gated on the matching uniform. Both come from the one config field, so
+// they agree by construction. Locked per batch.
+override VISUAL_CORTEX_FEATURES_ACTIVE: u32 = 0u;
+
+// Encoder input width. Flag off: the legacy raw-vision slice
+// (VISION_COLOR_COUNT + VISION_DEPTH_COUNT) + the non-visual tail — byte-identical
+// to the pre-cortex build. Flag on: the compact complex-cell vector
+// (VISUAL_FEATURE_COUNT) + the same non-visual tail. Selected by arithmetic on the
+// pipeline override (no runtime branch); `BrainLayout::with_retina_flagged`
+// mirrors this exact formula so the Rust buffer sizing and the WGSL offsets agree.
+// `active` is 0u or 1u, so exactly one term survives.
+override FEATURE_COUNT: u32 =
+    (1u - VISUAL_CORTEX_FEATURES_ACTIVE) * (VISION_COLOR_COUNT + VISION_DEPTH_COUNT)
+    + VISUAL_CORTEX_FEATURES_ACTIVE * VISUAL_FEATURE_COUNT
+    + NON_VISUAL_FEATURE_COUNT;
 const MEMORY_CAP: u32 = 128u;
 const RECALL_K: u32 = 16u;
 const ERROR_HISTORY_LEN: u32 = 128u;
@@ -64,12 +209,22 @@ override O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
 override O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
 override O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 
+// ── Visual-genome tail (plan 0008 visual-genome-config) ─────────────────────
+// Four heritable Gabor/DoG bank genes, contiguous right after O_MOVEMENT_SPEED.
+// `coop_visual_cortex` reads them from brain_state and re-imposes the gene clamps
+// + the DoG zero-sum / Gabor DC-balance invariants. Mirrors the O_GABOR_* /
+// O_DOG_SURROUND_RATIO / O_ORIENTATION_OFFSET constants in `buffers.rs`.
+override O_GABOR_WAVELENGTH: u32 = O_MOVEMENT_SPEED + 1u;
+override O_GABOR_ASPECT_RATIO: u32 = O_GABOR_WAVELENGTH + 1u;
+override O_DOG_SURROUND_RATIO: u32 = O_GABOR_ASPECT_RATIO + 1u;
+override O_ORIENTATION_OFFSET: u32 = O_DOG_SURROUND_RATIO + 1u;
+
 // ── TD(λ) critic state ──────────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
 // [critic_bias, forward_bias, turn_bias].
 
-override O_VALUE_WEIGHTS: u32 = O_MOVEMENT_SPEED + 1u;
+override O_VALUE_WEIGHTS: u32 = O_ORIENTATION_OFFSET + 1u;
 override O_VALUE_BIAS: u32 = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
 override O_PREV_VALUE: u32 = O_VALUE_BIAS + 1u;
 override O_TRACE_CRITIC: u32 = O_PREV_VALUE + 1u;
@@ -127,6 +282,9 @@ const CFG_DECAY_RATE: u32 = 5u;
 const CFG_DISTRESS_EXP: u32 = 6u;
 const CFG_METABOLIC_RATE: u32 = 7u;
 const CFG_INTEGRITY_SCALE: u32 = 8u;
+// Visual-cortex gate flag (plan 0008): 1.0 runs the Hubel-Wiesel cortex pass,
+// 0.0 is a no-op passthrough. Mirrors `CFG_VISUAL_CORTEX_ENABLED` in buffers.rs.
+const CFG_VISUAL_CORTEX_ENABLED: u32 = 9u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
@@ -180,6 +338,10 @@ const FOOD_RESPAWN_TIMER: u32 = 3u;
 
 const PI: f32 = 3.14159265;
 const TWO_PI: f32 = 6.28318530;
+// Small positive floor for divisions (CONTRIBUTING numeric safety:
+// `max(denominator, EPSILON)` before every division). Used by the visual-cortex
+// stages and any other pass guarding a divide-by-zero.
+const EPSILON: f32 = 1e-6;
 
 // ── Physics constants ───────────────────────────────────────────────────────
 
@@ -461,4 +623,23 @@ fn fast_tanh(x: f32) -> f32 {
 
 fn is_finite(v: f32) -> bool {
     return v == v && abs(v) < 3.4e38;
+}
+
+// ── Retina luminance (plan 0008, Stage 0) ───────────────────────────────────
+// Linear (Rec. 709) luminance of a raycast hit color, the single-channel field
+// L(x,y) the visual cortex operates on. Convolution kernels are linear
+// operators, so they act on linear-light luminance, not gamma-encoded RGB. Hit
+// colors are authored in linear space, so no inverse-gamma is applied.
+//
+// The weights MUST sum to 1.0; the Rust test `luminance_weights_sum_to_one`
+// recomputes the same three literals and guards against a typo drifting them.
+//
+// No brightness-normalization pass precedes Stage 1: DC (mean luminance) is
+// rejected downstream by the zero-sum DoG and the DC-balanced Gabor bank, so
+// only local contrast — not absolute brightness — survives into the cortex.
+//
+// Rec. 709 luminance weights (single canonical source; mirrored in the Rust
+// test): 0.2126 (R) + 0.7152 (G) + 0.0722 (B) = 1.0.
+fn retina_luminance(color: vec3<f32>) -> f32 {
+    return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
 }

@@ -132,6 +132,10 @@ impl MutationMomentum {
             ("max_curiosity_bonus", parent.max_curiosity_bonus),
             ("fatigue_floor", parent.fatigue_floor),
             ("movement_speed", parent.movement_speed),
+            ("gabor_wavelength", parent.gabor_wavelength),
+            ("gabor_aspect_ratio", parent.gabor_aspect_ratio),
+            ("dog_surround_ratio", parent.dog_surround_ratio),
+            ("orientation_offset", parent.orientation_offset),
         ];
 
         for (name, parent_val) in &params {
@@ -149,6 +153,10 @@ impl MutationMomentum {
                         "max_curiosity_bonus" => w.max_curiosity_bonus,
                         "fatigue_floor" => w.fatigue_floor,
                         "movement_speed" => w.movement_speed,
+                        "gabor_wavelength" => w.gabor_wavelength,
+                        "gabor_aspect_ratio" => w.gabor_aspect_ratio,
+                        "dog_surround_ratio" => w.dog_surround_ratio,
+                        "orientation_offset" => w.orientation_offset,
                         _ => *parent_val,
                     };
                     w_val - parent_val

@@ -12,6 +12,8 @@ use std::sync::atomic::AtomicBool;
 
 use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 
+use crate::complex::VISUAL_FEATURE_COUNT;
+
 /// First-hit guard for the `representation_dimension` vs `ENCODED_DIMENSION`
 /// mismatch warning in `build_config_for`. `build_config_for` runs on every
 /// `GpuKernel::reset_agents*` and on each evolution-spawned config, so without
@@ -28,7 +30,18 @@ pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
 /// `BrainLayout::feature_count` for any live layout. The static constants
 /// remain valid as tail *deltas* (`O_X - O_PREDICTOR_CONTEXT_WEIGHT`) for
 /// every layout, because the tail is vision-independent.
-const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + 25;
+const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + NON_VISUAL_FEATURE_COUNT;
+/// Non-visual feature tail width (plan 0008 wire-visual-features-into-encoder):
+/// the proprioception / interoception / touch features `coop_feature_extract`
+/// writes after the visual block — velocity magnitude(1) + facing(3) +
+/// angular(1) + energy ratio(1) + integrity ratio(1) + energy delta(1) +
+/// integrity delta(1) + touch(16) = 25. It is the same in both encoder layouts;
+/// only the leading visual block changes width with the cortex flag. Single
+/// canonical source mirrored by `NON_VISUAL_FEATURE_COUNT` in `common.wgsl`. Note
+/// this differs from `NON_VISUAL_COUNT` (27, the *sensory upload* width) by the
+/// two energy/integrity delta slots the brain re-reads same-cycle from physics
+/// rather than from the batch-lagged sensory buffer.
+pub const NON_VISUAL_FEATURE_COUNT: usize = 25;
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const INITIAL_FORWARD_BIAS: f32 = 0.3;
@@ -82,12 +95,23 @@ pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1;
 pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1;
 pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1;
 
+// ── Visual-genome tail (plan 0008 visual-genome-config) ───────────────
+// Four heritable Gabor/DoG bank genes, contiguous right after
+// `O_MOVEMENT_SPEED`, written per agent by `write_agent_heritable_config`
+// and read by the `coop_visual_cortex` shader pass. Mirrored by the
+// `O_GABOR_*` / `O_DOG_SURROUND_RATIO` / `O_ORIENTATION_OFFSET` overrides in
+// `common.wgsl`. Order matches `write_agent_heritable_config`'s `values` array.
+pub const O_GABOR_WAVELENGTH: usize = O_MOVEMENT_SPEED + 1;
+pub const O_GABOR_ASPECT_RATIO: usize = O_GABOR_WAVELENGTH + 1;
+pub const O_DOG_SURROUND_RATIO: usize = O_GABOR_ASPECT_RATIO + 1;
+pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
+
 // ── TD(λ) critic state ────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
 // [critic_bias, forward_bias, turn_bias].
 
-pub const O_VALUE_WEIGHTS: usize = O_MOVEMENT_SPEED + 1;
+pub const O_VALUE_WEIGHTS: usize = O_ORIENTATION_OFFSET + 1;
 pub const O_VALUE_BIAS: usize = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
 pub const O_PREV_VALUE: usize = O_VALUE_BIAS + 1;
 pub const O_TRACE_CRITIC: usize = O_PREV_VALUE + 1;
@@ -189,6 +213,23 @@ pub struct BrainLayout {
     pub vision_height: u32,
     pub vision_color_count: usize,
     pub vision_depth_count: usize,
+    /// Retinotopic luminance grid width the visual cortex operates on. Locked
+    /// per batch (config `retina_width`), independent of the legacy sensory
+    /// vision grid. See `xagent_shared::BrainConfig::retina_width`.
+    pub retina_width: usize,
+    /// Retinotopic luminance grid height; see `retina_width`.
+    pub retina_height: usize,
+    /// `retina_width * retina_height` — number of pixels in the cortex retina.
+    /// Validated with `checked_mul` so an oversized retina is a configuration
+    /// error, not a silent overflow.
+    pub retina_pixel_count: usize,
+    /// Whether this layout sizes the encoder for the Hubel-Wiesel visual cortex
+    /// (plan 0008). When `true`, `feature_count` is the compact complex-cell
+    /// vector + non-visual tail (`VISUAL_FEATURE_COUNT + NON_VISUAL_FEATURE_COUNT`);
+    /// when `false` it is the legacy raw-vision slice + non-visual tail. Must
+    /// match `BrainConfig::visual_cortex_enabled` and the WGSL FEATURE_COUNT
+    /// pipeline override (`vision_override_constants`). Locked per batch.
+    pub visual_cortex_enabled: bool,
     pub feature_count: usize,
     pub sensory_stride: usize,
     pub brain_stride: usize,
@@ -196,7 +237,72 @@ pub struct BrainLayout {
 }
 
 impl BrainLayout {
+    /// Build a layout for the given vision grid, deriving the retina grid from
+    /// `BrainConfig::default()` (curriculum default 32×32). Use
+    /// [`BrainLayout::with_retina`] to set an explicit retina resolution.
     pub fn new(vision_width: u32, vision_height: u32) -> Self {
+        let defaults = BrainConfig::default();
+        Self::with_retina(
+            vision_width,
+            vision_height,
+            defaults.retina_width,
+            defaults.retina_height,
+        )
+    }
+
+    /// Build a layout from a full [`BrainConfig`], threading the vision grid,
+    /// the configured retina resolution, AND the visual-cortex flag — so the
+    /// encoder width matches `BrainConfig::visual_cortex_enabled`. This is the
+    /// constructor `GpuKernel::new` uses; the flag must agree with the WGSL
+    /// FEATURE_COUNT pipeline override (`vision_override_constants`).
+    pub fn from_config(config: &BrainConfig) -> Self {
+        Self::with_retina_flagged(
+            config.vision_width,
+            config.vision_height,
+            config.retina_width,
+            config.retina_height,
+            config.visual_cortex_enabled,
+        )
+    }
+
+    /// Build a layout with an explicit retina grid and the legacy raw-vision
+    /// encoder width (visual cortex off). For the cortex-on width use
+    /// [`BrainLayout::from_config`] (or [`BrainLayout::with_retina_flagged`]).
+    pub fn with_retina(
+        vision_width: u32,
+        vision_height: u32,
+        retina_width: usize,
+        retina_height: usize,
+    ) -> Self {
+        Self::with_retina_flagged(
+            vision_width,
+            vision_height,
+            retina_width,
+            retina_height,
+            false,
+        )
+    }
+
+    /// Build a layout with an explicit retina grid and visual-cortex flag.
+    /// `retina_pixel_count` is validated with `checked_mul`; an oversized retina
+    /// is a configuration error, not a silent overflow.
+    ///
+    /// `visual_cortex_enabled` selects the encoder input width (the leading
+    /// visual block of `feature_count`), mirroring the WGSL FEATURE_COUNT override
+    /// in `common.wgsl` exactly:
+    ///   off — legacy raw-vision slice (`color_count + depth_count`)
+    ///   on  — compact complex-cell vector (`VISUAL_FEATURE_COUNT`)
+    /// plus the unchanged `NON_VISUAL_FEATURE_COUNT` tail in both cases.
+    pub fn with_retina_flagged(
+        vision_width: u32,
+        vision_height: u32,
+        retina_width: usize,
+        retina_height: usize,
+        visual_cortex_enabled: bool,
+    ) -> Self {
+        let retina_pixel_count = retina_width
+            .checked_mul(retina_height)
+            .expect("retina pixel count overflow");
         let pixel_count = (vision_width as usize)
             .checked_mul(vision_height as usize)
             .expect("vision dimensions overflow pixel count");
@@ -204,9 +310,18 @@ impl BrainLayout {
             .checked_mul(4)
             .expect("vision dimensions overflow color count");
         let depth_count = pixel_count;
-        let feature_count = color_count
-            .checked_add(depth_count)
-            .and_then(|v| v.checked_add(25))
+        // Encoder visual-block width: the complex-cell vector when the cortex is
+        // on, else the legacy raw-vision slice. Mirrors the WGSL FEATURE_COUNT
+        // override (single canonical formula across Rust ↔ WGSL).
+        let visual_block = if visual_cortex_enabled {
+            VISUAL_FEATURE_COUNT
+        } else {
+            color_count
+                .checked_add(depth_count)
+                .expect("vision dimensions overflow visual block")
+        };
+        let feature_count = visual_block
+            .checked_add(NON_VISUAL_FEATURE_COUNT)
             .expect("vision dimensions overflow feature count");
         let sensory_stride = color_count
             .checked_add(depth_count)
@@ -236,6 +351,10 @@ impl BrainLayout {
             vision_height,
             vision_color_count: color_count,
             vision_depth_count: depth_count,
+            retina_width,
+            retina_height,
+            retina_pixel_count,
+            visual_cortex_enabled,
             feature_count,
             sensory_stride,
             brain_stride,
@@ -247,8 +366,7 @@ impl BrainLayout {
 impl Default for BrainLayout {
     /// Follows `BrainConfig::default()` so the two defaults can never drift.
     fn default() -> Self {
-        let config = BrainConfig::default();
-        Self::new(config.vision_width, config.vision_height)
+        Self::from_config(&BrainConfig::default())
     }
 }
 
@@ -340,6 +458,11 @@ pub const CFG_DECAY_RATE: usize = 5;
 pub const CFG_DISTRESS_EXP: usize = 6;
 pub const CFG_METABOLIC_RATE: usize = 7;
 pub const CFG_INTEGRITY_SCALE: usize = 8;
+/// Visual-cortex gate flag (plan 0008). `1.0` = run the Hubel-Wiesel cortex
+/// pass, `0.0` = no-op passthrough + legacy raw-vision encoder input. Uses a
+/// previously-unused padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by
+/// `CFG_VISUAL_CORTEX_ENABLED` in `common.wgsl`.
+pub const CFG_VISUAL_CORTEX_ENABLED: usize = 9;
 pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
@@ -573,6 +696,11 @@ pub fn init_brain_state_for(
     let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_movement_speed = O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT;
+    // Plan 0008 visual-genome genes (contiguous after movement_speed).
+    let delta_gabor_wavelength = O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_gabor_aspect_ratio = O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_dog_surround_ratio = O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_orientation_offset = O_ORIENTATION_OFFSET - O_PREDICTOR_CONTEXT_WEIGHT;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
     for i in 0..ENCODED_DIMENSION {
@@ -597,6 +725,10 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_hab_curiosity] = config.max_curiosity_bonus;
     state[o_pred_ctx_wt + delta_fatigue_floor] = config.fatigue_floor;
     state[o_pred_ctx_wt + delta_movement_speed] = config.movement_speed;
+    state[o_pred_ctx_wt + delta_gabor_wavelength] = config.gabor_wavelength;
+    state[o_pred_ctx_wt + delta_gabor_aspect_ratio] = config.gabor_aspect_ratio;
+    state[o_pred_ctx_wt + delta_dog_surround_ratio] = config.dog_surround_ratio;
+    state[o_pred_ctx_wt + delta_orientation_offset] = config.orientation_offset;
 
     state
 }
@@ -645,6 +777,11 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     cfg[CFG_DISTRESS_EXP] = config.distress_exponent;
     cfg[CFG_METABOLIC_RATE] = config.metabolic_rate;
     cfg[CFG_INTEGRITY_SCALE] = config.integrity_scale;
+    cfg[CFG_VISUAL_CORTEX_ENABLED] = if config.visual_cortex_enabled {
+        1.0
+    } else {
+        0.0
+    };
     cfg
 }
 
@@ -680,9 +817,15 @@ mod tests {
 
     #[test]
     fn brain_stride_is_consistent() {
-        // The TD critic state is the last region of the brain layout:
-        // value head, prev value, three trace vectors, three trace biases.
-        assert_eq!(O_VALUE_WEIGHTS, O_MOVEMENT_SPEED + 1);
+        // The four heritable visual-genome genes (plan 0008) are contiguous right
+        // after `O_MOVEMENT_SPEED`; the TD critic state follows them as the last
+        // region of the brain layout: value head, prev value, three trace
+        // vectors, three trace biases.
+        assert_eq!(O_GABOR_WAVELENGTH, O_MOVEMENT_SPEED + 1);
+        assert_eq!(O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH + 1);
+        assert_eq!(O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO + 1);
+        assert_eq!(O_ORIENTATION_OFFSET, O_DOG_SURROUND_RATIO + 1);
+        assert_eq!(O_VALUE_WEIGHTS, O_ORIENTATION_OFFSET + 1);
         assert_eq!(O_TRACE_BIASES, O_VALUE_WEIGHTS + 4 * ENCODED_DIMENSION + 2);
         assert_eq!(BRAIN_STRIDE, O_TRACE_BIASES + 3);
     }
@@ -770,6 +913,58 @@ mod tests {
                 + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
             assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
         }
+    }
+
+    #[test]
+    fn retina_pixel_count_matches_config() {
+        // The retina grid is locked per batch (plan 0008) and independent of the
+        // legacy vision grid. A 32×32 retina must yield exactly 1024 pixels.
+        let layout = BrainLayout::with_retina(8, 6, 32, 32);
+        assert_eq!(layout.retina_width, 32);
+        assert_eq!(layout.retina_height, 32);
+        assert_eq!(layout.retina_pixel_count, 1024);
+
+        // `from_config` threads the configured retina; the default config is
+        // 32×32, so it must also produce 1024.
+        let layout = BrainLayout::from_config(&BrainConfig::default());
+        assert_eq!(layout.retina_pixel_count, 1024);
+        // `new` derives the retina from the default config for back-compat.
+        assert_eq!(BrainLayout::new(8, 6).retina_pixel_count, 1024);
+    }
+
+    #[test]
+    fn luminance_weights_sum_to_one() {
+        // Rec. 709 luminance weights (plan 0008, Stage 0). These three literals
+        // are the single canonical source mirrored by the WGSL `retina_luminance`
+        // helper in common.wgsl. A linear-light luminance must preserve a flat
+        // field: the weights MUST sum to exactly 1.0, otherwise a uniform retina
+        // would be scaled and the DC the cortex relies on rejecting would shift.
+        // This guards against a typo drifting either copy.
+        const LUMINANCE_R: f32 = 0.2126;
+        const LUMINANCE_G: f32 = 0.7152;
+        const LUMINANCE_B: f32 = 0.0722;
+        let sum = LUMINANCE_R + LUMINANCE_G + LUMINANCE_B;
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "Rec. 709 luminance weights must sum to 1.0, got {sum}"
+        );
+
+        // The helper that consumes these weights must be present in common.wgsl
+        // so it concatenates into every pipeline (the fused kernel included) and
+        // is available to the visual-cortex pass. common.wgsl is shared verbatim
+        // by all pipelines (see gpu_kernel.rs), so presence here == compiled in.
+        let common_src = include_str!("shaders/kernel/common.wgsl");
+        assert!(
+            common_src.contains("fn retina_luminance(color: vec3<f32>) -> f32"),
+            "retina_luminance must be declared in common.wgsl"
+        );
+        // The WGSL copy must carry the same three weights as the test above.
+        assert!(
+            common_src.contains("0.2126 * color.r")
+                && common_src.contains("0.7152 * color.g")
+                && common_src.contains("0.0722 * color.b"),
+            "common.wgsl retina_luminance weights must match the Rec. 709 weights"
+        );
     }
 
     #[test]
@@ -974,6 +1169,10 @@ mod tests {
         assert_eq!(wgsl["CFG_DISTRESS_EXP"], CFG_DISTRESS_EXP as u32);
         assert_eq!(wgsl["CFG_METABOLIC_RATE"], CFG_METABOLIC_RATE as u32);
         assert_eq!(wgsl["CFG_INTEGRITY_SCALE"], CFG_INTEGRITY_SCALE as u32);
+        assert_eq!(
+            wgsl["CFG_VISUAL_CORTEX_ENABLED"],
+            CFG_VISUAL_CORTEX_ENABLED as u32
+        );
     }
 
     #[test]

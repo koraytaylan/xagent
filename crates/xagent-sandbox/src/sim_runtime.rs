@@ -942,6 +942,135 @@ mod tests {
         }
     }
 
+    /// Build a two-agent world upload whose per-agent configs differ only in
+    /// `gabor_wavelength` (the first plan-0008 visual-genome tail slot). Both
+    /// agents spawn at the same safe position; the population size is fixed so
+    /// `reset_population` takes the in-place reseed path. Returns the upload and
+    /// the world's food count (mirrors `test_upload`).
+    fn two_agent_upload_with_wavelengths(
+        wavelength_a: f32,
+        wavelength_b: f32,
+    ) -> (PendingUpload, usize) {
+        use xagent_sandbox::world::WorldState;
+        use xagent_shared::WorldConfig;
+
+        let world = WorldState::new(WorldConfig::default());
+        let spawn = world.safe_spawn_position();
+        let make_config = |wavelength: f32| BrainConfig {
+            gabor_wavelength: wavelength,
+            ..BrainConfig::default()
+        };
+        let config_a = make_config(wavelength_a);
+        let config_b = make_config(wavelength_b);
+        let agent_row = |config: &BrainConfig| {
+            (
+                spawn,
+                100.0,
+                100.0,
+                config.memory_capacity,
+                config.processing_slots,
+            )
+        };
+        let upload = PendingUpload {
+            heights: world.terrain.heights.clone(),
+            biomes: world.biome_map.grid_as_u32(),
+            food_pos: world
+                .food_items
+                .iter()
+                .map(|f| (f.position.x, f.position.y, f.position.z))
+                .collect(),
+            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
+            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
+            agent_data: vec![agent_row(&config_a), agent_row(&config_b)],
+            agent_configs: vec![config_a, config_b],
+        };
+        (upload, world.food_items.len())
+    }
+
+    /// Read agent `index`'s `O_GABOR_WAVELENGTH` brain-state tail slot. The tail
+    /// base is derived from the read-back length (the dynamic `brain_stride`),
+    /// never a hardcoded stride, so this works for any `BrainLayout`.
+    fn read_gabor_wavelength(kernel: &GpuKernel, index: u32) -> f32 {
+        use xagent_brain::buffers::{
+            FIXED_TAIL_SIZE, O_GABOR_WAVELENGTH, O_PREDICTOR_CONTEXT_WEIGHT,
+        };
+
+        let state = kernel.read_agent_state(index);
+        let tail_base = state.brain_state.len() - FIXED_TAIL_SIZE;
+        let slot = tail_base + (O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT);
+        state.brain_state[slot]
+    }
+
+    /// The interactive worker must re-apply each agent's heritable visual genome
+    /// after inheritance overwrites the brain-state tail. Inheritance writes the
+    /// champion's exact state (carrying the champion's `gabor_wavelength`) into
+    /// every champion slot; `patch_agent_configs` then restores each agent's own
+    /// config. Without that patch step every agent's vision silently reverts to
+    /// the champion's, so this test fails on the un-patched worker and passes
+    /// once the patch covers the visual tail slots (plan 0008, task 0004).
+    /// GPU-gated.
+    #[test]
+    fn worker_reset_applies_visual_genome_after_inheritance() {
+        if !GpuKernel::is_available() {
+            eprintln!("Skipping: no GPU/fallback adapter available");
+            return;
+        }
+
+        const WAVELENGTH_A: f32 = 3.0;
+        const WAVELENGTH_B: f32 = 9.0;
+
+        // Two agents with distinct gabor_wavelength. `Worker::new` runs
+        // `patch_agent_configs`, so agent 0's tail already carries WAVELENGTH_A.
+        let (upload, food_count) = two_agent_upload_with_wavelengths(WAVELENGTH_A, WAVELENGTH_B);
+        let mut worker = Worker::new(SimInit {
+            agent_count: 2,
+            food_count,
+            brain_config: BrainConfig::default(),
+            world_config: WorldConfig::default(),
+            upload,
+            tick_budget: 0,
+            speed_multiplier: 1,
+            paused: true,
+            selected_agent: 0,
+        });
+
+        // The champion is agent 0's inherited state: it carries WAVELENGTH_A in
+        // its tail. Seeding it into *both* champion slots overwrites both tails
+        // with WAVELENGTH_A — so if the worker fails to re-patch, agent 1 keeps
+        // the champion's WAVELENGTH_A instead of its own WAVELENGTH_B.
+        let champion = worker.kernel.read_agent_state(0);
+        assert!(
+            (read_gabor_wavelength(&worker.kernel, 0) - WAVELENGTH_A).abs() < 1e-4,
+            "precondition: Worker::new should have patched agent 0's wavelength"
+        );
+
+        let (reset_upload, _) = two_agent_upload_with_wavelengths(WAVELENGTH_A, WAVELENGTH_B);
+        worker.reset_population(ResetRequest {
+            upload: reset_upload,
+            brain_config: BrainConfig::default(),
+            tick_budget: 0,
+            inherited: Some(InheritedBrain {
+                champion,
+                mutation_strength: 0.0,
+                champion_slots: 2,
+            }),
+            resume: false,
+        });
+
+        let agent_0 = read_gabor_wavelength(&worker.kernel, 0);
+        let agent_1 = read_gabor_wavelength(&worker.kernel, 1);
+        assert!(
+            (agent_0 - WAVELENGTH_A).abs() < 1e-4,
+            "agent 0 wavelength {agent_0} != own config {WAVELENGTH_A}"
+        );
+        assert!(
+            (agent_1 - WAVELENGTH_B).abs() < 1e-4,
+            "agent 1 wavelength {agent_1} reverted to champion's instead of own \
+             config {WAVELENGTH_B} — worker did not re-apply the visual genome \
+             after inheritance"
+        );
+    }
+
     /// Drain events through `pick`, returning the first non-`None` mapping or
     /// `None` if nothing matched within ~10 s (generous for a slow GPU).
     fn drain_until<T>(

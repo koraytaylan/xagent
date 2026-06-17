@@ -619,7 +619,8 @@ When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) an
      clamped to ≥ 0.0001.
    - Integers (`memory_capacity`, `processing_slots`):
      multiplied by [0.9, 1.1], rounded, clamped to ≥ 1.
-   - `visual_encoding_size` and `representation_dimension` are **not mutated** (visual_encoding_size must match the sensory pipeline; representation_dimension is locked to prevent weight inheritance breakage across generations).
+   - `representation_dimension` is **not mutated** — it is locked to prevent weight inheritance breakage across generations.
+   - `visual_encoding_size` is a **retired legacy field** (issue #106): superseded by the plan 0008 visual-cortex config (`retina_*`, `gabor_*`). It is no longer mutated *or* carried through crossover — each child resets it to the serde default; the field survives only so older saved configs still deserialize.
 3. Child spawns near parent (±5 units offset), generation = parent generation + 1.
 4. Child gets a fresh brain with the mutated config.
 
@@ -672,7 +673,7 @@ On death the agent is respawned with a **fresh brain** (no persistence in headle
 |---|---|---|---|---|
 | `memory_capacity` | 24 | 128 | 512 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | 8 | 16 | 32 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
-| `visual_encoding_size` | 32 | 64 | 128 | **Legacy / unused.** No kernel stage reads this field. Preserved only for config backwards compatibility (see issue #106). |
+| `visual_encoding_size` | 32 | 64 | 128 | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (`retina_*` / `gabor_*` config + `coop_visual_cortex` pass). No kernel stage reads it; not editable in the UI and not carried through breeding — retained only so older saved configs still deserialize (issue #106 resolved). |
 | `representation_dimension` | 128 | 128 | 128 | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; mismatched config values log a warning and are ignored (see issues #103, #106). |
 | `learning_rate` | 0.08 | 0.05 | 0.03 | Association update rate |
 | `decay_rate` | 0.002 | 0.001 | 0.0005 | Unreinforced pattern decay per tick |
@@ -940,7 +941,7 @@ death/respawn.
 - When enabled: agent must survive 5000 ticks continuously.
 - **Once per life**: `has_reproduced` flag prevents repeated spawning.
 - **Population cap**: `MAX_AGENTS = 100`.
-- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `visual_encoding_size` and `representation_dimension` are preserved (visual_encoding_size must match the sensory pipeline; representation_dimension is locked to prevent weight inheritance breakage across generations).
+- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `representation_dimension` is preserved (locked to prevent weight inheritance breakage across generations). `visual_encoding_size` is a retired legacy field (issue #106): superseded by the plan 0008 visual-cortex config and reset to its default on every breed rather than carried.
 - **Generation tracking**: Generation increments on each death/respawn, tracking how many lives the agent has lived.
 
 ### Telemetry Focus

@@ -257,6 +257,106 @@ pub fn run_agent_sweep(
     );
 }
 
+/// A/B the visual-cortex pass cost: full-pipeline tps with
+/// `visual_cortex_enabled` OFF vs. ON, at a fixed retina resolution and the
+/// given population (plan 0008 `visual-cortex-throughput-baseline`).
+///
+/// Both arms run the same `total_ticks` on a fresh kernel and time wall-clock
+/// from the first dispatch to the GPU completing the last tick (a `Maintain::Wait`
+/// drain), so the measured tps reflects GPU execution — including the new
+/// `coop_visual_cortex` pass when the flag is on — not just submit-return. The
+/// flag and the retina dimensions are compile-time WGSL overrides baked at
+/// `GpuKernel::new`, so toggling them on the `BrainConfig` per arm rebuilds the
+/// pipeline correctly. The OFF arm is byte-identical to the pre-plan build, so
+/// its tps is the 0006-fused baseline this regression is measured against.
+///
+/// The dispatch is chunked into bounded windows drained with a `Maintain::Wait`
+/// between chunks. The cortex-ON arm is ~100× slower; submitting all
+/// `total_ticks` in one fused batch would queue minutes of GPU work and trip
+/// wgpu's submission watchdog (`panic_on_timeout`). Chunking caps each
+/// drain to one window's worth of work for both arms identically; the wait
+/// time per chunk is real GPU execution and stays inside the timed region, so
+/// the tps is faithful.
+///
+/// Read-only measurement; it changes no persisted state. This benchmark only
+/// reports the numbers — the default-flip decision lives in
+/// `visual-encoder-default-gate`.
+pub fn run_visual_cortex_ab(
+    brain: BrainConfig,
+    world_config: WorldConfig,
+    agent_count: usize,
+    total_ticks: u64,
+) {
+    let retina_width = brain.retina_width;
+    let retina_height = brain.retina_height;
+    println!(
+        "[visual-cortex-ab] {} agents, {} ticks, retina {}x{} — visual cortex on/off tps",
+        agent_count, total_ticks, retina_width, retina_height
+    );
+    println!("  {:>22}  {:>14}  {:>22}", "arm", "tps", "vs off");
+
+    let mut off_tps = 0.0_f64;
+    for (i, enabled) in [false, true].into_iter().enumerate() {
+        let mut arm_brain = brain.clone();
+        arm_brain.visual_cortex_enabled = enabled;
+
+        let (mut kernel, _world) = create_kernel(&arm_brain, &world_config, agent_count);
+
+        // Drain in chunks so no single fused submission queues enough GPU work
+        // to trip the submission watchdog. `MAX_FUSED_BATCHES` kernel batches is
+        // one submit window — the unit `dispatch_batch` already chunks to.
+        let chunk_ticks = kernel
+            .kernel_batch_size()
+            .saturating_mul(xagent_brain::MAX_FUSED_BATCHES)
+            .max(1);
+
+        let start = Instant::now();
+        let mut tick: u64 = 0;
+        while tick < total_ticks {
+            let this_chunk = chunk_ticks.min((total_ticks - tick) as u32);
+            kernel.dispatch_batch(tick, this_chunk);
+            // Force the chunk to complete before queuing the next, so the queued
+            // backlog never exceeds one window. The wait is real GPU execution
+            // time and is intentionally inside the timed region.
+            kernel
+                .device()
+                .poll(wgpu::Maintain::Wait)
+                .panic_on_timeout();
+            tick += this_chunk as u64;
+        }
+        let secs = start.elapsed().as_secs_f64();
+
+        let tps = tick as f64 / secs;
+        let label = if enabled {
+            "cortex ON"
+        } else {
+            "cortex OFF (baseline)"
+        };
+        if i == 0 {
+            off_tps = tps;
+        }
+        let delta = if i == 0 || off_tps == 0.0 {
+            "—".to_string()
+        } else {
+            // Report both the retained fraction (gate metric) and the slowdown
+            // factor; at this cost the fraction rounds to ~0% so a bare percent
+            // would hide the magnitude.
+            format!(
+                "{:.2}% kept ({:.0}x slower)",
+                tps / off_tps * 100.0,
+                off_tps / tps.max(f64::EPSILON)
+            )
+        };
+        println!("  {label:>22}  {tps:>14.0}  {delta:>22}");
+    }
+
+    println!(
+        "[visual-cortex-ab] read: 'cortex ON' adds the DoG -> Gabor -> complex pass per agent; \
+         the % kept is the fraction of the OFF (0006-fused) tps retained. The default-flip \
+         budget lives in 0008-VISUAL-CORTEX-BASELINE.md."
+    );
+}
+
 /// Simulate the real tick loop with accumulator and per-frame dispatch —
 /// no rendering. Prints DIAG lines every second and returns the result.
 pub fn run_tick_loop_bench(

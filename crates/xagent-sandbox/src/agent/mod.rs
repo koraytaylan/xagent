@@ -17,7 +17,11 @@ use xagent_brain::buffers::{
     AgentBrainState, ENCODED_DIMENSION, FIXED_TAIL_SIZE, O_ACTION_FORWARD_WEIGHTS,
     O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
 };
-use xagent_shared::{BodyState, BrainConfig, InternalState, SensoryFrame};
+use xagent_shared::{
+    BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
+    DOG_SURROUND_RATIO_MIN, GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX,
+    GABOR_WAVELENGTH_MIN, ORIENTATION_OFFSET_PERIOD,
+};
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
 /// `HEATMAP_RES × HEATMAP_RES` grid. Each cell tracks how many ticks
@@ -375,7 +379,10 @@ pub fn mutate_config_with_strength(
                 strength,
             )
             .min(MAX_PROCESSING_SLOTS),
-        visual_encoding_size: parent.visual_encoding_size,
+        // Legacy field, superseded by the plan 0008 visual-cortex config; no
+        // longer carried through breeding (issue #106). The serde default
+        // supplies it on load, so seed it from the same default here.
+        visual_encoding_size: BrainConfig::default().visual_encoding_size,
         representation_dimension: parent.representation_dimension,
         learning_rate: momentum.biased_perturb_f(
             &mut rng,
@@ -413,6 +420,9 @@ pub fn mutate_config_with_strength(
             .clamp(0.05, 0.4),
         vision_width: parent.vision_width,
         vision_height: parent.vision_height,
+        // Retina resolution is locked per batch (not heritable); pass through.
+        retina_width: parent.retina_width,
+        retina_height: parent.retina_height,
         brain_tick_stride: parent.brain_tick_stride,
         vision_stride: parent.vision_stride,
         metabolic_rate: parent.metabolic_rate,
@@ -420,6 +430,44 @@ pub fn mutate_config_with_strength(
         movement_speed: momentum
             .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
             .clamp(1.0, 100.0),
+        // Visual-cortex gate is locked per batch (not heritable); pass through.
+        visual_cortex_enabled: parent.visual_cortex_enabled,
+        // Heritable visual-genome genes (plan 0008). Each is perturbed with
+        // momentum and clamped to the same bounds the shader re-imposes after
+        // reading the gene. `orientation_offset` has no hard clamp — orientation
+        // is half-circle periodic, so it wraps into [0, π) via rem_euclid.
+        gabor_wavelength: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.gabor_wavelength,
+                "gabor_wavelength",
+                strength,
+            )
+            .clamp(GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX),
+        gabor_aspect_ratio: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.gabor_aspect_ratio,
+                "gabor_aspect_ratio",
+                strength,
+            )
+            .clamp(GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX),
+        dog_surround_ratio: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.dog_surround_ratio,
+                "dog_surround_ratio",
+                strength,
+            )
+            .clamp(DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX),
+        orientation_offset: momentum
+            .biased_perturb_f(
+                &mut rng,
+                parent.orientation_offset,
+                "orientation_offset",
+                strength,
+            )
+            .rem_euclid(ORIENTATION_OFFSET_PERIOD),
     }
 }
 
@@ -500,7 +548,9 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.processing_slots
         },
-        visual_encoding_size: a.visual_encoding_size,
+        // Legacy field, superseded by the plan 0008 visual-cortex config; no
+        // longer carried through breeding (issue #106). Seed from the default.
+        visual_encoding_size: BrainConfig::default().visual_encoding_size,
         representation_dimension: a.representation_dimension,
         learning_rate: if rng.random::<f32>() < 0.5 {
             a.learning_rate
@@ -534,6 +584,9 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         },
         vision_width: a.vision_width,
         vision_height: a.vision_height,
+        // Retina resolution is locked per batch (not heritable); take from `a`.
+        retina_width: a.retina_width,
+        retina_height: a.retina_height,
         brain_tick_stride: a.brain_tick_stride,
         vision_stride: a.vision_stride,
         metabolic_rate: a.metabolic_rate,
@@ -542,6 +595,29 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.movement_speed
         } else {
             b.movement_speed
+        },
+        // Visual-cortex gate is locked per batch (not heritable); take from `a`.
+        visual_cortex_enabled: a.visual_cortex_enabled,
+        // Heritable visual-genome genes (plan 0008): uniform per-gene crossover.
+        gabor_wavelength: if rng.random::<f32>() < 0.5 {
+            a.gabor_wavelength
+        } else {
+            b.gabor_wavelength
+        },
+        gabor_aspect_ratio: if rng.random::<f32>() < 0.5 {
+            a.gabor_aspect_ratio
+        } else {
+            b.gabor_aspect_ratio
+        },
+        dog_surround_ratio: if rng.random::<f32>() < 0.5 {
+            a.dog_surround_ratio
+        } else {
+            b.dog_surround_ratio
+        },
+        orientation_offset: if rng.random::<f32>() < 0.5 {
+            a.orientation_offset
+        } else {
+            b.orientation_offset
         },
     }
 }
@@ -781,6 +857,68 @@ mod tests {
                 "movement_speed must be >= 1.0, got {}",
                 child.movement_speed,
             );
+        }
+    }
+
+    /// Plan 0008 visual-genome-config "Done when": mutation keeps every heritable
+    /// visual gene inside its clamp (and `orientation_offset` inside its [0, π)
+    /// wrap). Driving the parent to both extremes for 50 iterations exercises the
+    /// clamp/wrap from above and below — it fails loudly if any gene's clamp line
+    /// is omitted from `mutate_config_with_strength` (the unbounded perturbation
+    /// at strength 0.3 would otherwise escape the bound within 50 tries).
+    #[test]
+    fn mutate_config_respects_visual_gene_bounds() {
+        let momentum = MutationMomentum::new(0.9);
+        // Parents pushed past both ends of every gene's clamp. The orientation
+        // offset is seeded outside [0, π) on both ends so the rem_euclid wrap is
+        // exercised, not just a no-op pass-through.
+        let high = BrainConfig {
+            gabor_wavelength: 100.0,
+            gabor_aspect_ratio: 5.0,
+            dog_surround_ratio: 50.0,
+            orientation_offset: 10.0,
+            ..BrainConfig::default()
+        };
+        let low = BrainConfig {
+            gabor_wavelength: 0.01,
+            gabor_aspect_ratio: 0.001,
+            dog_surround_ratio: 0.1,
+            orientation_offset: -10.0,
+            ..BrainConfig::default()
+        };
+
+        let assert_bounds = |child: &BrainConfig| {
+            assert!(
+                child.gabor_wavelength >= GABOR_WAVELENGTH_MIN
+                    && child.gabor_wavelength <= GABOR_WAVELENGTH_MAX,
+                "gabor_wavelength out of [{GABOR_WAVELENGTH_MIN}, {GABOR_WAVELENGTH_MAX}]: {}",
+                child.gabor_wavelength,
+            );
+            assert!(
+                child.gabor_aspect_ratio >= GABOR_ASPECT_RATIO_MIN
+                    && child.gabor_aspect_ratio <= GABOR_ASPECT_RATIO_MAX,
+                "gabor_aspect_ratio out of [{GABOR_ASPECT_RATIO_MIN}, {GABOR_ASPECT_RATIO_MAX}]: {}",
+                child.gabor_aspect_ratio,
+            );
+            assert!(
+                child.dog_surround_ratio >= DOG_SURROUND_RATIO_MIN
+                    && child.dog_surround_ratio <= DOG_SURROUND_RATIO_MAX,
+                "dog_surround_ratio out of [{DOG_SURROUND_RATIO_MIN}, {DOG_SURROUND_RATIO_MAX}]: {}",
+                child.dog_surround_ratio,
+            );
+            // rem_euclid keeps the offset in [0, period): non-negative and strictly
+            // below π (the half-circle period orientation is invariant under).
+            assert!(
+                child.orientation_offset >= 0.0
+                    && child.orientation_offset < ORIENTATION_OFFSET_PERIOD,
+                "orientation_offset out of [0, {ORIENTATION_OFFSET_PERIOD}): {}",
+                child.orientation_offset,
+            );
+        };
+
+        for _ in 0..50 {
+            assert_bounds(&mutate_config_with_strength(&high, 0.3, &momentum));
+            assert_bounds(&mutate_config_with_strength(&low, 0.3, &momentum));
         }
     }
 

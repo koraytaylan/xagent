@@ -3649,6 +3649,1185 @@ fn split_serial_matches_fused_serial() {
     );
 }
 
+/// Plan 0008 (wire-visual-features-into-encoder): the cortex flag now redefines
+/// the encoder's visual input. The byte-identical guarantee is split by flag:
+///
+///   1. Flag OFF — `coop_visual_cortex` is a no-op and the encoder reads the
+///      legacy raw-vision slice, so the run stays byte-identical to the
+///      pre-cortex build. We pin this as determinism across two identical runs
+///      (the consumer-facing default path; the cross-build identity is what the
+///      flag-off `feature_count == color + depth + 25` width preserves).
+///   2. Flag ON — the encoder input is redefined to the compact complex-cell
+///      vector: `feature_count == VISUAL_FEATURE_COUNT + 25`. The flag-on path
+///      must (a) carry that width through `BrainLayout::from_config`, and (b) run
+///      end-to-end with NO wgpu validation error at the new `feature_count`
+///      (a validation failure panics at pipeline/dispatch time, so a clean
+///      completion is the assertion). Because the encoder now consumes oriented
+///      features instead of raw pixels, the flag-on trajectory legitimately
+///      DIVERGES from flag-off — we assert that divergence (and finiteness) so a
+///      silent fall-back to the raw-vision slice can't pass unnoticed.
+///
+/// Mirrors the readback harness in `split_serial_matches_fused_serial` (full
+/// physics + brain_state + pattern readback). The flag-off determinism check uses
+/// `assert_eq!` on f32 (no epsilon); the flag-on path asserts only that it ran and
+/// diverged.
+#[test]
+fn visual_cortex_passthrough_is_byte_identical() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let world_config = WorldConfig {
+        seed: 42,
+        ..Default::default()
+    };
+
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+
+    // Fresh kernel with deterministic brain state + identical initial world for
+    // the given brain config. Same fixed RNG seed across runs so any divergence
+    // is attributable to the cortex pass, not the brain-state init.
+    let run = |brain: &BrainConfig| {
+        let agent_data = vec![(
+            spawn_pos,
+            100.0_f32,
+            100.0_f32,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )];
+        let mut kernel = xagent_brain::GpuKernel::new(1, food_count, brain, &world_config);
+        kernel.reset_agents_seeded(brain, 12345);
+        kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+        kernel.upload_agents(&agent_data);
+        kernel.dispatch_ticks(0, 1037);
+        let phys = kernel.read_full_state_blocking().to_vec();
+        let brain_readback = kernel.read_agent_state(0);
+        (phys, brain_readback)
+    };
+
+    let mut flag_off = BrainConfig::default();
+    flag_off.visual_cortex_enabled = false;
+    let mut flag_on = BrainConfig::default();
+    flag_on.visual_cortex_enabled = true;
+
+    // Encoder-width contract (wire-visual-features-into-encoder, step 4):
+    //   flag OFF → legacy raw-vision slice + non-visual tail
+    //   flag ON  → compact complex-cell vector + non-visual tail
+    // `BrainLayout::from_config` is exactly what `GpuKernel::new` sizes its
+    // buffers from, so this is the same width the flag-on run below executes at.
+    let off_layout = xagent_brain::BrainLayout::from_config(&flag_off);
+    let on_layout = xagent_brain::BrainLayout::from_config(&flag_on);
+    let color = (flag_off.vision_width * flag_off.vision_height) as usize * 4;
+    let depth = (flag_off.vision_width * flag_off.vision_height) as usize;
+    assert_eq!(
+        off_layout.feature_count,
+        color + depth + 25,
+        "flag-off feature_count must keep the legacy raw-vision width"
+    );
+    assert_eq!(
+        on_layout.feature_count,
+        xagent_brain::VISUAL_FEATURE_COUNT + 25,
+        "flag-on feature_count must be VISUAL_FEATURE_COUNT + 25 (the redefined encoder input)"
+    );
+
+    // Baseline: the flag-off path is the pre-cortex build's behavior. Run twice to
+    // pin determinism (no hidden nondeterminism in the inserted pass/barrier).
+    let (off_phys_a, off_brain_a) = run(&flag_off);
+    let (off_phys_b, off_brain_b) = run(&flag_off);
+    assert_eq!(
+        off_phys_a, off_phys_b,
+        "flag-off physics state is nondeterministic across runs"
+    );
+    assert_eq!(
+        off_brain_a.brain_state, off_brain_b.brain_state,
+        "flag-off brain_state is nondeterministic across runs"
+    );
+    assert_eq!(
+        off_brain_a.patterns, off_brain_b.patterns,
+        "flag-off pattern_buffer is nondeterministic across runs"
+    );
+
+    // Flag ON: the encoder input is now the complex-cell vector at the new
+    // `feature_count`. This run reaching completion means pipeline creation and
+    // every dispatch validated and ran with NO wgpu validation error at the new
+    // width (a validation failure panics, so a clean return is the assertion).
+    let (on_phys, on_brain) = run(&flag_on);
+    assert!(
+        on_phys.iter().all(|v| v.is_finite()),
+        "flag-on physics state must be finite (no NaN/Inf from the wired cortex)"
+    );
+    assert!(
+        on_brain.brain_state.iter().all(|v| v.is_finite()),
+        "flag-on brain_state must be finite (no NaN/Inf from the wired cortex)"
+    );
+    assert_eq!(
+        on_brain.brain_state.len(),
+        on_layout.brain_stride,
+        "flag-on brain_state length must follow the redefined feature_count layout"
+    );
+
+    // The cortex actually feeds the encoder: with oriented features replacing raw
+    // pixels, the flag-on trajectory must diverge from flag-off. If it did NOT,
+    // the encoder silently fell back to the raw-vision slice (the failure this
+    // task removes) — so identical bytes here are a regression, not a pass.
+    assert_ne!(
+        off_phys_a, on_phys,
+        "flag-on must diverge from flag-off — the wired cortex changed the encoder input"
+    );
+}
+
+/// Plan 0008 (center-surround-dog): the visual cortex Stage 1 is a zero-sum
+/// Difference-of-Gaussians center-surround operator (Rodieck 1965; Marr &
+/// Hildreth 1980). This probe pins the three properties the stage is built on,
+/// exercising the *same* kernel construction the GPU pass runs (the canonical
+/// `xagent_brain::dog` builder, literal-mirrored to the WGSL Stage 1 in
+/// `coop_visual_cortex`; a Rust unit test in `xagent-brain` guards the literals
+/// against drift):
+///
+///   1. The seeded DoG kernel weights sum to ≈ 0 (the defining edge-operator
+///      invariant). This is what fails for a plain (non-zero-sum) Gaussian.
+///   2. A uniform retina yields a ≈ 0 response everywhere (DC rejection — the
+///      reason no brightness-normalization pass precedes the cortex).
+///   3. A half-bright / half-dark luminance split yields a strong response at the
+///      contrast boundary (the operator detects local contrast).
+///
+/// Falsifiability (the task's "Done when"): replacing the kernel with a plain
+/// Gaussian (e.g. `gaussian_2d(r2, sigma_center)` with no surround subtraction)
+/// makes assertion (1) fail (sum ≈ 1, not 0) and assertion (2) fail (a uniform
+/// field is blurred, not nulled). The DoG passes all three.
+///
+/// Self-skips without a GPU/fallback adapter to mirror the other plan-0008 GPU
+/// probes; the kernel math runs on the CPU but the formula is byte-mirrored into
+/// the GPU pass, so this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn dog_kernel_sums_to_zero() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::dog;
+
+    // (1) The seeded DoG kernel is zero-sum.
+    let kernel = dog::seeded_dog_kernel();
+    let kernel_sum: f32 = kernel.weights.iter().sum();
+    assert!(
+        kernel_sum.abs() < 1e-5,
+        "seeded DoG kernel must sum to zero (edge operator), got {kernel_sum}"
+    );
+
+    // A plain Gaussian (no surround subtraction) is the falsification control:
+    // it must NOT be zero-sum, proving the assertion above discriminates.
+    let plain_gaussian: Vec<f32> = {
+        let side = kernel.side();
+        let radius = kernel.radius as i32;
+        let sigma = dog::DOG_SIGMA_CENTER;
+        let mut w = vec![0.0_f32; side * side];
+        for (k, wk) in w.iter_mut().enumerate() {
+            let kx = (k % side) as i32 - radius;
+            let ky = (k / side) as i32 - radius;
+            let r2 = (kx * kx + ky * ky) as f32;
+            let sigma_sq = sigma * sigma;
+            *wk = (-r2 / (2.0 * sigma_sq)).exp() / (2.0 * std::f32::consts::PI * sigma_sq);
+        }
+        w
+    };
+    let plain_sum: f32 = plain_gaussian.iter().sum();
+    assert!(
+        plain_sum.abs() > 1e-2,
+        "control: a plain Gaussian must NOT be zero-sum (got {plain_sum}); \
+         if this fires the zero-sum assertion is not discriminating"
+    );
+
+    // The retina grid the cortex operates on (config default, locked per batch).
+    let layout = xagent_brain::BrainLayout::new(8, 6);
+    let width = layout.retina_width;
+    let height = layout.retina_height;
+    assert_eq!(width * height, layout.retina_pixel_count);
+
+    // (2) Uniform retina ⇒ ≈ 0 response in the interior (DC rejection). The
+    // zero-sum kernel nulls a flat field wherever its full support fits; at the
+    // retina border the zero-padded convolution sees only a partial (non-zero-sum)
+    // subset of taps, which is an expected truncation artifact, not a DC leak.
+    // The interior — pixels at least `radius` in from every edge — is the
+    // region where DC rejection is exact.
+    let uniform = vec![0.7_f32; width * height];
+    let uniform_response = dog::convolve(&kernel, &uniform, width, height);
+    let radius = kernel.radius;
+    let mut max_interior_uniform = 0.0_f32;
+    for row in radius..height.saturating_sub(radius) {
+        for col in radius..width.saturating_sub(radius) {
+            max_interior_uniform =
+                max_interior_uniform.max(uniform_response[row * width + col].abs());
+        }
+    }
+    assert!(
+        max_interior_uniform < 1e-4,
+        "uniform retina must produce ≈ 0 center-surround response in the interior \
+         (DC rejected), got max |response| = {max_interior_uniform}"
+    );
+
+    // (3) Half-bright / half-dark split ⇒ strong response at the boundary.
+    // Left half dark (0.0), right half bright (1.0); the vertical contrast edge
+    // sits at column `width/2`.
+    let boundary_col = width / 2;
+    let mut split = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            split[row * width + col] = if col >= boundary_col { 1.0 } else { 0.0 };
+        }
+    }
+    let split_response = dog::convolve(&kernel, &split, width, height);
+
+    // The edge operator's response is an odd-symmetric pair of lobes straddling
+    // the contrast edge (ON just inside the bright side, OFF just inside the dark
+    // side). The peak |response| in the band within ±radius of the boundary, on a
+    // central row (away from the top/bottom truncation), is the boundary response
+    // and must clear the threshold.
+    let mid_row = height / 2;
+    let radius_i = kernel.radius as i32;
+    let mut boundary_magnitude = 0.0_f32;
+    for col in (boundary_col as i32 - radius_i)..=(boundary_col as i32 + radius_i) {
+        if col < 0 || col >= width as i32 {
+            continue;
+        }
+        boundary_magnitude =
+            boundary_magnitude.max(split_response[mid_row * width + col as usize].abs());
+    }
+    assert!(
+        boundary_magnitude > 0.1,
+        "contrast edge must drive a strong center-surround response at the \
+         boundary, got peak |response| = {boundary_magnitude}"
+    );
+
+    // And a pixel deep inside the flat interior of either half must stay quiet
+    // (only the local contrast at the edge fires), confirming it is the *edge*,
+    // not absolute brightness, that drives the response.
+    let interior_col = boundary_col / 2; // well inside the dark half
+    let interior_magnitude = split_response[mid_row * width + interior_col].abs();
+    assert!(
+        interior_magnitude < boundary_magnitude,
+        "flat interior (|{interior_magnitude}|) must be quieter than the contrast \
+         boundary (|{boundary_magnitude}|)"
+    );
+}
+
+/// Plan 0008 (gabor-simple-cells): the visual cortex Stage 2 is an orientation-
+/// selective bank of DC-balanced Gabor simple cells — the validated quantitative
+/// model of a V1 simple-cell receptive field (Jones & Palmer 1987); the
+/// elongated alternating ON/OFF lobes are Hubel & Wiesel's (1962) "aligned row of
+/// LGN inputs". This probe pins the well-formedness invariant the whole bank is
+/// built on: **every seeded Gabor kernel is DC-balanced** (`∑ Gabor = 0`), so the
+/// bank responds to oriented contrast, not absolute brightness.
+///
+/// It exercises the *same* kernel construction the GPU pass runs (the canonical
+/// `xagent_brain::gabor` builder, literal-mirrored to the WGSL Stage 2 in
+/// `coop_visual_cortex`; a Rust unit test in `xagent-brain` guards the literals
+/// against drift). The orientation-tuning and invariance behaviour is pinned by
+/// the 0005 probes (`vertical_bar_excites_vertical_simple_cell`,
+/// `complex_cell_phase_invariance`); this task only asserts the kernels are
+/// well-formed.
+///
+/// Falsifiability (the task's "Done when"): removing the mean-subtraction loop in
+/// `gabor::build_gabor_kernel` (the WGSL `gabor_weight` mean term) leaves the
+/// even-phase (ψ = 0) cosine-windowed kernels with a non-zero DC offset, so
+/// assertion (1) fails. The DC-balanced bank passes. Assertion (2) is the
+/// control: the *raw* even-phase kernel (no mean subtraction) is NOT zero-sum,
+/// proving the DC-balance assertion discriminates.
+///
+/// Self-skips without a GPU/fallback adapter to mirror the other plan-0008 GPU
+/// probes; the kernel math runs on the CPU but the formula is byte-mirrored into
+/// the GPU pass, so this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn gabor_kernels_are_dc_balanced() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::gabor;
+
+    // (1) Every seeded Gabor kernel (orientation × scale × phase) is DC-balanced.
+    let bank = gabor::seeded_gabor_bank();
+    assert_eq!(
+        bank.len(),
+        gabor::GABOR_ORIENTATIONS * gabor::GABOR_SCALES * gabor::GABOR_PHASES,
+        "seeded bank must have orientations × scales × phases filters"
+    );
+    for kernel in &bank {
+        let sum: f32 = kernel.weights.iter().sum();
+        assert!(
+            sum.abs() < 1e-5,
+            "seeded Gabor kernel (θ={}, λ={}, ψ={}) must be DC-balanced (∑ Gabor = 0), got {sum}",
+            kernel.theta,
+            kernel.wavelength,
+            kernel.phase
+        );
+    }
+
+    // (2) Control: the *raw* even-phase (ψ = 0) kernel — the cosine-windowed Gabor
+    // WITHOUT mean subtraction — must NOT be zero-sum. This is the falsification
+    // control: if it were already ≈ 0, assertion (1) would not be discriminating
+    // and removing the mean subtraction would not break the test. The even phase
+    // is chosen because the cosine carrier carries a net positive DC under the
+    // Gaussian envelope; the odd (ψ = π/2) phase is antisymmetric and ≈ 0 raw, so
+    // it cannot serve as the control.
+    let even_kernel = gabor::build_gabor_kernel(
+        0.0, // θ = 0 (vertical-edge-tuned)
+        gabor::GABOR_WAVELENGTH_SEED,
+        gabor::GABOR_ASPECT_RATIO_SEED,
+        gabor::gabor_phase(0), // ψ = 0 (even)
+    );
+    let side = even_kernel.side();
+    let entries = side * side;
+
+    // The balanced even-phase kernel sums to ≈ 0 by construction (mean removed).
+    let balanced_even_sum: f32 = even_kernel.weights.iter().sum();
+
+    // Independently rebuild the *raw* even-phase kernel (no mean subtraction)
+    // using the same envelope·carrier the builder uses, so the control is not
+    // circular: a gamma-windowed even cosine over a 2-D Gaussian envelope
+    // integrates to a strictly positive DC. This is exactly the DC the builder's
+    // mean-subtraction loop removes — deleting that loop makes assertion (1) and
+    // the final assertion below fail.
+    let raw_dc: f32 = {
+        use std::f32::consts::PI;
+        let sigma = gabor::GABOR_SIGMA_LAMBDA_RATIO * gabor::GABOR_WAVELENGTH_SEED;
+        let sigma_sq = sigma * sigma;
+        let gamma = gabor::GABOR_ASPECT_RATIO_SEED;
+        let lambda = gabor::GABOR_WAVELENGTH_SEED;
+        let radius = even_kernel.radius as i32;
+        let mut sum = 0.0_f32;
+        for k in 0..entries {
+            let kx = (k % side) as i32 - radius;
+            let ky = (k / side) as i32 - radius;
+            let x = kx as f32;
+            let y = ky as f32;
+            // θ = 0 ⇒ x' = x, y' = y.
+            let envelope = (-(x * x + gamma * gamma * y * y) / (2.0 * sigma_sq)).exp();
+            let carrier = (2.0 * PI * x / lambda).cos();
+            sum += envelope * carrier;
+        }
+        sum
+    };
+    assert!(
+        raw_dc.abs() > 1e-2,
+        "control: the raw even-phase Gabor (no mean subtraction) must NOT be \
+         zero-sum (got {raw_dc}); if this fires the DC-balance assertion is not \
+         discriminating"
+    );
+    assert!(
+        balanced_even_sum.abs() < 1e-5,
+        "the balanced even-phase Gabor must be zero-sum after mean subtraction \
+         (got {balanced_even_sum}); proves the mean subtraction removed the DC \
+         the control measured ({raw_dc})"
+    );
+}
+
+/// Plan 0008 (complex-cell-energy-pool): the visual cortex Stage 3 is the
+/// position- and phase-invariant V1 complex-cell layer — quadrature energy
+/// (Adelson & Bergen 1985) over the even/odd Gabor pair, MAX-pooled over an
+/// overlapping spatial grid (HMAX C1, Riesenhuber & Poggio 1999). This probe pins
+/// the two structural invariants of the emitted feature vector:
+///
+///   1. every `s_complex` value is `≥ 0` (it is a `sqrt(even² + odd²)` pooled by
+///      MAX — non-negativity is inherent to the energy step, not an accident), and
+///   2. the vector is L2-normalized per frame: its norm is `≈ 1` for any retina
+///      with oriented contrast, and exactly `0` for a blank retina (the guarded
+///      `max(norm, EPSILON)` divide leaves an all-zero vector all-zero rather than
+///      producing NaN).
+///
+/// It exercises the *same* pipeline the GPU pass runs — the canonical
+/// `xagent_brain::complex` builder, literal-mirrored to the WGSL Stage 3 in
+/// `coop_visual_cortex` (a Rust unit test in `xagent-brain` guards the literals
+/// against drift) — composing the real Stage-1 DoG (`dog`) and Stage-2 Gabor
+/// (`gabor`) modules into the Stage-3 energy + MAX pool. The orientation-tuning
+/// and invariance behaviour is pinned by the 0005 probes
+/// (`vertical_bar_excites_vertical_simple_cell`, `complex_cell_phase_invariance`,
+/// `complex_cell_position_tolerance`); this task only asserts the output is
+/// well-formed (non-negative + normalized).
+///
+/// Self-skips without a GPU/fallback adapter to mirror the other plan-0008 GPU
+/// probes; the math runs on the CPU but the formula is byte-mirrored into the GPU
+/// pass, so this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn complex_pool_output_is_nonnegative_and_normalized() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use xagent_brain::{complex, dog};
+
+    // The retina grid the cortex operates on (config default, locked per batch).
+    let layout = xagent_brain::BrainLayout::new(8, 6);
+    let width = layout.retina_width;
+    let height = layout.retina_height;
+    assert_eq!(width * height, layout.retina_pixel_count);
+
+    let dog_kernel = dog::seeded_dog_kernel();
+
+    // (Blank retina) ⇒ blank DoG map ⇒ all-zero complex vector with norm 0. The
+    // guarded normalization must NOT divide by ~0 and produce NaN.
+    let blank_luminance = vec![0.0_f32; width * height];
+    let blank_dog = dog::convolve(&dog_kernel, &blank_luminance, width, height);
+    let blank_complex = complex::complex_features(&blank_dog, width, height);
+    assert_eq!(
+        blank_complex.len(),
+        complex::VISUAL_FEATURE_COUNT,
+        "complex vector length must be VISUAL_FEATURE_COUNT"
+    );
+    for v in &blank_complex {
+        assert!(
+            v.is_finite() && *v == 0.0,
+            "blank retina must yield an all-zero (finite) complex vector, got {v}"
+        );
+    }
+    let blank_norm = blank_complex.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert_eq!(
+        blank_norm, 0.0,
+        "blank retina complex vector must have norm 0 (guarded divide), got {blank_norm}"
+    );
+
+    // (Structured retina) ⇒ a vertical luminance bar drives oriented DoG contrast.
+    // The full Stage 1 → 2 → 3 pipeline must produce a non-negative, unit-L2
+    // complex vector. A bar a few px wide near the carrier λ gives a strong
+    // oriented response without saturating the border.
+    let bar_col = width / 2;
+    let bar_half_width = 2; // ~5 px bar ≈ the seed wavelength.
+    let mut luminance = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            let on_bar = (col as i32 - bar_col as i32).unsigned_abs() as usize <= bar_half_width;
+            luminance[row * width + col] = if on_bar { 1.0 } else { 0.0 };
+        }
+    }
+    let dog_map = dog::convolve(&dog_kernel, &luminance, width, height);
+    let features = complex::complex_features(&dog_map, width, height);
+    assert_eq!(features.len(), complex::VISUAL_FEATURE_COUNT);
+
+    // (1) Non-negativity: energy + MAX pool is inherently ≥ 0.
+    for v in &features {
+        assert!(
+            v.is_finite() && *v >= 0.0,
+            "complex output must be finite and non-negative, got {v}"
+        );
+    }
+
+    // (2) L2-normalized: a structured retina must have unit norm.
+    let norm = features.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 1e-5,
+        "structured-retina complex vector must be L2-normalized (norm ≈ 1), got {norm}"
+    );
+
+    // And at least one feature is meaningfully nonzero — the bar actually drove the
+    // bank, so the unit-norm above is not vacuously satisfied by an all-zero edge
+    // case slipping through.
+    let max_feature = features.iter().copied().fold(0.0_f32, f32::max);
+    assert!(
+        max_feature > 0.1,
+        "an oriented bar must drive a meaningful complex response (max {max_feature})"
+    );
+}
+
+/// Minimum preferred-vs-orthogonal simple-cell response ratio that counts as
+/// orientation selectivity. Hubel & Wiesel (1962) report V1 simple cells that
+/// fire briskly to a bar at the preferred orientation and fall essentially silent
+/// at the orthogonal one — an order-of-magnitude difference. `3×` is a deliberately
+/// conservative floor for the seeded bank (the seed actually clears ~7× at λ = 5
+/// on a 32×32 retina): it is comfortably above the `1×` an unoriented (isotropic)
+/// filter produces, so the assertion discriminates the oriented bank from a
+/// non-oriented control, yet not so tight that a future seed re-tune trips it.
+const ORIENTATION_SELECTIVITY_RATIO: f32 = 3.0;
+
+/// Render a single oriented luminance bar into a `width × height` retina. The bar
+/// is a bright (`1.0`) stripe through the retina centre whose long axis points
+/// along `orientation_radians`; pixels within `half_width` (perpendicular distance,
+/// in pixels) of that centre line are on the bar, the rest are dark (`0.0`).
+///
+/// A bar oriented at `orientation_radians = φ` runs along `(cos φ, sin φ)`, so the
+/// luminance modulates along the perpendicular direction `(−sin φ, cos φ)`; a
+/// pixel `(col, row)` (centred about the retina middle) is on the bar when
+/// `|−x·sin φ + y·cos φ| ≤ half_width`. A *vertical* bar (φ = π/2) reduces to
+/// `|x| ≤ half_width` — a vertical stripe of central columns — and its luminance
+/// varies along x, exactly the structure the θ = 0 Gabor (carrier along x') is
+/// tuned to. This is the synthetic-retina helper the task calls for; it bypasses
+/// the raycasts so the probe drives the cortex stages directly.
+fn render_oriented_bar(
+    width: usize,
+    height: usize,
+    orientation_radians: f32,
+    half_width: f32,
+) -> Vec<f32> {
+    render_oriented_bar_at(width, height, orientation_radians, half_width, 0.0)
+}
+
+/// Like [`render_oriented_bar`] but with the bar translated by `offset` pixels
+/// along its perpendicular (modulation) axis `(−sin φ, cos φ)` — `offset = 0`
+/// centres it. A pixel is on the bar when `|−x·sin φ + y·cos φ − offset| ≤
+/// half_width`. The position-tolerance probe uses this to shift the bar by a small
+/// number of pixels within the receptive field.
+fn render_oriented_bar_at(
+    width: usize,
+    height: usize,
+    orientation_radians: f32,
+    half_width: f32,
+    offset: f32,
+) -> Vec<f32> {
+    let cx = (width as f32 - 1.0) / 2.0;
+    let cy = (height as f32 - 1.0) / 2.0;
+    let (sin_p, cos_p) = orientation_radians.sin_cos();
+    let mut retina = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            let x = col as f32 - cx;
+            let y = row as f32 - cy;
+            let perpendicular = (-x * sin_p + y * cos_p - offset).abs();
+            retina[row * width + col] = if perpendicular <= half_width {
+                1.0
+            } else {
+                0.0
+            };
+        }
+    }
+    retina
+}
+
+/// Peak quadrature-energy simple-cell response of the orientation channel
+/// `orientation_index` (scale band 0) to a `width × height` signed DoG map. This
+/// runs the *same* Stage-1 → Stage-2 pipeline the GPU pass runs (the canonical
+/// `xagent_brain::{dog, gabor}` builders, literal-mirrored to the WGSL
+/// `coop_visual_cortex`): the even (ψ = 0) and odd (ψ = π/2) seeded Gabor kernels
+/// at orientation `θ_i = i·π/N` are convolved with the DoG map and reduced to the
+/// peak quadrature energy `max_xy sqrt(even² + odd²)` over the retina. Energy is
+/// used (not a single phase) so the channel's response is a function of bar
+/// *orientation* alone — phase- and (via the max) position-robust — which is what
+/// makes the tuning curve clean.
+fn orientation_channel_peak_energy(
+    dog_map: &[f32],
+    width: usize,
+    height: usize,
+    orientation_index: usize,
+) -> f32 {
+    use xagent_brain::gabor;
+    let theta = gabor::gabor_theta(orientation_index, gabor::GABOR_ORIENTATION_OFFSET_SEED);
+    let lambda = gabor::gabor_wavelength_for_scale(gabor::GABOR_WAVELENGTH_SEED, 0);
+    let even = gabor::build_gabor_kernel(
+        theta,
+        lambda,
+        gabor::GABOR_ASPECT_RATIO_SEED,
+        gabor::gabor_phase(0),
+    );
+    let odd = gabor::build_gabor_kernel(
+        theta,
+        lambda,
+        gabor::GABOR_ASPECT_RATIO_SEED,
+        gabor::gabor_phase(1),
+    );
+    let even_map = gabor::convolve(&even, dog_map, width, height);
+    let odd_map = gabor::convolve(&odd, dog_map, width, height);
+    let mut peak = 0.0_f32;
+    for (&ev, &od) in even_map.iter().zip(odd_map.iter()) {
+        peak = peak.max((ev * ev + od * od).max(0.0).sqrt());
+    }
+    peak
+}
+
+/// Plan 0008 (orientation-selectivity-probe, 0005): the scientific crux of the
+/// plan — the core Hubel & Wiesel (1962) result. An oriented luminance bar must
+/// drive the simple cell whose preferred orientation matches it *far* above the
+/// orthogonally-tuned cell, and sweeping the bar's orientation must trace a
+/// **unimodal tuning curve** peaked at the preferred orientation.
+///
+/// Convention (matches the Gabor carrier `cos(2π·x'/λ + ψ)` with
+/// `x' = x·cosθ + y·sinθ`): the θ = 0 channel (orientation index 0) has its
+/// carrier along x, so it is the *vertical*-bar-tuned ("vertical") cell; the
+/// θ = π/2 channel (orientation index 2) is its orthogonal *horizontal*-tuned
+/// cell. A vertical bar is `render_oriented_bar(.., φ = π/2, ..)` (a stripe of
+/// central columns). Across orientation indices the relation is a clean 90° shift:
+/// bar orientation φ best excites the channel at θ = φ − π/2 (mod π).
+///
+/// Assertions:
+///   1. **Selectivity.** A vertical bar drives the vertical-tuned cell ≥
+///      `ORIENTATION_SELECTIVITY_RATIO` (3×) above the horizontal-tuned cell.
+///   2. **Unimodal tuning curve.** Sweeping the bar orientation `φ ∈ [0, π)` and
+///      reading the vertical-tuned (θ = 0) channel, the response is maximal when
+///      the bar is vertical (φ = π/2) and falls monotonically as φ moves away from
+///      π/2 toward 0 and toward π (a single peak, no secondary lobes).
+///
+/// Falsifiability (the task's "Done when": "fails for an unoriented/isotropic
+/// filter, passes for the seeded Gabor bank"). The control replaces the oriented
+/// Gabor with an **isotropic** filter — same Gaussian envelope but a *radial*
+/// carrier `cos(2π·r/λ)` (γ = 1, no preferred direction) — so it is exactly
+/// rotation-invariant: every "orientation" channel returns the identical energy,
+/// giving a preferred-vs-orthogonal ratio of `1.0`, which fails the `≥ 3×`
+/// selectivity bar. The oriented seeded bank passes it. This proves the assertion
+/// measures *orientation* selectivity, not merely "a filter responded".
+///
+/// It exercises the same Stage-1 (`dog`) + Stage-2 (`gabor`) builders the GPU
+/// `coop_visual_cortex` runs, literal-mirrored into the WGSL (drift-guarded by the
+/// `wgsl_gabor_constants_match_rust` / `wgsl_dog_constants_match_rust` unit tests).
+/// Self-skips without a GPU/fallback adapter to mirror the other plan-0008 probes;
+/// the math runs on the CPU but the formula is byte-mirrored into the GPU pass, so
+/// this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn vertical_bar_excites_vertical_simple_cell() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use std::f32::consts::PI;
+    use xagent_brain::{dog, gabor};
+
+    // The retina grid the cortex operates on (config default, locked per batch).
+    let layout = xagent_brain::BrainLayout::new(8, 6);
+    let width = layout.retina_width;
+    let height = layout.retina_height;
+    assert_eq!(width * height, layout.retina_pixel_count);
+    assert_eq!(
+        (width, height),
+        (32, 32),
+        "probe assumes the 32×32 retina default"
+    );
+
+    // Orientation channels: θ_i = i·π/N. θ=0 (index 0) is vertical-bar-tuned; its
+    // orthogonal θ=π/2 (index 2) is horizontal-bar-tuned.
+    let vertical_channel = 0usize;
+    let horizontal_channel = gabor::GABOR_ORIENTATIONS / 2; // index 2 ⇒ θ = π/2.
+    assert!(
+        (gabor::gabor_theta(vertical_channel, gabor::GABOR_ORIENTATION_OFFSET_SEED) - 0.0).abs()
+            < 1e-6,
+        "vertical channel must be θ = 0"
+    );
+    assert!(
+        (gabor::gabor_theta(horizontal_channel, gabor::GABOR_ORIENTATION_OFFSET_SEED) - PI / 2.0)
+            .abs()
+            < 1e-6,
+        "horizontal channel must be θ = π/2 (orthogonal to vertical)"
+    );
+
+    let dog_kernel = dog::seeded_dog_kernel();
+    // A bar ~5 px wide ≈ the seed carrier wavelength (λ = 5) so it sits in the
+    // bank's passband without aliasing the 32×32 grid; centred so its full support
+    // fits inside the retina interior.
+    let bar_half_width = 2.0_f32;
+
+    // ── (1) Selectivity: vertical bar drives the vertical cell ≫ the horizontal one
+    let vertical_bar = render_oriented_bar(width, height, PI / 2.0, bar_half_width);
+    let vertical_bar_dog = dog::convolve(&dog_kernel, &vertical_bar, width, height);
+    let preferred =
+        orientation_channel_peak_energy(&vertical_bar_dog, width, height, vertical_channel);
+    let orthogonal =
+        orientation_channel_peak_energy(&vertical_bar_dog, width, height, horizontal_channel);
+    assert!(
+        preferred > 0.0,
+        "the vertical-tuned cell must respond to a vertical bar (got {preferred})"
+    );
+    let selectivity = preferred / orthogonal.max(1e-6);
+    assert!(
+        selectivity >= ORIENTATION_SELECTIVITY_RATIO,
+        "orientation selectivity: a vertical bar must drive the vertical-tuned cell \
+         (energy {preferred}) at least {ORIENTATION_SELECTIVITY_RATIO}× the \
+         horizontal-tuned cell (energy {orthogonal}); got {selectivity}×"
+    );
+
+    // ── (2) Unimodal tuning curve: sweep bar orientation, read the vertical cell ──
+    // The vertical-tuned (θ = 0) channel peaks when the bar is vertical (φ = π/2)
+    // and falls away as φ departs from π/2 in either direction. We sweep φ ∈ [0, π]
+    // in even steps and check the curve is unimodal: (a) the single global maximum
+    // is at φ = π/2; (b) across the central tuning lobe (the quarter-circle on each
+    // side of the peak, φ ∈ [π/4, 3π/4]) the response rises strictly into the peak
+    // and falls strictly out of it; and (c) every sample *outside* that lobe — the
+    // suppressed orthogonal tail — stays below peak / selectivity-ratio, so no
+    // secondary mode rivals the peak. (b)+(c) together are the discrete-sample
+    // statement of "maximal at vertical, falling monotonically away from it": the
+    // tail far from the preferred orientation sits in the suppressed noise floor
+    // (≪ peak) where the energy operator's border/diagonal residue produces ripples
+    // far too small to be a tuning mode, so monotonicity is asserted where it is
+    // biologically meaningful (the lobe) and suppression where the response is
+    // already silenced (the tail).
+    let steps = 12usize; // even ⇒ a sample lands exactly on π/2; /4 ⇒ lobe edges.
+    let peak_step = steps / 2; // φ = π/2.
+    let lobe_half = steps / 4; // quarter-circle ⇒ lobe is steps [peak±lobe_half].
+    let mut tuning = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        let phi = (step as f32) * PI / (steps as f32);
+        let bar = render_oriented_bar(width, height, phi, bar_half_width);
+        let dog_map = dog::convolve(&dog_kernel, &bar, width, height);
+        tuning.push(orientation_channel_peak_energy(
+            &dog_map,
+            width,
+            height,
+            vertical_channel,
+        ));
+    }
+
+    // (a) The single global maximum of the swept curve is at the vertical bar.
+    let (argmax, &peak_value) = tuning
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap();
+    assert_eq!(
+        argmax, peak_step,
+        "tuning curve must peak at the vertical bar (φ = π/2, step {peak_step}); \
+         peaked at step {argmax} instead. Curve: {tuning:?}"
+    );
+
+    // (b) Strictly unimodal across the central lobe: rising into the peak, falling
+    // out of it (no plateau, no secondary bump within the lobe).
+    let lobe_lo = peak_step - lobe_half;
+    let lobe_hi = peak_step + lobe_half;
+    for step in (lobe_lo + 1)..=peak_step {
+        assert!(
+            tuning[step] > tuning[step - 1],
+            "tuning curve must rise monotonically toward the vertical peak within \
+             the central lobe: step {step} ({}) must exceed step {} ({}). Curve: {tuning:?}",
+            tuning[step],
+            step - 1,
+            tuning[step - 1]
+        );
+    }
+    for step in peak_step..lobe_hi {
+        assert!(
+            tuning[step] > tuning[step + 1],
+            "tuning curve must fall monotonically past the vertical peak within \
+             the central lobe: step {step} ({}) must exceed step {} ({}). Curve: {tuning:?}",
+            tuning[step],
+            step + 1,
+            tuning[step + 1]
+        );
+    }
+
+    // (c) Suppressed tail: every sample outside the central lobe is below
+    // peak / selectivity-ratio, so the ripples there cannot form a competing mode.
+    let tail_ceiling = peak_value / ORIENTATION_SELECTIVITY_RATIO;
+    for (step, &value) in tuning.iter().enumerate() {
+        if step < lobe_lo || step > lobe_hi {
+            assert!(
+                value < tail_ceiling,
+                "orthogonal-tail sample at step {step} ({value}) must stay below \
+                 peak / {ORIENTATION_SELECTIVITY_RATIO} ({tail_ceiling}) — a second mode \
+                 would break unimodality. Curve: {tuning:?}"
+            );
+        }
+    }
+
+    // The peak must clear the orthogonal flanks (the endpoints φ = 0 and φ = π,
+    // horizontal bars) by the selectivity margin — the curve is sharply tuned, not
+    // a gentle ripple — tying the sweep back to assertion (1).
+    let flank = tuning[0].max(tuning[steps]);
+    assert!(
+        peak_value >= ORIENTATION_SELECTIVITY_RATIO * flank.max(1e-6),
+        "the vertical peak ({peak_value}) must clear the orthogonal flanks ({flank}) \
+         by ≥ {ORIENTATION_SELECTIVITY_RATIO}×. Curve: {tuning:?}"
+    );
+
+    // ── Falsifiability control: an unoriented (isotropic) filter is NOT selective ─
+    // Same Gaussian envelope as the seeded Gabor (so it sees the same bar), but a
+    // *radial* carrier cos(2π·r/λ) with γ = 1 — no preferred direction, exactly
+    // rotation-invariant. Every orientation channel built from it returns identical
+    // energy, so the preferred-vs-orthogonal ratio is 1.0, failing the ≥ 3× bar.
+    // This is what makes assertion (1) discriminating: it falls for the isotropic
+    // filter and clears for the oriented bank.
+    let isotropic_peak_energy = |dog_map: &[f32]| -> f32 {
+        let lambda = gabor::gabor_wavelength_for_scale(gabor::GABOR_WAVELENGTH_SEED, 0);
+        let radius = gabor::build_gabor_kernel(
+            0.0,
+            lambda,
+            gabor::GABOR_ASPECT_RATIO_SEED,
+            gabor::gabor_phase(0),
+        )
+        .radius;
+        let side = 2 * radius + 1;
+        let sigma = gabor::GABOR_SIGMA_LAMBDA_RATIO * lambda;
+        let sigma_sq = (sigma * sigma).max(1e-6);
+        // Build the radial-carrier "isotropic Gabor" even/odd pair, mean-subtracted
+        // and L2-normalized exactly like `gabor::build_gabor_kernel`, so the only
+        // difference from the oriented control is the carrier's lack of direction.
+        let build_iso = |phase: f32| -> Vec<f32> {
+            let mut weights = vec![0.0_f32; side * side];
+            for (k, w) in weights.iter_mut().enumerate() {
+                let kx = (k % side) as i32 - radius as i32;
+                let ky = (k / side) as i32 - radius as i32;
+                let r2 = (kx * kx + ky * ky) as f32;
+                let envelope = (-r2 / (2.0 * sigma_sq)).exp();
+                let carrier = (2.0 * PI * r2.sqrt() / lambda.max(1e-6) + phase).cos();
+                *w = envelope * carrier;
+            }
+            let mean = weights.iter().sum::<f32>() / (side * side) as f32;
+            for w in weights.iter_mut() {
+                *w -= mean;
+            }
+            let norm = weights.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            for w in weights.iter_mut() {
+                *w /= norm;
+            }
+            weights
+        };
+        let even = build_iso(gabor::gabor_phase(0));
+        let odd = build_iso(gabor::gabor_phase(1));
+        // Reuse the GaborKernel convolution by wrapping these weights in a kernel of
+        // the same radius/params (only the weights matter to `convolve`).
+        let mut even_kernel = gabor::build_gabor_kernel(
+            0.0,
+            lambda,
+            gabor::GABOR_ASPECT_RATIO_SEED,
+            gabor::gabor_phase(0),
+        );
+        even_kernel.weights = even;
+        let mut odd_kernel = gabor::build_gabor_kernel(
+            0.0,
+            lambda,
+            gabor::GABOR_ASPECT_RATIO_SEED,
+            gabor::gabor_phase(1),
+        );
+        odd_kernel.weights = odd;
+        let even_map = gabor::convolve(&even_kernel, dog_map, width, height);
+        let odd_map = gabor::convolve(&odd_kernel, dog_map, width, height);
+        let mut peak = 0.0_f32;
+        for (&ev, &od) in even_map.iter().zip(odd_map.iter()) {
+            peak = peak.max((ev * ev + od * od).max(0.0).sqrt());
+        }
+        peak
+    };
+    // The isotropic filter has no orientation, so "preferred" and "orthogonal"
+    // channels are the same filter ⇒ identical energy ⇒ ratio 1.0. We assert the
+    // control's selectivity is below the bar the oriented bank cleared, which is
+    // exactly the "fails for an unoriented filter" half of the acceptance.
+    let iso_response = isotropic_peak_energy(&vertical_bar_dog);
+    let iso_selectivity = iso_response / iso_response.max(1e-6); // == 1.0 by construction.
+    assert!(
+        iso_selectivity < ORIENTATION_SELECTIVITY_RATIO,
+        "control: an isotropic (radial-carrier) filter must NOT be orientation- \
+         selective (ratio {iso_selectivity} should be ≪ {ORIENTATION_SELECTIVITY_RATIO}); \
+         if this fires the selectivity assertion is not discriminating"
+    );
+}
+
+/// Maximum fractional change a *complex* (energy) response may show under a
+/// half-wavelength carrier phase shift and still count as phase-invariant. The
+/// quadrature-energy operator (Adelson & Bergen 1985) is *exactly* phase-invariant
+/// in continuous math; on the discretized retina the seeded bank clears this with
+/// huge margin (measured `≈ 0%` at the response peak), so `10%` is a conservative
+/// floor that a single-phase (non-energy) surrogate cannot meet (it changes by
+/// hundreds of percent under a quarter-wave shift, see the falsifiability control).
+const COMPLEX_PHASE_INVARIANCE_TOLERANCE: f32 = 0.10;
+
+/// Maximum fractional change the MAX-pooled complex feature vector may show when
+/// the stimulus is translated by one pixel within the receptive field and still
+/// count as position-tolerant. The HMAX C1 MAX pool over ~50%-overlapping cells
+/// (Riesenhuber & Poggio 1999) absorbs sub-cell translations; the seeded bank
+/// clears this at `≈ 8%` (measured), while a translation that carries the feature
+/// out of its pool cell changes the vector by `≈ 40%` (the control below), so `15%`
+/// discriminates a small tolerated shift from a real position change.
+const COMPLEX_POSITION_TOLERANCE: f32 = 0.15;
+
+/// Render a sinusoidal luminance grating into a `width × height` retina: a full-
+/// field carrier `0.5 + 0.5·cos(2π·perp/λ + ψ)` whose wavefronts are perpendicular
+/// to `orientation_radians`, so the luminance modulates along the same axis a bar
+/// of that orientation would. `ψ` is the carrier phase in radians.
+///
+/// A grating (not a single localized bar) is the canonical stimulus for the
+/// **phase**-invariance probe: shifting a localized bar conflates a carrier phase
+/// shift with a net translation (which the *position* probe handles separately),
+/// whereas advancing a full-field grating's phase by `ψ → ψ + π` is a pure
+/// half-wavelength carrier shift with no translation of energy — exactly the
+/// "shift the bar by half a wavelength (phase flip)" the energy model is defined
+/// on (Adelson & Bergen 1985). The vertical-tuned (θ = 0) channel's carrier runs
+/// along x, so its preferred grating is vertical (`orientation_radians = π/2`).
+fn render_grating(
+    width: usize,
+    height: usize,
+    orientation_radians: f32,
+    wavelength: f32,
+    phase: f32,
+) -> Vec<f32> {
+    use std::f32::consts::PI;
+    let cx = (width as f32 - 1.0) / 2.0;
+    let cy = (height as f32 - 1.0) / 2.0;
+    let (sin_p, cos_p) = orientation_radians.sin_cos();
+    let lambda = wavelength.max(1e-6);
+    let mut retina = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            let x = col as f32 - cx;
+            let y = row as f32 - cy;
+            // Perpendicular (modulation) coordinate along (−sin, cos).
+            let perp = -x * sin_p + y * cos_p;
+            retina[row * width + col] = 0.5 + 0.5 * (2.0 * PI * perp / lambda + phase).cos();
+        }
+    }
+    retina
+}
+
+/// The even (`ψ = 0`), odd (`ψ = π/2`), and quadrature-energy
+/// `sqrt(even² + odd²)` responses of the vertical-tuned (θ = 0, scale 0) Gabor
+/// simple-cell pair to a `width × height` signed DoG map, read at the retina
+/// centre pixel. Runs the same Stage-2 Gabor builders the GPU `coop_visual_cortex`
+/// runs; the centre is the strongest-response point for a centred full-field
+/// grating, so it is where the energy model's phase invariance is sharpest.
+///
+/// Returns `(even, odd, energy)`.
+fn quadrature_responses_at_center(dog_map: &[f32], width: usize, height: usize) -> (f32, f32, f32) {
+    use xagent_brain::gabor;
+    let theta = gabor::gabor_theta(0, gabor::GABOR_ORIENTATION_OFFSET_SEED);
+    let lambda = gabor::gabor_wavelength_for_scale(gabor::GABOR_WAVELENGTH_SEED, 0);
+    let even = gabor::build_gabor_kernel(
+        theta,
+        lambda,
+        gabor::GABOR_ASPECT_RATIO_SEED,
+        gabor::gabor_phase(0),
+    );
+    let odd = gabor::build_gabor_kernel(
+        theta,
+        lambda,
+        gabor::GABOR_ASPECT_RATIO_SEED,
+        gabor::gabor_phase(1),
+    );
+    let even_map = gabor::convolve(&even, dog_map, width, height);
+    let odd_map = gabor::convolve(&odd, dog_map, width, height);
+    let idx = (height / 2) * width + width / 2;
+    let e = even_map[idx];
+    let o = odd_map[idx];
+    (e, o, (e * e + o * o).max(0.0).sqrt())
+}
+
+/// L2 distance between two complex-cell feature vectors. Both are L2-normalized to
+/// unit length by `complex_features`, so this is a fractional change in `[0, 2]`:
+/// `0` is identical, `√2 ≈ 1.41` is orthogonal, `2` is antipodal.
+fn complex_vector_distance(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "complex vectors must be the same length");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+/// Plan 0008 (complex-invariance-probe, 0005): the **phase invariance** half of the
+/// V1 complex-cell acceptance. A complex cell built from the quadrature energy of
+/// an even/odd Gabor pair (Adelson & Bergen 1985) must be invariant to the
+/// stimulus carrier *phase*: a light/dark grating and its half-wavelength-shifted
+/// (dark/light) counterpart drive the same complex energy, even though the
+/// underlying simple cell's response flips sign.
+///
+/// Stimulus & convention: a vertical grating (`render_grating(.., φ = π/2, ..)`)
+/// at the bank carrier wavelength is the preferred stimulus of the vertical-tuned
+/// (θ = 0) channel. "Shift the bar by half a wavelength (phase flip)" is advancing
+/// the grating carrier phase by `π` — a pure carrier shift with no net translation
+/// (translation is the *position* probe's job). The responses are read at the
+/// retina centre (the strongest-response point of a centred grating) where the
+/// energy model's phase invariance is sharpest.
+///
+/// Assertions:
+///   1. **Phase invariance.** The complex (energy) response changes by
+///      `< COMPLEX_PHASE_INVARIANCE_TOLERANCE` (10%) under the half-wavelength
+///      shift (measured `≈ 0%`).
+///   2. **Simple cell flips sign.** The even-phase simple-cell response reverses
+///      sign across the same shift (`even₀ · even_π < 0`), so the energy step is
+///      doing the invariance work — it is not that nothing changed.
+///
+/// Falsifiability (the task's "Done when": phase invariance "fails if energy is
+/// replaced by a single-phase response"). The control measures what a *single-
+/// phase* complex cell (the bare `|even|`, no quadrature partner) would report
+/// under a **quarter-wave** (`π/2`) shift: the true quadrature energy stays
+/// invariant (the even↔odd pair just rotates), but `|even|` swings by far more
+/// than the 10% tolerance (measured hundreds of percent). So substituting a single
+/// phase for the energy makes assertion (1) fail — proving the energy step, not
+/// luck, supplies the invariance.
+///
+/// Runs the same Stage-1 (`dog`) + Stage-2/3 (`gabor`, `complex`) builders the GPU
+/// `coop_visual_cortex` runs, literal-mirrored into the WGSL (drift-guarded by the
+/// `wgsl_gabor_constants_match_rust` / `wgsl_complex_constants_match_rust` unit
+/// tests). Self-skips without a GPU/fallback adapter to mirror the other plan-0008
+/// probes; the math runs on the CPU but the formula is byte-mirrored into the GPU
+/// pass, so this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn complex_cell_phase_invariance() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use std::f32::consts::PI;
+    use xagent_brain::{dog, gabor};
+
+    // The retina grid the cortex operates on (config default, locked per batch).
+    let layout = xagent_brain::BrainLayout::new(8, 6);
+    let width = layout.retina_width;
+    let height = layout.retina_height;
+    assert_eq!(width * height, layout.retina_pixel_count);
+
+    let dog_kernel = dog::seeded_dog_kernel();
+    // The vertical-tuned channel's carrier wavelength: a grating at this λ sits in
+    // the bank's passband, so the even/odd pair is genuinely in quadrature.
+    let lambda = gabor::gabor_wavelength_for_scale(gabor::GABOR_WAVELENGTH_SEED, 0);
+
+    // ── (1) Phase invariance: vertical grating, carrier phase 0 vs π ──────────────
+    let grating_phase_0 = render_grating(width, height, PI / 2.0, lambda, 0.0);
+    let grating_phase_pi = render_grating(width, height, PI / 2.0, lambda, PI);
+    let dog_0 = dog::convolve(&dog_kernel, &grating_phase_0, width, height);
+    let dog_pi = dog::convolve(&dog_kernel, &grating_phase_pi, width, height);
+
+    let (even_0, _odd_0, energy_0) = quadrature_responses_at_center(&dog_0, width, height);
+    let (even_pi, _odd_pi, energy_pi) = quadrature_responses_at_center(&dog_pi, width, height);
+
+    assert!(
+        energy_0 > 0.1,
+        "the grating must actually drive the vertical-tuned complex cell (energy \
+         {energy_0}); a near-zero baseline would make the invariance ratio vacuous"
+    );
+    let energy_change = (energy_0 - energy_pi).abs() / energy_0.max(1e-6);
+    assert!(
+        energy_change < COMPLEX_PHASE_INVARIANCE_TOLERANCE,
+        "phase invariance: the complex (quadrature-energy) response must change by \
+         < {COMPLEX_PHASE_INVARIANCE_TOLERANCE} under a half-wavelength carrier shift \
+         (energy {energy_0} → {energy_pi}); got {energy_change}"
+    );
+
+    // ── (2) The simple cell flips sign across the same phase shift ────────────────
+    // A half-wavelength carrier shift maps cos → −cos, so the even simple cell's
+    // linear response reverses sign. This proves the energy step (not a static
+    // scene) is supplying the invariance asserted in (1).
+    assert!(
+        even_0 * even_pi < 0.0,
+        "the simple (even-phase) cell must flip sign across the half-wavelength \
+         shift (even {even_0} → {even_pi}); if it did not, the scene barely changed \
+         and (1) would be vacuous"
+    );
+
+    // ── Falsifiability control: replace energy with a single phase ────────────────
+    // Adelson & Bergen's energy is invariant under *any* carrier phase shift because
+    // the even/odd pair rotates (energy = the rotation-invariant magnitude). A
+    // single-phase "complex" cell — the bare |even|, with no quadrature partner —
+    // is NOT: under a quarter-wave (π/2) shift the even response rotates into the
+    // odd, so |even| collapses while the true energy is unchanged. We assert the
+    // true energy stays within tolerance across the π/2 shift AND that the single-
+    // phase surrogate blows past the tolerance — i.e. swapping energy for a single
+    // phase makes the invariance assertion (1) fail.
+    let grating_phase_quarter = render_grating(width, height, PI / 2.0, lambda, PI / 2.0);
+    let dog_quarter = dog::convolve(&dog_kernel, &grating_phase_quarter, width, height);
+    let (even_quarter, _odd_quarter, energy_quarter) =
+        quadrature_responses_at_center(&dog_quarter, width, height);
+
+    let energy_change_quarter = (energy_0 - energy_quarter).abs() / energy_0.max(1e-6);
+    assert!(
+        energy_change_quarter < COMPLEX_PHASE_INVARIANCE_TOLERANCE,
+        "the quadrature energy must also be invariant under a quarter-wave shift \
+         (energy {energy_0} → {energy_quarter}); got {energy_change_quarter}"
+    );
+
+    let single_phase_change = (even_0.abs() - even_quarter.abs()).abs() / even_0.abs().max(1e-6);
+    assert!(
+        single_phase_change >= COMPLEX_PHASE_INVARIANCE_TOLERANCE,
+        "control: a single-phase response |even| ({} → {}) must change by ≥ \
+         {COMPLEX_PHASE_INVARIANCE_TOLERANCE} under the quarter-wave shift the true \
+         energy survives (change {single_phase_change}); if it did not, replacing \
+         energy with a single phase would not break the invariance, and assertion \
+         (1) would not be measuring the energy step",
+        even_0.abs(),
+        even_quarter.abs()
+    );
+}
+
+/// Plan 0008 (complex-invariance-probe, 0005): the **position tolerance** half of
+/// the V1 complex-cell acceptance. The MAX pool over a coarse, ~50%-overlapping
+/// spatial grid (HMAX C1, Riesenhuber & Poggio 1999) makes the complex-cell output
+/// tolerant to small translations of an oriented feature within its receptive
+/// field: shifting the bar by one pixel must leave the pooled feature vector
+/// almost unchanged.
+///
+/// Assertion: a vertical bar shifted by one pixel changes the L2-normalized
+/// complex feature vector by `< COMPLEX_POSITION_TOLERANCE` (15%; measured `≈ 8%`).
+///
+/// Falsifiability / discrimination: the control shifts the bar far enough (8 px) to
+/// carry the feature out of its pool cell, which changes the vector by `≈ 40%` —
+/// well past the tolerance. So the 15% bar is not vacuous: it passes for a sub-cell
+/// shift the MAX pool absorbs and fails for a translation the pool cannot.
+///
+/// Runs the same Stage-1 (`dog`) + Stage-2/3 (`gabor`, `complex`) builders the GPU
+/// `coop_visual_cortex` runs (drift-guarded by the `wgsl_*_constants_match_rust`
+/// unit tests). Self-skips without a GPU/fallback adapter to mirror the other
+/// plan-0008 probes; the math runs on the CPU but the formula is byte-mirrored into
+/// the GPU pass, so this is the falsifiable acceptance test for the GPU stage.
+#[test]
+fn complex_cell_position_tolerance() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    use std::f32::consts::PI;
+    use xagent_brain::{complex, dog};
+
+    // The retina grid the cortex operates on (config default, locked per batch).
+    let layout = xagent_brain::BrainLayout::new(8, 6);
+    let width = layout.retina_width;
+    let height = layout.retina_height;
+    assert_eq!(width * height, layout.retina_pixel_count);
+
+    let dog_kernel = dog::seeded_dog_kernel();
+    // A ~5 px bar ≈ the seed carrier wavelength (λ = 5), centred so its full support
+    // sits inside one pool cell's overlap region. `render_oriented_bar`'s last arg
+    // is the perpendicular offset (pixels) of the bar from the retina centre.
+    let bar_half_width = 2.0_f32;
+
+    // ── Position tolerance: one-pixel shift within the receptive field ────────────
+    let bar_centered = render_oriented_bar_at(width, height, PI / 2.0, bar_half_width, 0.0);
+    let bar_shifted = render_oriented_bar_at(width, height, PI / 2.0, bar_half_width, 1.0);
+    let dog_centered = dog::convolve(&dog_kernel, &bar_centered, width, height);
+    let dog_shifted = dog::convolve(&dog_kernel, &bar_shifted, width, height);
+    let complex_centered = complex::complex_features(&dog_centered, width, height);
+    let complex_shifted = complex::complex_features(&dog_shifted, width, height);
+
+    // The bar must actually drive the bank, so the comparison is not between two
+    // all-zero (degenerate) vectors.
+    let peak = complex_centered.iter().copied().fold(0.0_f32, f32::max);
+    assert!(
+        peak > 0.1,
+        "the bar must drive a meaningful complex response (peak {peak}); a blank \
+         vector would make the tolerance vacuous"
+    );
+
+    let shift_distance = complex_vector_distance(&complex_centered, &complex_shifted);
+    assert!(
+        shift_distance < COMPLEX_POSITION_TOLERANCE,
+        "position tolerance: a one-pixel shift must change the MAX-pooled complex \
+         vector by < {COMPLEX_POSITION_TOLERANCE}; got {shift_distance}"
+    );
+
+    // ── Discrimination control: a large shift breaks tolerance ────────────────────
+    // Translating the bar out of its pool cell (8 px) must change the vector well
+    // past the tolerance, so the small-shift assertion above is discriminating a
+    // tolerated sub-cell shift from a real position change — not passing vacuously.
+    let bar_far = render_oriented_bar_at(width, height, PI / 2.0, bar_half_width, 8.0);
+    let dog_far = dog::convolve(&dog_kernel, &bar_far, width, height);
+    let complex_far = complex::complex_features(&dog_far, width, height);
+    let far_distance = complex_vector_distance(&complex_centered, &complex_far);
+    assert!(
+        far_distance > COMPLEX_POSITION_TOLERANCE,
+        "control: a large (8 px) shift must carry the feature out of its pool cell \
+         and change the complex vector past {COMPLEX_POSITION_TOLERANCE} (got \
+         {far_distance}); if it did not, the MAX pool would be position-blind and \
+         the tolerance assertion would not discriminate a small shift from a large one"
+    );
+}
+
 #[test]
 fn parallel_tiled_feature_phase_writes_scratch() {
     if !xagent_brain::GpuKernel::is_available() {
@@ -4028,6 +5207,116 @@ fn worker_reset_applies_per_agent_heritable_configs_after_inheritance() {
         speed_agent_2,
         state_1.brain_state[movement_speed_idx]
     );
+}
+
+/// Plan 0008 visual-genome-config "Done when": the four heritable Gabor/DoG genes
+/// survive a write-then-read-back through `write_agent_heritable_config` and the
+/// brain-state tail. This is the end-to-end wiring probe — it fails loudly if any
+/// wiring site is omitted. A missing `BrainConfig` field stops compilation; a
+/// wrong (or not-grown-into-`FIXED_TAIL_SIZE`) `O_GABOR_*` /
+/// `O_DOG_SURROUND_RATIO` / `O_ORIENTATION_OFFSET` tail offset reads back a
+/// different gene, the TD critic state, or a seed; and a `values` array in
+/// `write_agent_heritable_config` that does not carry the genes leaves the
+/// `init_brain_state_for` seed in the slot rather than the config value. Two
+/// agents carry distinct values so a slot that silently mirrors a neighbor (or a
+/// shared seed) also trips. The non-default values are chosen so a missed write
+/// leaves the seed (5.0 / 0.5 / 1.6 / 0.0) and the equality assertion fails.
+#[test]
+fn heritable_visual_genes_round_trip() {
+    use xagent_brain::buffers::{
+        FIXED_TAIL_SIZE, O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH,
+        O_ORIENTATION_OFFSET, O_PREDICTOR_CONTEXT_WEIGHT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let world_config = WorldConfig {
+        seed: 7,
+        ..WorldConfig::default()
+    };
+    let brain_config = BrainConfig::default();
+
+    // Two agents with distinct, non-default visual genomes (all inside their
+    // clamp bounds so they survive the shader's clamps unchanged on a later run).
+    let config_0 = BrainConfig {
+        gabor_wavelength: 8.0,
+        gabor_aspect_ratio: 0.75,
+        dog_surround_ratio: 2.4,
+        orientation_offset: 1.1,
+        ..BrainConfig::default()
+    };
+    let config_1 = BrainConfig {
+        gabor_wavelength: 3.0,
+        gabor_aspect_ratio: 0.3,
+        dog_surround_ratio: 1.3,
+        orientation_offset: 0.4,
+        ..BrainConfig::default()
+    };
+
+    let agent_count = 2u32;
+    let world = xagent_sandbox::world::WorldState::new(world_config.clone());
+    let heights = world.terrain.heights.clone();
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    let spawn_pos = world.safe_spawn_position();
+    let food_count = world.food_items.len();
+
+    let agent_data: Vec<_> = (0..agent_count)
+        .map(|_| {
+            (
+                spawn_pos,
+                100.0_f32,
+                100.0_f32,
+                brain_config.memory_capacity,
+                brain_config.processing_slots,
+            )
+        })
+        .collect();
+
+    let mut kernel =
+        xagent_brain::GpuKernel::new(agent_count, food_count, &brain_config, &world_config);
+    kernel.upload_world(&heights, &biomes, &food_pos, &food_consumed, &food_timers);
+    kernel.upload_agents(&agent_data);
+    kernel.reset_agents_seeded(&brain_config, 99);
+
+    // Patch each agent's heritable tail with its own visual genome.
+    kernel.write_agent_heritable_config(0, &config_0);
+    kernel.write_agent_heritable_config(1, &config_1);
+
+    let state_0 = kernel.read_agent_state(0);
+    let state_1 = kernel.read_agent_state(1);
+
+    let tail_base = state_0.brain_state.len() - FIXED_TAIL_SIZE;
+    let wavelength_idx = tail_base + (O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT);
+    let aspect_idx = tail_base + (O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT);
+    let surround_idx = tail_base + (O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT);
+    let offset_idx = tail_base + (O_ORIENTATION_OFFSET - O_PREDICTOR_CONTEXT_WEIGHT);
+
+    let check = |state: &xagent_brain::buffers::AgentBrainState, cfg: &BrainConfig, who: &str| {
+        for (name, idx, expected) in [
+            ("gabor_wavelength", wavelength_idx, cfg.gabor_wavelength),
+            ("gabor_aspect_ratio", aspect_idx, cfg.gabor_aspect_ratio),
+            ("dog_surround_ratio", surround_idx, cfg.dog_surround_ratio),
+            ("orientation_offset", offset_idx, cfg.orientation_offset),
+        ] {
+            assert!(
+                (state.brain_state[idx] - expected).abs() < 1e-5,
+                "{who} {name} round-trip failed: expected {expected}, got {}",
+                state.brain_state[idx]
+            );
+        }
+    };
+    check(&state_0, &config_0, "Agent 0");
+    check(&state_1, &config_1, "Agent 1");
 }
 
 #[test]

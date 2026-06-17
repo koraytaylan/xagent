@@ -87,13 +87,45 @@ fn subgroup_bitonic_supported(has_feature: bool, min_subgroup_size: u32) -> bool
     has_feature && min_subgroup_size >= MIN_SUBGROUP_WIDTH_FOR_BITONIC
 }
 
-/// Build the pipeline override map that feeds `VISION_W` / `VISION_H`
-/// into the WGSL override cascade. The returned map is the single source
-/// of truth for the vision-grid dimensions at pipeline creation time.
+/// Build the pipeline override map that feeds `VISION_W` / `VISION_H` /
+/// `RETINA_PIXEL_COUNT` into the WGSL override cascade. The returned map is the
+/// single source of truth for the vision-grid and retina dimensions at pipeline
+/// creation time.
 fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
     let mut map = HashMap::new();
     map.insert("VISION_W".to_string(), f64::from(layout.vision_width));
     map.insert("VISION_H".to_string(), f64::from(layout.vision_height));
+    // Retina width/height feed the WGSL `RETINA_WIDTH`/`RETINA_HEIGHT` overrides;
+    // `RETINA_PIXEL_COUNT` derives from them in the shader (single canonical
+    // source). The visual-cortex stages reconstruct 2-D pixel coordinates from
+    // the width, so no stride is hardcoded. Cast via `u32::try_into` so an
+    // oversized retina fails loudly at pipeline creation rather than truncating.
+    let retina_width: u32 = layout
+        .retina_width
+        .try_into()
+        .expect("retina width exceeds u32 override range");
+    let retina_height: u32 = layout
+        .retina_height
+        .try_into()
+        .expect("retina height exceeds u32 override range");
+    map.insert("RETINA_WIDTH".to_string(), f64::from(retina_width));
+    map.insert("RETINA_HEIGHT".to_string(), f64::from(retina_height));
+    // Visual-cortex encoder-input selector (plan 0008 wire-visual-features-into-encoder).
+    // Feeds the WGSL `VISUAL_CORTEX_FEATURES_ACTIVE` override, which selects the
+    // `FEATURE_COUNT` width (legacy raw-vision vs. compact complex-cell). This is
+    // the ONE root the host supplies for the encoder width — FEATURE_COUNT itself
+    // stays a WGSL `override` expression (single source of truth) and is NOT set
+    // here. `layout.visual_cortex_enabled` mirrors `BrainConfig::visual_cortex_enabled`
+    // and the runtime `CFG_VISUAL_CORTEX_ENABLED` uniform, so the buffer width and
+    // the per-pass behavior agree by construction.
+    map.insert(
+        "VISUAL_CORTEX_FEATURES_ACTIVE".to_string(),
+        if layout.visual_cortex_enabled {
+            1.0
+        } else {
+            0.0
+        },
+    );
     map
 }
 
@@ -615,7 +647,7 @@ impl GpuKernel {
         ))
         .expect("Failed to create GPU device");
 
-        let layout = BrainLayout::new(brain_config.vision_width, brain_config.vision_height);
+        let layout = BrainLayout::from_config(brain_config);
         let brain_tick_stride = brain_config.brain_tick_stride;
 
         // Sensory-lag bound (issue #115). The brain reads vision/proprioception
@@ -2473,9 +2505,16 @@ impl GpuKernel {
     /// Patch per-agent heritable config values in brain_state buffer.
     ///
     /// Writes habituation_sensitivity, max_curiosity_bonus, fatigue_floor,
-    /// and movement_speed from the given BrainConfig into the agent's
+    /// movement_speed, and the four plan-0008 visual-genome genes
+    /// (gabor_wavelength, gabor_aspect_ratio, dog_surround_ratio,
+    /// orientation_offset) from the given BrainConfig into the agent's
     /// brain_state slots. Use this after `reset_agents()` to apply
     /// per-agent config variation.
+    ///
+    /// All eight slots are one contiguous run in the fixed tail — `O_MOVEMENT_SPEED`
+    /// is followed immediately by `O_GABOR_WAVELENGTH .. O_ORIENTATION_OFFSET`
+    /// (see `buffers.rs`) — so a single `write_buffer` covers them; the
+    /// `debug_assert_eq!`s pin the contiguity.
     pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
         let i = index as usize;
         let bs = self.layout.brain_stride;
@@ -2497,12 +2536,32 @@ impl GpuKernel {
             O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT,
             first_delta + 3
         );
+        debug_assert_eq!(
+            O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 4
+        );
+        debug_assert_eq!(
+            O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 5
+        );
+        debug_assert_eq!(
+            O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 6
+        );
+        debug_assert_eq!(
+            O_ORIENTATION_OFFSET - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 7
+        );
 
         let values = [
             config.habituation_sensitivity,
             config.max_curiosity_bonus,
             config.fatigue_floor,
             config.movement_speed,
+            config.gabor_wavelength,
+            config.gabor_aspect_ratio,
+            config.dog_surround_ratio,
+            config.orientation_offset,
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(

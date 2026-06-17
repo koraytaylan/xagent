@@ -1784,6 +1784,29 @@ fn record_mutations(
             parent.fatigue_floor as f64,
             child.fatigue_floor as f64,
         ),
+        // Heritable visual-genome genes (plan 0008): record the mutation
+        // direction so selection's tuning of the bank is observable — the
+        // graduation signal the per-filter-genome follow-up is gated on (SCOPE).
+        (
+            "gabor_wavelength",
+            parent.gabor_wavelength as f64,
+            child.gabor_wavelength as f64,
+        ),
+        (
+            "gabor_aspect_ratio",
+            parent.gabor_aspect_ratio as f64,
+            child.gabor_aspect_ratio as f64,
+        ),
+        (
+            "dog_surround_ratio",
+            parent.dog_surround_ratio as f64,
+            child.dog_surround_ratio as f64,
+        ),
+        (
+            "orientation_offset",
+            parent.orientation_offset as f64,
+            child.orientation_offset as f64,
+        ),
     ];
 
     for (name, old_val, new_val) in params_to_check {
@@ -2851,8 +2874,12 @@ mod tests {
             {
                 has_b_param = true;
             }
-            // visual_encoding_size always from parent a
-            assert_eq!(child.visual_encoding_size, a.visual_encoding_size);
+            // visual_encoding_size is legacy (issue #106): no longer carried
+            // through crossover, always reset to the serde default.
+            assert_eq!(
+                child.visual_encoding_size,
+                BrainConfig::default().visual_encoding_size
+            );
         }
         assert!(has_a_param, "crossover never picked from parent A");
         assert!(has_b_param, "crossover never picked from parent B");

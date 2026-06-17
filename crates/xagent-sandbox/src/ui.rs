@@ -18,13 +18,6 @@ const MEMORY_CAPACITY_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick en
 const PROCESSING_SLOTS_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick energy drain only. \
      Kernel recall width is fixed at RECALL_K = 16.";
 
-/// Tooltip explaining that `visual_encoding_size` has no current kernel use.
-/// The field is preserved through breeding and serialization but no shader
-/// reads it. See issue #106.
-const VISUAL_ENCODING_SIZE_TOOLTIP: &str =
-    "Legacy: currently unused. No kernel stage reads this value — it is \
-     preserved only for config backwards compatibility.";
-
 /// Tab types for the dock area.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
@@ -1383,13 +1376,9 @@ impl<'a> TabContext<'a> {
                     b.processing_slots = ps.max(1) as usize;
                     ui.end_row();
 
-                    ui.label("visual_encoding_size (legacy)")
-                        .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                    let mut ve = b.visual_encoding_size as i32;
-                    ui.add(egui::DragValue::new(&mut ve).range(2..=512).speed(1))
-                        .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                    b.visual_encoding_size = ve.max(1) as usize;
-                    ui.end_row();
+                    // visual_encoding_size retired from the editor (issue #106):
+                    // superseded by the plan 0008 visual-cortex config. The field
+                    // survives only for deserialization back-compat.
 
                     ui.label("learning_rate");
                     ui.add(
@@ -1471,6 +1460,45 @@ impl<'a> TabContext<'a> {
                             .max_decimals(1),
                     );
                     ui.end_row();
+
+                    // Heritable visual-genome genes (plan 0008). Ranges match the
+                    // mutation clamps; orientation_offset spans the half-circle
+                    // [0, π) it wraps into.
+                    ui.label("gabor_wavelength");
+                    ui.add(
+                        egui::DragValue::new(&mut b.gabor_wavelength)
+                            .range(2.0..=12.0)
+                            .speed(0.1)
+                            .max_decimals(2),
+                    );
+                    ui.end_row();
+
+                    ui.label("gabor_aspect_ratio");
+                    ui.add(
+                        egui::DragValue::new(&mut b.gabor_aspect_ratio)
+                            .range(0.25..=1.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
+                    ui.end_row();
+
+                    ui.label("dog_surround_ratio");
+                    ui.add(
+                        egui::DragValue::new(&mut b.dog_surround_ratio)
+                            .range(1.2..=3.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
+                    ui.end_row();
+
+                    ui.label("orientation_offset");
+                    ui.add(
+                        egui::DragValue::new(&mut b.orientation_offset)
+                            .range(0.0..=std::f32::consts::PI)
+                            .speed(0.01)
+                            .max_decimals(3),
+                    );
+                    ui.end_row();
                 });
         });
 
@@ -1550,10 +1578,6 @@ impl<'a> TabContext<'a> {
                         ui.label("processing_slots")
                             .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                         ui.monospace(format!("{}", cfg.processing_slots));
-                        ui.end_row();
-                        ui.label("visual_encoding_size (legacy)")
-                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.visual_encoding_size));
                         ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1726,10 +1750,6 @@ impl<'a> TabContext<'a> {
                                             .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                                         ui.monospace(format!("{}", cfg.processing_slots));
                                         ui.end_row();
-                                        ui.label("visual_encoding_size (legacy)")
-                                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                                        ui.monospace(format!("{}", cfg.visual_encoding_size));
-                                        ui.end_row();
                                         ui.label("learning_rate");
                                         ui.monospace(format!("{:.5}", cfg.learning_rate));
                                         ui.end_row();
@@ -1761,10 +1781,6 @@ impl<'a> TabContext<'a> {
                             ui.label("processing_slots")
                                 .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                             ui.monospace(format!("{}", cfg.processing_slots));
-                            ui.end_row();
-                            ui.label("visual_encoding_size (legacy)")
-                                .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                            ui.monospace(format!("{}", cfg.visual_encoding_size));
                             ui.end_row();
                             ui.label("learning_rate");
                             ui.monospace(format!("{:.5}", cfg.learning_rate));
@@ -1944,10 +1960,6 @@ impl<'a> TabContext<'a> {
                             .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
                         ui.monospace(format!("{}", cfg.processing_slots));
                         ui.end_row();
-                        ui.label("visual_encoding_size (legacy)")
-                            .on_hover_text(VISUAL_ENCODING_SIZE_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.visual_encoding_size));
-                        ui.end_row();
                         ui.label("learning_rate");
                         ui.monospace(format!("{:.5}", cfg.learning_rate));
                         ui.end_row();
@@ -1968,6 +1980,19 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("movement_speed");
                         ui.monospace(format!("{:.1}", cfg.movement_speed));
+                        ui.end_row();
+                        // Heritable visual-genome genes (plan 0008).
+                        ui.label("gabor_wavelength");
+                        ui.monospace(format!("{:.2}", cfg.gabor_wavelength));
+                        ui.end_row();
+                        ui.label("gabor_aspect_ratio");
+                        ui.monospace(format!("{:.2}", cfg.gabor_aspect_ratio));
+                        ui.end_row();
+                        ui.label("dog_surround_ratio");
+                        ui.monospace(format!("{:.2}", cfg.dog_surround_ratio));
+                        ui.end_row();
+                        ui.label("orientation_offset");
+                        ui.monospace(format!("{:.3}", cfg.orientation_offset));
                         ui.end_row();
                     });
             });

@@ -309,7 +309,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 |-----------|-----------------|
 | `memory_capacity` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
-| `visual_encoding_size` | **Legacy / unused.** No kernel stage reads this field; preserved only for config backwards compatibility (see issue #106). |
+| `visual_encoding_size` | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (the structured `retina_*` / `gabor_*` / `dog_*` config and the `coop_visual_cortex` pass). No kernel stage reads this field and it is no longer editable in the UI or carried through breeding; it is retained only so older saved configs still deserialize (issue #106 resolved). |
 | `representation_dimension` | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The GPU kernel sizes encoder weights, predictor weights, and workgroup arrays from that constant — WGSL cannot resize them at runtime. The config field is a read-only echo; mismatched values log a warning and are ignored. Not mutated by evolution, not exposed in the UI (see issues #103, #106). |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |

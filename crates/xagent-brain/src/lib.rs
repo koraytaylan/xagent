@@ -21,9 +21,15 @@
 
 pub(crate) mod async_readback;
 pub mod buffers;
+pub mod complex;
+pub mod dog;
+pub mod gabor;
 pub mod gpu_kernel;
 
 pub use buffers::{AgentBrainState, BrainLayout};
+pub use complex::{complex_features, quadrature_energy, VISUAL_FEATURE_COUNT};
+pub use dog::{build_dog_kernel, seeded_dog_kernel, DogKernel};
+pub use gabor::{build_gabor_kernel, seeded_gabor_bank, GaborKernel};
 pub use gpu_kernel::{AgentTelemetry, BrainExecutionMode, GpuKernel, MAX_FUSED_BATCHES};
 
 /// Padé approximant for tanh, accurate to ~1e-4 for |x| < 4.5.

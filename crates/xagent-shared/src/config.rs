@@ -34,11 +34,12 @@ pub struct BrainConfig {
     /// `xagent_brain::buffers::RECALL_K = 16`, independent of this value.
     /// Mutated by evolution; clamped to `[1, 128]` at breeding time.
     pub processing_slots: usize,
-    /// **Legacy.** Currently has no effect in the GPU kernel — there is no
-    /// visual-encoder downsampling stage that reads this field. Preserved
-    /// through breeding and serialization for backwards compatibility with
-    /// existing saved configs; will be either wired to a real encoder or
-    /// removed in a future release. Not mutated by evolution.
+    /// **Legacy.** Superseded by plan 0008 visual-cortex config (`retina_*`,
+    /// `gabor_*`); retained only for deserialization back-compat (issue #106).
+    /// No kernel stage reads this field and it is no longer carried through
+    /// breeding or shown in the UI editor; the `serde` default supplies it when
+    /// older JSON / `xagent.db` configs omit it.
+    #[serde(default = "default_visual_encoding_size")]
     pub visual_encoding_size: usize,
     /// **Locked (compile-time).** Length of the internal representation
     /// vector. Must equal `xagent_brain::buffers::ENCODED_DIMENSION` — the
@@ -81,6 +82,17 @@ pub struct BrainConfig {
     /// odd-grid range-visibility note.
     #[serde(default = "default_vision_height", alias = "vision_h")]
     pub vision_height: u32,
+    /// Retinotopic luminance grid the visual cortex operates on. Locked per
+    /// batch (compile-time `override` into the kernel, like `vision_width`), not
+    /// heritable — so the brain-state stride stays uniform across the
+    /// population. Curriculum default 32×32; raised only when throughput stays
+    /// in budget (plan 0008 gate 0005).
+    #[serde(default = "default_retina_width")]
+    pub retina_width: usize,
+    /// Retinotopic luminance grid height. Locked per batch like
+    /// `retina_width`; see that field for the locked-not-heritable rationale.
+    #[serde(default = "default_retina_height")]
+    pub retina_height: usize,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
     /// Default 10, clamped to `[1, MAX_BRAIN_TICK_STRIDE]` in the UI. Combined
     /// with `vision_stride` this sets the one-batch sensory lag — see
@@ -106,7 +118,68 @@ pub struct BrainConfig {
     /// Heritable: mutated during breeding, clamped to [1.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
+    /// Gate flag for the Hubel-Wiesel visual cortex pass (plan 0008). When
+    /// `false` the cortex pass is a no-op passthrough and the encoder consumes
+    /// the legacy raw-vision slice, so the run is byte-identical to the
+    /// pre-cortex build. The default flips to `true` only once the 0005
+    /// orientation-selectivity / phase-position-invariance probes pass and the
+    /// throughput regression is within budget. Locked per batch, not heritable.
+    #[serde(default)]
+    pub visual_cortex_enabled: bool,
+    /// **Heritable (visual genome, plan 0008).** V1 Gabor carrier wavelength λ
+    /// in retina pixels for the whole simple-cell bank. The envelope σ is tied
+    /// as `0.56·λ` (≈ 1-octave V1 bandwidth, Jones & Palmer 1987). Seed 5.0;
+    /// mutated during breeding, clamped to
+    /// `[GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX]` = `[2.0, 12.0]`. The shader
+    /// re-imposes the clamp and the Gabor DC-balance invariant after reading it.
+    #[serde(default = "default_gabor_wavelength")]
+    pub gabor_wavelength: f32,
+    /// **Heritable (visual genome, plan 0008).** Gabor envelope aspect ratio γ
+    /// (long axis / short axis) for the whole bank; at 1.0 the envelope is
+    /// isotropic. Seed 0.5; mutated during breeding, clamped to
+    /// `[GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX]` = `[0.25, 1.0]`.
+    #[serde(default = "default_gabor_aspect_ratio")]
+    pub gabor_aspect_ratio: f32,
+    /// **Heritable (visual genome, plan 0008).** DoG surround:center sigma ratio
+    /// for the Stage-1 center-surround kernel. Seed 1.6 (Marr & Hildreth 1980
+    /// edge operator); mutated during breeding, clamped to
+    /// `[DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX]` = `[1.2, 3.0]` so a
+    /// mutated value can never degenerate the kernel into a non-edge blur. The
+    /// shader re-imposes the clamp and the DoG zero-sum invariant after reading.
+    #[serde(default = "default_dog_surround_ratio")]
+    pub dog_surround_ratio: f32,
+    /// **Heritable (visual genome, plan 0008).** Whole-bank orientation offset in
+    /// radians, added to the even `[0, π)` tiling of the Gabor bank. Seed 0.0;
+    /// mutated during breeding and wrapped back into `[0, π)` (orientation is
+    /// half-circle periodic for an unsigned bar), so it has no hard clamp — the
+    /// wrap is the bound the shader and the mutation path both apply.
+    #[serde(default = "default_orientation_offset")]
+    pub orientation_offset: f32,
 }
+
+/// Upper bound (exclusive) for `orientation_offset`: π. Orientation is
+/// half-circle periodic for an unsigned oriented bar, so the offset wraps modulo
+/// π rather than clamping to a hard range. Single canonical source for the wrap
+/// used in mutation (`agent/mod.rs`) — the shader applies the same wrap when it
+/// reads the gene.
+pub const ORIENTATION_OFFSET_PERIOD: f32 = std::f32::consts::PI;
+
+/// Inclusive clamp bounds for the heritable visual-genome scalar genes (plan
+/// 0008). These mirror the WGSL `GABOR_*`/`DOG_*` clamp constants in
+/// `xagent-brain` `common.wgsl` (the shader re-imposes them after reading the
+/// genes); they live here as the canonical source for the mutation clamps so the
+/// CPU breeding path and the GPU pass agree.
+pub const GABOR_WAVELENGTH_MIN: f32 = 2.0;
+/// See [`GABOR_WAVELENGTH_MIN`].
+pub const GABOR_WAVELENGTH_MAX: f32 = 12.0;
+/// See [`GABOR_WAVELENGTH_MIN`].
+pub const GABOR_ASPECT_RATIO_MIN: f32 = 0.25;
+/// See [`GABOR_WAVELENGTH_MIN`].
+pub const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
+/// See [`GABOR_WAVELENGTH_MIN`].
+pub const DOG_SURROUND_RATIO_MIN: f32 = 1.2;
+/// See [`GABOR_WAVELENGTH_MIN`].
+pub const DOG_SURROUND_RATIO_MAX: f32 = 3.0;
 
 /// Configuration for the world simulation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,8 +229,23 @@ fn default_vision_height() -> u32 {
     6
 }
 
+fn default_retina_width() -> usize {
+    32
+}
+
+fn default_retina_height() -> usize {
+    32
+}
+
 fn default_seed() -> u64 {
     42
+}
+
+/// Legacy back-compat default for `visual_encoding_size`. Superseded by plan
+/// 0008 visual-cortex config; retained only so older saved configs that omit it
+/// still deserialize (issue #106).
+fn default_visual_encoding_size() -> usize {
+    64
 }
 
 fn default_brain_tick_stride() -> u32 {
@@ -178,6 +266,30 @@ fn default_integrity_scale() -> f32 {
 
 fn default_movement_speed() -> f32 {
     20.0
+}
+
+/// Seed carrier wavelength λ for the Gabor bank (plan 0008). Mirrors
+/// `GABOR_WAVELENGTH_SEED` in the brain crate's `gabor` module / `common.wgsl`.
+fn default_gabor_wavelength() -> f32 {
+    5.0
+}
+
+/// Seed envelope aspect ratio γ for the Gabor bank (plan 0008). Mirrors
+/// `GABOR_ASPECT_RATIO_SEED`.
+fn default_gabor_aspect_ratio() -> f32 {
+    0.5
+}
+
+/// Seed DoG surround:center sigma ratio (plan 0008). Mirrors
+/// `DOG_SURROUND_RATIO_SEED` (Marr & Hildreth 1980).
+fn default_dog_surround_ratio() -> f32 {
+    1.6
+}
+
+/// Seed whole-bank orientation offset in radians (plan 0008). Mirrors
+/// `GABOR_ORIENTATION_OFFSET_SEED`.
+fn default_orientation_offset() -> f32 {
+    0.0
 }
 
 /// Describes an agent to be spawned into the world.
@@ -317,11 +429,18 @@ impl Default for BrainConfig {
             fatigue_floor: 0.1,
             vision_width: default_vision_width(),
             vision_height: default_vision_height(),
+            retina_width: default_retina_width(),
+            retina_height: default_retina_height(),
             brain_tick_stride: default_brain_tick_stride(),
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            visual_cortex_enabled: false,
+            gabor_wavelength: default_gabor_wavelength(),
+            gabor_aspect_ratio: default_gabor_aspect_ratio(),
+            dog_surround_ratio: default_dog_surround_ratio(),
+            orientation_offset: default_orientation_offset(),
         }
     }
 }
@@ -397,11 +516,18 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 6,
             vision_height: 4,
+            retina_width: 16,
+            retina_height: 16,
             brain_tick_stride: default_brain_tick_stride(),
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            visual_cortex_enabled: false,
+            gabor_wavelength: default_gabor_wavelength(),
+            gabor_aspect_ratio: default_gabor_aspect_ratio(),
+            dog_surround_ratio: default_dog_surround_ratio(),
+            orientation_offset: default_orientation_offset(),
         }
     }
 
@@ -420,11 +546,18 @@ impl BrainConfig {
             fatigue_floor: 0.1,
             vision_width: 12,
             vision_height: 8,
+            retina_width: 48,
+            retina_height: 48,
             brain_tick_stride: default_brain_tick_stride(),
             vision_stride: default_vision_stride(),
             metabolic_rate: default_metabolic_rate(),
             integrity_scale: default_integrity_scale(),
             movement_speed: default_movement_speed(),
+            visual_cortex_enabled: false,
+            gabor_wavelength: default_gabor_wavelength(),
+            gabor_aspect_ratio: default_gabor_aspect_ratio(),
+            dog_surround_ratio: default_dog_surround_ratio(),
+            orientation_offset: default_orientation_offset(),
         }
     }
 }
@@ -540,6 +673,53 @@ mod tests {
             config.sensory_lag_ticks(),
             BrainConfig::MAX_SENSORY_LAG_TICKS
         );
+    }
+
+    #[test]
+    fn legacy_config_without_visual_cortex_fields_still_loads() {
+        // A config saved before plan 0008 carries `visual_encoding_size` but
+        // none of the new `retina_*` / `gabor_*` / visual-cortex fields. The
+        // `#[serde(default)]` on each new field (and on the retained legacy
+        // `visual_encoding_size`) must supply the seed so the blob still loads.
+        // This is the back-compat guarantee for issue #106.
+        let legacy_json = r#"{
+            "memory_capacity": 128,
+            "processing_slots": 16,
+            "visual_encoding_size": 96,
+            "representation_dimension": 128,
+            "learning_rate": 0.05,
+            "decay_rate": 0.001
+        }"#;
+
+        let config: BrainConfig =
+            serde_json::from_str(legacy_json).expect("legacy config must still deserialize");
+
+        // The explicitly-present fields are preserved verbatim.
+        assert_eq!(config.memory_capacity, 128);
+        assert_eq!(config.processing_slots, 16);
+        assert_eq!(config.visual_encoding_size, 96);
+
+        // Every new plan 0008 field falls back to its seed default.
+        assert_eq!(config.retina_width, default_retina_width());
+        assert_eq!(config.retina_height, default_retina_height());
+        assert!(!config.visual_cortex_enabled);
+        assert!((config.gabor_wavelength - default_gabor_wavelength()).abs() < 1e-6);
+        assert!((config.gabor_aspect_ratio - default_gabor_aspect_ratio()).abs() < 1e-6);
+        assert!((config.dog_surround_ratio - default_dog_surround_ratio()).abs() < 1e-6);
+        assert!((config.orientation_offset - default_orientation_offset()).abs() < 1e-6);
+
+        // Older configs that also omit `visual_encoding_size` entirely must load
+        // too — the retained serde default supplies it.
+        let no_legacy_field = r#"{
+            "memory_capacity": 128,
+            "processing_slots": 16,
+            "representation_dimension": 128,
+            "learning_rate": 0.05,
+            "decay_rate": 0.001
+        }"#;
+        let config: BrainConfig =
+            serde_json::from_str(no_legacy_field).expect("config without the legacy field loads");
+        assert_eq!(config.visual_encoding_size, default_visual_encoding_size());
     }
 
     #[test]

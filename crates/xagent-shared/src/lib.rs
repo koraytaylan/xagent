@@ -9,6 +9,10 @@ pub mod motor;
 pub mod sensory;
 
 pub use body::{BodyState, InternalState};
-pub use config::{AgentDescriptor, BrainConfig, FullConfig, GovernorConfig, WorldConfig};
+pub use config::{
+    AgentDescriptor, BrainConfig, FullConfig, GovernorConfig, WorldConfig, DOG_SURROUND_RATIO_MAX,
+    DOG_SURROUND_RATIO_MIN, GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX,
+    GABOR_WAVELENGTH_MIN, ORIENTATION_OFFSET_PERIOD,
+};
 pub use motor::{MotorAction, MotorCommand};
 pub use sensory::{SensoryFrame, TouchContact, VisualField};

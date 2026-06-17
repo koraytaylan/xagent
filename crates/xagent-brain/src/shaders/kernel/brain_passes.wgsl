@@ -35,8 +35,15 @@ var<workgroup> s_recall: array<f32, 17>;
 var<workgroup> s_recall_similarity: array<f32, RECALL_K>;
 var<workgroup> s_prediction: array<f32, PREDICTOR_DIMENSION>;
 var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
-var<workgroup> s_pred_error: f32;
-var<workgroup> s_td_error: f32;
+// Prediction error (index 0) and TD error (index 1) share one threadgroup
+// binding: macOS Metal caps the number of distinct threadgroup resource slots
+// and the fused kernel is at that ceiling, so packing this scalar pair into one
+// array frees a slot for the plan-0008 visual-cortex scratch (`s_visual`)
+// without changing any value. `s_pred_td[0]` == the former `s_pred_error`,
+// `s_pred_td[1]` == the former `s_td_error`.
+const S_PRED_ERROR: u32 = 0u;
+const S_TD_ERROR: u32 = 1u;
+var<workgroup> s_pred_td: array<f32, 2>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 2>;
@@ -68,6 +75,36 @@ var<workgroup> s_reinf_dot: array<f32, 256>;
 // ── Argmin tracking for parallel min reduction (plan 0006) ────────────────────
 var<workgroup> s_argmin_val: array<f32, MEMORY_CAP>;
 var<workgroup> s_argmin_idx: array<u32, MEMORY_CAP>;
+
+// ── Visual cortex scratch (plan 0008) ─────────────────────────────────────────
+// All Hubel-Wiesel intermediates live in ONE combined workgroup buffer.
+// macOS Metal caps the number of distinct threadgroup resource slots (the fused
+// kernel is at that ceiling), so the cortex's persistent maps share a single
+// binding instead of three. The buffer is partitioned by the offset helpers
+// below; the regions are written/read with `workgroupBarrier()`s between stages,
+// exactly as separate buffers would be:
+//   [0 .. RETINA_PIXEL_COUNT)                          Stage 0 luminance retina
+//   [RETINA_PIXEL_COUNT .. 2·RETINA_PIXEL_COUNT)       Stage 1 signed DoG map
+//   [2·RETINA_PIXEL_COUNT .. +VISUAL_FEATURE_COUNT)    Stage 3 complex-cell output
+// Later stages (gabor-simple-cells → complex-cell-energy-pool →
+// wire-visual-features-into-encoder) fill the same regions, never re-declaring.
+// These are `override` (not `const`): they transitively reference the
+// `RETINA_PIXEL_COUNT` override, so they are evaluated at pipeline creation —
+// the same rule the FEATURE_COUNT-derived offsets in common.wgsl follow. The
+// Stage-3 complex region base (2·RETINA_PIXEL_COUNT) is added by the
+// complex-cell-energy-pool task when it first reads that region.
+override VC_RETINA_BASE: u32 = 0u;
+override VC_CENTER_SURROUND_BASE: u32 = RETINA_PIXEL_COUNT;
+override VC_COMPLEX_BASE: u32 = 2u * RETINA_PIXEL_COUNT;
+override VC_SCRATCH_LEN: u32 = 2u * RETINA_PIXEL_COUNT + VISUAL_FEATURE_COUNT;
+var<workgroup> s_visual: array<f32, VC_SCRATCH_LEN>;
+// Stage 1 needs NO additional workgroup binding for the DoG kernel either: the
+// small isotropic DoG kernel is recomputed analytically per tap during
+// convolution (`dog_weight`) rather than tabulated into shared memory. The
+// kernel is tiny (≤ (2·DOG_KERNEL_MAX_RADIUS+1)² taps) and the mean — recomputed
+// once per thread in a register via `dog_kernel_mean` — makes the per-tap weights
+// sum to zero exactly. DOG_KERNEL_MAX_RADIUS bounds the support so the
+// convolution loop is finite.
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -119,19 +156,41 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
 fn coop_feature_extract(agent_id: u32, tid: u32) {
     let s_base = agent_id * SENSORY_STRIDE;
 
-    // All threads cooperatively copy vision color + depth into s_features.
-    // sensory_buffer layout: [color(VISION_COLOR_COUNT) | depth(VISION_DEPTH_COUNT) | non-visual]
-    // s_features layout:  [color(VISION_COLOR_COUNT) | depth(VISION_DEPTH_COUNT) | non-visual(25)]
-    // The vision portion maps 1:1 between the two buffers.
+    // Encoder visual-input layout (plan 0008 wire-visual-features-into-encoder).
+    // The non-visual tail (the 25 proprioception/interoception/touch features
+    // written below) begins at the end of the encoder's visual block, whose width
+    // depends on the cortex flag:
+    //   flag OFF — visual block is the legacy raw-vision slice
+    //              (VISION_COLOR_COUNT + VISION_DEPTH_COUNT), copied 1:1 into
+    //              s_features[0 .. vision_count) here; `coop_visual_cortex` is a
+    //              no-op, so s_features is unchanged ⇒ byte-identical to the
+    //              pre-cortex build.
+    //   flag ON  — visual block is the VISUAL_FEATURE_COUNT complex-cell vector.
+    //              We do NOT copy raw vision into s_features: FEATURE_COUNT no
+    //              longer reserves room for it (it is VISUAL_FEATURE_COUNT +
+    //              NON_VISUAL_FEATURE_COUNT), and `coop_visual_cortex` reads the
+    //              luminance retina from `sensory_buffer` directly and overwrites
+    //              s_features[0 .. VISUAL_FEATURE_COUNT) after this pass.
+    // The flag read is workgroup-uniform — every thread takes the same branch
+    // (barrier uniformity) and computes the same `non_visual_base`. It is the same
+    // boolean as the FEATURE_COUNT pipeline override (both derive from
+    // `visual_cortex_enabled`), so the feature write offset agrees with the buffer
+    // width. The sensory read offsets below stay relative to `vision_count`: the
+    // sensory_buffer packs [color | depth | non-visual] regardless of the flag, so
+    // only the s_features WRITE offset moves.
+    let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
     let vision_count = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
-    for (var i = tid; i < vision_count; i += BRAIN_WORKGROUP_SIZE) {
-        s_features[i] = sensory_buffer[s_base + i];
+    if (!visual_cortex_enabled) {
+        for (var i = tid; i < vision_count; i += BRAIN_WORKGROUP_SIZE) {
+            s_features[i] = sensory_buffer[s_base + i];
+        }
     }
+    let non_visual_base = select(VISUAL_FEATURE_COUNT, vision_count, !visual_cortex_enabled);
 
     // Non-visual features (25 values) — thread 0 only.
     // Velocity magnitude requires a sqrt, so this can't be a bulk copy.
     if (tid == 0u) {
-        var fi = vision_count;
+        var fi = non_visual_base;
         let vel_offset = vision_count;
         let vx = sensory_buffer[s_base + vel_offset];
         let vy = sensory_buffer[s_base + vel_offset + 1u];
@@ -169,6 +228,480 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
             s_features[fi] = sensory_buffer[s_base + to + 3u]; fi = fi + 1u;
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 1.5: Visual cortex (plan 0008 — Hubel-Wiesel early visual cortex)
+//
+// Runs after feature extraction, before encode. The full pass reads the dense
+// luminance retina out of `s_features`, runs DoG center-surround → oriented
+// Gabor simple cells → quadrature-energy + MAX-pooled complex cells entirely in
+// workgroup memory, and writes the compact complex-cell vector back to the head
+// of `s_features` so the encoder consumes oriented features instead of raw
+// pixels.
+//
+// Stages landed so far (plan 0008):
+//   Stage 0 — luminance retina           (retina-luminance-derivation)
+//   Stage 1 — DoG center-surround        (center-surround-dog)
+//   Stage 2 — oriented Gabor bank        (gabor-simple-cells)
+//   Stage 3 — complex energy + MAX pool  (complex-cell-energy-pool, THIS TASK)
+// Stage 3 produces the TRUE per-(orientation, scale, pool-row, pool-col)
+// quadrature-energy + MAX-pooled complex vector (replacing Stage 2's earlier
+// provisional per-filter scalar summary) into the `s_complex` region of the
+// workgroup scratch, L2-normalized per frame. The remaining task
+// (wire-visual-features-into-encoder) copies `s_complex` to the head of
+// `s_features`; until then `coop_visual_cortex` only fills the workgroup scratch
+// (retina, DoG map, complex vector) and does NOT write `s_features`, so the
+// encoded state still matches the legacy raw-vision slice (the
+// `visual_cortex_passthrough_is_byte_identical` probe pins this even with the flag
+// on). The whole pass is gated on CFG_VISUAL_CORTEX_ENABLED, defaulted off.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Unit-volume 2-D isotropic Gaussian weight at radius² = r2 (pixels²).
+// G(r;σ) = exp(−r²/(2σ²)) / (2π σ²). The 1/(2πσ²) normalization makes each
+// Gaussian sum to ≈ 1 over an infinite plane, so the equal-weight DoG sums to
+// ≈ 0 over its support; thread 0 re-imposes ∑ = 0 exactly after building it.
+fn gaussian_2d(r2: f32, sigma: f32) -> f32 {
+    let sigma_sq = max(sigma * sigma, EPSILON);
+    return exp(-r2 / (2.0 * sigma_sq)) / (2.0 * PI * sigma_sq);
+}
+
+// DoG surround sigma from the heritable `dog_surround_ratio` gene, clamped to the
+// plan-0003 gene bounds [DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX] so a
+// mutated value can never degenerate the kernel into a blur (ratio → 1) or exceed
+// the scratch support (ratio too large). The clamp is the invariant re-imposed
+// AFTER reading the gene — mirrors `dog::build_dog_kernel` in Rust.
+fn dog_sigma_surround(surround_ratio: f32) -> f32 {
+    let sigma_center = max(DOG_SIGMA_CENTER, EPSILON);
+    let ratio = clamp(surround_ratio, DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX);
+    return max(ratio * sigma_center, EPSILON);
+}
+
+// DoG kernel half-width in pixels: 3σ of the larger (surround) Gaussian, clamped
+// to the scratch capacity. Pure, workgroup-uniform — every thread recomputes the
+// same value, so no threadgroup binding is needed to share it.
+fn dog_kernel_radius(surround_ratio: f32) -> u32 {
+    return min(
+        u32(ceil(DOG_SUPPORT_SIGMAS * dog_sigma_surround(surround_ratio))),
+        DOG_KERNEL_MAX_RADIUS,
+    );
+}
+
+// Raw (un-normalized) DoG tap at integer offset (kx, ky):
+//   G(r²; σ_center) − G(r²; σ_surround)
+// Unit-volume Gaussians make this sum to ≈ 0 over the support; the residual is
+// removed by subtracting `dog_kernel_mean()`.
+fn dog_raw(kx: i32, ky: i32, surround_ratio: f32) -> f32 {
+    let r2 = f32(kx * kx + ky * ky);
+    return gaussian_2d(r2, max(DOG_SIGMA_CENTER, EPSILON)) - gaussian_2d(r2, dog_sigma_surround(surround_ratio));
+}
+
+// Mean of the raw DoG over its truncated support. Subtracting it from every tap
+// makes ∑ kernel = 0 EXACTLY regardless of truncation error — the invariant the
+// `dog_kernel_sums_to_zero` probe pins, and what makes a uniform field produce a
+// ≈ 0 response. Pure function of the seed constants; each thread evaluates it
+// once into a register (no shared memory), so it adds no threadgroup binding.
+fn dog_kernel_mean(radius: u32, surround_ratio: f32) -> f32 {
+    let r = i32(radius);
+    let side = 2u * radius + 1u;
+    var raw_sum: f32 = 0.0;
+    for (var ky = -r; ky <= r; ky = ky + 1) {
+        for (var kx = -r; kx <= r; kx = kx + 1) {
+            raw_sum = raw_sum + dog_raw(kx, ky, surround_ratio);
+        }
+    }
+    return raw_sum / max(f32(side * side), EPSILON);
+}
+
+// Zero-sum DoG tap = raw tap − mean. Subtracting the mean re-imposes ∑ kernel = 0
+// EXACTLY after the heritable surround_ratio reshapes the kernel.
+fn dog_weight(kx: i32, ky: i32, mean: f32, surround_ratio: f32) -> f32 {
+    return dog_raw(kx, ky, surround_ratio) - mean;
+}
+
+// ── Stage 2: oriented Gabor simple-cell bank (Jones & Palmer 1987; Hubel &
+//    Wiesel 1962) ────────────────────────────────────────────────────────────
+// Each filter is a DC-balanced 2-D Gabor computed analytically per tap (the same
+// binding-budget strategy as the DoG: no tabulated kernel in shared memory). The
+// helpers below are pure and workgroup-uniform, so every thread reconstructs the
+// identical kernel without a threadgroup binding. The seed genes
+// (GABOR_WAVELENGTH_SEED / GABOR_ASPECT_RATIO_SEED / GABOR_ORIENTATION_OFFSET_SEED)
+// are read here and the clamps re-imposed; when the heritable Gabor genes land
+// (plan 0003) only the read source changes, not the math. The Rust `gabor`
+// module mirrors these literal-for-literal and the `gabor_kernels_are_dc_balanced`
+// probe pins ∑ Gabor = 0.
+
+// Preferred orientation θ for bank index i ∈ [0, GABOR_ORIENTATIONS):
+// i·π/N + offset, wrapped into [0, π). The wrap keeps a mutated (possibly
+// negative) offset in range; mirrors `gabor_theta` in the Rust module.
+fn gabor_theta(orientation_index: u32, orientation_offset: f32) -> f32 {
+    let n = max(f32(GABOR_ORIENTATIONS), EPSILON);
+    let raw = f32(orientation_index) * PI / n + orientation_offset;
+    // Euclidean remainder into [0, π): floor handles negative offsets.
+    let wrapped = raw - PI * floor(raw / PI);
+    return wrapped;
+}
+
+// Carrier wavelength λ for scale band s ∈ [0, GABOR_SCALES): the base wavelength
+// scaled one octave per band, clamped to the gene bounds so the largest band
+// cannot grow the support past GABOR_KERNEL_MAX_RADIUS. Mirrors
+// `gabor_wavelength_for_scale` in the Rust module.
+fn gabor_wavelength_for_scale(base_wavelength: f32, scale_band: u32) -> f32 {
+    let base = clamp(base_wavelength, GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX);
+    let lambda = base * pow(GABOR_SCALE_STEP, f32(scale_band));
+    return clamp(lambda, GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX);
+}
+
+// Carrier phase ψ for phase index p ∈ [0, GABOR_PHASES): the quadrature pair
+// {0, π/2} (even, odd). Mirrors `gabor_phase` in the Rust module.
+fn gabor_phase(phase_index: u32) -> f32 {
+    return f32(phase_index) * (PI / 2.0);
+}
+
+// Envelope sigma σ for carrier wavelength λ (σ = ratio·λ, floored).
+fn gabor_sigma(wavelength: f32) -> f32 {
+    return max(GABOR_SIGMA_LAMBDA_RATIO * wavelength, EPSILON);
+}
+
+// Gabor kernel half-width in pixels for carrier wavelength λ: 3σ of the envelope,
+// clamped to the worst-case support so the convolution loop stays finite.
+fn gabor_kernel_radius(wavelength: f32) -> u32 {
+    return min(
+        u32(ceil(GABOR_SUPPORT_SIGMAS * gabor_sigma(wavelength))),
+        GABOR_KERNEL_MAX_RADIUS,
+    );
+}
+
+// Raw (un-balanced) Gabor tap at integer offset (kx, ky) for orientation θ,
+// carrier wavelength λ, aspect ratio γ, and phase ψ. Mirrors `gabor_raw` in the
+// Rust module. Divisions by σ² and λ are floored with EPSILON.
+fn gabor_raw(kx: i32, ky: i32, theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32) -> f32 {
+    let sigma_sq = max(gabor_sigma(wavelength) * gabor_sigma(wavelength), EPSILON);
+    let gamma = clamp(aspect_ratio, GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX);
+    let lambda = max(wavelength, EPSILON);
+    let x = f32(kx);
+    let y = f32(ky);
+    let cos_t = cos(theta);
+    let sin_t = sin(theta);
+    let x_rot = x * cos_t + y * sin_t;
+    let y_rot = -x * sin_t + y * cos_t;
+    let envelope = exp(-(x_rot * x_rot + gamma * gamma * y_rot * y_rot) / (2.0 * sigma_sq));
+    let carrier = cos(2.0 * PI * x_rot / lambda + phase);
+    return envelope * carrier;
+}
+
+// Mean of the raw Gabor over its truncated support. Subtracting it from every tap
+// makes ∑ Gabor = 0 EXACTLY (DC balance) regardless of truncation error — the
+// invariant the `gabor_kernels_are_dc_balanced` probe pins, and what makes the
+// bank respond to oriented contrast rather than absolute brightness. Pure
+// function of the gene/seed args; each thread evaluates it once into a register
+// (no shared memory), so it adds no threadgroup binding.
+fn gabor_kernel_mean(radius: u32, theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32) -> f32 {
+    let r = i32(radius);
+    let side = 2u * radius + 1u;
+    var raw_sum: f32 = 0.0;
+    for (var ky = -r; ky <= r; ky = ky + 1) {
+        for (var kx = -r; kx <= r; kx = kx + 1) {
+            raw_sum = raw_sum + gabor_raw(kx, ky, theta, wavelength, aspect_ratio, phase);
+        }
+    }
+    return raw_sum / max(f32(side * side), EPSILON);
+}
+
+// L2 norm of the mean-subtracted Gabor kernel over its truncated support. Used
+// to normalize each filter to unit energy (standard Gabor convention: keeps the
+// even/odd quadrature responses commensurable for Stage 3, and shrinks the
+// residual f32 DC of the larger kernels below the 1e-5 balance the
+// `gabor_kernels_are_dc_balanced` probe pins). Pure / workgroup-uniform, so no
+// threadgroup binding. Mirrors the L2 step in `gabor::build_gabor_kernel`.
+fn gabor_kernel_norm(radius: u32, theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32, mean: f32) -> f32 {
+    let r = i32(radius);
+    var norm_sq: f32 = 0.0;
+    for (var ky = -r; ky <= r; ky = ky + 1) {
+        for (var kx = -r; kx <= r; kx = kx + 1) {
+            let w = gabor_raw(kx, ky, theta, wavelength, aspect_ratio, phase) - mean;
+            norm_sq = norm_sq + w * w;
+        }
+    }
+    return max(sqrt(norm_sq), EPSILON);
+}
+
+// DC-balanced, unit-energy Gabor tap = (raw tap − mean) / L2 norm. Scaling a
+// zero-sum kernel keeps it zero-sum, so the normalization cannot reintroduce DC.
+fn gabor_weight(kx: i32, ky: i32, theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32, mean: f32, norm: f32) -> f32 {
+    return (gabor_raw(kx, ky, theta, wavelength, aspect_ratio, phase) - mean) / norm;
+}
+
+// ── Stage 3: V1 complex cells (quadrature energy + MAX pool) ─────────────────
+// Phase invariance from the squared quadrature pair (Adelson & Bergen 1985) and
+// position/scale tolerance from the MAX over a local neighborhood (HMAX C1,
+// Riesenhuber & Poggio 1999). The per-pixel even/odd Gabor responses are NOT
+// stored — Stage 2's binding-budget note explains the fused kernel is at the
+// Metal threadgroup-memory ceiling, so we recompute the even (ψ=0) and odd
+// (ψ=π/2) convolutions of the signed DoG map ON THE FLY at each retina pixel and
+// MAX-pool the energy directly into the compact `s_complex` output. The Rust
+// `complex` module mirrors this and the `complex_pool_output_is_nonnegative_and_normalized`
+// probe pins the invariants (non-negative, L2-normalized / 0 for a blank retina).
+
+// Linear (un-rectified) simple-cell response — the convolution of the signed DoG
+// map with one DC-balanced, unit-energy Gabor kernel — evaluated at retina pixel
+// (pcol, prow). Zero-padded at the retina border (border pixels see fewer taps;
+// an expected truncation artifact for an edge operator). Workgroup-uniform kernel
+// args, so no threadgroup binding. `g_mean` / `g_norm` are precomputed once per
+// (orientation, scale, phase) so this inner sampler does not rebuild them per tap.
+// Mirrors `gabor::convolve` (one output pixel) in the Rust module.
+fn gabor_response_at(
+    pcol: i32, prow: i32,
+    radius: u32,
+    theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32,
+    g_mean: f32, g_norm: f32,
+) -> f32 {
+    var acc: f32 = 0.0;
+    let r = i32(radius);
+    for (var ky = -r; ky <= r; ky = ky + 1) {
+        let sr = prow + ky;
+        if (sr < 0 || sr >= i32(RETINA_HEIGHT)) { continue; }
+        for (var kx = -r; kx <= r; kx = kx + 1) {
+            let sc = pcol + kx;
+            if (sc < 0 || sc >= i32(RETINA_WIDTH)) { continue; }
+            let pidx = u32(sr) * RETINA_WIDTH + u32(sc);
+            acc = acc + gabor_weight(kx, ky, theta, wavelength, aspect_ratio, phase, g_mean, g_norm)
+                * s_visual[VC_CENTER_SURROUND_BASE + pidx];
+        }
+    }
+    return acc;
+}
+
+// Inclusive [lo, hi] pixel bounds along one axis of pool cell `cell` of `cells`
+// over a retina dimension of `extent` pixels. Each nominal block is extent/cells
+// wide; the bounds are widened by a half-block margin on each side so adjacent
+// cells overlap ~50% (HMAX C1 overlapping pooling — the position tolerance the
+// 0005 probe pins), then clamped to [0, extent). `cells` and `extent` are ≥ 1 by
+// construction (POOL_* = 4, retina ≥ 1). Returns lo ≤ hi, both valid indices.
+// Mirrors `pool_bounds` in the Rust `complex` module. Packed into a vec2 since
+// WGSL has no out-params.
+fn pool_bounds(cell: u32, cells: u32, extent: u32) -> vec2<u32> {
+    let block = f32(extent) / max(f32(cells), EPSILON);
+    let margin = block * 0.5;
+    let start = f32(cell) * block - margin;
+    let end = f32(cell + 1u) * block + margin;
+    let last = max(extent, 1u) - 1u;
+    let lo = min(u32(max(floor(start), 0.0)), last);
+    let hi = min(max(u32(max(ceil(end), 0.0)), lo), last);
+    return vec2<u32>(lo, hi);
+}
+
+fn coop_visual_cortex(agent_id: u32, tid: u32) {
+    // Gate flag (plan 0008): 0.0 ⇒ no-op passthrough, encoder keeps the legacy
+    // raw-vision slice. Read uniformly so every thread takes the same branch
+    // (barrier uniformity). The stages added by later tasks live behind this.
+    let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
+    if (!visual_cortex_enabled) {
+        return;
+    }
+
+    // ── Heritable visual-genome genes (plan 0008 visual-genome-config) ────────
+    // Read the four per-agent Gabor/DoG bank genes from this agent's brain-state
+    // tail. They are written by `write_agent_heritable_config` (Rust) and seeded
+    // in `init_brain_state_for`. The clamps + invariants (DoG zero-sum, Gabor DC
+    // balance) are re-imposed downstream in the kernel helpers AFTER these reads,
+    // so a mutated gene can never make a degenerate kernel (this is the locked
+    // "invariants enforced after every mutation" decision). Read uniformly (same
+    // slot for every lane), so no barrier-uniformity hazard.
+    let brain_base = agent_id * BRAIN_STRIDE;
+    let gene_gabor_wavelength = brain_state[brain_base + O_GABOR_WAVELENGTH];
+    let gene_gabor_aspect_ratio = brain_state[brain_base + O_GABOR_ASPECT_RATIO];
+    let gene_dog_surround_ratio = brain_state[brain_base + O_DOG_SURROUND_RATIO];
+    let gene_orientation_offset = brain_state[brain_base + O_ORIENTATION_OFFSET];
+
+    // ── Stage 0: luminance retina ────────────────────────────────────────────
+    // All threads cooperatively fill the dense retina with Rec. 709 luminance
+    // derived from the per-ray hit color. The color is read straight from this
+    // agent's slice of `sensory_buffer` — NOT from `s_features`: with the cortex
+    // on, FEATURE_COUNT is the compact (VISUAL_FEATURE_COUNT + non-visual) width
+    // and `coop_feature_extract` does not stage the raw vision into `s_features`
+    // (there is no room), so the cortex sources its input from the raycast buffer
+    // directly. `sensory_buffer` packs [color(VISION_COLOR_COUNT) | depth | …];
+    // ray r's RGBA is sensory_buffer[s_base + r*4 .. r*4+4].
+    // The vision slice is the legacy VISION_W × VISION_H RGBA grid; we
+    // nearest-neighbor sample it into the RETINA_WIDTH × RETINA_HEIGHT retina so
+    // the cortex operates on the dense grid even before the raycast retina
+    // densification lands (when that lands the mapping degenerates to 1:1).
+    // Division guards: VISION_W/H ≥ 1.
+    let s_base = agent_id * SENSORY_STRIDE;
+    let vision_w_f = f32(max(VISION_W, 1u));
+    let vision_h_f = f32(max(VISION_H, 1u));
+    let retina_w_f = f32(max(RETINA_WIDTH, 1u));
+    let retina_h_f = f32(max(RETINA_HEIGHT, 1u));
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let rcol = i % RETINA_WIDTH;
+        let rrow = i / RETINA_WIDTH;
+        // Map retina (col,row) → source vision (col,row) by proportional
+        // nearest-neighbor sampling, clamped inside the vision grid.
+        let vcol = min(u32((f32(rcol) + 0.5) / retina_w_f * vision_w_f), VISION_W - 1u);
+        let vrow = min(u32((f32(rrow) + 0.5) / retina_h_f * vision_h_f), VISION_H - 1u);
+        let ray = vrow * VISION_W + vcol;
+        let ci = s_base + ray * 4u;
+        let color = vec3<f32>(sensory_buffer[ci], sensory_buffer[ci + 1u], sensory_buffer[ci + 2u]);
+        s_visual[VC_RETINA_BASE + i] = retina_luminance(color);
+    }
+    workgroupBarrier();
+
+    // ── Stage 1: Difference-of-Gaussians center-surround (Rodieck 1965; Marr
+    //    & Hildreth 1980) ─────────────────────────────────────────────────────
+    // Signed valid-region convolution of the retina with the zero-sum DoG kernel,
+    // producing the local-contrast map. ON/OFF is the rectified split at
+    // consumption in Stage 2 (r_on = max(0, v), r_off = max(0, −v)), so only the
+    // signed map is stored here. The kernel is recomputed analytically per tap
+    // (`dog_weight`) — see the binding-budget note above — and zero-padded at the
+    // retina border (border pixels see fewer taps, acceptable for an edge
+    // operator). `dog_kernel_radius()` / `dog_kernel_mean()` are pure and
+    // workgroup-uniform, so every thread uses the same kernel.
+    let radius = dog_kernel_radius(gene_dog_surround_ratio);
+    let kernel_mean = dog_kernel_mean(radius, gene_dog_surround_ratio);
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let pcol = i32(i % RETINA_WIDTH);
+        let prow = i32(i / RETINA_WIDTH);
+        var acc: f32 = 0.0;
+        for (var ky = -i32(radius); ky <= i32(radius); ky = ky + 1) {
+            let sr = prow + ky;
+            if (sr < 0 || sr >= i32(RETINA_HEIGHT)) { continue; }
+            for (var kx = -i32(radius); kx <= i32(radius); kx = kx + 1) {
+                let sc = pcol + kx;
+                if (sc < 0 || sc >= i32(RETINA_WIDTH)) { continue; }
+                let pidx = u32(sr) * RETINA_WIDTH + u32(sc);
+                acc = acc + dog_weight(kx, ky, kernel_mean, gene_dog_surround_ratio) * s_visual[VC_RETINA_BASE + pidx];
+            }
+        }
+        s_visual[VC_CENTER_SURROUND_BASE + i] = acc;
+    }
+    workgroupBarrier();
+
+    // ── Stages 2+3: oriented Gabor simple cells → complex-cell energy + MAX pool
+    //    (Jones & Palmer 1987; Hubel & Wiesel 1962; Adelson & Bergen 1985;
+    //     Riesenhuber & Poggio 1999) ───────────────────────────────────────────
+    // For each (orientation, scale) the even (ψ=0) and odd (ψ=π/2) Gabor kernels
+    // are convolved with the signed DoG map to get the LINEAR simple-cell
+    // responses; their quadrature energy E = sqrt(even² + odd²) is phase-invariant
+    // (Adelson & Bergen), and E is MAX-pooled over a POOL_ROWS × POOL_COLS grid of
+    // ~50%-overlapping cells for position tolerance (HMAX C1). The result is the
+    // compact complex-cell vector `s_complex[orientation][scale][row][col]`.
+    //
+    // The full per-pixel even/odd maps for the 16-filter bank do NOT fit alongside
+    // the brain's other workgroup scratch (the fused kernel is at the Metal
+    // threadgroup-memory ceiling), so they are NOT stored: each lane recomputes the
+    // even/odd convolutions ON THE FLY at the retina pixels inside its pool cell
+    // (`gabor_response_at`) and reduces them straight to the pooled MAX. Squaring
+    // supplies non-negativity, so the LINEAR (un-rectified) responses are used —
+    // rectifying first would double-count. Pool over POSITION only; the energy step
+    // already collapsed the two phases, and each scale keeps its own output slots.
+    //
+    // Output ordering is orientation-major → scale → pool-row → pool-col, matching
+    // `complex_features` in the Rust `complex` module. One workgroup lane per output
+    // cell (VISUAL_FEATURE_COUNT cells striped over the 256 lanes), so all lanes
+    // share the convolution work. The Gabor/DoG kernels are recomputed analytically
+    // per tap (`gabor_weight`) — workgroup-uniform, no threadgroup binding. The Rust
+    // mirror and the `complex_pool_output_is_nonnegative_and_normalized` probe pin
+    // the invariants (all ≥ 0; L2 norm ≈ 1, or 0 for a blank retina).
+    // Heritable Gabor genes (clamps/wrap re-imposed inside the helpers below:
+    // `gabor_theta` wraps the offset into [0, π), `gabor_wavelength_for_scale`
+    // clamps λ to [MIN, MAX], `gabor_raw` clamps γ to [MIN, MAX]). Mirrors the
+    // Rust `gabor` module — the construction is identical, only the read source
+    // changed from the seed constants to the per-agent genes.
+    let gabor_orientation_offset = gene_orientation_offset;
+    let gabor_base_wavelength = gene_gabor_wavelength;
+    let gabor_aspect_ratio = gene_gabor_aspect_ratio;
+    let pool_cells = POOL_ROWS * POOL_COLS;       // cells per (orientation, scale)
+    for (var out_idx = tid; out_idx < VISUAL_FEATURE_COUNT; out_idx += BRAIN_WORKGROUP_SIZE) {
+        // Decode the flat output index into (orientation, scale, pool_row,
+        // pool_col) — orientation-major → scale → row → col.
+        let pool_col = out_idx % POOL_COLS;
+        let pool_row = (out_idx / POOL_COLS) % POOL_ROWS;
+        let scale_band = (out_idx / pool_cells) % GABOR_SCALES;
+        let orientation_index = out_idx / (pool_cells * GABOR_SCALES);
+
+        let theta = gabor_theta(orientation_index, gabor_orientation_offset);
+        let lambda = gabor_wavelength_for_scale(gabor_base_wavelength, scale_band);
+        let g_radius = gabor_kernel_radius(lambda);
+        // Even/odd quadrature pair: ψ ∈ {0, π/2}. Kernel mean/norm precomputed once
+        // per phase so the per-pixel sampler reuses them.
+        let psi_even = gabor_phase(0u);
+        let psi_odd = gabor_phase(1u);
+        let mean_even = gabor_kernel_mean(g_radius, theta, lambda, gabor_aspect_ratio, psi_even);
+        let norm_even = gabor_kernel_norm(g_radius, theta, lambda, gabor_aspect_ratio, psi_even, mean_even);
+        let mean_odd = gabor_kernel_mean(g_radius, theta, lambda, gabor_aspect_ratio, psi_odd);
+        let norm_odd = gabor_kernel_norm(g_radius, theta, lambda, gabor_aspect_ratio, psi_odd, mean_odd);
+
+        // Pool-cell pixel bounds (overlapping). MAX the quadrature energy over them.
+        let row_bounds = pool_bounds(pool_row, POOL_ROWS, RETINA_HEIGHT);
+        let col_bounds = pool_bounds(pool_col, POOL_COLS, RETINA_WIDTH);
+        var peak: f32 = 0.0;   // E ≥ 0, so 0 is the valid pooling identity.
+        for (var prow = row_bounds.x; prow <= row_bounds.y; prow = prow + 1u) {
+            for (var pcol = col_bounds.x; pcol <= col_bounds.y; pcol = pcol + 1u) {
+                let even = gabor_response_at(
+                    i32(pcol), i32(prow), g_radius,
+                    theta, lambda, gabor_aspect_ratio, psi_even, mean_even, norm_even);
+                let odd = gabor_response_at(
+                    i32(pcol), i32(prow), g_radius,
+                    theta, lambda, gabor_aspect_ratio, psi_odd, mean_odd, norm_odd);
+                let energy = sqrt(max(even * even + odd * odd, 0.0));
+                peak = max(peak, energy);
+            }
+        }
+        s_visual[VC_COMPLEX_BASE + out_idx] = peak;
+    }
+    workgroupBarrier();
+
+    // ── L2-normalize the complex-cell vector per frame (V1 response
+    //    normalization). Parallel sum-of-squares reduction via s_dense_partials
+    //    (free here — Stage 3 runs fully before coop_encode, with a barrier
+    //    between, so reusing it is safe), then a guarded divide by max(norm,
+    //    EPSILON). A blank retina has norm < EPSILON, so the divide leaves the
+    //    vector all-zero (no NaN) — the probe's "0 for a blank retina" branch.
+    if (tid < VISUAL_FEATURE_COUNT) {
+        let v = s_visual[VC_COMPLEX_BASE + tid];
+        s_dense_partials[tid] = v * v;
+    } else {
+        s_dense_partials[tid] = 0.0;
+    }
+    workgroupBarrier();
+    // VISUAL_FEATURE_COUNT (128) ≤ BRAIN_WORKGROUP_SIZE (256); the tree reduce
+    // below sums all lanes' partials into s_dense_partials[0].
+    var stride: u32 = BRAIN_WORKGROUP_SIZE / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            s_dense_partials[tid] = s_dense_partials[tid] + s_dense_partials[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid == 0u) {
+        s_enc_norm = max(sqrt(s_dense_partials[0]), EPSILON);
+    }
+    workgroupBarrier();
+    let inv_norm = 1.0 / s_enc_norm;
+    for (var i = tid; i < VISUAL_FEATURE_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        s_visual[VC_COMPLEX_BASE + i] = s_visual[VC_COMPLEX_BASE + i] * inv_norm;
+    }
+    workgroupBarrier();
+
+    // ── Wire the complex-cell vector into the encoder input
+    //    (wire-visual-features-into-encoder) ───────────────────────────────────
+    // Write the L2-normalized complex-cell vector to the head of `s_features`,
+    // replacing the raw-vision slice the encoder used to read. The non-visual
+    // tail was already written by `coop_feature_extract` at offset
+    // VISUAL_FEATURE_COUNT (its flag-on `non_visual_base`), so it is untouched
+    // here and the encoder sees [complex(VISUAL_FEATURE_COUNT) | non-visual(25)]
+    // — exactly FEATURE_COUNT entries with the flag on. This runs only when the
+    // flag is on (the early return above gates the whole pass), so the flag-off
+    // path never reaches here and stays byte-identical. The trailing
+    // workgroupBarrier() makes these writes visible before `coop_encode` reads
+    // `s_features`.
+    for (var i = tid; i < VISUAL_FEATURE_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        s_features[i] = s_visual[VC_COMPLEX_BASE + i];
+    }
+    workgroupBarrier();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -516,7 +1049,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
         // Pass prediction_error to the post-credit block via shared memory.
         // (Kept for pass 7 as the single forward-error value; no overwrite.)
-        s_pred_error = prediction_error;
+        s_pred_td[S_PRED_ERROR] = prediction_error;
     }
     workgroupBarrier();
 
@@ -563,7 +1096,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 -MAX_TD_ERROR, MAX_TD_ERROR,
             );
             brain_state[brain_base + O_PREV_VALUE] = value;
-            s_td_error = td_error;
+            s_pred_td[S_TD_ERROR] = td_error;
 
             let critic_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
             let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
@@ -579,7 +1112,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
         // Threads 0..ENCODED_DIMENSION: apply δ through the traces.
         if (tid < ENCODED_DIMENSION) {
-            let td_error = s_td_error;
+            let td_error = s_pred_td[S_TD_ERROR];
             let critic_trace = brain_state[brain_base + O_TRACE_CRITIC + tid];
             let forward_trace = brain_state[brain_base + O_TRACE_FWD + tid];
             let turn_trace = brain_state[brain_base + O_TRACE_TURN + tid];
@@ -738,7 +1271,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     if (tid == 0u) {
         let gradient = s_homeo[0u];
         let urgency = s_homeo[2u];
-        let prediction_error = s_pred_error;
+        let prediction_error = s_pred_td[S_PRED_ERROR];
 
         // Policy evaluation with bias and dot products
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
@@ -888,11 +1421,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Slot 2 is consumed by the physics phase as strafe — keep it zero.
         decision_buffer[decision_base + DECISION_MOTOR + 2u] = 0.0;
         // Slot 3 is TD-error telemetry for CPU readback.
-        decision_buffer[decision_base + DECISION_MOTOR + 3u] = s_td_error;
+        decision_buffer[decision_base + DECISION_MOTOR + 3u] = s_pred_td[S_TD_ERROR];
 
         // Write telemetry to physics buffer for CPU readback
         let phys_base = agent_id * PHYS_STRIDE;
-        physics_state[phys_base + P_PREDICTION_ERROR] = s_pred_error;
+        physics_state[phys_base + P_PREDICTION_ERROR] = s_pred_td[S_PRED_ERROR];
         physics_state[phys_base + P_EXPLORATION_RATE_OUT] = exploration_rate;
         physics_state[phys_base + P_FATIGUE_FACTOR_OUT] = fatigue_factor;
         physics_state[phys_base + P_MOTOR_FWD_OUT] = forward;
@@ -962,7 +1495,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     // prediction error that drives novelty.
     if (tid == 0u) {
         brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] +=
-            learning_rate * 0.01 * (s_pred_error - 0.5);
+            learning_rate * 0.01 * (s_pred_td[S_PRED_ERROR] - 0.5);
         brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT] = clamp(
             brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
@@ -1037,7 +1570,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
             let sim = clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
             if (sim > 0.3) {
                 if (pattern_buffer[pattern_base + O_PAT_ACTIVE + pattern] >= 0.5) {
-                    pattern_buffer[pattern_base + O_PAT_REINF + pattern] += sim * learning_rate * (1.0 - s_pred_error);
+                    pattern_buffer[pattern_base + O_PAT_REINF + pattern] += sim * learning_rate * (1.0 - s_pred_td[S_PRED_ERROR]);
                     pattern_buffer[pattern_base + O_PAT_REINF + pattern] = clamp(
                         pattern_buffer[pattern_base + O_PAT_REINF + pattern], 0.0, 20.0);
                     let valence_lr = learning_rate * 0.3;

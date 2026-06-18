@@ -2320,9 +2320,10 @@ mod tests {
             50.0, // still burns energy (metabolic + brain)
             true,
         );
-        // Even with high food, low energy input makes foraging < 1.0.
-        // The foraging axis is capped at 1.0, so the camper's advantage is
-        // limited, and exploration also caps at coverage (not boosted by low distance).
+        // The foraging axis actually maxes out here (food/energy far exceeds the
+        // target), so what holds the composite below 1.0 is coverage-bounded
+        // exploration: cells/grid = 250/1000 = 0.25, and low distance cannot
+        // inflate it past true coverage.
         assert!(
             camper < 1.0,
             "camper should not achieve perfect fitness; got {camper}"
@@ -2483,7 +2484,8 @@ mod tests {
         // effort-rebased mode, fast-aimless should drop significantly.
         eprintln!("\n=== CALIBRATION INTENT VERIFICATION ===");
         eprintln!(
-            "Competent forager effort score: {:.4} (target: near 1.0)",
+            "Competent forager composite: {:.4} (foraging axis = 1.0; composite is \
+             held below 1.0 by exploration = 0.6 and the one-death survival factor 0.75)",
             effort_competent
         );
         eprintln!(

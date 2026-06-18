@@ -206,23 +206,29 @@ const WC_SPEED_COST_EXPONENT: u32 = 24u;
 ### Drag in the energy drain (BOTH paths)
 
 ```wgsl
-// kernel_tick.wgsl:163 and the phase_physics.wgsl mirror
+// kernel_tick.wgsl:175-182 and the phase_physics.wgsl mirror
 let speed_ratio = move_speed / 20.0;
-let drag = pow(max(speed_ratio, 1.0), wc_f32(WC_SPEED_COST_EXPONENT)); // 1.0 when k=1
+let speed_cost_exponent = wc_f32(WC_SPEED_COST_EXPONENT);
+let above_baseline = speed_ratio >= 1.0;
+// k>1.0: apply pow only above baseline; below baseline keep speed_ratio (= k=1.0 drain).
+let super_linear_drag = select(speed_ratio, pow(speed_ratio, speed_cost_exponent), above_baseline);
+// k=1.0: use speed_ratio exactly (bit-identical to the pre-task expression).
+let drag = select(super_linear_drag, speed_ratio, speed_cost_exponent == 1.0);
 let movement_mag = min(abs(motor_forward) + abs(motor_strafe), 1.414) * drag;
 ```
 
 Properties that make this safe:
-- **`k = 1.0` is a bit-exact no-op:** `pow(max(r,1.0), 1.0)` over `r ≥ 1` equals
-  `r`, and for `r < 1` the old code already used `r` while the new code uses
-  `max(r,1.0) = 1.0` — but at `k = 1.0` we keep the *exact* old expression by
-  guarding the whole drag behind the flag (`if k == 1.0 use r else use
-  pow(max(r,1.0),k)`), so the default path is byte-identical. (The
-  `max(r,1.0)` clamp only engages once `k ≠ 1.0`.)
-- **Above-baseline only** kills the torpor-drift failure mode: there is no
-  `drag < 1` region below default speed, so selection gets no downward gradient
-  that would ratchet `move_speed` to its floor. The speed→fitness curve becomes
-  single-peaked.
+- **`k = 1.0` is a bit-exact no-op:** the outer `select(…, speed_ratio,
+  speed_cost_exponent == 1.0)` falls straight back to the exact old `drag =
+  speed_ratio` expression whenever `k = 1.0`, so the default path is
+  byte-identical. The `pow` branch is only ever reached for `k ≠ 1.0`.
+- **Above-baseline only** kills the torpor-drift failure mode: for `k > 1.0` the
+  `pow` engages only where `speed_ratio ≥ 1.0`; below baseline the drag stays
+  `speed_ratio` — the exact `k = 1.0` value — so the exponent adds *no new*
+  downward gradient that would ratchet `move_speed` to its floor. The
+  speed→fitness curve stays single-peaked. (Note: this is a `select`, not a
+  `max(speed_ratio, 1.0)` clamp — sub-baseline drain is left untouched rather
+  than flattened to `1.0`.)
 - **Disciplines both reward layers for free.** Selection feels it via more
   starvation deaths at high speed; the in-life TD learner feels it via
   `energy_delta` (energy is a brain interoception input,

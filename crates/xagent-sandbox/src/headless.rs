@@ -403,28 +403,27 @@ pub fn dump_tree(db_path: &str) {
     }
 }
 
-/// Run speed-decoupling validation: A/B test with all 0009 flags off (baseline)
-/// vs on, measuring speed↔fitness correlation and other metrics.
+/// Run speed-decoupling validation: an A/B test with effort-rebased fitness,
+/// super-linear locomotor drag, and the danger percept OFF (baseline) vs ON,
+/// measuring the speed↔fitness correlation and supporting metrics.
 ///
-/// The populated result is written to the plan folder
-/// `docs/plans/0009-Intent-Aware-Fitness/0009-SPEED-DECOUPLING.md` (relative to
-/// the repository root, located by walking up from the process CWD) so the
-/// canonical decision record lives with the plan docs rather than in the CWD.
+/// The populated result is written to `speed-decoupling-validation.md` in the
+/// process working directory.
 pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("SPEED-DECOUPLING VALIDATION (Plan 0009)");
+    println!("SPEED-DECOUPLING VALIDATION");
     println!(
-        "Running {} generations with all 0009 flags OFF (baseline) then ON",
+        "Running {} generations with the effort/drag/danger flags OFF (baseline) then ON",
         num_generations
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // Baseline run (all flags off)
-    println!("\n[BASELINE] All 0009 flags OFF");
+    println!("\n[BASELINE] effort-rebased fitness / super-linear drag / danger percept OFF");
     let baseline_stats = run_headless_with_flags(config.clone(), num_generations, false, false);
 
-    // On run (all 0009 flags on: effort-rebased fitness, super-linear drag at k=2.0, danger percept)
-    println!("\n[ON] All 0009 flags ON");
+    // On run: effort-rebased fitness, super-linear drag at k=2.0, and danger percept all on
+    println!("\n[ON] effort-rebased fitness / super-linear drag / danger percept ON");
     let on_stats = run_headless_with_flags(config.clone(), num_generations, true, true);
 
     // Compute and report metrics
@@ -436,42 +435,12 @@ pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
 
     let markdown = format_validation_markdown(&baseline_stats, &on_stats);
 
-    // Write to plan folder (walk up from CWD to find docs/plans/0009-Intent-Aware-Fitness/).
-    let plan_doc_path = locate_plan_doc();
-    match std::fs::write(&plan_doc_path, &markdown) {
-        Ok(()) => println!("\nResults saved to {}", plan_doc_path),
-        Err(e) => eprintln!("Failed to write plan doc to {}: {}", plan_doc_path, e),
+    // Save the report in the process working directory.
+    let report_path = "speed-decoupling-validation.md";
+    match std::fs::write(report_path, markdown) {
+        Ok(()) => println!("\nResults saved to ./{}", report_path),
+        Err(e) => eprintln!("Failed to write {}: {}", report_path, e),
     }
-
-    // Also write a copy in the CWD for convenience.
-    let cwd_path = "0009-SPEED-DECOUPLING.md";
-    match std::fs::write(cwd_path, markdown) {
-        Ok(()) => println!("Results also saved to ./{}", cwd_path),
-        Err(e) => eprintln!("Failed to write CWD copy: {}", e),
-    }
-}
-
-/// Walk up from the process CWD until we find the plan folder, then return the
-/// full path to the decision doc inside it.  Falls back to the CWD copy if the
-/// plan folder is not found (e.g. in CI worktrees with unusual roots).
-fn locate_plan_doc() -> String {
-    let plan_rel = std::path::Path::new("docs")
-        .join("plans")
-        .join("0009-Intent-Aware-Fitness")
-        .join("0009-SPEED-DECOUPLING.md");
-
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    loop {
-        let candidate = dir.join(&plan_rel);
-        if candidate.parent().map(|p| p.exists()).unwrap_or(false) {
-            return candidate.to_string_lossy().into_owned();
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    // Fall back to CWD
-    "0009-SPEED-DECOUPLING.md".to_owned()
 }
 
 /// Statistics collected during a headless run.
@@ -490,26 +459,28 @@ struct ValidationStats {
     speed_trajectory_per_gen: Vec<f32>,
 }
 
-/// Layer A (super-linear drag) exponent used in the ON run.
-/// k=2.0: cost scales as (speed/20)^2 above baseline — the keystone of plan 0003.
-/// k=1.0 in the baseline run is a bit-exact no-op per the WGSL guard.
+/// Super-linear locomotor-drag exponent used in the ON run.
+/// k=2.0: energy cost scales as (speed/20)^2 above the baseline speed, so the
+/// energy-drain axis becomes speed-dependent and faster movement costs
+/// disproportionately more. k=1.0 in the baseline run is a bit-exact no-op per
+/// the WGSL guard.
 const ON_SPEED_COST_EXPONENT: f32 = 2.0;
 
 /// Run headless evolution and collect statistics with specified flags.
 ///
-/// `flags_on = true` activates all three 0009 mechanisms together:
-///   - `effort_rebased_fitness`: food-per-energy + cells-per-distance (Layer C)
-///   - `speed_cost_exponent = 2.0`: super-linear locomotor drag above baseline (Layer A)
-///   - `danger_percept_enabled`: dedicated danger bearing/distance senses (Layer D)
+/// `flags_on = true` activates all three mechanisms together:
+///   - `effort_rebased_fitness`: food-per-energy + cells-per-distance
+///   - `speed_cost_exponent = 2.0`: super-linear locomotor drag above baseline
+///   - `danger_percept_enabled`: dedicated danger bearing/distance senses
 fn run_headless_with_flags(
     mut config: FullConfig,
     num_generations: u64,
     effort_rebased_fitness: bool,
     danger_percept_enabled: bool,
 ) -> ValidationStats {
-    // Set the 0009 flags.
-    // When enabling, also engage Layer A (super-linear drag) at k=2.0 — the keystone
-    // mechanism (plan 0003) that makes the energy-drain axis speed-dependent.
+    // Set the validation flags.
+    // When enabling, also engage the super-linear drag at k=2.0 — the keystone
+    // mechanism that makes the energy-drain axis speed-dependent.
     // Leaving speed_cost_exponent=1.0 in the ON run would make the ON and baseline
     // runs byte-identical on the energy-drain axis, defeating the measurement.
     config.brain.effort_rebased_fitness = effort_rebased_fitness;
@@ -1004,16 +975,15 @@ fn format_validation_markdown(baseline: &ValidationStats, on_stats: &ValidationS
     };
 
     format!(
-        "# Decision: Speed-Decoupling Validation (Plan 0009 — Task 0006)\n\
+        "# Speed-Decoupling Validation Report\n\
 \n\
 **Date:** 2026-06-18\n\
 **Status:** MEASURED\n\
-**Task:** `speed-decoupling-validation`\n\
 \n\
 ## Configuration\n\
 \n\
-- Baseline: all 0009 flags OFF (`speed_cost_exponent=1.0`, `effort_rebased_fitness=false`, `danger_percept_enabled=false`)\n\
-- On: Layer A `speed_cost_exponent={exp:.1}`, `effort_rebased_fitness=true`, `danger_percept_enabled=true`\n\
+- Baseline: effort/drag/danger flags OFF (`speed_cost_exponent=1.0`, `effort_rebased_fitness=false`, `danger_percept_enabled=false`)\n\
+- On: super-linear drag `speed_cost_exponent={exp:.1}`, `effort_rebased_fitness=true`, `danger_percept_enabled=true`\n\
 \n\
 ## Measured Metrics\n\
 \n\
@@ -1050,7 +1020,7 @@ The speed-fitness correlation {corr_direction} from {baseline_corr:.4} (baseline
 \n\
 Baseline slope {baseline_death:.4} — positive slope means faster agents die more; \
 negative means faster agents die less (the exploit). ON slope: {on_death:.4}.\n\
-Path-length hazard (Layer B) makes per-crossing damage speed-invariant, so fast agents \
+Path-length hazard makes per-crossing damage speed-invariant, so fast agents \
 no longer get cheaper hazard exposure.\n\
 \n\
 ### Food-Per-Energy vs Speed\n\
@@ -1092,7 +1062,7 @@ Mean ticks alive — Baseline: {baseline_ticks} | On: {on_ticks}.\n\
 \n\
 This document was generated by the speed-decoupling validation harness \
 (`cargo run --release -- --validate-speed-decoupling`). \
-It records the canonical baseline for all future Plan 0009 A/B tests.\n",
+It records the baseline for future speed-decoupling A/B tests.\n",
         exp = ON_SPEED_COST_EXPONENT,
         baseline_corr = baseline.speed_fitness_correlation,
         on_corr = on_stats.speed_fitness_correlation,
@@ -1148,11 +1118,11 @@ It records the canonical baseline for all future Plan 0009 A/B tests.\n",
             "GATE NOT MET — Some criteria not met; review metrics above before flipping defaults."
         },
         decision = if gate_passed {
-            "The validation passed. The Plan 0009 layers (Layer A: super-linear drag at k=2.0, \
-Layer B: path-length hazard, Layer C: effort-rebased fitness, Layer D: danger percept) \
+            "The validation passed. The four mechanisms (super-linear drag at k=2.0, \
+path-length hazard, effort-rebased fitness, and the danger percept) \
 successfully decouple movement speed from composite fitness. \
 The population remained viable and danger-decision data is retained. \
-Defaults are candidates for flipping per task `default-flip-gate`."
+The defaults are candidates for flipping now that this gate has passed."
         } else {
             "The validation did not meet all gate criteria. Review the measured metrics and \
 consider tuning the drag exponent (speed_cost_exponent), the fitness calibration constants \

@@ -943,7 +943,7 @@ mod tests {
     }
 
     /// Build a two-agent world upload whose per-agent configs differ only in
-    /// `gabor_wavelength` (the first plan-0008 visual-genome tail slot). Both
+    /// `gabor_wavelength` (the first Gabor visual-genome tail slot). Both
     /// agents spawn at the same safe position; the population size is fixed so
     /// `reset_population` takes the in-place reseed path. Returns the upload and
     /// the world's food count (mirrors `test_upload`).
@@ -1007,7 +1007,7 @@ mod tests {
     /// every champion slot; `patch_agent_configs` then restores each agent's own
     /// config. Without that patch step every agent's vision silently reverts to
     /// the champion's, so this test fails on the un-patched worker and passes
-    /// once the patch covers the visual tail slots (plan 0008, task 0004).
+    /// once the patch covers the visual tail slots with per-agent genome values.
     /// GPU-gated.
     #[test]
     fn worker_reset_applies_visual_genome_after_inheritance() {

@@ -1,4 +1,4 @@
-//! Stage 1 of the Hubel-Wiesel visual cortex (plan 0008): the center-surround
+//! Stage 1 of the Hubel-Wiesel visual cortex: the center-surround
 //! Difference-of-Gaussians (DoG) kernel.
 //!
 //! This is the canonical Rust reference for the seeded DoG kernel. It mirrors,
@@ -8,7 +8,7 @@
 //! the GPU; this module exists so the `dog_kernel_sums_to_zero` probe can assert
 //! the kernel's mathematical invariants (zero-sum, edge response) on the CPU
 //! without a workgroup-memory readback. The two share one set of literals — when
-//! the heritable `dog_surround_ratio` gene lands (plan 0003) it overrides only
+//! the heritable `dog_surround_ratio` gene lands it overrides only
 //! the surround ratio argument here; the construction is identical.
 //!
 //! A DoG is a zero-sum concentric kernel that reports local contrast (an edge
@@ -30,19 +30,19 @@ pub const DOG_SIGMA_CENTER: f32 = 1.0;
 
 /// Seed surround:center sigma ratio (Marr & Hildreth 1980). Single canonical
 /// source mirrored by `DOG_SURROUND_RATIO_SEED` in `common.wgsl`. Becomes the
-/// heritable `dog_surround_ratio` gene in plan 0003.
+/// heritable `dog_surround_ratio` gene.
 pub const DOG_SURROUND_RATIO_SEED: f32 = 1.6;
 
 /// Kernel truncation radius in sigmas (3σ of the larger Gaussian). Mirrors
 /// `DOG_SUPPORT_SIGMAS` in `common.wgsl`.
 pub const DOG_SUPPORT_SIGMAS: f32 = 3.0;
 
-/// Lower clamp on the surround ratio (matches the plan-0003 gene clamp): below
+/// Lower clamp on the surround ratio (heritable gene clamp): below
 /// this the kernel degenerates into a blur rather than an edge operator. Mirrors
 /// the clamp in `coop_visual_cortex`.
 pub const DOG_SURROUND_RATIO_MIN: f32 = 1.2;
 
-/// Upper clamp on the surround ratio (matches the plan-0003 gene clamp and the
+/// Upper clamp on the surround ratio (heritable gene clamp and the
 /// `DOG_SURROUND_RATIO_MAX` support-bounding constant in `common.wgsl`).
 pub const DOG_SURROUND_RATIO_MAX: f32 = 3.0;
 

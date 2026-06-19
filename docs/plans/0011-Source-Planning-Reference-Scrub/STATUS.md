@@ -3,12 +3,9 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned. Authored from the planning-reference findings in the
-2026-06-18 Grok 4.3 and Gemini 3.1 Pro High reviews of Plan 0009; the current
-debt was re-derived from the live `contributing_guard.rs` baseline (128
-reference-lines across 23 files) and partitioned so this plan owns only the files
-Plan 0010 does not touch. No task started.
-_Last updated: 2026-06-18, against `claude/funny-cray-84end5`._
+**Status:** ✅ Complete. All 5 tasks landed and squash-merged into
+`claude/hungry-pare-b37669` as `ed47c7c119692f5ceb4a055447c3093c34857b27`.
+_Last updated: 2026-06-19, against `claude/hungry-pare-b37669`._
 
 - **Goal:** Ratchet the `contributing_guard.rs::PLANNING_REFERENCE_BASELINE` down
   to zero on the files Plan 0010 does not edit, replacing each planning-process
@@ -29,17 +26,19 @@ _Last updated: 2026-06-18, against `claude/funny-cray-84end5`._
   (or small-group) scrub tasks that strip references and lower the matching
   baseline rows in the same commit — all disjoint, all `Depends on: —`, fully
   parallel with each other and with Plan 0010.
-- **Outcome:** _Pending — not started._
+- **Outcome:** All 5 tasks completed; planning-process references stripped from the
+  13 owned files across both crate areas; `contributing_guard.rs` baseline ratcheted
+  down accordingly — comment/string hygiene only, no behavioral change.
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Vision-encoder & brain-shader reference scrub | `scrub-vision-encoder-modules`, `scrub-brain-passes-shader`, `scrub-tiled-brain-shaders` | 📋 Planned |
-| 0002 | Sandbox binary reference scrub | `scrub-ui-and-sim-runtime`, `scrub-bench` | 📋 Planned |
+| 0001 | Vision-encoder & brain-shader reference scrub | `scrub-vision-encoder-modules`, `scrub-brain-passes-shader`, `scrub-tiled-brain-shaders` | ✅ Done |
+| 0002 | Sandbox binary reference scrub | `scrub-ui-and-sim-runtime`, `scrub-bench` | ✅ Done |
 
 ## Verification
 
-_Pending._ Success is the `planning_references_do_not_exceed_baseline` guard
-staying green with this plan's 13 files removed from (or lowered in)
-`PLANNING_REFERENCE_BASELINE`, and a grep of those files returning no
-`plan 0…`/`Layer …`/`speed-decoupling`/bare `0008`/`0006` vocabulary. No runtime
-behavior, buffer layout, or other test outcome changes.
+All tasks landed green. The `planning_references_do_not_exceed_baseline` guard
+remains green with this plan's 13 files removed from (or lowered in)
+`PLANNING_REFERENCE_BASELINE`, and no `plan 0…`/`Layer …`/`speed-decoupling`/bare
+`0008`/`0006` vocabulary remains in the owned files. No runtime behavior, buffer
+layout, or other test outcome changes.

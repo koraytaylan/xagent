@@ -1,6 +1,6 @@
-// Plan 0006: copy coop_feature_extract semantics into brain_scratch so tiled
-// encode (a separate dispatch) can read features cross-workgroup.
-// This shader is concatenated after common.wgsl by the host.
+// Feature extraction for tiled encode: copy sensory and interoceptive features
+// into workgroup-shared brain_scratch so tiled encode (a separate dispatch) can
+// read features cross-workgroup. This shader is concatenated after common.wgsl by the host.
 
 @compute @workgroup_size(256)
 fn phase_brain_features(
@@ -13,9 +13,9 @@ fn phase_brain_features(
     let s_base = agent_id * SENSORY_STRIDE;
     let vision_count = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
 
-    // Mirror `coop_feature_extract`'s flag-dependent layout (plan 0008
-    // wire-visual-features-into-encoder) so SCRATCH_FEATURES is sized exactly
-    // like the fused `s_features`:
+    // Mirror `coop_feature_extract`'s flag-dependent layout for visual-cortex
+    // config: SCRATCH_FEATURES must match the fused path's s_features dimensions
+    // so the split/tiled path is compatible:
     //   flag OFF — copy the raw vision slice into SCRATCH_FEATURES[0 .. vision_count)
     //              and place the non-visual tail after it (legacy width).
     //   flag ON  — SCRATCH_FEATURES is the compact (VISUAL_FEATURE_COUNT +
@@ -23,11 +23,11 @@ fn phase_brain_features(
     //              would overrun SCRATCH_FEATURES into SCRATCH_ENCODED, so it is
     //              skipped and the non-visual tail starts at VISUAL_FEATURE_COUNT.
     // NOTE: the split/tiled execution path has no cortex stage (the visual cortex
-    // ships in the fused `FusedSerial` default per plan 0008 SCOPE), so with the
-    // flag ON the leading VISUAL_FEATURE_COUNT slots remain zero here. The
-    // flag-on cortex is exercised only on the fused path; this guard exists to
-    // keep the split path bounded and layout-consistent, not to replicate the
-    // cortex. The flag read is workgroup-uniform.
+    // is only available in the fused kernel path), so with the flag ON the
+    // leading VISUAL_FEATURE_COUNT slots remain zero here. The flag-on cortex is
+    // exercised only on the fused path; this guard exists to keep the split path
+    // bounded and layout-consistent, not to replicate the cortex. The flag read
+    // is workgroup-uniform.
     let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
     if (!visual_cortex_enabled) {
         // All threads cooperatively copy vision color + depth into brain_scratch.

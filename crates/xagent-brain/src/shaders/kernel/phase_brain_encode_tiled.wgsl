@@ -1,4 +1,4 @@
-// Plan 0006 — ParallelTiled tiled encode.
+// ParallelTiled tiled encode: per-agent input matrix multiply across dispatches.
 //
 // Dispatched as workgroups(agent_count, ENCODED_DIMENSION/16, 1) with
 // workgroup_size 256. Each workgroup (wgid.y in 0..7) owns 16 encoded output

@@ -1,4 +1,4 @@
-// Plan 0006 — ParallelTiled tiled predictor (train + predict).
+// ParallelTiled tiled predictor: per-agent TD(λ) value-function prediction.
 //
 // Dispatched as workgroups(agent_count, PREDICTOR_DIMENSION/16, 1),
 // workgroup_size 256. Each workgroup (wgid.y in 0..7) owns 16 predictor rows;

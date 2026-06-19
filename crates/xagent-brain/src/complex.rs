@@ -1,4 +1,4 @@
-//! Stage 3 of the Hubel-Wiesel visual cortex (plan 0008): the position- and
+//! Stage 3 of the Hubel-Wiesel visual cortex: the position- and
 //! phase-invariant V1 complex cells (quadrature energy + MAX pooling).
 //!
 //! This is the canonical Rust reference for the complex-cell stage. It mirrors,

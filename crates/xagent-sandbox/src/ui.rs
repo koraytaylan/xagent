@@ -1377,7 +1377,7 @@ impl<'a> TabContext<'a> {
                     ui.end_row();
 
                     // visual_encoding_size retired from the editor (issue #106):
-                    // superseded by the plan 0008 visual-cortex config. The field
+                    // superseded by visual-cortex Gabor/DoG encoder configuration. The field
                     // survives only for deserialization back-compat.
 
                     ui.label("learning_rate");
@@ -1461,7 +1461,7 @@ impl<'a> TabContext<'a> {
                     );
                     ui.end_row();
 
-                    // Heritable visual-genome genes (plan 0008). Ranges match the
+                    // Heritable Gabor visual-genome genes. Ranges match the
                     // mutation clamps; orientation_offset spans the half-circle
                     // [0, π) it wraps into.
                     ui.label("gabor_wavelength");
@@ -1981,7 +1981,7 @@ impl<'a> TabContext<'a> {
                         ui.label("movement_speed");
                         ui.monospace(format!("{:.1}", cfg.movement_speed));
                         ui.end_row();
-                        // Heritable visual-genome genes (plan 0008).
+                        // Heritable Gabor visual-genome genes.
                         ui.label("gabor_wavelength");
                         ui.monospace(format!("{:.2}", cfg.gabor_wavelength));
                         ui.end_row();

@@ -1,4 +1,4 @@
-// Plan 0006 — ParallelTiled tiled encoder credit.
+// ParallelTiled tiled encoder credit: per-agent encoder-weight gradient updates.
 //
 // Dispatched as workgroups(agent_count, ENCODED_DIMENSION/16, 1), workgroup_size
 // 256. Mirrors the fused coop_learn_and_store "7b" encoder-credit update but

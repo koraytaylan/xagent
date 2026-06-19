@@ -25,7 +25,7 @@ fn brain_tick(
     coop_feature_extract(agent_id, tid);
     workgroupBarrier();
 
-    // Visual cortex (plan 0008): no-op passthrough until the DoG → Gabor →
+    // Visual cortex: no-op passthrough until the DoG → Gabor →
     // complex stages land, gated on CFG_VISUAL_CORTEX_ENABLED. Kept in sync with
     // the fused kernel (kernel_tick.wgsl) so both pipelines run the same passes.
     coop_visual_cortex(agent_id, tid);

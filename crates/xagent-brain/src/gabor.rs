@@ -1,4 +1,4 @@
-//! Stage 2 of the Hubel-Wiesel visual cortex (plan 0008): the orientation-
+//! Stage 2 of the Hubel-Wiesel visual cortex: the orientation-
 //! selective V1 simple-cell bank (oriented Gabor filters).
 //!
 //! This is the canonical Rust reference for the seeded Gabor bank. It mirrors,
@@ -9,7 +9,7 @@
 //! assert each kernel's mathematical invariant (DC balance, i.e. `∑ Gabor = 0`)
 //! on the CPU without a workgroup-memory readback. The two share one set of
 //! literals — when the heritable `gabor_wavelength` / `gabor_aspect_ratio` /
-//! `orientation_offset` genes land (plan 0003) they override only the
+//! `orientation_offset` genes land they override only the
 //! corresponding argument here; the construction is identical.
 //!
 //! The 2-D Gabor is the validated quantitative model of a V1 simple-cell
@@ -60,19 +60,19 @@ pub const GABOR_SCALES: usize = 2;
 /// `common.wgsl`. Pooled over by the complex-cell energy step, never reduced.
 pub const GABOR_PHASES: usize = 2;
 
-/// Seed carrier wavelength λ in retina pixels (`gabor_wavelength` gene seed,
-/// plan 0003). Single canonical source mirrored by `GABOR_WAVELENGTH_SEED` in
+/// Seed carrier wavelength λ in retina pixels (`gabor_wavelength` gene seed).
+/// Single canonical source mirrored by `GABOR_WAVELENGTH_SEED` in
 /// `common.wgsl`. Heritable; clamped to `[GABOR_WAVELENGTH_MIN, ..MAX]`.
 pub const GABOR_WAVELENGTH_SEED: f32 = 5.0;
 
 /// Seed envelope aspect ratio γ (long axis / short axis), `gabor_aspect_ratio`
-/// gene seed (plan 0003). Single canonical source mirrored by
+/// gene seed. Single canonical source mirrored by
 /// `GABOR_ASPECT_RATIO_SEED` in `common.wgsl`. Heritable; clamped to
 /// `[GABOR_ASPECT_RATIO_MIN, ..MAX]`.
 pub const GABOR_ASPECT_RATIO_SEED: f32 = 0.5;
 
 /// Seed whole-bank orientation offset in radians, added to the even `[0, π)`
-/// tiling (`orientation_offset` gene seed, plan 0003). Single canonical source
+/// tiling (`orientation_offset` gene seed). Single canonical source
 /// mirrored by `GABOR_ORIENTATION_OFFSET_SEED` in `common.wgsl`. Heritable;
 /// wrapped to `[0, π)`.
 pub const GABOR_ORIENTATION_OFFSET_SEED: f32 = 0.0;
@@ -92,20 +92,20 @@ pub const GABOR_SCALE_STEP: f32 = 2.0;
 /// `GABOR_SUPPORT_SIGMAS` in `common.wgsl`.
 pub const GABOR_SUPPORT_SIGMAS: f32 = 3.0;
 
-/// Lower clamp on the carrier wavelength λ (plan-0003 gene clamp). Mirrors the
+/// Lower clamp on the carrier wavelength λ (heritable gene clamp). Mirrors the
 /// clamp in `coop_visual_cortex`. Below ~2 px/cycle the carrier is undersampled
 /// on the retina grid.
 pub const GABOR_WAVELENGTH_MIN: f32 = 2.0;
 
-/// Upper clamp on the carrier wavelength λ (plan-0003 gene clamp and the support-
+/// Upper clamp on the carrier wavelength λ (heritable gene clamp and the support-
 /// bounding ceiling). Mirrors `GABOR_WAVELENGTH_MAX` in `common.wgsl`.
 pub const GABOR_WAVELENGTH_MAX: f32 = 12.0;
 
-/// Lower clamp on the envelope aspect ratio γ (plan-0003 gene clamp). Mirrors the
+/// Lower clamp on the envelope aspect ratio γ (heritable gene clamp). Mirrors the
 /// clamp in `coop_visual_cortex`.
 pub const GABOR_ASPECT_RATIO_MIN: f32 = 0.25;
 
-/// Upper clamp on the envelope aspect ratio γ (plan-0003 gene clamp). At 1.0 the
+/// Upper clamp on the envelope aspect ratio γ (heritable gene clamp). At 1.0 the
 /// envelope is isotropic. Mirrors the clamp in `coop_visual_cortex`.
 pub const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
 

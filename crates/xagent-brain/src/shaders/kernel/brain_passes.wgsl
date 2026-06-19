@@ -17,7 +17,7 @@
 
 const BRAIN_WORKGROUP_SIZE: u32 = 256u;
 
-// ── Dense tiling (plan 0006): same-dispatch cooperative parallelism ────────
+// ── Dense tiling: same-dispatch cooperative parallelism ────────────────────
 // 64 output rows × 4 inner lanes = 256 invocations, using the whole workgroup
 // while keeping one workgroup per agent.
 const DENSE_OUTPUT_TILE: u32 = 64u;
@@ -38,8 +38,8 @@ var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 // Prediction error (index 0) and TD error (index 1) share one threadgroup
 // binding: macOS Metal caps the number of distinct threadgroup resource slots
 // and the fused kernel is at that ceiling, so packing this scalar pair into one
-// array frees a slot for the plan-0008 visual-cortex scratch (`s_visual`)
-// without changing any value. `s_pred_td[0]` == the former `s_pred_error`,
+// array frees a slot for the visual-cortex scratch (`s_visual`) without
+// changing any value. `s_pred_td[0]` == the former `s_pred_error`,
 // `s_pred_td[1]` == the former `s_td_error`.
 const S_PRED_ERROR: u32 = 0u;
 const S_TD_ERROR: u32 = 1u;
@@ -51,7 +51,7 @@ var<workgroup> s_explore: array<f32, 2>;
 // group of DENSE_INNER_LANES entries reduces one output row.
 var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
 
-// ── Scalars for parallel action-tail reductions (plan 0006 parallelization) ──
+// ── Scalars for parallel action-tail reductions ──
 // Each reduction writes its final scalar here so thread 0 can read without
 // barrier deadlock. All 256 threads participate in the reductions.
 var<workgroup> s_err_sum: f32;
@@ -66,17 +66,17 @@ var<workgroup> s_fwd_scale: f32;
 var<workgroup> s_trn_scale: f32;
 var<workgroup> s_val_scale: f32;
 
-// ── Encoded-vector norm shared by memory reinforcement and store (plan 0006) ──
+// ── Encoded-vector norm shared by memory reinforcement and store ──────────────
 var<workgroup> s_enc_norm: f32;
 
-// ── Memory reinforcement tiling (plan 0006): 256 threads × 2 lanes per pattern ──
+// ── Memory reinforcement tiling: 256 threads × 2 lanes per pattern ──────────────
 var<workgroup> s_reinf_dot: array<f32, 256>;
 
-// ── Argmin tracking for parallel min reduction (plan 0006) ────────────────────
+// ── Argmin tracking for parallel min reduction ──────────────────────────────────
 var<workgroup> s_argmin_val: array<f32, MEMORY_CAP>;
 var<workgroup> s_argmin_idx: array<u32, MEMORY_CAP>;
 
-// ── Visual cortex scratch (plan 0008) ─────────────────────────────────────────
+// ── Visual cortex scratch ──────────────────────────────────────────────────────
 // All Hubel-Wiesel intermediates live in ONE combined workgroup buffer.
 // macOS Metal caps the number of distinct threadgroup resource slots (the fused
 // kernel is at that ceiling), so the cortex's persistent maps share a single
@@ -114,7 +114,7 @@ fn rand_f32_brain(seed: u32) -> f32 {
 
 // Fixed-order tree reduction of s_dense_partials[0..ENCODED_DIMENSION) into [0].
 // Must be called by ALL workgroup invocations (barrier uniformity).
-// This is the parallel action-tail reduction helper (plan 0006).
+// This is the parallel action-tail reduction helper.
 fn wg_reduce_dense(tid: u32) {
     var stride: u32 = ENCODED_DIMENSION / 2u;
     loop {
@@ -156,7 +156,7 @@ fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
 fn coop_feature_extract(agent_id: u32, tid: u32) {
     let s_base = agent_id * SENSORY_STRIDE;
 
-    // Encoder visual-input layout (plan 0008 wire-visual-features-into-encoder).
+    // Encoder visual-input layout: wire visual features into encoder input.
     // The non-visual tail (the 25 proprioception/interoception/touch features
     // written below) begins at the end of the encoder's visual block, whose width
     // depends on the cortex flag:
@@ -227,14 +227,14 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
             s_features[fi] = sensory_buffer[s_base + to + 2u]; fi = fi + 1u;
             s_features[fi] = sensory_buffer[s_base + to + 3u]; fi = fi + 1u;
         }
-        // Danger percept (plan 0009 danger-percept-sense): when enabled, pack
-        // the nearest-danger distance and bearing from `physics_state` into the
-        // two extra feature slots. These are read same-cycle from physics —
-        // exactly the pattern used for interoception above — rather than from
-        // the batch-lagged sensory_buffer. `DANGER_PERCEPT_FEATURES_ACTIVE` is
-        // a pipeline override constant (0u or 1u), so `NON_VISUAL_FEATURE_COUNT`
-        // already accounts for the 2 extra slots when the flag is on and the
-        // write is always in-bounds. With the flag off, this block is unreachable
+        // Danger percept: when enabled, pack the nearest-danger distance and
+        // bearing from `physics_state` into the two extra feature slots. These
+        // are read same-cycle from physics — exactly the pattern used for
+        // interoception above — rather than from the batch-lagged
+        // sensory_buffer. `DANGER_PERCEPT_FEATURES_ACTIVE` is a pipeline
+        // override constant (0u or 1u), so `NON_VISUAL_FEATURE_COUNT` already
+        // accounts for the 2 extra slots when the flag is on and the write is
+        // always in-bounds. With the flag off, this block is unreachable
         // (NON_VISUAL_FEATURE_COUNT == 25u, fi stays at non_visual_base + 25).
         if (DANGER_PERCEPT_FEATURES_ACTIVE != 0u) {
             let phys_danger_base = agent_id * PHYS_STRIDE;
@@ -250,7 +250,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 1.5: Visual cortex (plan 0008 — Hubel-Wiesel early visual cortex)
+// Pass 1.5: Visual cortex (Hubel-Wiesel early visual cortex)
 //
 // Runs after feature extraction, before encode. The full pass reads the dense
 // luminance retina out of `s_features`, runs DoG center-surround → oriented
@@ -259,11 +259,11 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
 // of `s_features` so the encoder consumes oriented features instead of raw
 // pixels.
 //
-// Stages landed so far (plan 0008):
+// Stages implemented:
 //   Stage 0 — luminance retina           (retina-luminance-derivation)
 //   Stage 1 — DoG center-surround        (center-surround-dog)
 //   Stage 2 — oriented Gabor bank        (gabor-simple-cells)
-//   Stage 3 — complex energy + MAX pool  (complex-cell-energy-pool, THIS TASK)
+//   Stage 3 — complex energy + MAX pool  (complex-cell-energy-pool)
 // Stage 3 produces the TRUE per-(orientation, scale, pool-row, pool-col)
 // quadrature-energy + MAX-pooled complex vector (replacing Stage 2's earlier
 // provisional per-filter scalar summary) into the `s_complex` region of the
@@ -286,10 +286,10 @@ fn gaussian_2d(r2: f32, sigma: f32) -> f32 {
 }
 
 // DoG surround sigma from the heritable `dog_surround_ratio` gene, clamped to the
-// plan-0003 gene bounds [DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX] so a
-// mutated value can never degenerate the kernel into a blur (ratio → 1) or exceed
-// the scratch support (ratio too large). The clamp is the invariant re-imposed
-// AFTER reading the gene — mirrors `dog::build_dog_kernel` in Rust.
+// gene bounds [DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX] so a mutated
+// value can never degenerate the kernel into a blur (ratio → 1) or exceed the
+// scratch support (ratio too large). The clamp is the invariant re-imposed AFTER
+// reading the gene — mirrors `dog::build_dog_kernel` in Rust.
 fn dog_sigma_surround(surround_ratio: f32) -> f32 {
     let sigma_center = max(DOG_SIGMA_CENTER, EPSILON);
     let ratio = clamp(surround_ratio, DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX);
@@ -345,10 +345,10 @@ fn dog_weight(kx: i32, ky: i32, mean: f32, surround_ratio: f32) -> f32 {
 // helpers below are pure and workgroup-uniform, so every thread reconstructs the
 // identical kernel without a threadgroup binding. The seed genes
 // (GABOR_WAVELENGTH_SEED / GABOR_ASPECT_RATIO_SEED / GABOR_ORIENTATION_OFFSET_SEED)
-// are read here and the clamps re-imposed; when the heritable Gabor genes land
-// (plan 0003) only the read source changes, not the math. The Rust `gabor`
-// module mirrors these literal-for-literal and the `gabor_kernels_are_dc_balanced`
-// probe pins ∑ Gabor = 0.
+// are read here and the clamps re-imposed; when heritable Gabor genes are used,
+// only the read source changes, not the math. The Rust `gabor` module mirrors
+// these literal-for-literal and the `gabor_kernels_are_dc_balanced` probe pins
+// ∑ Gabor = 0.
 
 // Preferred orientation θ for bank index i ∈ [0, GABOR_ORIENTATIONS):
 // i·π/N + offset, wrapped into [0, π). The wrap keeps a mutated (possibly
@@ -429,10 +429,10 @@ fn gabor_kernel_mean(radius: u32, theta: f32, wavelength: f32, aspect_ratio: f32
 
 // L2 norm of the mean-subtracted Gabor kernel over its truncated support. Used
 // to normalize each filter to unit energy (standard Gabor convention: keeps the
-// even/odd quadrature responses commensurable for Stage 3, and shrinks the
-// residual f32 DC of the larger kernels below the 1e-5 balance the
-// `gabor_kernels_are_dc_balanced` probe pins). Pure / workgroup-uniform, so no
-// threadgroup binding. Mirrors the L2 step in `gabor::build_gabor_kernel`.
+// even/odd quadrature responses commensurable, and shrinks the residual f32 DC
+// of the larger kernels below the 1e-5 balance the probe pins). Pure /
+// workgroup-uniform, so no threadgroup binding. Mirrors the L2 step in
+// `gabor::build_gabor_kernel`.
 fn gabor_kernel_norm(radius: u32, theta: f32, wavelength: f32, aspect_ratio: f32, phase: f32, mean: f32) -> f32 {
     let r = i32(radius);
     var norm_sq: f32 = 0.0;
@@ -511,15 +511,15 @@ fn pool_bounds(cell: u32, cells: u32, extent: u32) -> vec2<u32> {
 }
 
 fn coop_visual_cortex(agent_id: u32, tid: u32) {
-    // Gate flag (plan 0008): 0.0 ⇒ no-op passthrough, encoder keeps the legacy
-    // raw-vision slice. Read uniformly so every thread takes the same branch
-    // (barrier uniformity). The stages added by later tasks live behind this.
+    // Gate flag: 0.0 ⇒ no-op passthrough, encoder keeps the legacy raw-vision
+    // slice. Read uniformly so every thread takes the same branch (barrier
+    // uniformity). The stages live behind this gate.
     let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
     if (!visual_cortex_enabled) {
         return;
     }
 
-    // ── Heritable visual-genome genes (plan 0008 visual-genome-config) ────────
+    // ── Heritable visual-genome genes ──────────────────────────────────────────
     // Read the four per-agent Gabor/DoG bank genes from this agent's brain-state
     // tail. They are written by `write_agent_heritable_config` (Rust) and seeded
     // in `init_brain_state_for`. The clamps + invariants (DoG zero-sum, Gabor DC
@@ -724,7 +724,7 @@ fn coop_visual_cortex(agent_id: u32, tid: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass 2: Encode (plan 0006 dense tiling: all 256 lanes, 64 output rows × 4 lanes)
+// Pass 2: Encode (dense tiling: all 256 lanes, 64 output rows × 4 lanes)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn coop_encode(agent_id: u32, tid: u32) {
@@ -804,11 +804,11 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let shaping = TD_DISCOUNT * potential - prev_potential;
         physics_state[phys_base_homeo + P_PREV_POTENTIAL] = potential;
 
-        // Avoidance potential shaping (plan 0009 danger-avoidance-potential):
-        // Φ_d(s) = -(1 - nearest_danger_distance / DANGER_SENSE_RADIUS).
-        // More negative as danger nears; shaping reward adds γ·Φ_d(s') − Φ_d(s),
-        // so moving away yields positive increment, moving toward yields negative.
-        // Behind danger_percept_enabled flag (default false).
+        // Avoidance potential shaping: Φ_d(s) = -(1 - nearest_danger_distance /
+        // DANGER_SENSE_RADIUS). More negative as danger nears; shaping reward
+        // adds γ·Φ_d(s') − Φ_d(s), so moving away yields positive increment,
+        // moving toward yields negative. Behind danger_percept_enabled flag
+        // (default false).
         var danger_shaping: f32 = 0.0;
         if (bc_f32(CFG_DANGER_PERCEPT_ENABLED) != 0.0) {
             let danger_dist = physics_state[phys_base_homeo + P_NEAREST_DANGER_DISTANCE];
@@ -962,7 +962,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     let tick_count = brain_state[brain_base + O_TICK_COUNT];
     let recall_count = u32(s_recall[RECALL_K]);
 
-    // ── Predictor: train then predict — plan 0006 dense tiling ──
+    // ── Predictor: train then predict (dense tiling) ────────────────────────────
     // ParallelTiled (use_scratch_prediction = true): phase_brain_predictor_tiled
     // already trained O_PREDICTOR_WEIGHTS and wrote the row predictions into
     // SCRATCH_PREDICTION across more workgroups, so the tail just loads them.
@@ -1537,7 +1537,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
             brain_state[brain_base + O_PREDICTOR_CONTEXT_WEIGHT], 0.05, 0.5);
     }
 
-    // ── 7b. Encoder credit: plan 0006 dense tiling ──────────────────────
+    // ── 7b. Encoder credit: dense tiling ──────────────────────────────────────
     // Task-driven nudge: features that co-occurred with TD-error eligibility
     // get their weights into this dimension strengthened.
     // Use the dense tiling: 64 output rows (encoded dims) × 4 inner lanes.
@@ -1566,7 +1566,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         }
     }
 
-    // ── Compute encoded-vector norm ONCE (plan 0006 memory reinforcement tiling) ──
+    // ── Compute encoded-vector norm ONCE (memory reinforcement tiling) ──────────
     // All threads cooperate on the tree reduction; result is shared by 7c and 7d.
     {
         if (tid < ENCODED_DIMENSION) {
@@ -1579,7 +1579,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         workgroupBarrier();
     }
 
-    // ── 7c. Memory reinforcement: tiled with all 256 threads (plan 0006) ───────
+    // ── 7c. Memory reinforcement: tiled with all 256 threads ────────────────────
     // Uses encoded (pre-habituation) state for memory similarity.
     // All 256 threads compute partial dot products: pattern = tid % MEMORY_CAP,
     // lane = tid / MEMORY_CAP (0 or 1). Each lane reduces over its stride-2 half

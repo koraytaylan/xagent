@@ -1,10 +1,10 @@
-// Plan 0006 — ParallelTiled brain tail.
+// ParallelTiled brain tail: remaining brain passes after tiled feature extract.
 //
 // One workgroup per agent (workgroup_size 256). feature_extract (pass 0) and
 // encode (pass 1) have already run as separate dispatches writing SCRATCH_*; this
 // tail loads SCRATCH_ENCODED into the workgroup s_encoded array and then runs the
-// remaining cooperative passes 2..6 exactly as kernel_tick.wgsl::brain_tick_inner
-// does — habituate_homeo, recall_score, recall_topk, predict_and_act, and
+// remaining cooperative passes 2..6 exactly as the fused brain_tick does —
+// habituate_homeo, recall_score, recall_topk, predict_and_act, and
 // learn_and_store — but with encoder-credit (7b) SKIPPED, because the tiled
 // encoder-credit phase performs it. None of these passes read s_features, so only
 // s_encoded must be reloaded. Concatenated with common.wgsl + brain_passes.wgsl.

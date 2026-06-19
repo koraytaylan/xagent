@@ -259,7 +259,7 @@ pub fn run_agent_sweep(
 
 /// A/B the visual-cortex pass cost: full-pipeline tps with
 /// `visual_cortex_enabled` OFF vs. ON, at a fixed retina resolution and the
-/// given population (plan 0008 `visual-cortex-throughput-baseline`).
+/// given population, measuring the throughput overhead of the visual-cortex pass.
 ///
 /// Both arms run the same `total_ticks` on a fresh kernel and time wall-clock
 /// from the first dispatch to the GPU completing the last tick (a `Maintain::Wait`
@@ -267,8 +267,8 @@ pub fn run_agent_sweep(
 /// `coop_visual_cortex` pass when the flag is on — not just submit-return. The
 /// flag and the retina dimensions are compile-time WGSL overrides baked at
 /// `GpuKernel::new`, so toggling them on the `BrainConfig` per arm rebuilds the
-/// pipeline correctly. The OFF arm is byte-identical to the pre-plan build, so
-/// its tps is the 0006-fused baseline this regression is measured against.
+/// pipeline correctly. The OFF arm is byte-identical to the initial fused-kernel build, so
+/// its tps is the fused-kernel baseline this regression is measured against.
 ///
 /// The dispatch is chunked into bounded windows drained with a `Maintain::Wait`
 /// between chunks. The cortex-ON arm is ~100× slower; submitting all
@@ -352,8 +352,8 @@ pub fn run_visual_cortex_ab(
 
     println!(
         "[visual-cortex-ab] read: 'cortex ON' adds the DoG -> Gabor -> complex pass per agent; \
-         the % kept is the fraction of the OFF (0006-fused) tps retained. The default-flip \
-         budget lives in 0008-VISUAL-CORTEX-BASELINE.md."
+         the % kept is the fraction of the OFF (fused-kernel) tps retained. The default-flip \
+         budget lives in the visual-encoder throughput documentation."
     );
 }
 

@@ -1181,20 +1181,25 @@ It records the baseline for future speed-decoupling A/B tests.\n",
             "GATE FAILED — Some criteria not met; review metrics above before flipping defaults."
         },
         decision = if !baseline_corr_exploitable {
-            "The baseline correlation is not strongly-positive (below |{baseline_min:.2}| threshold). \
+            format!(
+                "The baseline correlation is not strongly-positive (below |{:.2}| threshold). \
 The gate cannot assess decoupling improvement without a clear baseline exploit. \
-Baseline variants may need tuning or the validation may need retrying with different configurations."
+Baseline variants may need tuning or the validation may need retrying with different configurations.",
+                BASELINE_CORR_MIN
+            )
         } else if gate_passed {
             "The validation passed. The four mechanisms (super-linear drag at k=2.0, \
 path-length hazard, effort-rebased fitness, and the danger percept) \
 successfully decouple movement speed from composite fitness. \
 The population remained viable and danger-decision data is retained. \
 The defaults are candidates for flipping now that this gate has passed."
+                .to_string()
         } else {
             "The validation did not meet all gate criteria. Review the measured metrics and \
 consider tuning the drag exponent (speed_cost_exponent), the fitness calibration constants \
-(FORAGING_ENERGY_TARGET / EXPLORATION_DISTANCE_BUDGET), or the danger sense radius before \
+(FORAGING_ENERGY_TARGET / EXPLORATION_RATE_TARGET), or the danger sense radius before \
 attempting another run. Do not flip the defaults until the gate passes."
+                .to_string()
         },
     )
 }

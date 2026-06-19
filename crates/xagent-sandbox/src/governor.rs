@@ -4913,7 +4913,8 @@ mod tests {
     /// A production-magnitude telemetry profile (energy ~1.5e4, distance ~6e5,
     /// food/cells from the recorded competent forager) must yield foraging ≥ 0.95
     /// and exploration not pinned to ~0 under the re-derived Variant B calibration.
-    /// Fails under the old constants (axis ~= 0.02), passes after recalibration.
+    /// Fails under the old constants (foraging ≈ 0.56 < 0.95 from `(4200/15000)/0.5`,
+    /// exploration ≈ 0.008 ≈ 0), passes after recalibration.
     ///
     /// This test verifies that the scale-invariant effort-rebased fitness axes
     /// reach saturation on real production-scale telemetry (1M-tick budget). The

@@ -69,15 +69,19 @@ gate math has GPU-free unit tests, and the avoidance-intent metric now measures
 genuine turn-aways (sign inversion fixed). No 0009 default is flipped by this plan;
 running the gate to a flip decision is the follow-on `0009 default-flip-gate` task.
 
-## Follow-up nits (non-blocking, surfaced by reviewers — not yet addressed)
+## Follow-up nits (surfaced by reviewers — resolved)
 
-- `governor.rs` ~L2937: stale doc-comment still names `EXPLORATION_DISTANCE_BUDGET`
-  (renamed to `EXPLORATION_RATE_TARGET`).
-- `governor.rs` ~L4880/L4884: a diagnostic comment cites an inaccurate old-constant
-  number for the competent-forager profile.
-- `headless.rs` ~L1170: the `INCONCLUSIVE` decision branch renders the literal
-  `{baseline_min:.2}` instead of the value (cosmetic; offline-tool prose only).
-- `docs/plans/0009-Intent-Aware-Fitness/0009-FITNESS-CALIBRATION.md`: now stale after
-  the recalibration (shows pre-Variant-B numbers + `…/1000` grid; should be `…/1024`).
-- Pre-existing planning-reference comments touched in `kernel_tick.wgsl` /
-  `phase_physics.wgsl` were not stripped on-touch — covered by Plan 0011.
+- ✅ `governor.rs` `fitness_calibration_replay_profiles` doc-comment already named
+  `EXPLORATION_RATE_TARGET` on the final tip (fixed during the serial run).
+- ✅ `governor.rs` `competent_forager_saturates_foraging_on_real_scale` doc-comment:
+  the inaccurate "axis ≈ 0.02" corrected to foraging ≈ 0.56 (`(4200/15000)/0.5`),
+  exploration ≈ 0.008.
+- ✅ `headless.rs`: the `INCONCLUSIVE` decision branch now interpolates the threshold
+  via `format!` (was the literal `{baseline_min:.2}`); the stale
+  `EXPLORATION_DISTANCE_BUDGET` name in the failed-decision prose updated to
+  `EXPLORATION_RATE_TARGET`.
+- ✅ `docs/plans/0009-Intent-Aware-Fitness/0009-FITNESS-CALIBRATION.md`: a
+  "superseded by Plan 0010" banner added; the historical synthetic-profile tables
+  are retained but flagged as no longer matching the current test.
+- ⏭️ Pre-existing planning-reference comments in `kernel_tick.wgsl` /
+  `phase_physics.wgsl` are owned by Plan 0011 (Source Planning-Reference Scrub).

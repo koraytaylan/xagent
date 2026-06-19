@@ -1,8 +1,21 @@
 # Decision: Fitness Calibration (Plan 0009 — Layer C, Task `fitness-calibration-replay`)
 
 **Date:** 2026-06-18
-**Status:** CALIBRATED
+**Status:** 🗄️ SUPERSEDED by Plan 0010 (see banner below)
 **Task:** `fitness-calibration-replay` (Layer C — effort-rebased fitness)
+
+> **⚠️ Superseded by Plan 0010 (2026-06-19).** This record documents the *original*
+> Plan 0009 calibration, chosen from **synthetic per-life profiles**. Plan 0010's
+> `effort-axes-recalibration` re-derived the constants from **real recorded-generation
+> telemetry** after finding these synthetic profiles under-scale versus production's
+> cumulative-per-generation accumulators (100–1000× larger). It **renamed**
+> `EXPLORATION_DISTANCE_BUDGET` → `EXPLORATION_RATE_TARGET` and changed both values and
+> formulas to scale-invariant per-tick rates (`FORAGING_ENERGY_TARGET = 250_000.0`,
+> `EXPLORATION_RATE_TARGET = 440.0`, grid denominator `1024`). **The constants, axis
+> tables, and `fitness_calibration_replay_profiles` output below reflect the 0009
+> calibration and no longer match the current test** — they are retained as the
+> historical decision record. For the live calibration see
+> [`../0010-Intent-Aware-Fitness-Hardening/0010-FITNESS-RECALIBRATION-DECISION.md`](../0010-Intent-Aware-Fitness-Hardening/0010-FITNESS-RECALIBRATION-DECISION.md).
 
 ## Purpose
 

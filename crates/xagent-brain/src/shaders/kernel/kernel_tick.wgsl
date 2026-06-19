@@ -172,14 +172,14 @@ fn agent_physics(agent_id: u32, tick: u32) {
     //   k=1.0:                  drag = speed_ratio          (exact old expression, always)
     //   k>1.0, speed_ratio < 1: drag = speed_ratio          (unchanged from k=1.0)
     //   k>1.0, speed_ratio >= 1: drag = pow(speed_ratio, k) (super-linear above baseline)
-    let speed_ratio = move_speed / 20.0;
+    let speed_ratio = move_speed / DEFAULT_MOVE_SPEED;
     let speed_cost_exponent = wc_f32(WC_SPEED_COST_EXPONENT);
     let above_baseline = speed_ratio >= 1.0;
     // For k>1.0: apply pow only above baseline; below baseline keep speed_ratio.
     let super_linear_drag = select(speed_ratio, pow(speed_ratio, speed_cost_exponent), above_baseline);
     // For k=1.0: use speed_ratio exactly (bit-identical to pre-task expression).
     let drag = select(super_linear_drag, speed_ratio, speed_cost_exponent == 1.0);
-    let movement_mag = min(abs(motor_forward) + abs(motor_strafe), 1.414) * drag;
+    let movement_mag = min(abs(motor_forward) + abs(motor_strafe), SQRT_2) * drag;
     var energy = physics_state[b + P_ENERGY];
     let depletion_drain = wc_f32(WC_ENERGY_DEPLETION) * metabolic_rate;
     let movement_drain = movement_mag * wc_f32(WC_MOVEMENT_COST) * metabolic_rate;
@@ -200,12 +200,12 @@ fn agent_physics(agent_id: u32, tick: u32) {
         // Path-length hazard dose (plan 0009, Layer B): integrity loss is proportional
         // to the distance traveled through danger this tick, not to the number of ticks
         // spent in it. reference_step is a default-speed agent's per-tick displacement
-        // (default_speed * dt = 20.0 * WC_DT), so a default-speed agent (step_len ≈
+        // (default_speed * dt = DEFAULT_MOVE_SPEED * WC_DT), so a default-speed agent (step_len ≈
         // reference_step) takes byte-identical per-tick damage to the old per-tick model,
         // a 2× agent pays 2× per tick over half the ticks (the same dose per crossing),
         // and a stationary agent (step_len = 0) takes zero dose. NO floor on step_len:
         // dose is strictly proportional to path length.
-        let reference_step = 20.0 * wc_f32(WC_DT);
+        let reference_step = DEFAULT_MOVE_SPEED * wc_f32(WC_DT);
         physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY]
             - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale * (step_len / max(reference_step, EPSILON));
         physics_state[b + P_IN_DANGER_BIOME] = 1.0;
@@ -225,7 +225,12 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // Metabolic brain drain
     let mem_cap = physics_state[b + P_MEMORY_CAP];
     let proc_slots = physics_state[b + P_PROCESSING_SLOTS];
-    energy -= (METABOLIC_BASE_COST + mem_cap * METABOLIC_MEMORY_COST + proc_slots * METABOLIC_PROCESSING_COST) * metabolic_rate;
+    // Per-tick energy burned == per-tick energy delta. The brain metabolic drain is
+    // part of the cost an effort-denominated foraging score must see; omitting it
+    // makes the score scale with brain size instead of skill.
+    let brain_drain = (METABOLIC_BASE_COST + mem_cap * METABOLIC_MEMORY_COST + proc_slots * METABOLIC_PROCESSING_COST) * metabolic_rate;
+    energy -= brain_drain;
+    physics_state[b + P_ENERGY_SPENT] += brain_drain;
 
     // Clamp and death check
     energy = max(energy, 0.0);
@@ -243,28 +248,30 @@ fn agent_physics(agent_id: u32, tick: u32) {
         physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;
     }
 
-    // Avoidance intent: accumulate fraction of ticks where danger was in sense range
-    // and motor turn opposed the danger bearing (deliberate turn-away).
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Danger detection: nearest danger cell via biome grid scan
+// ══════════════════════════════════════════════════════════════════════════
+
+fn agent_avoidance_accumulate(agent_id: u32, motor_turn: f32) {
+    let b = agent_id * PHYS_STRIDE;
     let danger_distance = physics_state[b + P_NEAREST_DANGER_DISTANCE];
     let danger_bearing = physics_state[b + P_NEAREST_DANGER_BEARING];
     if danger_distance < DANGER_SENSE_RADIUS {
         // Danger is in sense range; count this tick
         physics_state[b + P_AVOIDANCE_SENSE_RANGE_TICKS] += 1.0;
 
-        // Check if motor turn opposes the danger bearing (turn away = negative product)
-        // motor_turn is in [-1, 1], positive = turn right, negative = turn left
-        // danger_bearing is signed: positive = danger to the right, negative = danger to the left
-        // Turn-away means motor_turn and danger_bearing have opposite signs
-        let turn_opposes_bearing = (motor_turn * danger_bearing) < 0.0;
-        if turn_opposes_bearing {
+        // danger_bearing is the signed facing-relative angle to the nearest danger:
+        // NEGATIVE = danger to the right (positive motor_turn turns right), POSITIVE =
+        // danger to the left. A genuine turn-AWAY rotates against the bearing, so the
+        // product (motor_turn * danger_bearing) is POSITIVE for an avoidance turn.
+        let turn_away = (motor_turn * danger_bearing) > 0.0;
+        if turn_away {
             physics_state[b + P_AVOIDANCE_TURNS_OPPOSING] += 1.0;
         }
     }
 }
-
-// ══════════════════════════════════════════════════════════════════════════
-// Danger detection: nearest danger cell via biome grid scan
-// ══════════════════════════════════════════════════════════════════════════
 
 fn agent_danger_detect(agent_id: u32) {
     let b = agent_id * PHYS_STRIDE;
@@ -298,8 +305,8 @@ fn agent_danger_detect(agent_id: u32) {
 
     for (var dr = -i32(max_cell_delta); dr <= i32(max_cell_delta); dr++) {
         for (var dc = -i32(max_cell_delta); dc <= i32(max_cell_delta); dc++) {
-            let row = u32(clamp(agent_row_i + dr, 0, 255));
-            let col = u32(clamp(agent_col_i + dc, 0, 255));
+            let row = u32(clamp(agent_row_i + dr, 0, i32(BIOME_GRID_MAX_INDEX)));
+            let col = u32(clamp(agent_col_i + dc, 0, i32(BIOME_GRID_MAX_INDEX)));
 
             if (sample_biome(f32(col) / biome_inv - biome_half + 0.5 / biome_inv,
                              f32(row) / biome_inv - biome_half + 0.5 / biome_inv) == BIOME_DANGER) {
@@ -309,7 +316,7 @@ fn agent_danger_detect(agent_id: u32) {
                 let to_danger = vec3f(cell_x - agent_pos.x, 0.0, cell_z - agent_pos.z);
                 let dist = length(to_danger);
 
-                if (dist < best_distance && dist < sense_radius) {
+                if (dist < best_distance && dist < sense_radius && dist > EPSILON) {
                     best_distance = dist;
                     found_danger = true;
 
@@ -800,8 +807,18 @@ fn kernel_tick(
         workgroupBarrier();
 
         // Danger detection: thread 0 scans biome grid for nearest danger
-        if (tid == 0u) {
+        if (tid == 0u && wc_u32(WC_DANGER_PERCEPT_ENABLED) != 0u) {
             agent_danger_detect(agent_id);
+        }
+        workgroupBarrier();
+
+        // Avoidance accumulation: thread 0 increments the counter based on motor turn
+        // and the danger bearing just computed. This runs after danger_detect so the
+        // counter reads same-cycle danger values (unlike agent_physics, which ran before).
+        if (tid == 0u) {
+            let decision_base = agent_id * DECISION_STRIDE;
+            let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
+            agent_avoidance_accumulate(agent_id, motor_turn);
         }
         workgroupBarrier();
 

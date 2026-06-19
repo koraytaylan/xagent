@@ -75,7 +75,7 @@ const PLANNING_REFERENCE_BASELINE: &[(&str, usize)] = &[
     ("crates/xagent-sandbox/src/main.rs", 2),
     ("crates/xagent-sandbox/src/sim_runtime.rs", 1),
     ("crates/xagent-sandbox/src/ui.rs", 3),
-    ("crates/xagent-sandbox/tests/integration.rs", 21),
+    ("crates/xagent-sandbox/tests/integration.rs", 20),
     ("crates/xagent-shared/src/config.rs", 17),
 ];
 

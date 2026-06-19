@@ -16,8 +16,12 @@ use xagent_brain::buffers::{
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
-use crate::agent::{mutate_brain_state, mutate_config, Agent};
-use crate::governor::{AdvanceResult, Governor};
+use crate::agent::{
+    mutate_brain_state, mutate_brain_state_seeded, mutate_config, mutate_config_seeded, Agent,
+};
+use crate::governor::{
+    compute_avoidance_intent_fraction, compute_danger_dwell_fraction, AdvanceResult, Governor,
+};
 use crate::world::WorldState;
 
 /// Chunk size for dispatch_batch calls. Between chunks we can read back
@@ -433,7 +437,13 @@ pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
 
     print_validation_metrics(&baseline_stats, &on_stats);
 
-    let markdown = format_validation_markdown(&baseline_stats, &on_stats);
+    let markdown = format_validation_markdown(
+        num_generations,
+        config.world.seed,
+        config.governor.population_size,
+        &baseline_stats,
+        &on_stats,
+    );
 
     // Save the report in the process working directory.
     let report_path = "speed-decoupling-validation.md";
@@ -449,6 +459,10 @@ struct ValidationStats {
     mean_fitness: f32,
     mean_movement_speed: f32,
     mean_ticks_alive: u64,
+    /// Mean deaths per agent across all agents and all generations in this run.
+    /// Uncapped: unlike `mean_ticks_alive`, this is never pinned to `tick_budget`.
+    /// A value of 0.0 means no agent ever died — a population-viability red flag.
+    mean_death_count: f32,
     speed_fitness_correlation: f32,
     death_speed_regression: f32,
     food_per_energy_vs_speed_slope: f32,
@@ -465,6 +479,25 @@ struct ValidationStats {
 /// disproportionately more. k=1.0 in the baseline run is a bit-exact no-op per
 /// the WGSL guard.
 const ON_SPEED_COST_EXPONENT: f32 = 2.0;
+
+/// Gate: baseline must have an exploitable speed-fitness correlation.
+/// The gate only certifies decoupling when the baseline actually had a speed
+/// exploit to remove (strongly-positive correlation). A baseline already below
+/// threshold is reported "inconclusive", never PASS.
+const BASELINE_CORR_MIN: f32 = 0.3;
+
+/// Gate: ON arm's speed-fitness correlation must fall below this threshold.
+const DECOUPLE_CORR_MAX: f32 = 0.3;
+
+/// Gate: ON arm must strictly improve below baseline by this margin.
+/// Prevents claiming success when ON is only marginally better.
+const DECOUPLE_MARGIN: f32 = 0.02;
+
+/// Gate: minimum mean avoidance intent fraction (turns opposing danger bearing
+/// per sense-range tick). Below this, the population is not engaging with danger
+/// decisions meaningfully. Tuned at 0.05 to require some non-zero avoidance
+/// measurement while tolerating natural variance.
+const AVOIDANCE_FLOOR: f32 = 0.05;
 
 /// Run headless evolution and collect statistics with specified flags.
 ///
@@ -508,12 +541,17 @@ fn run_headless_with_flags(
         .expect("Failed to initialize validation governor");
 
     let seed_config = config.brain.clone();
+    // Derive a stable seed for population initialization from the world seed, ensuring both arms
+    // (baseline and ON) get identical initial genomes when run with the same world seed.
+    let pop_init_seed = config.world.seed;
     let mut current_configs: Vec<BrainConfig> = {
         let repeats = governor.config.eval_repeats.max(1);
         let unique_count = (governor.config.population_size / repeats).max(1);
         let mut unique_configs = vec![seed_config.clone()];
-        for _ in 1..unique_count {
-            unique_configs.push(mutate_config(&seed_config));
+        for i in 1..unique_count {
+            // Each mutation gets a deterministic seed derived from the world seed and the index.
+            let mutation_seed = pop_init_seed.wrapping_add(i as u64);
+            unique_configs.push(mutate_config_seeded(&seed_config, mutation_seed));
         }
         let mut configs = Vec::with_capacity(governor.config.population_size);
         for uc in &unique_configs {
@@ -584,14 +622,21 @@ fn run_headless_with_flags(
             })
             .collect();
         kernel.upload_agents(&agent_data);
-        kernel.reset_agents(&current_configs[0]);
+        kernel.reset_agents_seeded(&current_configs[0], config.world.seed);
 
         if let Some(ref state) = inherited_state {
             for (i, agent) in agents.iter().enumerate() {
                 if i < repeats {
                     kernel.write_agent_state(agent.brain_idx, state);
                 } else {
-                    let mutated = mutate_brain_state(state, inherited_mutation_strength);
+                    // Derive a seeded mutation for this agent: world seed wrapping_add the agent index.
+                    // This ensures both baseline and ON arms draw identical brain-state mutations.
+                    let mutation_seed = config.world.seed.wrapping_add(i as u64);
+                    let mutated = mutate_brain_state_seeded(
+                        state,
+                        inherited_mutation_strength,
+                        mutation_seed,
+                    );
                     kernel.write_agent_state(agent.brain_idx, &mutated);
                 }
             }
@@ -743,6 +788,13 @@ fn run_headless_with_flags(
         .iter()
         .map(|f| f.death_count as f32)
         .collect();
+    // Mean deaths per agent: uncapped metric not pinned to tick_budget.
+    // If agents never die, this is 0.0 — a population-viability red flag.
+    let mean_death_count = if death_counts.is_empty() {
+        0.0
+    } else {
+        death_counts.iter().sum::<f32>() / death_counts.len() as f32
+    };
     let food_per_energy: Vec<f32> = all_agents_fitness
         .iter()
         .map(|f| {
@@ -758,47 +810,30 @@ fn run_headless_with_flags(
     let death_speed_regression = compute_regression(&speeds, &death_counts);
     let food_per_energy_vs_speed_slope = compute_regression(&speeds, &food_per_energy);
 
-    // danger_dwell_fraction: fraction of the agent's path spent in danger biome.
+    // danger_dwell_fraction and avoidance_intent_fraction: population-aggregate
+    // statistics computed through the shared reducer, identical to production.
     let mean_danger_dwell_fraction = if all_agents_fitness.is_empty() {
         0.0
     } else {
-        all_agents_fitness
-            .iter()
-            .map(|f| {
-                if f.distance_traveled > 0.001 {
-                    (f.danger_path_length / f.distance_traveled).min(1.0)
-                } else {
-                    0.0
-                }
-            })
-            .sum::<f32>()
-            / all_agents_fitness.len() as f32
+        compute_danger_dwell_fraction(&all_agents_fitness)
     };
 
-    // avoidance_intent_fraction: fraction of in-sense-range ticks where the agent
-    // turned away from the nearest danger cell.  Computed from AgentFitness fields
-    // populated by the kernel (avoidance_turns_opposing / avoidance_sense_range_ticks),
-    // mirroring governor.rs:843-844.
     let mean_avoidance_intent_fraction = if all_agents_fitness.is_empty() {
         0.0
     } else {
-        all_agents_fitness
-            .iter()
-            .map(|f| {
-                let sense_ticks = f.avoidance_sense_range_ticks.max(1.0);
-                (f.avoidance_turns_opposing / sense_ticks).min(1.0)
-            })
-            .sum::<f32>()
-            / all_agents_fitness.len() as f32
+        compute_avoidance_intent_fraction(&all_agents_fitness)
     };
 
-    // Clean up temp database
+    // Clean up temp database and its sidecars
     let _ = std::fs::remove_file(&temp_db);
+    let _ = std::fs::remove_file(format!("{}-wal", &temp_db));
+    let _ = std::fs::remove_file(format!("{}-shm", &temp_db));
 
     ValidationStats {
         mean_fitness,
         mean_movement_speed,
         mean_ticks_alive,
+        mean_death_count,
         speed_fitness_correlation,
         death_speed_regression,
         food_per_energy_vs_speed_slope,
@@ -943,12 +978,29 @@ fn print_validation_metrics(baseline: &ValidationStats, on_stats: &ValidationSta
 }
 
 /// Format validation results as markdown.
-fn format_validation_markdown(baseline: &ValidationStats, on_stats: &ValidationStats) -> String {
-    let speed_decoupled = on_stats.speed_fitness_correlation.abs() < 0.3;
-    let ticks_alive_ok = on_stats.mean_ticks_alive > baseline.mean_ticks_alive * 80 / 100;
+fn format_validation_markdown(
+    num_generations: u64,
+    world_seed: u64,
+    population_size: usize,
+    baseline: &ValidationStats,
+    on_stats: &ValidationStats,
+) -> String {
+    // Gate logic: require strongly-positive baseline AND strict improvement AND uncapped viability.
+    let baseline_corr_exploitable = baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+    let on_decoupled = on_stats.speed_fitness_correlation.abs() < DECOUPLE_CORR_MAX;
+    let strict_improvement = on_stats.speed_fitness_correlation.abs()
+        <= baseline.speed_fitness_correlation.abs() - DECOUPLE_MARGIN;
+    let speed_decoupled = baseline_corr_exploitable && on_decoupled && strict_improvement;
+
+    // Viability: uncapped metric — mean death-count per agent.
+    // Unlike mean_ticks_alive, this cannot be pinned to tick_budget:
+    // a value of 0.0 means no agent ever died, indicating the population is not
+    // actually cycling through life/death/respawn as expected.
+    let viability_ok = on_stats.mean_death_count > 0.0;
+
     let danger_retained = on_stats.mean_danger_dwell_fraction > 0.01;
-    let avoidance_retained = on_stats.mean_avoidance_intent_fraction >= 0.0; // non-negative by construction
-    let gate_passed = speed_decoupled && ticks_alive_ok && danger_retained;
+    let avoidance_above_chance = on_stats.mean_avoidance_intent_fraction >= AVOIDANCE_FLOOR;
+    let gate_passed = speed_decoupled && viability_ok && danger_retained && avoidance_above_chance;
 
     let baseline_traj = baseline
         .speed_trajectory_per_gen
@@ -979,6 +1031,9 @@ fn format_validation_markdown(baseline: &ValidationStats, on_stats: &ValidationS
 \n\
 **Date:** 2026-06-18\n\
 **Status:** MEASURED\n\
+**Generations:** {num_gens}\n\
+**World Seed:** {seed}\n\
+**Population Size:** {pop_size}\n\
 \n\
 ## Configuration\n\
 \n\
@@ -1046,13 +1101,14 @@ Mean ticks alive — Baseline: {baseline_ticks} | On: {on_ticks}.\n\
 ## Gate Status\n\
 \n\
 **Criteria:**\n\
-1. Speed-fitness correlation falls from strongly-positive to approx 0 (`|r| < 0.3`): {gate1}\n\
-2. Mean ticks_alive does not collapse vs baseline (>= 80% retained): {gate2}\n\
-3. Danger metrics stay non-zero (danger_dwell_fraction > 0.01): {gate3}\n\
+1. Baseline correlation is strongly-positive (|r| >= {baseline_min:.2}): {gate_baseline}\n\
+2. Speed-fitness correlation {corr_direction} from strongly-positive to below threshold (|r| < {decouple_max:.2}): {gate_decoupling}\n\
+3. ON strictly improves below baseline by margin (>= {margin:.3}): {gate_margin}\n\
+4. Population viability maintained (mean death-count > 0): {gate_viability}\n\
+5. Danger metrics stay non-zero (danger_dwell_fraction > 0.01): {gate_danger}\n\
+6. Avoidance intent above floor (>= {avoidance_floor:.3}): {gate_avoidance}\n\
 \n\
-**Avoidance intent non-negative:** {avoidance_note}\n\
-\n\
-**Result:** {gate_result}\n\
+**Overall Result:** {gate_overall}\n\
 \n\
 ## Decision\n\
 \n\
@@ -1063,6 +1119,9 @@ Mean ticks alive — Baseline: {baseline_ticks} | On: {on_ticks}.\n\
 This document was generated by the speed-decoupling validation harness \
 (`cargo run --release -- --validate-speed-decoupling`). \
 It records the baseline for future speed-decoupling A/B tests.\n",
+        num_gens = num_generations,
+        seed = world_seed,
+        pop_size = population_size,
         exp = ON_SPEED_COST_EXPONENT,
         baseline_corr = baseline.speed_fitness_correlation,
         on_corr = on_stats.speed_fitness_correlation,
@@ -1098,26 +1157,34 @@ It records the baseline for future speed-decoupling A/B tests.\n",
             "Speed still correlates with fitness above the |0.3| threshold. \
              Consider tuning k (speed_cost_exponent) or the fitness calibration constants."
         },
-        ticks_summary = if ticks_alive_ok {
-            "Population viability is preserved: ON ticks_alive >= 80% of baseline."
+        ticks_summary = if viability_ok {
+            "Population viability is maintained: mean death-count per generation > 0."
         } else {
-            "Population viability concern: ON ticks_alive dropped below 80% of baseline. \
+            "Population viability concern: no deaths per generation recorded. \
              Consider reducing the drag exponent or reviewing energy constants."
         },
-        gate1 = if speed_decoupled { "PASS" } else { "FAIL" },
-        gate2 = if ticks_alive_ok { "PASS" } else { "FAIL" },
-        gate3 = if danger_retained { "PASS" } else { "FAIL" },
-        avoidance_note = if avoidance_retained {
-            "PASS (non-negative avoidance_intent_fraction computed from kernel telemetry)"
-        } else {
-            "N/A"
-        },
-        gate_result = if gate_passed {
+        baseline_min = BASELINE_CORR_MIN,
+        decouple_max = DECOUPLE_CORR_MAX,
+        margin = DECOUPLE_MARGIN,
+        avoidance_floor = AVOIDANCE_FLOOR,
+        gate_baseline = if baseline_corr_exploitable { "PASS" } else { "FAIL" },
+        gate_decoupling = if on_decoupled { "PASS" } else { "FAIL" },
+        gate_margin = if strict_improvement { "PASS" } else { "FAIL" },
+        gate_viability = if viability_ok { "PASS" } else { "FAIL" },
+        gate_danger = if danger_retained { "PASS" } else { "FAIL" },
+        gate_avoidance = if avoidance_above_chance { "PASS" } else { "FAIL" },
+        gate_overall = if !baseline_corr_exploitable {
+            "INCONCLUSIVE — Baseline correlation not strongly-positive; cannot assess improvement."
+        } else if gate_passed {
             "GATE PASSED — All criteria met; speed is successfully decoupled from fitness."
         } else {
-            "GATE NOT MET — Some criteria not met; review metrics above before flipping defaults."
+            "GATE FAILED — Some criteria not met; review metrics above before flipping defaults."
         },
-        decision = if gate_passed {
+        decision = if !baseline_corr_exploitable {
+            "The baseline correlation is not strongly-positive (below |{baseline_min:.2}| threshold). \
+The gate cannot assess decoupling improvement without a clear baseline exploit. \
+Baseline variants may need tuning or the validation may need retrying with different configurations."
+        } else if gate_passed {
             "The validation passed. The four mechanisms (super-linear drag at k=2.0, \
 path-length hazard, effort-rebased fitness, and the danger percept) \
 successfully decouple movement speed from composite fitness. \
@@ -1130,4 +1197,339 @@ consider tuning the drag exponent (speed_cost_exponent), the fitness calibration
 attempting another run. Do not flip the defaults until the gate passes."
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_correlation_extremes() {
+        // Perfect positive correlation: x = y
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let corr = compute_correlation(&x, &y);
+        assert!(
+            (corr - 1.0).abs() < 1e-6,
+            "perfect correlation should be ~1.0"
+        );
+
+        // Perfect negative correlation: x = -y
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![-1.0, -2.0, -3.0, -4.0, -5.0];
+        let corr = compute_correlation(&x, &y);
+        assert!(
+            (corr - (-1.0)).abs() < 1e-6,
+            "perfect negative correlation should be ~-1.0"
+        );
+
+        // Zero correlation: constant x
+        let x = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let y = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let corr = compute_correlation(&x, &y);
+        assert!(
+            corr.abs() < 1e-6,
+            "constant x should give ~0 correlation (not NaN)"
+        );
+
+        // Insufficient data
+        let x = vec![1.0];
+        let y = vec![1.0];
+        let corr = compute_correlation(&x, &y);
+        assert!(corr == 0.0, "insufficient data should return 0.0");
+    }
+
+    #[test]
+    fn compute_regression_slope() {
+        // Known slope: y = 2*x
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![2.0, 4.0, 6.0, 8.0, 10.0];
+        let slope = compute_regression(&x, &y);
+        assert!((slope - 2.0).abs() < 1e-6, "slope of y=2x should be 2.0");
+
+        // Known slope: y = -0.5*x
+        let x = vec![2.0, 4.0, 6.0, 8.0, 10.0];
+        let y = vec![-1.0, -2.0, -3.0, -4.0, -5.0];
+        let slope = compute_regression(&x, &y);
+        assert!(
+            (slope - (-0.5)).abs() < 1e-6,
+            "slope of y=-0.5x should be -0.5"
+        );
+
+        // Insufficient data
+        let x = vec![1.0];
+        let y = vec![1.0];
+        let slope = compute_regression(&x, &y);
+        assert!(slope == 0.0, "insufficient data should return 0.0");
+    }
+
+    #[test]
+    fn gate_rejects_rising_correlation() {
+        // The original real-world failure: baseline corr = 0.31 (exploitable, >=0.3)
+        // and ON corr = 0.295 (below DECOUPLE_CORR_MAX so on_decoupled is true), but
+        // the drop of 0.015 is less than DECOUPLE_MARGIN = 0.02, so strict_improvement
+        // is false. This mirrors the 0.2238 → 0.2569 bug where the gate printed PASS
+        // despite a rising correlation. The baseline_corr_exploitable conjunct is true
+        // here so this test independently falsifies strict_improvement.
+        let baseline = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 50.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.31,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![50.0],
+        };
+        let on = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 45.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.295, // dropped only 0.015, below DECOUPLE_MARGIN=0.02
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![45.0],
+        };
+
+        let baseline_corr_exploitable =
+            baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+        let on_decoupled = on.speed_fitness_correlation.abs() < DECOUPLE_CORR_MAX;
+        let strict_improvement = on.speed_fitness_correlation.abs()
+            <= baseline.speed_fitness_correlation.abs() - DECOUPLE_MARGIN;
+        let speed_decoupled = baseline_corr_exploitable && on_decoupled && strict_improvement;
+
+        assert!(
+            baseline_corr_exploitable,
+            "baseline must be exploitable so this test isolates strict_improvement"
+        );
+        assert!(
+            on_decoupled,
+            "on_decoupled must be true so this test isolates strict_improvement"
+        );
+        assert!(
+            !strict_improvement,
+            "strict_improvement must be false: ON dropped less than DECOUPLE_MARGIN"
+        );
+        assert!(
+            !speed_decoupled,
+            "gate should reject when ON fails strict improvement margin"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_weak_baseline() {
+        // Baseline corr = 0.25 (below BASELINE_CORR_MIN = 0.3)
+        let baseline = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 50.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.25,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![50.0],
+        };
+
+        let baseline_corr_exploitable =
+            baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+        assert!(
+            !baseline_corr_exploitable,
+            "gate should reject weak baseline"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_tick_collapse() {
+        // Baseline has good corr, ON reduces it strictly enough, but the ON arm
+        // shows zero deaths (mean_death_count = 0.0): viability failure.
+        // An ON population that never dies is budget-saturating — not genuinely
+        // cycling through respawn — so the gate must reject it.
+        let baseline = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 50.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.5,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![50.0],
+        };
+        let on = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 45.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 0.0, // Zero deaths: viability collapse
+            speed_fitness_correlation: 0.15,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![45.0],
+        };
+
+        let baseline_corr_exploitable =
+            baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+        let on_decoupled = on.speed_fitness_correlation.abs() < DECOUPLE_CORR_MAX;
+        let strict_improvement = on.speed_fitness_correlation.abs()
+            <= baseline.speed_fitness_correlation.abs() - DECOUPLE_MARGIN;
+        let speed_decoupled = baseline_corr_exploitable && on_decoupled && strict_improvement;
+
+        // Viability check: zero deaths must cause the gate to fail.
+        let viability_ok = on.mean_death_count > 0.0;
+        let danger_retained = on.mean_danger_dwell_fraction > 0.01;
+        let avoidance_above_chance = on.mean_avoidance_intent_fraction >= AVOIDANCE_FLOOR;
+        let gate_passed =
+            speed_decoupled && viability_ok && danger_retained && avoidance_above_chance;
+
+        assert!(
+            !gate_passed,
+            "gate should fail when mean_death_count is zero (viability collapse)"
+        );
+        assert!(
+            !viability_ok,
+            "viability_ok must be false when mean_death_count is 0.0"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_danger_zero() {
+        // ON has low danger_dwell_fraction
+        let on = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 45.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.15,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.005, // Below 0.01 threshold
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![45.0],
+        };
+
+        let danger_retained = on.mean_danger_dwell_fraction > 0.01;
+        assert!(
+            !danger_retained,
+            "gate should reject when danger_dwell_fraction drops below 0.01"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_avoidance_below_floor() {
+        // All other conjuncts pass, but ON avoidance is below AVOIDANCE_FLOOR.
+        // This independently falsifies the avoidance_above_chance conjunct: removing
+        // it from gate_passed would flip the result to true, proving the conjunct
+        // is load-bearing and not redundant with another check.
+        let baseline = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 50.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.5, // exploitable baseline
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.1,
+            speed_trajectory_per_gen: vec![50.0],
+        };
+        let on = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 45.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 3.0, // deaths > 0 so viability_ok is true
+            speed_fitness_correlation: 0.15, // < DECOUPLE_CORR_MAX and 0.5-0.15=0.35 >= DECOUPLE_MARGIN
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05, // > 0.01 so danger_retained is true
+            mean_avoidance_intent_fraction: 0.02, // below AVOIDANCE_FLOOR = 0.05
+            speed_trajectory_per_gen: vec![45.0],
+        };
+
+        let baseline_corr_exploitable =
+            baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+        let on_decoupled = on.speed_fitness_correlation.abs() < DECOUPLE_CORR_MAX;
+        let strict_improvement = on.speed_fitness_correlation.abs()
+            <= baseline.speed_fitness_correlation.abs() - DECOUPLE_MARGIN;
+        let speed_decoupled = baseline_corr_exploitable && on_decoupled && strict_improvement;
+        let viability_ok = on.mean_death_count > 0.0;
+        let danger_retained = on.mean_danger_dwell_fraction > 0.01;
+        let avoidance_above_chance = on.mean_avoidance_intent_fraction >= AVOIDANCE_FLOOR;
+        let gate_passed =
+            speed_decoupled && viability_ok && danger_retained && avoidance_above_chance;
+
+        // Verify all other conjuncts are true so only avoidance drives the result.
+        assert!(
+            speed_decoupled,
+            "speed_decoupled must be true to isolate avoidance conjunct"
+        );
+        assert!(
+            viability_ok,
+            "viability_ok must be true to isolate avoidance conjunct"
+        );
+        assert!(
+            danger_retained,
+            "danger_retained must be true to isolate avoidance conjunct"
+        );
+        assert!(
+            !avoidance_above_chance,
+            "avoidance_above_chance must be false: ON avoidance below AVOIDANCE_FLOOR"
+        );
+        assert!(
+            !gate_passed,
+            "gate should reject when avoidance intent fraction is below AVOIDANCE_FLOOR"
+        );
+    }
+
+    #[test]
+    fn gate_passes_when_all_criteria_met() {
+        // All criteria satisfied: baseline exploitable, ON decouples, improves strictly,
+        // viability ok (deaths > 0), danger retained, avoidance above floor
+        let baseline = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 50.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 5.0,
+            speed_fitness_correlation: 0.5,
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.12,
+            speed_trajectory_per_gen: vec![50.0],
+        };
+        let on = ValidationStats {
+            mean_fitness: 0.5,
+            mean_movement_speed: 45.0,
+            mean_ticks_alive: 900000,
+            mean_death_count: 3.0,
+            speed_fitness_correlation: 0.25, // 0.5 - 0.25 = 0.25 >= DECOUPLE_MARGIN
+            death_speed_regression: 0.0,
+            food_per_energy_vs_speed_slope: 0.0,
+            mean_danger_dwell_fraction: 0.05,
+            mean_avoidance_intent_fraction: 0.12,
+            speed_trajectory_per_gen: vec![45.0],
+        };
+
+        let baseline_corr_exploitable =
+            baseline.speed_fitness_correlation.abs() >= BASELINE_CORR_MIN;
+        let on_decoupled = on.speed_fitness_correlation.abs() < DECOUPLE_CORR_MAX;
+        let strict_improvement = on.speed_fitness_correlation.abs()
+            <= baseline.speed_fitness_correlation.abs() - DECOUPLE_MARGIN;
+        let speed_decoupled = baseline_corr_exploitable && on_decoupled && strict_improvement;
+        let viability_ok = on.mean_death_count > 0.0;
+        let danger_retained = on.mean_danger_dwell_fraction > 0.01;
+        let avoidance_above_chance = on.mean_avoidance_intent_fraction >= AVOIDANCE_FLOOR;
+        let gate_passed =
+            speed_decoupled && viability_ok && danger_retained && avoidance_above_chance;
+
+        assert!(gate_passed, "gate should pass when all criteria are met");
+    }
 }

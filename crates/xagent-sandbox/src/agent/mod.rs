@@ -370,29 +370,53 @@ pub fn mutate_config(parent: &BrainConfig) -> BrainConfig {
 
 /// Create a mutated BrainConfig with a configurable mutation strength.
 /// `strength` controls the perturbation range: e.g. 0.1 → ±10%, 0.3 → ±30%.
+///
+/// Creates a thread-local RNG internally. Use `mutate_config_with_strength_rng`
+/// directly when reproducible draws are required (e.g. seeded A/B paired tests).
 pub fn mutate_config_with_strength(
     parent: &BrainConfig,
     strength: f32,
     momentum: &MutationMomentum,
 ) -> BrainConfig {
     let mut rng = rand::rng();
+    mutate_config_with_strength_rng(parent, strength, momentum, &mut rng)
+}
 
+/// Perturb inherited GPU brain state for neuroevolution.
+/// Mutates encoder weights (10%), action weights (20%), and predictor weights (5%)
+/// with configurable strength. This lets evolution explore behavioral
+/// variations that within-lifetime learning might miss.
+///
+/// Creates a thread-local RNG internally. Use `mutate_brain_state_with_rng`
+/// directly when reproducible draws are required (e.g. seeded A/B paired tests).
+pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainState {
+    let mut rng = rand::rng();
+    mutate_brain_state_with_rng(state, strength, &mut rng)
+}
+
+/// Create a seeded mutated BrainConfig from a parent config with a fixed seed.
+/// Both arms of a paired A/B test call this with the same seed to get identical genomes.
+pub fn mutate_config_seeded(parent: &BrainConfig, seed: u64) -> BrainConfig {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    mutate_config_with_strength_rng(parent, 0.1, &MutationMomentum::new(0.9), &mut rng)
+}
+
+/// Canonical body for config mutation — accepts an explicit RNG so the caller
+/// controls reproducibility. `mutate_config_with_strength` is the public
+/// convenience wrapper that creates a thread-local RNG and delegates here.
+fn mutate_config_with_strength_rng(
+    parent: &BrainConfig,
+    strength: f32,
+    momentum: &MutationMomentum,
+    rng: &mut impl rand::Rng,
+) -> BrainConfig {
     BrainConfig {
         memory_capacity: momentum
-            .biased_perturb_u(
-                &mut rng,
-                parent.memory_capacity,
-                "memory_capacity",
-                strength,
-            )
+            .biased_perturb_u(rng, parent.memory_capacity, "memory_capacity", strength)
             .min(MAX_MEMORY_CAPACITY),
         processing_slots: momentum
-            .biased_perturb_u(
-                &mut rng,
-                parent.processing_slots,
-                "processing_slots",
-                strength,
-            )
+            .biased_perturb_u(rng, parent.processing_slots, "processing_slots", strength)
             .min(MAX_PROCESSING_SLOTS),
         // Legacy field, superseded by the plan 0008 visual-cortex config; no
         // longer carried through breeding (issue #106). The serde default
@@ -400,23 +424,18 @@ pub fn mutate_config_with_strength(
         visual_encoding_size: BrainConfig::default().visual_encoding_size,
         representation_dimension: parent.representation_dimension,
         learning_rate: momentum.biased_perturb_f(
-            &mut rng,
+            rng,
             parent.learning_rate,
             "learning_rate",
             strength,
         ),
-        decay_rate: momentum.biased_perturb_f(&mut rng, parent.decay_rate, "decay_rate", strength),
+        decay_rate: momentum.biased_perturb_f(rng, parent.decay_rate, "decay_rate", strength),
         distress_exponent: momentum
-            .biased_perturb_f(
-                &mut rng,
-                parent.distress_exponent,
-                "distress_exponent",
-                strength,
-            )
+            .biased_perturb_f(rng, parent.distress_exponent, "distress_exponent", strength)
             .clamp(1.5, 5.0),
         habituation_sensitivity: momentum
             .biased_perturb_f(
-                &mut rng,
+                rng,
                 parent.habituation_sensitivity,
                 "habituation_sensitivity",
                 strength,
@@ -424,14 +443,14 @@ pub fn mutate_config_with_strength(
             .clamp(5.0, 50.0),
         max_curiosity_bonus: momentum
             .biased_perturb_f(
-                &mut rng,
+                rng,
                 parent.max_curiosity_bonus,
                 "max_curiosity_bonus",
                 strength,
             )
             .clamp(0.1, 1.0),
         fatigue_floor: momentum
-            .biased_perturb_f(&mut rng, parent.fatigue_floor, "fatigue_floor", strength)
+            .biased_perturb_f(rng, parent.fatigue_floor, "fatigue_floor", strength)
             .clamp(0.05, 0.4),
         vision_width: parent.vision_width,
         vision_height: parent.vision_height,
@@ -443,7 +462,7 @@ pub fn mutate_config_with_strength(
         metabolic_rate: parent.metabolic_rate,
         integrity_scale: parent.integrity_scale,
         movement_speed: momentum
-            .biased_perturb_f(&mut rng, parent.movement_speed, "movement_speed", strength)
+            .biased_perturb_f(rng, parent.movement_speed, "movement_speed", strength)
             .clamp(1.0, 100.0),
         // Speed-cost exponent is locked per batch (not heritable); pass through.
         speed_cost_exponent: parent.speed_cost_exponent,
@@ -458,16 +477,11 @@ pub fn mutate_config_with_strength(
         // reading the gene. `orientation_offset` has no hard clamp — orientation
         // is half-circle periodic, so it wraps into [0, π) via rem_euclid.
         gabor_wavelength: momentum
-            .biased_perturb_f(
-                &mut rng,
-                parent.gabor_wavelength,
-                "gabor_wavelength",
-                strength,
-            )
+            .biased_perturb_f(rng, parent.gabor_wavelength, "gabor_wavelength", strength)
             .clamp(GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX),
         gabor_aspect_ratio: momentum
             .biased_perturb_f(
-                &mut rng,
+                rng,
                 parent.gabor_aspect_ratio,
                 "gabor_aspect_ratio",
                 strength,
@@ -475,7 +489,7 @@ pub fn mutate_config_with_strength(
             .clamp(GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX),
         dog_surround_ratio: momentum
             .biased_perturb_f(
-                &mut rng,
+                rng,
                 parent.dog_surround_ratio,
                 "dog_surround_ratio",
                 strength,
@@ -483,7 +497,7 @@ pub fn mutate_config_with_strength(
             .clamp(DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX),
         orientation_offset: momentum
             .biased_perturb_f(
-                &mut rng,
+                rng,
                 parent.orientation_offset,
                 "orientation_offset",
                 strength,
@@ -492,12 +506,26 @@ pub fn mutate_config_with_strength(
     }
 }
 
-/// Perturb inherited GPU brain state for neuroevolution.
-/// Mutates encoder weights (10%), action weights (20%), and predictor weights (5%)
-/// with configurable strength. This lets evolution explore behavioral
-/// variations that within-lifetime learning might miss.
-pub fn mutate_brain_state(state: &AgentBrainState, strength: f32) -> AgentBrainState {
-    let mut rng = rand::rng();
+/// Perturb inherited GPU brain state with a seeded RNG for reproducible mutations.
+/// Both arms of a paired A/B test call this with the same seed to get identical brain states.
+pub fn mutate_brain_state_seeded(
+    state: &AgentBrainState,
+    strength: f32,
+    seed: u64,
+) -> AgentBrainState {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    mutate_brain_state_with_rng(state, strength, &mut rng)
+}
+
+/// Canonical body for brain-state mutation — accepts an explicit RNG so the caller
+/// controls reproducibility. `mutate_brain_state` is the public convenience wrapper
+/// that creates a thread-local RNG and delegates here.
+fn mutate_brain_state_with_rng(
+    state: &AgentBrainState,
+    strength: f32,
+    rng: &mut impl rand::Rng,
+) -> AgentBrainState {
     let mut mutated = state.clone();
 
     // Derive layout from actual state length (supports dynamic vision_width × vision_height).

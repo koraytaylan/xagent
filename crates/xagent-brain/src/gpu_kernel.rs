@@ -2523,6 +2523,30 @@ impl GpuKernel {
         );
     }
 
+    /// Write motor decision commands for one agent.
+    ///
+    /// Sets the forward, turn, and strafe components in the decision_buffer
+    /// (DECISION_MOTOR offset). All values are clamped to [-1.0, 1.0] as the
+    /// kernel does. Used in tests to inject specific motor commands.
+    pub fn write_motor_decision(&self, index: u32, forward: f32, turn: f32, strafe: f32) {
+        let i = index as usize;
+        let decision_base = i * DECISION_STRIDE;
+        let motor_base = decision_base + DECISION_MOTOR;
+
+        let clamped = [
+            forward.clamp(-1.0, 1.0),
+            turn.clamp(-1.0, 1.0),
+            strafe.clamp(-1.0, 1.0),
+        ];
+
+        let offset = (motor_base * 4) as u64;
+        self.queue.write_buffer(
+            &self.decision_buffer,
+            offset,
+            bytemuck::cast_slice(&clamped),
+        );
+    }
+
     /// Patch per-agent heritable config values in brain_state buffer.
     ///
     /// Writes habituation_sensitivity, max_curiosity_bonus, fatigue_floor,

@@ -757,6 +757,33 @@ mod tests {
     }
 
     #[test]
+    fn serde_default_off_coverage() {
+        // A config blob that omits `danger_percept_enabled` and
+        // `effort_rebased_fitness` must deserialize both fields as `false`.
+        // This is the back-compat guarantee: new flag fields must default to
+        // `false` when absent from a legacy config blob, enforced by
+        // `#[serde(default)]` on each field. Dropping either attribute would
+        // cause deserialization to fail on a legacy blob and this test to fail.
+        let minimal_json = r#"{
+            "memory_capacity": 64,
+            "processing_slots": 8,
+            "representation_dimension": 64,
+            "learning_rate": 0.01,
+            "decay_rate": 0.001
+        }"#;
+        let config: BrainConfig = serde_json::from_str(minimal_json)
+            .expect("legacy config without flag fields must load");
+        assert!(
+            !config.danger_percept_enabled,
+            "danger_percept_enabled must default to false when the field is absent"
+        );
+        assert!(
+            !config.effort_rebased_fitness,
+            "effort_rebased_fitness must default to false when the field is absent"
+        );
+    }
+
+    #[test]
     fn sensory_lag_saturates_on_overflow() {
         // A corrupt/hand-edited config must not wrap to a small lag and sneak past
         // the bound; the product saturates so the comparison still rejects it.

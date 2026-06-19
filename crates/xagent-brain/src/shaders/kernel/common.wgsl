@@ -368,10 +368,18 @@ const TWO_PI: f32 = 6.28318530;
 // `max(denominator, EPSILON)` before every division). Used by the visual-cortex
 // stages and any other pass guarding a divide-by-zero.
 const EPSILON: f32 = 1e-6;
+/// Square root of 2; used as the motor-magnitude clamp (maximum L∞ norm of
+/// motor commands before drag). Bounds the movement-cost accumulator by clamping
+/// the combined forward+strafe magnitude to √2 ≈ 1.414, so a diagonally-maxed
+/// agent burns energy at the same rate as a max-forward agent.
+const SQRT_2: f32 = 1.41421356237;
 
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
+/// Baseline locomotion speed; movement energy and the path-length-hazard
+/// reference step are both normalized by it. One name, one source of truth.
+const DEFAULT_MOVE_SPEED: f32 = 20.0;
 const TURN_SPEED: f32 = 3.0;
 const AGENT_HALF_HEIGHT: f32 = 1.0;
 const METABOLIC_BASE_COST: f32 = 0.0001;
@@ -398,6 +406,9 @@ const AGENT_GRID_CELL_STRIDE: u32 = 33u;  // 1 + 32
 
 const TERRAIN_VPS: u32 = 129u;
 const BIOME_GRID_RES: u32 = 256u;
+/// Biome grid is 256×256; the last valid index is 255. Naming it removes the
+/// silent coupling between the clamp literal and the grid resolution.
+const BIOME_GRID_MAX_INDEX: u32 = 255u;
 
 // ── Food respawn constants ──────────────────────────────────────────────────
 
@@ -637,9 +648,9 @@ fn sample_height(x: f32, z: f32) -> f32 {
 fn sample_biome(x: f32, z: f32) -> u32 {
     let biome_half = wc_f32(WC_TERRAIN_HALF);
     let biome_inv = wc_f32(WC_BIOME_INV_CELL);
-    let col = min(u32((x + biome_half) * biome_inv), 255u);
-    let row = min(u32((z + biome_half) * biome_inv), 255u);
-    return biome_grid[row * 256u + col];
+    let col = min(u32((x + biome_half) * biome_inv), BIOME_GRID_MAX_INDEX);
+    let row = min(u32((z + biome_half) * biome_inv), BIOME_GRID_MAX_INDEX);
+    return biome_grid[row * BIOME_GRID_RES + col];
 }
 
 // ── Activation function ─────────────────────────────────────────────────────

@@ -635,11 +635,11 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut 
 
 /// Fill a caller-owned world-config buffer in place.
 ///
-/// Writes the 24 world-config slots into `out` without allocating, so the
+/// Writes the first WORLD_CONFIG_SIZE slots into `out` without allocating, so the
 /// per-batch GPU dispatch path can reuse one scratch array instead of heap-
 /// allocating a fresh `Vec` every batch. `out` is fully zeroed first so the
 /// result is byte-identical to [`build_world_config`]'s `vec![0.0; N]` init —
-/// the padding/`WC_PHASE_MASK` slots the caller sets afterward stay `0.0`.
+/// the padding slots the caller sets afterward stay `0.0`.
 #[allow(clippy::too_many_arguments)]
 pub fn fill_world_config(
     out: &mut [f32; WORLD_CONFIG_SIZE],
@@ -1145,9 +1145,15 @@ mod tests {
         for line in src.lines() {
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("const ") {
-                // e.g. "P_ENERGY: u32 = 11u;"
+                // e.g. "P_ENERGY: u32 = 11u;" or "WC_PHASE_MASK: u32 = 21u;  // comment"
                 if let Some((name, tail)) = rest.split_once(':') {
                     if let Some(val_part) = tail.split('=').nth(1) {
+                        // Strip inline comment if present
+                        let val_part = if let Some(comment_start) = val_part.find("//") {
+                            &val_part[..comment_start]
+                        } else {
+                            val_part
+                        };
                         let val_str = val_part
                             .trim()
                             .trim_end_matches(';')
@@ -1266,6 +1272,49 @@ mod tests {
         assert_eq!(
             wgsl["CFG_VISUAL_CORTEX_ENABLED"],
             CFG_VISUAL_CORTEX_ENABLED as u32
+        );
+        assert_eq!(
+            wgsl["CFG_DANGER_PERCEPT_ENABLED"],
+            CFG_DANGER_PERCEPT_ENABLED as u32
+        );
+    }
+
+    #[test]
+    fn shader_wc_constants_match_rust() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+
+        assert_eq!(wgsl["WC_WORLD_SIZE"], WC_WORLD_SIZE as u32);
+        assert_eq!(wgsl["WC_DT"], WC_DT as u32);
+        assert_eq!(wgsl["WC_ENERGY_DEPLETION"], WC_ENERGY_DEPLETION as u32);
+        assert_eq!(wgsl["WC_MOVEMENT_COST"], WC_MOVEMENT_COST as u32);
+        assert_eq!(wgsl["WC_HAZARD_DAMAGE"], WC_HAZARD_DAMAGE as u32);
+        assert_eq!(wgsl["WC_INTEGRITY_REGEN"], WC_INTEGRITY_REGEN as u32);
+        assert_eq!(wgsl["WC_FOOD_ENERGY"], WC_FOOD_ENERGY as u32);
+        assert_eq!(wgsl["WC_FOOD_RADIUS"], WC_FOOD_RADIUS as u32);
+        assert_eq!(wgsl["WC_TERRAIN_VPS"], WC_TERRAIN_VPS as u32);
+        assert_eq!(wgsl["WC_TERRAIN_INV_STEP"], WC_TERRAIN_INV_STEP as u32);
+        assert_eq!(wgsl["WC_TERRAIN_HALF"], WC_TERRAIN_HALF as u32);
+        assert_eq!(wgsl["WC_BIOME_INV_CELL"], WC_BIOME_INV_CELL as u32);
+        assert_eq!(wgsl["WC_FOOD_COUNT"], WC_FOOD_COUNT as u32);
+        assert_eq!(wgsl["WC_AGENT_COUNT"], WC_AGENT_COUNT as u32);
+        assert_eq!(wgsl["WC_TICK"], WC_TICK as u32);
+        assert_eq!(wgsl["WC_RNG_SEED"], WC_RNG_SEED as u32);
+        assert_eq!(wgsl["WC_WORLD_HALF_BOUND"], WC_WORLD_HALF_BOUND as u32);
+        assert_eq!(wgsl["WC_BIOME_GRID_RES"], WC_BIOME_GRID_RES as u32);
+        assert_eq!(wgsl["WC_GRID_WIDTH"], WC_GRID_WIDTH as u32);
+        assert_eq!(wgsl["WC_GRID_OFFSET"], WC_GRID_OFFSET as u32);
+        assert_eq!(wgsl["WC_TICKS_TO_RUN"], WC_TICKS_TO_RUN as u32);
+        assert_eq!(wgsl["WC_PHASE_MASK"], WC_PHASE_MASK as u32);
+        assert_eq!(wgsl["WC_VISION_STRIDE"], WC_VISION_STRIDE as u32);
+        assert_eq!(wgsl["WC_BRAIN_TICK_STRIDE"], WC_BRAIN_TICK_STRIDE as u32);
+        assert_eq!(
+            wgsl["WC_SPEED_COST_EXPONENT"],
+            WC_SPEED_COST_EXPONENT as u32
+        );
+        assert_eq!(
+            wgsl["WC_DANGER_PERCEPT_ENABLED"],
+            WC_DANGER_PERCEPT_ENABLED as u32
         );
     }
 
@@ -1518,5 +1567,6 @@ mod tests {
         assert!(WC_VISION_STRIDE < WORLD_CONFIG_SIZE);
         assert!(WC_BRAIN_TICK_STRIDE < WORLD_CONFIG_SIZE);
         assert!(WC_SPEED_COST_EXPONENT < WORLD_CONFIG_SIZE);
+        assert!(WC_DANGER_PERCEPT_ENABLED < WORLD_CONFIG_SIZE);
     }
 }

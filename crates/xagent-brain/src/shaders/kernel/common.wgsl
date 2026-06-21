@@ -298,7 +298,7 @@ const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 44u;
+const PHYS_STRIDE: u32 = 45u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -344,13 +344,18 @@ const P_NEAREST_DANGER_DISTANCE: u32 = 39u;
 /// Signed bearing (radians) from current facing direction to the nearest in-range
 /// danger biome cell. Sentinel value is 0.0 when no danger is in range.
 const P_NEAREST_DANGER_BEARING: u32 = 40u;
-/// Previous avoidance potential, used for potential-based shaping. Mirrors
-/// P_PREV_POTENTIAL's pattern for danger avoidance.
+/// Reserved: previous avoidance potential (no longer written after reward-shaping
+/// removal). Retained for layout parity and test compatibility; reset on respawn.
 const P_PREV_DANGER_POTENTIAL: u32 = 41u;
 /// Cumulative count of ticks where danger was in sense range.
 const P_AVOIDANCE_SENSE_RANGE_TICKS: u32 = 42u;
 /// Cumulative count of ticks where danger was in sense range AND motor turn opposed bearing.
 const P_AVOIDANCE_TURNS_OPPOSING: u32 = 43u;
+/// Pre-amplification homeostatic learning signal raw_gradient
+/// (pure homeostatic: energy_delta*ENERGY_WEIGHT + integrity_delta*INTEGRITY_WEIGHT),
+/// written by coop_habituate_homeo for CPU readback. Per-agent live state,
+/// never serialized.
+const P_RAW_GRADIENT_OUT: u32 = 44u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -420,13 +425,11 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
 const VISION_MAX_DIST: f32 = 30.0;
-// World-units radius within which food contributes to the approach potential Φ.
-// Set to VISION_MAX_DIST so Φ is a proxy for "nearest visible food"; the
-// potential-based shaping that consumes it is optimal-policy-invariant for any
-// state potential, so a radius proxy needs no FOV-visibility test.
-const SHAPING_RADIUS: f32 = 30.0;
+// World-units radius of the nearest-food sense scan in agent_food_detect.
+// Set to VISION_MAX_DIST to match the visual field range.
+const FOOD_SENSE_RADIUS: f32 = 30.0;
 // World-units radius within which danger (biome cells) are sensed for avoidance
-// potential and bearing calculation. Symmetric to SHAPING_RADIUS.
+// bearing calculation. Symmetric to FOOD_SENSE_RADIUS.
 const DANGER_SENSE_RADIUS: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
@@ -491,13 +494,6 @@ const ATTEN_FLOOR: f32 = 0.1;
 const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
-// Approach-shaping gain: Φ(s) = −APPROACH_SHAPING_GAIN · d_norm, where d_norm is
-// the nearest in-range food distance normalized by SHAPING_RADIUS. Sized so the
-// per-brain-tick shaping term F = γΦ(s′) − Φ(s) dominates the ~2e-4 metabolic
-// drain (making closing distance the dominant within-tick steering signal) while
-// staying well below the ~0.12 contact-eat reward spike (so eating still anchors
-// the objective).
-const APPROACH_SHAPING_GAIN: f32 = 0.05;
 const GRADIENT_FAST_BLEND: f32 = 0.6;
 const GRADIENT_MEDIUM_BLEND: f32 = 0.04;
 const GRADIENT_SLOW_BLEND: f32 = 0.004;

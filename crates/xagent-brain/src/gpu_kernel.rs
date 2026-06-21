@@ -342,6 +342,7 @@ pub struct AgentTelemetry {
     pub staleness: f32,
     pub urgency: f32,
     pub gradient: f32,
+    pub raw_gradient: f32,
     pub prediction_error: f32,
     pub exploration_rate: f32,
     /// Critic estimate of the discounted homeostatic return from the
@@ -2616,6 +2617,24 @@ impl GpuKernel {
         );
     }
 
+    /// Write specific fields in one agent's physics state buffer.
+    ///
+    /// Allows tests to set individual physics fields (e.g., P_ENERGY, P_PREV_ENERGY, etc.)
+    /// to controlled values for testing. The `fields` slice contains (offset, value) pairs
+    /// where `offset` is a physics slot constant like `P_ENERGY`, `P_PREV_ENERGY`, etc.
+    /// (not a byte offset — this method handles the conversion).
+    pub fn write_agent_physics_fields(&self, index: u32, fields: &[(usize, f32)]) {
+        let i = index as usize;
+        for &(slot_offset, value) in fields {
+            let byte_offset = ((i * PHYS_STRIDE + slot_offset) * 4) as u64;
+            self.queue.write_buffer(
+                &self.agent_phys_buffer,
+                byte_offset,
+                bytemuck::cast_slice(&[value]),
+            );
+        }
+    }
+
     /// Non-blocking: kick off async readback of one agent's brain state.
     /// Results are collected via `try_collect_agent_state`.
     pub fn request_agent_state(&mut self, index: u32) -> bool {
@@ -2942,6 +2961,7 @@ impl GpuKernel {
         let mut phys = Vec::with_capacity(PHYS_STRIDE);
         self.read_buffer_range(&self.agent_phys_buffer, phys_offset, phys_size, &mut phys);
         let gradient = phys[P_GRADIENT_OUT];
+        let raw_gradient = phys[P_RAW_GRADIENT_OUT];
         let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
@@ -2957,6 +2977,7 @@ impl GpuKernel {
             staleness,
             urgency,
             gradient,
+            raw_gradient,
             prediction_error,
             exploration_rate,
             value,
@@ -3151,6 +3172,7 @@ impl GpuKernel {
         let phys_data = self.telemetry_staging.phys.slice(..).get_mapped_range();
         let phys: &[f32] = bytemuck::cast_slice(&phys_data);
         let gradient = phys[P_GRADIENT_OUT];
+        let raw_gradient = phys[P_RAW_GRADIENT_OUT];
         let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
@@ -3168,6 +3190,7 @@ impl GpuKernel {
             staleness,
             urgency,
             gradient,
+            raw_gradient,
             prediction_error,
             exploration_rate,
             value,

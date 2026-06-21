@@ -3,8 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
-_Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
+**Status:** ✅ Complete.
+_Last updated: 2026-06-21, against `claude/peaceful-kapitsa-b53c19`._
 
 - **Goal:** Both PBRS terms removed; raw_gradient now purely homeostatic
   (energy_delta*ENERGY_WEIGHT + integrity_delta*INTEGRITY_WEIGHT); code-to-README
@@ -31,9 +31,9 @@ _Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Measurement-Baseline | `measure-baseline-pre-removal` | 📋 Planned |
-| 0002 | Approach-Shaping-Removal | `remove-approach-shaping` | 📋 Planned |
-| 0003 | Avoidance-Shaping-Removal | `remove-danger-shaping` | 📋 Planned |
-| 0004 | Dead-Code-Cleanup | `remove-orphaned-consts` | 📋 Planned |
-| 0005 | Parity-And-Tests | `verify-gradient-parity`, `add-homeostatic-only-gate` | 📋 Planned |
-| 0006 | Documentation-Update | `update-readme-vision` | 📋 Planned |
+| 0001 | Measurement-Baseline | `measure-baseline-pre-removal` | ✅ Done |
+| 0002 | Approach-Shaping-Removal | `remove-approach-shaping` | ✅ Done |
+| 0003 | Avoidance-Shaping-Removal | `remove-danger-shaping` | ✅ Done |
+| 0004 | Dead-Code-Cleanup | `remove-orphaned-consts` | ✅ Done |
+| 0005 | Parity-And-Tests | `verify-gradient-parity`, `add-homeostatic-only-gate` | ✅ Done |
+| 0006 | Documentation-Update | `update-readme-vision` | ✅ Done |

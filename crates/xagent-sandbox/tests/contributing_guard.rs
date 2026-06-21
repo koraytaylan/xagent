@@ -33,7 +33,7 @@ const GUARD_TEST_FILE_NAME: &str = "contributing_guard.rs";
 /// reference — that defeats the guard. The test prints a ready-to-paste
 /// replacement table whenever this list drifts from reality.
 const PLANNING_REFERENCE_BASELINE: &[(&str, usize)] = &[
-    ("crates/xagent-brain/src/buffers.rs", 11),
+    ("crates/xagent-brain/src/buffers.rs", 10),
     ("crates/xagent-brain/src/gpu_kernel.rs", 4),
     ("crates/xagent-brain/src/shaders/kernel/common.wgsl", 17),
     ("crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl", 3),
@@ -44,7 +44,7 @@ const PLANNING_REFERENCE_BASELINE: &[(&str, usize)] = &[
     ("crates/xagent-sandbox/src/agent/mod.rs", 5),
     ("crates/xagent-sandbox/src/governor.rs", 1),
     ("crates/xagent-sandbox/src/main.rs", 2),
-    ("crates/xagent-sandbox/tests/integration.rs", 20),
+    ("crates/xagent-sandbox/tests/integration.rs", 19),
     ("crates/xagent-shared/src/config.rs", 17),
 ];
 

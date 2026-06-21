@@ -402,7 +402,7 @@ When all dimensions are changing rapidly, mean attenuation is high and curiosity
 
 5. **Urgency**: `(energy_distress + integrity_distress) * 0.5`
 
-**Output** (`homeo_out` buffer, 6 f32 per agent): `[gradient, raw_gradient_amplified, urgency, grad_fast, grad_med, grad_slow]`
+**Output** (`homeo_out` buffer, 7 f32 per agent): `[gradient, raw_gradient_amplified, urgency, grad_fast, grad_med, grad_slow, raw_gradient]`
 
 ---
 

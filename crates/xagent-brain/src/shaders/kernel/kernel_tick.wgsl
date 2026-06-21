@@ -34,12 +34,12 @@
 var<workgroup> s_alive: u32;
 
 // Squared-distance reduction scratch for the nearest food within
-// `SHAPING_RADIUS` — the approach-potential input. Reduced in parallel with the
-// eat candidate in `agent_food_detect`, reusing the same two barriers. Sized to
-// the reduction width (= MEMORY_CAP, half the 256-thread workgroup), matching
-// `s_similarities`. Distance only; no food index is needed because the nearest
-// in-range food is measured for steering, not eaten.
-var<workgroup> s_shaping_dist_sq: array<f32, MEMORY_CAP>;
+// `FOOD_SENSE_RADIUS`. Reduced in parallel with the eat candidate in
+// `agent_food_detect`, reusing the same two barriers. Sized to the reduction
+// width (= MEMORY_CAP, half the 256-thread workgroup), matching `s_similarities`.
+// Distance only; no food index is needed because the nearest in-range food is
+// measured for sensory steering feedback.
+var<workgroup> s_food_dist_sq: array<f32, MEMORY_CAP>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
@@ -358,9 +358,9 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     // when the agent is dead (or a hypothetical divergence prevented the scan).
     var local_best_idx = 0xFFFFFFFFu;
     var local_best_dist_sq = 1e12;
-    // Nearest food within SHAPING_RADIUS, independent of the eat gate, for the
-    // approach potential. Same sentinel so the reduction runs safely when dead.
-    var local_best_shaping_dist_sq = 1e12;
+    // Nearest food within FOOD_SENSE_RADIUS, independent of the eat gate, for the
+    // food-sense navigation feature. Same sentinel so the reduction runs safely when dead.
+    var local_best_food_dist_sq = 1e12;
 
     if (alive) {
         let pos = vec3f(
@@ -370,7 +370,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         let food_count = wc_u32(WC_FOOD_COUNT);
         let eat_radius = wc_f32(WC_FOOD_RADIUS);
         let eat_radius_sq = eat_radius * eat_radius;
-        let shaping_radius_sq = SHAPING_RADIUS * SHAPING_RADIUS;
+        let food_sense_radius_sq = FOOD_SENSE_RADIUS * FOOD_SENSE_RADIUS;
 
         // Each thread scans a slice of food_state
         for (var f = tid; f < food_count; f += 256u) {
@@ -383,10 +383,10 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
                 local_best_dist_sq = d_sq;
                 local_best_idx = f;
             }
-            // Wider navigational reduction: nearest food in shaping range, no
-            // eat gate. SHAPING_RADIUS ≥ eat_radius, so this is a superset.
-            if (d_sq < shaping_radius_sq && d_sq < local_best_shaping_dist_sq) {
-                local_best_shaping_dist_sq = d_sq;
+            // Wider navigational reduction: nearest food in sense range, no
+            // eat gate. FOOD_SENSE_RADIUS ≥ eat_radius, so this is a superset.
+            if (d_sq < food_sense_radius_sq && d_sq < local_best_food_dist_sq) {
+                local_best_food_dist_sq = d_sq;
             }
         }
     }
@@ -397,7 +397,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     if (tid < 128u) {
         s_similarities[tid] = local_best_dist_sq;
         shared_sort_indices[tid] = local_best_idx;
-        s_shaping_dist_sq[tid] = local_best_shaping_dist_sq;
+        s_food_dist_sq[tid] = local_best_food_dist_sq;
     }
     workgroupBarrier();
 
@@ -408,43 +408,43 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             s_similarities[slot] = local_best_dist_sq;
             shared_sort_indices[slot] = local_best_idx;
         }
-        s_shaping_dist_sq[slot] = min(s_shaping_dist_sq[slot], local_best_shaping_dist_sq);
+        s_food_dist_sq[slot] = min(s_food_dist_sq[slot], local_best_food_dist_sq);
     }
     workgroupBarrier();
 
     if (tid == 0u && alive) {
         var best_idx = 0xFFFFFFFFu;
         var best_dist_sq = 1e12;
-        var best_shaping_dist_sq = 1e12;
+        var best_food_dist_sq = 1e12;
         for (var i = 0u; i < 128u; i++) {
             if (s_similarities[i] < best_dist_sq) {
                 best_dist_sq = s_similarities[i];
                 best_idx = shared_sort_indices[i];
             }
-            best_shaping_dist_sq = min(best_shaping_dist_sq, s_shaping_dist_sq[i]);
+            best_food_dist_sq = min(best_food_dist_sq, s_food_dist_sq[i]);
         }
-        // Publish the nearest in-range food distance for the approach potential;
-        // SHAPING_RADIUS sentinel when none is within range.
-        let shaping_radius_sq = SHAPING_RADIUS * SHAPING_RADIUS;
+        // Publish the nearest in-range food distance (food-sense navigation feature);
+        // FOOD_SENSE_RADIUS sentinel when none is within range.
+        let food_sense_radius_sq = FOOD_SENSE_RADIUS * FOOD_SENSE_RADIUS;
         physics_state[b + P_NEAREST_FOOD_DISTANCE] = select(
-            SHAPING_RADIUS,
-            sqrt(best_shaping_dist_sq),
-            best_shaping_dist_sq < shaping_radius_sq);
+            FOOD_SENSE_RADIUS,
+            sqrt(best_food_dist_sq),
+            best_food_dist_sq < food_sense_radius_sq);
 
         // Compute signed bearing from facing direction to nearest food.
         // bearing = atan2(cross(facing, to_food).y, dot(facing, to_food))
         // In XZ plane: facing is normalized, to_food is displacement to food
         // Find the food with the minimum distance and compute bearing from it.
-        if (best_shaping_dist_sq < shaping_radius_sq) {
+        if (best_food_dist_sq < food_sense_radius_sq) {
             let agent_pos = vec3f(
                 physics_state[b + P_POS_X],
                 physics_state[b + P_POS_Y],
                 physics_state[b + P_POS_Z]);
             let food_count = wc_u32(WC_FOOD_COUNT);
-            let shaping_radius = SHAPING_RADIUS;
+            let food_sense_radius = FOOD_SENSE_RADIUS;
 
-            // Find the food item with the minimum distance in shaping range
-            var min_dist_sq = shaping_radius_sq;
+            // Find the food item with the minimum distance in food-sense range
+            var min_dist_sq = food_sense_radius_sq;
             var best_food_idx = 0xFFFFFFFFu;
             for (var f = 0u; f < food_count; f++) {
                 if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
@@ -478,7 +478,7 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
                 let dot_val = facing_x * to_food.x + facing_z * to_food.z;
                 physics_state[b + P_NEAREST_FOOD_BEARING] = atan2(cross_y, dot_val);
             } else {
-                // Should not happen if best_shaping_dist_sq < shaping_radius_sq, but be defensive
+                // Should not happen if best_food_dist_sq < food_sense_radius_sq, but be defensive
                 physics_state[b + P_NEAREST_FOOD_BEARING] = 0.0;
             }
         } else {
@@ -582,18 +582,18 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // Restore cumulative avoidance intent (generation-cumulative, never reset)
     physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS] = saved_avoidance_sense_range;
     physics_state[base + P_AVOIDANCE_TURNS_OPPOSING] = saved_avoidance_turns_opposing;
-    // Approach-potential state: no food is "in range" until the next
-    // food-detect pass, and the previous potential must not carry across the
-    // death so the eat-respawn food teleport cannot inject a shaping reward.
-    physics_state[base + P_NEAREST_FOOD_DISTANCE] = SHAPING_RADIUS;
+    // Reset the food-sense distance to its no-food sentinel until the next
+    // food-detect pass. P_PREV_POTENTIAL is a reserved slot (shaping removed);
+    // zero it on respawn so no stale value carries across death.
+    physics_state[base + P_NEAREST_FOOD_DISTANCE] = FOOD_SENSE_RADIUS;
     physics_state[base + P_PREV_POTENTIAL]        = 0.0;
     // Navigation telemetry: bearing and danger will be recomputed on next ticks
     physics_state[base + P_NEAREST_FOOD_BEARING]  = 0.0;
     physics_state[base + P_IN_DANGER_BIOME]       = 0.0;
     physics_state[base + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
     physics_state[base + P_NEAREST_DANGER_BEARING]  = 0.0;
-    // Danger-avoidance potential state: must reset on death so the respawn
-    // cannot inject spurious shaping reward (mirrors P_PREV_POTENTIAL reset).
+    // P_PREV_DANGER_POTENTIAL is a reserved slot (avoidance shaping removed);
+    // zero it on respawn so no stale value carries across death.
     physics_state[base + P_PREV_DANGER_POTENTIAL]   = 0.0;
 
     // 4. Reset brain state

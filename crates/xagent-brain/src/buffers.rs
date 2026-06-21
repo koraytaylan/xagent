@@ -180,16 +180,14 @@ pub const P_URGENCY_OUT: usize = 30;
 /// across the death/respawn reset so CPU readback can attribute the death to
 /// an exact tick instead of the end-of-batch upper bound.
 pub const P_LAST_DEATH_TICK: usize = 31;
-/// Planar distance (world units) to the nearest food within `SHAPING_RADIUS`,
-/// written by the food-detect pass each cycle; the `SHAPING_RADIUS` sentinel
-/// when no food is in range. Read same-cycle by the homeostasis pass to form
-/// the approach potential `Φ`. Per-agent live state, regenerated each run —
+/// Planar distance (world units) to the nearest food within `FOOD_SENSE_RADIUS`,
+/// written by the food-detect pass each cycle; the `FOOD_SENSE_RADIUS` sentinel
+/// when no food is in range. Per-agent live state, regenerated each run —
 /// never serialized or inherited.
 pub const P_NEAREST_FOOD_DISTANCE: usize = 32;
-/// Previous brain tick's approach potential `Φ(s)`, written by the homeostasis
-/// pass after forming the shaping term `F = γΦ(s′) − Φ(s)`. Reset on respawn so
-/// the food teleport-on-eat cannot inject a spurious shaping reward across a
-/// death.
+/// Reserved: previous brain tick's approach potential (no longer written
+/// after reward-shaping removal). Retained for layout parity and test
+/// compatibility; reset on respawn. Per-agent live state, never serialized.
 pub const P_PREV_POTENTIAL: usize = 33;
 /// Signed bearing (radians) from current facing direction to the nearest
 /// in-range food, computed in agent_food_detect. Sentinel value is 0.0 when no
@@ -212,8 +210,9 @@ pub const P_NEAREST_DANGER_DISTANCE: usize = 39;
 /// danger biome cell. Computed like P_NEAREST_FOOD_BEARING. Sentinel value is 0.0
 /// when no danger is in range.
 pub const P_NEAREST_DANGER_BEARING: usize = 40;
-/// Previous avoidance potential, used for potential-based shaping. Mirrors
-/// P_PREV_POTENTIAL's pattern for danger avoidance. Reset on respawn.
+/// Reserved: previous avoidance potential (no longer written after reward-shaping
+/// removal). Retained for layout parity and test compatibility; reset on respawn.
+/// Per-agent live state, never serialized.
 pub const P_PREV_DANGER_POTENTIAL: usize = 41;
 /// Cumulative count of ticks where danger was in sense range. Used to compute
 /// the fraction of ticks where avoidance decision was made.
@@ -221,14 +220,19 @@ pub const P_AVOIDANCE_SENSE_RANGE_TICKS: usize = 42;
 /// Cumulative count of ticks where danger was in sense range AND the motor turn
 /// opposed the danger bearing (deliberate turn-away). Used to compute avoidance intent.
 pub const P_AVOIDANCE_TURNS_OPPOSING: usize = 43;
-pub const PHYS_STRIDE: usize = 44;
+/// Pre-amplification homeostatic learning signal raw_gradient
+/// (pure homeostatic: energy_delta*ENERGY_WEIGHT + integrity_delta*INTEGRITY_WEIGHT),
+/// written by coop_habituate_homeo for CPU readback. Per-agent live state,
+/// never serialized.
+pub const P_RAW_GRADIENT_OUT: usize = 44;
+pub const PHYS_STRIDE: usize = 45;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
 // ── Sensory constants ───────────────────────────────────────────────────────
 
 /// World-units radius within which danger biome cells are sensed for avoidance
-/// potential and bearing calculation. Symmetric to SHAPING_RADIUS (food).
+/// bearing calculation. Symmetric to FOOD_SENSE_RADIUS (food).
 pub const DANGER_SENSE_RADIUS: f32 = 30.0;
 
 // ── Runtime layout for configurable vision dimensions ─────────────────
@@ -515,11 +519,12 @@ pub const CFG_INTEGRITY_SCALE: usize = 8;
 /// previously-unused padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by
 /// `CFG_VISUAL_CORTEX_ENABLED` in `common.wgsl`.
 pub const CFG_VISUAL_CORTEX_ENABLED: usize = 9;
-/// Danger-avoidance potential shaping gate flag (plan 0009). `1.0` = compute danger
-/// avoidance potential shaping and add to raw_gradient, `0.0` = no-op (danger
-/// telemetry still computed, but potential shaping gated off). Uses a previously-unused
-/// padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by `CFG_DANGER_PERCEPT_ENABLED`
-/// in `common.wgsl`.
+/// Danger-percept sensory feature gate flag. `1.0` = pack danger distance and bearing
+/// into the encoder input (two additional non-visual features via `DANGER_PERCEPT_FEATURES_ACTIVE`),
+/// `0.0` = no-op (danger features omitted from sensory input). The avoidance-PBRS shaping
+/// term that formerly read this flag has been removed; this flag now controls only sensory
+/// feature availability, not any reward shaping. Uses a previously-unused padding slot, so
+/// `CONFIG_SIZE` is unchanged. Mirrored by `CFG_DANGER_PERCEPT_ENABLED` in `common.wgsl`.
 pub const CFG_DANGER_PERCEPT_ENABLED: usize = 10;
 pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
 
@@ -1496,6 +1501,7 @@ mod tests {
             P_PREV_DANGER_POTENTIAL,
             P_AVOIDANCE_SENSE_RANGE_TICKS,
             P_AVOIDANCE_TURNS_OPPOSING,
+            P_RAW_GRADIENT_OUT,
         ]
         .iter()
         .max()

@@ -91,8 +91,8 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Danger percept telemetry: reset to sentinel values, will be recomputed
     physics_state[base + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
     physics_state[base + P_NEAREST_DANGER_BEARING]  = 0.0;
-    // Potential-based shaping state: reset so respawn cannot inject spurious rewards.
-    // Food approach and danger-avoidance potentials both reset to zero.
+    // Reserved potential slots (shaping removed); zeroed on respawn so no stale
+    // value carries across death. Food-approach and danger-avoidance both reset.
     physics_state[base + P_PREV_POTENTIAL]          = 0.0;
     physics_state[base + P_PREV_DANGER_POTENTIAL]   = 0.0;
 

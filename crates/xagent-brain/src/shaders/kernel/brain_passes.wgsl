@@ -28,7 +28,7 @@ const DENSE_INNER_LANES: u32 = 4u;
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_habituated: array<f32, ENCODED_DIMENSION>;
-var<workgroup> s_homeo: array<f32, 6>;
+var<workgroup> s_homeo: array<f32, 7>;
 var<workgroup> s_similarities: array<f32, MEMORY_CAP>;
 var<workgroup> shared_sort_indices: array<u32, MEMORY_CAP>;
 var<workgroup> s_recall: array<f32, 17>;
@@ -761,6 +761,8 @@ fn coop_encode(agent_id: u32, tid: u32) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 3: Habituate + Homeostasis (threads 0..31 + thread 0)
 // ═══════════════════════════════════════════════════════════════════════════
+// Computes pure homeostatic gradients (energy_delta*ENERGY_WEIGHT + integrity_delta*INTEGRITY_WEIGHT)
+// with no reward-shaping terms. Drives all downstream credit assignment.
 
 fn coop_habituate_homeo(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
@@ -788,38 +790,11 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let prev_integrity = brain_state[brain_base + O_HOMEO + 5u];
         let energy_delta = clamp(energy - prev_energy, -MAX_HOMEOSTATIC_DELTA, MAX_HOMEOSTATIC_DELTA);
         let integrity_delta = clamp(integrity - prev_integrity, -MAX_HOMEOSTATIC_DELTA, MAX_HOMEOSTATIC_DELTA);
-        // Potential-based approach shaping (optimal-policy-invariant). Φ(s) =
-        // −gain·d_norm rises toward 0 as the agent closes on in-range food;
-        // F = γΦ(s′) − Φ(s) telescopes over an episode, so it only accelerates
-        // credit toward the unchanged eat objective, never alters it. Folding F
-        // into raw_gradient here (not just the TD reward) propagates the
-        // approach signal to the reward, the homeostatic EMAs, and the memory
-        // valence in one place. P_NEAREST_FOOD_DISTANCE was written same-cycle by
-        // the food-detect pass; phys_base_homeo is already bound above.
-        let d_norm = clamp(
-            physics_state[phys_base_homeo + P_NEAREST_FOOD_DISTANCE] / SHAPING_RADIUS,
-            0.0, 1.0);
-        let potential = -APPROACH_SHAPING_GAIN * d_norm;
-        let prev_potential = physics_state[phys_base_homeo + P_PREV_POTENTIAL];
-        let shaping = TD_DISCOUNT * potential - prev_potential;
-        physics_state[phys_base_homeo + P_PREV_POTENTIAL] = potential;
+        // Shaping term removed: pure homeostatic learning only.
+        let shaping: f32 = 0.0;
 
-        // Avoidance potential shaping: Φ_d(s) = -(1 - nearest_danger_distance /
-        // DANGER_SENSE_RADIUS). More negative as danger nears; shaping reward
-        // adds γ·Φ_d(s') − Φ_d(s), so moving away yields positive increment,
-        // moving toward yields negative. Behind danger_percept_enabled flag
-        // (default false).
-        var danger_shaping: f32 = 0.0;
-        if (bc_f32(CFG_DANGER_PERCEPT_ENABLED) != 0.0) {
-            let danger_dist = physics_state[phys_base_homeo + P_NEAREST_DANGER_DISTANCE];
-            let danger_d_norm = clamp(
-                danger_dist / max(DANGER_SENSE_RADIUS, EPSILON),
-                0.0, 1.0);
-            let danger_potential = -(1.0 - danger_d_norm);
-            let prev_danger_potential = physics_state[phys_base_homeo + P_PREV_DANGER_POTENTIAL];
-            danger_shaping = TD_DISCOUNT * danger_potential - prev_danger_potential;
-            physics_state[phys_base_homeo + P_PREV_DANGER_POTENTIAL] = danger_potential;
-        }
+        // Avoidance shaping term removed: danger percept remains available to encoder/predictor for natural discovery.
+        let danger_shaping: f32 = 0.0;
         let raw_gradient = energy_delta * ENERGY_WEIGHT
             + integrity_delta * INTEGRITY_WEIGHT
             + shaping
@@ -844,6 +819,7 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         let raw_gradient_amplified = raw_gradient * (1.0 + urgency);
         s_homeo[0u] = gradient;
         s_homeo[1u] = raw_gradient_amplified;
+        s_homeo[6u] = raw_gradient;
         s_homeo[2u] = urgency;
         s_homeo[3u] = gradient_fast;
         s_homeo[4u] = gradient_medium;
@@ -1468,6 +1444,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         physics_state[phys_base + P_MOTOR_FWD_OUT] = forward;
         physics_state[phys_base + P_MOTOR_TURN_OUT] = turn;
         physics_state[phys_base + P_GRADIENT_OUT] = gradient;
+        physics_state[phys_base + P_RAW_GRADIENT_OUT] = s_homeo[6u];
         physics_state[phys_base + P_URGENCY_OUT] = urgency;
     }
     workgroupBarrier();

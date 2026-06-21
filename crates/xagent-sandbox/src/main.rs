@@ -121,7 +121,12 @@ struct Cli {
     #[arg(long)]
     validate_speed_decoupling: bool,
 
-    /// Number of generations for speed-decoupling validation (default: 10)
+    /// Run innate-instinct validation: A/B test with innate_instincts_enabled
+    /// OFF (baseline) vs ON, measuring survival, alignment, and food-per-death.
+    #[arg(long)]
+    validate_innate_instincts: bool,
+
+    /// Number of generations for validation (default: 10)
     #[arg(long, default_value_t = 10)]
     validation_generations: u64,
 }
@@ -654,6 +659,11 @@ fn main() {
 
     if cli.validate_speed_decoupling {
         headless::validate_speed_decoupling(config, cli.validation_generations);
+        return;
+    }
+
+    if cli.validate_innate_instincts {
+        headless::validate_innate_instincts(config, cli.validation_generations);
         return;
     }
 

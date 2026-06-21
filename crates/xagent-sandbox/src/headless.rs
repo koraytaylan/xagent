@@ -424,11 +424,12 @@ pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
 
     // Baseline run (all flags off)
     println!("\n[BASELINE] effort-rebased fitness / super-linear drag / danger percept OFF");
-    let baseline_stats = run_headless_with_flags(config.clone(), num_generations, false, false);
+    let baseline_stats =
+        run_headless_with_flags(config.clone(), num_generations, false, false, false);
 
     // On run: effort-rebased fitness, super-linear drag at k=2.0, and danger percept all on
     println!("\n[ON] effort-rebased fitness / super-linear drag / danger percept ON");
-    let on_stats = run_headless_with_flags(config.clone(), num_generations, true, true);
+    let on_stats = run_headless_with_flags(config.clone(), num_generations, true, true, false);
 
     // Compute and report metrics
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -453,6 +454,105 @@ pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
     }
 }
 
+/// Run innate-instinct prove-or-kill A/B benchmark.
+/// Baseline: innate_instincts_enabled=false (blank slate, learning from scratch).
+/// ON: innate_instincts_enabled=true (seeded instinct patterns + learning).
+/// Both arms use identical seeded populations and worlds (deterministic mutations from config.world.seed).
+/// Evaluates three gates: survival (+10%), alignment (>=0.4), food-per-death (>=2.0, real food/deaths).
+pub fn validate_innate_instincts(config: FullConfig, num_generations: u64) {
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("INNATE-INSTINCT VALIDATION");
+    println!(
+        "Running {} generations with innate_instincts_enabled OFF (baseline) then ON",
+        num_generations
+    );
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let (_baseline_stats, _on_stats, passed) = run_innate_instinct_ab(config, num_generations);
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("RESULTS");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    println!(
+        "\nFinal Decision: {}",
+        if passed {
+            "✓✓✓ ALL GATES PASS"
+        } else {
+            "✗✗✗ GATE FAILURE"
+        }
+    );
+}
+
+/// Run innate-instinct A/B comparison and evaluate gates.
+/// Returns (baseline_stats, on_stats, passed: bool).
+fn run_innate_instinct_ab(
+    config: FullConfig,
+    num_generations: u64,
+) -> (ValidationStats, ValidationStats, bool) {
+    // Baseline: innate_instincts_enabled=false (blank slate, learning from scratch).
+    // All speed-decoupling flags off — isolates the innate-instinct flag as the only variable.
+    println!("\n=== Baseline (innate_instincts_enabled=false) ===");
+    let baseline_stats =
+        run_headless_with_flags(config.clone(), num_generations, false, false, false);
+
+    // ON: innate_instincts_enabled=true (seeded instincts).
+    // All speed-decoupling flags remain off — same single-variable isolation.
+    println!("\n=== ON (innate_instincts_enabled=true) ===");
+    let on_stats = run_headless_with_flags(config.clone(), num_generations, false, false, true);
+
+    // Apply gates.
+    println!("\n=== Gate Evaluation ===");
+
+    let survival_gate = on_stats.mean_ticks_alive
+        >= ((baseline_stats.mean_ticks_alive as f32) * (1.0 + INSTINCT_SURVIVAL_MARGIN)) as u64;
+    println!(
+        "Survival gate (ON >= baseline × {:.1}%): baseline={}, ON={} → {}",
+        INSTINCT_SURVIVAL_MARGIN * 100.0,
+        baseline_stats.mean_ticks_alive,
+        on_stats.mean_ticks_alive,
+        if survival_gate {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
+    );
+
+    let alignment_gate = on_stats.mean_avoidance_intent_fraction >= INSTINCT_ALIGNMENT_FLOOR;
+    println!(
+        "Alignment gate (avoidance-intent >= {:.1}): ON={:.3} → {}",
+        INSTINCT_ALIGNMENT_FLOOR,
+        on_stats.mean_avoidance_intent_fraction,
+        if alignment_gate {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
+    );
+
+    // REAL food consumed (population mean), never mean_fitness (a composite).
+    let food_per_death_on = if on_stats.mean_death_count > FOOD_PER_DEATH_ZERO_GUARD {
+        on_stats.mean_food_consumed / on_stats.mean_death_count
+    } else {
+        f32::INFINITY
+    };
+    let food_per_death_gate = food_per_death_on >= INSTINCT_FOOD_PER_DEATH_MIN;
+    println!(
+        "Food-per-death gate (ratio >= {:.1}): ON={:.2} → {}",
+        INSTINCT_FOOD_PER_DEATH_MIN,
+        food_per_death_on,
+        if food_per_death_gate {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
+    );
+
+    let passed = survival_gate && alignment_gate && food_per_death_gate;
+
+    (baseline_stats, on_stats, passed)
+}
+
 /// Statistics collected during a headless run.
 #[derive(Clone, Debug)]
 struct ValidationStats {
@@ -463,6 +563,9 @@ struct ValidationStats {
     /// Uncapped: unlike `mean_ticks_alive`, this is never pinned to `tick_budget`.
     /// A value of 0.0 means no agent ever died — a population-viability red flag.
     mean_death_count: f32,
+    /// Mean food consumed per agent across all agents and all generations.
+    /// Used for food-per-death ratio calculation in instinct validation.
+    mean_food_consumed: f32,
     speed_fitness_correlation: f32,
     death_speed_regression: f32,
     food_per_energy_vs_speed_slope: f32,
@@ -479,6 +582,24 @@ struct ValidationStats {
 /// disproportionately more. k=1.0 in the baseline run is a bit-exact no-op per
 /// the WGSL guard.
 const ON_SPEED_COST_EXPONENT: f32 = 2.0;
+
+/// Guard value for the food-per-death denominator.
+/// Treats mean_death_count values below this threshold as effectively zero, returning
+/// f32::INFINITY instead of dividing. Chosen at 1e-4 to absorb floating-point imprecision
+/// near zero (e.g., a sub-1-per-10000 death rate is meaninglessly small as a divisor).
+const FOOD_PER_DEATH_ZERO_GUARD: f32 = 1e-4;
+
+/// Gate: ON (instincts seeded) must improve survival over baseline by at least this margin.
+/// Tuned at 0.10 (10%) to require meaningful benefit while tolerating natural variance.
+const INSTINCT_SURVIVAL_MARGIN: f32 = 0.10;
+
+/// Gate: mean avoidance-intent fraction (turns opposing danger bearing) in ON run
+/// must exceed this floor. Tuned at 0.4 to require substantial steering-alignment.
+const INSTINCT_ALIGNMENT_FLOOR: f32 = 0.4;
+
+/// Gate: ON run's food-per-death ratio (mean food count / mean death count) must
+/// exceed this threshold. Tuned at 2.0 to require at least 2 food consumed per death.
+const INSTINCT_FOOD_PER_DEATH_MIN: f32 = 2.0;
 
 /// Gate: baseline must have an exploitable speed-fitness correlation.
 /// The gate only certifies decoupling when the baseline actually had a speed
@@ -501,30 +622,37 @@ const AVOIDANCE_FLOOR: f32 = 0.05;
 
 /// Run headless evolution and collect statistics with specified flags.
 ///
-/// `flags_on = true` activates all three mechanisms together:
+/// `effort_rebased_fitness = true` activates effort-rebased fitness + super-linear drag:
 ///   - `effort_rebased_fitness`: food-per-energy + cells-per-distance
 ///   - `speed_cost_exponent = 2.0`: super-linear locomotor drag above baseline
 ///   - `danger_percept_enabled`: dedicated danger bearing/distance senses
+///   - `innate_instincts_enabled`: seeded instinct patterns for the innate-instinct A/B harness.
+///     Pass `false` for the speed-decoupling harness (baseline and ON arms both use `false`).
 fn run_headless_with_flags(
     mut config: FullConfig,
     num_generations: u64,
     effort_rebased_fitness: bool,
     danger_percept_enabled: bool,
+    innate_instincts_enabled: bool,
 ) -> ValidationStats {
     // Set the validation flags.
-    // When enabling, also engage the super-linear drag at k=2.0 — the keystone
-    // mechanism that makes the energy-drain axis speed-dependent.
+    // When enabling effort-rebased fitness, also engage the super-linear drag at k=2.0 — the
+    // keystone mechanism that makes the energy-drain axis speed-dependent.
     // Leaving speed_cost_exponent=1.0 in the ON run would make the ON and baseline
     // runs byte-identical on the energy-drain axis, defeating the measurement.
     config.brain.effort_rebased_fitness = effort_rebased_fitness;
     config.brain.danger_percept_enabled = danger_percept_enabled;
+    config.brain.innate_instincts_enabled = innate_instincts_enabled;
     if effort_rebased_fitness {
         config.brain.speed_cost_exponent = ON_SPEED_COST_EXPONENT;
     }
 
     println!(
-        "  Flags: effort_rebased={}, danger_percept={}, speed_cost_exponent={}",
-        effort_rebased_fitness, danger_percept_enabled, config.brain.speed_cost_exponent
+        "  Flags: effort_rebased={}, danger_percept={}, speed_cost_exponent={}, innate_instincts={}",
+        effort_rebased_fitness,
+        danger_percept_enabled,
+        config.brain.speed_cost_exponent,
+        innate_instincts_enabled
     );
 
     // Create a temporary database for this run
@@ -795,6 +923,15 @@ fn run_headless_with_flags(
     } else {
         death_counts.iter().sum::<f32>() / death_counts.len() as f32
     };
+    let mean_food_consumed = if all_agents_fitness.is_empty() {
+        0.0
+    } else {
+        all_agents_fitness
+            .iter()
+            .map(|f| f.food_consumed as f32)
+            .sum::<f32>()
+            / all_agents_fitness.len() as f32
+    };
     let food_per_energy: Vec<f32> = all_agents_fitness
         .iter()
         .map(|f| {
@@ -834,6 +971,7 @@ fn run_headless_with_flags(
         mean_movement_speed,
         mean_ticks_alive,
         mean_death_count,
+        mean_food_consumed,
         speed_fitness_correlation,
         death_speed_regression,
         food_per_energy_vs_speed_slope,
@@ -1281,6 +1419,7 @@ mod tests {
             mean_movement_speed: 50.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.31,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1293,6 +1432,7 @@ mod tests {
             mean_movement_speed: 45.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.295, // dropped only 0.015, below DECOUPLE_MARGIN=0.02
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1334,6 +1474,7 @@ mod tests {
             mean_movement_speed: 50.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.25,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1361,6 +1502,7 @@ mod tests {
             mean_movement_speed: 50.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.5,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1373,6 +1515,7 @@ mod tests {
             mean_movement_speed: 45.0,
             mean_ticks_alive: 900000,
             mean_death_count: 0.0, // Zero deaths: viability collapse
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.15,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1413,6 +1556,7 @@ mod tests {
             mean_movement_speed: 45.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.15,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1439,6 +1583,7 @@ mod tests {
             mean_movement_speed: 50.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.5, // exploitable baseline
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1451,6 +1596,7 @@ mod tests {
             mean_movement_speed: 45.0,
             mean_ticks_alive: 900000,
             mean_death_count: 3.0, // deaths > 0 so viability_ok is true
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.15, // < DECOUPLE_CORR_MAX and 0.5-0.15=0.35 >= DECOUPLE_MARGIN
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1503,6 +1649,7 @@ mod tests {
             mean_movement_speed: 50.0,
             mean_ticks_alive: 900000,
             mean_death_count: 5.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.5,
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1515,6 +1662,7 @@ mod tests {
             mean_movement_speed: 45.0,
             mean_ticks_alive: 900000,
             mean_death_count: 3.0,
+            mean_food_consumed: 10.0,
             speed_fitness_correlation: 0.25, // 0.5 - 0.25 = 0.25 >= DECOUPLE_MARGIN
             death_speed_regression: 0.0,
             food_per_energy_vs_speed_slope: 0.0,
@@ -1536,5 +1684,142 @@ mod tests {
             speed_decoupled && viability_ok && danger_retained && avoidance_above_chance;
 
         assert!(gate_passed, "gate should pass when all criteria are met");
+    }
+
+    // ── innate-instinct validation gate predicates ──────────────────────
+
+    #[test]
+    fn innate_gate_survival_requires_10_percent_improvement() {
+        // Test the survival gate predicate: ON ticks must exceed baseline by 10%.
+        let baseline_ticks = 100000u64;
+        let on_ticks_below = 109999u64; // Just below 110% threshold
+        let on_ticks_at = 110000u64; // Exactly at 110%
+        let on_ticks_above = 110001u64; // Above 110%
+
+        let threshold = (baseline_ticks as f32 * (1.0 + INSTINCT_SURVIVAL_MARGIN)) as u64;
+
+        // Below threshold should fail
+        assert!(
+            on_ticks_below < threshold,
+            "test setup: on_ticks_below should be below threshold"
+        );
+
+        // At or above threshold should pass
+        assert!(
+            on_ticks_at >= threshold,
+            "test setup: on_ticks_at should be at threshold"
+        );
+        assert!(
+            on_ticks_above >= threshold,
+            "test setup: on_ticks_above should be above threshold"
+        );
+    }
+
+    #[test]
+    fn innate_gate_alignment_requires_0_4_avoidance_intent() {
+        // Test alignment gate predicate: avoidance-intent fraction must be >= 0.4.
+        let below_floor = 0.39999_f32;
+        let at_floor = 0.4_f32;
+        let above_floor = 0.40001_f32;
+
+        // Below floor should fail gate
+        assert!(
+            below_floor < INSTINCT_ALIGNMENT_FLOOR,
+            "below_floor should fail alignment gate"
+        );
+
+        // At or above floor should pass gate
+        assert!(
+            at_floor >= INSTINCT_ALIGNMENT_FLOOR,
+            "at_floor should pass alignment gate"
+        );
+        assert!(
+            above_floor >= INSTINCT_ALIGNMENT_FLOOR,
+            "above_floor should pass alignment gate"
+        );
+    }
+
+    #[test]
+    fn innate_gate_food_per_death_requires_2_0_ratio() {
+        // Test food-per-death gate predicate: ratio must be >= 2.0.
+        let mean_food = 10.0_f32;
+        let death_count_below = 5.00001_f32; // ratio = 10 / 5.00001 ≈ 1.9999 < 2.0
+        let death_count_at = 5.0_f32; // ratio = 10 / 5.0 = 2.0
+        let death_count_above = 4.99999_f32; // ratio = 10 / 4.99999 ≈ 2.00001 > 2.0
+
+        let ratio_below = mean_food / death_count_below;
+        let ratio_at = mean_food / death_count_at;
+        let ratio_above = mean_food / death_count_above;
+
+        // Below threshold should fail gate
+        assert!(
+            ratio_below < INSTINCT_FOOD_PER_DEATH_MIN,
+            "ratio_below should fail food-per-death gate"
+        );
+
+        // At or above threshold should pass gate
+        assert!(
+            ratio_at >= INSTINCT_FOOD_PER_DEATH_MIN,
+            "ratio_at should pass food-per-death gate"
+        );
+        assert!(
+            ratio_above >= INSTINCT_FOOD_PER_DEATH_MIN,
+            "ratio_above should pass food-per-death gate"
+        );
+    }
+
+    #[test]
+    fn innate_gate_food_per_death_infinity_with_zero_deaths() {
+        // Edge case: zero deaths yields infinity, which always passes food-per-death gate.
+        let mean_food = 10.0_f32;
+        let zero_deaths = 0.0_f32;
+
+        let food_per_death = if zero_deaths > FOOD_PER_DEATH_ZERO_GUARD {
+            mean_food / zero_deaths
+        } else {
+            f32::INFINITY
+        };
+
+        // Infinity should pass the gate
+        assert!(
+            food_per_death >= INSTINCT_FOOD_PER_DEATH_MIN,
+            "food_per_death=infinity should pass the threshold"
+        );
+    }
+
+    #[test]
+    fn innate_gate_all_three_predicates_required() {
+        // Verify that all three gates are conjunctive (all must be true).
+        // Test a scenario where two pass but one fails.
+
+        // Survival gate passes (ON = baseline + 15%)
+        let baseline_ticks = 100000u64;
+        let on_ticks = 115000u64;
+
+        // Alignment gate passes (ON avoidance = 0.5 > 0.4)
+        let on_avoidance = 0.5_f32;
+
+        // Food-per-death gate FAILS (ratio = 1.5 < 2.0)
+        let on_food = 7.5_f32;
+        let on_death = 5.0_f32;
+        let on_food_per_death = on_food / on_death;
+
+        // Individual gate evaluations
+        let survival_gate =
+            on_ticks >= ((baseline_ticks as f32) * (1.0 + INSTINCT_SURVIVAL_MARGIN)) as u64;
+        let alignment_gate = on_avoidance >= INSTINCT_ALIGNMENT_FLOOR;
+        let food_per_death_gate = on_food_per_death >= INSTINCT_FOOD_PER_DEATH_MIN;
+
+        // Verify individual gate states
+        assert!(survival_gate, "survival gate should pass");
+        assert!(alignment_gate, "alignment gate should pass");
+        assert!(!food_per_death_gate, "food-per-death gate should fail");
+
+        // Combined gate must fail
+        let combined_gate = survival_gate && alignment_gate && food_per_death_gate;
+        assert!(
+            !combined_gate,
+            "combined gate must fail when any individual gate fails"
+        );
     }
 }

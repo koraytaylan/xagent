@@ -508,6 +508,21 @@ impl GpuKernel {
         self.has_subgroup
     }
 
+    /// Gate helper: return initialized pattern memory for a fresh agent, optionally
+    /// seeded with innate instinct priors. When `config.innate_instincts_enabled`
+    /// is true, returns seeded danger and food patterns. When false, returns
+    /// blank-slate memory (byte-identical to pre-instinct behavior).
+    fn pattern_init_for(config: &BrainConfig) -> Vec<f32> {
+        if config.innate_instincts_enabled {
+            seed_instinct_patterns(
+                config.instinct_danger_strength,
+                config.instinct_food_strength,
+            )
+        } else {
+            init_pattern_memory()
+        }
+    }
+
     /// Re-initialize all per-agent GPU state for a new generation without
     /// recreating the device, pipelines, or buffers.  The caller must also
     /// call `upload_agents` afterwards to set physics positions.
@@ -555,7 +570,7 @@ impl GpuKernel {
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
         for _ in 0..n {
             brain_data.extend_from_slice(&init_brain_state_for(brain_config, &self.layout, rng));
-            pattern_data.extend_from_slice(&init_pattern_memory());
+            pattern_data.extend_from_slice(&Self::pattern_init_for(brain_config));
         }
         self.queue.write_buffer(
             &self.brain_state_buffer,
@@ -853,7 +868,7 @@ impl GpuKernel {
         let mut pattern_data = Vec::with_capacity(n * PATTERN_STRIDE);
         for _ in 0..n {
             brain_data.extend_from_slice(&init_brain_state_for(brain_config, &layout, &mut rng));
-            pattern_data.extend_from_slice(&init_pattern_memory());
+            pattern_data.extend_from_slice(&Self::pattern_init_for(brain_config));
         }
         queue.write_buffer(&brain_state_buffer, 0, bytemuck::cast_slice(&brain_data));
         queue.write_buffer(&pattern_buffer, 0, bytemuck::cast_slice(&pattern_data));
@@ -2836,7 +2851,7 @@ impl GpuKernel {
                 &self.layout,
                 &mut rng,
             ));
-            pattern_data.extend_from_slice(&init_pattern_memory());
+            pattern_data.extend_from_slice(&Self::pattern_init_for(brain_config));
         }
         self.queue.write_buffer(
             &self.brain_state_buffer,
@@ -3552,6 +3567,25 @@ mod tests {
         assert!(
             BITONIC_SUBGROUP_SRC.contains("subgroupShuffle"),
             "bitonic_sort_subgroup.wgsl must rely on subgroupShuffle — otherwise why live in a separate file"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Pattern initialization — gate-aware helper ensures byte-identical behavior
+    // when innate_instincts_enabled is false.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pattern_init_for_calls_init_pattern_memory_when_gate_is_off() {
+        let mut config = BrainConfig::default();
+        config.innate_instincts_enabled = false;
+
+        let gated_result = GpuKernel::pattern_init_for(&config);
+        let blank_slate = init_pattern_memory();
+
+        assert_eq!(
+            gated_result, blank_slate,
+            "pattern_init_for must return init_pattern_memory() output when innate_instincts_enabled is false"
         );
     }
 }

@@ -20,7 +20,8 @@ use xagent_brain::buffers::{
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
     DOG_SURROUND_RATIO_MIN, GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX,
-    GABOR_WAVELENGTH_MIN, ORIENTATION_OFFSET_PERIOD,
+    GABOR_WAVELENGTH_MIN, INSTINCT_DANGER_STRENGTH_MAX, INSTINCT_DANGER_STRENGTH_MIN,
+    INSTINCT_FOOD_STRENGTH_MAX, INSTINCT_FOOD_STRENGTH_MIN, ORIENTATION_OFFSET_PERIOD,
 };
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -472,6 +473,8 @@ fn mutate_config_with_strength_rng(
         danger_percept_enabled: parent.danger_percept_enabled,
         // Effort-rebased fitness gate is locked per batch (not heritable); pass through.
         effort_rebased_fitness: parent.effort_rebased_fitness,
+        // Innate-instincts gate is locked per batch (not heritable); pass through.
+        innate_instincts_enabled: parent.innate_instincts_enabled,
         // Heritable visual-genome genes (plan 0008). Each is perturbed with
         // momentum and clamped to the same bounds the shader re-imposes after
         // reading the gene. `orientation_offset` has no hard clamp — orientation
@@ -503,6 +506,24 @@ fn mutate_config_with_strength_rng(
                 strength,
             )
             .rem_euclid(ORIENTATION_OFFSET_PERIOD),
+        // Heritable instinct genes: instinct strengths perturbed with
+        // momentum and clamped to [INSTINCT_*_STRENGTH_MIN, INSTINCT_*_STRENGTH_MAX].
+        instinct_danger_strength: momentum
+            .biased_perturb_f(
+                rng,
+                parent.instinct_danger_strength,
+                "instinct_danger_strength",
+                strength,
+            )
+            .clamp(INSTINCT_DANGER_STRENGTH_MIN, INSTINCT_DANGER_STRENGTH_MAX),
+        instinct_food_strength: momentum
+            .biased_perturb_f(
+                rng,
+                parent.instinct_food_strength,
+                "instinct_food_strength",
+                strength,
+            )
+            .clamp(INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX),
     }
 }
 
@@ -653,6 +674,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         danger_percept_enabled: a.danger_percept_enabled,
         // Effort-rebased fitness gate is locked per batch (not heritable); take from `a`.
         effort_rebased_fitness: a.effort_rebased_fitness,
+        // Innate-instincts gate is locked per batch (not heritable); take from `a`.
+        innate_instincts_enabled: a.innate_instincts_enabled,
         // Heritable visual-genome genes (plan 0008): uniform per-gene crossover.
         gabor_wavelength: if rng.random::<f32>() < 0.5 {
             a.gabor_wavelength
@@ -673,6 +696,17 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.orientation_offset
         } else {
             b.orientation_offset
+        },
+        // Heritable instinct genes: uniform per-gene crossover.
+        instinct_danger_strength: if rng.random::<f32>() < 0.5 {
+            a.instinct_danger_strength
+        } else {
+            b.instinct_danger_strength
+        },
+        instinct_food_strength: if rng.random::<f32>() < 0.5 {
+            a.instinct_food_strength
+        } else {
+            b.instinct_food_strength
         },
     }
 }
@@ -932,6 +966,8 @@ mod tests {
             gabor_aspect_ratio: 5.0,
             dog_surround_ratio: 50.0,
             orientation_offset: 10.0,
+            instinct_danger_strength: 10.0,
+            instinct_food_strength: 10.0,
             ..BrainConfig::default()
         };
         let low = BrainConfig {
@@ -939,6 +975,8 @@ mod tests {
             gabor_aspect_ratio: 0.001,
             dog_surround_ratio: 0.1,
             orientation_offset: -10.0,
+            instinct_danger_strength: -1.0,
+            instinct_food_strength: -1.0,
             ..BrainConfig::default()
         };
 
@@ -968,6 +1006,19 @@ mod tests {
                     && child.orientation_offset < ORIENTATION_OFFSET_PERIOD,
                 "orientation_offset out of [0, {ORIENTATION_OFFSET_PERIOD}): {}",
                 child.orientation_offset,
+            );
+            // Instinct danger and food strength genes must stay within [0.1, 1.0].
+            assert!(
+                child.instinct_danger_strength >= INSTINCT_DANGER_STRENGTH_MIN
+                    && child.instinct_danger_strength <= INSTINCT_DANGER_STRENGTH_MAX,
+                "instinct_danger_strength out of [{INSTINCT_DANGER_STRENGTH_MIN}, {INSTINCT_DANGER_STRENGTH_MAX}]: {}",
+                child.instinct_danger_strength,
+            );
+            assert!(
+                child.instinct_food_strength >= INSTINCT_FOOD_STRENGTH_MIN
+                    && child.instinct_food_strength <= INSTINCT_FOOD_STRENGTH_MAX,
+                "instinct_food_strength out of [{INSTINCT_FOOD_STRENGTH_MIN}, {INSTINCT_FOOD_STRENGTH_MAX}]: {}",
+                child.instinct_food_strength,
             );
         };
 

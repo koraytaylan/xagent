@@ -3,8 +3,8 @@
 Task-level execution status for this plan lives here. Keep it current as tasks
 land, and keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
-_Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
+**Status:** ✅ Complete.
+_Last updated: 2026-06-22, against `develop`._
 
 - **Goal:** Seed instinct priors (danger→avoidance, food→approach) into pattern
   memory at brain birth, heritable via evolved strength genes, gated behind
@@ -27,7 +27,7 @@ _Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Innate-Pattern-Seeding | `add-instinct-config-fields`, `implement-seed-instinct-patterns` | 📋 Planned |
-| 0002 | Heritable-Instinct-Config | `add-instinct-mutation-to-breeding` | 📋 Planned |
-| 0003 | Default-Off-Gating | `add-instinct-gate-flag`, `integrate-seeding-into-reset-path` | 📋 Planned |
-| 0004 | Prove-Or-Kill-Gate | `implement-ab-validation-harness`, `author-ab-gate-decision-doc` | 📋 Planned |
+| 0001 | Innate-Pattern-Seeding | `add-instinct-config-fields`, `implement-seed-instinct-patterns` | ✅ Done |
+| 0002 | Heritable-Instinct-Config | `add-instinct-mutation-to-breeding` | ✅ Done |
+| 0003 | Default-Off-Gating | `add-instinct-gate-flag`, `integrate-seeding-into-reset-path` | ✅ Done |
+| 0004 | Prove-Or-Kill-Gate | `implement-ab-validation-harness`, `author-ab-gate-decision-doc` | 🚧 In progress |

@@ -147,6 +147,13 @@ pub struct BrainConfig {
     /// gate passes. Locked per batch, not heritable.
     #[serde(default)]
     pub effort_rebased_fitness: bool,
+    /// Gate flag for seeded innate instinct priors. When `false`,
+    /// pattern memory initializes to all zeros (blank slate, byte-identical to
+    /// pre-instinct behavior). When `true`, danger and food instinct patterns are
+    /// seeded at initialization via seed_instinct_patterns(). Locked per batch,
+    /// not heritable. Default `false` until the prove-or-kill A/B gate passes.
+    #[serde(default)]
+    pub innate_instincts_enabled: bool,
     /// **Heritable (visual genome, plan 0008).** V1 Gabor carrier wavelength λ
     /// in retina pixels for the whole simple-cell bank. The envelope σ is tied
     /// as `0.56·λ` (≈ 1-octave V1 bandwidth, Jones & Palmer 1987). Seed 5.0;
@@ -176,6 +183,18 @@ pub struct BrainConfig {
     /// wrap is the bound the shader and the mutation path both apply.
     #[serde(default = "default_orientation_offset")]
     pub orientation_offset: f32,
+    /// **Heritable (innate instinct gene).** Multiplier for the danger instinct
+    /// pattern's negative valence, controlling how strongly aversive the seeded danger
+    /// prior is. Seed 0.8; mutated during breeding, clamped to
+    /// `[INSTINCT_DANGER_STRENGTH_MIN, INSTINCT_DANGER_STRENGTH_MAX]` = `[0.1, 1.0]`.
+    #[serde(default = "default_instinct_danger_strength")]
+    pub instinct_danger_strength: f32,
+    /// **Heritable (innate instinct gene).** Multiplier for the food instinct
+    /// pattern's positive valence, controlling how strongly appetitive the seeded
+    /// food/energy-gain prior is. Seed 0.8; mutated during breeding, clamped to
+    /// `[INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX]` = `[0.1, 1.0]`.
+    #[serde(default = "default_instinct_food_strength")]
+    pub instinct_food_strength: f32,
 }
 
 /// Upper bound (exclusive) for `orientation_offset`: π. Orientation is
@@ -184,6 +203,14 @@ pub struct BrainConfig {
 /// used in mutation (`agent/mod.rs`) — the shader applies the same wrap when it
 /// reads the gene.
 pub const ORIENTATION_OFFSET_PERIOD: f32 = std::f32::consts::PI;
+
+/// Inclusive clamp bounds for the heritable instinct-strength scalar genes. These
+/// control the magnitude of the seeded danger and food instinct patterns; they are
+/// re-imposed during breeding and in the shader after seeding.
+pub const INSTINCT_DANGER_STRENGTH_MIN: f32 = 0.1;
+pub const INSTINCT_DANGER_STRENGTH_MAX: f32 = 1.0;
+pub const INSTINCT_FOOD_STRENGTH_MIN: f32 = 0.1;
+pub const INSTINCT_FOOD_STRENGTH_MAX: f32 = 1.0;
 
 /// Inclusive clamp bounds for the heritable visual-genome scalar genes (plan
 /// 0008). These mirror the WGSL `GABOR_*`/`DOG_*` clamp constants in
@@ -315,6 +342,14 @@ fn default_dog_surround_ratio() -> f32 {
 /// `GABOR_ORIENTATION_OFFSET_SEED`.
 fn default_orientation_offset() -> f32 {
     0.0
+}
+
+fn default_instinct_danger_strength() -> f32 {
+    0.8
+}
+
+fn default_instinct_food_strength() -> f32 {
+    0.8
 }
 
 /// Describes an agent to be spawned into the world.
@@ -465,10 +500,13 @@ impl Default for BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             effort_rebased_fitness: false,
+            innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
             orientation_offset: default_orientation_offset(),
+            instinct_danger_strength: default_instinct_danger_strength(),
+            instinct_food_strength: default_instinct_food_strength(),
         }
     }
 }
@@ -555,10 +593,13 @@ impl BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             effort_rebased_fitness: false,
+            innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
             orientation_offset: default_orientation_offset(),
+            instinct_danger_strength: default_instinct_danger_strength(),
+            instinct_food_strength: default_instinct_food_strength(),
         }
     }
 
@@ -588,10 +629,13 @@ impl BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             effort_rebased_fitness: false,
+            innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
             orientation_offset: default_orientation_offset(),
+            instinct_danger_strength: default_instinct_danger_strength(),
+            instinct_food_strength: default_instinct_food_strength(),
         }
     }
 }

@@ -809,6 +809,52 @@ pub fn init_pattern_memory() -> Vec<f32> {
     vec![0.0_f32; PATTERN_STRIDE]
 }
 
+/// Seed two innate instinct patterns into the pattern buffer for one agent.
+/// Instinct 0 (slot 0): danger context — high negative valence paired with
+/// avoidance motor priors (backward, evasive turn).
+/// Instinct 1 (slot 1): energy-gain context — high positive valence paired with
+/// approach motor priors (forward, no turn bias).
+/// Both are subject to normal recall, decay, and reinforcement like learned patterns.
+/// Returns a vector of length PATTERN_STRIDE with the two priors pre-filled and
+/// remaining slots zero-initialized.
+pub fn seed_instinct_patterns(danger_strength: f32, food_strength: f32) -> Vec<f32> {
+    let mut patterns = vec![0.0_f32; PATTERN_STRIDE];
+
+    // ─ Instinct 0: danger (slot 0) ─
+    // Encoded state: fixed signature for "danger detected" (e.g., all -0.5).
+    for d in 0..ENCODED_DIMENSION {
+        patterns[O_PAT_STATES + d * MEMORY_CAP] = -0.5;
+    }
+    patterns[O_PAT_NORMS] = 1.0;
+    patterns[O_PAT_REINF] = 1.0;
+    // Motor: [forward, turn, valence]
+    patterns[O_PAT_MOTOR] = -0.7; // backward (escape behavior).
+    patterns[O_PAT_MOTOR + 1] = 0.5; // evasive turn.
+    patterns[O_PAT_MOTOR + 2] = -danger_strength; // strong negative valence.
+                                                  // Active and metadata
+    patterns[O_PAT_ACTIVE] = 1.0;
+    patterns[O_ACTIVE_COUNT] = 1.0;
+    patterns[O_LAST_STORED_IDX] = 1.0;
+
+    // ─ Instinct 1: energy gain / food (slot 1) ─
+    // Encoded state: fixed signature for "food/energy detected" (e.g., all +0.5).
+    for d in 0..ENCODED_DIMENSION {
+        patterns[O_PAT_STATES + d * MEMORY_CAP + 1] = 0.5;
+    }
+    patterns[O_PAT_NORMS + 1] = 1.0;
+    patterns[O_PAT_REINF + 1] = 1.0;
+    // Motor: [forward, turn, valence]
+    patterns[O_PAT_MOTOR + 3] = 0.7; // forward (approach behavior).
+    patterns[O_PAT_MOTOR + 4] = 0.0; // no turn bias.
+    patterns[O_PAT_MOTOR + 5] = food_strength; // strong positive valence.
+                                               // Active and metadata
+    patterns[O_PAT_ACTIVE + 1] = 1.0;
+    patterns[O_ACTIVE_COUNT] = 2.0;
+    patterns[O_LAST_STORED_IDX] = 2.0;
+
+    patterns
+}
+
 /// Build config buffer values from BrainConfig.
 /// Layout is derived from config's `vision_width`/`vision_height`.
 pub fn build_config(config: &BrainConfig) -> Vec<f32> {

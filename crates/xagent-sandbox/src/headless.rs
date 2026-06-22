@@ -11,8 +11,9 @@ use xagent_shared::{BrainConfig, FullConfig};
 use xagent_brain::buffers::{
     BrainLayout, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS,
     O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE,
-    P_AVOIDANCE_SENSE_RANGE_TICKS, P_AVOIDANCE_TURNS_OPPOSING, P_DANGER_PATH_LENGTH, P_DEATH_COUNT,
-    P_DISTANCE_TRAVELED, P_ENERGY_SPENT, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
+    P_APPROACH_SENSE_RANGE_TICKS, P_APPROACH_TURNS_TOWARD, P_AVOIDANCE_SENSE_RANGE_TICKS,
+    P_AVOIDANCE_TURNS_OPPOSING, P_DANGER_PATH_LENGTH, P_DEATH_COUNT, P_DISTANCE_TRAVELED,
+    P_ENERGY_SPENT, P_FOOD_COUNT, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
@@ -234,6 +235,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             agents[i].danger_path_length = state[base + P_DANGER_PATH_LENGTH];
             agents[i].avoidance_sense_range_ticks = state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
             agents[i].avoidance_turns_opposing = state[base + P_AVOIDANCE_TURNS_OPPOSING];
+            agents[i].approach_sense_range_ticks = state[base + P_APPROACH_SENSE_RANGE_TICKS];
+            agents[i].approach_turns_toward = state[base + P_APPROACH_TURNS_TOWARD];
             agents[i].death_count = state[base + P_DEATH_COUNT] as u32;
             final_food += u64::from(agents[i].food_consumed);
             final_alive += agents[i].total_ticks_alive;
@@ -822,6 +825,8 @@ fn run_headless_with_flags(
             agents[i].danger_path_length = state[base + P_DANGER_PATH_LENGTH];
             agents[i].avoidance_sense_range_ticks = state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
             agents[i].avoidance_turns_opposing = state[base + P_AVOIDANCE_TURNS_OPPOSING];
+            agents[i].approach_sense_range_ticks = state[base + P_APPROACH_SENSE_RANGE_TICKS];
+            agents[i].approach_turns_toward = state[base + P_APPROACH_TURNS_TOWARD];
             agents[i].death_count = state[base + P_DEATH_COUNT] as u32;
         }
 

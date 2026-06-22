@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 
 use xagent_brain::buffers::{
-    PHYS_STRIDE, P_ALIVE, P_AVOIDANCE_SENSE_RANGE_TICKS, P_AVOIDANCE_TURNS_OPPOSING,
-    P_DANGER_PATH_LENGTH, P_DEATH_COUNT, P_DISTANCE_TRAVELED, P_ENERGY, P_ENERGY_SPENT,
-    P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y, P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT,
-    P_GRADIENT_OUT, P_INTEGRITY, P_LAST_DEATH_TICK, P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT,
-    P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z, P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT,
-    P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
+    PHYS_STRIDE, P_ALIVE, P_APPROACH_SENSE_RANGE_TICKS, P_APPROACH_TURNS_TOWARD,
+    P_AVOIDANCE_SENSE_RANGE_TICKS, P_AVOIDANCE_TURNS_OPPOSING, P_DANGER_PATH_LENGTH, P_DEATH_COUNT,
+    P_DISTANCE_TRAVELED, P_ENERGY, P_ENERGY_SPENT, P_EXPLORATION_RATE_OUT, P_FACING_X, P_FACING_Y,
+    P_FACING_Z, P_FATIGUE_FACTOR_OUT, P_FOOD_COUNT, P_GRADIENT_OUT, P_INTEGRITY, P_LAST_DEATH_TICK,
+    P_MAX_ENERGY, P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
+    P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
 };
 use xagent_brain::AgentTelemetry;
 
@@ -255,6 +255,8 @@ impl App {
             a.danger_path_length = state[base + P_DANGER_PATH_LENGTH];
             a.avoidance_sense_range_ticks = state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
             a.avoidance_turns_opposing = state[base + P_AVOIDANCE_TURNS_OPPOSING];
+            a.approach_sense_range_ticks = state[base + P_APPROACH_SENSE_RANGE_TICKS];
+            a.approach_turns_toward = state[base + P_APPROACH_TURNS_TOWARD];
             let new_deaths = state[base + P_DEATH_COUNT] as u32;
             let gpu_death_tick = state[base + P_LAST_DEATH_TICK] as u64;
             a.apply_death_count_readback(new_deaths, gpu_death_tick, death_reference_tick);

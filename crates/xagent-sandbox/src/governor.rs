@@ -40,6 +40,8 @@ pub struct AgentFitness {
     pub danger_path_length: f32,
     pub avoidance_sense_range_ticks: f32,
     pub avoidance_turns_opposing: f32,
+    pub approach_sense_range_ticks: f32,
+    pub approach_turns_toward: f32,
 }
 
 /// Foraging rate (food consumed per 1000 alive ticks) that earns a full
@@ -204,6 +206,17 @@ pub(crate) fn compute_avoidance_intent_fraction(fitness: &[AgentFitness]) -> f32
     let total_sense_range_ticks: f32 = fitness.iter().map(|f| f.avoidance_sense_range_ticks).sum();
     let total_turns_opposing: f32 = fitness.iter().map(|f| f.avoidance_turns_opposing).sum();
     total_turns_opposing / total_sense_range_ticks.max(EPSILON)
+}
+
+/// Population fraction of in-sense-range ticks the agents steered toward food.
+/// Sum of approach_turns_toward across the population divided by the sum of
+/// approach_sense_range_ticks. This is the defensible population statistic (sum/sum,
+/// not average-of-ratios) and is computed identically in both production and the
+/// headless harness.
+pub(crate) fn compute_approach_intent_fraction(fitness: &[AgentFitness]) -> f32 {
+    let total_sense_range_ticks: f32 = fitness.iter().map(|f| f.approach_sense_range_ticks).sum();
+    let total_turns_toward: f32 = fitness.iter().map(|f| f.approach_turns_toward).sum();
+    total_turns_toward / total_sense_range_ticks.max(EPSILON)
 }
 
 /// Per-generation within-life foraging tracker. Snapshots cumulative
@@ -675,6 +688,8 @@ impl Governor {
                     danger_path_length: a.danger_path_length,
                     avoidance_sense_range_ticks: a.avoidance_sense_range_ticks,
                     avoidance_turns_opposing: a.avoidance_turns_opposing,
+                    approach_sense_range_ticks: a.approach_sense_range_ticks,
+                    approach_turns_toward: a.approach_turns_toward,
                 }
             })
             .collect();
@@ -862,12 +877,13 @@ impl Governor {
         if let Some(node_id) = self.current_node_id {
             let danger_dwell_fraction = compute_danger_dwell_fraction(fitness);
             let avoidance_intent_fraction = compute_avoidance_intent_fraction(fitness);
+            let approach_intent_fraction = compute_approach_intent_fraction(fitness);
 
             // Insert into behavior_metric table with placeholder values for fields not yet computed
             let _ = self.db.execute(
                 "INSERT INTO behavior_metric \
-                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, danger_dwell_fraction, avoidance_intent_fraction) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, danger_dwell_fraction, avoidance_intent_fraction, approach_intent_fraction) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     node_id,
                     fitness.len() as i64,
@@ -876,6 +892,7 @@ impl Governor {
                     0.0, // straightness placeholder (to be computed from recording later)
                     danger_dwell_fraction,
                     avoidance_intent_fraction,
+                    approach_intent_fraction,
                 ],
             );
         }
@@ -1861,13 +1878,18 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             food_bearing_alignment REAL,
             danger_dwell_fraction REAL,
             danger_exit_latency_ticks REAL,
-            avoidance_intent_fraction REAL
+            avoidance_intent_fraction REAL,
+            approach_intent_fraction REAL
         );",
     )?;
 
     // Backwards-compatible migration: add avoidance_intent_fraction to behavior_metric
     let _ =
         db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN avoidance_intent_fraction REAL;");
+
+    // Backwards-compatible migration: add approach_intent_fraction to behavior_metric
+    let _ =
+        db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN approach_intent_fraction REAL;");
 
     Ok(())
 }
@@ -2040,6 +2062,8 @@ mod tests {
             danger_path_length: 10.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            approach_sense_range_ticks: 0.0,
+            approach_turns_toward: 0.0,
         }]
     }
 
@@ -2082,6 +2106,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             })
             .collect()
     }
@@ -3554,6 +3580,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -3568,6 +3596,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 2,
@@ -3582,6 +3612,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
         ];
 
@@ -3688,6 +3720,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -3705,6 +3739,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 2,
@@ -3722,6 +3758,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 3,
@@ -3739,6 +3777,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
         ];
 
@@ -3792,6 +3832,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 1,
@@ -3809,6 +3851,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 0,
@@ -3826,6 +3870,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
             AgentFitness {
                 agent_index: 3,
@@ -3843,6 +3889,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             },
         ];
 
@@ -3998,6 +4046,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                approach_sense_range_ticks: 0.0,
+                approach_turns_toward: 0.0,
             })
             .collect()
     }
@@ -4058,6 +4108,8 @@ mod tests {
             danger_path_length: 10.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            approach_sense_range_ticks: 0.0,
+            approach_turns_toward: 0.0,
         }];
 
         // Gen 0: succeeds — node config should update to the best performer
@@ -4854,6 +4906,104 @@ mod tests {
              straight-through population ({:.4})",
             avoidance_intent_turn_value,
             avoidance_intent_straight_value
+        );
+    }
+
+    #[test]
+    fn approach_intent_fraction_discriminates_turn_toward() {
+        use glam::Vec3;
+
+        // ── Turn-toward population ───────────────────────────────────────────────
+        let mut gov_turn = test_governor(3);
+
+        let mut agent_turn_0 = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_turn_0.distance_traveled = 100.0;
+        // Sensed food for 80 ticks, turned toward the bearing on 70 of them.
+        agent_turn_0.approach_sense_range_ticks = 80.0;
+        agent_turn_0.approach_turns_toward = 70.0;
+
+        let mut agent_turn_1 = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_turn_1.distance_traveled = 90.0;
+        // Sensed food for 60 ticks, turned toward the bearing on 50 of them.
+        agent_turn_1.approach_sense_range_ticks = 60.0;
+        agent_turn_1.approach_turns_toward = 50.0;
+
+        let agents_turn = vec![agent_turn_0, agent_turn_1];
+        let fitness_turn = gov_turn.evaluate(&agents_turn);
+        let node_id_turn = gov_turn
+            .current_node_id
+            .expect("current_node_id must be set after evaluate");
+        let _result_turn = gov_turn.advance(&fitness_turn);
+
+        let approach_intent_turn: Option<f64> = gov_turn
+            .db
+            .query_row(
+                "SELECT approach_intent_fraction FROM behavior_metric WHERE node_id = ?1",
+                params![node_id_turn],
+                |row| row.get(0),
+            )
+            .expect("behavior_metric row must exist for turn-toward generation");
+
+        let approach_intent_turn_value = approach_intent_turn
+            .expect("approach_intent_fraction must be non-null for turn-toward population");
+
+        // Expected: (70 + 50) / (80 + 60) = 120 / 140 ≈ 0.857
+        let expected_turn = 120.0 / 140.0;
+        assert!(
+            (approach_intent_turn_value - expected_turn).abs() < 1e-5,
+            "turn-toward approach_intent_fraction should be ~{:.4}, got {:.4}",
+            expected_turn,
+            approach_intent_turn_value
+        );
+
+        // ── Straight-through population ───────────────────────────────────────
+        let mut gov_straight = test_governor(3);
+
+        let mut agent_straight_0 = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent_straight_0.distance_traveled = 100.0;
+        // Sensed food for 80 ticks but never turned to approach it.
+        agent_straight_0.approach_sense_range_ticks = 80.0;
+        agent_straight_0.approach_turns_toward = 0.0;
+
+        let mut agent_straight_1 = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        agent_straight_1.distance_traveled = 90.0;
+        // Sensed food for 60 ticks but never turned to approach it.
+        agent_straight_1.approach_sense_range_ticks = 60.0;
+        agent_straight_1.approach_turns_toward = 0.0;
+
+        let agents_straight = vec![agent_straight_0, agent_straight_1];
+        let fitness_straight = gov_straight.evaluate(&agents_straight);
+        let node_id_straight = gov_straight
+            .current_node_id
+            .expect("current_node_id must be set after evaluate");
+        let _result_straight = gov_straight.advance(&fitness_straight);
+
+        let approach_intent_straight: Option<f64> = gov_straight
+            .db
+            .query_row(
+                "SELECT approach_intent_fraction FROM behavior_metric WHERE node_id = ?1",
+                params![node_id_straight],
+                |row| row.get(0),
+            )
+            .expect("behavior_metric row must exist for straight-through generation");
+
+        let approach_intent_straight_value = approach_intent_straight
+            .expect("approach_intent_fraction must be non-null for straight-through population");
+
+        // Expected: 0 / (80 + 60) = 0.0
+        assert!(
+            approach_intent_straight_value.abs() < 1e-9,
+            "straight-through approach_intent_fraction should be 0.0, got {:.6}",
+            approach_intent_straight_value
+        );
+
+        // ── Discrimination assertion ──────────────────────────────────────────
+        assert!(
+            approach_intent_turn_value > approach_intent_straight_value,
+            "turn-toward population ({:.4}) must score higher approach_intent_fraction than \
+             straight-through population ({:.4})",
+            approach_intent_turn_value,
+            approach_intent_straight_value
         );
     }
 

@@ -225,7 +225,13 @@ pub const P_AVOIDANCE_TURNS_OPPOSING: usize = 43;
 /// written by coop_habituate_homeo for CPU readback. Per-agent live state,
 /// never serialized.
 pub const P_RAW_GRADIENT_OUT: usize = 44;
-pub const PHYS_STRIDE: usize = 45;
+/// Cumulative count of ticks where food was in sense range. Used to compute
+/// the fraction of ticks where approach decision was made.
+pub const P_APPROACH_SENSE_RANGE_TICKS: usize = 45;
+/// Cumulative count of ticks where food was in sense range AND the motor turn
+/// rotated toward the nearest food bearing (deliberate turn-toward). Used to compute approach intent.
+pub const P_APPROACH_TURNS_TOWARD: usize = 46;
+pub const PHYS_STRIDE: usize = 47;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -1308,6 +1314,14 @@ mod tests {
             wgsl["P_AVOIDANCE_TURNS_OPPOSING"],
             P_AVOIDANCE_TURNS_OPPOSING as u32
         );
+        assert_eq!(
+            wgsl["P_APPROACH_SENSE_RANGE_TICKS"],
+            P_APPROACH_SENSE_RANGE_TICKS as u32
+        );
+        assert_eq!(
+            wgsl["P_APPROACH_TURNS_TOWARD"],
+            P_APPROACH_TURNS_TOWARD as u32
+        );
     }
 
     #[test]
@@ -1548,6 +1562,8 @@ mod tests {
             P_AVOIDANCE_SENSE_RANGE_TICKS,
             P_AVOIDANCE_TURNS_OPPOSING,
             P_RAW_GRADIENT_OUT,
+            P_APPROACH_SENSE_RANGE_TICKS,
+            P_APPROACH_TURNS_TOWARD,
         ]
         .iter()
         .max()

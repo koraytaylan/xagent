@@ -298,7 +298,7 @@ const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 45u;
+const PHYS_STRIDE: u32 = 47u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -356,6 +356,10 @@ const P_AVOIDANCE_TURNS_OPPOSING: u32 = 43u;
 /// written by coop_habituate_homeo for CPU readback. Per-agent live state,
 /// never serialized.
 const P_RAW_GRADIENT_OUT: u32 = 44u;
+/// Cumulative count of ticks where food was in sense range.
+const P_APPROACH_SENSE_RANGE_TICKS: u32 = 45u;
+/// Cumulative count of ticks where food was in sense range AND motor turn rotated toward bearing.
+const P_APPROACH_TURNS_TOWARD: u32 = 46u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 

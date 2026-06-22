@@ -37,11 +37,12 @@ sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> 
    - [6.6 Prediction + Action Selection](#66-prediction--action-selection----coop_predict_and_act)
    - [6.7 Learning + Memory Storage](#67-learning--memory-storage----coop_learn_and_store)
 7. [Emergent Phenomena](#7-emergent-phenomena)
-8. [Host API (gpu_kernel.rs)](#8-host-api-gpu_kernelrs)
-9. [Configuration (BrainConfig)](#9-configuration-brainconfig)
-10. [Testing](#10-testing)
-11. [Design Decisions](#11-design-decisions)
-12. [Known Limitations & Future Work](#12-known-limitations--future-work)
+8. [Intent & Awareness Telemetry](#8-intent--awareness-telemetry)
+9. [Host API (gpu_kernel.rs)](#9-host-api-gpu_kernelrs)
+10. [Configuration (BrainConfig)](#10-configuration-brainconfig)
+11. [Testing](#11-testing)
+12. [Design Decisions](#12-design-decisions)
+13. [Known Limitations & Future Work](#13-known-limitations--future-work)
 
 ---
 
@@ -644,7 +645,82 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 
 ---
 
-## 8. Host API (gpu_kernel.rs)
+## 8. Intent & Awareness Telemetry
+
+The brain's learned steering behavior is measured through two count-based intent signals that capture whether the agent's motor output aligns with sensed state.
+
+### The Two Intent Signals
+
+**Approach-Intent** measures food-seeking behavior. Each tick the nearest food is in sensory range (`food_distance < FOOD_SENSE_RADIUS`), an **approach sense-range counter** increments; if the agent's motor turn rotates *toward* the food bearing (opposite sign from avoidance), an **approach turns-toward counter** increments. The per-agent approach-intent fraction is `turns_toward / sense_range_ticks` — the fraction of in-range ticks where the motor turn aligned with food.
+
+**Avoidance-Intent** measures danger-avoidance behavior. Each tick the nearest danger is in sensory range (`danger_distance < DANGER_SENSE_RADIUS`), an **avoidance sense-range counter** increments; if the agent's motor turn rotates *away from* the danger bearing, an **avoidance turns-opposing counter** increments. The per-agent avoidance-intent fraction is `turns_opposing / sense_range_ticks` — the fraction of in-range ticks where the motor turn aligned with danger avoidance.
+
+Both counters are **generation-cumulative** — they persist across agent respawn so intent accumulates over the agent's entire lifetime.
+
+### Computation
+
+The four intent counters are incremented every brain cycle in the fused kernel:
+
+- **GPU-side**: In `kernel_tick.wgsl`, the thread-0 block that runs after `agent_food_detect` and `agent_danger_detect` (≈ line 812) calls:
+  - `agent_approach_accumulate(agent_id, motor_turn)` — gates on `food_distance < FOOD_SENSE_RADIUS`, increments `P_APPROACH_SENSE_RANGE_TICKS` and (conditionally) `P_APPROACH_TURNS_TOWARD` using the turn-toward test `(motor_turn * food_bearing) < 0.0`.
+  - `agent_avoidance_accumulate(agent_id, motor_turn)` — gates on `danger_distance < DANGER_SENSE_RADIUS`, increments `P_AVOIDANCE_SENSE_RANGE_TICKS` and (conditionally) `P_AVOIDANCE_TURNS_OPPOSING` using the turn-away test `(motor_turn * danger_bearing) > 0.0`.
+  - Both functions are wrapped in a single thread-0 `workgroupBarrier()` block for synchronization.
+
+- **Death/Respawn preservation**: Both the fused death path (`agent_death_respawn` in `kernel_tick.wgsl`) and the split remainder path (`phase_death.wgsl`) save the four counters before zeroing the per-agent physics state and restore them afterward. This ensures intent accumulates across respawns.
+
+- **CPU-side exposure**: All four counters are exposed on `AgentTelemetry` (in `gpu_kernel.rs`) as `approach_sense_range_ticks`, `approach_turns_toward`, `avoidance_sense_range_ticks`, and `avoidance_turns_opposing`. They are read from the physics state buffer in both readback paths: `read_agent_telemetry_blocking` (for tests and one-shot inspection) and `try_collect_telemetry` (for per-frame UI snapshots).
+
+### Population Aggregation
+
+Per-agent intent fractions are computed from the CPU-side `Agent` cache:
+
+```rust
+pub fn compute_approach_intent_fraction(fitness: &[AgentFitness]) -> f32 {
+    let total_sense_range_ticks: f32 = fitness.iter().map(|f| f.approach_sense_range_ticks).sum();
+    let total_turns_toward: f32 = fitness.iter().map(|f| f.approach_turns_toward).sum();
+    total_turns_toward / total_sense_range_ticks.max(EPSILON)
+}
+
+pub fn compute_avoidance_intent_fraction(fitness: &[AgentFitness]) -> f32 {
+    let total_sense_range_ticks: f32 = fitness.iter().map(|f| f.avoidance_sense_range_ticks).sum();
+    let total_turns_opposing: f32 = fitness.iter().map(|f| f.avoidance_turns_opposing).sum();
+    total_turns_opposing / total_sense_range_ticks.max(EPSILON)
+}
+```
+
+These population fractions are computed at each fitness evaluation and persisted to the `behavior_metric` table as `approach_intent_fraction` and `avoidance_intent_fraction` columns, one row per generation. They aggregate across all agents to show whether the population exhibits goal-directed steering on each axis.
+
+### What They Measure
+
+Intent fractions answer: **does steering correlate with sensed state, or is it incidental motion?**
+
+- **High intent** (e.g., ≥ 0.75): The agent consistently steers in the direction of sensed food or danger. This suggests the agent has learned to couple its motor output to sensed state — whether through direct policy learning or memory recall, steering is deliberate.
+
+- **Low intent** (e.g., ≤ 0.25): The agent's steering is uncorrelated with sensed food/danger. This can arise from pure exploration, from policy learning that hasn't converged, or from an agent so far from any stimulus that the sensory percept is never triggered. Motor output in this range may be statistically random.
+
+- **Chance intent** (0.5): If steering were random with respect to bearing, the intent fraction would be approximately 0.5 (a random turn is equally likely to rotate toward or away from any bearing).
+
+The **baseline distribution** measured under pure homeostatic learning (post-Plan-0012, no reward shaping) provides the reference. By comparing a new condition's intent distribution against this baseline, researchers can detect whether a learning change, an architectural modification, or a world change has moved agents from chance-level to above-chance deliberate steering.
+
+### Reading the Baseline Distribution
+
+The baseline measurement probe (`intent_baseline_measurement.rs`) captures the across-agent distribution of both intent fractions at default config:
+
+- **Mean / Std / Min / Max** — classical summary statistics
+- **p25 / p50 / p75** — percentiles used to classify agents:
+  - **Deliberate** (intent ≥ p75): Agent exhibits above-chance, goal-directed steering
+  - **Incidental** (intent ≤ p25): Agent's steering is at or below chance level
+  - **Ambiguous** (p25 < intent < p75): Agent steering is between these thresholds
+
+A follow-up validation-harness plan will use these percentiles to classify agents and validate that intent thresholds correlate with observable path-coherence metrics (straightness, decision reversal rate, encounter statistics).
+
+### Measurement-Only, Zero Learning Impact
+
+These counters and fractions are **purely observational**. They have zero impact on the kernel's learning, the fitness computation, or agent selection. The counters are computed post-hoc from telemetry and do not feed back into the brain's gradient or credit signals. This design respects the homeostasis-only learning constraint absolutely — intent is a lens on *what was learned*, not a learning signal itself.
+
+---
+
+## 9. Host API (gpu_kernel.rs)
 
 ### GpuKernel
 
@@ -734,7 +810,7 @@ The CPU only learns about a death by reading `physics_state[base + P_DEATH_COUNT
 
 ---
 
-## 9. Configuration (BrainConfig)
+## 10. Configuration (BrainConfig)
 
 The `BrainConfig` struct (defined in `xagent-shared`) provides heritable parameters. Fixed dimensions (`DIM`, `FEATURE_COUNT`, `MEMORY_CAP`, `RECALL_K`) are constants in `buffers.rs`. Tunable parameters are stored per-agent in the brain state buffer and passed to shaders via the config uniform:
 
@@ -778,7 +854,7 @@ The `BrainConfig` struct (defined in `xagent-shared`) provides heritable paramet
 
 ---
 
-## 10. Testing
+## 11. Testing
 
 ### Philosophy
 
@@ -808,7 +884,7 @@ GPU-dependent integration tests (full kernel-tick behavioral checks, determinist
 
 ---
 
-## 11. Design Decisions
+## 12. Design Decisions
 
 ### Why GPU-Resident Over CPU
 
@@ -865,7 +941,7 @@ Backpropagating prediction error through the predictor and into the encoder weig
 
 ---
 
-## 12. Known Limitations & Future Work
+## 13. Known Limitations & Future Work
 
 ### Current Limitations
 

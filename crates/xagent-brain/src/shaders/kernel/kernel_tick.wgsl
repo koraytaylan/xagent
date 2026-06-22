@@ -273,6 +273,25 @@ fn agent_avoidance_accumulate(agent_id: u32, motor_turn: f32) {
     }
 }
 
+fn agent_approach_accumulate(agent_id: u32, motor_turn: f32) {
+    let b = agent_id * PHYS_STRIDE;
+    let food_distance = physics_state[b + P_NEAREST_FOOD_DISTANCE];
+    let food_bearing = physics_state[b + P_NEAREST_FOOD_BEARING];
+    if food_distance < FOOD_SENSE_RADIUS {
+        // Food is in sense range; count this tick
+        physics_state[b + P_APPROACH_SENSE_RANGE_TICKS] += 1.0;
+
+        // food_bearing is the signed facing-relative angle to the nearest food:
+        // NEGATIVE = food to the right (positive motor_turn turns right), POSITIVE =
+        // food to the left. A genuine turn-TOWARD rotates with the bearing (opposite sign to avoidance),
+        // so the product (motor_turn * food_bearing) is NEGATIVE for an approach turn.
+        let turn_toward = (motor_turn * food_bearing) < 0.0;
+        if turn_toward {
+            physics_state[b + P_APPROACH_TURNS_TOWARD] += 1.0;
+        }
+    }
+}
+
 fn agent_danger_detect(agent_id: u32) {
     let b = agent_id * PHYS_STRIDE;
     let alive = physics_state[b + P_ALIVE];
@@ -553,6 +572,9 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // Preserve cumulative avoidance intent counters (generation-cumulative)
     let saved_avoidance_sense_range = physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
     let saved_avoidance_turns_opposing = physics_state[base + P_AVOIDANCE_TURNS_OPPOSING];
+    // Preserve cumulative approach intent counters (generation-cumulative)
+    let saved_approach_sense_range = physics_state[base + P_APPROACH_SENSE_RANGE_TICKS];
+    let saved_approach_turns_toward = physics_state[base + P_APPROACH_TURNS_TOWARD];
 
     // 3. Reset physics state
     for (var i = 0u; i < PHYS_STRIDE; i++) {
@@ -582,6 +604,9 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // Restore cumulative avoidance intent (generation-cumulative, never reset)
     physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS] = saved_avoidance_sense_range;
     physics_state[base + P_AVOIDANCE_TURNS_OPPOSING] = saved_avoidance_turns_opposing;
+    // Restore cumulative approach intent (generation-cumulative, never reset)
+    physics_state[base + P_APPROACH_SENSE_RANGE_TICKS] = saved_approach_sense_range;
+    physics_state[base + P_APPROACH_TURNS_TOWARD] = saved_approach_turns_toward;
     // Reset the food-sense distance to its no-food sentinel until the next
     // food-detect pass. P_PREV_POTENTIAL is a reserved slot (shaping removed);
     // zero it on respawn so no stale value carries across death.
@@ -812,13 +837,14 @@ fn kernel_tick(
         }
         workgroupBarrier();
 
-        // Avoidance accumulation: thread 0 increments the counter based on motor turn
-        // and the danger bearing just computed. This runs after danger_detect so the
-        // counter reads same-cycle danger values (unlike agent_physics, which ran before).
+        // Avoidance and approach accumulation: thread 0 increments the counters based on
+        // motor turn and the danger/food bearings just computed. This runs after
+        // danger_detect and food_detect so the counters read same-cycle sensory values.
         if (tid == 0u) {
             let decision_base = agent_id * DECISION_STRIDE;
             let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
             agent_avoidance_accumulate(agent_id, motor_turn);
+            agent_approach_accumulate(agent_id, motor_turn);
         }
         workgroupBarrier();
 

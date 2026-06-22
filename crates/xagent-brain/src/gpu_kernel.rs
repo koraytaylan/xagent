@@ -343,6 +343,10 @@ pub struct AgentTelemetry {
     pub urgency: f32,
     pub gradient: f32,
     pub raw_gradient: f32,
+    pub approach_sense_range_ticks: f32,
+    pub approach_turns_toward: f32,
+    pub avoidance_sense_range_ticks: f32,
+    pub avoidance_turns_opposing: f32,
     pub prediction_error: f32,
     pub exploration_rate: f32,
     /// Critic estimate of the discounted homeostatic return from the
@@ -2970,7 +2974,7 @@ impl GpuKernel {
         let max_penalty = (1.0 - fatigue_floor).max(1e-6);
         let staleness = ((1.0 - fatigue_factor) / max_penalty).clamp(0.0, 1.0);
 
-        // Physics buffer: gradient, urgency, prediction_error, exploration_rate
+        // Physics buffer: gradient, urgency, prediction_error, exploration_rate, and intent counters
         let phys_offset = (i * PHYS_STRIDE * 4) as u64;
         let phys_size = (PHYS_STRIDE * 4) as u64;
         let mut phys = Vec::with_capacity(PHYS_STRIDE);
@@ -2980,6 +2984,10 @@ impl GpuKernel {
         let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
+        let approach_sense_range_ticks = phys[P_APPROACH_SENSE_RANGE_TICKS];
+        let approach_turns_toward = phys[P_APPROACH_TURNS_TOWARD];
+        let avoidance_sense_range_ticks = phys[P_AVOIDANCE_SENSE_RANGE_TICKS];
+        let avoidance_turns_opposing = phys[P_AVOIDANCE_TURNS_OPPOSING];
 
         AgentTelemetry {
             vision_color,
@@ -2993,6 +3001,10 @@ impl GpuKernel {
             urgency,
             gradient,
             raw_gradient,
+            approach_sense_range_ticks,
+            approach_turns_toward,
+            avoidance_sense_range_ticks,
+            avoidance_turns_opposing,
             prediction_error,
             exploration_rate,
             value,
@@ -3183,7 +3195,7 @@ impl GpuKernel {
         drop(brain_data);
         self.telemetry_staging.brain.unmap();
 
-        // Physics — gradient and urgency sourced from phys buffer (authoritative)
+        // Physics — gradient, urgency, intent counters sourced from phys buffer (authoritative)
         let phys_data = self.telemetry_staging.phys.slice(..).get_mapped_range();
         let phys: &[f32] = bytemuck::cast_slice(&phys_data);
         let gradient = phys[P_GRADIENT_OUT];
@@ -3191,6 +3203,10 @@ impl GpuKernel {
         let urgency = phys[P_URGENCY_OUT];
         let prediction_error = phys[P_PREDICTION_ERROR];
         let exploration_rate = phys[P_EXPLORATION_RATE_OUT];
+        let approach_sense_range_ticks = phys[P_APPROACH_SENSE_RANGE_TICKS];
+        let approach_turns_toward = phys[P_APPROACH_TURNS_TOWARD];
+        let avoidance_sense_range_ticks = phys[P_AVOIDANCE_SENSE_RANGE_TICKS];
+        let avoidance_turns_opposing = phys[P_AVOIDANCE_TURNS_OPPOSING];
         drop(phys_data);
         self.telemetry_staging.phys.unmap();
 
@@ -3206,6 +3222,10 @@ impl GpuKernel {
             urgency,
             gradient,
             raw_gradient,
+            approach_sense_range_ticks,
+            approach_turns_toward,
+            avoidance_sense_range_ticks,
+            avoidance_turns_opposing,
             prediction_error,
             exploration_rate,
             value,

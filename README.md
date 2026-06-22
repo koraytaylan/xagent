@@ -158,6 +158,10 @@ This is the **only** evaluative signal. There is no reward function.
 
 See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into each component.
 
+### Intent & Awareness as Observational Lenses
+
+Two count-based intent signals measure whether the learned steering behavior aligns with sensed state — **approach-intent** (fraction of in-range ticks the motor turn rotated toward food) and **avoidance-intent** (fraction of in-range ticks it rotated away from danger). These are **measurement-only**: they have zero impact on learning, fitness computation, or agent selection. They serve as an observational lens on emergence — when steering consistently aligns with sensed food/danger, intent is high and behavior appears deliberate; when uncorrelated, motion is incidental. The counters are generation-cumulative (preserved across respawn) and exposed on `AgentTelemetry` for per-frame sampling; the population fractions are computed at each fitness evaluation and recorded in the `behavior_metric` table. A baseline distribution measured under pure homeostatic learning (post-Plan-0012) provides the reference for future comparisons. See the [brain crate README § Intent & Awareness Telemetry](crates/xagent-brain/README.md#8-intent--awareness-telemetry) for detailed computation and interpretation.
+
 ---
 
 ## 4. The Sandbox World
@@ -561,7 +565,68 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 ---
 
-## 14. Future Directions
+## 14. Measuring Intentional Behavior
+
+A core research question for emergent cognition is: does learned behavior reflect deliberate goal-directed steering, or does it arise by chance?
+
+xagent provides two **count-based intent metrics** for answering this empirically. Each agent accumulates generation-cumulative counters tracking whether steering aligns with sensed food or danger:
+
+- **Approach-Intent Fraction** = (brain cycles the agent turned *toward* sensed food) / (brain cycles food was in sensory range). Measures food-seeking alignment.
+- **Avoidance-Intent Fraction** = (brain cycles the agent turned *away* from sensed danger) / (brain cycles danger was in sensory range). Measures danger-avoidance alignment.
+
+### Telemetry & Aggregation
+
+Per-agent counters are exposed on `AgentTelemetry` (captured once per frame for selected agent) and on every agent's `Agent` cache (updated every state readback). At each fitness evaluation, the population fractions are computed and recorded in the `behavior_metric` table:
+
+```sql
+SELECT generation, approach_intent_fraction, avoidance_intent_fraction FROM behavior_metric;
+```
+
+These columns aggregate across all agents in the population, providing a generation-level summary of emergent steering alignment.
+
+### Baseline Distribution
+
+The baseline measurement probe (`intent_baseline_measurement.rs`) captures the across-agent distribution of both intent fractions under pure homeostatic learning (post-Plan-0012, no reward shaping):
+
+- **Mean / Std / Min / Max** — classical summary statistics
+- **p25 / p50 / p75** — percentiles used to classify future deliberate vs. incidental agents
+
+Example baseline from a 16-agent run:
+- Approach-intent: p25=0.45, p50=0.52, p75=0.58
+- Avoidance-intent: p25=0.48, p50=0.51, p75=0.54
+
+(These are examples; actual baselines depend on world layout and config.)
+
+### Using Intent to Study Emergence
+
+Intent metrics enable three lines of investigation:
+
+1. **Baseline hypothesis testing**: Is learned steering above or at chance (0.5)? The baseline answers this for the default config. Changes to learning rate, architecture, or world parameters can be measured against it.
+
+2. **Agent classification**: Agents with intent ≥ p75 are operating above the baseline and may be exhibiting deliberate behavior; agents ≤ p25 are at or below chance. This classification can seed further analysis — e.g., comparing path-coherence metrics between the two groups.
+
+3. **Temporal tracking**: As training progresses, watch intent fractions rise. Plateauing intent suggests convergence; declining intent may signal overfitting or world changes.
+
+### What Intent Does NOT Measure
+
+- **Validity of the learned behavior** — High intent means steering is deliberate, not that it is *effective*. An agent that has learned to run into hazards with deliberation is still running into hazards.
+- **Credit attribution** — Intent measures alignment, not how the learned policy was formed. Two agents with identical high intent may have arrived there via encoder learning, memory recall, or policy evolution.
+- **Multi-modal awareness** — The counters measure response to sensed food/danger only. Agents navigating by learned landmarks or social cues will show zero intent on these axes but may still be behaving deliberately.
+
+### Deferred: Deliberate-vs-Incidental Validation
+
+A follow-up plan will build a seeded A/B validation harness that classifies agents deliberate-vs-incidental against the baseline percentiles recorded here. That harness will:
+
+1. Construct a null random-walk control population (agents with randomized motor outputs).
+2. Measure intent fractions for both the learned and random-walk populations.
+3. Correlate intent thresholds with observable path-coherence metrics (straightness, decision-reversal rate).
+4. Assert that high-intent agents outperform random-walk controls on metrics the designer *did not* optimize for.
+
+That validation harness is deferred because defensible thresholds can only be set once this plan's real baseline numbers exist — and the baseline may show intent at chance, in which case the next investigation targets the credit path or sensory representation, not a classifier.
+
+---
+
+## 15. Future Directions
 
 - **Multi-agent communication** — Agents could emit and perceive signals (sound, visual markers), enabling emergent social behaviors, cooperation, or competition.
 - **Dynamic memory growth** — Allow memory capacity to expand based on environmental complexity, simulating neuroplasticity.

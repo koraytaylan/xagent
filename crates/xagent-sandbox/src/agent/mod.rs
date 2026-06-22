@@ -159,6 +159,10 @@ pub struct Agent {
     pub avoidance_sense_range_ticks: f32,
     /// Count of ticks where danger was in sense range AND motor turn opposed bearing (for avoidance-intent metric).
     pub avoidance_turns_opposing: f32,
+    /// Count of ticks where food was in sense range (for approach-intent metric).
+    pub approach_sense_range_ticks: f32,
+    /// Count of ticks where food was in sense range AND motor turn rotated toward bearing (for approach-intent metric).
+    pub approach_turns_toward: f32,
     /// Position visit counts for heatmap visualization.
     pub heatmap: Vec<u32>,
     /// Distance-sampled control points for trail visualization (current life only).
@@ -212,6 +216,8 @@ impl Agent {
             danger_path_length: 0.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            approach_sense_range_ticks: 0.0,
+            approach_turns_toward: 0.0,
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],
             trail: Vec::with_capacity(256),
             trail_dirty: false,

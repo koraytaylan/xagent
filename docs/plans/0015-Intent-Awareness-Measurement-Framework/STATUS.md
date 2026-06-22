@@ -3,8 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
-_Last updated: 2026-06-22, against `fix/sim-runtime-undrained-test-flake`._
+**Status:** ✅ Complete.
+_Last updated: 2026-06-22, against `develop`._
 
 - **Goal:** Add the **approach-intent** counterpart to the project's existing
   **avoidance-intent** machinery and measure the baseline. Count-based food-side
@@ -38,6 +38,6 @@ _Last updated: 2026-06-22, against `fix/sim-runtime-undrained-test-flake`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Approach-Intent Telemetry Pipeline | `wire-approach-intent-counters` | 📋 Planned |
-| 0002 | Homeostasis-Only Intent Metrics | `populate-approach-intent-fraction` | 📋 Planned |
-| 0003 | Baseline Measurement & Documentation | `measure-baseline-intent-distribution`, `document-intent-measurement-framework` | 📋 Planned |
+| 0001 | Approach-Intent Telemetry Pipeline | `wire-approach-intent-counters` | ✅ Done |
+| 0002 | Homeostasis-Only Intent Metrics | `populate-approach-intent-fraction` | ✅ Done |
+| 0003 | Baseline Measurement & Documentation | `measure-baseline-intent-distribution`, `document-intent-measurement-framework` | ✅ Done |

@@ -201,3 +201,113 @@ Both modes keep the same survival multiplier (`SURVIVAL_FLOOR = 0.25`,
 `DEATH_PENALTY = 0.5`) and axis weights (`FORAGING_WEIGHT = 0.85`,
 `EXPLORATION_WEIGHT = 0.15`). Only the effort-rebased axis formulas and their
 constants change.
+
+---
+
+## Addendum — Plan 0014 Correction (2026-06-22)
+
+**Status:** Variant B was rejected and replaced with pure cumulative ratios.
+
+### The Bug in Variant B
+
+The algebraic analysis in "Why the Exploration Formula Is Algebraically Different" above correctly
+identifies that the Variant B exploration formula contains `ticks` in the numerator:
+
+```
+cells / per_tick_distance / TARGET = cells × ticks / (distance × TARGET)
+```
+
+The foraging formula has the same leak:
+
+```
+food / per_tick_energy / TARGET = food × ticks / (energy × TARGET)
+```
+
+Both axes therefore grow with `ticks_alive`, meaning a long-lived agent with the same
+`food/energy` and `cells/distance` ratios scores higher than a short-lived agent with identical
+foraging skill. This is the camping inversion the rebasing was invented to defeat: a camper that
+lives the full budget accumulates `ticks = 1,000,000` in the numerator while a risk-taking
+competent forager at `ticks = 850,000` is discounted by 15%.
+
+Measured consequence: the synthetic calibration test (`fitness_calibration_replay_profiles`)
+showed `Camper effort ≈ 0.8646 > Competent effort ≈ 0.7034`, i.e. Variant B was still
+camper-dominated even after the recalibration.
+
+### Corrected Formula (Plan 0014)
+
+Remove `ticks_alive` from both axes entirely. Denominate on the cumulative totals directly:
+
+```rust
+// Foraging: food found per unit energy burned — no ticks factor
+let foraging = ((food_consumed as f32 / energy_spent.max(ENERGY_FLOOR))
+    / FORAGING_ENERGY_TARGET)
+    .min(1.0);
+
+// Exploration: cells visited per unit distance traveled — no ticks factor
+let coverage = (cells_explored as f32 / total_grid_cells).min(1.0);
+let cells_per_distance = (cells_explored as f32
+    / distance_traveled.max(DISTANCE_FLOOR)
+    / EXPLORATION_RATE_TARGET)
+    .min(1.0);
+let exploration = coverage.min(cells_per_distance);
+```
+
+Two agents with identical `food/energy` and `cells/distance` ratios but different lifetimes
+now receive the same score by construction.
+
+### Re-Derived Constants (Plan 0014)
+
+**Calibration anchor:** competent forager profile (food=4,200, energy=15,000,
+distance=520,000, cells=256) must score ≥ 0.95 on each axis.
+
+#### FORAGING_ENERGY_TARGET
+
+```
+raw_ratio = food / energy = 4,200 / 15,000 = 0.280
+FORAGING_ENERGY_TARGET = 0.280 / 0.95 ≈ 0.2947 → 0.294
+```
+
+Verification: `4,200 / 15,000 / 0.294 = 0.280 / 0.294 = 0.952 ≥ 0.95` ✓
+
+The constant is ~850× smaller than the Variant B value (250,000) because the numerator is
+`food / energy` (≈ 0.28) rather than `food / per_tick_energy` (≈ food × ticks / energy ≈ 237,900).
+
+#### EXPLORATION_RATE_TARGET
+
+```
+raw_ratio = cells / distance = 256 / 520,000 ≈ 0.000492
+EXPLORATION_RATE_TARGET = 0.000492 / 0.95 ≈ 0.000518 → 0.0005
+```
+
+Verification: `256 / 520,000 / 0.0005 = 0.000492 / 0.0005 = 0.984 ≥ 0.95` ✓
+
+### Corrected Archetype Scores (Plan 0014 formula)
+
+Competent forager profile: food=4,200, energy=15,000, distance=520,000, cells=256, deaths=2.
+
+| Archetype    | food  | energy | distance | cells | foraging | coverage | cells/dist | exploration |
+|-------------|-------|--------|----------|-------|----------|----------|------------|-------------|
+| Competent   | 4200  | 15000  | 520000   | 256   | 0.952    | 0.250    | 0.984      | 0.250       |
+| Fast-aimless| 1800  | 32000  | 850000   | 512   | 0.191    | 0.500    | 0.756      | 0.191       |
+| Camper      | 5100  | 10000  | 8000     | 64    | 1.0(cap) | 0.0625   | 1.0(cap)   | 0.0625      |
+| Deprived    | 280   | 15000  | 520000   | 64    | 0.0635   | 0.0625   | 0.246      | 0.0625      |
+
+Note: Camper scores coverage = 0.0625 (exploration-limited), not the camping-dominated 0.8646 from Variant B.
+Note: `ticks_alive` is not shown — it does not appear in either axis formula.
+
+### Constants in Source
+
+```rust
+/// Food per unit energy for a competent forager earning full foraging credit.
+/// Calibrated from real production-scale telemetry: a competent forager
+/// (food=4200, energy=15,000) achieves food/energy ≈ 0.28, so TARGET = 0.28/0.95 ≈ 0.294
+/// ensures foraging ≥ 0.95 for that profile. Used only when effort_rebased_fitness = true.
+const FORAGING_ENERGY_TARGET: f32 = 0.294;
+
+/// Cells explored per unit distance for a competent forager earning full
+/// exploration credit. Calibrated from real telemetry: cells=256,
+/// distance=520,000, raw_ratio=256/520,000≈0.000492, TARGET = 0.000492/0.95 ≈ 0.000518.
+/// Used only when effort_rebased_fitness = true in the duration-independent
+/// exploration formula.
+const EXPLORATION_RATE_TARGET: f32 = 0.0005;
+```

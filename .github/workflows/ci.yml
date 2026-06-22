@@ -22,6 +22,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Mesa lavapipe (GPU software adapter)
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+
+      - name: Verify lavapipe installation
+        run: vulkaninfo --summary || true
+
       - name: Rustfmt check
         run: cargo fmt --all -- --check
 
@@ -33,6 +39,9 @@ jobs:
 
       - name: Cargo test
         run: cargo test -p xagent-sandbox
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          XAGENT_REQUIRE_GPU: "1"
 
       - name: Benchmark (informational)
         if: github.event_name == 'push'

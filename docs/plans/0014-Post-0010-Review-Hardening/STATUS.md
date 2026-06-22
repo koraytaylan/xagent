@@ -3,8 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
-_Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
+**Status:** ✅ Complete.
+_Last updated: 2026-06-22, against `develop`._
 
 - **Goal:** Fix the three confirmed correctness/validity defects the four
   `2026-06-19` due-diligence reviews surfaced that the reward-model re-think (0012,
@@ -31,6 +31,34 @@ _Last updated: 2026-06-19, against `claude/nice-liskov-fe972d`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Effort-Fitness-Camper-Fix | `fix-foraging-duration-leak`, `add-anti-camper-assertion` | 📋 Planned |
-| 0002 | CI-GPU-Test-Execution | `install-lavapipe-in-ci`, `add-gpu-test-runcount-gate` | 📋 Planned |
-| 0003 | Death-Path-TD-Parity | `fix-phase-death-actor-scale`, `add-death-crossing-parity-test` | 📋 Planned |
+| 0001 | Effort-Fitness-Camper-Fix | `fix-foraging-duration-leak`, `add-anti-camper-assertion` | ✅ Done |
+| 0002 | CI-GPU-Test-Execution | `install-lavapipe-in-ci`, `add-gpu-test-runcount-gate` | ✅ Done |
+| 0003 | Death-Path-TD-Parity | `fix-phase-death-actor-scale`, `add-death-crossing-parity-test` | ✅ Done |
+
+## Execution notes
+
+The parallel run landed 3/6 tasks; the rest were recovered by hand (one stalled,
+one blocked, one redundant). Resolutions:
+
+- **`add-anti-camper-assertion`** stalled because its `competent > camper`
+  assertion was **unsatisfiable as authored**: removing the `ticks` factor did not
+  invert the ranking — the old camper fixture (`food=250/energy=60`) is a
+  hyper-efficient exploiter with a *higher* food/energy ratio than the competent
+  forager, so both cap the foraging axis and the camper wins on zero deaths. Per
+  an explicit decision, the calibration camper was redefined as a true **idle**
+  agent (near-zero food), matching the plan's own description; it now scores
+  **0.1504 ≪ 0.7034**. Added the `competent > camper` guard, a foraging negative
+  control, and `effort_fitness_is_duration_invariant` (with a legacy-mode control).
+  See [`0014-CAMPER-FITNESS-DECISION.md`](0014-CAMPER-FITNESS-DECISION.md).
+- **`add-gpu-test-runcount-gate`** was implemented by the `install-lavapipe-in-ci`
+  developer (the `gpu_adapter_present_when_required` guard + `XAGENT_REQUIRE_GPU`
+  env in both workflows already landed on the plan branch), so its standalone merge
+  was a redundant no-op. Deliverables verified present.
+- **`add-death-crossing-parity-test`** could not be the authored fused-vs-split
+  byte comparison: both execution modes drive the physics-only remainder through
+  the same `physics_pipeline` (`phase_physics` + `phase_death`) and full cycles
+  through the same fused `kernel_tick.wgsl`, so they never diverge on death. The
+  real M4 divergence is full-cycle-death vs remainder-death (shared by both modes).
+  Replaced with a single-run scale-recovery test that forces a death through the
+  physics-remainder path and recovers `lr·scale` from the terminal update; teeth
+  verified (recovers `0.000781` on the TD-bug, `0.006250` with the fix).

@@ -9,7 +9,7 @@ Enforcement, strongest first:
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 83 lib unit + 11 bin unit + 62 integration tests (156 total). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
+- `cargo test -p xagent-sandbox` — runs 221 total tests (109 lib unit + 14 bin unit + 96 integration + 2 doctests). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
 
 ## Architecture
 - `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence

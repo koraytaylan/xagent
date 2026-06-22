@@ -7082,6 +7082,201 @@ fn split_fused_integrity_through_danger_crossing() {
     );
 }
 
+/// Death-path actor-scale parity: a test that forces an agent death through the
+/// **physics-only remainder dispatch** — the one place `phase_death.wgsl` runs —
+/// and verifies its terminal-death ACTOR (forward/turn) weight update scales with
+/// `ACTOR_VECTOR_SCALE` (1/16), not the critic's `TD_VECTOR_SCALE` (1/128).
+///
+/// Why not a FusedSerial-vs-SplitSerial byte comparison (as one might expect):
+/// both execution modes drive the physics-only remainder through the *same*
+/// `physics_pipeline` (`phase_physics` + `phase_death`), and full brain cycles
+/// through the *same* fused `kernel_tick.wgsl` (which has its own correct
+/// death/respawn). So the two modes never diverge on death — the real divergence
+/// (M4) was between the full-cycle death path and the remainder death path, both
+/// shared by both modes. This recovers `lr · scale` directly from a single
+/// remainder death (mirroring `actor_step_scales_with_actor_vector_scale`): one
+/// terminal update adds `lr · scale · δ · trace` per weight dimension, so
+/// `Δw / (δ · trace)` recovers `lr · scale`, robust to δ and trace magnitude. With
+/// the bug the forward/turn step would come back 8× smaller (≈ the critic step).
+#[test]
+fn death_path_actor_update_uses_actor_vector_scale() {
+    use xagent_brain::buffers::{
+        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_TRACE_CRITIC,
+        O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS, P_DEATH_COUNT, P_ENERGY,
+    };
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    // Mirrors of common.wgsl. The actor terminal-death step must scale with
+    // ACTOR_VECTOR_SCALE; the critic (value) step keeps TD_VECTOR_SCALE. Both paths
+    // multiply by the terminal TD error (−MAX_TD_ERROR = −1.0).
+    const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
+    const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
+    const CRITIC_LEARNING_RATE: f32 = 0.01;
+    const TD_VECTOR_SCALE: f32 = 1.0 / ENCODED_DIMENSION as f32;
+    const MAX_WEIGHT_NORM: f32 = 2.0;
+    const TERMINAL_DEATH_TD_ERROR: f32 = -1.0;
+    /// Expected `Δw / (δ·trace)` for the actor and the critic terminal-death step.
+    const ACTOR_STEP: f32 = ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE;
+    const CRITIC_STEP: f32 = CRITIC_LEARNING_RATE * TD_VECTOR_SCALE;
+
+    // Probe arena (like `actor_step_scales_with_actor_vector_scale`): a stationary
+    // agent with one food held in view drives non-zero forward/turn/value
+    // eligibility traces (a uniform world perceives nothing, so its traces — and
+    // the terminal update — stay ~0). `brain_tick_stride > 1` lets a single-tick
+    // dispatch be a PHYSICS-ONLY remainder (the path that runs `phase_death.wgsl`).
+    let brain = BrainConfig {
+        brain_tick_stride: 2,
+        vision_stride: 1,
+        movement_speed: 0.0,
+        ..Default::default()
+    };
+    let world_config = WorldConfig {
+        seed: 1,
+        ..Default::default()
+    };
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+    let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    let food = [(0.0_f32, PROBE_FOOD_Y, 12.0_f32)];
+
+    let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+    kernel.reset_agents_seeded(&brain, 67);
+    kernel.upload_world(&heights, &biomes, &food, &[false], &[0.0]);
+    // Low energy cap: drained by metabolic + brain cost so the agent starves a
+    // little after the warmup has built its traces.
+    kernel.upload_agents(&[(
+        Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        3.0_f32,
+        100.0_f32,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )]);
+
+    // Warm up in FULL brain cycles (the brain ticks, accumulating traces), stopping
+    // while the agent is still alive but nearly out of energy. Each cycle is
+    // `vision_stride * brain_tick_stride` ticks and runs the fused `kernel_tick`.
+    let full = (brain.vision_stride * brain.brain_tick_stride) as u32;
+    let mut tick = 0u64;
+    let mut warmups = 0;
+    loop {
+        kernel.dispatch_ticks(tick, full);
+        tick += u64::from(full);
+        let phys = kernel.read_full_state_blocking();
+        assert_eq!(
+            phys[P_DEATH_COUNT], 0.0,
+            "agent died during the brain-cycle warmup (energy cap too low to build traces first)"
+        );
+        warmups += 1;
+        if phys[P_ENERGY] < 0.15 {
+            break;
+        }
+        assert!(
+            warmups < 100_000,
+            "agent never approached starvation; lower the energy cap"
+        );
+    }
+
+    // Snapshot the pre-death brain state: the traces drive the terminal update and
+    // are reset on death, so they must be read before it.
+    let before = kernel.read_agent_state(0);
+
+    // Kill the agent with PHYSICS-ONLY remainder ticks (1 tick each, < brain_tick_stride),
+    // which run `phase_physics` + `phase_death` — the M4 fix's path. The brain does
+    // not tick here, so the traces stay frozen at the snapshot and the only change to
+    // the weights is the single terminal-death update.
+    let mut killed = false;
+    for _ in 0..100_000 {
+        kernel.dispatch_ticks(tick, 1);
+        tick += 1;
+        if kernel.read_full_state_blocking()[P_DEATH_COUNT] >= 1.0 {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "agent did not starve through the physics-remainder path"
+    );
+    let after = kernel.read_agent_state(0);
+
+    // No-clamp precondition: if a weight family's L2 norm stayed inside the
+    // MAX_WEIGHT_NORM ball, its per-dimension delta is the raw terminal step (the
+    // clamp never scaled it).
+    let l2 = |state: &[f32], base: usize| -> f32 {
+        (0..ENCODED_DIMENSION)
+            .map(|d| state[base + d] * state[base + d])
+            .sum::<f32>()
+            .sqrt()
+    };
+    for (base, name) in [
+        (O_ACTION_FORWARD_WEIGHTS, "forward"),
+        (O_ACTION_TURN_WEIGHTS, "turn"),
+        (O_VALUE_WEIGHTS, "value"),
+    ] {
+        let norm = l2(&after.brain_state, base);
+        assert!(
+            norm < MAX_WEIGHT_NORM - 1e-3,
+            "{name} weight norm {norm} reached the L2 ball; the no-clamp precondition broke"
+        );
+    }
+
+    // Recover `lr · scale` from the terminal update at the best-conditioned (largest
+    // |trace|) dimension of each family.
+    let recover = |w_base: usize, trace_base: usize| -> (f32, f32) {
+        let d = (0..ENCODED_DIMENSION)
+            .max_by(|&a, &b| {
+                before.brain_state[trace_base + a]
+                    .abs()
+                    .total_cmp(&before.brain_state[trace_base + b].abs())
+            })
+            .unwrap();
+        let trace = before.brain_state[trace_base + d];
+        let dw = after.brain_state[w_base + d] - before.brain_state[w_base + d];
+        (
+            dw / (TERMINAL_DEATH_TD_ERROR * trace),
+            (TERMINAL_DEATH_TD_ERROR * trace).abs(),
+        )
+    };
+    let (fwd_step, fwd_cond) = recover(O_ACTION_FORWARD_WEIGHTS, O_TRACE_FWD);
+    let (turn_step, turn_cond) = recover(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
+    let (val_step, val_cond) = recover(O_VALUE_WEIGHTS, O_TRACE_CRITIC);
+    eprintln!(
+        "death-path step: forward={fwd_step:.6} turn={turn_step:.6} value={val_step:.8} \
+         (expect actor {ACTOR_STEP:.6}, critic {CRITIC_STEP:.8}; TD-bug actor would be {:.6})",
+        ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE
+    );
+
+    // Conditioning: δ·trace must be well above noise so the ratio is meaningful.
+    assert!(
+        fwd_cond > 1e-4 && turn_cond > 1e-4 && val_cond > 1e-4,
+        "death-path traces too small to test the step scale (fwd={fwd_cond}, turn={turn_cond}, val={val_cond})"
+    );
+
+    // The fix: the terminal-death ACTOR update scales with ACTOR_VECTOR_SCALE, NOT
+    // the critic's TD_VECTOR_SCALE. Before the fix the forward/turn steps come back
+    // 8× smaller (≈ the critic step) and these assertions fail.
+    let actor_tol = ACTOR_STEP * 0.05;
+    assert!(
+        (fwd_step - ACTOR_STEP).abs() < actor_tol,
+        "death-path forward step {fwd_step:.6} != ACTOR step {ACTOR_STEP:.6} \
+         (the TD-scale bug would give {:.6})",
+        ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE
+    );
+    assert!(
+        (turn_step - ACTOR_STEP).abs() < actor_tol,
+        "death-path turn step {turn_step:.6} != ACTOR step {ACTOR_STEP:.6}"
+    );
+    // Critic uses TD scale in both paths — a sanity check the harness recovers it.
+    assert!(
+        (val_step - CRITIC_STEP).abs() < CRITIC_STEP.abs() * 0.10,
+        "death-path value step {val_step:.8} != critic step {CRITIC_STEP:.8}"
+    );
+}
+
 /// Verifies three properties of the super-linear drag exponent (plan 0009 Layer A):
 ///
 /// **(a) k=1.0 is bit-identical to the pre-task baseline.**  At `move_speed=20`
@@ -7534,6 +7729,16 @@ fn seeded_ab_arms_are_paired() {
             p1, p2,
             "Mutated patterns[{}] differs between arms; seeding is not deterministic: {:.8} vs {:.8}",
             j, p1, p2
+        );
+    }
+}
+
+#[test]
+fn gpu_adapter_present_when_required() {
+    if std::env::var("XAGENT_REQUIRE_GPU").is_ok() {
+        assert!(
+            xagent_brain::GpuKernel::is_available(),
+            "XAGENT_REQUIRE_GPU set but no GPU/lavapipe adapter — CI would silently skip the GPU suite"
         );
     }
 }

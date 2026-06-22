@@ -1213,20 +1213,33 @@ mod tests {
         assert!(ready.is_some(), "kernel should become ready");
         let _ = runtime.drain_events();
 
-        // Run undrained for a window, then read how far the worker got on its
-        // own. A nonzero tick proves it advances without the main thread.
-        std::thread::sleep(Duration::from_millis(400));
-        let first = max_tick(&runtime).expect("snapshots after the first window");
-        assert!(
-            first > 0,
-            "worker should advance ticks while undrained, got {first}"
-        );
+        // Sample the worker's progress over an undrained window: never drain
+        // mid-window, so this proves the worker advances without the main thread
+        // consuming events. Poll generously across windows rather than trusting
+        // a single fixed wall-clock budget — a software adapter (CI lavapipe) is
+        // far slower than a hardware GPU at shader compilation and the first
+        // async readback, so a fixed sleep races the first published snapshot.
+        // Mirrors the `drain_until` budget used by the sibling GPU tests. Each
+        // iteration's pre-sample sleep is itself a real undrained window.
+        let advance_past = |minimum: u64| -> Option<u64> {
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(200));
+                if let Some(tick) = max_tick(&runtime) {
+                    if tick > minimum {
+                        return Some(tick);
+                    }
+                }
+            }
+            None
+        };
 
-        // A second undrained window must show further progress: the worker is
-        // not gated on event consumption (the redraw-stall guarantee), and it
-        // never blocked on the (now-drained) snapshot channel.
-        std::thread::sleep(Duration::from_millis(400));
-        let second = max_tick(&runtime).expect("snapshots after the second window");
+        // A nonzero tick proves the worker advances without the main thread.
+        let first = advance_past(0).expect("worker should advance ticks while undrained");
+
+        // Further progress must follow: the worker is not gated on event
+        // consumption (the redraw-stall guarantee), and it never blocked on the
+        // (now-drained) snapshot channel.
+        let second = advance_past(first).expect("worker should keep advancing while undrained");
         assert!(
             second > first,
             "worker should keep advancing while undrained: {second} !> {first}"

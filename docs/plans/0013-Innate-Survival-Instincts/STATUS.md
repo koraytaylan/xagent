@@ -3,7 +3,7 @@
 Task-level execution status for this plan lives here. Keep it current as tasks
 land, and keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** ✅ Complete.
+**Status:** ✅ Complete (prove-or-kill: **negative** — instincts rejected, flag stays default-off).
 _Last updated: 2026-06-22, against `develop`._
 
 - **Goal:** Seed instinct priors (danger→avoidance, food→approach) into pattern
@@ -30,4 +30,22 @@ _Last updated: 2026-06-22, against `develop`._
 | 0001 | Innate-Pattern-Seeding | `add-instinct-config-fields`, `implement-seed-instinct-patterns` | ✅ Done |
 | 0002 | Heritable-Instinct-Config | `add-instinct-mutation-to-breeding` | ✅ Done |
 | 0003 | Default-Off-Gating | `add-instinct-gate-flag`, `integrate-seeding-into-reset-path` | ✅ Done |
-| 0004 | Prove-Or-Kill-Gate | `implement-ab-validation-harness`, `author-ab-gate-decision-doc` | 🚧 In progress |
+| 0004 | Prove-Or-Kill-Gate | `implement-ab-validation-harness`, `author-ab-gate-decision-doc` | ✅ Done (gate **FAILED**) |
+
+## Prove-or-kill outcome
+
+The A/B benchmark was run on the local Metal adapter (10 generations, population
+10) and **failed all three gates** — see
+[`0013-INNATE-INSTINCT-DECISION.md`](0013-INNATE-INSTINCT-DECISION.md):
+
+- **Survival** +0.19% (baseline 995074 → ON 996975; needs +10%); ON trailed
+  baseline in early generations.
+- **Alignment** 0.000 (needs ≥0.4) — but the benchmark ran with
+  `danger_percept=false`, so the danger instinct is never sensed; the primary
+  revisit condition is to re-run with danger perception enabled.
+- **Food-per-death** 0.37 (needs ≥2.0) — the food instinct (food perception is on,
+  so this gate had a fair test) gave no foraging benefit.
+
+Decision: **reject this iteration**, `innate_instincts_enabled` stays default-off.
+The seeding code ships complete behind the flag. Revisit conditions (fair danger
+test, early-learning interference, alternative signatures) are in the decision doc.

@@ -237,14 +237,27 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         // always in-bounds. With the flag off, this block is unreachable
         // (NON_VISUAL_FEATURE_COUNT == 25u, fi stays at non_visual_base + 25).
         if (DANGER_PERCEPT_FEATURES_ACTIVE != 0u) {
-            let phys_danger_base = agent_id * PHYS_STRIDE;
-            // Distance: normalized to [0, 1] over DANGER_SENSE_RADIUS; 1.0 means
-            // the sentinel "no danger in range" — the furthest possible reading.
-            let raw_dist = physics_state[phys_danger_base + P_NEAREST_DANGER_DISTANCE];
-            s_features[fi] = raw_dist / max(DANGER_SENSE_RADIUS, EPSILON); fi = fi + 1u;
-            // Bearing: already a signed angle in [-π, π]; normalize to [-1, 1].
-            let raw_bearing = physics_state[phys_danger_base + P_NEAREST_DANGER_BEARING];
-            s_features[fi] = raw_bearing / max(PI, EPSILON); fi = fi + 1u;
+            // Ablation mask (measurement-only): when blinded, present the brain with
+            // the "no danger in range" sentinel — distance 1.0 (normalized
+            // DANGER_SENSE_RADIUS, the furthest reading) and bearing 0.0 — exactly
+            // what the encoder would see with no danger nearby. The raw physics
+            // slots are untouched, so the geometry-gated avoidance-intent counters
+            // in `agent_avoidance_accumulate` keep counting; only the brain's
+            // percept is suppressed. This isolates the causal effect of *seeing*
+            // the danger bearing on steering (deliberate vs incidental).
+            if (wc_u32(WC_DANGER_PERCEPT_BLINDED) != 0u) {
+                s_features[fi] = 1.0; fi = fi + 1u;
+                s_features[fi] = 0.0; fi = fi + 1u;
+            } else {
+                let phys_danger_base = agent_id * PHYS_STRIDE;
+                // Distance: normalized to [0, 1] over DANGER_SENSE_RADIUS; 1.0 means
+                // the sentinel "no danger in range" — the furthest possible reading.
+                let raw_dist = physics_state[phys_danger_base + P_NEAREST_DANGER_DISTANCE];
+                s_features[fi] = raw_dist / max(DANGER_SENSE_RADIUS, EPSILON); fi = fi + 1u;
+                // Bearing: already a signed angle in [-π, π]; normalize to [-1, 1].
+                let raw_bearing = physics_state[phys_danger_base + P_NEAREST_DANGER_BEARING];
+                s_features[fi] = raw_bearing / max(PI, EPSILON); fi = fi + 1u;
+            }
         }
     }
 }

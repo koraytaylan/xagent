@@ -477,6 +477,9 @@ fn mutate_config_with_strength_rng(
         visual_cortex_enabled: parent.visual_cortex_enabled,
         // Danger-percept gate is locked per batch (not heritable); pass through.
         danger_percept_enabled: parent.danger_percept_enabled,
+        // Danger-percept ablation mask (measurement-only) is locked per batch and
+        // applied at kernel construction; pass it through so the value is stable.
+        danger_percept_blinded: parent.danger_percept_blinded,
         // Effort-rebased fitness gate is locked per batch (not heritable); pass through.
         effort_rebased_fitness: parent.effort_rebased_fitness,
         // Innate-instincts gate is locked per batch (not heritable); pass through.
@@ -678,6 +681,9 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         visual_cortex_enabled: a.visual_cortex_enabled,
         // Danger-percept gate is locked per batch (not heritable); take from `a`.
         danger_percept_enabled: a.danger_percept_enabled,
+        // Danger-percept ablation mask (measurement-only) is applied at kernel
+        // construction, not carried on `Agent`; default off in this path.
+        danger_percept_blinded: false,
         // Effort-rebased fitness gate is locked per batch (not heritable); take from `a`.
         effort_rebased_fitness: a.effort_rebased_fitness,
         // Innate-instincts gate is locked per batch (not heritable); take from `a`.

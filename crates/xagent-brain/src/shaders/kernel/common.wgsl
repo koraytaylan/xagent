@@ -490,6 +490,11 @@ const WC_VISION_STRIDE: u32 = 22u;
 const WC_BRAIN_TICK_STRIDE: u32 = 23u;
 const WC_SPEED_COST_EXPONENT: u32 = 24u;
 const WC_DANGER_PERCEPT_ENABLED: u32 = 25u;
+// Danger-percept ablation mask (measurement-only): 1u = blind the brain by packing
+// the "no danger in range" sentinel into the danger encoder features while the
+// geometry-gated avoidance counters keep counting; 0u = pack the true detected
+// values. Only meaningful when WC_DANGER_PERCEPT_ENABLED == 1u.
+const WC_DANGER_PERCEPT_BLINDED: u32 = 26u;
 
 // ── Habituation / homeostasis constants ─────────────────────────────────────
 

@@ -444,6 +444,7 @@ pub struct GpuKernel {
     speed_cost_exponent: f32,
     has_subgroup: bool, // retained for runtime diagnostics
     danger_percept_enabled: bool,
+    danger_percept_blinded: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
     world_config_scratch: [f32; WORLD_CONFIG_SIZE],
@@ -1378,6 +1379,7 @@ impl GpuKernel {
             brain_tick_stride,
             speed_cost_exponent: brain_config.speed_cost_exponent,
             danger_percept_enabled: brain_config.danger_percept_enabled,
+            danger_percept_blinded: brain_config.danger_percept_blinded,
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
@@ -1523,6 +1525,7 @@ impl GpuKernel {
             self.brain_tick_stride,
             self.speed_cost_exponent,
             self.danger_percept_enabled,
+            self.danger_percept_blinded,
         );
         self.world_config_scratch[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(

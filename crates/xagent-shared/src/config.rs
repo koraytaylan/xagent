@@ -139,6 +139,19 @@ pub struct BrainConfig {
     /// once the speed-decoupling gate passes. Locked per batch, not heritable.
     #[serde(default)]
     pub danger_percept_enabled: bool,
+    /// Measurement-only ablation mask for the danger percept. When `true`, the
+    /// danger distance/bearing are still detected
+    /// and still feed the geometry-gated avoidance-intent counters, but the
+    /// values packed into the brain's encoder feature vector are forced to the
+    /// "no danger in range" sentinel (distance 1.0, bearing 0.0) — the brain is
+    /// blinded to danger while the counters keep counting. This isolates the
+    /// causal contribution of the percept to steering (deliberate vs incidental)
+    /// in a seeded A/B where both arms keep `danger_percept_enabled = true` so
+    /// the encoder width is identical. Has no effect unless
+    /// `danger_percept_enabled` is also `true`. Runtime-only, not heritable,
+    /// default `false` (no effect on the shipped path).
+    #[serde(default)]
+    pub danger_percept_blinded: bool,
     /// Gate flag for effort-rebased fitness (plan 0009). When `false` the
     /// composite fitness uses the legacy time-denominated formula (food per
     /// time, exploration as fraction of cells). When `true` it re-bases both
@@ -499,6 +512,7 @@ impl Default for BrainConfig {
             speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
+            danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),
@@ -592,6 +606,7 @@ impl BrainConfig {
             speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
+            danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),
@@ -628,6 +643,7 @@ impl BrainConfig {
             speed_cost_exponent: default_speed_cost_exponent(),
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
+            danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
             gabor_wavelength: default_gabor_wavelength(),

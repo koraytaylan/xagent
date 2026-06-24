@@ -457,6 +457,10 @@ impl App {
 
                         // Move snapshot out so we can pass &mut to the closure
                         let mut evo_snap = std::mem::take(&mut self.evo_snapshot);
+                        // Restamp the live GPU storage-buffer ceiling so the
+                        // brain-config editor bounds the vision grid to what the
+                        // next kernel build can allocate (survives snapshot resets).
+                        evo_snap.gpu_storage_buffer_limit = renderer.gpu_storage_buffer_limit;
                         let gen_tick = evo_snap.gen_tick;
                         let tick_budget = evo_snap.tick_budget;
                         let evo_generation = evo_snap.generation;

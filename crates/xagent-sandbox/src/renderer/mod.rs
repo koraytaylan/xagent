@@ -158,6 +158,11 @@ pub struct Renderer {
     pub text_vb: wgpu::Buffer,
     pub text_ib: wgpu::Buffer,
     pub text_num_indices: u32,
+    /// Effective single-buffer storage ceiling in bytes
+    /// (`min(max_storage_buffer_binding_size, max_buffer_size)`) for the adapter
+    /// backing this renderer — mirrors what the simulation kernel can allocate.
+    /// Surfaced to the brain-config editor to bound the vision grid.
+    pub gpu_storage_buffer_limit: u64,
 }
 
 impl Renderer {
@@ -183,6 +188,15 @@ impl Renderer {
         .expect("Failed to find a suitable GPU adapter");
 
         log::info!("Using adapter: {:?}", adapter.get_info());
+
+        // Effective single-buffer ceiling the simulation kernel will allocate
+        // against: `GpuKernel::new` raises `max_storage_buffer_binding_size` to
+        // the adapter maximum but leaves `max_buffer_size` at the wgpu default,
+        // so the real per-buffer limit is the smaller of the two. The brain-config
+        // editor reads this to bound the vision grid (see `EvolutionSnapshot`).
+        let max_storage_buffer_binding_size = (adapter.limits().max_storage_buffer_binding_size
+            as u64)
+            .min(wgpu::Limits::default().max_buffer_size);
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -574,6 +588,7 @@ impl Renderer {
             text_vb,
             text_ib,
             text_num_indices: 0,
+            gpu_storage_buffer_limit: max_storage_buffer_binding_size,
         }
     }
 

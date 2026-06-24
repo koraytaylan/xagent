@@ -18,6 +18,15 @@ const MEMORY_CAPACITY_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick en
 const PROCESSING_SLOTS_TOOLTIP: &str = "Proxy (metabolic cost): feeds per-tick energy drain only. \
      Kernel recall width is fixed at RECALL_K = 16.";
 
+/// Tooltip for the vision-grid dimension fields. The upper bound is computed
+/// per-frame from the GPU storage-buffer budget, population, and visual-cortex
+/// setting (see `max_vision_pixels`), so width × height can never exceed what
+/// the next generation's kernel build can allocate.
+const VISION_DIM_TOOLTIP: &str = "Visual field dimension (pixels). The ceiling \
+     adapts to the GPU storage-buffer budget, population, and visual-cortex \
+     setting: a larger field on one axis lowers the other axis's ceiling, and a \
+     larger population lowers both.";
+
 /// Tab types for the dock area.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
@@ -173,6 +182,13 @@ pub struct EvolutionSnapshot {
     // Editable fields for Idle state (pre-start configuration)
     pub edit_brain: xagent_shared::BrainConfig,
     pub edit_governor: xagent_shared::GovernorConfig,
+    /// Effective single GPU storage-buffer ceiling in bytes
+    /// (`min(max_storage_buffer_binding_size, max_buffer_size)`), restamped
+    /// from the live renderer each frame. Bounds the vision-grid sliders to a
+    /// grid the next generation's kernel build can actually allocate (see
+    /// [`max_vision_pixels`]). Defaults to the conservative wgpu floor until the
+    /// renderer reports the real adapter limit.
+    pub gpu_storage_buffer_limit: u64,
 }
 
 impl Default for EvolutionSnapshot {
@@ -200,8 +216,93 @@ impl Default for EvolutionSnapshot {
             tree_pane_fraction: 0.25,
             edit_brain: xagent_shared::BrainConfig::default(),
             edit_governor: xagent_shared::GovernorConfig::default(),
+            // Conservative floor before the renderer reports the real adapter
+            // limit: the smaller of the two wgpu default storage limits, which
+            // every adapter is guaranteed to support.
+            gpu_storage_buffer_limit: (wgpu::Limits::default().max_storage_buffer_binding_size
+                as u64)
+                .min(wgpu::Limits::default().max_buffer_size),
         }
     }
+}
+
+/// Absolute per-dimension ceiling for the `vision_width` / `vision_height`
+/// editor fields, independent of the GPU budget. Set well above any practical
+/// vision resolution; in realistic configs the GPU storage-buffer budget
+/// ([`max_vision_pixels`]) is the binding constraint. The absolute ceiling only
+/// matters when the visual cortex is on — then the brain buffers stop scaling
+/// with the vision grid and the GPU budget alone would permit an absurd grid.
+const VISION_DIM_ABS_MAX: u32 = 4096;
+
+/// Upper bound for the pixel-count search in [`max_vision_pixels`]
+/// (`VISION_DIM_ABS_MAX` squared). No larger grid is ever exposed, so probing
+/// beyond it is wasted work.
+const MAX_VISION_PROBE_PIXELS: usize =
+    (VISION_DIM_ABS_MAX as usize) * (VISION_DIM_ABS_MAX as usize);
+
+/// Largest vision grid (`vision_width * vision_height`, in pixels) whose
+/// per-agent GPU buffers stay within `storage_buffer_limit_bytes` for the given
+/// population and brain-config flags.
+///
+/// The vision grid linearly inflates three per-agent storage buffers —
+/// `sensory_stride`, `brain_stride` (the raw-vision encoder input, when the
+/// visual cortex is off), and `brain_scratch_stride` — each bound as a single
+/// buffer of `population * stride * 4` bytes in `GpuKernel::new`. The tightest
+/// of the three sets the ceiling. `storage_buffer_limit_bytes` is the kernel's
+/// effective single-buffer limit (`min(max_storage_buffer_binding_size,
+/// max_buffer_size)`), so a grid the editor allows can never exceed what the
+/// next generation's kernel build will allocate.
+fn max_vision_pixels(
+    storage_buffer_limit_bytes: u64,
+    population: usize,
+    visual_cortex_enabled: bool,
+    danger_percept_enabled: bool,
+    retina_width: usize,
+    retina_height: usize,
+) -> usize {
+    let population = population.max(1) as u64;
+    // The strides depend only on the pixel count (width × height), so a
+    // `pixels × 1` probe grid measures any grid of the same area.
+    let fits = |pixels: usize| -> bool {
+        let layout = xagent_brain::buffers::BrainLayout::with_retina_flagged(
+            pixels as u32,
+            1,
+            retina_width,
+            retina_height,
+            visual_cortex_enabled,
+            danger_percept_enabled,
+        );
+        let max_stride = layout
+            .sensory_stride
+            .max(layout.brain_stride)
+            .max(layout.brain_scratch_stride) as u64;
+        population
+            .checked_mul(max_stride)
+            .and_then(|floats| floats.checked_mul(4))
+            .is_some_and(|bytes| bytes <= storage_buffer_limit_bytes)
+    };
+    if !fits(1) {
+        // Even a single pixel overflows the limit; keep the slider usable.
+        return 1;
+    }
+    // Exponential search for an upper bound that does not fit, then binary
+    // search the largest pixel count that does (`fits` is monotonic: the
+    // strides grow with the pixel count).
+    let mut low = 1usize;
+    let mut high = 2usize;
+    while high < MAX_VISION_PROBE_PIXELS && fits(high) {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_VISION_PROBE_PIXELS);
+    }
+    while low < high {
+        let midpoint = low + (high - low + 1) / 2;
+        if fits(midpoint) {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    low
 }
 
 /// Per-frame world state snapshot for the mini-map.
@@ -1358,6 +1459,10 @@ impl<'a> TabContext<'a> {
                 .num_columns(2)
                 .spacing([20.0, 6.0])
                 .show(ui, |ui| {
+                    // Read the disjoint fields the vision-grid cap needs before
+                    // borrowing `edit_brain` mutably for the editor.
+                    let storage_buffer_limit = evo.gpu_storage_buffer_limit;
+                    let population = evo.edit_governor.population_size;
                     let b = &mut evo.edit_brain;
 
                     ui.label("memory_capacity")
@@ -1398,23 +1503,46 @@ impl<'a> TabContext<'a> {
                     );
                     ui.end_row();
 
-                    ui.label("vision_width");
+                    // GPU-budget-aware vision-grid caps. `max_vision_pixels`
+                    // returns the largest `width × height` whose per-agent
+                    // buffers fit the storage-buffer limit for this population
+                    // and visual-cortex setting; each axis's ceiling is that
+                    // budget divided by the other axis, so a smaller height buys
+                    // a wider field and vice versa.
+                    let max_pixels = max_vision_pixels(
+                        storage_buffer_limit,
+                        population,
+                        b.visual_cortex_enabled,
+                        b.danger_percept_enabled,
+                        b.retina_width,
+                        b.retina_height,
+                    );
+
+                    ui.label("vision_width").on_hover_text(VISION_DIM_TOOLTIP);
+                    let width_cap = (max_pixels / (b.vision_height.max(1) as usize))
+                        .clamp(2, VISION_DIM_ABS_MAX as usize)
+                        as i32;
                     let mut vision_width = b.vision_width as i32;
                     ui.add(
                         egui::DragValue::new(&mut vision_width)
-                            .range(2..=32)
+                            .range(2..=width_cap)
                             .speed(1),
-                    );
+                    )
+                    .on_hover_text(VISION_DIM_TOOLTIP);
                     b.vision_width = vision_width.max(2) as u32;
                     ui.end_row();
 
-                    ui.label("vision_height");
+                    ui.label("vision_height").on_hover_text(VISION_DIM_TOOLTIP);
+                    let height_cap = (max_pixels / (b.vision_width.max(1) as usize))
+                        .clamp(2, VISION_DIM_ABS_MAX as usize)
+                        as i32;
                     let mut vision_height = b.vision_height as i32;
                     ui.add(
                         egui::DragValue::new(&mut vision_height)
-                            .range(2..=32)
+                            .range(2..=height_cap)
                             .speed(1),
-                    );
+                    )
+                    .on_hover_text(VISION_DIM_TOOLTIP);
                     b.vision_height = vision_height.max(2) as u32;
                     ui.end_row();
 
@@ -2155,5 +2283,89 @@ impl<'a> TabContext<'a> {
         let current_marker = if is_current { ">> " } else { "" };
 
         format!("{}Gen {} {}", current_marker, node.generation, fitness_str)
+    }
+}
+
+#[cfg(test)]
+mod vision_cap_tests {
+    use super::{max_vision_pixels, MAX_VISION_PROBE_PIXELS};
+    use xagent_brain::buffers::BrainLayout;
+    use xagent_shared::BrainConfig;
+
+    /// Recompute the per-agent buffer footprint the way `GpuKernel::new` sizes
+    /// the storage buffers, so the test verifies against the real layout math
+    /// rather than a duplicated formula.
+    fn fits(pixels: usize, population: usize, cortex: bool, danger: bool, limit: u64) -> bool {
+        let defaults = BrainConfig::default();
+        let layout = BrainLayout::with_retina_flagged(
+            pixels as u32,
+            1,
+            defaults.retina_width,
+            defaults.retina_height,
+            cortex,
+            danger,
+        );
+        let max_stride = layout
+            .sensory_stride
+            .max(layout.brain_stride)
+            .max(layout.brain_scratch_stride) as u64;
+        (population as u64) * max_stride * 4 <= limit
+    }
+
+    #[test]
+    fn returns_exact_maximum_that_fits() {
+        // 256 MiB is the common effective ceiling (wgpu default max_buffer_size).
+        let limit: u64 = 256 << 20;
+        for &(pop, cortex, danger) in &[
+            (1usize, false, false),
+            (10, false, true),
+            (100, false, true),
+            (10, true, true),
+        ] {
+            let p = max_vision_pixels(limit, pop, cortex, danger, 32, 32);
+            assert!(p >= 1, "must keep the slider usable (pop={pop})");
+            assert!(
+                fits(p, pop, cortex, danger, limit),
+                "returned grid must fit (pop={pop}, cortex={cortex})",
+            );
+            if p < MAX_VISION_PROBE_PIXELS {
+                assert!(
+                    !fits(p + 1, pop, cortex, danger, limit),
+                    "p must be the largest fitting grid (pop={pop}, cortex={cortex})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn larger_population_never_raises_the_cap() {
+        let limit: u64 = 256 << 20;
+        let small_pop = max_vision_pixels(limit, 10, false, true, 32, 32);
+        let large_pop = max_vision_pixels(limit, 100, false, true, 32, 32);
+        assert!(
+            large_pop <= small_pop,
+            "more agents share the budget, so the per-grid cap cannot grow",
+        );
+    }
+
+    #[test]
+    fn visual_cortex_decouples_brain_from_vision() {
+        // With the cortex on, the encoder stops scaling with the vision grid, so
+        // only the raw sensory buffer grows — a far looser constraint, hence a
+        // strictly larger pixel budget than the cortex-off raw-vision encoder.
+        let limit: u64 = 256 << 20;
+        let cortex_off = max_vision_pixels(limit, 10, false, true, 32, 32);
+        let cortex_on = max_vision_pixels(limit, 10, true, true, 32, 32);
+        assert!(
+            cortex_on > cortex_off,
+            "cortex-on {cortex_on} should exceed cortex-off {cortex_off}",
+        );
+    }
+
+    #[test]
+    fn tiny_limit_keeps_slider_alive() {
+        // A limit too small for even a single pixel must still return 1, not 0,
+        // so the editor's `2..=cap` range never inverts.
+        assert_eq!(max_vision_pixels(1, 100, false, true, 32, 32), 1);
     }
 }

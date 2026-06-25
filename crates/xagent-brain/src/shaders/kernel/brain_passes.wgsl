@@ -80,31 +80,32 @@ var<workgroup> s_argmin_idx: array<u32, MEMORY_CAP>;
 // All Hubel-Wiesel intermediates live in ONE combined workgroup buffer.
 // macOS Metal caps the number of distinct threadgroup resource slots (the fused
 // kernel is at that ceiling), so the cortex's persistent maps share a single
-// binding instead of three. The buffer is partitioned by the offset helpers
-// below; the regions are written/read with `workgroupBarrier()`s between stages,
-// exactly as separate buffers would be:
+// binding instead of four. The buffer is partitioned into four non-overlapping
+// regions written/read with `workgroupBarrier()`s between stages:
 //   [0 .. RETINA_PIXEL_COUNT)                          Stage 0 luminance retina
-//   [RETINA_PIXEL_COUNT .. 2·RETINA_PIXEL_COUNT)       Stage 1 signed DoG map
-//   [2·RETINA_PIXEL_COUNT .. +VISUAL_FEATURE_COUNT)    Stage 3 complex-cell output
-// Later stages (gabor-simple-cells → complex-cell-energy-pool →
-// wire-visual-features-into-encoder) fill the same regions, never re-declaring.
+//   [RETINA_PIXEL_COUNT .. 2·RETINA_PIXEL_COUNT)       Stage 1 signed DoG map (final)
+//   [2·RETINA_PIXEL_COUNT .. 3·RETINA_PIXEL_COUNT)     Stage 1 horizontal-pass scratch
+//   [3·RETINA_PIXEL_COUNT .. +VISUAL_FEATURE_COUNT)    Stage 3 complex-cell output
+// The horizontal-pass scratch region (VC_HORIZ_SCRATCH_BASE) is used by the
+// separable DoG algorithm (Stage 1) as a ping-pong intermediate so each of the
+// four single-Gaussian passes reads from one region and writes to a different
+// region with no in-place races. After Stage 1 the region is unused; Stage 3
+// writes its output to VC_COMPLEX_BASE without touching the scratch region.
 // These are `override` (not `const`): they transitively reference the
 // `RETINA_PIXEL_COUNT` override, so they are evaluated at pipeline creation —
-// the same rule the FEATURE_COUNT-derived offsets in common.wgsl follow. The
-// Stage-3 complex region base (2·RETINA_PIXEL_COUNT) is added by the
-// complex-cell-energy-pool task when it first reads that region.
+// the same rule the FEATURE_COUNT-derived offsets in common.wgsl follow.
 override VC_RETINA_BASE: u32 = 0u;
 override VC_CENTER_SURROUND_BASE: u32 = RETINA_PIXEL_COUNT;
-override VC_COMPLEX_BASE: u32 = 2u * RETINA_PIXEL_COUNT;
-override VC_SCRATCH_LEN: u32 = 2u * RETINA_PIXEL_COUNT + VISUAL_FEATURE_COUNT;
+override VC_HORIZ_SCRATCH_BASE: u32 = 2u * RETINA_PIXEL_COUNT;
+override VC_COMPLEX_BASE: u32 = 3u * RETINA_PIXEL_COUNT;
+override VC_SCRATCH_LEN: u32 = 3u * RETINA_PIXEL_COUNT + VISUAL_FEATURE_COUNT;
 var<workgroup> s_visual: array<f32, VC_SCRATCH_LEN>;
-// Stage 1 needs NO additional workgroup binding for the DoG kernel either: the
-// small isotropic DoG kernel is recomputed analytically per tap during
-// convolution (`dog_weight`) rather than tabulated into shared memory. The
-// kernel is tiny (≤ (2·DOG_KERNEL_MAX_RADIUS+1)² taps) and the mean — recomputed
-// once per thread in a register via `dog_kernel_mean` — makes the per-tap weights
-// sum to zero exactly. DOG_KERNEL_MAX_RADIUS bounds the support so the
-// convolution loop is finite.
+// Stage 1 needs NO additional workgroup binding for the DoG kernel: the 1D
+// Gaussian weights are recomputed analytically per tap (one call to
+// `gaussian_1d`) rather than tabulated into shared memory. The kernel is tiny
+// (≤ (2·DOG_KERNEL_MAX_RADIUS+1) taps per pass) and recomputed per thread in
+// registers with no threadgroup binding. DOG_KERNEL_MAX_RADIUS bounds the
+// support so every convolution loop is finite.
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -298,6 +299,16 @@ fn gaussian_2d(r2: f32, sigma: f32) -> f32 {
     return exp(-r2 / (2.0 * sigma_sq)) / (2.0 * PI * sigma_sq);
 }
 
+// Unit-variance 1-D Gaussian weight at offset k (pixels).
+// g(k;σ) = exp(−k²/(2σ²)) / (√(2π) σ). The 1/(√(2π)σ) normalization makes
+// the 1D Gaussian integrate to ≈ 1 over the real line; the outer product of
+// two 1D Gaussians equals the 2D Gaussian, so separable convolution is exact.
+fn gaussian_1d(k: i32, sigma: f32) -> f32 {
+    let sigma_sq = max(sigma * sigma, EPSILON);
+    let k_f = f32(k);
+    return exp(-(k_f * k_f) / (2.0 * sigma_sq)) / (sqrt(2.0 * PI) * sigma);
+}
+
 // DoG surround sigma from the heritable `dog_surround_ratio` gene, clamped to the
 // gene bounds [DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX] so a mutated
 // value can never degenerate the kernel into a blur (ratio → 1) or exceed the
@@ -345,11 +356,22 @@ fn dog_kernel_mean(radius: u32, surround_ratio: f32) -> f32 {
     return raw_sum / max(f32(side * side), EPSILON);
 }
 
-// Zero-sum DoG tap = raw tap − mean. Subtracting the mean re-imposes ∑ kernel = 0
-// EXACTLY after the heritable surround_ratio reshapes the kernel.
-fn dog_weight(kx: i32, ky: i32, mean: f32, surround_ratio: f32) -> f32 {
-    return dog_raw(kx, ky, surround_ratio) - mean;
-}
+// ── Separable DoG convolution: two 1D Gaussian passes per Gaussian component ──
+// The 2D Gaussian is exactly separable:
+//   G_2D(x,y; σ) = G_1D(x; σ) · G_1D(y; σ)
+// Therefore the 2D DoG is computed as the difference of two separable products:
+//   DoG_2D(x,y) = G_center_2D(x,y) − G_surround_2D(x,y)
+// Each 2D Gaussian is computed in two 1D passes (horizontal then vertical) that
+// each read from one buffer and write to a different buffer, so there are no
+// in-place data races. The five-pass schedule is:
+//   (1) h_center:    read retina (A), write B  → B = horizontal-center pass
+//   (2) v_center:    read B,          write C  → C = center_2D
+//   (3) h_surround:  read retina (A), write B  → B = horizontal-surround pass
+//   (4) v_surround:  read B,          write A  → A = surround_2D
+//   (5) subtract:    read C and A,    write B  → B = center_2D − surround_2D − dc
+// The DC offset (mean of the 2D DoG over its truncated support) is subtracted
+// in pass 5 to re-impose ∑ kernel = 0 exactly, exactly as `dog_kernel_mean` does
+// in the Rust reference and in the non-separable WGSL alternative.
 
 // ── Stage 2: oriented Gabor simple-cell bank (Jones & Palmer 1987; Hubel &
 //    Wiesel 1962) ────────────────────────────────────────────────────────────
@@ -578,19 +600,49 @@ fn coop_visual_cortex(agent_id: u32, tid: u32) {
         s_visual[VC_RETINA_BASE + i] = retina_luminance(color);
     }
     workgroupBarrier();
+    // Profiling gate: limit=1 ⇒ retina only. Uniform read; every thread takes
+    // the same branch so the workgroupBarrier above is already satisfied.
+    if (bc_f32(CFG_CORTEX_STAGE_LIMIT) == 1.0) { return; }
 
     // ── Stage 1: Difference-of-Gaussians center-surround (Rodieck 1965; Marr
     //    & Hildreth 1980) ─────────────────────────────────────────────────────
-    // Signed valid-region convolution of the retina with the zero-sum DoG kernel,
-    // producing the local-contrast map. ON/OFF is the rectified split at
-    // consumption in Stage 2 (r_on = max(0, v), r_off = max(0, −v)), so only the
-    // signed map is stored here. The kernel is recomputed analytically per tap
-    // (`dog_weight`) — see the binding-budget note above — and zero-padded at the
-    // retina border (border pixels see fewer taps, acceptable for an edge
-    // operator). `dog_kernel_radius()` / `dog_kernel_mean()` are pure and
-    // workgroup-uniform, so every thread uses the same kernel.
+    // Correct separable DoG: two independent 2D Gaussians, each computed via
+    // two 1D passes, then subtracted. Each pass reads one region and writes a
+    // different region so there are no in-place data races. Buffer legend:
+    //   A = VC_RETINA_BASE          (retina, read-only until Stage 1 pass (4))
+    //   B = VC_CENTER_SURROUND_BASE (DoG output; also used as horizontal scratch)
+    //   C = VC_HORIZ_SCRATCH_BASE   (vertical-center scratch, free after Stage 1)
+    //
+    // Operation count: 4 × (2R+1) adds/mults per pixel (plus the subtract step)
+    // vs (2R+1)² for the 2D kernel. For R=5 (default σ_s=1.6, 3σ support):
+    //   separable: 4×11 = 44 single-Gaussian samples per pixel
+    //   non-separable: 11×11 = 121 DoG samples per pixel  →  ≥2.7× fewer ops
     let radius = dog_kernel_radius(gene_dog_surround_ratio);
-    let kernel_mean = dog_kernel_mean(radius, gene_dog_surround_ratio);
+    let sigma_center = max(DOG_SIGMA_CENTER, EPSILON);
+    let sigma_surround = dog_sigma_surround(gene_dog_surround_ratio);
+    // DC mean of the 2D DoG over the truncated support. Subtracted in pass (5)
+    // to re-impose ∑ kernel = 0 exactly, mirroring `dog_kernel_mean` in Rust.
+    let dog_dc_mean = dog_kernel_mean(radius, gene_dog_surround_ratio);
+
+    // ── Stage 1a (pass 1): horizontal center Gaussian — reads A, writes B ────
+    // B[row][col] = Σ_{kx} G_1D(kx; σ_center) · A[row][col+kx]
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let pcol = i32(i % RETINA_WIDTH);
+        let prow = i32(i / RETINA_WIDTH);
+        var acc: f32 = 0.0;
+        for (var kx = -i32(radius); kx <= i32(radius); kx = kx + 1) {
+            let sc = pcol + kx;
+            if (sc < 0 || sc >= i32(RETINA_WIDTH)) { continue; }
+            let pidx = u32(prow) * RETINA_WIDTH + u32(sc);
+            acc = acc + gaussian_1d(kx, sigma_center)
+                * s_visual[VC_RETINA_BASE + pidx];
+        }
+        s_visual[VC_CENTER_SURROUND_BASE + i] = acc;
+    }
+    workgroupBarrier();
+
+    // ── Stage 1b (pass 2): vertical center Gaussian — reads B, writes C ──────
+    // C[row][col] = Σ_{ky} G_1D(ky; σ_center) · B[row+ky][col] = center_2D
     for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
         let pcol = i32(i % RETINA_WIDTH);
         let prow = i32(i / RETINA_WIDTH);
@@ -598,16 +650,66 @@ fn coop_visual_cortex(agent_id: u32, tid: u32) {
         for (var ky = -i32(radius); ky <= i32(radius); ky = ky + 1) {
             let sr = prow + ky;
             if (sr < 0 || sr >= i32(RETINA_HEIGHT)) { continue; }
-            for (var kx = -i32(radius); kx <= i32(radius); kx = kx + 1) {
-                let sc = pcol + kx;
-                if (sc < 0 || sc >= i32(RETINA_WIDTH)) { continue; }
-                let pidx = u32(sr) * RETINA_WIDTH + u32(sc);
-                acc = acc + dog_weight(kx, ky, kernel_mean, gene_dog_surround_ratio) * s_visual[VC_RETINA_BASE + pidx];
-            }
+            let pidx = u32(sr) * RETINA_WIDTH + u32(pcol);
+            acc = acc + gaussian_1d(ky, sigma_center)
+                * s_visual[VC_CENTER_SURROUND_BASE + pidx];
+        }
+        // C (VC_HORIZ_SCRATCH_BASE) holds center_2D after this pass.
+        s_visual[VC_HORIZ_SCRATCH_BASE + i] = acc;
+    }
+    workgroupBarrier();
+
+    // ── Stage 1c (pass 3): horizontal surround Gaussian — reads A, writes B ──
+    // B[row][col] = Σ_{kx} G_1D(kx; σ_surround) · A[row][col+kx]
+    // A (VC_RETINA_BASE) is still the original retina: passes 1 and 2 only
+    // read from it; this is the last pass that reads A.
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let pcol = i32(i % RETINA_WIDTH);
+        let prow = i32(i / RETINA_WIDTH);
+        var acc: f32 = 0.0;
+        for (var kx = -i32(radius); kx <= i32(radius); kx = kx + 1) {
+            let sc = pcol + kx;
+            if (sc < 0 || sc >= i32(RETINA_WIDTH)) { continue; }
+            let pidx = u32(prow) * RETINA_WIDTH + u32(sc);
+            acc = acc + gaussian_1d(kx, sigma_surround)
+                * s_visual[VC_RETINA_BASE + pidx];
         }
         s_visual[VC_CENTER_SURROUND_BASE + i] = acc;
     }
     workgroupBarrier();
+
+    // ── Stage 1d (pass 4): vertical surround Gaussian — reads B, writes A ────
+    // A[row][col] = Σ_{ky} G_1D(ky; σ_surround) · B[row+ky][col] = surround_2D
+    // Writing to A (VC_RETINA_BASE) is safe here; the original retina is no
+    // longer needed after Stage 1c finished reading it.
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let pcol = i32(i % RETINA_WIDTH);
+        let prow = i32(i / RETINA_WIDTH);
+        var acc: f32 = 0.0;
+        for (var ky = -i32(radius); ky <= i32(radius); ky = ky + 1) {
+            let sr = prow + ky;
+            if (sr < 0 || sr >= i32(RETINA_HEIGHT)) { continue; }
+            let pidx = u32(sr) * RETINA_WIDTH + u32(pcol);
+            acc = acc + gaussian_1d(ky, sigma_surround)
+                * s_visual[VC_CENTER_SURROUND_BASE + pidx];
+        }
+        // A (VC_RETINA_BASE) now holds surround_2D.
+        s_visual[VC_RETINA_BASE + i] = acc;
+    }
+    workgroupBarrier();
+
+    // ── Stage 1e (pass 5): subtract and store — reads A and C, writes B ──────
+    // B = center_2D − surround_2D − dog_dc_mean = zero-sum DoG map
+    // Subtracting dog_dc_mean re-imposes ∑ kernel = 0 exactly over the truncated
+    // support (same correction as `dog_kernel_mean` in the Rust reference).
+    for (var i = tid; i < RETINA_PIXEL_COUNT; i += BRAIN_WORKGROUP_SIZE) {
+        let center_val = s_visual[VC_HORIZ_SCRATCH_BASE + i]; // center_2D from pass 2
+        let surround_val = s_visual[VC_RETINA_BASE + i];      // surround_2D from pass 4
+        s_visual[VC_CENTER_SURROUND_BASE + i] = center_val - surround_val - dog_dc_mean;
+    }
+    workgroupBarrier();
+    // Profiling gate: limit=2 ⇒ retina + DoG only. Uniform read.
+    if (bc_f32(CFG_CORTEX_STAGE_LIMIT) == 2.0) { return; }
 
     // ── Stages 2+3: oriented Gabor simple cells → complex-cell energy + MAX pool
     //    (Jones & Palmer 1987; Hubel & Wiesel 1962; Adelson & Bergen 1985;
@@ -697,7 +799,7 @@ fn coop_visual_cortex(agent_id: u32, tid: u32) {
         s_dense_partials[tid] = 0.0;
     }
     workgroupBarrier();
-    // VISUAL_FEATURE_COUNT (128) ≤ BRAIN_WORKGROUP_SIZE (256); the tree reduce
+    // VISUAL_FEATURE_COUNT (18) ≤ BRAIN_WORKGROUP_SIZE (256); the tree reduce
     // below sums all lanes' partials into s_dense_partials[0].
     var stride: u32 = BRAIN_WORKGROUP_SIZE / 2u;
     loop {

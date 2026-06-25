@@ -5,3 +5,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Leaked per-task cargo registry cache (implement-plan worktrees isolate CARGO_HOME here)
+/.cargo/

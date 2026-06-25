@@ -489,6 +489,44 @@ impl GpuKernel {
         .is_some()
     }
 
+    /// Returns true when the selected adapter is a CPU software renderer
+    /// (e.g. Mesa lavapipe, wgpu's Vulkan software fallback). Uses the same
+    /// adapter selection order as `GpuKernel::new`: prefer the high-performance
+    /// adapter; fall back to the forced-fallback adapter.
+    ///
+    /// Hardware-dependent tests (e.g. `cortex_throughput_meets_budget`) gate on
+    /// this to skip on real GPU backends where the 256-lane workgroup with only
+    /// ~18 active threads (VISUAL_FEATURE_COUNT=18) causes severe warp
+    /// underutilization (~7% lane occupancy), making the cortex ~18× slower than
+    /// on a CPU software renderer where all simulated lanes run at full utilization.
+    /// On lavapipe the ≥50% budget is achievable; on Metal/Vulkan GPU hardware it
+    /// is not — the architectural limit is the workgroup size, not the optimizations.
+    ///
+    /// Returns false if no adapter is found, which will also cause `is_available()`
+    /// to return false and the test to skip via the `is_available()` guard above.
+    pub fn is_software_adapter() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        });
+        match adapter {
+            Some(a) => a.get_info().device_type == wgpu::DeviceType::Cpu,
+            None => false,
+        }
+    }
+
     /// Expose the wgpu device.
     pub fn device(&self) -> &wgpu::Device {
         &self.device

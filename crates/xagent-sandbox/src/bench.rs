@@ -468,6 +468,257 @@ pub fn run_tick_loop_bench(
     }
 }
 
+/// Profile the visual-cortex component cost per-frame and per-component.
+///
+/// Measures throughput at N=10 and N=100 agents with cortex enabled vs.
+/// disabled, and per-stage sub-component costs via `cortex_stage_limit` (a
+/// BrainConfig field that short-circuits `coop_visual_cortex` after each
+/// WGSL stage):
+///
+/// - Stage 1 only (limit=1): retina fill (luminance sampling from raycast
+///   buffer into the 32×32 workgroup array).
+/// - Stage 1+2 (limit=2): retina + DoG center-surround convolution.
+/// - All stages (limit=0): retina + DoG + Gabor bank + quadrature-energy +
+///   MAX pooling + L2 normalization.
+///
+/// Incremental differences isolate each sub-component's wall-clock cost.
+pub fn run_cortex_throughput_profile(brain: BrainConfig, world_config: WorldConfig) {
+    const PROFILE_FRAMES: u64 = 100;
+
+    // Run the full profile at both N=10 and N=100 so the downstream
+    // optimization task (separable-dog-optimization) can verify that gains
+    // hold at higher agent counts.
+    for &agent_count in &[10_usize, 100_usize] {
+        println!(
+            "\n[cortex-profile] N={} agents, {} frames — retina {}×{}",
+            agent_count, PROFILE_FRAMES, brain.retina_width, brain.retina_height
+        );
+        println!(
+            "  {:>32}  {:>14}  {:>18}  {:>20}",
+            "configuration", "tps", "per-frame (μs)", "vs fused baseline"
+        );
+
+        // Step 1: fused baseline (cortex OFF) — reference for overhead %.
+        let mut baseline_brain = brain.clone();
+        baseline_brain.visual_cortex_enabled = false;
+        baseline_brain.cortex_stage_limit = 0;
+        let baseline_us = run_one_profile_arm(
+            &baseline_brain,
+            &world_config,
+            agent_count,
+            PROFILE_FRAMES,
+            "cortex OFF (fused baseline)",
+            None,
+        );
+
+        // Step 2: per-stage sub-component measurements (cortex ON, stage limit
+        // 1 → 2 → 0).  The stage_limit field short-circuits coop_visual_cortex
+        // uniformly across all workgroup threads after each barrier, so every
+        // configuration is byte-safe and produces valid GPU submission patterns.
+        //
+        // Stage labels and their coverage:
+        //   limit=1: retina fill only (Stage 0)
+        //   limit=2: retina + DoG center-surround (Stages 0–1)
+        //   limit=0: all stages — retina, DoG, Gabor bank, quadrature-energy,
+        //            3×3 MAX pooling, L2 normalization (Stages 0–3)
+        let stages: &[(&str, u32)] = &[
+            ("cortex ON — retina only", 1),
+            ("cortex ON — retina + DoG", 2),
+            ("cortex ON — all stages", 0),
+        ];
+        let mut stage_us_values = [0.0_f64; 3];
+        for (idx, &(label, limit)) in stages.iter().enumerate() {
+            let mut arm_brain = brain.clone();
+            arm_brain.visual_cortex_enabled = true;
+            arm_brain.cortex_stage_limit = limit;
+            let this_us = run_one_profile_arm(
+                &arm_brain,
+                &world_config,
+                agent_count,
+                PROFILE_FRAMES,
+                label,
+                Some(baseline_us),
+            );
+            stage_us_values[idx] = this_us;
+        }
+
+        // Sub-component incremental costs.
+        let retina_us = stage_us_values[0] - baseline_us;
+        let dog_incremental_us = stage_us_values[1] - stage_us_values[0];
+        let gabor_pool_incremental_us = stage_us_values[2] - stage_us_values[1];
+        let cortex_total_us = stage_us_values[2] - baseline_us;
+
+        println!();
+        println!("[cortex-profile] Sub-component cost breakdown (N={agent_count}):");
+        println!(
+            "  {:>38}: {:>9.2} μs  ({:>5.1}% of cortex)",
+            "Stage 0 — retina fill",
+            retina_us,
+            if cortex_total_us > 0.0 {
+                retina_us / cortex_total_us * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "  {:>38}: {:>9.2} μs  ({:>5.1}% of cortex)",
+            "Stage 1 — DoG center-surround",
+            dog_incremental_us,
+            if cortex_total_us > 0.0 {
+                dog_incremental_us / cortex_total_us * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "  {:>38}: {:>9.2} μs  ({:>5.1}% of cortex)",
+            "Stages 2+3 — Gabor + quadrature + pool",
+            gabor_pool_incremental_us,
+            if cortex_total_us > 0.0 {
+                gabor_pool_incremental_us / cortex_total_us * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "  {:>38}: {:>9.2} μs  (dominant sub-component: {})",
+            "Total cortex cost",
+            cortex_total_us,
+            if gabor_pool_incremental_us >= dog_incremental_us
+                && gabor_pool_incremental_us >= retina_us
+            {
+                "Gabor + quadrature + pooling"
+            } else if dog_incremental_us >= retina_us {
+                "DoG center-surround"
+            } else {
+                "retina fill"
+            }
+        );
+    }
+}
+
+/// Result of a paired cortex throughput measurement (cortex OFF vs ON).
+/// Used by `measure_cortex_throughput` to return structured data for assertions.
+pub struct CortexThroughputResult {
+    /// Throughput with cortex disabled (fused baseline), in ticks per second.
+    pub baseline_tps: f64,
+    /// Throughput with cortex enabled (all stages), in ticks per second.
+    pub cortex_tps: f64,
+    /// Fraction of baseline: `cortex_tps / baseline_tps`. Target: ≥ 0.50.
+    pub fraction_of_baseline: f64,
+}
+
+/// Measure cortex throughput at a given agent count over `frame_count` frames.
+/// Returns the fused-baseline and cortex-on throughput values for assertion.
+///
+/// Uses the same timing method as `run_cortex_throughput_profile` so the numbers
+/// are directly comparable; unlike that function this returns the values instead
+/// of only printing them, enabling test assertions.
+pub fn measure_cortex_throughput(
+    brain: &BrainConfig,
+    world_config: &WorldConfig,
+    agent_count: usize,
+    frame_count: u64,
+) -> CortexThroughputResult {
+    let mut baseline_brain = brain.clone();
+    baseline_brain.visual_cortex_enabled = false;
+    baseline_brain.cortex_stage_limit = 0;
+    let baseline_us = run_one_profile_arm(
+        &baseline_brain,
+        world_config,
+        agent_count,
+        frame_count,
+        "cortex OFF (fused baseline)",
+        None,
+    );
+
+    let mut cortex_brain = brain.clone();
+    cortex_brain.visual_cortex_enabled = true;
+    cortex_brain.cortex_stage_limit = 0;
+    let cortex_us = run_one_profile_arm(
+        &cortex_brain,
+        world_config,
+        agent_count,
+        frame_count,
+        "cortex ON — all stages",
+        Some(baseline_us),
+    );
+
+    let baseline_tps = if baseline_us > 0.0 {
+        1_000_000.0 / baseline_us
+    } else {
+        0.0
+    };
+    let cortex_tps = if cortex_us > 0.0 {
+        1_000_000.0 / cortex_us
+    } else {
+        0.0
+    };
+    let fraction_of_baseline = if baseline_tps > 0.0 {
+        cortex_tps / baseline_tps
+    } else {
+        0.0
+    };
+
+    CortexThroughputResult {
+        baseline_tps,
+        cortex_tps,
+        fraction_of_baseline,
+    }
+}
+
+/// Run one profiling arm: dispatch `frame_count` ticks with the given
+/// `brain` config, print one result row, and return the measured per-frame
+/// cost in microseconds.
+fn run_one_profile_arm(
+    brain: &BrainConfig,
+    world_config: &WorldConfig,
+    agent_count: usize,
+    frame_count: u64,
+    label: &str,
+    baseline_us: Option<f64>,
+) -> f64 {
+    let (mut kernel, _world) = create_kernel(brain, world_config, agent_count);
+
+    // Drain in chunks so no single fused submission queues enough GPU work to
+    // trip the submission watchdog.
+    let chunk_ticks = kernel
+        .kernel_batch_size()
+        .saturating_mul(xagent_brain::MAX_FUSED_BATCHES)
+        .max(1);
+
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    while tick < frame_count {
+        let this_chunk = chunk_ticks.min((frame_count - tick) as u32);
+        kernel.dispatch_batch(tick, this_chunk);
+        kernel
+            .device()
+            .poll(wgpu::Maintain::Wait)
+            .panic_on_timeout();
+        tick += this_chunk as u64;
+    }
+    let secs = start.elapsed().as_secs_f64();
+
+    let tps = tick as f64 / secs;
+    let per_frame_us = if tick > 0 {
+        secs * 1_000_000.0 / tick as f64
+    } else {
+        0.0
+    };
+
+    let overhead = match baseline_us {
+        None => "—".to_string(),
+        Some(base) => {
+            let pct = (per_frame_us - base) / per_frame_us.max(base) * 100.0;
+            format!("{pct:+.2}%")
+        }
+    };
+
+    println!("  {label:>32}  {tps:>14.0}  {per_frame_us:>18.2}  {overhead:>20}");
+    per_frame_us
+}
+
 fn create_kernel(
     brain: &BrainConfig,
     world_config: &WorldConfig,

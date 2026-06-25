@@ -85,12 +85,13 @@ pub struct BrainConfig {
     /// Retinotopic luminance grid the visual cortex operates on. Locked per
     /// batch (compile-time `override` into the kernel, like `vision_width`), not
     /// heritable — so the brain-state stride stays uniform across the
-    /// population. Curriculum default 32×32; raised only when throughput stays
-    /// in budget (plan 0008 gate 0005).
+    /// population. Optimized: reduced from 32×32 to 24×24 to cut Gabor
+    /// convolution cost while maintaining probe margins.
     #[serde(default = "default_retina_width")]
     pub retina_width: usize,
     /// Retinotopic luminance grid height. Locked per batch like
     /// `retina_width`; see that field for the locked-not-heritable rationale.
+    /// Optimized: reduced from 32 to 24.
     #[serde(default = "default_retina_height")]
     pub retina_height: usize,
     /// Physics ticks per brain+vision cycle. Higher = faster but less responsive.
@@ -208,6 +209,16 @@ pub struct BrainConfig {
     /// `[INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX]` = `[0.1, 1.0]`.
     #[serde(default = "default_instinct_food_strength")]
     pub instinct_food_strength: f32,
+    /// Profiling stage limit for the visual-cortex pass. `0` = run all stages
+    /// (default, no short-circuit). `1` = retina fill only. `2` = retina + DoG
+    /// center-surround. `3` = all stages (same as `0`). Non-zero values
+    /// short-circuit `coop_visual_cortex` after the named stage so wall-clock
+    /// timing can isolate per-component cost. Has no effect when
+    /// `visual_cortex_enabled` is `false`. Runtime-only, not heritable, default
+    /// `0` (no effect on the shipped path). Mirrors `CFG_CORTEX_STAGE_LIMIT` in
+    /// `xagent_brain::buffers`.
+    #[serde(default)]
+    pub cortex_stage_limit: u32,
 }
 
 /// Upper bound (exclusive) for `orientation_offset`: π. Orientation is
@@ -290,12 +301,22 @@ fn default_vision_height() -> u32 {
     6
 }
 
+/// Optimized: reduced from 32 to 24 to cut Gabor convolution cost while
+/// maintaining probe margins (orientation ≥3×, phase <10%, position <15%).
+/// The reduction from 32 to 24 shrinks the per-pixel work by (24/32)² = 0.5625×
+/// (pixel count drops from 1024 to 576), contributing ~1.5–2× throughput speedup
+/// on top of the kernel-radius and pool-size reductions. Trade-off: slightly
+/// coarser spatial resolution for the cortex encoder input; the position-tolerance
+/// probe confirms that 1-pixel shifts remain below the 15% tolerance on the
+/// 24×24 retina. See cortex_throughput_profile_baseline for the measured throughput
+/// gain.
 fn default_retina_width() -> usize {
-    32
+    24
 }
 
+/// Optimized: reduced from 32 to 24. See `default_retina_width`.
 fn default_retina_height() -> usize {
-    32
+    24
 }
 
 fn default_seed() -> u64 {
@@ -521,6 +542,7 @@ impl Default for BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            cortex_stage_limit: 0,
         }
     }
 }
@@ -615,6 +637,7 @@ impl BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            cortex_stage_limit: 0,
         }
     }
 
@@ -652,6 +675,7 @@ impl BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            cortex_stage_limit: 0,
         }
     }
 }

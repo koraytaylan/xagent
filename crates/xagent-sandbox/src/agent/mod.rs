@@ -484,6 +484,8 @@ fn mutate_config_with_strength_rng(
         effort_rebased_fitness: parent.effort_rebased_fitness,
         // Innate-instincts gate is locked per batch (not heritable); pass through.
         innate_instincts_enabled: parent.innate_instincts_enabled,
+        // Cortex profiling stage limit is runtime-only (not heritable); pass through.
+        cortex_stage_limit: parent.cortex_stage_limit,
         // Heritable visual-genome genes (plan 0008). Each is perturbed with
         // momentum and clamped to the same bounds the shader re-imposes after
         // reading the gene. `orientation_offset` has no hard clamp — orientation
@@ -688,6 +690,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         effort_rebased_fitness: a.effort_rebased_fitness,
         // Innate-instincts gate is locked per batch (not heritable); take from `a`.
         innate_instincts_enabled: a.innate_instincts_enabled,
+        // Cortex profiling stage limit is runtime-only (not heritable); default off.
+        cortex_stage_limit: 0,
         // Heritable visual-genome genes (plan 0008): uniform per-gene crossover.
         gabor_wavelength: if rng.random::<f32>() < 0.5 {
             a.gabor_wavelength

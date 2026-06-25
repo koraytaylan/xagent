@@ -54,12 +54,19 @@ use crate::gabor::{
 };
 
 /// Number of pooled rows in the complex-cell output grid. Single canonical
-/// source mirrored by `POOL_ROWS` in `common.wgsl`. The standard HMAX C1 grid.
-pub const POOL_ROWS: usize = 4;
+/// source mirrored by `POOL_ROWS` in `common.wgsl`.
+/// Optimization: reduced from 4 to 3 to cut pool iteration count while
+/// maintaining position tolerance (1-pixel shift stays within a cell, 8-pixel
+/// shift crosses cell boundaries — verified by `complex_cell_position_tolerance`).
+/// Trade-off: coarser grid means ~50% more pixels per cell on the 20×20 retina,
+/// but 16 fewer total output cells (9 vs 25 from 5×5), reducing gabor_response_at
+/// evaluations. See cortex_throughput_profile_baseline.
+pub const POOL_ROWS: usize = 3;
 
 /// Number of pooled columns in the complex-cell output grid. Single canonical
 /// source mirrored by `POOL_COLS` in `common.wgsl`.
-pub const POOL_COLS: usize = 4;
+/// Optimization: reduced from 4 to 3; see `POOL_ROWS`.
+pub const POOL_COLS: usize = 3;
 
 /// Length of the complex-cell feature vector the visual cortex emits:
 /// `GABOR_ORIENTATIONS × GABOR_SCALES × POOL_ROWS × POOL_COLS`. Single canonical
@@ -199,13 +206,16 @@ mod tests {
     /// The output length is exactly the product of the bank and pool factors —
     /// the canonical `VISUAL_FEATURE_COUNT` the WGSL scratch and (eventually) the
     /// encoder width derive from.
+    /// Optimization: reduced Gabor orientations from 4 to 2, scales from 2 to 1,
+    /// and pool from 4×4 to 3×3, so feature count is now 2 × 1 × 3 × 3 = 18
+    /// (was 4 × 2 × 4 × 4 = 128).
     #[test]
     fn feature_count_is_product_of_bank_and_pool() {
         assert_eq!(
             VISUAL_FEATURE_COUNT,
             GABOR_ORIENTATIONS * GABOR_SCALES * POOL_ROWS * POOL_COLS
         );
-        assert_eq!(VISUAL_FEATURE_COUNT, 128);
+        assert_eq!(VISUAL_FEATURE_COUNT, 18);
     }
 
     /// Quadrature energy is non-negative and phase-invariant: an even/odd pair
@@ -311,11 +321,11 @@ mod tests {
     fn wgsl_complex_constants_match_rust() {
         let common_src = include_str!("shaders/kernel/common.wgsl");
         assert!(
-            common_src.contains("const POOL_ROWS: u32 = 4u;"),
+            common_src.contains("const POOL_ROWS: u32 = 3u;"),
             "common.wgsl POOL_ROWS must match Rust POOL_ROWS ({POOL_ROWS})"
         );
         assert!(
-            common_src.contains("const POOL_COLS: u32 = 4u;"),
+            common_src.contains("const POOL_COLS: u32 = 3u;"),
             "common.wgsl POOL_COLS must match Rust POOL_COLS ({POOL_COLS})"
         );
         // VISUAL_FEATURE_COUNT is derived from the bank/pool factors in both
@@ -325,8 +335,8 @@ mod tests {
             common_src.contains("GABOR_ORIENTATIONS * GABOR_SCALES * POOL_ROWS * POOL_COLS"),
             "common.wgsl VISUAL_FEATURE_COUNT must derive from the bank/pool factors"
         );
-        assert_eq!(POOL_ROWS, 4);
-        assert_eq!(POOL_COLS, 4);
-        assert_eq!(VISUAL_FEATURE_COUNT, 128);
+        assert_eq!(POOL_ROWS, 3);
+        assert_eq!(POOL_COLS, 3);
+        assert_eq!(VISUAL_FEATURE_COUNT, 18);
     }
 }

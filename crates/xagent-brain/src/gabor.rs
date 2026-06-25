@@ -47,13 +47,14 @@
 use std::f32::consts::PI;
 
 /// Number of evenly-tiled orientations over `[0, π)`. Single canonical source
-/// mirrored by `GABOR_ORIENTATIONS` in `common.wgsl`. Start 4 (0, 45, 90, 135°),
-/// the HMAX S1 choice (Riesenhuber & Poggio 1999).
-pub const GABOR_ORIENTATIONS: usize = 4;
+/// mirrored by `GABOR_ORIENTATIONS` in `common.wgsl`.
+/// Optimization: reduced from 4 to 2 (0°, 90°) to cut Gabor convolution cost.
+pub const GABOR_ORIENTATIONS: usize = 2;
 
 /// Number of carrier scales (wavelength bands). Single canonical source mirrored
 /// by `GABOR_SCALES` in `common.wgsl`.
-pub const GABOR_SCALES: usize = 2;
+/// Optimization: reduced from 2 to 1 scale to cut Gabor convolution cost.
+pub const GABOR_SCALES: usize = 1;
 
 /// Number of carrier phases — a single quadrature pair (even `ψ = 0`, odd
 /// `ψ = π/2`). Single canonical source mirrored by `GABOR_PHASES` in
@@ -99,7 +100,11 @@ pub const GABOR_WAVELENGTH_MIN: f32 = 2.0;
 
 /// Upper clamp on the carrier wavelength λ (heritable gene clamp and the support-
 /// bounding ceiling). Mirrors `GABOR_WAVELENGTH_MAX` in `common.wgsl`.
-pub const GABOR_WAVELENGTH_MAX: f32 = 12.0;
+/// Optimization: reduced from 12.0 to 5.0 (matching the seed wavelength) so the
+/// per-pixel Gabor kernel radius is bounded at 9 (side 19, 361 taps) instead of
+/// 21 (side 43, 1849 taps). This caps heritable wavelength evolution to [2, 5]
+/// px/cycle rather than [2, 12]. Trade-off documented in common.wgsl.
+pub const GABOR_WAVELENGTH_MAX: f32 = 5.0;
 
 /// Lower clamp on the envelope aspect ratio γ (heritable gene clamp). Mirrors the
 /// clamp in `coop_visual_cortex`.
@@ -339,8 +344,8 @@ mod tests {
 
     #[test]
     fn orientations_tile_evenly_over_half_circle() {
-        // 0, π/4, π/2, 3π/4 for the seeded offset 0.
-        let expected = [0.0, PI / 4.0, PI / 2.0, 3.0 * PI / 4.0];
+        // Optimization: reduced to 2 orientations (0°, 90°) for Gabor efficiency.
+        let expected = [0.0, PI / 2.0];
         for (i, &want) in expected.iter().enumerate() {
             let got = gabor_theta(i, GABOR_ORIENTATION_OFFSET_SEED);
             assert!(
@@ -355,8 +360,13 @@ mod tests {
         let lo = gabor_wavelength_for_scale(GABOR_WAVELENGTH_SEED, 0);
         let hi = gabor_wavelength_for_scale(GABOR_WAVELENGTH_SEED, 1);
         assert!((lo - GABOR_WAVELENGTH_SEED).abs() < 1e-5);
-        // Second band is one octave up, still inside the clamp (5 → 10 ≤ 12).
-        assert!((hi - GABOR_WAVELENGTH_SEED * GABOR_SCALE_STEP).abs() < 1e-5);
+        // With GABOR_SCALES=1, scale band 1 is unused; but if called, it would
+        // step one octave (5 → 10) and clamp to GABOR_WAVELENGTH_MAX=5. The clamp
+        // keeps the kernel support bounded: any gene value stays within [2, 5].
+        assert!(
+            hi <= GABOR_WAVELENGTH_MAX + 1e-5,
+            "scale band 1 must not exceed GABOR_WAVELENGTH_MAX"
+        );
     }
 
     #[test]
@@ -374,8 +384,8 @@ mod tests {
         // Mirrors `dog::tests::wgsl_dog_constants_match_rust`.
         let common_src = include_str!("shaders/kernel/common.wgsl");
         let checks: &[(&str, &str)] = &[
-            ("const GABOR_ORIENTATIONS: u32 = 4u;", "GABOR_ORIENTATIONS"),
-            ("const GABOR_SCALES: u32 = 2u;", "GABOR_SCALES"),
+            ("const GABOR_ORIENTATIONS: u32 = 2u;", "GABOR_ORIENTATIONS"),
+            ("const GABOR_SCALES: u32 = 1u;", "GABOR_SCALES"),
             ("const GABOR_PHASES: u32 = 2u;", "GABOR_PHASES"),
             (
                 "const GABOR_WAVELENGTH_SEED: f32 = 5.0;",
@@ -405,8 +415,8 @@ mod tests {
                 "common.wgsl must contain `{needle}` so WGSL {name} matches Rust"
             );
         }
-        assert_eq!(GABOR_ORIENTATIONS, 4);
-        assert_eq!(GABOR_SCALES, 2);
+        assert_eq!(GABOR_ORIENTATIONS, 2);
+        assert_eq!(GABOR_SCALES, 1);
         assert_eq!(GABOR_PHASES, 2);
         assert_eq!(GABOR_WAVELENGTH_SEED, 5.0);
         assert_eq!(GABOR_ASPECT_RATIO_SEED, 0.5);

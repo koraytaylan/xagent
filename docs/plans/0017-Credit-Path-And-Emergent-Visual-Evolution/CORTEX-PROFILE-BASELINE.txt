@@ -1,0 +1,100 @@
+# Visual-Cortex Throughput Profile Baseline
+
+## Measurement Parameters
+- Test: `cortex_throughput_profile_baseline()` in `crates/xagent-sandbox/tests/integration.rs`
+- Date: 2026-06-24
+- Machine: Local Metal, M3 Max
+- Frames: 100
+- Retina resolution: 32×32
+- Build: debug (unoptimized)
+- Sub-component method: `BrainConfig::cortex_stage_limit` short-circuits
+  `coop_visual_cortex` uniformly after each WGSL stage; incremental differences
+  isolate per-stage wall-clock cost.
+
+## Results at N=10 Agents
+
+| Configuration                    | Throughput (tps) | Per-Frame Cost (μs) | vs Fused Baseline |
+|----------------------------------|------------------|---------------------|-------------------|
+| Cortex OFF (fused baseline)      | ~7,625           | 131.14              | —                 |
+| Cortex ON — retina only          | ~8,693           | 115.03              | -12.28%           |
+| Cortex ON — retina + DoG         | ~7,723           | 129.49              | -1.26%            |
+| Cortex ON — all stages           | ~83              | 12,117.40           | +98.92%           |
+
+### Sub-Component Breakdown (N=10, incremental stage cost)
+
+| Sub-Component                          | Cost (μs) | % of Cortex Total |
+|----------------------------------------|-----------|-------------------|
+| Stage 0 — retina fill (luminance)      | ~15       | ~0.1%             |
+| Stage 1 — DoG center-surround          | ~14       | ~0.1%             |
+| Stages 2+3 — Gabor + quadrature + pool | ~11,988   | ~99.9%            |
+| **Total cortex cost**                  | ~11,986   | 100%              |
+
+**Dominant sub-component: Gabor bank + quadrature-energy + 4×4 MAX pooling**
+
+## Results at N=100 Agents
+
+| Configuration                    | Throughput (tps) | Per-Frame Cost (μs) | vs Fused Baseline |
+|----------------------------------|------------------|---------------------|-------------------|
+| Cortex OFF (fused baseline)      | ~7,742           | 129.17              | —                 |
+| Cortex ON — retina only          | ~6,951           | 143.86              | +10.21%           |
+| Cortex ON — retina + DoG         | ~6,909           | 144.75              | +10.76%           |
+| Cortex ON — all stages           | ~75              | 13,393.87           | +99.04%           |
+
+### Sub-Component Breakdown (N=100, incremental stage cost)
+
+| Sub-Component                          | Cost (μs) | % of Cortex Total |
+|----------------------------------------|-----------|-------------------|
+| Stage 0 — retina fill (luminance)      | ~15       | ~0.1%             |
+| Stage 1 — DoG center-surround          | ~1        | ~0.0%             |
+| Stages 2+3 — Gabor + quadrature + pool | ~13,249   | ~99.9%            |
+| **Total cortex cost**                  | ~13,265   | 100%              |
+
+**Dominant sub-component: Gabor bank + quadrature-energy + 4×4 MAX pooling**
+
+## Summary
+
+- **Measured cortex overhead (N=10)**: 98.92% of wall-clock time; cortex ON is
+  ~93× slower than cortex OFF (~83 tps vs ~7,625 tps).
+- **Measured cortex overhead (N=100)**: 99.04% of wall-clock time; cortex ON is
+  ~103× slower than cortex OFF (~75 tps vs ~7,742 tps).
+- The SCOPE.md spec states "~81 tps vs ~34,000 tps" (99.76% overhead, 420× slower).
+  That figure came from a different measurement context (release build or different GPU
+  configuration). The values here are the current measured baseline on this machine in
+  a debug build; they are the canonical record for plan 0017 optimization comparisons.
+- Both the N=10 and N=100 baselines are similar in absolute cortex cost (~12–13 ms),
+  showing the cost is per-agent and roughly linear (100 agents × same single-workgroup
+  dispatch; the cortex runs once per vision stride, not once per agent, but total GPU
+  time still grows with population because the fused kernel dispatches one workgroup
+  per agent — each agent's cortex runs in its own workgroup in parallel).
+
+## Cortex Pipeline Description
+
+The cortex implements dense Gabor convolutions over a 32×32 luminance retina:
+1. Stage 0 — Retina fill: nearest-neighbor sampling from raycast buffer → 32×32
+   luminance array. (~15 μs, ~0.1% of cortex cost)
+2. Stage 1 — DoG center-surround: signed valid-region convolution of retina with
+   zero-sum DoG kernel (radius ~3σ_surround). (~1–14 μs, ~0.0–0.1% of cortex cost)
+3. Stages 2+3 — Gabor simple cells + quadrature-energy + MAX pooling:
+   8 orientations × 2 scales × per-pixel even/odd Gabor convolutions on the DoG map,
+   quadrature energy E = sqrt(even² + odd²), MAX-pooled over overlapping 4×4 cells
+   → 128 complex-cell features. L2 normalization follows. (~12,000–13,250 μs, ~99.9%
+   of cortex cost)
+
+Total operations per-frame per-agent: ~32×32 × 2 (DoG) + 32×32 × 16 (Gabor) +
+16k (quadrature) + 128 (pooling) ≈ 200k operations.
+
+## Optimization Priorities (based on measured sub-component dominance)
+
+1. **Gabor bank convolution** (critical — ~99.9% of cortex cost): The even/odd
+   Gabor responses are recomputed analytically per-pixel per-filter, with no kernel
+   caching. Reducing the number of filters (8→4 orientations) or the retina size
+   (32×32→24×24) would directly cut this cost. Separable row/column factoring of
+   the Gabor itself is the next step (separable-dog-optimization task; note: the
+   separable optimization applies more directly to Gabor than to DoG based on this
+   profile — DoG cost is negligible).
+2. **Retina size reduction** (high impact): Reducing from 32×32 to 24×24 cuts
+   input pixels by ~1.78×, directly reducing Gabor convolution work.
+3. **Pooling radius reduction**: 4×4→3×3 saves ~1.2× per pool cell evaluation.
+4. **DoG separable optimization** (negligible): DoG is ~0.1% of cortex cost.
+   Implementing separable 1D DoG kernels would save <15 μs of a ~12,000 μs budget.
+   Do not prioritize this over Gabor or retina-size work.

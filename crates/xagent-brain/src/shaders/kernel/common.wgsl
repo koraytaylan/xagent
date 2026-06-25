@@ -70,8 +70,10 @@ const DOG_KERNEL_MAX_RADIUS: u32 = 9u;
 // 1999), scales one octave apart, and a single quadrature phase pair (even ψ=0,
 // odd ψ=π/2). The complex-cell energy step pools over scale and position but
 // NEVER over the two phases, so GABOR_PHASES stays 2.
-const GABOR_ORIENTATIONS: u32 = 4u;   // 0, 45, 90, 135°
-const GABOR_SCALES: u32 = 2u;
+// Optimization: reduced from 4 to 2 orientations (0°, 90°) and from 2 to 1 scale
+// to cut Gabor convolution cost by ~4×. Probe margins must hold (orientation ≥3×, phase <10%, position <15%).
+const GABOR_ORIENTATIONS: u32 = 2u;   // 0, 90°
+const GABOR_SCALES: u32 = 1u;
 const GABOR_PHASES: u32 = 2u;          // quadrature pair {0, π/2}
 // Carrier wavelength λ seed in retina pixels (heritable `gabor_wavelength` gene,
 // plan 0003; seed read here until then). Envelope σ = GABOR_SIGMA_LAMBDA_RATIO·λ.
@@ -92,15 +94,26 @@ const GABOR_SUPPORT_SIGMAS: f32 = 3.0;
 // re-imposed in the shader after reading the genes so a mutated value can never
 // undersample the carrier or grow the kernel support past the worst-case radius.
 const GABOR_WAVELENGTH_MIN: f32 = 2.0;
-const GABOR_WAVELENGTH_MAX: f32 = 12.0;
+// Optimization: reduced from 12 to 5 (matching the seed wavelength) to cap the
+// Gabor kernel support at radius 9 (side 19) instead of radius 21 (side 43).
+// Trade-off: heritable wavelength evolution is now bounded to [2, 5] px/cycle
+// (one scale band at most 2.5 octaves above the lower limit) rather than the
+// original [2, 12]. This shrinks the analytical per-tap work from 43²=1849
+// to 19²=361 per pixel (~5× fewer operations), the dominant cost lever for
+// the Gabor bank. Orientation selectivity and phase invariance are maintained
+// because the seeded λ=5 still drives clear alternating ON/OFF lobes on the
+// 20×20 retina; the probe margins (≥3× tuning, <10% phase change) are
+// verified after this reduction. See cortex_throughput_profile_baseline.
+const GABOR_WAVELENGTH_MAX: f32 = 5.0;
 const GABOR_ASPECT_RATIO_MIN: f32 = 0.25;
 const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
 // Worst-case kernel half-width (radius), ≥ the largest seeded kernel. Bounds the
-// per-tap convolution loop:
-//   λ_max band = min(GABOR_WAVELENGTH_MAX · GABOR_SCALE_STEP, GABOR_WAVELENGTH_MAX)
-//              = 12 (clamped); σ = 0.56·12 = 6.72; radius = ceil(3·6.72) = 21
-// (side 43). The seeded bank's largest band is λ = 10 → σ = 5.6 → radius 17.
-const GABOR_KERNEL_MAX_RADIUS: u32 = 21u;
+// per-tap convolution loop.
+// With GABOR_WAVELENGTH_MAX = 5: σ_max = 0.56·5 = 2.8; radius = ceil(3·2.8) = 9
+// (side 19, 361 taps — vs the original 43² = 1849 taps at radius 21).
+// The seeded bank at λ=5 also computes radius = ceil(3·0.56·5) = 9 exactly,
+// so the worst-case bound is tight.
+const GABOR_KERNEL_MAX_RADIUS: u32 = 9u;
 
 // ── Complex-cell MAX-pool grid (plan 0008 complex-cell-energy-pool) ─────────
 // Stage 3 MAX-pools the per-pixel quadrature energy E_{θ,λ}(x,y) over a coarse
@@ -108,17 +121,23 @@ const GABOR_KERNEL_MAX_RADIUS: u32 = 21u;
 // Poggio 1999). Each pool cell covers a contiguous block of the retina and the
 // blocks overlap ~50% (the half-block-margin in `pool_bounds`), so a small
 // position shift of an oriented bar stays inside the same cell — the
-// `complex_cell_position_tolerance` probe (0005) pins this. 4 × 4 = 16 cells
-// per (orientation, scale) is the standard HMAX C1 grid. Single canonical source
-// mirrored by `POOL_ROWS` / `POOL_COLS` in the Rust `complex` module.
-const POOL_ROWS: u32 = 4u;
-const POOL_COLS: u32 = 4u;
+// `complex_cell_position_tolerance` probe (0005) pins this.
+// Optimization: reduced from 4×4=16 to 3×3=9 cells per (orientation, scale).
+// Trade-off: coarser spatial grid means larger pool cells (~50% more pixels per
+// cell on a 20×20 retina) but fewer total output cells (9 vs 16 per filter),
+// reducing the total number of gabor_response_at evaluations. Position tolerance
+// is maintained (1-pixel shift stays within a pool cell) while the 8-pixel
+// discrimination control still carries the bar to a different cell. Single
+// canonical source mirrored by `POOL_ROWS` / `POOL_COLS` in the Rust
+// `complex` module.
+const POOL_ROWS: u32 = 3u;
+const POOL_COLS: u32 = 3u;
 
 // ── Visual cortex feature vector size (plan 0008) ──────────────────────────
 // VISUAL_FEATURE_COUNT is the length of the complex-cell output the visual
 // cortex pass writes back to the head of `s_features`:
-// GABOR_ORIENTATIONS × GABOR_SCALES × POOL_ROWS × POOL_COLS (4 × 2 × 4 × 4
-// = 128). It is the canonical source for sizing the cortex workgroup scratch and
+// GABOR_ORIENTATIONS × GABOR_SCALES × POOL_ROWS × POOL_COLS (2 × 1 × 3 × 3
+// = 18). It is the canonical source for sizing the cortex workgroup scratch and
 // is derived from the bank/pool constants (no longer a bare literal) so the bank
 // or pool grid can grow without a stale length drifting from the math. Mirrored
 // by `VISUAL_FEATURE_COUNT` in the Rust `complex` module and echoed-and-validated
@@ -295,6 +314,13 @@ const CFG_INTEGRITY_SCALE: u32 = 8u;
 // 0.0 is a no-op passthrough. Mirrors `CFG_VISUAL_CORTEX_ENABLED` in buffers.rs.
 const CFG_VISUAL_CORTEX_ENABLED: u32 = 9u;
 const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
+// Profiling stage limit for `coop_visual_cortex`: 0 = all stages (default),
+// 1 = retina only, 2 = retina + DoG, 3 = retina + DoG + Gabor/quadrature/pooling
+// (same as 0). Non-zero values short-circuit the cortex pass after the named
+// stage so wall-clock timing can isolate per-component cost. Mirrors
+// `CFG_CORTEX_STAGE_LIMIT` in buffers.rs. Has no effect when
+// `CFG_VISUAL_CORTEX_ENABLED` is 0.0.
+const CFG_CORTEX_STAGE_LIMIT: u32 = 11u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 

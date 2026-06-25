@@ -540,6 +540,14 @@ pub const CFG_VISUAL_CORTEX_ENABLED: usize = 9;
 /// feature availability, not any reward shaping. Uses a previously-unused padding slot, so
 /// `CONFIG_SIZE` is unchanged. Mirrored by `CFG_DANGER_PERCEPT_ENABLED` in `common.wgsl`.
 pub const CFG_DANGER_PERCEPT_ENABLED: usize = 10;
+/// Profiling stage limit for `coop_visual_cortex`: `0.0` = run all stages
+/// (default, same as no limit), `1.0` = retina only, `2.0` = retina + DoG,
+/// `3.0` = all (same as `0.0`). Non-zero values short-circuit the cortex
+/// pass after the named stage so wall-clock timing can isolate per-component
+/// cost. Has no effect when `CFG_VISUAL_CORTEX_ENABLED` is `0.0`. Uses the
+/// last padding slot (was unused). Mirrors `CFG_CORTEX_STAGE_LIMIT` in
+/// `common.wgsl`.
+pub const CFG_CORTEX_STAGE_LIMIT: usize = 11;
 pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
@@ -922,6 +930,7 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     } else {
         0.0
     };
+    cfg[CFG_CORTEX_STAGE_LIMIT] = config.cortex_stage_limit as f32;
     cfg
 }
 
@@ -1057,19 +1066,19 @@ mod tests {
 
     #[test]
     fn retina_pixel_count_matches_config() {
-        // The retina grid is locked per batch (plan 0008) and independent of the
-        // legacy vision grid. A 32×32 retina must yield exactly 1024 pixels.
-        let layout = BrainLayout::with_retina(8, 6, 32, 32);
-        assert_eq!(layout.retina_width, 32);
-        assert_eq!(layout.retina_height, 32);
-        assert_eq!(layout.retina_pixel_count, 1024);
+        // The retina grid is locked per batch and independent of the
+        // legacy vision grid. A 24×24 retina (optimized for throughput) yields 576 pixels.
+        let layout = BrainLayout::with_retina(8, 6, 24, 24);
+        assert_eq!(layout.retina_width, 24);
+        assert_eq!(layout.retina_height, 24);
+        assert_eq!(layout.retina_pixel_count, 576);
 
         // `from_config` threads the configured retina; the default config is
-        // 32×32, so it must also produce 1024.
+        // now 24×24, so it must produce 576.
         let layout = BrainLayout::from_config(&BrainConfig::default());
-        assert_eq!(layout.retina_pixel_count, 1024);
+        assert_eq!(layout.retina_pixel_count, 576);
         // `new` derives the retina from the default config for back-compat.
-        assert_eq!(BrainLayout::new(8, 6).retina_pixel_count, 1024);
+        assert_eq!(BrainLayout::new(8, 6).retina_pixel_count, 576);
     }
 
     #[test]
@@ -1353,6 +1362,10 @@ mod tests {
         assert_eq!(
             wgsl["CFG_DANGER_PERCEPT_ENABLED"],
             CFG_DANGER_PERCEPT_ENABLED as u32
+        );
+        assert_eq!(
+            wgsl["CFG_CORTEX_STAGE_LIMIT"],
+            CFG_CORTEX_STAGE_LIMIT as u32
         );
     }
 

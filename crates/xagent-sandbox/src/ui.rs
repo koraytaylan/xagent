@@ -1120,26 +1120,52 @@ impl<'a> TabContext<'a> {
                     // Background
                     p.rect_filled(rect, 2.0, egui::Color32::from_gray(15));
 
-                    // Paint each pixel as a colored rectangle
-                    for row in 0..vh {
-                        for col in 0..vw {
-                            let idx = (row * vw + col) * 4;
-                            let r =
-                                (effective_snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8;
-                            let g = (effective_snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0)
-                                as u8;
-                            let b = (effective_snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0)
-                                as u8;
-                            let pixel_rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    rect.left() + col as f32 * cell_w,
-                                    rect.top() + row as f32 * cell_h,
-                                ),
-                                egui::vec2(cell_w, cell_h),
-                            );
-                            p.rect_filled(pixel_rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                    // Upload vision as a GPU texture (one rect instead of vw*vh rect_filled calls)
+                    let pixels: Vec<egui::Color32> = (0..vw * vh)
+                        .map(|i| {
+                            let idx = i * 4;
+                            egui::Color32::from_rgb(
+                                (effective_snap.vision_color[idx] * 255.0).clamp(0.0, 255.0) as u8,
+                                (effective_snap.vision_color[idx + 1] * 255.0).clamp(0.0, 255.0)
+                                    as u8,
+                                (effective_snap.vision_color[idx + 2] * 255.0).clamp(0.0, 255.0)
+                                    as u8,
+                            )
+                        })
+                        .collect();
+                    let image = egui::ColorImage {
+                        size: [vw, vh],
+                        pixels,
+                    };
+
+                    let ctx = cols[0].ctx().clone();
+                    let tex_key =
+                        egui::Id::new(("agent_vision", effective_snap.id, vw, vh));
+                    let existing =
+                        ctx.data(|data| data.get_temp::<egui::TextureHandle>(tex_key));
+                    let tex_id = match existing {
+                        Some(mut handle) => {
+                            handle.set(image, egui::TextureOptions::NEAREST);
+                            handle.id()
                         }
-                    }
+                        None => {
+                            let handle = ctx.load_texture(
+                                "agent_vision",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            );
+                            let id = handle.id();
+                            ctx.data_mut(|data| data.insert_temp(tex_key, handle));
+                            id
+                        }
+                    };
+
+                    p.image(
+                        tex_id,
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
 
                     // Grid lines (subtle)
                     for col in 0..=vw {

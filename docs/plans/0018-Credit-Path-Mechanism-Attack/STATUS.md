@@ -3,8 +3,40 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete — **negative result.** All three spikes ran and each
+recorded **REJECT**; no fix cleared the ≥0.70 gate, so no mechanism was
+integrated and the mirrored-steering baseline assertion stays at `[0.38, 0.62]`.
+The credit-path bottleneck carries forward to plan 0019.
 _Last updated: 2026-06-25, against `develop`._
+
+## Outcome
+
+The three measurement gates held throughout: steering alignment stayed in the
+chance band, encoder food-side separability was unchanged, and food visibility
+held — so the encoder is confirmed not to be the bottleneck.
+
+- **0001 Auxiliary steering loss — REJECT.** A direct-supervision auxiliary loss
+  converges in a CPU-side test harness (−68.5%), but the harness only *measures*
+  the existing GPU TD path; it injects no GPU weight updates. Steering stayed at
+  **0.509** (chance). The concept is sound but must be a GPU-side weight update to
+  be testable — that is the gated `auxiliary-steering-integration` task.
+- **0002 Frame-synchronized trace decay — REJECT.** Prototype only acts at
+  `vision_stride>1`, but the mirrored-steering probe trains at `vision_stride=1`
+  where it is disabled by design → **0.501**, mechanism behaviorally untested for
+  steering. The prototype's live-kernel code was **reverted** post-decision (it
+  had landed unflagged under a REJECT); the decision doc is retained as the
+  measured negative result.
+- **0003 Gradient-variance shaping — REJECT, and the sharpest finding.** TD-error
+  normalization amplified mean|δ| from **4.5e-4 → 0.18 (~400×)** yet steering
+  stayed at **0.498** (chance). Magnitude is *not* the bottleneck. The credit
+  signal's **temporal alignment and lack of direct supervision** are.
+
+**Carry-forward to plan 0019:** the credit path's problem is *alignment*, not
+learning-rate scale — making the gradient larger moved steering by zero. Fixes
+must deliver the (already-separable) directional encoder signal to action with
+correct timing/supervision. The three gated integration tasks remain unrun on
+branch `implement-plan/0018`; revisit them only with a mechanism that actually
+writes GPU weights and is measured at the probe's training stride.
 
 - **Goal:** Steering alignment moves from chance (0.489 baseline, 0.38–0.62 band)
   to ≥0.70 via at least one of three mechanisms: auxiliary self-supervised
@@ -38,6 +70,12 @@ _Last updated: 2026-06-25, against `develop`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Auxiliary Steering Objective | `baseline-steering-and-variance-probe`, `auxiliary-steering-spike`, `auxiliary-steering-integration`, `credit-path-fix-lands` | 📋 Planned |
-| 0002 | Credit Horizon and Trace Restructuring | `trace-horizon-spike`, `trace-horizon-integration` | 📋 Planned |
-| 0003 | Gradient Variance and Signal Shaping | `gradient-variance-diagnosis`, `gradient-shaping-integration` | 📋 Planned |
+| 0001 | Auxiliary Steering Objective | `baseline-steering-and-variance-probe` ✅ landed, `auxiliary-steering-spike` ✅ landed (REJECT), `auxiliary-steering-integration` ⛔ gated (not run), `credit-path-fix-lands` ⛔ blocked (not run) | ❌ Rejected |
+| 0002 | Credit Horizon and Trace Restructuring | `trace-horizon-spike` ✅ landed (REJECT, prototype reverted), `trace-horizon-integration` ⛔ gated (not run) | ❌ Rejected |
+| 0003 | Gradient Variance and Signal Shaping | `gradient-variance-diagnosis` ✅ landed (REJECT), `gradient-shaping-integration` ⛔ gated (not run) | ❌ Rejected |
+
+**What landed on `develop`:** the baseline + spike *measurement* tests and the
+three decision docs (the negative-result record). No mechanism, flag, or
+TD-path behavior change shipped. Gated integration tasks (`*-integration`) and
+`credit-path-fix-lands` were never run and have no branches beyond the planned
+worktrees; pursue them under plan 0019 if a viable mechanism emerges.

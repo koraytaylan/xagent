@@ -535,6 +535,8 @@ fn mutate_config_with_strength_rng(
                 strength,
             )
             .clamp(INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX),
+        // Auxiliary-loss gate is runtime/measurement-only (not heritable); pass through.
+        auxiliary_steering_loss_enabled: parent.auxiliary_steering_loss_enabled,
     }
 }
 
@@ -724,6 +726,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.instinct_food_strength
         },
+        // Auxiliary-loss gate is runtime/measurement-only (not heritable); default off.
+        auxiliary_steering_loss_enabled: false,
     }
 }
 

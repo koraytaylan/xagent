@@ -219,6 +219,11 @@ pub struct BrainConfig {
     /// `xagent_brain::buffers`.
     #[serde(default)]
     pub cortex_stage_limit: u32,
+    /// Enable direct-supervision auxiliary loss on turn/forward action channels.
+    /// When true, bearing-aligned gradients are injected into policy weights
+    /// in addition to TD(λ) credit. Zero-cost when false.
+    #[serde(default)]
+    pub auxiliary_steering_loss_enabled: bool,
 }
 
 /// Upper bound (exclusive) for `orientation_offset`: π. Orientation is
@@ -543,6 +548,7 @@ impl Default for BrainConfig {
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
             cortex_stage_limit: 0,
+            auxiliary_steering_loss_enabled: false,
         }
     }
 }
@@ -638,6 +644,7 @@ impl BrainConfig {
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
             cortex_stage_limit: 0,
+            auxiliary_steering_loss_enabled: false,
         }
     }
 
@@ -676,6 +683,7 @@ impl BrainConfig {
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
             cortex_stage_limit: 0,
+            auxiliary_steering_loss_enabled: false,
         }
     }
 }

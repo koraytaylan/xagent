@@ -487,6 +487,11 @@ pub const WC_DANGER_PERCEPT_ENABLED: usize = 25;
 /// is `1.0`. Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is
 /// unchanged. Mirrored by `WC_DANGER_PERCEPT_BLINDED` in `common.wgsl`.
 pub const WC_DANGER_PERCEPT_BLINDED: usize = 26;
+/// Auxiliary steering loss gate flag. `1.0` = enable direct-supervision
+/// auxiliary loss on turn/forward action channels, `0.0` = disable (TD-only).
+/// Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is unchanged.
+/// Mirrors `WC_AUXILIARY_STEERING_LOSS_ENABLED` in `common.wgsl`.
+pub const WC_AUXILIARY_STEERING_LOSS_ENABLED: usize = 27;
 pub const WORLD_CONFIG_SIZE: usize = 28; // padded to 7 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
@@ -680,6 +685,7 @@ pub fn fill_world_config(
     speed_cost_exponent: f32,
     danger_percept_enabled: bool,
     danger_percept_blinded: bool,
+    auxiliary_steering_loss_enabled: bool,
 ) {
     let gw = grid_width(config.world_size);
     let go = gw / 2;
@@ -711,6 +717,11 @@ pub fn fill_world_config(
     out[WC_SPEED_COST_EXPONENT] = speed_cost_exponent;
     out[WC_DANGER_PERCEPT_ENABLED] = if danger_percept_enabled { 1.0 } else { 0.0 };
     out[WC_DANGER_PERCEPT_BLINDED] = if danger_percept_blinded { 1.0 } else { 0.0 };
+    out[WC_AUXILIARY_STEERING_LOSS_ENABLED] = if auxiliary_steering_loss_enabled {
+        1.0
+    } else {
+        0.0
+    };
 }
 
 /// Build the world config uniform data.
@@ -729,6 +740,7 @@ pub fn build_world_config(
     speed_cost_exponent: f32,
     danger_percept_enabled: bool,
     danger_percept_blinded: bool,
+    auxiliary_steering_loss_enabled: bool,
 ) -> Vec<f32> {
     let mut wc = [0.0f32; WORLD_CONFIG_SIZE];
     fill_world_config(
@@ -743,6 +755,7 @@ pub fn build_world_config(
         speed_cost_exponent,
         danger_percept_enabled,
         danger_percept_blinded,
+        auxiliary_steering_loss_enabled,
     );
     wc.to_vec()
 }

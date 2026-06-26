@@ -23,6 +23,11 @@ const BRAIN_WORKGROUP_SIZE: u32 = 256u;
 const DENSE_OUTPUT_TILE: u32 = 64u;
 const DENSE_INNER_LANES: u32 = 4u;
 
+// ── Auxiliary bearing-alignment loss ─────────────────────────────────────────
+// Learning rate for the auxiliary steering loss: 1/10th of ACTION_WEIGHT_LEARNING_RATE
+// (~0.1) so that auxiliary updates remain subordinate to the TD(λ) primary credit signal.
+const AUX_STEERING_LOSS_RATE: f32 = 0.01;
+
 // ── Shared memory (~2.5 KB at default 8×6; scales with FEATURE_COUNT) ──────
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
@@ -1561,6 +1566,38 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         physics_state[phys_base + P_GRADIENT_OUT] = gradient;
         physics_state[phys_base + P_RAW_GRADIENT_OUT] = s_homeo[6u];
         physics_state[phys_base + P_URGENCY_OUT] = urgency;
+    }
+    workgroupBarrier();
+
+    // ── Auxiliary bearing-alignment loss: direct supervision of turn/forward ──
+    // (only if enabled via BrainConfig flag). Applies gradient descent on the
+    // bearing error to O_ACTION_TURN_WEIGHTS and O_ACTION_FORWARD_WEIGHTS, in
+    // addition to TD(λ) credit. Zero-cost when the flag is unset.
+    if (tid < ENCODED_DIMENSION) {
+        let aux_loss_enabled = wc_u32(WC_AUXILIARY_STEERING_LOSS_ENABLED) != 0u;
+        if (aux_loss_enabled) {
+            // Food bearing is already stored in physics_state as an angle in [-π, π]
+            // relative to the agent's current yaw; no need to recompute from position.
+            let phys_base = agent_id * PHYS_STRIDE;
+            let food_bearing = physics_state[phys_base + P_NEAREST_FOOD_BEARING];
+
+            // Normalize bearing to [-1, 1] using the named PI constant (3.14159265).
+            let bearing_target = clamp(food_bearing / PI, -1.0, 1.0);
+
+            // Turn channel: agent should rotate toward bearing (error → zero when aligned).
+            let turn_output = decision_buffer[decision_base + DECISION_MOTOR + 1u];
+            let turn_error = turn_output - bearing_target;
+            brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] -=
+                AUX_STEERING_LOSS_RATE * turn_error * s_encoded[tid];
+
+            // Forward channel: agent should advance when aligned with food bearing.
+            // Target = cos(bearing): +1 when directly ahead, −1 when directly behind.
+            let forward_target = cos(food_bearing);
+            let forward_output = decision_buffer[decision_base + DECISION_MOTOR];
+            let forward_error = forward_output - forward_target;
+            brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] -=
+                AUX_STEERING_LOSS_RATE * forward_error * s_encoded[tid];
+        }
     }
     workgroupBarrier();
 

@@ -20,8 +20,14 @@ supervises the turn action directly toward the food-direction signal, which the
 project's homeostasis-only / "food-bearing-blind, approach incidental by
 construction" contract forbids as a live learning term. This decision records the
 corrected measurement as a diagnostic result and carries the sharpened problem to
-Plan 0021. The auxiliary-loss code remains in the tree behind its default-off flag
-(`auxiliary_steering_loss_enabled`), sign-corrected, as a measurement harness only.
+a future credit-path plan (the 0021/0022 slots are already allocated to other
+work, so a new plan must be authored). Following the 0017/0018 precedent for
+non-integrated credit-path prototypes, **the auxiliary-loss code was reverted from
+`develop`** (the `BrainConfig` flag, the `WC_AUXILIARY_STEERING_LOSS_ENABLED`
+uniform slot, the `brain_passes.wgsl` loss block, and the two probe tests are all
+removed). This decision doc plus git history (commits `41c8b3cd` implement,
+`17dcfcb5` sign-fix, and the revert commit) are the durable record; the result is
+reproducible by reverting that revert.
 
 ### What the first run got wrong
 
@@ -87,14 +93,15 @@ long-standing bottleneck precisely:
 
 ## Next Step
 
-Record this decision. Do **not** run the integration task; do **not** update the
-steering baseline (mirrored-steering 0.489 stands as the homeostasis-only baseline).
-Carry the sharpened problem to **Plan 0021**: achieve the same vision→turn routing
-under homeostatic pressure alone.
+Record this decision and revert the prototype code (done). Do **not** run the
+integration task; do **not** update the steering baseline (mirrored-steering 0.489
+stands as the homeostasis-only baseline). Carry the sharpened problem to a future
+credit-path plan: achieve the same vision→turn routing under homeostatic pressure
+alone.
 
-## Structural Candidates for Plan 0021
+## Structural Candidates for the next credit-path plan
 
-Plan 0021 should evaluate candidates by whether they unblock vision→turn routing
+That plan should evaluate candidates by whether they unblock vision→turn routing
 **without** a privileged food-direction target — i.e., they must improve credit
 assignment, not re-introduce approach-shaping. The 0.841 direct-supervision result
 is the upper-bound reference these must approach under homeostasis-only.

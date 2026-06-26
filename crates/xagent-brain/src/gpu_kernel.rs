@@ -445,7 +445,6 @@ pub struct GpuKernel {
     has_subgroup: bool, // retained for runtime diagnostics
     danger_percept_enabled: bool,
     danger_percept_blinded: bool,
-    auxiliary_steering_loss_enabled: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
     world_config_scratch: [f32; WORLD_CONFIG_SIZE],
@@ -1419,7 +1418,6 @@ impl GpuKernel {
             speed_cost_exponent: brain_config.speed_cost_exponent,
             danger_percept_enabled: brain_config.danger_percept_enabled,
             danger_percept_blinded: brain_config.danger_percept_blinded,
-            auxiliary_steering_loss_enabled: brain_config.auxiliary_steering_loss_enabled,
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
@@ -1566,7 +1564,6 @@ impl GpuKernel {
             self.speed_cost_exponent,
             self.danger_percept_enabled,
             self.danger_percept_blinded,
-            self.auxiliary_steering_loss_enabled,
         );
         self.world_config_scratch[WC_PHASE_MASK] = phase_mask as f32;
         self.queue.write_buffer(

@@ -521,9 +521,6 @@ const WC_DANGER_PERCEPT_ENABLED: u32 = 25u;
 // geometry-gated avoidance counters keep counting; 0u = pack the true detected
 // values. Only meaningful when WC_DANGER_PERCEPT_ENABLED == 1u.
 const WC_DANGER_PERCEPT_BLINDED: u32 = 26u;
-/// Auxiliary steering loss gate flag. 1u = enable direct-supervision
-/// auxiliary loss on turn/forward action channels, 0u = disable (TD-only).
-const WC_AUXILIARY_STEERING_LOSS_ENABLED: u32 = 27u;
 
 // ── Habituation / homeostasis constants ─────────────────────────────────────
 

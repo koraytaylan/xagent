@@ -1582,9 +1582,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let food_bearing = physics_state[phys_base + P_NEAREST_FOOD_BEARING];
 
             // Normalize bearing to [-1, 1] using the named PI constant (3.14159265).
-            let bearing_target = clamp(food_bearing / PI, -1.0, 1.0);
+            // P_NEAREST_FOOD_BEARING is atan2(facing × to_food, facing · to_food) =
+            // yaw − food_heading. Physics applies `yaw += motor_turn · TURN_SPEED · dt`,
+            // so the turn that REDUCES the bearing to zero (rotates toward food) is
+            // motor_turn = −bearing. The supervision target is therefore the NEGATED
+            // normalized bearing; using +bearing trains anti-steering (away from food).
+            let bearing_target = clamp(-food_bearing / PI, -1.0, 1.0);
 
-            // Turn channel: agent should rotate toward bearing (error → zero when aligned).
+            // Turn channel: agent should rotate toward food (error → zero when aligned).
             let turn_output = decision_buffer[decision_base + DECISION_MOTOR + 1u];
             let turn_error = turn_output - bearing_target;
             brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] -=

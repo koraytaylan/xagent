@@ -9506,9 +9506,10 @@ fn auxiliary_loss_flag_passes_to_gpu() {
     // If this runs without crashing, the flag passed through.
 }
 
-/// Compute the lower bound of a 95% Clopper-Pearson confidence interval.
-/// Using a simplified normal approximation sufficient for this purpose.
-fn clopper_pearson_ci_lower(successes: u64, trials: u64, _confidence: f64) -> f64 {
+/// Lower bound of a 95% Wald (normal-approximation) confidence interval for a
+/// proportion. This is NOT the exact Clopper-Pearson (beta) interval; z is
+/// fixed at 1.96 (95%), which is sufficient for the steering-probe verdict.
+fn wald_ci_lower_95(successes: u64, trials: u64) -> f64 {
     if successes == 0 {
         return 0.0;
     }
@@ -9518,9 +9519,9 @@ fn clopper_pearson_ci_lower(successes: u64, trials: u64, _confidence: f64) -> f6
     (p - margin).max(0.0)
 }
 
-/// Compute the upper bound of a 95% Clopper-Pearson confidence interval.
-/// Using a simplified normal approximation sufficient for this purpose.
-fn clopper_pearson_ci_upper(successes: u64, trials: u64, _confidence: f64) -> f64 {
+/// Upper bound of a 95% Wald (normal-approximation) confidence interval for a
+/// proportion. See `wald_ci_lower_95` for the caveat on exactness.
+fn wald_ci_upper_95(successes: u64, trials: u64) -> f64 {
     if successes == trials {
         return 1.0;
     }
@@ -9610,8 +9611,8 @@ fn gpu_auxiliary_steering_alignment_probe() {
 
     // Compute alignment rate and 95% CI.
     let rate = correct as f64 / scored_eval.max(1) as f64;
-    let ci_lower = clopper_pearson_ci_lower(correct as u64, scored_eval as u64, 0.95);
-    let ci_upper = clopper_pearson_ci_upper(correct as u64, scored_eval as u64, 0.95);
+    let ci_lower = wald_ci_lower_95(correct as u64, scored_eval as u64);
+    let ci_upper = wald_ci_upper_95(correct as u64, scored_eval as u64);
 
     // Record measurement to stderr.
     eprintln!(

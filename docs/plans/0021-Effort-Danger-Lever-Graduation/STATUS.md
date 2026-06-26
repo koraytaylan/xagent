@@ -3,8 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** 📋 Planned.
-_Last updated: 2026-06-25, against `develop`._
+**Status:** ✅ Complete.
+_Last updated: 2026-06-27, against `develop`._
 
 - **Goal:** Three gated levers have recorded flip-or-retire decisions with
   measured 95% CI evidence and documented unlock conditions: effort-fitness (run
@@ -23,6 +23,6 @@ _Last updated: 2026-06-25, against `develop`._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Effort-Fitness-Production-A-B | `effort-fitness-production-a-b` | 📋 Planned |
-| 0002 | Danger-Percept-Production-A-B | `danger-percept-production-a-b` | 📋 Planned |
-| 0003 | Innate-Instincts-Graduation-Status | `innate-instincts-terminal-or-gated-mark` | 📋 Planned |
+| 0001 | Effort-Fitness-Production-A-B | `effort-fitness-production-a-b` | ✅ Done |
+| 0002 | Danger-Percept-Production-A-B | `danger-percept-production-a-b` | ✅ Done |
+| 0003 | Innate-Instincts-Graduation-Status | `innate-instincts-terminal-or-gated-mark` | ✅ Done |

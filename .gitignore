@@ -9,6 +9,7 @@
 # Leaked per-task cargo registry cache (implement-plan worktrees isolate CARGO_HOME here)
 /.cargo/
 
-# Generated bootstrap JSON artifact written by --validate-speed-decoupling to the cwd.
-# The canonical artifact lives in docs/plans/0021-Effort-Danger-Lever-Graduation/.
+# Generated bootstrap JSON artifacts written by the --validate-* harnesses to the cwd.
+# The canonical, dated copies live in docs/plans/0021-Effort-Danger-Lever-Graduation/.
 /speed_decoupling_bootstrap.json
+/danger_percept_bootstrap.json

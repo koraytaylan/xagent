@@ -59,7 +59,7 @@ pub const PHYS_STRIDE: usize = 45;
   `read_agent_telemetry_blocking` (`gpu_kernel.rs:2944`) and `try_collect_telemetry`
   (`gpu_kernel.rs:3153`) — and include it in each struct literal.
 
-- **Add the measurement probe** `tests/learning_signal_baseline.rs`: a single-agent
+- **Add the measurement probe** `crates/xagent-brain/tests/learning_signal_baseline.rs`: a single-agent
   default-config run capturing the `raw_gradient` distribution (mean/std/min/max over
   100 ticks) into the test's doc comment via
   `read_agent_telemetry_blocking(0).raw_gradient`. It embeds the standard GPU
@@ -299,7 +299,7 @@ is a permanent regression guard: any future edit that reintroduces a shaping ter
 fails it. It embeds the `GpuKernel::is_available()` self-skip guard, so it
 self-skips without an adapter and runs under Mesa lavapipe in CI.
 
-A measurement probe, `learning_signal_baseline.rs`, captures the pre-removal
+A measurement probe, `crates/xagent-brain/tests/learning_signal_baseline.rs`, captures the pre-removal
 `raw_gradient` distribution (mean/std/min/max over 100 ticks at default config)
 into its doc comment, supplying the "before" reference embedded in the guard test;
 the probe asserts nothing.

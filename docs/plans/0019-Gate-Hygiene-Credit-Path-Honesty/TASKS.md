@@ -121,7 +121,7 @@ Cortex and credit probes print large diagnostic tables. 2026-06-19 grok-43 recom
 
 ### test-path-traceability — Audit and Update Test File Paths in Plan STATUS Docs
 
-Plan STATUS.md docs reference test deliverables (intent_baseline_measurement.rs, danger_percept_ablation_ab.rs) without crate prefix. They live in xagent-brain/tests but can be misread as xagent-sandbox/tests. Hampers traceability when project has two test crates.
+Plan STATUS.md docs reference test deliverables (`crates/xagent-brain/tests/intent_baseline_measurement.rs`, `crates/xagent-brain/tests/danger_percept_ablation_ab.rs`) without crate prefix. They live in xagent-brain/tests but can be misread as xagent-sandbox/tests. Hampers traceability when project has two test crates.
 
 **Steps:**
 1. Open docs/plans/0015-Intent-Awareness-Measurement-Framework/STATUS.md and docs/plans/0016-Intent-As-Meta-Score-Evolved-Policy-Ablation/STATUS.md.

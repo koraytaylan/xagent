@@ -246,7 +246,7 @@ learn whether a signal even exists before building a classifier on top of it).
    deliberate-vs-incidental thresholds.
 6. Do **not** assert any threshold — this is measurement-only. Record the computed
    statistics in a doc comment on the test (run it, paste the real numbers back, matching
-   the `learning_signal_baseline.rs` record-then-paste idiom), and add a high-level comment:
+   the `crates/xagent-brain/tests/learning_signal_baseline.rs` record-then-paste idiom), and add a high-level comment:
    'Baseline intent fractions under pure homeostatic learning (no PBRS shaping,
    post-Plan-0012); the reference distribution a follow-up validation-harness plan will use
    to set deliberate-vs-incidental thresholds.'
@@ -255,7 +255,7 @@ learn whether a signal even exists before building a classifier on top of it).
 
 - **Depends on:** wire-approach-intent-counters
 - **Done when:** A measurement probe drives a 16-agent kernel via the
-  `learning_signal_baseline.rs` upload/dispatch idiom in a world that exercises both intent
+  `crates/xagent-brain/tests/learning_signal_baseline.rs` upload/dispatch idiom in a world that exercises both intent
   axes (food within `FOOD_SENSE_RADIUS` of each agent; `danger_percept_enabled = true` with
   danger biome in range), reads each agent's approach- and avoidance-intent fractions, and
   records mean/std/min/max + p25/p50/p75 per axis in its doc comment. A validity guard
@@ -282,7 +282,7 @@ harness rather than describing it as shipped.
    generation-cumulative, exposed on `AgentTelemetry` and aggregated by
    `compute_*_intent_fraction` into the `behavior_metric` table); (3) what they measure —
    whether steering correlates with sensed state (deliberate) or not (incidental); (4) how
-   to read the baseline distribution that `intent_baseline_measurement.rs` records
+   to read the baseline distribution that `crates/xagent-brain/tests/intent_baseline_measurement.rs` records
    (mean/std/min/max + p25/p50/p75), noting a follow-up plan will turn the percentiles into
    deliberate (≥ p75) / incidental (≤ p25) classification thresholds via a validation harness.
 2. In `README.md`, add a note in §3 (The Cognitive Architecture) or §10 (Why

@@ -37,7 +37,7 @@ if !xagent_brain::GpuKernel::is_available() {
 ```
 
 - **Depends on:** —
-- **Done when:** The `P_RAW_GRADIENT_OUT` debug slot is wired through the kernel and `AgentTelemetry`, and the `learning_signal_baseline.rs` test compiles and runs green, outputting the baseline `raw_gradient` statistics (mean, std, min, max) over 100 ticks recorded in the test's doc comment for use by `add-homeostatic-only-gate`; cargo fmt/clippy/test green.
+- **Done when:** The `P_RAW_GRADIENT_OUT` debug slot is wired through the kernel and `AgentTelemetry`, and the `crates/xagent-brain/tests/learning_signal_baseline.rs` test compiles and runs green, outputting the baseline `raw_gradient` statistics (mean, std, min, max) over 100 ticks recorded in the test's doc comment for use by `add-homeostatic-only-gate`; cargo fmt/clippy/test green.
 
 ---
 

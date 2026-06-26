@@ -9,7 +9,7 @@
 
 Plan 0015 shipped a complete intent measurement infrastructure — approach and
 avoidance counters, per-agent telemetry, population fractions, and a baseline
-distribution under homeostasis-only learning (`intent_baseline_measurement.rs`,
+distribution under homeostasis-only learning (`crates/xagent-brain/tests/intent_baseline_measurement.rs`,
 baseline approach ≈ 0.498, avoidance ≈ 0.421). However, those are *within-life*
 baselines (random init + TD only, no evolution across generations). The baseline
 numbers raise a critical question the framework explicitly defers: are those
@@ -22,7 +22,7 @@ Two load-bearing facts motivate this plan:
 1. **Within-life intent alone cannot adjudicate causality.** A within-life run
    measures whether agents turn when the target is in range, but does not isolate
    whether the turn is *caused by* sensing the target or is incidental motion that
-   the counter happens to score. Proof: in `danger_percept_ablation_ab.rs`
+   the counter happens to score. Proof: in `crates/xagent-brain/tests/danger_percept_ablation_ab.rs`
    (lines 1–72, the lived seeded A/B harness), the within-life avoidance fraction
    is ≈0.42 under both sighted (danger bearing visible) and blinded (danger bearing
    masked) runs — the delta is +0.0036, real but negligible (CI excludes 0, noise
@@ -55,13 +55,13 @@ Findings:
 
 1. **Within-life danger-percept ablation shows percept wiring but negligible
    steering contribution.** The seeded within-life A/B in
-   `danger_percept_ablation_ab.rs:1-72` measures mean avoidance delta = +0.0036
+   `crates/xagent-brain/tests/danger_percept_ablation_ab.rs:1-72` measures mean avoidance delta = +0.0036
    (sighted 0.427, blinded 0.424) with CI [+0.0008, +0.0065], above the A/A noise
    floor (0.0, deterministic kernel) but far below practical significance (±0.05).
    This rules out broken wiring but leaves open whether selection amplifies the
    signal.
 2. **Generational selection regime is untested for intent-causality.** The baseline
-   distribution (`intent_baseline_measurement.rs`) is within-life only (random init
+   distribution (`crates/xagent-brain/tests/intent_baseline_measurement.rs`) is within-life only (random init
    + TD, no evolution). Whether evolved populations show stronger danger-avoidance
    intent delta under generational selection is unknown.
 3. **Paired seeded A/B harness for evolved policies exists and is proven.** The
@@ -73,7 +73,7 @@ Findings:
    ablation.
 4. **Intent-as-meta-score framework is not yet explicit.** Threshold setting, delta
    interpretation, noise-floor gating, and lifespan-denominator accounting are
-   implicit in the within-life test (`danger_percept_ablation_ab.rs:27-31`); they
+   implicit in the within-life test (`crates/xagent-brain/tests/danger_percept_ablation_ab.rs:27-31`); they
    must be documented as an explicit framework so future ablations can follow the
    pattern (`docs/plans/0015-Intent-Awareness-Measurement-Framework/SCOPE.md:99-104`).
 
@@ -162,7 +162,7 @@ Findings:
   0001). This plan measures via blinding mask only, not by changing how detection
   runs. The physics and sensing remain unchanged.
 - **Within-life danger-percept re-measurement or refinement.** The within-life
-  harness exists (`danger_percept_ablation_ab.rs`) and is mature. This plan measures
+  harness exists (`crates/xagent-brain/tests/danger_percept_ablation_ab.rs`) and is mature. This plan measures
   evolved policy only, not within-life. If the within-life numbers need refinement,
   that is a separate task.
 - **Threshold-based gating of evolution on intent.** This plan measures and

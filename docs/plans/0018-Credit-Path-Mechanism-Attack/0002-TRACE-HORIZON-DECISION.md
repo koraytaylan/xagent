@@ -58,13 +58,29 @@ Prototype 0002 implements frame-synchronized trace decay: traces persist unchang
 
 ## Result: REJECT
 
-The frame-synchronized decay mechanism is **active and stable** (verified by unit test at
-`vision_stride=10`). However, it does **not improve steering alignment above chance (0.38–0.62 band)**
-when the steering probe trains at `vision_stride=1` (where the mechanism is disabled by design).
+**The REJECT verdict applies to the dense-stride (`vision_stride=1`) steering probe,** not to
+the frame-sync mechanism itself. The probe measures steering alignment under conditions where the
+mechanism is disabled by design (dense strides). The frame-synchronized decay mechanism remains
+structurally sound, verified active by unit test at `vision_stride=10` (+54% trace accumulation),
+and falsifiable under sparse-stride evaluation.
 
-The fundamental issue: the mirrored-steering probe's training regime (dense strides, 100-tick
-episodes) does not activate the frame-synchronized decay path, so the mechanism cannot affect
-steering outcomes in this evaluation framework.
+The steering probe trains at `vision_stride=1` (dense), where the mechanism is disabled. At this
+configuration, the probe measures per-tick decay behavior exclusively, so it does not exercise the
+frame-sync path and therefore cannot measure its effect on steering. The 0.501 alignment result
+reflects dense-stride performance, not sparse-stride behavior.
+
+## Scope-of-This-Result
+
+**The mechanism was not tested under its activation condition.** The frame-sync mechanism is
+designed to activate only at `vision_stride > 1` (sparse strides); the steering probe trains
+exclusively at `vision_stride=1` (dense), where the mechanism is disabled. This is a
+**scope mismatch**, not a falsification: the probe never exercises the mechanism, so the result
+cannot answer whether frame-sync improves steering at the configurations where it is meant to
+operate.
+
+A fair test of the frame-sync mechanism requires sparse-stride evaluation (`vision_stride=10`
+or higher) to exercise the frame-boundary decay path. That evaluation is deferred (see
+When-to-Revisit below).
 
 ### Why This Mechanism Did Not Change Steering Alignment
 
@@ -87,6 +103,23 @@ steering outcomes in this evaluation framework.
 
 - **Encoder food-side separability:** Within expected margin (Gabor cortex ~0.964, raycast ~0.0036)
 - **Food-visibility and consumption:** Agents still reach and eat food during training (no regression)
+
+## When-to-Revisit
+
+Frame-synchronized trace decay remains a candidate mechanism for steering improvement when the
+steering harness is re-configured to exercise it. Revisit criteria:
+
+1. **Configure the steering probe to use sparse strides** (`vision_stride=10` or similar) during
+   training and evaluation, allowing the frame-sync mechanism to activate and decay traces at
+   frame boundaries.
+2. **Run the same 120-episode, left/right food alternation protocol** with sparse-stride settings.
+3. **Measure steering alignment and compare to dense-stride baseline** (this document's 0.501 result).
+   If sparse-stride steering exceeds dense-stride by a meaningful margin (>0.10), frame-sync
+   justifies integration; if alignment remains in the chance band, the bottleneck is confirmed
+   to be elsewhere.
+
+This sparse-stride test is likely a candidate for plan 0020 or later, once the primary
+credit-path bottleneck is better isolated.
 
 ## Next Steps
 

@@ -58,9 +58,10 @@ gap; all are hygiene or documentation truthfulness.
    falsifying-only by default (`crates/xagent-sandbox/tests/integration.rs:658`).
 
 7. **Test file paths in STATUS docs are easy to misread.**
-   `intent_baseline_measurement.rs` and `danger_percept_ablation_ab.rs` live in
-   `xagent-brain/tests`, but the references omit the crate, risking
-   wrong-directory searches now that the project has two test crates
+   `crates/xagent-brain/tests/intent_baseline_measurement.rs` and
+   `crates/xagent-brain/tests/danger_percept_ablation_ab.rs` are referenced by bare
+   filename in plan docs, but the project now has two test crates and omitting the
+   crate prefix risks wrong-directory searches
    (`docs/plans/0015-Intent-Awareness-Measurement-Framework/STATUS.md`).
 
 **Provenance.** Every finding re-verified against `develop` source: the

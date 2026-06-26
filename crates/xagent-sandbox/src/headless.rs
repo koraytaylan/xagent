@@ -489,7 +489,7 @@ pub fn validate_innate_instincts(config: FullConfig, num_generations: u64) {
 
 /// Run innate-instinct A/B comparison and evaluate gates.
 /// Returns (baseline_stats, on_stats, passed: bool).
-fn run_innate_instinct_ab(
+pub fn run_innate_instinct_ab(
     config: FullConfig,
     num_generations: u64,
 ) -> (ValidationStats, ValidationStats, bool) {
@@ -558,25 +558,25 @@ fn run_innate_instinct_ab(
 
 /// Statistics collected during a headless run.
 #[derive(Clone, Debug)]
-struct ValidationStats {
-    mean_fitness: f32,
-    mean_movement_speed: f32,
-    mean_ticks_alive: u64,
+pub struct ValidationStats {
+    pub mean_fitness: f32,
+    pub mean_movement_speed: f32,
+    pub mean_ticks_alive: u64,
     /// Mean deaths per agent across all agents and all generations in this run.
     /// Uncapped: unlike `mean_ticks_alive`, this is never pinned to `tick_budget`.
     /// A value of 0.0 means no agent ever died — a population-viability red flag.
-    mean_death_count: f32,
+    pub mean_death_count: f32,
     /// Mean food consumed per agent across all agents and all generations.
     /// Used for food-per-death ratio calculation in instinct validation.
-    mean_food_consumed: f32,
-    speed_fitness_correlation: f32,
-    death_speed_regression: f32,
-    food_per_energy_vs_speed_slope: f32,
-    mean_danger_dwell_fraction: f32,
-    mean_avoidance_intent_fraction: f32,
+    pub mean_food_consumed: f32,
+    pub speed_fitness_correlation: f32,
+    pub death_speed_regression: f32,
+    pub food_per_energy_vs_speed_slope: f32,
+    pub mean_danger_dwell_fraction: f32,
+    pub mean_avoidance_intent_fraction: f32,
     /// Population-mean movement_speed per generation (chronological order).
     /// Used to assess whether speed stops ratcheting toward 100 under the ON flags.
-    speed_trajectory_per_gen: Vec<f32>,
+    pub speed_trajectory_per_gen: Vec<f32>,
 }
 
 /// Super-linear locomotor-drag exponent used in the ON run.

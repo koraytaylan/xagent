@@ -1139,10 +1139,8 @@ impl<'a> TabContext<'a> {
                     };
 
                     let ctx = cols[0].ctx().clone();
-                    let tex_key =
-                        egui::Id::new(("agent_vision", effective_snap.id, vw, vh));
-                    let existing =
-                        ctx.data(|data| data.get_temp::<egui::TextureHandle>(tex_key));
+                    let tex_key = egui::Id::new(("agent_vision", effective_snap.id, vw, vh));
+                    let existing = ctx.data(|data| data.get_temp::<egui::TextureHandle>(tex_key));
                     let tex_id = match existing {
                         Some(mut handle) => {
                             handle.set(image, egui::TextureOptions::NEAREST);

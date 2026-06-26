@@ -91,8 +91,8 @@ and (c) avoidance potential-based reward shaping. `run_headless_with_flags`
 (`headless.rs:628-664`) already accepts the flag and returns a `ValidationStats`
 carrying `mean_ticks_alive`, `mean_fitness`, and the approach/avoidance intent
 fractions. The hardened suite measures the percept in isolation —
-`intent_baseline_measurement.rs:24-43` records the avoidance distribution at default
-config with danger ON, and `danger_percept_ablation_ab.rs:11-96` runs a paired A/B
+`crates/xagent-brain/tests/intent_baseline_measurement.rs:24-43` records the avoidance distribution at default
+config with danger ON, and `crates/xagent-brain/tests/danger_percept_ablation_ab.rs:11-96` runs a paired A/B
 with/without the danger signal (both arms `danger_percept_enabled=true` so the
 intent counters always run). What is missing is a full production A/B of
 `danger_percept` OFF (baseline) vs ON, with bootstrap precision, and a recorded

@@ -3,11 +3,8 @@
 Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
-**Status:** ✅ Complete — **negative result.** All three spikes ran and each
-recorded **REJECT**; no fix cleared the ≥0.70 gate, so no mechanism was
-integrated and the mirrored-steering baseline assertion stays at `[0.38, 0.62]`.
-The credit-path bottleneck carries forward to plan 0019.
-_Last updated: 2026-06-25, against `develop`._
+**Status:** ✅ Complete — **negative result.** All three spikes ran; WS0001 CPU-side overlay rejected (mechanism not tested at GPU-integrated level — deferred); WS0002 and WS0003 rejected under their tested conditions. No fix cleared the ≥0.70 gate, so no mechanism was integrated and the mirrored-steering baseline assertion stays at `[0.38, 0.62]`. The credit-path bottleneck carries forward to plan 0019.
+_Last updated: 2026-06-26, against `develop`._
 
 ## Outcome
 
@@ -15,11 +12,13 @@ The three measurement gates held throughout: steering alignment stayed in the
 chance band, encoder food-side separability was unchanged, and food visibility
 held — so the encoder is confirmed not to be the bottleneck.
 
-- **0001 Auxiliary steering loss — REJECT.** A direct-supervision auxiliary loss
+- **0001 Auxiliary steering loss — REJECT (CPU-side overlay; mechanism not tested at GPU-integrated level).** A direct-supervision auxiliary loss
   converges in a CPU-side test harness (−68.5%), but the harness only *measures*
   the existing GPU TD path; it injects no GPU weight updates. Steering stayed at
-  **0.509** (chance). The concept is sound but must be a GPU-side weight update to
-  be testable — that is the gated `auxiliary-steering-integration` task.
+  **0.509** (chance). The CPU-side measurement overlay is rejected; the mechanism
+  itself (GPU-integrated auxiliary loss with actual weight updates in
+  `brain_passes.wgsl`) was never tested at the level required for falsification and
+  is deferred to a future plan (e.g. 0020) for GPU-integrated evaluation.
 - **0002 Frame-synchronized trace decay — REJECT.** Prototype only acts at
   `vision_stride>1`, but the mirrored-steering probe trains at `vision_stride=1`
   where it is disabled by design → **0.501**, mechanism behaviorally untested for

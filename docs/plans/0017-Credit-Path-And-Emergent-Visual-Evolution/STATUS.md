@@ -4,14 +4,17 @@ Task-level execution status for this plan. Keep it current as tasks land, and
 keep the roll-up row in [`../STATUS.md`](../STATUS.md) in sync.
 
 **Status:** 🚧 Partially landed — credit-path fix **FALSIFIED**, optimization landed.
-_Last updated: 2026-06-25, against `develop`._
+_Last updated: 2026-06-26, against `develop`._
 
 **Outcome:** WS0001's premise (decay-schedule hardening and/or urgency isolation
 unlocks steering) was **falsified** — no candidate cleared the 0.62 gate (combined
 `0.441` vs `0.489` baseline), so the prototype shader changes were **reverted from
 `develop`**; only the chance-baseline probe and the falsification record landed
 ([`0001-CREDIT-PATH-DECISION.md`](0001-CREDIT-PATH-DECISION.md)). **WS0002 (cortex
-throughput) landed in full.** WS0003's encoder spike landed with a **DEFER** verdict
+throughput) is ⛔ blocked — the ≥50% budget assertion passes only on CI (lavapipe);
+real-GPU hardware (Metal) measures ~83 tps vs ~7,625 tps baseline (~1.1%), a 45× miss
+recorded in CORTEX-PROFILE-BASELINE.txt (18/256 active lanes, ~7% occupancy).
+Workgroup restructuring required; carried to plan 0022.** WS0003's encoder spike landed with a **DEFER** verdict
 ([`0003-EMERGENT-ENCODER-DECISION.md`](0003-EMERGENT-ENCODER-DECISION.md)). WS0004 is
 **superseded** — the A/B can't run until an encoder is integrated, which is gated on a
 working credit path. The credit-path bottleneck is carried forward to **plan 0018**.
@@ -35,7 +38,7 @@ working credit path. The credit-path bottleneck is carried forward to **plan 001
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
 | 0001 | Credit-Path Diagnosis and Learning Unlock | `baseline-mirrored-steering-probe` ✅, `td-decay-schedule-audit` 🧪 (falsified, reverted), `urgency-scaling-isolation` 🧪 (falsified, reverted), `credit-path-fix-lands` ❌ (no fix cleared the gate) | ❌ Falsified |
-| 0002 | Cortex Throughput Optimization | `cortex-throughput-profile-baseline` ✅, `separable-dog-optimization` ✅, `cortex-throughput-optimization-suite` ✅ | ✅ Done |
+| 0002 | Cortex Throughput Optimization | `cortex-throughput-profile-baseline` ✅, `separable-dog-optimization` ✅, `cortex-throughput-optimization-suite` ✅ | ⛔ Blocked (real-GPU 1.1% budget miss) |
 | 0003 | Emergent Self-Organizing Encoder | `emergent-encoder-spike` ✅, `emergent-encoder-integration` ⛔ (gated → deferred) | 🚧 Spike landed, integration deferred |
 | 0004 | A/B Comparison and Winner Promotion | `ab-harness-design` ⛔, `ab-analysis-and-verdict` ⛔ | 🗄️ Superseded (needs integrated encoder + working credit path) |
 

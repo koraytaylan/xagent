@@ -214,7 +214,7 @@ Properties that make this safe:
 ## 0007 — Test-File-Path-Traceability
 
 Today plan STATUS (and ARCHITECTURE) docs reference brain-crate test
-deliverables — `intent_baseline_measurement.rs`, `danger_percept_ablation_ab.rs`
+deliverables — `crates/xagent-brain/tests/intent_baseline_measurement.rs`, `crates/xagent-brain/tests/danger_percept_ablation_ab.rs`
 — without a crate prefix (e.g. in `docs/plans/0015-…/STATUS.md` and
 `docs/plans/0016-…/STATUS.md`). These tests live under
 `crates/xagent-brain/tests/`, but a bare filename is easily misread as

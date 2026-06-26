@@ -1,12 +1,15 @@
 use glam::Vec3;
-use xagent_shared::{BrainConfig, MotorAction, MotorCommand, WorldConfig};
+use xagent_shared::{BrainConfig, FullConfig, MotorAction, MotorCommand, WorldConfig};
 
 use xagent_sandbox::agent::AgentBody;
 use xagent_sandbox::bench;
+use xagent_sandbox::headless;
 use xagent_sandbox::physics;
 use xagent_sandbox::world::biome::BiomeType;
 use xagent_sandbox::world::terrain::TerrainData;
 use xagent_sandbox::world::WorldState;
+
+const XAGENT_VERBOSE_PROBES: &str = "XAGENT_VERBOSE_PROBES";
 
 // ── Helper ─────────────────────────────────────────────────────────────
 
@@ -634,7 +637,7 @@ fn bench_runner_completes_and_reports_ticks_per_sec() {
 ///
 /// Post-optimization (3×3 pool, radius=9, 24×24 retina):
 ///   - Expected speedup: ~7–10× from combined pool+kernel reduction.
-///   - cortex_throughput_meets_budget assertion enforces ≥50% of measured baseline.
+///   - cortex_throughput_meets_budget_on_software_adapter assertion enforces ≥50% of measured baseline (lavapipe/CI only; real GPU sits at ~1.1% of baseline, recorded in CORTEX-PROFILE-BASELINE.txt).
 ///
 /// N=100 agents (pre-optimization baseline):
 ///   - Cortex OFF (fused baseline): ~7,742 tps (129.17 μs/frame)
@@ -693,14 +696,16 @@ fn cortex_throughput_profile_baseline() {
 /// at full CPU utilization regardless of active count, so the ~7% occupancy does not
 /// hurt throughput. On real GPU hardware the warp scheduler only activates the 18
 /// live lanes per warp; the remaining 238 lanes sit idle, causing ~18× throughput
-/// regression relative to the fused (cortex-off) baseline. This architectural limit
-/// cannot be eliminated by the pooling/retina/bank optimizations in this task without
-/// restructuring the workgroup layout (out of scope per SCOPE.md). The ≥50% criterion
-/// therefore applies only to the CI environment (lavapipe on Linux) where it is
-/// achievable and meaningful. All invariance probes (orientation ≥3×, phase <10%,
-/// position <15%) run on both hardware and software adapters and are not gated.
+/// regression relative to the fused (cortex-off) baseline (~7% lane occupancy, measured
+/// as ~1.1% of baseline throughput on Metal: 83 tps vs 7,625 tps, recorded in
+/// CORTEX-PROFILE-BASELINE.txt). This architectural limit cannot be eliminated by the
+/// pooling/retina/bank optimizations in this task without restructuring the workgroup
+/// layout (out of scope per SCOPE.md). The ≥50% criterion therefore applies only to
+/// the CI environment (lavapipe on Linux) where it is achievable and meaningful. All
+/// invariance probes (orientation ≥3×, phase <10%, position <15%) run on both
+/// hardware and software adapters and are not gated.
 #[test]
-fn cortex_throughput_meets_budget() {
+fn cortex_throughput_meets_budget_on_software_adapter() {
     if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no adapter available");
         return;
@@ -711,7 +716,7 @@ fn cortex_throughput_meets_budget() {
         // budget is a CI (lavapipe) gate — skip on real GPU hardware so a legitimate
         // Metal run does not produce a false failure.
         eprintln!(
-            "Skipping cortex_throughput_meets_budget on GPU hardware adapter: \
+            "Skipping cortex_throughput_meets_budget_on_software_adapter on GPU hardware adapter: \
              warp underutilization (18/256 active lanes = ~7%) makes the ≥50% \
              criterion unachievable without workgroup restructuring (out of scope). \
              This test runs and asserts only on CPU software adapters (lavapipe/CI)."
@@ -729,7 +734,7 @@ fn cortex_throughput_meets_budget() {
     let result = xagent_sandbox::bench::measure_cortex_throughput(&brain, &world, 10, 50);
 
     eprintln!(
-        "[cortex_throughput_meets_budget] baseline={:.0} tps, cortex={:.0} tps, \
+        "[cortex_throughput_meets_budget_on_software_adapter] baseline={:.0} tps, cortex={:.0} tps, \
          fraction={:.3} (target ≥0.50)",
         result.baseline_tps, result.cortex_tps, result.fraction_of_baseline
     );
@@ -8739,11 +8744,13 @@ fn baseline_td_error_variance_during_foraging() {
     let std = var.sqrt();
     let min = samples.iter().copied().fold(f32::INFINITY, f32::min);
     let max = samples.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    eprintln!(
-        "baseline TD-error variance: mean|δ|={mean:.3e}, std={std:.3e}, \
-         min={min:.3e}, max={max:.3e}, n={}",
-        samples.len()
-    );
+    if std::env::var(XAGENT_VERBOSE_PROBES).is_ok() {
+        eprintln!(
+            "baseline TD-error variance: mean|δ|={mean:.3e}, std={std:.3e}, \
+             min={min:.3e}, max={max:.3e}, n={}",
+            samples.len()
+        );
+    }
 
     // Movement-enabled foraging baseline measured 2026-06-25 Metal: mean|δ|=4.547e-4.
     // Range [2e-4, 6e-4] brackets that measurement and flags regressions or
@@ -8865,7 +8872,9 @@ fn auxiliary_steering_loss_converges_on_bearing() {
     let third = TICKS / 3;
     let early: f32 = losses[..third].iter().sum::<f32>() / third.max(1) as f32;
     let late: f32 = losses[TICKS - third..].iter().sum::<f32>() / third.max(1) as f32;
-    eprintln!("auxiliary steering loss: early={early:.4}, late={late:.4}");
+    if std::env::var(XAGENT_VERBOSE_PROBES).is_ok() {
+        eprintln!("auxiliary steering loss: early={early:.4}, late={late:.4}");
+    }
     assert!(
         late < early,
         "auxiliary loss did not decay: early={early:.4}, late={late:.4} — \
@@ -9094,25 +9103,27 @@ fn gradient_variance_per_context_breakdown() {
     let (lower_rg_mean, lower_rg_std) = compute_stats(&lower_raw_gradients);
     let (upper_rg_mean, upper_rg_std) = compute_stats(&upper_raw_gradients);
 
-    eprintln!(
-        "gradient_variance_per_context_breakdown: median_energy={median_energy:.1}, \
-         lower_half_td (n={}): mean|δ|={:.3e} ± {:.3e}, \
-         upper_half_td (n={}): mean|δ|={:.3e} ± {:.3e}, \
-         lower_half_raw_gradient (n={}): mean={:.3e} ± {:.3e}, \
-         upper_half_raw_gradient (n={}): mean={:.3e} ± {:.3e}",
-        lower_td_errors.len(),
-        lower_td_mean,
-        lower_td_std,
-        upper_td_errors.len(),
-        upper_td_mean,
-        upper_td_std,
-        lower_raw_gradients.len(),
-        lower_rg_mean,
-        lower_rg_std,
-        upper_raw_gradients.len(),
-        upper_rg_mean,
-        upper_rg_std,
-    );
+    if std::env::var(XAGENT_VERBOSE_PROBES).is_ok() {
+        eprintln!(
+            "gradient_variance_per_context_breakdown: median_energy={median_energy:.1}, \
+             lower_half_td (n={}): mean|δ|={:.3e} ± {:.3e}, \
+             upper_half_td (n={}): mean|δ|={:.3e} ± {:.3e}, \
+             lower_half_raw_gradient (n={}): mean={:.3e} ± {:.3e}, \
+             upper_half_raw_gradient (n={}): mean={:.3e} ± {:.3e}",
+            lower_td_errors.len(),
+            lower_td_mean,
+            lower_td_std,
+            upper_td_errors.len(),
+            upper_td_mean,
+            upper_td_std,
+            lower_raw_gradients.len(),
+            lower_rg_mean,
+            lower_rg_std,
+            upper_raw_gradients.len(),
+            upper_rg_mean,
+            upper_rg_std,
+        );
+    }
 
     // Both halves must have samples (the median split guarantees this).
     assert!(
@@ -9346,6 +9357,137 @@ fn gpu_adapter_present_when_required() {
         assert!(
             xagent_brain::GpuKernel::is_available(),
             "XAGENT_REQUIRE_GPU set but no GPU/lavapipe adapter — CI would silently skip the GPU suite"
+        );
+    }
+}
+
+/// Guards harness logic, not the 0013 gate verdict: with 2 generations and a
+/// tiny population, every ValidationStats field must be finite and in a valid
+/// range (no NaN/inf, counts non-negative). Catches harness rot if the learning
+/// path changes shape, without pinning a pass/fail learning result.
+#[test]
+fn run_innate_instinct_ab_produces_valid_stats() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    // 2 gens, N=5 — exercises the harness end-to-end at negligible runtime.
+    let config = FullConfig {
+        brain: BrainConfig::default(),
+        world: WorldConfig::default(),
+        governor: xagent_shared::GovernorConfig {
+            population_size: 5,
+            ..Default::default()
+        },
+    };
+    let (baseline, on, _passed) = headless::run_innate_instinct_ab(config, 2);
+
+    // Assert each field is finite and non-negative (well-formed), not a verdict.
+    for stats in [&baseline, &on] {
+        assert!(
+            stats.mean_fitness.is_finite(),
+            "mean_fitness is not finite: {}",
+            stats.mean_fitness
+        );
+        assert!(
+            stats.mean_fitness >= 0.0,
+            "mean_fitness is negative: {}",
+            stats.mean_fitness
+        );
+
+        assert!(
+            stats.mean_movement_speed.is_finite(),
+            "mean_movement_speed is not finite: {}",
+            stats.mean_movement_speed
+        );
+        assert!(
+            stats.mean_movement_speed >= 0.0,
+            "mean_movement_speed is negative: {}",
+            stats.mean_movement_speed
+        );
+
+        assert!(
+            stats.mean_death_count.is_finite(),
+            "mean_death_count is not finite: {}",
+            stats.mean_death_count
+        );
+        assert!(
+            stats.mean_death_count >= 0.0,
+            "mean_death_count is negative: {}",
+            stats.mean_death_count
+        );
+
+        assert!(
+            stats.mean_food_consumed.is_finite(),
+            "mean_food_consumed is not finite: {}",
+            stats.mean_food_consumed
+        );
+        assert!(
+            stats.mean_food_consumed >= 0.0,
+            "mean_food_consumed is negative: {}",
+            stats.mean_food_consumed
+        );
+
+        assert!(
+            stats.speed_fitness_correlation.is_finite(),
+            "speed_fitness_correlation is not finite: {}",
+            stats.speed_fitness_correlation
+        );
+
+        assert!(
+            stats.death_speed_regression.is_finite(),
+            "death_speed_regression is not finite: {}",
+            stats.death_speed_regression
+        );
+
+        assert!(
+            stats.food_per_energy_vs_speed_slope.is_finite(),
+            "food_per_energy_vs_speed_slope is not finite: {}",
+            stats.food_per_energy_vs_speed_slope
+        );
+
+        assert!(
+            stats.mean_danger_dwell_fraction.is_finite(),
+            "mean_danger_dwell_fraction is not finite: {}",
+            stats.mean_danger_dwell_fraction
+        );
+        assert!(
+            stats.mean_danger_dwell_fraction >= 0.0,
+            "mean_danger_dwell_fraction is negative: {}",
+            stats.mean_danger_dwell_fraction
+        );
+        assert!(
+            stats.mean_danger_dwell_fraction <= 1.0,
+            "mean_danger_dwell_fraction exceeds 1.0: {}",
+            stats.mean_danger_dwell_fraction
+        );
+
+        assert!(
+            stats.mean_avoidance_intent_fraction.is_finite(),
+            "mean_avoidance_intent_fraction is not finite: {}",
+            stats.mean_avoidance_intent_fraction
+        );
+        assert!(
+            stats.mean_avoidance_intent_fraction >= 0.0,
+            "mean_avoidance_intent_fraction is negative: {}",
+            stats.mean_avoidance_intent_fraction
+        );
+        assert!(
+            stats.mean_avoidance_intent_fraction <= 1.0,
+            "mean_avoidance_intent_fraction exceeds 1.0: {}",
+            stats.mean_avoidance_intent_fraction
+        );
+
+        assert!(
+            !stats
+                .speed_trajectory_per_gen
+                .iter()
+                .any(|v| !v.is_finite()),
+            "speed_trajectory_per_gen contains non-finite values"
+        );
+        assert!(
+            stats.speed_trajectory_per_gen.iter().all(|v| v >= &0.0),
+            "speed_trajectory_per_gen contains negative values"
         );
     }
 }

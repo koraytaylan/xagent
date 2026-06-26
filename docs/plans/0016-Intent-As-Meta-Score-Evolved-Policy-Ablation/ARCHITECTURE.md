@@ -83,7 +83,7 @@ approach_intent_trajectory_per_gen.push(gen_mean_approach_intent);
 ```
 
 - **A new measurement test** `crates/xagent-sandbox/tests/danger_percept_evolved_ab.rs`,
-  mirroring the within-life harness `danger_percept_ablation_ab.rs:1-72` but calling the
+  mirroring the within-life harness `crates/xagent-brain/tests/danger_percept_ablation_ab.rs:1-72` but calling the
   *evolved* harness. Per seed it runs a sighted arm (`danger_percept_blinded = false`) and a
   blinded arm (`= true`) across `NUM_GENERATIONS`, both with `danger_percept_enabled = true`
   and the identical world seed, so genomes and world match and only the mask differs. It
@@ -91,10 +91,10 @@ approach_intent_trajectory_per_gen.push(gen_mean_approach_intent);
   lifespan, mean death count, and mean food consumed; computes the paired mean delta
   (sighted − blinded), its sample std, and a 95% CI by the normal approximation
   `ci95 = 1.96 * std_delta / sqrt(num_seeds)` (the formula the within-life test uses at
-  `danger_percept_ablation_ab.rs:247`); and measures an A/A noise floor by running the same
+  `crates/xagent-brain/tests/danger_percept_ablation_ab.rs:247`); and measures an A/A noise floor by running the same
   seed sighted twice and taking the absolute fraction difference. It embeds the GPU
   self-skip guard verbatim and follows the run-then-paste idiom — measured numbers pasted
-  into the file's doc comment (mirroring `danger_percept_ablation_ab.rs:33-71`):
+  into the file's doc comment (mirroring `crates/xagent-brain/tests/danger_percept_ablation_ab.rs:33-71`):
 
 ```rust
 /// Evolved-policy danger-percept A/B: paired seeded evolution, sighted vs blinded encoder,
@@ -131,10 +131,10 @@ Properties that make this safe:
 
 ## 0002 — Intent-As-Meta-Score Framework Documentation
 
-Today the danger-percept within-life ablation (`danger_percept_ablation_ab.rs`) documents
+Today the danger-percept within-life ablation (`crates/xagent-brain/tests/danger_percept_ablation_ab.rs`) documents
 the measurement idiom — paired runs, seed identity, delta/CI, A/A noise floor, verdict logic
 — only inline as comments and measured numbers in the test file
-(`danger_percept_ablation_ab.rs:27-31`, `:33-71`, `:279-290`). The framework is implicit: a
+(`crates/xagent-brain/tests/danger_percept_ablation_ab.rs:27-31`, `:33-71`, `:279-290`). The framework is implicit: a
 future plan that wants to measure another evolvable parameter (a hypothetical
 `food_percept_blinded`, `danger_cost_enabled`, `slow_damage_enabled`) must reverse-engineer
 the pattern from this one test. There is no explicit statement of the intent-as-meta-score
@@ -167,9 +167,9 @@ Edits (documentation-only; no code or behavior changes):
 
 - **Add an "Evolved-Policy Intent Validation" subsection to `crates/xagent-brain/README.md`**
   under "Intent & Awareness Telemetry" (added by Plan 0015). Explain the two intent regimes:
-  **within-life** (random init + TD, e.g. `intent_baseline_measurement.rs`) measures whether
+  **within-life** (random init + TD, e.g. `crates/xagent-brain/tests/intent_baseline_measurement.rs`) measures whether
   counters increment when the target is in range — the baseline Plan 0015 established; and
-  **evolved-policy** (generational selection, e.g. `danger_percept_evolved_ab.rs`) measures
+  **evolved-policy** (generational selection, e.g. `crates/xagent-sandbox/tests/danger_percept_evolved_ab.rs`) measures
   whether evolution amplifies or diminishes the causal brain→steering coupling. Document the
   paired-seeded A/B pattern and why it isolates causality (seed identity, blinding mask,
   delta interpretation), and note that the within-life pilot showed a +0.0036 delta

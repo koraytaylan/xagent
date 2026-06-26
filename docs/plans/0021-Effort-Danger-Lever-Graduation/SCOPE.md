@@ -29,8 +29,8 @@ conditions.
    the hardened speed-decoupling validation
    (`crates/xagent-sandbox/src/headless.rs:428-443` `run_headless_with_flags`
    enables it as a flag), plus two corroborating tests:
-   `intent_baseline_measurement.rs` (avoidance distribution at default config) and
-   `danger_percept_ablation_ab.rs` (paired A/B with/without danger percept
+   `crates/xagent-brain/tests/intent_baseline_measurement.rs` (avoidance distribution at default config) and
+   `crates/xagent-brain/tests/danger_percept_ablation_ab.rs` (paired A/B with/without danger percept
    signal). The `2026-06-25` review F8 and 0010 STATUS explicitly ask for either a
    flip-or-retire decision or documented unlock conditions. The danger-percept A/B
    harness is ready; this plan runs it on production seeds and records the verdict.
@@ -54,8 +54,8 @@ decision. This plan runs the production A/Bs and writes the decision docs.
 foraging formula and `competent > camper` guard at `governor.rs:135-151`
 (confirmed); the speed-decoupling harness with the `danger_percept_enabled` flag
 toggle at `headless.rs:419-458` / `headless.rs:428-443` (confirmed); the two
-hardened danger tests `intent_baseline_measurement.rs` and
-`danger_percept_ablation_ab.rs` (confirmed); the recorded prove-or-kill gate
+hardened danger tests `crates/xagent-brain/tests/intent_baseline_measurement.rs` and
+`crates/xagent-brain/tests/danger_percept_ablation_ab.rs` (confirmed); the recorded prove-or-kill gate
 failures in `0013-INNATE-INSTINCT-DECISION.md` against `run_innate_instinct_ab` at
 `headless.rs:492-560` (confirmed). No `2026-06-25` review claim was rejected
 during verification — all three flagged levers are confirmed default-off and

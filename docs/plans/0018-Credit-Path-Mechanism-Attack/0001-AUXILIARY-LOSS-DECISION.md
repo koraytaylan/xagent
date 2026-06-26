@@ -6,7 +6,7 @@
 
 ## Summary
 
-The prototype demonstrates that the direct-supervision auxiliary steering loss CONVERGES in a test harness (loss decays −68.5%), but this convergence is a CPU-side measurement of the GPU kernel's existing TD learning path. The CPU-side auxiliary loss does NOT inject gradient updates into the GPU kernel — it is measurement-only. When the steering probe is run after training under the same auxiliary-loss regime, alignment is 0.509 (451/886), which remains in the chance band [0.38, 0.62]. The design is REJECTED: loss convergence does not translate to steering improvement because the CPU-side measurement overlay has no mechanism to modify GPU weights.
+The prototype demonstrates that the direct-supervision auxiliary steering loss CONVERGES in a test harness (loss decays −68.5%), but this convergence is a CPU-side measurement of the GPU kernel's existing TD learning path. The CPU-side auxiliary loss does NOT inject gradient updates into the GPU kernel — it is measurement-only. When the steering probe is run after training under the same auxiliary-loss regime, alignment is 0.509 (451/886), which remains in the chance band [0.38, 0.62]. **The design is REJECTED for the CPU-side measurement overlay tested here:** loss convergence does not translate to steering improvement because the CPU-side measurement overlay has no mechanism to modify GPU weights. The mechanism itself (auxiliary steering loss as a GPU-integrated technique) is not tested at the relevant level and should not be considered falsified.
 
 ## Measurements
 
@@ -42,6 +42,12 @@ The spike design as implemented is a CPU-side measurement overlay. The auxiliary
 
 4. **ACCEPT was premature.** The previous ACCEPT verdict was based only on loss convergence, which is a necessary but insufficient condition. The spec requires steering alignment to clear ≥0.70 for ACCEPT, or the verdict is REJECT with measured cause. Alignment stayed in the chance band.
 
+## Scope-of-This-Rejection
+
+This rejection applies specifically to the CPU-side measurement overlay tested here, not to the auxiliary loss mechanism as a GPU-integrated technique. The test (`auxiliary_steering_loss_converges_on_bearing` and `auxiliary_steering_probe_with_loss_enabled`) measured a CPU-side loss computation that reads agent telemetry and computes the bearing mismatch, but does not inject gradient updates back into the GPU kernel's weight matrices. The mechanism — direct supervision of steering output via an auxiliary loss with actual GPU-integrated weight updates — was never tested at the level required for falsification.
+
+The REJECT verdict means: the CPU-side measurement overlay provides no steering improvement and is not carried forward. The mechanism itself (auxiliary steering loss implemented inside `brain_passes.wgsl` with actual weight updates) remains to be tested in a future GPU-integrated implementation, which is the correct path to evaluate whether auxiliary supervision can bypass the slow TD bootstrap.
+
 ## Measured Cause
 
 - **Primary cause:** The auxiliary loss is CPU-side measurement only; it does not inject gradient updates into the GPU kernel. Steering alignment 0.509 (451/886) remained in chance band [0.38, 0.62].
@@ -50,13 +56,15 @@ The spike design as implemented is a CPU-side measurement overlay. The auxiliary
 
 ## Next Step
 
-Per the spec: REJECT means no code lands — the main TD path stays unchanged. Workstreams 0002 (trace-horizon) and 0003 (gradient shaping) proceed in parallel.
+Per the spec: REJECT of the CPU-side overlay means no measurement-overlay code lands — the main TD path stays unchanged. Workstreams 0002 (trace-horizon) and 0003 (gradient shaping) proceed in parallel.
 
-If `auxiliary-steering-integration` is unblocked (e.g., by a REJECT-then-GPU-integrate sequence), the integration task should:
+**Future GPU-integrated implementation:** The auxiliary steering loss mechanism is deferred to a future plan (e.g., 0020) for GPU-integrated testing. When that work is undertaken, the implementation should:
 1. Move the loss computation into `coop_predict_and_act()` in `brain_passes.wgsl`.
 2. Apply actual weight updates at an auxiliary learning rate (0.01, 1/10th of TD).
 3. Add `auxiliary_steering_loss_enabled` flag to `BrainConfig` (default off).
-4. Re-run the mirrored-steering probe and record alignment.
+4. Re-run the mirrored-steering probe with the GPU-integrated loss and record alignment; gate on ≥0.70 before acceptance.
+
+This approach will test the mechanism at the correct level: GPU-integrated credit updates that can actually modify network weights and produce measurable steering improvement.
 
 ## Measurement Protocol
 

@@ -163,7 +163,7 @@ telemetry.
 Edits:
 
 - **Measurement probe** `crates/xagent-brain/tests/intent_baseline_measurement.rs`,
-  mirroring the kernel-driving idiom of `learning_signal_baseline.rs` (the snapshot/zeros
+  mirroring the kernel-driving idiom of `crates/xagent-brain/tests/learning_signal_baseline.rs` (the snapshot/zeros
   trap is reading telemetry off a kernel that was never dispatched). Concretely:
   `BrainConfig::default()` / `WorldConfig::default()` (from `xagent_shared`),
   `GpuKernel::new(16, food_count, …)`, `reset_agents_seeded(&brain_config, 12345)`,
@@ -216,7 +216,7 @@ layout-parity test (`buffers.rs`, updated for the two new slots), the new
 `approach_intent_fraction_discriminates_turn_toward` test (mirroring the avoidance
 discrimination test at `governor.rs:4763`), and the death-path-parity regression test
 (which passes only if both death functions save/restore the new counters identically). The
-baseline probe `intent_baseline_measurement.rs` is measurement-only (asserts nothing) and
+baseline probe `crates/xagent-brain/tests/intent_baseline_measurement.rs` is measurement-only (asserts nothing) and
 embeds the `GpuKernel::is_available()` self-skip guard, so it self-skips without an adapter
 and runs under Mesa lavapipe in CI. The falsifiable deliberate-vs-incidental gate lives in
 the deferred follow-up harness, authored once the baseline numbers exist.

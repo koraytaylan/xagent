@@ -1,0 +1,56 @@
+{
+  "danger_dwell_fraction_baseline": {
+    "effect": 0.0,
+    "lower_ci": 0.13947099447250366,
+    "point": 0.2401958703994751,
+    "upper_ci": 0.3212563395500183
+  },
+  "danger_dwell_fraction_on": {
+    "effect": -0.006185740232467651,
+    "lower_ci": 0.14105427265167236,
+    "point": 0.23401013016700745,
+    "upper_ci": 0.29411837458610535
+  },
+  "mean_fitness_baseline": {
+    "effect": 0.0,
+    "lower_ci": 0.011188100092113018,
+    "point": 0.022133085876703262,
+    "upper_ci": 0.03347805142402649
+  },
+  "mean_fitness_on": {
+    "effect": -0.017414625734090805,
+    "lower_ci": 0.002914966316893697,
+    "point": 0.004718460608273745,
+    "upper_ci": 0.009127429686486721
+  },
+  "mean_ticks_alive_baseline": {
+    "effect": 0.0,
+    "lower_ci": 9925.0,
+    "point": 9960.4697265625,
+    "upper_ci": 9994.0
+  },
+  "mean_ticks_alive_on": {
+    "effect": 11.8798828125,
+    "lower_ci": 9944.0,
+    "point": 9972.349609375,
+    "upper_ci": 9994.0
+  },
+  "run_parameters": {
+    "num_generations": 50,
+    "num_replicates": 100,
+    "population": 100,
+    "tick_budget_per_generation": 10000
+  },
+  "speed_correlation_baseline": {
+    "effect": 0.0,
+    "lower_ci": -0.20951014757156372,
+    "point": 0.09137041121721268,
+    "upper_ci": 0.5251175165176392
+  },
+  "speed_correlation_on": {
+    "effect": -0.07517305016517639,
+    "lower_ci": -0.3079395294189453,
+    "point": 0.016197362914681435,
+    "upper_ci": 0.5296201705932617
+  }
+}

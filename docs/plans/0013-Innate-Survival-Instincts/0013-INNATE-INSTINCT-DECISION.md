@@ -92,3 +92,18 @@ Reopen only with new evidence from offline prototyping:
 
 Until at least (1) is addressed and a re-run shows a real benefit, the seeded-
 instinct mechanism ships **complete but default-off** behind `innate_instincts_enabled`.
+
+## Decision update: Gated-on-Credit-Path (recorded 2026-06-26, plan 0021)
+
+**Status: DEFERRED, gated on credit-path improvement.**
+
+The initial 0013 run rejected the innate-instincts mechanism, but the longer-term diagnosis (plans 0017–0020) now clarifies that the rejection is not a mechanism failure — it is a **credit-path bottleneck**. The seeded patterns (danger instinct, food instinct) are sound as motor priors, but they cannot be acted upon reliably when the learning credit path sits at chance (steering-alignment 0.489, acceptance threshold 0.62). Plan 0020 proved this directly: a correctly-supervised turn→food-bearing auxiliary loss achieves 0.841 steering (95% CI [0.816, 0.867]), clearing the acceptance gate and demonstrating that the routing is learnable in principle — the problem is that the self-supervised TD path does not deliver that signal.
+
+This gate **re-opens when a future plan achieves `steering_alignment >= 0.62`** on production seeds with the default homeostasis-only learning path. At that point, re-run the innate-instincts A/B with `danger_percept_enabled=true` and `innate_instincts_enabled=ON/OFF` to measure the seeded-prior contribution to the improved credit signal. The revised A/B targets are:
+
+- **Survival gate**: ON ≥ baseline × 1.10 (unchanged)
+- **Alignment gate**: avoidance-intent ≥ 0.4 (unchanged, but now with danger sensed)
+- **Food-per-death gate**: ratio ≥ 2.0 (unchanged)
+- **Credit-path precondition**: steering-alignment > 0.62 (new gating criterion)
+
+The seeding code ships complete and default-off behind `innate_instincts_enabled` for future research reference. The blank-slate learning model is the committed baseline until the credit-path improvement unlocks this gate.

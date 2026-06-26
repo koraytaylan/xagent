@@ -126,9 +126,39 @@ struct Cli {
     #[arg(long)]
     validate_innate_instincts: bool,
 
-    /// Number of generations for validation (default: 10)
-    #[arg(long, default_value_t = 10)]
+    /// Run danger-percept production A/B: danger_percept_enabled OFF (baseline) vs ON,
+    /// measuring avoidance-intent, approach-intent, ticks_alive, and steering_alignment
+    /// with bootstrap 95% CI across N replicates.
+    #[arg(long)]
+    validate_danger_percept: bool,
+
+    /// Number of generations for validation (default: 50 for production scale)
+    #[arg(long, default_value_t = 50)]
     validation_generations: u64,
+
+    /// Population size for validation A/B (default: 100 for production scale)
+    #[arg(long, default_value_t = 100)]
+    validation_population: u32,
+
+    /// Number of bootstrap replicates for validation (default: 100 for full production CI;
+    /// reduce to 5-10 for quick local checks where GPU time is limited)
+    #[arg(long, default_value_t = 100)]
+    validation_replicates: usize,
+
+    /// Override the per-generation tick budget for validation A/B runs (default: 0 = use
+    /// the governor's configured tick_budget, typically 1_000_000). Setting a smaller value
+    /// (e.g., 10_000) dramatically reduces wall-clock time while preserving the evolutionary
+    /// signal across 50 generations; both A/B arms always use the same budget, so the
+    /// relative comparison is unbiased. Values must be a non-zero multiple of
+    /// vision_stride × brain_tick_stride (100 at default strides); 0 means no override.
+    #[arg(long, default_value_t = 0)]
+    validation_tick_budget: u64,
+
+    /// Offset added to the world seed before the bootstrap loop starts. Use to shard N=100
+    /// replicates across parallel processes: run N=10 with seed-start 0, 10, 20 ... 90 in
+    /// parallel, then merge the per-shard JSON files (default: 0, no offset).
+    #[arg(long, default_value_t = 0)]
+    validation_seed_start: u64,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -658,12 +688,37 @@ fn main() {
     }
 
     if cli.validate_speed_decoupling {
-        headless::validate_speed_decoupling(config, cli.validation_generations);
+        // Apply seed-start offset so parallel shards use non-overlapping seed ranges.
+        if cli.validation_seed_start > 0 {
+            config.world.seed = config.world.seed.wrapping_add(cli.validation_seed_start);
+        }
+        headless::validate_speed_decoupling(
+            config,
+            cli.validation_generations,
+            cli.validation_population,
+            cli.validation_replicates,
+            cli.validation_tick_budget,
+        );
         return;
     }
 
     if cli.validate_innate_instincts {
         headless::validate_innate_instincts(config, cli.validation_generations);
+        return;
+    }
+
+    if cli.validate_danger_percept {
+        // Apply seed-start offset so parallel shards use non-overlapping seed ranges.
+        if cli.validation_seed_start > 0 {
+            config.world.seed = config.world.seed.wrapping_add(cli.validation_seed_start);
+        }
+        headless::validate_danger_percept(
+            config,
+            cli.validation_generations,
+            cli.validation_population,
+            cli.validation_replicates,
+            cli.validation_tick_budget,
+        );
         return;
     }
 

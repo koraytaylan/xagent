@@ -1,0 +1,56 @@
+{
+  "approach_intent_baseline": {
+    "effect": 0.0,
+    "lower_ci": 0.47117117047309875,
+    "point": 0.49211737513542175,
+    "upper_ci": 0.5034627318382263
+  },
+  "approach_intent_on": {
+    "effect": -0.00044974684715270996,
+    "lower_ci": 0.4698079228401184,
+    "point": 0.49166762828826904,
+    "upper_ci": 0.5064674019813538
+  },
+  "avoidance_intent_baseline": {
+    "effect": 0.0,
+    "lower_ci": 0.0,
+    "point": 0.0,
+    "upper_ci": 0.0
+  },
+  "avoidance_intent_on": {
+    "effect": 0.49793490767478943,
+    "lower_ci": 0.4749702215194702,
+    "point": 0.49793490767478943,
+    "upper_ci": 0.51474928855896
+  },
+  "mean_ticks_alive_baseline": {
+    "effect": 0.0,
+    "lower_ci": 995.0,
+    "point": 997.9400024414062,
+    "upper_ci": 1000.0
+  },
+  "mean_ticks_alive_on": {
+    "effect": -0.09002685546875,
+    "lower_ci": 995.0,
+    "point": 997.8499755859375,
+    "upper_ci": 1000.0
+  },
+  "run_parameters": {
+    "num_generations": 50,
+    "num_replicates": 100,
+    "population": 100,
+    "tick_budget_per_generation": 1000
+  },
+  "steering_alignment_baseline": {
+    "effect": 0.0,
+    "lower_ci": 0.23558558523654938,
+    "point": 0.24605868756771088,
+    "upper_ci": 0.25173136591911316
+  },
+  "steering_alignment_on": {
+    "effect": 0.24874247610569,
+    "lower_ci": 0.47245392203330994,
+    "point": 0.4948011636734009,
+    "upper_ci": 0.5081764459609985
+  }
+}

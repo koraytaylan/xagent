@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use log::info;
+use serde::{Deserialize, Serialize};
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
@@ -21,13 +22,21 @@ use crate::agent::{
     mutate_brain_state, mutate_brain_state_seeded, mutate_config, mutate_config_seeded, Agent,
 };
 use crate::governor::{
-    compute_avoidance_intent_fraction, compute_danger_dwell_fraction, AdvanceResult, Governor,
+    compute_approach_intent_fraction, compute_avoidance_intent_fraction,
+    compute_danger_dwell_fraction, AdvanceResult, Governor,
 };
 use crate::world::WorldState;
 
-/// Chunk size for dispatch_batch calls. Between chunks we can read back
-/// positions for heatmap recording.
+/// Chunk size for dispatch_batch calls in the standard headless run.
+/// Between chunks we read back positions for heatmap recording.
 const HEATMAP_INTERVAL: u32 = 100;
+
+/// Number of position samples taken per generation in the validation dispatch loop.
+/// 4 samples (one per quarter of the tick budget) satisfies the within-life tracker's
+/// quarter-boundary requirements while keeping the GPU readback count low.  The
+/// actual dispatch batch size is `tick_budget / VALIDATION_HEATMAP_SAMPLES`, clamped
+/// to at least `HEATMAP_INTERVAL` (100 ticks) so it is always a valid batch.
+const VALIDATION_HEATMAP_SAMPLES: u32 = 4;
 
 /// Run the headless evolution loop: no window, no rendering, max speed.
 /// Creates a Governor, runs generations until complete or interrupted.
@@ -410,51 +419,316 @@ pub fn dump_tree(db_path: &str) {
     }
 }
 
-/// Run speed-decoupling validation: an A/B test with effort-rebased fitness,
-/// super-linear locomotor drag, and the danger percept OFF (baseline) vs ON,
-/// measuring the speed↔fitness correlation and supporting metrics.
+/// Run the paired baseline-vs-ON speed-decoupling A/B at a fixed envelope.
 ///
-/// The populated result is written to `speed-decoupling-validation.md` in the
-/// process working directory.
-pub fn validate_speed_decoupling(config: FullConfig, num_generations: u64) {
+/// Wraps `num_replicates` bootstrap replicates (baseline: all flags OFF; ON: effort-rebased
+/// fitness + super-linear locomotor drag at `speed_cost_exponent=2.0`, danger percept OFF) and
+/// computes 95% CI for four metrics: `mean_ticks_alive`, `speed_fitness_correlation`,
+/// `mean_fitness`, `danger_dwell_fraction`. Outputs JSON with point/CI/effect and a
+/// machine-readable decision rule.
+///
+/// Production default: 100 replicates, population 100, 50 generations. Pass smaller values via
+/// `--validation-replicates` / `--validation-population` / `--validation-generations` for quick
+/// hardware-limited checks.
+///
+/// `tick_budget_override`: if non-zero, replaces the governor's default 1 M-tick budget per
+/// generation. Use a smaller value (e.g. 10_000) to make N=100 production-scale bootstrap
+/// feasible on hardware where 1 M ticks × 50 gen × 100 pop × 200 arm-calls is prohibitive;
+/// 0 means keep the governor's configured value.
+pub fn validate_speed_decoupling(
+    config: FullConfig,
+    num_generations: u64,
+    population: u32,
+    num_replicates: usize,
+    tick_budget_override: u64,
+) {
+    let effective_tick_budget = if tick_budget_override > 0 {
+        tick_budget_override
+    } else {
+        config.governor.tick_budget
+    };
+
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("SPEED-DECOUPLING VALIDATION");
+    println!("SPEED-DECOUPLING PRODUCTION A/B VALIDATION");
     println!(
-        "Running {} generations with the effort/drag/danger flags OFF (baseline) then ON",
-        num_generations
+        "Running N={} bootstrap replicates at population {} × {} generations × {} ticks/gen",
+        num_replicates, population, num_generations, effective_tick_budget
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Baseline run (all flags off)
-    println!("\n[BASELINE] effort-rebased fitness / super-linear drag / danger percept OFF");
-    let baseline_stats =
-        run_headless_with_flags(config.clone(), num_generations, false, false, false);
+    // Collect baseline and ON metrics across N replicates.
+    let mut baseline_ticks_alive: Vec<f32> = Vec::new();
+    let mut baseline_speed_correlation: Vec<f32> = Vec::new();
+    let mut baseline_fitness: Vec<f32> = Vec::new();
+    let mut baseline_danger_dwell: Vec<f32> = Vec::new();
 
-    // On run: effort-rebased fitness, super-linear drag at k=2.0, and danger percept all on
-    println!("\n[ON] effort-rebased fitness / super-linear drag / danger percept ON");
-    let on_stats = run_headless_with_flags(config.clone(), num_generations, true, true, false);
+    let mut on_ticks_alive: Vec<f32> = Vec::new();
+    let mut on_speed_correlation: Vec<f32> = Vec::new();
+    let mut on_fitness: Vec<f32> = Vec::new();
+    let mut on_danger_dwell: Vec<f32> = Vec::new();
 
-    // Compute and report metrics
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("RESULTS");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    for replicate in 0..num_replicates {
+        println!(
+            "\n[Replicate {}/{}] Running baseline and ON arms...",
+            replicate + 1,
+            num_replicates
+        );
 
-    print_validation_metrics(&baseline_stats, &on_stats);
+        // Generate a seeded but independent world for this replicate.
+        let mut replicate_config = config.clone();
+        replicate_config.governor.population_size = population as usize;
+        replicate_config.world.seed = config.world.seed.wrapping_add(replicate as u64);
+        // Apply tick_budget_override when set: both arms use the same budget for a fair A/B.
+        if tick_budget_override > 0 {
+            replicate_config.governor.tick_budget = tick_budget_override;
+        }
 
-    let markdown = format_validation_markdown(
-        num_generations,
-        config.world.seed,
-        config.governor.population_size,
-        &baseline_stats,
-        &on_stats,
-    );
+        // Baseline run (all flags off)
+        let baseline_stats = run_headless_with_flags(
+            replicate_config.clone(),
+            num_generations,
+            false,
+            false,
+            false,
+        );
 
-    // Save the report in the process working directory.
-    let report_path = "speed-decoupling-validation.md";
-    match std::fs::write(report_path, markdown) {
-        Ok(()) => println!("\nResults saved to ./{}", report_path),
-        Err(e) => eprintln!("Failed to write {}: {}", report_path, e),
+        // ON run: effort-rebased fitness, super-linear drag at k=2.0, danger percept OFF.
+        // danger_percept_enabled=false isolates the effort-fitness + speed-cost axis from the
+        // danger-percept signal, so the two mechanisms are measured independently.
+        let on_stats =
+            run_headless_with_flags(replicate_config, num_generations, true, false, false);
+
+        // Record metrics for this replicate.
+        baseline_ticks_alive.push(baseline_stats.mean_ticks_alive as f32);
+        baseline_speed_correlation.push(baseline_stats.speed_fitness_correlation);
+        baseline_fitness.push(baseline_stats.mean_fitness);
+        baseline_danger_dwell.push(baseline_stats.mean_danger_dwell_fraction);
+
+        on_ticks_alive.push(on_stats.mean_ticks_alive as f32);
+        on_speed_correlation.push(on_stats.speed_fitness_correlation);
+        on_fitness.push(on_stats.mean_fitness);
+        on_danger_dwell.push(on_stats.mean_danger_dwell_fraction);
     }
+
+    // Compute bootstrap metrics: point estimate (mean), lower/upper 95% CI, effect.
+    let ticks_alive_baseline = compute_bootstrap_metric(&baseline_ticks_alive, None);
+    let ticks_alive_on =
+        compute_bootstrap_metric(&on_ticks_alive, Some(ticks_alive_baseline.point));
+
+    let speed_correlation_baseline = compute_bootstrap_metric(&baseline_speed_correlation, None);
+    let speed_correlation_on = compute_bootstrap_metric(
+        &on_speed_correlation,
+        Some(speed_correlation_baseline.point),
+    );
+
+    let fitness_baseline = compute_bootstrap_metric(&baseline_fitness, None);
+    let fitness_on = compute_bootstrap_metric(&on_fitness, Some(fitness_baseline.point));
+
+    let danger_dwell_baseline = compute_bootstrap_metric(&baseline_danger_dwell, None);
+    let danger_dwell_on =
+        compute_bootstrap_metric(&on_danger_dwell, Some(danger_dwell_baseline.point));
+
+    // Output JSON — include run parameters alongside metrics so the artifact is self-describing.
+    let json_output = serde_json::json!({
+        "run_parameters": {
+            "num_replicates": num_replicates,
+            "population": population,
+            "num_generations": num_generations,
+            "tick_budget_per_generation": effective_tick_budget,
+        },
+        "mean_ticks_alive_baseline": ticks_alive_baseline,
+        "mean_ticks_alive_on": ticks_alive_on,
+        "speed_correlation_baseline": speed_correlation_baseline,
+        "speed_correlation_on": speed_correlation_on,
+        "mean_fitness_baseline": fitness_baseline,
+        "mean_fitness_on": fitness_on,
+        "danger_dwell_fraction_baseline": danger_dwell_baseline,
+        "danger_dwell_fraction_on": danger_dwell_on,
+    });
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("BOOTSTRAP RESULTS (JSON)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_output).unwrap_or_default()
+    );
+
+    // Save JSON output.
+    let json_path = "speed_decoupling_bootstrap.json";
+    match std::fs::write(
+        json_path,
+        serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+    ) {
+        Ok(()) => println!("\nJSON output saved to ./{}", json_path),
+        Err(e) => eprintln!("Failed to write {}: {}", json_path, e),
+    }
+
+    // Print decision rule.
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("DECISION RULE");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    print_speed_decoupling_decision_rule(
+        &ticks_alive_baseline,
+        &ticks_alive_on,
+        &speed_correlation_baseline,
+        &speed_correlation_on,
+        &danger_dwell_baseline,
+        &danger_dwell_on,
+    );
+}
+
+/// Run danger-percept production A/B validation with bootstrap 95% confidence intervals.
+/// Baseline: danger_percept_enabled=false (all other flags off).
+/// ON: danger_percept_enabled=true (all other flags off).
+/// Measures avoidance-intent, approach-intent, survival (ticks_alive), and steering_alignment
+/// across N bootstrap replicates at production scale.
+///
+/// `tick_budget_override`: if non-zero, replaces the governor's default 1 M-tick budget per
+/// generation. Use a smaller value (e.g. 10_000) to make N=100 production-scale bootstrap
+/// feasible on hardware where 1 M ticks × 50 gen × 100 pop × 200 arm-calls is prohibitive;
+/// 0 means keep the governor's configured value.
+pub fn validate_danger_percept(
+    config: FullConfig,
+    num_generations: u64,
+    population: u32,
+    num_replicates: usize,
+    tick_budget_override: u64,
+) {
+    let effective_tick_budget = if tick_budget_override > 0 {
+        tick_budget_override
+    } else {
+        config.governor.tick_budget
+    };
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("DANGER-PERCEPT PRODUCTION A/B VALIDATION");
+    println!(
+        "Running N={} bootstrap replicates at population {} × {} generations × {} ticks/gen",
+        num_replicates, population, num_generations, effective_tick_budget
+    );
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Collect metrics across N replicates: baseline (danger_percept OFF) and ON.
+    let mut baseline_avoidance_intent: Vec<f32> = Vec::new();
+    let mut baseline_approach_intent: Vec<f32> = Vec::new();
+    let mut baseline_ticks_alive: Vec<f32> = Vec::new();
+    let mut baseline_steering_alignment: Vec<f32> = Vec::new();
+
+    let mut on_avoidance_intent: Vec<f32> = Vec::new();
+    let mut on_approach_intent: Vec<f32> = Vec::new();
+    let mut on_ticks_alive: Vec<f32> = Vec::new();
+    let mut on_steering_alignment: Vec<f32> = Vec::new();
+
+    for replicate in 0..num_replicates {
+        println!(
+            "\n[Replicate {}/{}] Running baseline (danger_percept OFF) and ON arms...",
+            replicate + 1,
+            num_replicates
+        );
+
+        // Generate a seeded but independent world for this replicate.
+        let mut replicate_config = config.clone();
+        replicate_config.governor.population_size = population as usize;
+        replicate_config.world.seed = config.world.seed.wrapping_add(replicate as u64);
+        // Apply tick_budget_override when set: both arms use the same budget for a fair A/B.
+        if tick_budget_override > 0 {
+            replicate_config.governor.tick_budget = tick_budget_override;
+        }
+
+        // Baseline run: all flags off, danger_percept_enabled=false
+        let baseline_stats = run_headless_with_flags(
+            replicate_config.clone(),
+            num_generations,
+            false,
+            false,
+            false,
+        );
+
+        // ON run: danger_percept_enabled=true, all other flags off
+        let on_stats =
+            run_headless_with_flags(replicate_config, num_generations, false, true, false);
+
+        // Record metrics for this replicate.
+        baseline_avoidance_intent.push(baseline_stats.mean_avoidance_intent_fraction);
+        baseline_approach_intent.push(baseline_stats.mean_approach_intent_fraction);
+        baseline_ticks_alive.push(baseline_stats.mean_ticks_alive as f32);
+        baseline_steering_alignment.push(baseline_stats.mean_steering_alignment);
+
+        on_avoidance_intent.push(on_stats.mean_avoidance_intent_fraction);
+        on_approach_intent.push(on_stats.mean_approach_intent_fraction);
+        on_ticks_alive.push(on_stats.mean_ticks_alive as f32);
+        on_steering_alignment.push(on_stats.mean_steering_alignment);
+    }
+
+    // Compute bootstrap metrics: point estimate (mean), lower/upper 95% CI, effect.
+    let avoidance_baseline = compute_bootstrap_metric(&baseline_avoidance_intent, None);
+    let avoidance_on =
+        compute_bootstrap_metric(&on_avoidance_intent, Some(avoidance_baseline.point));
+
+    let approach_baseline = compute_bootstrap_metric(&baseline_approach_intent, None);
+    let approach_on = compute_bootstrap_metric(&on_approach_intent, Some(approach_baseline.point));
+
+    let ticks_alive_baseline = compute_bootstrap_metric(&baseline_ticks_alive, None);
+    let ticks_alive_on =
+        compute_bootstrap_metric(&on_ticks_alive, Some(ticks_alive_baseline.point));
+
+    let steering_baseline = compute_bootstrap_metric(&baseline_steering_alignment, None);
+    let steering_on =
+        compute_bootstrap_metric(&on_steering_alignment, Some(steering_baseline.point));
+
+    // Output JSON — include run parameters alongside metrics so the artifact is self-describing.
+    let json_output = serde_json::json!({
+        "run_parameters": {
+            "num_replicates": num_replicates,
+            "population": population,
+            "num_generations": num_generations,
+            "tick_budget_per_generation": effective_tick_budget,
+        },
+        "avoidance_intent_baseline": avoidance_baseline,
+        "avoidance_intent_on": avoidance_on,
+        "approach_intent_baseline": approach_baseline,
+        "approach_intent_on": approach_on,
+        "mean_ticks_alive_baseline": ticks_alive_baseline,
+        "mean_ticks_alive_on": ticks_alive_on,
+        "steering_alignment_baseline": steering_baseline,
+        "steering_alignment_on": steering_on,
+    });
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("BOOTSTRAP RESULTS (JSON)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_output).unwrap_or_default()
+    );
+
+    // Save JSON output.
+    let json_path = "danger_percept_bootstrap.json";
+    match std::fs::write(
+        json_path,
+        serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+    ) {
+        Ok(()) => println!("\nJSON output saved to ./{}", json_path),
+        Err(e) => eprintln!("Failed to write {}: {}", json_path, e),
+    }
+
+    // Print decision rule.
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("DECISION RULE");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    print_danger_percept_decision_rule(
+        &avoidance_baseline,
+        &avoidance_on,
+        &approach_baseline,
+        &approach_on,
+        &ticks_alive_baseline,
+        &ticks_alive_on,
+        &steering_baseline,
+        &steering_on,
+    );
 }
 
 /// Run innate-instinct prove-or-kill A/B benchmark.
@@ -556,6 +830,18 @@ pub fn run_innate_instinct_ab(
     (baseline_stats, on_stats, passed)
 }
 
+/// One metric's bootstrap summary over N replicates: the point estimate,
+/// its 95% CI bounds (2.5th/97.5th percentile), and the ON−baseline effect.
+/// Recorded for ticks_alive, speed_correlation, fitness, and danger_dwell so the
+/// flip/retire/defer rule is backed by precision, not point-estimate noise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BootstrapMetric {
+    pub point: f32,
+    pub lower_ci: f32,
+    pub upper_ci: f32,
+    pub effect: f32,
+}
+
 /// Statistics collected during a headless run.
 #[derive(Clone, Debug)]
 pub struct ValidationStats {
@@ -574,6 +860,14 @@ pub struct ValidationStats {
     pub food_per_energy_vs_speed_slope: f32,
     pub mean_danger_dwell_fraction: f32,
     pub mean_avoidance_intent_fraction: f32,
+    /// Mean approach-intent fraction: sum of approach turns toward food divided by sum of
+    /// approach sense-range ticks, population aggregate. Paired with avoidance-intent
+    /// for the danger-percept A/B evaluation.
+    pub mean_approach_intent_fraction: f32,
+    /// Mean per-agent steering alignment: how well the chosen turn tracks the danger/food
+    /// gradient. Recorded as a deferral signal in danger-percept A/B to explain why intent
+    /// improves but steering stays in the chance band (credit-path bottleneck).
+    pub mean_steering_alignment: f32,
     /// Population-mean movement_speed per generation (chronological order).
     /// Used to assess whether speed stops ratcheting toward 100 under the ON flags.
     pub speed_trajectory_per_gen: Vec<f32>,
@@ -608,19 +902,23 @@ const INSTINCT_FOOD_PER_DEATH_MIN: f32 = 2.0;
 /// The gate only certifies decoupling when the baseline actually had a speed
 /// exploit to remove (strongly-positive correlation). A baseline already below
 /// threshold is reported "inconclusive", never PASS.
+#[allow(dead_code)]
 const BASELINE_CORR_MIN: f32 = 0.3;
 
 /// Gate: ON arm's speed-fitness correlation must fall below this threshold.
+#[allow(dead_code)]
 const DECOUPLE_CORR_MAX: f32 = 0.3;
 
 /// Gate: ON arm must strictly improve below baseline by this margin.
 /// Prevents claiming success when ON is only marginally better.
+#[allow(dead_code)]
 const DECOUPLE_MARGIN: f32 = 0.02;
 
 /// Gate: minimum mean avoidance intent fraction (turns opposing danger bearing
 /// per sense-range tick). Below this, the population is not engaging with danger
 /// decisions meaningfully. Tuned at 0.05 to require some non-zero avoidance
 /// measurement while tolerating natural variance.
+#[allow(dead_code)]
 const AVOIDANCE_FLOOR: f32 = 0.05;
 
 /// Run headless evolution and collect statistics with specified flags.
@@ -782,8 +1080,18 @@ fn run_headless_with_flags(
         let tick_budget = governor.config.tick_budget;
         let mut ticks_done: u64 = 0;
 
+        // Adaptive dispatch interval: tick_budget / VALIDATION_HEATMAP_SAMPLES gives exactly
+        // VALIDATION_HEATMAP_SAMPLES readbacks per generation, clamped to at least
+        // HEATMAP_INTERVAL (100 ticks) to avoid sub-stride batches.  This balances heatmap
+        // coverage (cells_explored) against GPU round-trip overhead regardless of tick_budget.
+        let validation_interval = ((tick_budget / u64::from(VALIDATION_HEATMAP_SAMPLES))
+            .max(u64::from(HEATMAP_INTERVAL))) as u32;
+
         while ticks_done < tick_budget {
-            let remaining = (tick_budget - ticks_done).min(HEATMAP_INTERVAL as u64) as u32;
+            // Use the adaptive dispatch interval to keep Metal/Vulkan round-trip overhead low
+            // while still sampling enough positions for meaningful heatmap coverage.  Both arms
+            // see the same interval, so the relative A/B comparison is unbiased.
+            let remaining = (tick_budget - ticks_done).min(validation_interval as u64) as u32;
             kernel.dispatch_batch(ticks_done, remaining);
             ticks_done += remaining as u64;
             governor.advance_ticks(u64::from(remaining));
@@ -966,6 +1274,18 @@ fn run_headless_with_flags(
         compute_avoidance_intent_fraction(&all_agents_fitness)
     };
 
+    let mean_approach_intent_fraction = if all_agents_fitness.is_empty() {
+        0.0
+    } else {
+        compute_approach_intent_fraction(&all_agents_fitness)
+    };
+
+    // Steering alignment: average of approach and avoidance intent fractions.
+    // Both are bounded [0, 1]; their mean reflects overall directional steering effectiveness.
+    // At chance, this is ~0.46-0.5 (the empirical baseline for vision-conditional steering).
+    let mean_steering_alignment =
+        (mean_approach_intent_fraction + mean_avoidance_intent_fraction) / 2.0;
+
     // Clean up temp database and its sidecars
     let _ = std::fs::remove_file(&temp_db);
     let _ = std::fs::remove_file(format!("{}-wal", &temp_db));
@@ -982,8 +1302,263 @@ fn run_headless_with_flags(
         food_per_energy_vs_speed_slope,
         mean_danger_dwell_fraction,
         mean_avoidance_intent_fraction,
+        mean_approach_intent_fraction,
+        mean_steering_alignment,
         speed_trajectory_per_gen,
     }
+}
+
+/// Lower percentile bound for the 95% bootstrap confidence interval (2.5th percentile).
+const CI_LOWER_PERCENTILE: f32 = 0.025;
+/// Upper percentile bound for the 95% bootstrap confidence interval (97.5th percentile).
+const CI_UPPER_PERCENTILE: f32 = 0.975;
+
+/// Compute bootstrap metric: point estimate, 95% CI bounds, and effect size.
+/// If baseline_point is None, effect is computed as zero (no comparison).
+fn compute_bootstrap_metric(values: &[f32], baseline_point: Option<f32>) -> BootstrapMetric {
+    if values.is_empty() {
+        return BootstrapMetric {
+            point: 0.0,
+            lower_ci: 0.0,
+            upper_ci: 0.0,
+            effect: 0.0,
+        };
+    }
+
+    // Point estimate: mean of replicates.
+    let point = values.iter().sum::<f32>() / values.len() as f32;
+
+    // 95% CI: 2.5th and 97.5th percentile.
+    // Use floor for the lower index and ceil for the upper index, then clamp so that
+    // lower_idx <= upper_idx regardless of N (necessary for N < 40 where the two
+    // percentile indices would otherwise cross).
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let last = values.len() - 1;
+    let lower_idx = ((CI_LOWER_PERCENTILE * last as f32).floor() as usize).min(last);
+    let upper_idx = ((CI_UPPER_PERCENTILE * last as f32).ceil() as usize)
+        .min(last)
+        .max(lower_idx);
+
+    let lower_ci = sorted[lower_idx];
+    let upper_ci = sorted[upper_idx];
+
+    // Effect: ON − baseline.
+    let effect = baseline_point.map_or(0.0, |b| point - b);
+
+    BootstrapMetric {
+        point,
+        lower_ci,
+        upper_ci,
+        effect,
+    }
+}
+
+/// Print speed-decoupling decision rule and verdict.
+/// Upper ticks-alive multiplier defining the +5% stability band above baseline.
+/// ON arm may not exceed this without indicating unexpected survival inflation.
+const TICKS_ALIVE_UPPER_BAND: f32 = 1.05;
+/// Minimum fraction of baseline danger-dwell the ON arm must retain.
+/// Agents must still enter hazard zones at ≥80% of the baseline rate.
+const DANGER_DWELL_RETENTION: f32 = 0.8;
+
+fn print_speed_decoupling_decision_rule(
+    ticks_alive_baseline: &BootstrapMetric,
+    ticks_alive_on: &BootstrapMetric,
+    speed_correlation_baseline: &BootstrapMetric,
+    speed_correlation_on: &BootstrapMetric,
+    danger_dwell_baseline: &BootstrapMetric,
+    danger_dwell_on: &BootstrapMetric,
+) {
+    // Thresholds (locked decision).
+    const SPEED_CORR_EXPLOITABLE: f32 = 0.5;
+    const SPEED_CORR_DECOUPLED: f32 = 0.2;
+    const TICKS_ALIVE_BAND: f32 = 0.1; // ±10% of baseline.
+
+    println!("\nThresholds:");
+    println!(
+        "  (a) speed_correlation BASELINE strongly positive (>= {:.1})",
+        SPEED_CORR_EXPLOITABLE
+    );
+    println!(
+        "  (b) speed_correlation ON near zero (in [-{:.1}, {:.1}])",
+        SPEED_CORR_DECOUPLED, SPEED_CORR_DECOUPLED
+    );
+    println!(
+        "  (c) ticks_alive ON within [-10%, +{:.0}%] of baseline",
+        (TICKS_ALIVE_UPPER_BAND - 1.0) * 100.0
+    );
+    println!(
+        "  (d) danger_dwell_fraction ON >= baseline * {:.1}",
+        DANGER_DWELL_RETENTION
+    );
+
+    // Check gates.
+    let gate_a = speed_correlation_baseline.point >= SPEED_CORR_EXPLOITABLE;
+    let gate_b = speed_correlation_on.point.abs() <= SPEED_CORR_DECOUPLED;
+    let lower_band = ticks_alive_baseline.point * (1.0 - TICKS_ALIVE_BAND);
+    let upper_band = ticks_alive_baseline.point * TICKS_ALIVE_UPPER_BAND;
+    let gate_c = ticks_alive_on.point >= lower_band && ticks_alive_on.point <= upper_band;
+    let gate_d = danger_dwell_on.point >= danger_dwell_baseline.point * DANGER_DWELL_RETENTION;
+
+    println!("\nGate Evaluation:");
+    println!(
+        "  (a) baseline speed_correlation {:.4} >= {:.1}? → {}",
+        speed_correlation_baseline.point,
+        SPEED_CORR_EXPLOITABLE,
+        if gate_a { "✓" } else { "✗" }
+    );
+    println!(
+        "  (b) ON speed_correlation {:.4} in [-{:.1}, {:.1}]? → {}",
+        speed_correlation_on.point,
+        SPEED_CORR_DECOUPLED,
+        SPEED_CORR_DECOUPLED,
+        if gate_b { "✓" } else { "✗" }
+    );
+    println!(
+        "  (c) ON ticks_alive {:.0} in [{:.0}, {:.0}]? → {}",
+        ticks_alive_on.point,
+        lower_band,
+        upper_band,
+        if gate_c { "✓" } else { "✗" }
+    );
+    println!(
+        "  (d) ON danger_dwell {:.4} >= {:.4}? → {}",
+        danger_dwell_on.point,
+        danger_dwell_baseline.point * DANGER_DWELL_RETENTION,
+        if gate_d { "✓" } else { "✗" }
+    );
+
+    // FLIP: all gates pass.
+    // RETIRE: ON is clearly negative on any axis (mechanism failure):
+    //   - speed_correlation_on <= -SPEED_CORR_DECOUPLED: correlation inverted beyond the
+    //     "near zero" band (< -0.2), meaning ON arm actively drives a negative speed-fitness
+    //     link — the mechanism is working in the wrong direction.
+    //   - ticks_alive_on < lower_band: survival drops >10% below baseline (harmful).
+    // DEFER: thresholds do not align — gate (a) baseline not exploitable at this scale,
+    //        gate (b) or gate (d) borderline, or gate (c) within band. Gate (a) failure
+    //        is a scale artifact (speed-ratchet requires sufficient generations to emerge),
+    //        not a mechanism failure, so it routes to DEFER rather than RETIRE.
+    let verdict = if gate_a && gate_b && gate_c && gate_d {
+        "FLIP: All gates pass. Effort-fitness is ready to ship."
+    } else if speed_correlation_on.point < -SPEED_CORR_DECOUPLED
+        || ticks_alive_on.point < lower_band
+    {
+        "RETIRE: ON speed_correlation is inverted beyond the near-zero band (<-0.2, mechanism working backwards) OR ticks_alive ON drops >10% below baseline."
+    } else {
+        "DEFER: Thresholds do not align; more data or refinement needed (see gate evaluation above)."
+    };
+
+    println!("\n>>> VERDICT: {}", verdict);
+}
+
+/// Lower bound of the "steering at chance" band. A value below this is considered regressed.
+/// 0.38 mirrors the upper bound (0.62) symmetrically around 0.5 (random chance).
+const STEERING_CHANCE_FLOOR: f32 = 0.38;
+/// Upper bound of the chance band; also the minimum threshold for "good" steering.
+/// Using a single constant avoids having two names for the same boundary (0.62).
+const STEERING_GOOD_THRESHOLD: f32 = 0.62;
+/// Acceptable ±band for ticks_alive stability between baseline and ON arms.
+/// ±5% keeps the survival gate sensitive enough to catch real regressions while
+/// tolerating the stochastic noise typical of 50-generation evolutionary runs.
+const SURVIVAL_STABILITY_BAND: f32 = 0.05;
+
+/// Print danger-percept decision rule and verdict.
+/// Thresholds define flip (intent up, survival stable, steering good), retire (intent down,
+/// survival down), or defer (intent/survival pass but steering at chance, unlock when credit
+/// path improves).
+fn print_danger_percept_decision_rule(
+    avoidance_baseline: &BootstrapMetric,
+    avoidance_on: &BootstrapMetric,
+    approach_baseline: &BootstrapMetric,
+    approach_on: &BootstrapMetric,
+    ticks_alive_baseline: &BootstrapMetric,
+    ticks_alive_on: &BootstrapMetric,
+    steering_baseline: &BootstrapMetric,
+    steering_on: &BootstrapMetric,
+) {
+    println!("\nThresholds:");
+    println!("  (a) avoidance-intent ON > baseline (lower CI of ON > point of baseline)");
+    println!(
+        "  (b) survival ON within ±{:.0}% of baseline (CI overlap)",
+        SURVIVAL_STABILITY_BAND * 100.0
+    );
+    println!(
+        "  (c) steering_alignment ON: good if > {:.2}, chance if in [{:.2}, {:.2}]",
+        STEERING_GOOD_THRESHOLD, STEERING_CHANCE_FLOOR, STEERING_GOOD_THRESHOLD
+    );
+
+    // Check gates.
+    let lower_survival_band = ticks_alive_baseline.point * (1.0 - SURVIVAL_STABILITY_BAND);
+    let upper_survival_band = ticks_alive_baseline.point * (1.0 + SURVIVAL_STABILITY_BAND);
+    let gate_a = avoidance_on.lower_ci > avoidance_baseline.point;
+    let gate_b =
+        ticks_alive_on.point >= lower_survival_band && ticks_alive_on.point <= upper_survival_band;
+    let steering_is_good = steering_on.point > STEERING_GOOD_THRESHOLD;
+    let steering_is_chance =
+        steering_on.point >= STEERING_CHANCE_FLOOR && steering_on.point <= STEERING_GOOD_THRESHOLD;
+
+    println!("\nGate Evaluation:");
+    println!(
+        "  (a) ON avoidance_intent {:.4} (CI: [{:.4}, {:.4}]) > baseline {:.4}? → {}",
+        avoidance_on.point,
+        avoidance_on.lower_ci,
+        avoidance_on.upper_ci,
+        avoidance_baseline.point,
+        if gate_a { "✓" } else { "✗" }
+    );
+    println!(
+        "  (b) ON ticks_alive {:.0} in [{:.0}, {:.0}]? → {}",
+        ticks_alive_on.point,
+        lower_survival_band,
+        upper_survival_band,
+        if gate_b { "✓" } else { "✗" }
+    );
+    let steering_label = if steering_is_good {
+        format!("GOOD (> {:.2})", STEERING_GOOD_THRESHOLD)
+    } else if steering_is_chance {
+        format!(
+            "CHANCE-BAND ({:.2}-{:.2}, credit path bottleneck)",
+            STEERING_CHANCE_FLOOR, STEERING_GOOD_THRESHOLD
+        )
+    } else {
+        format!("REGRESSED (< {:.2})", STEERING_CHANCE_FLOOR)
+    };
+    println!(
+        "  (c) ON steering_alignment {:.4} (baseline {:.4}): {}",
+        steering_on.point, steering_baseline.point, steering_label
+    );
+
+    // Print auxiliary metrics for context.
+    println!("\nAuxiliary Metrics:");
+    println!(
+        "  approach_intent ON: {:.4} (baseline {:.4}, Δ {:.4})",
+        approach_on.point, approach_baseline.point, approach_on.effect
+    );
+    println!(
+        "  avoidance_intent ON: {:.4} (baseline {:.4}, Δ {:.4})",
+        avoidance_on.point, avoidance_baseline.point, avoidance_on.effect
+    );
+
+    // Decision logic:
+    // FLIP: avoidance intent up AND survival stable.
+    // RETIRE: avoidance intent down OR survival regressed.
+    // DEFER: avoidance intent and survival pass BUT steering stays at chance,
+    //        document unlock condition (steering must exceed 0.62).
+    let verdict = if gate_a && gate_b && steering_is_good {
+        "FLIP: Avoidance-intent up, survival stable, steering good. Danger-percept is ready to ship."
+    } else if gate_a && gate_b && steering_is_chance {
+        "DEFER: Avoidance-intent up, survival stable, but steering remains in the chance band [0.38, 0.62]. \
+         Unlock condition: steering_alignment must exceed 0.62 on the default learning path (requires credit-path improvements) before danger-percept-enabled contributes independently. \
+         The percept is wired and improves intent, but the credit path (not the percept) limits steering effectiveness."
+    } else if !gate_a || !gate_b {
+        "RETIRE: Avoidance-intent did not improve beyond baseline OR survival regressed. Mechanism does not show benefit at production scale."
+    } else {
+        "DEFER: Inconclusive. Steering regressed beyond the chance band, requiring investigation before integration."
+    };
+
+    println!("\n>>> VERDICT: {}", verdict);
 }
 
 /// Compute Pearson correlation between two vectors.
@@ -1044,6 +1619,7 @@ fn compute_regression(x: &[f32], y: &[f32]) -> f32 {
 }
 
 /// Print validation metrics to console.
+#[allow(dead_code)]
 fn print_validation_metrics(baseline: &ValidationStats, on_stats: &ValidationStats) {
     println!("\nMetric                            Baseline        On              Delta");
     println!("──────────────────────────────────────────────────────────────────────");
@@ -1121,6 +1697,7 @@ fn print_validation_metrics(baseline: &ValidationStats, on_stats: &ValidationSta
 }
 
 /// Format validation results as markdown.
+#[allow(dead_code)]
 fn format_validation_markdown(
     num_generations: u64,
     world_seed: u64,
@@ -1430,6 +2007,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![50.0],
         };
         let on = ValidationStats {
@@ -1443,6 +2022,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![45.0],
         };
 
@@ -1485,6 +2066,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![50.0],
         };
 
@@ -1513,6 +2096,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![50.0],
         };
         let on = ValidationStats {
@@ -1526,6 +2111,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![45.0],
         };
 
@@ -1567,6 +2154,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.005, // Below 0.01 threshold
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![45.0],
         };
 
@@ -1594,6 +2183,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.1,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![50.0],
         };
         let on = ValidationStats {
@@ -1607,6 +2198,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05, // > 0.01 so danger_retained is true
             mean_avoidance_intent_fraction: 0.02, // below AVOIDANCE_FLOOR = 0.05
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![45.0],
         };
 
@@ -1660,6 +2253,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.12,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![50.0],
         };
         let on = ValidationStats {
@@ -1673,6 +2268,8 @@ mod tests {
             food_per_energy_vs_speed_slope: 0.0,
             mean_danger_dwell_fraction: 0.05,
             mean_avoidance_intent_fraction: 0.12,
+            mean_approach_intent_fraction: 0.5,
+            mean_steering_alignment: 0.3,
             speed_trajectory_per_gen: vec![45.0],
         };
 

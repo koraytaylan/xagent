@@ -28,7 +28,7 @@ const DENSE_INNER_LANES: u32 = 4u;
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_habituated: array<f32, ENCODED_DIMENSION>;
-var<workgroup> s_homeo: array<f32, 7>;
+var<workgroup> s_homeo: array<f32, 8>;
 var<workgroup> s_similarities: array<f32, MEMORY_CAP>;
 var<workgroup> shared_sort_indices: array<u32, MEMORY_CAP>;
 var<workgroup> s_recall: array<f32, 17>;
@@ -41,9 +41,11 @@ var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 // array frees a slot for the visual-cortex scratch (`s_visual`) without
 // changing any value. `s_pred_td[0]` == the former `s_pred_error`,
 // `s_pred_td[1]` == the former `s_td_error`.
+// Index 2 carries homeo predictor error (homeostatic gradient predictor head) — still one binding.
 const S_PRED_ERROR: u32 = 0u;
 const S_TD_ERROR: u32 = 1u;
-var<workgroup> s_pred_td: array<f32, 2>;
+const S_HOMEO_PRED_ERROR: u32 = 2u;
+var<workgroup> s_pred_td: array<f32, 3>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 2>;
@@ -1181,6 +1183,63 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     }
     workgroupBarrier();
 
+    // ── Homeostatic gradient predictor head ─────────────────────────
+    // Predict raw_gradient from the forward model's predicted state, train
+    // the predictor online, and blend the previous tick's prediction into
+    // the TD reward as an anticipatory credit signal. Gated on the flag;
+    // when disabled the predicted gradient is zero and the block is a no-op.
+    let homeo_pred_enabled = bc_f32(CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED) != 0.0;
+
+    // Sub-step 1: parallel dot product s_prediction · homeo_predictor_weights
+    if (homeo_pred_enabled) {
+        if (tid < ENCODED_DIMENSION) {
+            s_dense_partials[tid] = s_prediction[tid]
+                * brain_state[brain_base + O_HOMEO_PREDICTOR_WEIGHTS + tid];
+        } else {
+            s_dense_partials[tid] = 0.0;
+        }
+    } else {
+        s_dense_partials[tid] = 0.0;
+    }
+    workgroupBarrier();
+    wg_reduce_dense(tid);
+
+    // Sub-step 2: thread 0 computes prediction, trains bias, stores prev
+    if (tid == 0u) {
+        var predicted_gradient: f32 = 0.0;
+        if (homeo_pred_enabled) {
+            predicted_gradient = s_dense_partials[0]
+                + brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS];
+            // Train: previous tick's prediction vs this tick's actual gradient
+            let prev_pred = brain_state[brain_base + O_PREV_HOMEO_PREDICTION];
+            let actual = s_homeo[6u];  // raw_gradient from coop_habituate_homeo
+            let pred_error = prev_pred - actual;
+            let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
+            brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] -= pred_lr * pred_error;
+            // Store current prediction for next tick's training
+            brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = predicted_gradient;
+            // Publish pred_error for the weight-update threads
+            s_pred_td[S_HOMEO_PRED_ERROR] = pred_error;
+            // Carry predicted gradient to TD reward blend and late telemetry
+            s_homeo[7u] = predicted_gradient;
+        } else {
+            s_pred_td[S_HOMEO_PRED_ERROR] = 0.0;
+            s_homeo[7u] = 0.0;
+        }
+    }
+    workgroupBarrier();
+
+    // Sub-step 3: update predictor weights (threads 0..ENCODED_DIMENSION)
+    if (homeo_pred_enabled && tid < ENCODED_DIMENSION) {
+        let pred_error = s_pred_td[S_HOMEO_PRED_ERROR];
+        let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
+        var w = brain_state[brain_base + O_HOMEO_PREDICTOR_WEIGHTS + tid]
+            - pred_lr * pred_error * s_prediction[tid];
+        w = clamp(w, -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+        brain_state[brain_base + O_HOMEO_PREDICTOR_WEIGHTS + tid] = w;
+    }
+    workgroupBarrier();
+
     // ── TD(λ) credit: value head + eligibility traces ───────────────────
     // The critic estimates the discounted homeostatic return from the
     // current encoded state. The TD error δ for the previous transition is
@@ -1217,7 +1276,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             var value: f32 = brain_state[brain_base + O_VALUE_BIAS] + s_value;
             // Reward is the immediate urgency-amplified homeostatic delta
             // accrued since the previous brain tick.
-            let reward = s_homeo[1u];
+            // ── Homeostatic predictive credit blend (homeostatic gradient predictor head) ──────────
+            // The previous tick's predicted gradient (written to s_homeo[7] by the
+            // predictor block) provides anticipatory credit: the agent is
+            // reinforced for decisions its own learned homeo model predicts will
+            // improve survival. β scales the blend (0= pure TD, 0.3=moderate).
+            let predictive_bonus = s_homeo[7u] * bc_f32(CFG_HOMEO_PREDICTIVE_CREDIT_BETA);
+            let reward = s_homeo[1u] + predictive_bonus;
             let prev_value = brain_state[brain_base + O_PREV_VALUE];
             let td_error = clamp(
                 reward + TD_DISCOUNT * value - prev_value,
@@ -1561,6 +1626,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         physics_state[phys_base + P_GRADIENT_OUT] = gradient;
         physics_state[phys_base + P_RAW_GRADIENT_OUT] = s_homeo[6u];
         physics_state[phys_base + P_URGENCY_OUT] = urgency;
+        physics_state[phys_base + P_HOMEO_PREDICTED_GRADIENT_OUT] = s_homeo[7u];
     }
     workgroupBarrier();
 

@@ -163,7 +163,7 @@ fn agent_physics(agent_id: u32, tick: u32) {
 
     // Energy depletion
     let metabolic_rate = bc_f32(CFG_METABOLIC_RATE);
-    // Super-linear drag (plan 0009, Layer A): above-baseline-only cost exponent.
+    // Super-linear drag (Layer A): above-baseline-only cost exponent.
     // Normalize by default speed (20.0); the exponent only activates when the agent
     // is above baseline speed (speed_ratio >= 1.0). Below baseline the drag is
     // exactly `speed_ratio` (the same as k=1.0), so sub-baseline drain is unchanged
@@ -197,7 +197,7 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // otherwise — the flag must match the agent's actual current biome.
     let in_danger = (biome_type == BIOME_DANGER);
     if in_danger {
-        // Path-length hazard dose (plan 0009, Layer B): integrity loss is proportional
+        // Path-length hazard dose (Layer B): integrity loss is proportional
         // to the distance traveled through danger this tick, not to the number of ticks
         // spent in it. reference_step is a default-speed agent's per-tick displacement
         // (default_speed * dt = DEFAULT_MOVE_SPEED * WC_DT), so a default-speed agent (step_len ≈
@@ -680,6 +680,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
     brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
     brain_state[brain_base + O_PREV_VALUE] = 0.0;
+    // Episodic slot for homeostatic gradient predictor (homeostatic gradient predictor head); weights survive.
+    brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = 0.0;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -715,7 +717,7 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     if (alive && 0u < limit) { coop_feature_extract(agent_id, tid); }
     workgroupBarrier();
 
-    // Visual cortex (plan 0008): inserted between feature extraction and encode.
+    // Visual cortex: inserted between feature extraction and encode.
     // It belongs to the early-visual stage, so it shares feature-extract's
     // profiling slot (`0u < limit`) rather than consuming a new `pass_limit`
     // index — keeping the seven counted passes (0..6) and the default limit of 7

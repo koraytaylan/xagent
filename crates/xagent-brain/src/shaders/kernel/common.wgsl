@@ -15,7 +15,7 @@ override VISION_H: u32 = 6u;
 
 // ── Retina grid (pipeline-overridable constants) ───────────────────────────
 // RETINA_WIDTH / RETINA_HEIGHT are the retinotopic luminance grid dimensions
-// (config `retina_width` / `retina_height`, plan 0008). They are locked per
+// (config `retina_width` / `retina_height`). They are locked per
 // batch and independent of the legacy VISION_W × VISION_H sensory grid.
 // Supplied by the Rust host at pipeline creation via `vision_override_constants()`;
 // the defaults below keep the shader standalone-compilable at the 32×32 retina.
@@ -27,13 +27,13 @@ override RETINA_WIDTH: u32 = 32u;
 override RETINA_HEIGHT: u32 = 32u;
 override RETINA_PIXEL_COUNT: u32 = RETINA_WIDTH * RETINA_HEIGHT;
 
-// ── DoG center-surround seed constants (plan 0008 center-surround-dog) ───────
+// ── DoG center-surround seed constants ───────
 // Stage 1 of the visual cortex is a zero-sum Difference-of-Gaussians:
 //   DoG(x,y) = G(x,y; σ_center) − G(x,y; σ_surround),  σ_surround = ratio·σ_center
 // with unit-volume Gaussians so ∑ DoG = 0 exactly (a local-contrast / edge
 // operator, Rodieck 1965; Marr & Hildreth 1980). σ_center is a fixed per-batch
 // seed; the surround ratio seed is 1.6 (Marr & Hildreth) and becomes the
-// heritable `dog_surround_ratio` gene in plan 0003 — until then the seed is read
+// heritable `dog_surround_ratio` gene — the seed is read
 // here. These literals are the single canonical source, mirrored by the Rust
 // `dog` module constants and exercised by the `dog_kernel_sums_to_zero` probe.
 const DOG_SIGMA_CENTER: f32 = 1.0;
@@ -54,7 +54,7 @@ const DOG_SURROUND_RATIO_MAX: f32 = 3.0;
 //          = ceil(3·3·1) = 9  (side 19, ≤ 361 taps).
 const DOG_KERNEL_MAX_RADIUS: u32 = 9u;
 
-// ── Gabor simple-cell bank seed constants (plan 0008 gabor-simple-cells) ─────
+// ── Gabor simple-cell bank seed constants ─────
 // Stage 2 of the visual cortex is an orientation-selective Gabor bank — the
 // validated quantitative model of a V1 simple-cell receptive field (Jones &
 // Palmer 1987); the elongated alternating ON/OFF lobes are Hubel & Wiesel's
@@ -76,13 +76,13 @@ const GABOR_ORIENTATIONS: u32 = 2u;   // 0, 90°
 const GABOR_SCALES: u32 = 1u;
 const GABOR_PHASES: u32 = 2u;          // quadrature pair {0, π/2}
 // Carrier wavelength λ seed in retina pixels (heritable `gabor_wavelength` gene,
-// plan 0003; seed read here until then). Envelope σ = GABOR_SIGMA_LAMBDA_RATIO·λ.
+// seed read here until the gene is wired). Envelope σ = GABOR_SIGMA_LAMBDA_RATIO·λ.
 const GABOR_WAVELENGTH_SEED: f32 = 5.0;
 // Envelope aspect ratio γ seed (long axis / short axis; heritable
-// `gabor_aspect_ratio` gene, plan 0003).
+// `gabor_aspect_ratio` gene).
 const GABOR_ASPECT_RATIO_SEED: f32 = 0.5;
 // Whole-bank orientation offset seed in radians, added to the even [0,π) tiling
-// (heritable `orientation_offset` gene, plan 0003).
+// (heritable `orientation_offset` gene).
 const GABOR_ORIENTATION_OFFSET_SEED: f32 = 0.0;
 // σ as a fraction of λ — 0.56 gives the ≈1-octave V1 spatial-frequency bandwidth.
 const GABOR_SIGMA_LAMBDA_RATIO: f32 = 0.56;
@@ -115,7 +115,7 @@ const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
 // so the worst-case bound is tight.
 const GABOR_KERNEL_MAX_RADIUS: u32 = 9u;
 
-// ── Complex-cell MAX-pool grid (plan 0008 complex-cell-energy-pool) ─────────
+// ── Complex-cell MAX-pool grid ─────────
 // Stage 3 MAX-pools the per-pixel quadrature energy E_{θ,λ}(x,y) over a coarse
 // POOL_ROWS × POOL_COLS spatial grid (HMAX C1 position tolerance, Riesenhuber &
 // Poggio 1999). Each pool cell covers a contiguous block of the retina and the
@@ -133,7 +133,7 @@ const GABOR_KERNEL_MAX_RADIUS: u32 = 9u;
 const POOL_ROWS: u32 = 3u;
 const POOL_COLS: u32 = 3u;
 
-// ── Visual cortex feature vector size (plan 0008) ──────────────────────────
+// ── Visual cortex feature vector size ──────────────────────────
 // VISUAL_FEATURE_COUNT is the length of the complex-cell output the visual
 // cortex pass writes back to the head of `s_features`:
 // GABOR_ORIENTATIONS × GABOR_SCALES × POOL_ROWS × POOL_COLS (2 × 1 × 3 × 3
@@ -160,7 +160,7 @@ override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
 const ENCODED_DIMENSION: u32 = 128u;
 const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
 
-// Visual-cortex encoder-input selector (plan 0008 wire-visual-features-into-encoder).
+// Visual-cortex encoder-input selector (wire-visual-features-into-encoder).
 // Supplied by the Rust host at pipeline creation via `vision_override_constants()`
 // from `BrainConfig::visual_cortex_enabled` (1u = on, 0u = off). It is the SAME
 // boolean as the runtime `CFG_VISUAL_CORTEX_ENABLED` uniform, but the encoder
@@ -172,7 +172,7 @@ const PREDICTOR_DIMENSION: u32 = ENCODED_DIMENSION;
 // they agree by construction. Locked per batch.
 override VISUAL_CORTEX_FEATURES_ACTIVE: u32 = 0u;
 
-// Danger percept encoder-input selector (plan 0009 danger-percept-sense).
+// Danger percept encoder-input selector (danger-percept-sense).
 // Supplied by the Rust host at pipeline creation via the world-config bit
 // `WC_DANGER_PERCEPT_ENABLED` (1u = on, 0u = off). When on, the non-visual
 // feature tail width grows to include danger bearing + distance (25 -> 27);
@@ -180,11 +180,11 @@ override VISUAL_CORTEX_FEATURES_ACTIVE: u32 = 0u;
 // per batch, independent of the visual-cortex flag.
 override DANGER_PERCEPT_FEATURES_ACTIVE: u32 = 0u;
 
-// Non-visual feature tail (plan 0008 wire-visual-features-into-encoder): the
+// Non-visual feature tail (wire-visual-features-into-encoder): the
 // proprioception / interoception / touch features `coop_feature_extract` writes
 // after the visual block — velocity magnitude(1) + facing(3) + angular(1) +
 // energy ratio(1) + integrity ratio(1) + energy delta(1) + integrity delta(1) +
-// touch(16) = 25 base. When danger_percept is enabled (plan 0009), add danger
+// touch(16) = 25 base. When danger_percept is enabled, add danger
 // bearing(1) + distance(1) = 27 total. Single canonical source, mirrored by
 // `NON_VISUAL_FEATURE_COUNT` in `buffers.rs`. The base is constant but the
 // tail width changes with the danger-percept flag; the leading visual block
@@ -237,7 +237,7 @@ override O_HAB_MAX_CURIOSITY: u32 = O_HAB_SENSITIVITY + 1u;
 override O_FATIGUE_FLOOR: u32 = O_HAB_MAX_CURIOSITY + 1u;
 override O_MOVEMENT_SPEED: u32 = O_FATIGUE_FLOOR + 1u;
 
-// ── Visual-genome tail (plan 0008 visual-genome-config) ─────────────────────
+// ── Visual-genome tail (heritable Gabor/DoG genes) ─────────────────────
 // Four heritable Gabor/DoG bank genes, contiguous right after O_MOVEMENT_SPEED.
 // `coop_visual_cortex` reads them from brain_state and re-imposes the gene clamps
 // + the DoG zero-sum / Gabor DC-balance invariants. Mirrors the O_GABOR_* /
@@ -247,12 +247,22 @@ override O_GABOR_ASPECT_RATIO: u32 = O_GABOR_WAVELENGTH + 1u;
 override O_DOG_SURROUND_RATIO: u32 = O_GABOR_ASPECT_RATIO + 1u;
 override O_ORIENTATION_OFFSET: u32 = O_DOG_SURROUND_RATIO + 1u;
 
+// ── Homeostatic gradient predictor head ─────────────────────────────
+// Linear head (128→1) on top of the forward model's predicted state s_prediction.
+// Trained online to predict raw_gradient; the previous tick's prediction provides
+// an anticipatory credit signal that bridges the ~10-tick sensory latency.
+// Weights are heritable (seeded at birth, inherited, mutated); the prev-prediction
+// slot is episodic (zeroed on death), like O_PREV_VALUE.
+override O_HOMEO_PREDICTOR_WEIGHTS: u32 = O_ORIENTATION_OFFSET + 1u;
+override O_HOMEO_PREDICTOR_BIAS: u32 = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
+override O_PREV_HOMEO_PREDICTION: u32 = O_HOMEO_PREDICTOR_BIAS + 1u;
+
 // ── TD(λ) critic state ──────────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
 // [critic_bias, forward_bias, turn_bias].
 
-override O_VALUE_WEIGHTS: u32 = O_ORIENTATION_OFFSET + 1u;
+override O_VALUE_WEIGHTS: u32 = O_PREV_HOMEO_PREDICTION + 1u;
 override O_VALUE_BIAS: u32 = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
 override O_PREV_VALUE: u32 = O_VALUE_BIAS + 1u;
 override O_TRACE_CRITIC: u32 = O_PREV_VALUE + 1u;
@@ -273,14 +283,14 @@ const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 
 // ── Per-agent brain scratch (binding 13) offsets ────────────────────────────
-// Storage-backed intermediates so multi-workgroup brain phases (plan 0006) can
+// Storage-backed intermediates so multi-workgroup brain phases can
 // cooperate per agent across dispatch boundaries. Layout mirrors the fused
 // var<workgroup> arrays 1:1. override (transitively references FEATURES_STRIDE).
 override SCRATCH_FEATURES: u32 = 0u;
 override SCRATCH_ENCODED: u32 = SCRATCH_FEATURES + FEATURES_STRIDE;
 override SCRATCH_HABITUATED: u32 = SCRATCH_ENCODED + ENCODED_DIMENSION;
 override SCRATCH_HOMEO: u32 = SCRATCH_HABITUATED + ENCODED_DIMENSION;
-override SCRATCH_RECALL: u32 = SCRATCH_HOMEO + 6u;
+override SCRATCH_RECALL: u32 = SCRATCH_HOMEO + 8u;
 override SCRATCH_RECALL_SIMILARITY: u32 = SCRATCH_RECALL + RECALL_IDX_STRIDE;
 override SCRATCH_PREDICTION: u32 = SCRATCH_RECALL_SIMILARITY + RECALL_K;
 override SCRATCH_CREDIT: u32 = SCRATCH_PREDICTION + PREDICTOR_DIMENSION;
@@ -310,7 +320,7 @@ const CFG_DECAY_RATE: u32 = 5u;
 const CFG_DISTRESS_EXP: u32 = 6u;
 const CFG_METABOLIC_RATE: u32 = 7u;
 const CFG_INTEGRITY_SCALE: u32 = 8u;
-// Visual-cortex gate flag (plan 0008): 1.0 runs the Hubel-Wiesel cortex pass,
+// Visual-cortex gate flag: 1.0 runs the Hubel-Wiesel cortex pass,
 // 0.0 is a no-op passthrough. Mirrors `CFG_VISUAL_CORTEX_ENABLED` in buffers.rs.
 const CFG_VISUAL_CORTEX_ENABLED: u32 = 9u;
 const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
@@ -321,10 +331,15 @@ const CFG_DANGER_PERCEPT_ENABLED: u32 = 10u;
 // `CFG_CORTEX_STAGE_LIMIT` in buffers.rs. Has no effect when
 // `CFG_VISUAL_CORTEX_ENABLED` is 0.0.
 const CFG_CORTEX_STAGE_LIMIT: u32 = 11u;
+// Homeostatic predictive credit (homeostatic gradient predictor head): 1.0 enables the 128→1 gradient
+// predictor head (anticipatory credit from own homeo model); 0.0 = zero-cost no-op.
+const CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED: u32 = 12u;
+const CFG_HOMEO_PREDICTOR_LEARNING_RATE: u32 = 13u;
+const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: u32 = 14u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 47u;
+const PHYS_STRIDE: u32 = 48u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -386,6 +401,9 @@ const P_RAW_GRADIENT_OUT: u32 = 44u;
 const P_APPROACH_SENSE_RANGE_TICKS: u32 = 45u;
 /// Cumulative count of ticks where food was in sense range AND motor turn rotated toward bearing.
 const P_APPROACH_TURNS_TOWARD: u32 = 46u;
+/// Homeostatic gradient predicted by the forward model's predictor head
+/// (homeostatic gradient predictor head). Written by coop_predict_and_act when enabled; zero otherwise.
+const P_HOMEO_PREDICTED_GRADIENT_OUT: u32 = 47u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -609,7 +627,7 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
 @group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
-@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 3>;
+@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 4>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -698,7 +716,7 @@ fn is_finite(v: f32) -> bool {
     return v == v && abs(v) < 3.4e38;
 }
 
-// ── Retina luminance (plan 0008, Stage 0) ───────────────────────────────────
+// ── Retina luminance (Stage 0) ───────────────────────────────────
 // Linear (Rec. 709) luminance of a raycast hit color, the single-channel field
 // L(x,y) the visual cortex operates on. Convolution kernels are linear
 // operators, so they act on linear-light luminance, not gamma-encoded RGB. Hit

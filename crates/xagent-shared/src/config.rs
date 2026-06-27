@@ -34,7 +34,7 @@ pub struct BrainConfig {
     /// `xagent_brain::buffers::RECALL_K = 16`, independent of this value.
     /// Mutated by evolution; clamped to `[1, 128]` at breeding time.
     pub processing_slots: usize,
-    /// **Legacy.** Superseded by plan 0008 visual-cortex config (`retina_*`,
+    /// **Legacy.** Superseded by the visual-cortex config (`retina_*`,
     /// `gabor_*`); retained only for deserialization back-compat (issue #106).
     /// No kernel stage reads this field and it is no longer carried through
     /// breeding or shown in the UI editor; the `serde` default supplies it when
@@ -122,10 +122,10 @@ pub struct BrainConfig {
     /// Exponent for speed-cost drag curve in the fused kernel's energy drain.
     /// Default 1.0 (no-op: cost is linear in speed). Values > 1.0 make drag
     /// super-linear above baseline speed. Applied to `pow(max(speed/20, 1.0), k)`.
-    /// Locked per batch, not heritable (plan 0003 / 0006 gate).
+    /// Locked per batch, not heritable.
     #[serde(default = "default_speed_cost_exponent")]
     pub speed_cost_exponent: f32,
-    /// Gate flag for the Hubel-Wiesel visual cortex pass (plan 0008). When
+    /// Gate flag for the Hubel-Wiesel visual cortex pass. When
     /// `false` the cortex pass is a no-op passthrough and the encoder consumes
     /// the legacy raw-vision slice, so the run is byte-identical to the
     /// pre-cortex build. The default flips to `true` only once the 0005
@@ -133,7 +133,7 @@ pub struct BrainConfig {
     /// throughput regression is within budget. Locked per batch, not heritable.
     #[serde(default)]
     pub visual_cortex_enabled: bool,
-    /// Gate flag for the dedicated danger percept sense (plan 0009). When
+    /// Gate flag for the dedicated danger percept sense. When
     /// `false` the danger bearing and distance are not packed into the sensory
     /// feature vector, so the encoder input width and the encoded state match
     /// the pre-percept build (byte-identical). The default flips to `true` only
@@ -153,7 +153,7 @@ pub struct BrainConfig {
     /// default `false` (no effect on the shipped path).
     #[serde(default)]
     pub danger_percept_blinded: bool,
-    /// Gate flag for effort-rebased fitness (plan 0009). When `false` the
+    /// Gate flag for effort-rebased fitness. When `false` the
     /// composite fitness uses the legacy time-denominated formula (food per
     /// time, exploration as fraction of cells). When `true` it re-bases both
     /// axes onto effort: foraging = food/energy, exploration = min(coverage,
@@ -168,7 +168,25 @@ pub struct BrainConfig {
     /// not heritable. Default `false` until the prove-or-kill A/B gate passes.
     #[serde(default)]
     pub innate_instincts_enabled: bool,
-    /// **Heritable (visual genome, plan 0008).** V1 Gabor carrier wavelength λ
+    /// Enable the homeostatic gradient predictor: a 128→1 linear head on the
+    /// forward model that learns to anticipate raw_gradient. The predicted
+    /// gradient provides an anticipatory credit signal (β-scaled term in the
+    /// TD reward), bridging sensory latency without external targets.
+    /// Weights are heritable. Zero-cost when false. (homeostatic gradient predictor head)
+    #[serde(default)]
+    pub homeo_predictive_credit_enabled: bool,
+
+    /// Learning rate for the homeostatic gradient predictor's online gradient
+    /// descent. Trained on every brain tick against the actual raw_gradient.
+    #[serde(default = "default_homeo_predictor_learning_rate")]
+    pub homeo_predictor_learning_rate: f32,
+
+    /// Blend weight for the predicted gradient in the TD reward.
+    /// reward = raw_gradient_amplified + β * prev_predicted_gradient.
+    /// 0.0 = disabled; 0.3 = anticipatory credit at ~30% weight.
+    #[serde(default = "default_homeo_predictive_credit_beta")]
+    pub homeo_predictive_credit_beta: f32,
+    /// **Heritable (visual genome).** V1 Gabor carrier wavelength λ
     /// in retina pixels for the whole simple-cell bank. The envelope σ is tied
     /// as `0.56·λ` (≈ 1-octave V1 bandwidth, Jones & Palmer 1987). Seed 5.0;
     /// mutated during breeding, clamped to
@@ -176,13 +194,13 @@ pub struct BrainConfig {
     /// re-imposes the clamp and the Gabor DC-balance invariant after reading it.
     #[serde(default = "default_gabor_wavelength")]
     pub gabor_wavelength: f32,
-    /// **Heritable (visual genome, plan 0008).** Gabor envelope aspect ratio γ
+    /// **Heritable (visual genome).** Gabor envelope aspect ratio γ
     /// (long axis / short axis) for the whole bank; at 1.0 the envelope is
     /// isotropic. Seed 0.5; mutated during breeding, clamped to
     /// `[GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX]` = `[0.25, 1.0]`.
     #[serde(default = "default_gabor_aspect_ratio")]
     pub gabor_aspect_ratio: f32,
-    /// **Heritable (visual genome, plan 0008).** DoG surround:center sigma ratio
+    /// **Heritable (visual genome).** DoG surround:center sigma ratio
     /// for the Stage-1 center-surround kernel. Seed 1.6 (Marr & Hildreth 1980
     /// edge operator); mutated during breeding, clamped to
     /// `[DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX]` = `[1.2, 3.0]` so a
@@ -190,7 +208,7 @@ pub struct BrainConfig {
     /// shader re-imposes the clamp and the DoG zero-sum invariant after reading.
     #[serde(default = "default_dog_surround_ratio")]
     pub dog_surround_ratio: f32,
-    /// **Heritable (visual genome, plan 0008).** Whole-bank orientation offset in
+    /// **Heritable (visual genome).** Whole-bank orientation offset in
     /// radians, added to the even `[0, π)` tiling of the Gabor bank. Seed 0.0;
     /// mutated during breeding and wrapped back into `[0, π)` (orientation is
     /// half-circle periodic for an unsigned bar), so it has no hard clamp — the
@@ -354,25 +372,25 @@ fn default_speed_cost_exponent() -> f32 {
     1.0
 }
 
-/// Seed carrier wavelength λ for the Gabor bank (plan 0008). Mirrors
+/// Seed carrier wavelength λ for the Gabor bank. Mirrors
 /// `GABOR_WAVELENGTH_SEED` in the brain crate's `gabor` module / `common.wgsl`.
 fn default_gabor_wavelength() -> f32 {
     5.0
 }
 
-/// Seed envelope aspect ratio γ for the Gabor bank (plan 0008). Mirrors
+/// Seed envelope aspect ratio γ for the Gabor bank. Mirrors
 /// `GABOR_ASPECT_RATIO_SEED`.
 fn default_gabor_aspect_ratio() -> f32 {
     0.5
 }
 
-/// Seed DoG surround:center sigma ratio (plan 0008). Mirrors
+/// Seed DoG surround:center sigma ratio. Mirrors
 /// `DOG_SURROUND_RATIO_SEED` (Marr & Hildreth 1980).
 fn default_dog_surround_ratio() -> f32 {
     1.6
 }
 
-/// Seed whole-bank orientation offset in radians (plan 0008). Mirrors
+/// Seed whole-bank orientation offset in radians. Mirrors
 /// `GABOR_ORIENTATION_OFFSET_SEED`.
 fn default_orientation_offset() -> f32 {
     0.0
@@ -384,6 +402,13 @@ fn default_instinct_danger_strength() -> f32 {
 
 fn default_instinct_food_strength() -> f32 {
     0.8
+}
+
+fn default_homeo_predictor_learning_rate() -> f32 {
+    0.01
+}
+fn default_homeo_predictive_credit_beta() -> f32 {
+    0.3
 }
 
 /// Describes an agent to be spawned into the world.
@@ -536,6 +561,9 @@ impl Default for BrainConfig {
             danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
+            homeo_predictive_credit_enabled: false,
+            homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
+            homeo_predictive_credit_beta: default_homeo_predictive_credit_beta(),
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -631,6 +659,9 @@ impl BrainConfig {
             danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
+            homeo_predictive_credit_enabled: false,
+            homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
+            homeo_predictive_credit_beta: default_homeo_predictive_credit_beta(),
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -669,6 +700,9 @@ impl BrainConfig {
             danger_percept_blinded: false,
             effort_rebased_fitness: false,
             innate_instincts_enabled: false,
+            homeo_predictive_credit_enabled: false,
+            homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
+            homeo_predictive_credit_beta: default_homeo_predictive_credit_beta(),
             gabor_wavelength: default_gabor_wavelength(),
             gabor_aspect_ratio: default_gabor_aspect_ratio(),
             dog_surround_ratio: default_dog_surround_ratio(),
@@ -795,7 +829,7 @@ mod tests {
 
     #[test]
     fn legacy_config_without_visual_cortex_fields_still_loads() {
-        // A config saved before plan 0008 carries `visual_encoding_size` but
+        // A config saved before the visual-cortex config carries `visual_encoding_size` but
         // none of the new `retina_*` / `gabor_*` / visual-cortex fields. The
         // `#[serde(default)]` on each new field (and on the retained legacy
         // `visual_encoding_size`) must supply the seed so the blob still loads.
@@ -817,7 +851,7 @@ mod tests {
         assert_eq!(config.processing_slots, 16);
         assert_eq!(config.visual_encoding_size, 96);
 
-        // Every new plan 0008 field falls back to its seed default.
+        // Every new visual-cortex field falls back to its seed default.
         assert_eq!(config.retina_width, default_retina_width());
         assert_eq!(config.retina_height, default_retina_height());
         assert!(!config.visual_cortex_enabled);

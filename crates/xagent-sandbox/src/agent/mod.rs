@@ -425,7 +425,7 @@ fn mutate_config_with_strength_rng(
         processing_slots: momentum
             .biased_perturb_u(rng, parent.processing_slots, "processing_slots", strength)
             .min(MAX_PROCESSING_SLOTS),
-        // Legacy field, superseded by the plan 0008 visual-cortex config; no
+        // Legacy field, superseded by the visual-cortex config; no
         // longer carried through breeding (issue #106). The serde default
         // supplies it on load, so seed it from the same default here.
         visual_encoding_size: BrainConfig::default().visual_encoding_size,
@@ -486,7 +486,7 @@ fn mutate_config_with_strength_rng(
         innate_instincts_enabled: parent.innate_instincts_enabled,
         // Cortex profiling stage limit is runtime-only (not heritable); pass through.
         cortex_stage_limit: parent.cortex_stage_limit,
-        // Heritable visual-genome genes (plan 0008). Each is perturbed with
+        // Heritable visual-genome genes. Each is perturbed with
         // momentum and clamped to the same bounds the shader re-imposes after
         // reading the gene. `orientation_offset` has no hard clamp — orientation
         // is half-circle periodic, so it wraps into [0, π) via rem_euclid.
@@ -535,6 +535,10 @@ fn mutate_config_with_strength_rng(
                 strength,
             )
             .clamp(INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX),
+        // homeostatic gradient predictor flags: carried unchanged (not mutated; locked like danger/innate for now)
+        homeo_predictive_credit_enabled: parent.homeo_predictive_credit_enabled,
+        homeo_predictor_learning_rate: parent.homeo_predictor_learning_rate,
+        homeo_predictive_credit_beta: parent.homeo_predictive_credit_beta,
     }
 }
 
@@ -629,7 +633,7 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         } else {
             b.processing_slots
         },
-        // Legacy field, superseded by the plan 0008 visual-cortex config; no
+        // Legacy field, superseded by the visual-cortex config; no
         // longer carried through breeding (issue #106). Seed from the default.
         visual_encoding_size: BrainConfig::default().visual_encoding_size,
         representation_dimension: a.representation_dimension,
@@ -692,7 +696,7 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         innate_instincts_enabled: a.innate_instincts_enabled,
         // Cortex profiling stage limit is runtime-only (not heritable); default off.
         cortex_stage_limit: 0,
-        // Heritable visual-genome genes (plan 0008): uniform per-gene crossover.
+        // Heritable visual-genome genes: uniform per-gene crossover.
         gabor_wavelength: if rng.random::<f32>() < 0.5 {
             a.gabor_wavelength
         } else {
@@ -723,6 +727,22 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.instinct_food_strength
         } else {
             b.instinct_food_strength
+        },
+        // homeostatic gradient predictor flags (locked per batch for now; carried via uniform crossover)
+        homeo_predictive_credit_enabled: if rng.random::<f32>() < 0.5 {
+            a.homeo_predictive_credit_enabled
+        } else {
+            b.homeo_predictive_credit_enabled
+        },
+        homeo_predictor_learning_rate: if rng.random::<f32>() < 0.5 {
+            a.homeo_predictor_learning_rate
+        } else {
+            b.homeo_predictor_learning_rate
+        },
+        homeo_predictive_credit_beta: if rng.random::<f32>() < 0.5 {
+            a.homeo_predictive_credit_beta
+        } else {
+            b.homeo_predictive_credit_beta
         },
     }
 }
@@ -965,7 +985,7 @@ mod tests {
         }
     }
 
-    /// Plan 0008 visual-genome-config "Done when": mutation keeps every heritable
+    /// Visual-genome "Done when": mutation keeps every heritable
     /// visual gene inside its clamp (and `orientation_offset` inside its [0, π)
     /// wrap). Driving the parent to both extremes for 50 iterations exercises the
     /// clamp/wrap from above and below — it fails loudly if any gene's clamp line

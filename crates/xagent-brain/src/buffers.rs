@@ -24,6 +24,12 @@ static REPR_DIM_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub const ENCODED_DIMENSION: usize = 128;
 pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
+
+/// Factor for Xavier/Glorot uniform initialization of tanh-activated linear
+/// layers: weights ~ U(-sqrt(factor / fan_in), +sqrt(factor / fan_in)).
+/// The conventional factor for tanh is 6.0 (to preserve variance of 1
+/// through the layer for the uniform distribution after tanh).
+const XAVIER_TANH_UNIFORM_FACTOR: f32 = 6.0;
 /// Feature count for the reference 8×6 vision layout that anchors the
 /// static `O_*` offset constants below. The runtime default layout is
 /// `BrainLayout::default()` (which follows `BrainConfig::default()`); use
@@ -31,7 +37,7 @@ pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
 /// remain valid as tail *deltas* (`O_X - O_PREDICTOR_CONTEXT_WEIGHT`) for
 /// every layout, because the tail is vision-independent.
 const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + NON_VISUAL_FEATURE_COUNT;
-/// Non-visual feature tail width (plan 0008 wire-visual-features-into-encoder):
+/// Non-visual feature tail width (wire-visual-features-into-encoder):
 /// the proprioception / interoception / touch features `coop_feature_extract`
 /// writes after the visual block — velocity magnitude(1) + facing(3) +
 /// angular(1) + energy ratio(1) + integrity ratio(1) + energy delta(1) +
@@ -95,7 +101,7 @@ pub const O_HAB_MAX_CURIOSITY: usize = O_HAB_SENSITIVITY + 1;
 pub const O_FATIGUE_FLOOR: usize = O_HAB_MAX_CURIOSITY + 1;
 pub const O_MOVEMENT_SPEED: usize = O_FATIGUE_FLOOR + 1;
 
-// ── Visual-genome tail (plan 0008 visual-genome-config) ───────────────
+// ── Visual-genome tail (heritable Gabor/DoG bank genes) ───────────────
 // Four heritable Gabor/DoG bank genes, contiguous right after
 // `O_MOVEMENT_SPEED`, written per agent by `write_agent_heritable_config`
 // and read by the `coop_visual_cortex` shader pass. Mirrored by the
@@ -106,12 +112,22 @@ pub const O_GABOR_ASPECT_RATIO: usize = O_GABOR_WAVELENGTH + 1;
 pub const O_DOG_SURROUND_RATIO: usize = O_GABOR_ASPECT_RATIO + 1;
 pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
 
+// ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
+// Linear head (128→1) on top of the forward model's predicted state s_prediction.
+// Trained online to predict raw_gradient; the previous tick's prediction provides
+// an anticipatory credit signal that bridges the ~10-tick sensory latency.
+// Weights are heritable (seeded at birth, inherited, mutated); the prev-prediction
+// slot is episodic (zeroed on death), like O_PREV_VALUE.
+pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_ORIENTATION_OFFSET + 1;
+pub const O_HOMEO_PREDICTOR_BIAS: usize = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
+pub const O_PREV_HOMEO_PREDICTION: usize = O_HOMEO_PREDICTOR_BIAS + 1;
+
 // ── TD(λ) critic state ────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
 // [critic_bias, forward_bias, turn_bias].
 
-pub const O_VALUE_WEIGHTS: usize = O_ORIENTATION_OFFSET + 1;
+pub const O_VALUE_WEIGHTS: usize = O_PREV_HOMEO_PREDICTION + 1;
 pub const O_VALUE_BIAS: usize = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
 pub const O_PREV_VALUE: usize = O_VALUE_BIAS + 1;
 pub const O_TRACE_CRITIC: usize = O_PREV_VALUE + 1;
@@ -231,7 +247,12 @@ pub const P_APPROACH_SENSE_RANGE_TICKS: usize = 45;
 /// Cumulative count of ticks where food was in sense range AND the motor turn
 /// rotated toward the nearest food bearing (deliberate turn-toward). Used to compute approach intent.
 pub const P_APPROACH_TURNS_TOWARD: usize = 46;
-pub const PHYS_STRIDE: usize = 47;
+/// Homeostatic gradient predicted by the forward model's 128→1 predictor head
+/// (homeostatic gradient predictor head). Written when homeo_predictive_credit_enabled; zero otherwise.
+/// Per-agent live state, never serialized. Provides the anticipatory credit
+/// signal used in the TD reward blend.
+pub const P_HOMEO_PREDICTED_GRADIENT_OUT: usize = 47;
+pub const PHYS_STRIDE: usize = 48;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -262,14 +283,14 @@ pub struct BrainLayout {
     /// error, not a silent overflow.
     pub retina_pixel_count: usize,
     /// Whether this layout sizes the encoder for the Hubel-Wiesel visual cortex
-    /// (plan 0008). When `true`, `feature_count` is the compact complex-cell
+    /// When `true`, `feature_count` is the compact complex-cell
     /// vector + non-visual tail (`VISUAL_FEATURE_COUNT + NON_VISUAL_FEATURE_COUNT`);
     /// when `false` it is the legacy raw-vision slice + non-visual tail. Must
     /// match `BrainConfig::visual_cortex_enabled` and the WGSL FEATURE_COUNT
     /// pipeline override (`vision_override_constants`). Locked per batch.
     pub visual_cortex_enabled: bool,
     /// Whether this layout sizes the sensory/feature buffers to include the
-    /// dedicated danger percept (plan 0009). When `true`, non-visual feature
+    /// dedicated danger percept. When `true`, non-visual feature
     /// count grows by 2 (danger bearing + distance). Must match
     /// `BrainConfig::danger_percept_enabled` and the WGSL
     /// `DANGER_PERCEPT_FEATURES_ACTIVE` pipeline override (`vision_override_constants`).
@@ -394,7 +415,7 @@ impl BrainLayout {
         let brain_scratch_stride = feature_count
             .checked_add(ENCODED_DIMENSION) // encoded
             .and_then(|v| v.checked_add(ENCODED_DIMENSION)) // habituated
-            .and_then(|v| v.checked_add(HOMEO_OUT_STRIDE)) // homeo (6)
+            .and_then(|v| v.checked_add(8)) // homeo (8, homeostatic gradient predictor (s_homeo grew for predicted grad))
             .and_then(|v| v.checked_add(RECALL_IDX_STRIDE)) // recall (17)
             .and_then(|v| v.checked_add(RECALL_K)) // recall similarity (16)
             .and_then(|v| v.checked_add(PREDICTOR_DIMENSION)) // prediction
@@ -474,7 +495,7 @@ pub const WC_PHASE_MASK: usize = 21; // bit0=physics, bit1=vision, bit2=brain
 pub const WC_VISION_STRIDE: usize = 22;
 pub const WC_BRAIN_TICK_STRIDE: usize = 23;
 pub const WC_SPEED_COST_EXPONENT: usize = 24;
-/// Danger percept gate flag (plan 0009). `1.0` = pack nearest-danger bearing and
+/// Danger percept gate flag. `1.0` = pack nearest-danger bearing and
 /// distance into non-visual features, `0.0` = no-op (feature count unchanged).
 /// Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is unchanged.
 /// Mirrored by `WC_DANGER_PERCEPT_ENABLED` in `common.wgsl`.
@@ -510,7 +531,7 @@ pub const SCRATCH_FEATURES: usize = 0;
 pub const SCRATCH_ENCODED: usize = SCRATCH_FEATURES + FEATURES_STRIDE;
 pub const SCRATCH_HABITUATED: usize = SCRATCH_ENCODED + ENCODED_DIMENSION;
 pub const SCRATCH_HOMEO: usize = SCRATCH_HABITUATED + ENCODED_DIMENSION;
-pub const SCRATCH_RECALL: usize = SCRATCH_HOMEO + HOMEO_OUT_STRIDE;
+pub const SCRATCH_RECALL: usize = SCRATCH_HOMEO + 8; // room for s_homeo[0..7] (homeostatic gradient predictor head grew s_homeo to 8)
 pub const SCRATCH_RECALL_SIMILARITY: usize = SCRATCH_RECALL + RECALL_IDX_STRIDE;
 pub const SCRATCH_PREDICTION: usize = SCRATCH_RECALL_SIMILARITY + RECALL_K;
 pub const SCRATCH_CREDIT: usize = SCRATCH_PREDICTION + PREDICTOR_DIMENSION;
@@ -528,7 +549,7 @@ pub const CFG_DECAY_RATE: usize = 5;
 pub const CFG_DISTRESS_EXP: usize = 6;
 pub const CFG_METABOLIC_RATE: usize = 7;
 pub const CFG_INTEGRITY_SCALE: usize = 8;
-/// Visual-cortex gate flag (plan 0008). `1.0` = run the Hubel-Wiesel cortex
+/// Visual-cortex gate flag. `1.0` = run the Hubel-Wiesel cortex
 /// pass, `0.0` = no-op passthrough + legacy raw-vision encoder input. Uses a
 /// previously-unused padding slot, so `CONFIG_SIZE` is unchanged. Mirrored by
 /// `CFG_VISUAL_CORTEX_ENABLED` in `common.wgsl`.
@@ -548,7 +569,14 @@ pub const CFG_DANGER_PERCEPT_ENABLED: usize = 10;
 /// last padding slot (was unused). Mirrors `CFG_CORTEX_STAGE_LIMIT` in
 /// `common.wgsl`.
 pub const CFG_CORTEX_STAGE_LIMIT: usize = 11;
-pub const CONFIG_SIZE: usize = 12; // padded to 12 for uniform vec4 alignment (3 × vec4)
+/// Homeostatic predictive credit (homeostatic gradient predictor head): 1.0 enables the 128→1 gradient
+/// predictor head; 0.0 is zero-cost no-op (byte-identical path).
+pub const CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED: usize = 12;
+/// Predictor online LR (homeostatic gradient predictor head).
+pub const CFG_HOMEO_PREDICTOR_LEARNING_RATE: usize = 13;
+/// β blend for predicted gradient into TD reward (homeostatic gradient predictor head).
+pub const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: usize = 14;
+pub const CONFIG_SIZE: usize = 16; // padded for uniform vec4 alignment (4 × vec4); 15 values used, last reserved
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
 
@@ -793,11 +821,27 @@ pub fn init_brain_state_for(
     let delta_hab_curiosity = O_HAB_MAX_CURIOSITY - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_fatigue_floor = O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_movement_speed = O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT;
-    // Plan 0008 visual-genome genes (contiguous after movement_speed).
+    // Heritable visual-genome genes (contiguous after movement_speed).
     let delta_gabor_wavelength = O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_gabor_aspect_ratio = O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_dog_surround_ratio = O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_orientation_offset = O_ORIENTATION_OFFSET - O_PREDICTOR_CONTEXT_WEIGHT;
+
+    // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
+    // Xavier-uniform for the 128→1 head weights (same fan-in as value head).
+    // Bias and prev-prediction (episodic) left at 0 (vec init).
+    let delta_homeo_pred_weights = O_HOMEO_PREDICTOR_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_homeo_pred_bias = O_HOMEO_PREDICTOR_BIAS - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_prev_homeo_pred = O_PREV_HOMEO_PREDICTION - O_PREDICTOR_CONTEXT_WEIGHT;
+    // Xavier uniform using the same fan-in as the value head (ENCODED_DIMENSION).
+    let homeo_pred_scale = (XAVIER_TANH_UNIFORM_FACTOR / ENCODED_DIMENSION as f32).sqrt();
+    for i in 0..ENCODED_DIMENSION {
+        state[o_pred_ctx_wt + delta_homeo_pred_weights + i] =
+            (rng.random::<f32>() * 2.0 - 1.0) * homeo_pred_scale;
+    }
+    // bias and prev-pred already 0 from vec![0.0]; explicit for clarity on episodic slot
+    state[o_pred_ctx_wt + delta_homeo_pred_bias] = 0.0;
+    state[o_pred_ctx_wt + delta_prev_homeo_pred] = 0.0;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
     for i in 0..ENCODED_DIMENSION {
@@ -931,6 +975,13 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
         0.0
     };
     cfg[CFG_CORTEX_STAGE_LIMIT] = config.cortex_stage_limit as f32;
+    cfg[CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED] = if config.homeo_predictive_credit_enabled {
+        1.0
+    } else {
+        0.0
+    };
+    cfg[CFG_HOMEO_PREDICTOR_LEARNING_RATE] = config.homeo_predictor_learning_rate;
+    cfg[CFG_HOMEO_PREDICTIVE_CREDIT_BETA] = config.homeo_predictive_credit_beta;
     cfg
 }
 
@@ -949,8 +1000,8 @@ mod tests {
         assert!(layout.sensory_stride >= layout.feature_count);
         // The static offset constants anchor to the default layout.
         assert_eq!(layout.brain_stride, BRAIN_STRIDE);
-        // Brain scratch stride at 8×6: 265 + 128 + 128 + 6 + 17 + 16 + 128 + 128 + 4 = 820
-        assert_eq!(layout.brain_scratch_stride, 820);
+        // Brain scratch stride at 8×6: 265 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 822 (homeo region +2 for gradient predictor head)
+        assert_eq!(layout.brain_scratch_stride, 822);
     }
 
     #[test]
@@ -960,13 +1011,13 @@ mod tests {
         let layout = BrainLayout::new(17, 13);
         assert_eq!(layout.sensory_stride, 1132);
         assert_eq!(layout.feature_count, 1130);
-        // Brain scratch stride at 17×13: 1130 + 128 + 128 + 6 + 17 + 16 + 128 + 128 + 4 = 1685
-        assert_eq!(layout.brain_scratch_stride, 1685);
+        // Brain scratch stride at 17×13: 1130 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 1687 (homeo +2)
+        assert_eq!(layout.brain_scratch_stride, 1687);
     }
 
     #[test]
     fn brain_stride_is_consistent() {
-        // The four heritable visual-genome genes (plan 0008) are contiguous right
+        // The four heritable visual-genome genes are contiguous right
         // after `O_MOVEMENT_SPEED`; the TD critic state follows them as the last
         // region of the brain layout: value head, prev value, three trace
         // vectors, three trace biases.
@@ -974,7 +1025,13 @@ mod tests {
         assert_eq!(O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH + 1);
         assert_eq!(O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO + 1);
         assert_eq!(O_ORIENTATION_OFFSET, O_DOG_SURROUND_RATIO + 1);
-        assert_eq!(O_VALUE_WEIGHTS, O_ORIENTATION_OFFSET + 1);
+        assert_eq!(O_HOMEO_PREDICTOR_WEIGHTS, O_ORIENTATION_OFFSET + 1);
+        assert_eq!(
+            O_HOMEO_PREDICTOR_BIAS,
+            O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION
+        );
+        assert_eq!(O_PREV_HOMEO_PREDICTION, O_HOMEO_PREDICTOR_BIAS + 1);
+        assert_eq!(O_VALUE_WEIGHTS, O_PREV_HOMEO_PREDICTION + 1);
         assert_eq!(O_TRACE_BIASES, O_VALUE_WEIGHTS + 4 * ENCODED_DIMENSION + 2);
         assert_eq!(BRAIN_STRIDE, O_TRACE_BIASES + 3);
     }
@@ -992,7 +1049,7 @@ mod tests {
         assert_eq!(SCRATCH_ENCODED, SCRATCH_FEATURES + FEATURES_STRIDE);
         assert_eq!(SCRATCH_HABITUATED, SCRATCH_ENCODED + ENCODED_DIMENSION);
         assert_eq!(SCRATCH_HOMEO, SCRATCH_HABITUATED + ENCODED_DIMENSION);
-        assert_eq!(SCRATCH_RECALL, SCRATCH_HOMEO + HOMEO_OUT_STRIDE);
+        assert_eq!(SCRATCH_RECALL, SCRATCH_HOMEO + 8); // homeostatic gradient predictor: s_homeo grew to 8, scratch region follows
         assert_eq!(
             SCRATCH_RECALL_SIMILARITY,
             SCRATCH_RECALL + RECALL_IDX_STRIDE
@@ -1083,7 +1140,7 @@ mod tests {
 
     #[test]
     fn luminance_weights_sum_to_one() {
-        // Rec. 709 luminance weights (plan 0008, Stage 0). These three literals
+        // Rec. 709 luminance weights (Stage 0 of the visual cortex). These three literals
         // are the single canonical source mirrored by the WGSL `retina_luminance`
         // helper in common.wgsl. A linear-light luminance must preserve a flat
         // field: the weights MUST sum to exactly 1.0, otherwise a uniform retina
@@ -1160,6 +1217,12 @@ mod tests {
         assert!(CFG_DISTRESS_EXP < CONFIG_SIZE);
         assert!(CFG_METABOLIC_RATE < CONFIG_SIZE);
         assert!(CFG_INTEGRITY_SCALE < CONFIG_SIZE);
+        assert!(CFG_VISUAL_CORTEX_ENABLED < CONFIG_SIZE);
+        assert!(CFG_DANGER_PERCEPT_ENABLED < CONFIG_SIZE);
+        assert!(CFG_CORTEX_STAGE_LIMIT < CONFIG_SIZE);
+        assert!(CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED < CONFIG_SIZE);
+        assert!(CFG_HOMEO_PREDICTOR_LEARNING_RATE < CONFIG_SIZE);
+        assert!(CFG_HOMEO_PREDICTIVE_CREDIT_BETA < CONFIG_SIZE);
     }
 
     #[test]
@@ -1593,6 +1656,7 @@ mod tests {
             P_RAW_GRADIENT_OUT,
             P_APPROACH_SENSE_RANGE_TICKS,
             P_APPROACH_TURNS_TOWARD,
+            P_HOMEO_PREDICTED_GRADIENT_OUT,
         ]
         .iter()
         .max()

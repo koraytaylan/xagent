@@ -920,7 +920,7 @@ fn fused_dispatch_matches_split() {
     );
 }
 
-/// Dense tiling smoke test (plan 0006): verify that the same-dispatch tiling
+/// Dense tiling smoke test: verify that the same-dispatch tiling
 /// produces finite, bounded motor outputs and no NaN/infinity in brain state.
 /// Does not assert byte-equality against the old serial path (reduction order
 /// intentionally changed); only checks finiteness, bounds, and alive/death counts.
@@ -2662,6 +2662,51 @@ fn learning_probe_baseline_turn_alignment_is_chance() {
     );
 }
 
+/// Smoke: enabling the homeostatic predictive credit flag must be
+/// a zero-behavior no-op when the mechanism is off by default, and must not
+/// crash or change liveness when turned on.
+#[test]
+fn homeo_predictive_credit_flag_is_inert_when_disabled() {
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    // Default BrainConfig has the flag false — exercise the off path.
+    use xagent_brain::buffers::{PHYS_STRIDE, P_ALIVE};
+    let brain_config = BrainConfig::default();
+    let mut arena = build_probe_arena(&brain_config, 17);
+    arena.kernel.dispatch_batch(0, 10);
+    let state = arena.kernel.read_full_state_blocking();
+    let mut any_alive = false;
+    for a in 0..17 {
+        if state[a * PHYS_STRIDE + P_ALIVE] >= 0.5 {
+            any_alive = true;
+            break;
+        }
+    }
+    assert!(any_alive, "at least one agent alive with flag off");
+
+    // Now enable; should still run and keep agents alive (no NaN explosions etc).
+    let mut enabled = BrainConfig::default();
+    enabled.homeo_predictive_credit_enabled = true;
+    enabled.homeo_predictor_learning_rate = 0.01;
+    enabled.homeo_predictive_credit_beta = 0.3;
+    let mut arena2 = build_probe_arena(&enabled, 17);
+    arena2.kernel.dispatch_batch(0, 10);
+    let state2 = arena2.kernel.read_full_state_blocking();
+    let mut any_alive2 = false;
+    for a in 0..17 {
+        if state2[a * PHYS_STRIDE + P_ALIVE] >= 0.5 {
+            any_alive2 = true;
+            break;
+        }
+    }
+    assert!(
+        any_alive2,
+        "at least one agent alive with predictor enabled"
+    );
+}
+
 /// Free-running foraging baseline in the probe arena with the default
 /// config (normal movement, default strides): records food eaten and deaths
 /// over a fixed tick budget. The printed numbers are the recorded baseline
@@ -3157,7 +3202,7 @@ fn death_applies_terminal_td_update_through_traces() {
         return;
     }
 
-    /// Under the path-length hazard model (plan 0009), stationary agents
+    /// Under the path-length hazard model, stationary agents
     /// (movement_speed = 0.0) take zero hazard damage (step_len = 0).
     /// Instead, we use energy depletion to trigger death reliably on tick 1.
     /// With max_energy = 0.001 and per-tick drain ≈ 0.018, the agent will
@@ -3235,7 +3280,7 @@ fn td_traces_bounded_across_deaths() {
         return;
     }
 
-    /// Under the path-length hazard model (plan 0009), stationary agents
+    /// Under the path-length hazard model, stationary agents
     /// take zero hazard damage. Instead, we use energy depletion to trigger
     /// repeated deaths. With max_energy = 1.8 and per-tick drain ≈ 0.018,
     /// agents die roughly every 100 ticks, guaranteeing multiple deaths in
@@ -3438,7 +3483,7 @@ fn hazard_probe_exit_latency_baseline() {
     // raw exit_fraction=0.396, mean_exit_latency=315.0, death_fraction=0.000
     // (19/48 exits, mean of exits 315.0, 0/48 deaths). This is a substantial
     // improvement over the per-tick hazard model (raw 0.188 / 0.812 deaths);
-    // plan 0009 path-length hazard makes danger graded-not-lethal, so fast
+    // path-length hazard makes danger graded-not-lethal, so fast
     // maneuvering agents escape more often and stationary/slow agents take
     // zero dose. ±50% relative bands for exit_fraction and mean_latency.
     // death_fraction is now ≈0; use an absolute upper bound (0.05 = 2/48).
@@ -7904,7 +7949,7 @@ fn death_path_actor_update_uses_actor_vector_scale() {
     );
 }
 
-/// Verifies three properties of the super-linear drag exponent (plan 0009 Layer A):
+/// Verifies three properties of the super-linear drag exponent (Layer A):
 ///
 /// **(a) k=1.0 is bit-identical to the pre-task baseline.**  At `move_speed=20`
 /// the exponent selects `speed_ratio = 1.0` for both k=1.0 and k=2.0

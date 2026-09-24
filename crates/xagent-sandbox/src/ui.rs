@@ -1170,14 +1170,14 @@ impl<'a> TabContext<'a> {
                         let x = rect.left() + col as f32 * cell_w;
                         p.line_segment(
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                            egui::Stroke::new(0.5, egui::Color32::from_gray(40)),
+                            egui::Stroke::new(0.5_f32, egui::Color32::from_gray(40)),
                         );
                     }
                     for row in 0..=vh {
                         let y = rect.top() + row as f32 * cell_h;
                         p.line_segment(
                             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                            egui::Stroke::new(0.5, egui::Color32::from_gray(40)),
+                            egui::Stroke::new(0.5_f32, egui::Color32::from_gray(40)),
                         );
                     }
                 } else {
@@ -1264,7 +1264,11 @@ impl<'a> TabContext<'a> {
 
                     // Agent dot
                     p.circle_filled(agent_pos, 5.0, agent_color);
-                    p.circle_stroke(agent_pos, 5.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    p.circle_stroke(
+                        agent_pos,
+                        5.0,
+                        egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                    );
 
                     // Facing direction arrow
                     let arrow_len = 12.0;
@@ -1273,7 +1277,7 @@ impl<'a> TabContext<'a> {
                     let arrow_end = egui::pos2(agent_pos.x + dx, agent_pos.y + dz);
                     p.line_segment(
                         [agent_pos, arrow_end],
-                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                     );
                 }
 
@@ -1281,7 +1285,7 @@ impl<'a> TabContext<'a> {
                 p.rect_stroke(
                     map_rect,
                     2.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
                     egui::StrokeKind::Inside,
                 );
             });
@@ -1365,7 +1369,7 @@ impl<'a> TabContext<'a> {
                 let y = rect.bottom() - frac * rect.height();
                 painter.line_segment(
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    egui::Stroke::new(0.5, egui::Color32::from_gray(50)),
+                    egui::Stroke::new(0.5_f32, egui::Color32::from_gray(50)),
                 );
             }
 
@@ -1386,7 +1390,7 @@ impl<'a> TabContext<'a> {
                         egui::pos2(x, y)
                     })
                     .collect();
-                let stroke = egui::Stroke::new(1.5, color);
+                let stroke = egui::Stroke::new(1.5_f32, color);
                 for pair in points.windows(2) {
                     painter.line_segment([pair[0], pair[1]], stroke);
                 }
@@ -2017,7 +2021,7 @@ impl<'a> TabContext<'a> {
                     })
                     .collect();
                 for pair in pts.windows(2) {
-                    painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, color));
+                    painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0_f32, color));
                 }
             }
 

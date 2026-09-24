@@ -110,7 +110,7 @@ pub fn generate_food_mesh_from_state(food_state: &[f32]) -> Mesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    for item in food_state.chunks_exact(FOOD_STATE_STRIDE) {
+    for item in food_state.as_chunks::<FOOD_STATE_STRIDE>().0 {
         if item[FOOD_RESPAWN_TIMER] > 0.0 {
             continue;
         }

@@ -1265,8 +1265,8 @@ fn run_headless_with_flags(
 
     // Clean up temp database and its sidecars
     let _ = std::fs::remove_file(&temp_db);
-    let _ = std::fs::remove_file(format!("{}-wal", &temp_db));
-    let _ = std::fs::remove_file(format!("{}-shm", &temp_db));
+    let _ = std::fs::remove_file(format!("{}-wal", temp_db));
+    let _ = std::fs::remove_file(format!("{}-shm", temp_db));
 
     ValidationStats {
         mean_fitness,

@@ -2242,7 +2242,9 @@ fn score_turn_alignment(arena: &mut ProbeArena, start_tick: u64, ticks: usize) -
 /// hit color written by the vision shader).
 fn count_food_pixels(vision_color: &[f32]) -> usize {
     vision_color
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| {
             (px[0] - 0.7).abs() < 0.01 && (px[1] - 0.95).abs() < 0.01 && (px[2] - 0.2).abs() < 0.01
         })

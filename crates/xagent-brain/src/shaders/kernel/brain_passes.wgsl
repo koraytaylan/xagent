@@ -1208,20 +1208,31 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     if (tid == 0u) {
         var predicted_gradient: f32 = 0.0;
         if (homeo_pred_enabled) {
-            predicted_gradient = s_dense_partials[0]
-                + brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS];
+            predicted_gradient = clamp(
+                s_dense_partials[0] + brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS],
+                -MAX_HOMEOSTATIC_DELTA,
+                MAX_HOMEOSTATIC_DELTA,
+            );
             // Train: previous tick's prediction vs this tick's actual gradient
             let prev_pred = brain_state[brain_base + O_PREV_HOMEO_PREDICTION];
             let actual = s_homeo[6u];  // raw_gradient from coop_habituate_homeo
-            let pred_error = prev_pred - actual;
+            let pred_error = clamp(
+                prev_pred - actual,
+                -MAX_HOMEOSTATIC_DELTA,
+                MAX_HOMEOSTATIC_DELTA,
+            );
             let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
-            brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] -= pred_lr * pred_error;
+            brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] = clamp(
+                brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] - pred_lr * pred_error,
+                -MAX_HOMEOSTATIC_DELTA,
+                MAX_HOMEOSTATIC_DELTA,
+            );
             // Store current prediction for next tick's training
             brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = predicted_gradient;
             // Publish pred_error for the weight-update threads
             s_pred_td[S_HOMEO_PRED_ERROR] = pred_error;
-            // Carry predicted gradient to TD reward blend and late telemetry
-            s_homeo[7u] = predicted_gradient;
+            // Carry previous tick's predicted gradient to TD reward blend and late telemetry
+            s_homeo[7u] = prev_pred;
         } else {
             s_pred_td[S_HOMEO_PRED_ERROR] = 0.0;
             s_homeo[7u] = 0.0;
@@ -1233,8 +1244,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     if (homeo_pred_enabled && tid < ENCODED_DIMENSION) {
         let pred_error = s_pred_td[S_HOMEO_PRED_ERROR];
         let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
+        let previous_prediction = brain_state[brain_base + O_PREV_PREDICTION + tid];
         var w = brain_state[brain_base + O_HOMEO_PREDICTOR_WEIGHTS + tid]
-            - pred_lr * pred_error * s_prediction[tid];
+            - pred_lr * TD_VECTOR_SCALE * pred_error * previous_prediction;
         w = clamp(w, -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
         brain_state[brain_base + O_HOMEO_PREDICTOR_WEIGHTS + tid] = w;
     }

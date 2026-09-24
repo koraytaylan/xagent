@@ -2709,6 +2709,138 @@ fn homeo_predictive_credit_flag_is_inert_when_disabled() {
     );
 }
 
+/// Standard normal two-tailed critical value for 95% confidence intervals.
+const Z_CRITICAL_95: f64 = 1.96;
+
+/// Computes normal approximation of the Clopper–Pearson confidence interval lower bound.
+fn clopper_pearson_ci_lower(successes: u64, trials: u64) -> f64 {
+    if successes == 0 || trials == 0 {
+        return 0.0;
+    }
+    let p = successes as f64 / trials as f64;
+    let margin = Z_CRITICAL_95 * ((p * (1.0 - p)) / trials as f64).sqrt();
+    (p - margin).max(0.0)
+}
+
+/// Computes normal approximation of the Clopper–Pearson confidence interval upper bound.
+fn clopper_pearson_ci_upper(successes: u64, trials: u64) -> f64 {
+    if trials == 0 {
+        return 0.0;
+    }
+    if successes == trials {
+        return 1.0;
+    }
+    let p = successes as f64 / trials as f64;
+    let margin = Z_CRITICAL_95 * ((p * (1.0 - p)) / trials as f64).sqrt();
+    (p + margin).min(1.0)
+}
+
+/// Training episodes for homeostatic predictive credit steering probe.
+const HOMEO_PROBE_TRAIN_EPISODES: usize = 120;
+/// Ticks per training episode for homeostatic predictive credit steering probe.
+const HOMEO_PROBE_EPISODE_TICKS: u32 = 100;
+/// Evaluation ticks for stationary turn alignment scoring.
+const HOMEO_PROBE_EVAL_TICKS: usize = 60;
+/// Minimum scored evaluation samples required to avoid false chance readings.
+const HOMEO_PROBE_MIN_SCORED_SAMPLES: usize = 200;
+/// Predictor online learning rate for the probe.
+const HOMEO_PROBE_PREDICTOR_LR: f32 = 0.01;
+/// Beta blend weight for anticipatory TD reward in the probe.
+const HOMEO_PROBE_PREDICTIVE_BETA: f32 = 0.3;
+
+/// Evaluates directional steering alignment with the homeostatic gradient
+/// predictor head active during training.
+///
+/// Follows the mirrored-steering protocol (120 episodes, alternating food side).
+/// After training, one diagnostic episode measures the mean absolute error
+/// of the gradient predictor. Evaluation runs with pinned movement and the
+/// predictor disabled to verify policy transfer.
+#[test]
+fn homeo_predictive_credit_steering_probe() {
+    use xagent_brain::buffers::{
+        PHYS_STRIDE, P_FOOD_COUNT, P_HOMEO_PREDICTED_GRADIENT_OUT, P_RAW_GRADIENT_OUT,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let train_brain = BrainConfig {
+        brain_tick_stride: 1,
+        vision_stride: 1,
+        homeo_predictive_credit_enabled: true,
+        homeo_predictor_learning_rate: HOMEO_PROBE_PREDICTOR_LR,
+        homeo_predictive_credit_beta: HOMEO_PROBE_PREDICTIVE_BETA,
+        ..Default::default()
+    };
+    let mut arena = build_probe_arena(&train_brain, 17);
+
+    let mut tick_cursor = 0_u64;
+    let mut food_total = 0.0_f32;
+    for episode in 0..HOMEO_PROBE_TRAIN_EPISODES {
+        arena.reset_bodies_with(episode % 2 == 1);
+        arena
+            .kernel
+            .dispatch_batch(tick_cursor, HOMEO_PROBE_EPISODE_TICKS);
+        tick_cursor += u64::from(HOMEO_PROBE_EPISODE_TICKS);
+        let state = arena.kernel.read_full_state_blocking();
+        for a in 0..PROBE_AGENT_COUNT {
+            food_total += state[a * PHYS_STRIDE + P_FOOD_COUNT];
+        }
+    }
+    assert!(
+        food_total > 0.0,
+        "no food eaten across {HOMEO_PROBE_TRAIN_EPISODES} training episodes — arena broke"
+    );
+
+    // Diagnostic episode: measure mean absolute prediction error with predictor active
+    arena.reset_bodies_with(false);
+    let mut abs_error_sum = 0.0_f64;
+    let mut error_samples = 0_usize;
+    for t in 0..HOMEO_PROBE_EPISODE_TICKS {
+        arena.kernel.dispatch_batch(tick_cursor + u64::from(t), 1);
+        let state = arena.kernel.read_full_state_blocking();
+        if t >= 2 {
+            for a in 0..PROBE_AGENT_COUNT {
+                let actual = state[a * PHYS_STRIDE + P_RAW_GRADIENT_OUT] as f64;
+                let predicted = state[a * PHYS_STRIDE + P_HOMEO_PREDICTED_GRADIENT_OUT] as f64;
+                abs_error_sum += (predicted - actual).abs();
+                error_samples += 1;
+            }
+        }
+    }
+    tick_cursor += u64::from(HOMEO_PROBE_EPISODE_TICKS);
+    let mean_abs_error = if error_samples > 0 {
+        abs_error_sum / error_samples as f64
+    } else {
+        0.0
+    };
+
+    // Evaluation: pinned movement, predictor disabled
+    let eval_brain = probe_brain_config();
+    for a in 0..PROBE_AGENT_COUNT {
+        arena
+            .kernel
+            .write_agent_heritable_config(a as u32, &eval_brain);
+    }
+    arena.reset_bodies();
+    let (correct, scored) = score_turn_alignment(&mut arena, tick_cursor, HOMEO_PROBE_EVAL_TICKS);
+
+    let rate = correct as f64 / scored.max(1) as f64;
+    let ci_lower = clopper_pearson_ci_lower(correct as u64, scored as u64);
+    let ci_upper = clopper_pearson_ci_upper(correct as u64, scored as u64);
+    eprintln!(
+        "homeo predictive credit steering probe: food={food_total}, \
+         turn/bearing alignment {correct}/{scored} = {rate:.3} (95% CI [{ci_lower:.3}, {ci_upper:.3}]), \
+         mae={mean_abs_error:.6}"
+    );
+    assert!(
+        scored >= HOMEO_PROBE_MIN_SCORED_SAMPLES,
+        "only {scored} scored samples — evaluation geometry broke"
+    );
+}
+
 /// Free-running foraging baseline in the probe arena with the default
 /// config (normal movement, default strides): records food eaten and deaths
 /// over a fixed tick budget. The printed numbers are the recorded baseline

@@ -339,3 +339,30 @@ This decision is deferred. Re-open when:
 **Authored by:** Plan 0021-0001  
 **Reviewed by:** [to be filled]  
 **Date signed:** 2026-06-26
+
+---
+
+## Decision update (2026-09-25): FLIP
+
+**Status:** FLIPPED — `effort_rebased_fitness = true` and `speed_cost_exponent = 2.0` are
+now the constructed defaults (`BrainConfig::default`, `tiny`, `large`). Serialized configs
+that omit either field still load as `false` / `1.0`, the regime they were recorded under.
+The speed-decoupling harness pins its baseline arm to `speed_cost_exponent = 1.0`.
+
+**Evidence (unlock condition 2 met at production scale):** The live GUI session in
+`xagent.db` (run 1, started 2026-09-24) ran 220 generations at **100 000 ticks per
+generation** (population 10, 2 eval repeats) with both levers OFF. Across all 2 190 agent
+evaluations:
+
+| Metric | Value |
+|---|---|
+| Pearson r(`movement_speed`, composite fitness) | **0.928** (gate (a) threshold 0.5) |
+| Agents at speed ≥ 80 | 1 412 / 2 190; `movement_speed` pinned at the 100.0 clamp |
+| Survival multiplier at speed ≥ 80 | 0.258 (≈ 190 deaths / generation — the 0.25 floor) |
+| Exploration axis at speed ≥ 80 | 0.984 (saturated) |
+| Best composite / theoretical ceiling at that death rate | 0.257 / ≈ 0.258 |
+
+Gate (a) — the only failing gate in the 10 000-tick A/B — therefore holds decisively at the
+production tick budget: the speed ratchet emerges and saturates the legacy objective. Gates
+(b)–(d) passed in the original A/B. With the levers off, fitness has no remaining gradient
+for brain genes, so evolution cannot improve behavior.

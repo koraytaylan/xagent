@@ -8083,13 +8083,13 @@ fn death_path_actor_update_uses_actor_vector_scale() {
     );
 }
 
-/// Verifies three properties of the super-linear drag exponent (Layer A):
+/// Verifies three properties of the super-linear drag exponent:
 ///
-/// **(a) k=1.0 is bit-identical to the pre-task baseline.**  At `move_speed=20`
-/// the exponent selects `speed_ratio = 1.0` for both k=1.0 and k=2.0
-/// (`pow(1.0, k) == 1.0`), so they produce the exact same energy drain.
+/// **(a) k=2.0 is bit-identical to linear drag at baseline speed.**  At
+/// `move_speed=20` the exponent selects `speed_ratio = 1.0` for both k=1.0 and
+/// k=2.0 (`pow(1.0, k) == 1.0`), so they produce the exact same energy drain.
 /// Identical energy reads after N ticks confirm the select-guard is byte-neutral
-/// at the default exponent.
+/// at baseline speed.
 ///
 /// **(b) k=2.0 raises drag above baseline.**  At `move_speed=40` (speed_ratio=2),
 /// k=2.0 gives `drag = pow(2.0, 2.0) = 4.0` while k=1.0 gives `drag = 2.0`.
@@ -8104,7 +8104,7 @@ fn death_path_actor_update_uses_actor_vector_scale() {
 /// This confirms the "above-baseline-only" invariant: the exponent never creates
 /// a torpor incentive (no new energy discount for going slower than baseline).
 #[test]
-fn speed_cost_exponent_default_is_noop() {
+fn speed_cost_exponent_is_noop_at_or_below_baseline() {
     if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;

@@ -876,8 +876,7 @@ pub struct ValidationStats {
 /// Super-linear locomotor-drag exponent used in the ON run.
 /// k=2.0: energy cost scales as (speed/20)^2 above the baseline speed, so the
 /// energy-drain axis becomes speed-dependent and faster movement costs
-/// disproportionately more. k=1.0 in the baseline run is a bit-exact no-op per
-/// the WGSL guard.
+/// disproportionately more.
 const ON_SPEED_COST_EXPONENT: f32 = 2.0;
 
 /// Guard value for the food-per-death denominator.
@@ -914,16 +913,25 @@ fn run_headless_with_flags(
     innate_instincts_enabled: bool,
 ) -> ValidationStats {
     // Set the validation flags.
+/// Locomotor-drag exponent used in the baseline (legacy-regime) run: linear
+/// drag, a bit-exact no-op per the WGSL guard. Set explicitly because the
+/// constructed `BrainConfig` default is super-linear; leaving it would give
+/// the baseline arm the ON arm's drag.
+const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
+
     // When enabling effort-rebased fitness, also engage the super-linear drag at k=2.0 — the
     // keystone mechanism that makes the energy-drain axis speed-dependent.
-    // Leaving speed_cost_exponent=1.0 in the ON run would make the ON and baseline
-    // runs byte-identical on the energy-drain axis, defeating the measurement.
+    // Sharing one exponent across the ON and baseline runs would make them
+    // byte-identical on the energy-drain axis, defeating the measurement, so the
+    // baseline pins linear drag.
     config.brain.effort_rebased_fitness = effort_rebased_fitness;
     config.brain.danger_percept_enabled = danger_percept_enabled;
     config.brain.innate_instincts_enabled = innate_instincts_enabled;
-    if effort_rebased_fitness {
-        config.brain.speed_cost_exponent = ON_SPEED_COST_EXPONENT;
-    }
+    config.brain.speed_cost_exponent = if effort_rebased_fitness {
+        ON_SPEED_COST_EXPONENT
+    } else {
+        BASELINE_SPEED_COST_EXPONENT
+    };
 
     println!(
         "  Flags: effort_rebased={}, danger_percept={}, speed_cost_exponent={}, innate_instincts={}",

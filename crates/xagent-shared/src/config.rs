@@ -120,10 +120,12 @@ pub struct BrainConfig {
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
     /// Exponent for speed-cost drag curve in the fused kernel's energy drain.
-    /// Default 1.0 (no-op: cost is linear in speed). Values > 1.0 make drag
-    /// super-linear above baseline speed. Applied to `pow(max(speed/20, 1.0), k)`.
+    /// Values > 1.0 make drag super-linear above baseline speed; 1.0 keeps it
+    /// linear. Applied to `pow(max(speed/20, 1.0), k)`. Default 2.0 — see
+    /// [`default_speed_cost_exponent`] for why. A config blob that omits the
+    /// field loads as 1.0, the regime it was recorded under.
     /// Locked per batch, not heritable.
-    #[serde(default = "default_speed_cost_exponent")]
+    #[serde(default = "legacy_speed_cost_exponent")]
     pub speed_cost_exponent: f32,
     /// Gate flag for the Hubel-Wiesel visual cortex pass. When
     /// `false` the cortex pass is a no-op passthrough and the encoder consumes
@@ -157,8 +159,12 @@ pub struct BrainConfig {
     /// composite fitness uses the legacy time-denominated formula (food per
     /// time, exploration as fraction of cells). When `true` it re-bases both
     /// axes onto effort: foraging = food/energy, exploration = min(coverage,
-    /// cells/distance). The default stays `false` until the speed-decoupling
-    /// gate passes. Locked per batch, not heritable.
+    /// cells/distance). Defaults to `true`: under the time-denominated formula
+    /// `movement_speed` is the only gene that buys fitness (a 100 000-tick
+    /// generation run measured a 0.93 speed↔fitness correlation, speed pinned
+    /// at its 100.0 clamp and the composite saturated near 0.26), so evolution
+    /// cannot select on behavior. A config blob that omits the field loads as
+    /// `false`, the regime it was recorded under. Locked per batch, not heritable.
     #[serde(default)]
     pub effort_rebased_fitness: bool,
     /// Gate flag for seeded innate instinct priors. When `false`,
@@ -368,7 +374,18 @@ fn default_movement_speed() -> f32 {
     20.0
 }
 
+/// Default drag exponent. Quadratic drag above baseline speed makes food per
+/// unit energy single-peaked in `movement_speed` (encounter rate grows linearly
+/// with speed, locomotor cost quadratically), which removes the monotone
+/// speed→fitness ratchet that linear drag leaves in place. It is the exponent
+/// the speed-decoupling A/B validated alongside effort-rebased fitness.
 fn default_speed_cost_exponent() -> f32 {
+    2.0
+}
+
+/// Drag exponent assumed for a serialized config that predates the field:
+/// linear drag, the only behavior that existed when such a config was written.
+fn legacy_speed_cost_exponent() -> f32 {
     1.0
 }
 
@@ -559,7 +576,7 @@ impl Default for BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             danger_percept_blinded: false,
-            effort_rebased_fitness: false,
+            effort_rebased_fitness: true,
             innate_instincts_enabled: false,
             homeo_predictive_credit_enabled: false,
             homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
@@ -657,7 +674,7 @@ impl BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             danger_percept_blinded: false,
-            effort_rebased_fitness: false,
+            effort_rebased_fitness: true,
             innate_instincts_enabled: false,
             homeo_predictive_credit_enabled: false,
             homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
@@ -698,7 +715,7 @@ impl BrainConfig {
             visual_cortex_enabled: false,
             danger_percept_enabled: false,
             danger_percept_blinded: false,
-            effort_rebased_fitness: false,
+            effort_rebased_fitness: true,
             innate_instincts_enabled: false,
             homeo_predictive_credit_enabled: false,
             homeo_predictor_learning_rate: default_homeo_predictor_learning_rate(),
@@ -877,7 +894,8 @@ mod tests {
     #[test]
     fn serde_default_off_coverage() {
         // A config blob that omits `danger_percept_enabled` and
-        // `effort_rebased_fitness` must deserialize both fields as `false`.
+        // `effort_rebased_fitness` must deserialize both fields as `false`,
+        // even though the constructed default enables effort-rebased fitness.
         // This is the back-compat guarantee: new flag fields must default to
         // `false` when absent from a legacy config blob, enforced by
         // `#[serde(default)]` on each field. Dropping either attribute would
@@ -917,9 +935,10 @@ mod tests {
     #[test]
     fn speed_cost_exponent_round_trips() {
         // Test that speed_cost_exponent serializes and deserializes correctly,
-        // and that the default is 1.0 (no-op).
+        // and that the constructed default is the quadratic drag exponent.
         let config = BrainConfig::default();
-        assert_eq!(config.speed_cost_exponent, 1.0);
+        assert_eq!(config.speed_cost_exponent, default_speed_cost_exponent());
+        assert!(config.speed_cost_exponent > 1.0);
 
         // Test custom values round-trip through JSON.
         let config = BrainConfig {
@@ -930,7 +949,8 @@ mod tests {
         let deserialized: BrainConfig = serde_json::from_str(&json).expect("config deserializes");
         assert_eq!(deserialized.speed_cost_exponent, 2.5);
 
-        // Test that old configs without speed_cost_exponent deserialize with the default.
+        // Old configs without speed_cost_exponent deserialize with linear drag,
+        // the regime they were recorded under.
         let json_without_field = r#"{
             "memory_capacity": 128,
             "processing_slots": 16,
@@ -958,7 +978,32 @@ mod tests {
             "orientation_offset": 0.0
         }"#;
         let deserialized: BrainConfig = serde_json::from_str(json_without_field)
-            .expect("config without speed_cost_exponent loads with default");
+            .expect("config without speed_cost_exponent loads with the legacy exponent");
+        assert_eq!(
+            deserialized.speed_cost_exponent,
+            legacy_speed_cost_exponent()
+        );
         assert_eq!(deserialized.speed_cost_exponent, 1.0);
+    }
+
+    #[test]
+    fn every_preset_prices_speed_into_fitness() {
+        // Every constructed preset must run effort-rebased fitness with
+        // super-linear drag; otherwise movement_speed is a free fitness lever.
+        for (name, config) in [
+            ("default", BrainConfig::default()),
+            ("tiny", BrainConfig::tiny()),
+            ("large", BrainConfig::large()),
+        ] {
+            assert!(
+                config.effort_rebased_fitness,
+                "{name} preset must enable effort-rebased fitness"
+            );
+            assert!(
+                config.speed_cost_exponent > 1.0,
+                "{name} preset must use super-linear drag, got {}",
+                config.speed_cost_exponent
+            );
+        }
     }
 }

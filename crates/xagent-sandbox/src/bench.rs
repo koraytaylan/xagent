@@ -318,10 +318,7 @@ pub fn run_visual_cortex_ab(
             // Force the chunk to complete before queuing the next, so the queued
             // backlog never exceeds one window. The wait is real GPU execution
             // time and is intentionally inside the timed region.
-            kernel
-                .device()
-                .poll(wgpu::Maintain::Wait)
-                .panic_on_timeout();
+            kernel.poll_wait();
             tick += this_chunk as u64;
         }
         let secs = start.elapsed().as_secs_f64();
@@ -692,10 +689,7 @@ fn run_one_profile_arm(
     while tick < frame_count {
         let this_chunk = chunk_ticks.min((frame_count - tick) as u32);
         kernel.dispatch_batch(tick, this_chunk);
-        kernel
-            .device()
-            .poll(wgpu::Maintain::Wait)
-            .panic_on_timeout();
+        kernel.poll_wait();
         tick += this_chunk as u64;
     }
     let secs = start.elapsed().as_secs_f64();

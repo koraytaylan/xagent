@@ -545,6 +545,11 @@ const WC_DANGER_PERCEPT_BLINDED: u32 = 26u;
 const HAB_EMA_ALPHA: f32 = 0.02;
 const ATTEN_FLOOR: f32 = 0.1;
 const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
+// Live homeostatic-gradient predictions are clamped into ±MAX_HOMEOSTATIC_DELTA.
+// Death writes this out-of-range sentinel so the next brain tick can tell
+// "this episode has not predicted yet" from a real prediction of zero.
+// Zero is a legal output (zero features and a zero bias) and must stay trainable.
+const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
 const GRADIENT_FAST_BLEND: f32 = 0.6;

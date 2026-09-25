@@ -166,4 +166,8 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
     brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
     brain_state[brain_base + O_PREV_VALUE] = 0.0;
+    // Same episodic rule as the fused death path. This remainder dispatch does
+    // not run the brain, so the sentinel must already be in place for the next
+    // brain tick. Zero would look like a real prediction.
+    brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = HOMEO_PREDICTION_ABSENT;
 }

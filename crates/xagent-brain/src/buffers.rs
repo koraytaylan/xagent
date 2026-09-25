@@ -116,8 +116,10 @@ pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
 // Linear head (128→1) on top of the forward model's predicted state s_prediction.
 // Trained online to predict raw_gradient; the previous tick's prediction provides
 // an anticipatory credit signal that bridges the ~10-tick sensory latency.
-// Weights are heritable (seeded at birth, inherited, mutated); the prev-prediction
-// slot is episodic (zeroed on death), like O_PREV_VALUE.
+// Weights are seeded at birth and copied with the brain buffer. Brain-state
+// mutation does not perturb them; lifetime gradient steps are the update.
+// The previous-prediction slot is episodic (marked absent at birth and on
+// death, because zero is a legal prediction), like O_PREV_VALUE.
 pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_ORIENTATION_OFFSET + 1;
 pub const O_HOMEO_PREDICTOR_BIAS: usize = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
 pub const O_PREV_HOMEO_PREDICTION: usize = O_HOMEO_PREDICTOR_BIAS + 1;
@@ -252,6 +254,16 @@ pub const P_APPROACH_TURNS_TOWARD: usize = 46;
 /// Per-agent live state, never serialized. Provides the anticipatory credit
 /// signal used in the TD reward blend.
 pub const P_HOMEO_PREDICTED_GRADIENT_OUT: usize = 47;
+
+/// Value written to `O_PREV_HOMEO_PREDICTION` at birth and on death.
+///
+/// Live predictions are clamped into the kernel's `MAX_HOMEOSTATIC_DELTA`
+/// interval. This sentinel sits strictly outside that interval so the next
+/// tick can tell "no prediction was produced this episode" from a real
+/// prediction of zero. Zero is what a zero feature vector and a zero bias
+/// actually predict, so clearing the slot to zero would be a false sample.
+/// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
+pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
 pub const PHYS_STRIDE: usize = 48;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
@@ -829,7 +841,9 @@ pub fn init_brain_state_for(
 
     // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
     // Xavier-uniform for the 128→1 head weights (same fan-in as value head).
-    // Bias and prev-prediction (episodic) left at 0 (vec init).
+    // Bias starts at 0. The previous prediction is the absent sentinel:
+    // zero would be a legal sample, and the first tick's energy jump from
+    // the zeroed homeostatic slot to a full meter would train that false 0.
     let delta_homeo_pred_weights = O_HOMEO_PREDICTOR_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_homeo_pred_bias = O_HOMEO_PREDICTOR_BIAS - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_prev_homeo_pred = O_PREV_HOMEO_PREDICTION - O_PREDICTOR_CONTEXT_WEIGHT;
@@ -839,9 +853,11 @@ pub fn init_brain_state_for(
         state[o_pred_ctx_wt + delta_homeo_pred_weights + i] =
             (rng.random::<f32>() * 2.0 - 1.0) * homeo_pred_scale;
     }
-    // bias and prev-pred already 0 from vec![0.0]; explicit for clarity on episodic slot
+    // Previous prediction first: zero is a legal sample (`|x| <= 0.3`), so this
+    // slot must not stay at the buffer's initial 0. The bias is the line that
+    // stores 0.
+    state[o_pred_ctx_wt + delta_prev_homeo_pred] = HOMEO_PREDICTION_ABSENT;
     state[o_pred_ctx_wt + delta_homeo_pred_bias] = 0.0;
-    state[o_pred_ctx_wt + delta_prev_homeo_pred] = 0.0;
 
     // Habituation attenuation: 1.0 (no attenuation initially)
     for i in 0..ENCODED_DIMENSION {
@@ -1087,6 +1103,31 @@ mod tests {
         assert_eq!(state.len(), layout.brain_stride);
     }
 
+    /// Birth fills the buffer with zeros, and zero is inside the prediction
+    /// clamp. Every layout's previous-prediction slot must leave that range.
+    #[test]
+    fn init_brain_state_for_marks_prev_homeo_prediction_absent() {
+        let config = BrainConfig::default();
+        let mut rng = rand::rng();
+        for (w, h) in [(8, 6), (6, 4), (32, 24)] {
+            let layout = BrainLayout::new(w, h);
+            let state = init_brain_state_for(&config, &layout, &mut rng);
+            let o_pred_ctx_wt = layout.feature_count * ENCODED_DIMENSION
+                + ENCODED_DIMENSION
+                + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+            let slot = o_pred_ctx_wt + (O_PREV_HOMEO_PREDICTION - O_PREDICTOR_CONTEXT_WEIGHT);
+            assert_eq!(
+                state[slot], HOMEO_PREDICTION_ABSENT,
+                "birth at {w}x{h} left a legal prediction of 0 in the previous-prediction slot"
+            );
+            let bias = o_pred_ctx_wt + (O_HOMEO_PREDICTOR_BIAS - O_PREDICTOR_CONTEXT_WEIGHT);
+            assert_eq!(state[bias], 0.0, "bias init must stay zero");
+        }
+        let state = init_brain_state(&config, &mut rng);
+        assert_eq!(state.len(), BRAIN_STRIDE);
+        assert_eq!(state[O_PREV_HOMEO_PREDICTION], HOMEO_PREDICTION_ABSENT);
+    }
+
     #[test]
     fn brain_layout_default_values() {
         let layout = BrainLayout::default();
@@ -1278,6 +1319,33 @@ mod tests {
     }
 
     // ── Shader↔Rust constant sync ────────────────────────────────────────
+
+    fn parse_wgsl_f32_constant(src: &str, name: &str) -> f32 {
+        let prefix = format!("const {name}: f32 =");
+        for line in src.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                let value = rest.split("//").next().unwrap_or(rest);
+                let value = value.trim().trim_end_matches(';').trim();
+                return value.parse().unwrap_or_else(|_| {
+                    panic!("shader constant {name} is not a float literal: {value}")
+                });
+            }
+        }
+        panic!("shader is missing const {name}")
+    }
+
+    #[test]
+    fn homeo_prediction_absent_matches_shader_and_sits_outside_the_clamp() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let absent = parse_wgsl_f32_constant(src, "HOMEO_PREDICTION_ABSENT");
+        let max_delta = parse_wgsl_f32_constant(src, "MAX_HOMEOSTATIC_DELTA");
+        assert_eq!(absent, HOMEO_PREDICTION_ABSENT);
+        assert!(
+            absent > max_delta,
+            "sentinel {absent} must be strictly above the prediction clamp ±{max_delta}"
+        );
+    }
 
     /// Parse `const NAME: TY = VALu;` lines from the shader source
     /// and return a map of name→value for all integer constants.

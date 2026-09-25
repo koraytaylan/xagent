@@ -680,8 +680,10 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
     brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
     brain_state[brain_base + O_PREV_VALUE] = 0.0;
-    // Episodic slot for homeostatic gradient predictor (homeostatic gradient predictor head); weights survive.
-    brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = 0.0;
+    // Episodic slot for the homeostatic gradient predictor. Weights survive.
+    // Zero would be a legal prediction, so store the out-of-range sentinel.
+    // The brain pass later in this cycle must not train on it.
+    brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = HOMEO_PREDICTION_ABSENT;
 }
 
 // ══════════════════════════════════════════════════════════════════════════

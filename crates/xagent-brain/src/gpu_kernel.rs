@@ -465,11 +465,98 @@ pub struct GpuKernel {
     /// Number of `queue.submit` calls made by `dispatch_ticks` — lets a reader
     /// confirm full batches actually fuse (submits ≪ batches at high speed).
     probe_submits: u64,
+    /// Drops last so the process-wide Vulkan gate stays held while the wgpu
+    /// resources above are destroyed. See `vulkan_gate`.
+    vulkan_lock_tail: vulkan_gate::LockTail,
+}
+
+/// Serializes Vulkan entry points across threads.
+///
+/// The loader's debug-utils object naming (`vkSetDebugUtilsObjectNameEXT`)
+/// segfaults inside `libvulkan.so` when several wgpu devices call it at once.
+/// `cargo test` does that: each GPU test builds its own `GpuKernel` device.
+/// This gate covers `GpuKernel` only. The window renderer creates a second
+/// device on the main thread while the simulation worker builds another, and
+/// those renderer calls are not under this lock. The gate is re-entrant on
+/// the owning thread because dispatch helpers call each other.
+mod vulkan_gate {
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+        static DROP_HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+
+    struct DepthTick;
+
+    impl Drop for DepthTick {
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    fn lock() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Held for the duration of one Vulkan-touching call.
+    #[must_use = "dropping the guard releases the Vulkan gate immediately"]
+    pub(super) struct Guard {
+        _depth: DepthTick,
+        _lock: Option<MutexGuard<'static, ()>>,
+    }
+
+    pub(super) fn enter() -> Guard {
+        let nested = DEPTH.with(|depth| {
+            let nested = depth.get() > 0;
+            depth.set(depth.get().saturating_add(1));
+            nested
+        });
+        let held = if nested { None } else { Some(lock()) };
+        Guard {
+            _depth: DepthTick,
+            _lock: held,
+        }
+    }
+
+    /// Acquire the gate for kernel destruction.
+    ///
+    /// `Drop::drop` runs before fields are destroyed, so the guard is stashed
+    /// in thread-local storage and released by `LockTail`, which is the last
+    /// field of the kernel struct.
+    pub(super) fn stash_for_struct_drop() {
+        let nested = DEPTH.with(|depth| depth.get() > 0);
+        if nested {
+            return;
+        }
+        DROP_HELD.with(|slot| {
+            let mut held = slot.borrow_mut();
+            if held.is_none() {
+                *held = Some(lock());
+            }
+        });
+    }
+
+    /// Last field of the kernel. Dropping it releases the gate stashed by
+    /// `stash_for_struct_drop` after the wgpu resources are already gone.
+    pub(super) struct LockTail;
+
+    impl Drop for LockTail {
+        fn drop(&mut self) {
+            DROP_HELD.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
 }
 
 impl GpuKernel {
     /// Check whether a GPU (or fallback CPU) adapter is available.
     pub fn is_available() -> bool {
+        let _vulkan = vulkan_gate::enter();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -505,6 +592,7 @@ impl GpuKernel {
     /// Returns false if no adapter is found, which will also cause `is_available()`
     /// to return false and the test to skip via the `is_available()` guard above.
     pub fn is_software_adapter() -> bool {
+        let _vulkan = vulkan_gate::enter();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -527,12 +615,27 @@ impl GpuKernel {
         }
     }
 
+    /// Block until this kernel's queued GPU work finishes.
+    ///
+    /// Holds the process-wide Vulkan gate for the poll. [`Self::device`]
+    /// returns a reference the caller can use after that gate is released,
+    /// which races other devices inside the Vulkan loader.
+    pub fn poll_wait(&self) {
+        let _vulkan = vulkan_gate::enter();
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+    }
+
     /// Expose the wgpu device.
+    ///
+    /// The returned reference is not covered by the Vulkan gate. Poll through
+    /// [`Self::poll_wait`] when other threads may own devices.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
     /// Expose the wgpu queue.
+    ///
+    /// The returned reference is not covered by the Vulkan gate.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
@@ -584,6 +687,7 @@ impl GpuKernel {
     }
 
     fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
+        let _vulkan = vulkan_gate::enter();
         // Drain any pending async readback so staging buffers are clean.
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
@@ -636,6 +740,7 @@ impl GpuKernel {
         brain_config: &BrainConfig,
         world_config: &WorldConfig,
     ) -> Self {
+        let _vulkan = vulkan_gate::enter();
         let n = agent_count as usize;
         let f = food_count;
         let gw = grid_width(world_config.world_size);
@@ -1426,6 +1531,7 @@ impl GpuKernel {
             probe_complete_nanos: 0,
             probe_batches: 0,
             probe_submits: 0,
+            vulkan_lock_tail: vulkan_gate::LockTail,
         }
     }
 
@@ -1438,6 +1544,7 @@ impl GpuKernel {
         food_consumed: &[bool],
         food_timers: &[f32],
     ) {
+        let _vulkan = vulkan_gate::enter();
         self.queue.write_buffer(
             &self.heightmap_buffer,
             0,
@@ -1469,6 +1576,7 @@ impl GpuKernel {
         &self,
         agents: &[(glam::Vec3, f32, f32, usize, usize)], // (pos, max_energy, max_integrity, mem_cap, proc_slots)
     ) {
+        let _vulkan = vulkan_gate::enter();
         let mut data = vec![0.0f32; self.agent_count as usize * PHYS_STRIDE];
         for (i, &(pos, max_e, max_i, mem_cap, proc_slots)) in agents.iter().enumerate() {
             let base = i * PHYS_STRIDE;
@@ -1552,6 +1660,7 @@ impl GpuKernel {
         phase_mask: u32,
         vision_stride: u32,
     ) {
+        let _vulkan = vulkan_gate::enter();
         fill_world_config(
             &mut self.world_config_scratch,
             &self.world_config,
@@ -1576,6 +1685,7 @@ impl GpuKernel {
     /// Dispatch with explicit phase mask (for profiling).
     /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
     pub fn dispatch_batch_masked(&mut self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
+        let _vulkan = vulkan_gate::enter();
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
@@ -1670,6 +1780,7 @@ impl GpuKernel {
     /// buffer, while on success we need to release the mapping before the
     /// slot can be reused.
     fn unmap_staging_slot(&self, slot: usize) {
+        let _vulkan = vulkan_gate::enter();
         self.state_staging[slot].unmap();
         if self.food_count > 0 {
             self.food_staging[slot].unmap();
@@ -1773,6 +1884,7 @@ impl GpuKernel {
 
     /// Fused serial execution: the original dispatch_ticks body.
     fn dispatch_ticks_fused_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let _vulkan = vulkan_gate::enter();
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
@@ -1967,6 +2079,7 @@ impl GpuKernel {
     /// Split-serial execution: each brain cycle is one kernel dispatch instead of
     /// vision_stride cycles per dispatch. Byte-identical to fused serial.
     fn dispatch_ticks_split_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let _vulkan = vulkan_gate::enter();
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
@@ -2215,6 +2328,7 @@ impl GpuKernel {
     /// order differs from fused (tiled lane reductions), so this path is
     /// deterministic within mode and bounded-drift against fused, not byte-equal.
     fn dispatch_ticks_parallel_tiled(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        let _vulkan = vulkan_gate::enter();
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
         let kernel_batches = brain_cycles / self.vision_stride;
         let remainder_cycles = brain_cycles % self.vision_stride;
@@ -2404,6 +2518,7 @@ impl GpuKernel {
     /// [`dispatch_ticks`](Self::dispatch_ticks): compute may advance any number
     /// of times between snapshot requests.
     pub fn request_state_snapshot(&mut self) -> bool {
+        let _vulkan = vulkan_gate::enter();
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
@@ -2474,6 +2589,7 @@ impl GpuKernel {
     /// [`cached_state`](Self::cached_state) (and
     /// [`cached_food_state`](Self::cached_food_state) when food exists).
     pub fn try_collect_state_snapshot(&mut self) -> bool {
+        let _vulkan = vulkan_gate::enter();
         // `device.poll(Poll)` services *all* device-wide map_async callbacks, so
         // there is nothing to do when both readback kinds are idle — skip the
         // poll entirely on those iterations. Observationally identical.
@@ -2511,6 +2627,7 @@ impl GpuKernel {
 
     /// Blocking readback of full agent physics state.
     pub fn read_full_state_blocking(&mut self) -> &[f32] {
+        let _vulkan = vulkan_gate::enter();
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2566,6 +2683,7 @@ impl GpuKernel {
 
     /// Write full brain state for one agent (blocking GPU upload).
     pub fn write_agent_state(&self, index: u32, state: &AgentBrainState) {
+        let _vulkan = vulkan_gate::enter();
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
@@ -2590,6 +2708,7 @@ impl GpuKernel {
     /// (DECISION_MOTOR offset). All values are clamped to [-1.0, 1.0] as the
     /// kernel does. Used in tests to inject specific motor commands.
     pub fn write_motor_decision(&self, index: u32, forward: f32, turn: f32, strafe: f32) {
+        let _vulkan = vulkan_gate::enter();
         let i = index as usize;
         let decision_base = i * DECISION_STRIDE;
         let motor_base = decision_base + DECISION_MOTOR;
@@ -2622,6 +2741,7 @@ impl GpuKernel {
     /// (see `buffers.rs`) — so a single `write_buffer` covers them; the
     /// `debug_assert_eq!`s pin the contiguity.
     pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
+        let _vulkan = vulkan_gate::enter();
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
@@ -2684,6 +2804,7 @@ impl GpuKernel {
     /// where `offset` is a physics slot constant like `P_ENERGY`, `P_PREV_ENERGY`, etc.
     /// (not a byte offset — this method handles the conversion).
     pub fn write_agent_physics_fields(&self, index: u32, fields: &[(usize, f32)]) {
+        let _vulkan = vulkan_gate::enter();
         let i = index as usize;
         for &(slot_offset, value) in fields {
             let byte_offset = ((i * PHYS_STRIDE + slot_offset) * 4) as u64;
@@ -2698,6 +2819,7 @@ impl GpuKernel {
     /// Non-blocking: kick off async readback of one agent's brain state.
     /// Results are collected via `try_collect_agent_state`.
     pub fn request_agent_state(&mut self, index: u32) -> bool {
+        let _vulkan = vulkan_gate::enter();
         if index >= self.agent_count {
             log::warn!(
                 "[GPU] request_agent_state: index {index} out of bounds (agent_count={})",
@@ -2772,6 +2894,7 @@ impl GpuKernel {
     /// `Some(None)` if a map_async error occurred (readback abandoned),
     /// or `None` if still in flight or nothing was requested.
     pub fn try_collect_agent_state(&mut self) -> Option<Option<AgentBrainState>> {
+        let _vulkan = vulkan_gate::enter();
         let readback = self.agent_state_staging.as_ref()?;
         self.device.poll(wgpu::Maintain::Poll);
 
@@ -2822,6 +2945,7 @@ impl GpuKernel {
     where
         F: Fn(usize) -> AgentBrainState,
     {
+        let _vulkan = vulkan_gate::enter();
         debug_assert_eq!(
             count, self.agent_count as usize,
             "batch_write_agent_states: count ({}) != agent_count ({})",
@@ -2868,6 +2992,7 @@ impl GpuKernel {
     /// Non-blocking version of `reset_agents`. Returns false if async staging
     /// buffers are still in flight (caller should retry next frame).
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
+        let _vulkan = vulkan_gate::enter();
         // Check if any staging buffer is still in flight.
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
@@ -2915,6 +3040,7 @@ impl GpuKernel {
 
     /// Helper: blocking read of a buffer range into a pre-sized Vec<f32>.
     fn read_buffer_range(&self, buffer: &wgpu::Buffer, offset: u64, size: u64, out: &mut Vec<f32>) {
+        let _vulkan = vulkan_gate::enter();
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_read_staging"),
             size,
@@ -3056,6 +3182,7 @@ impl GpuKernel {
     /// Unmap all pre-allocated telemetry staging buffers.
     /// Only unmaps when a telemetry readback was pending.
     fn unmap_telemetry_staging(&self) {
+        let _vulkan = vulkan_gate::enter();
         if self.pending_telemetry.is_some() {
             self.telemetry_staging.sensory.unmap();
             self.telemetry_staging.decision.unmap();
@@ -3070,6 +3197,7 @@ impl GpuKernel {
     /// is already pending, this is a no-op. If a different agent is requested,
     /// the old pending readback is cleared first.
     pub fn request_agent_telemetry(&mut self, index: u32) {
+        let _vulkan = vulkan_gate::enter();
         // Gate: skip if a readback for the same agent is already in flight.
         if let Some(pending) = &self.pending_telemetry {
             if pending.agent_index == index {
@@ -3161,6 +3289,7 @@ impl GpuKernel {
     /// If any map_async callback reported an error, clears the pending state
     /// so the next frame can retry.
     pub fn try_collect_telemetry(&mut self) -> Option<(u32, AgentTelemetry)> {
+        let _vulkan = vulkan_gate::enter();
         // Same union gate as `try_collect_state_snapshot`: the poll services the
         // whole device, so skip it when nothing is in flight.
         if !(self.has_staging_in_flight() || self.has_pending_telemetry()) {
@@ -3284,6 +3413,7 @@ impl GpuKernel {
     /// Test-only: dispatch the feature-to-scratch phase once (one workgroup/agent)
     /// and submit. Used to validate brain_scratch wiring before ParallelTiled lands.
     pub fn dispatch_feature_phase_for_test(&mut self) {
+        let _vulkan = vulkan_gate::enter();
         let n = self.agent_count;
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let bg = &self.bind_groups[self.active_config_index];
@@ -3297,6 +3427,7 @@ impl GpuKernel {
 
     /// Test-only: blocking readback of the brain_scratch buffer (all agents).
     pub fn read_brain_scratch_blocking(&mut self) -> Vec<f32> {
+        let _vulkan = vulkan_gate::enter();
         let n = self.agent_count as usize;
         let buf_size = (n * self.layout.brain_scratch_stride * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3320,6 +3451,12 @@ impl GpuKernel {
         drop(data);
         staging.unmap();
         result
+    }
+}
+
+impl Drop for GpuKernel {
+    fn drop(&mut self) {
+        vulkan_gate::stash_for_struct_drop();
     }
 }
 

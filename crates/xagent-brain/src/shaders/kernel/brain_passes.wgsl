@@ -1048,6 +1048,14 @@ fn coop_recall_topk(agent_id: u32, tid: u32 /* SUBGROUP_TOPK_PARAMS */) {
 // rest (incl. novelty, TD credit, motor): thread 0
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn homeo_prediction_was_made(stored: f32) -> bool {
+    // Predictions written by this pass are clamped into ±MAX_HOMEOSTATIC_DELTA.
+    // HOMEO_PREDICTION_ABSENT and any other out-of-range value means no
+    // prediction has been made this episode (birth or death). NaN fails the
+    // comparison and is treated as absent.
+    return abs(stored) <= MAX_HOMEOSTATIC_DELTA;
+}
+
 fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let pattern_base = agent_id * PATTERN_STRIDE;
@@ -1213,26 +1221,33 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 -MAX_HOMEOSTATIC_DELTA,
                 MAX_HOMEOSTATIC_DELTA,
             );
-            // Train: previous tick's prediction vs this tick's actual gradient
+            // Train only when the stored value is a prediction this head produced.
+            // After death the slot holds HOMEO_PREDICTION_ABSENT. Treating that
+            // as zero would apply SGD to the surviving forward-model features
+            // against the respawn spike, and would blend a fake zero into TD.
             let prev_pred = brain_state[brain_base + O_PREV_HOMEO_PREDICTION];
-            let actual = s_homeo[6u];  // raw_gradient from coop_habituate_homeo
-            let pred_error = clamp(
-                prev_pred - actual,
-                -MAX_HOMEOSTATIC_DELTA,
-                MAX_HOMEOSTATIC_DELTA,
-            );
-            let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
-            brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] = clamp(
-                brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] - pred_lr * pred_error,
-                -MAX_HOMEOSTATIC_DELTA,
-                MAX_HOMEOSTATIC_DELTA,
-            );
-            // Store current prediction for next tick's training
+            if (homeo_prediction_was_made(prev_pred)) {
+                let actual = s_homeo[6u]; // raw_gradient from coop_habituate_homeo
+                let pred_error = clamp(
+                    prev_pred - actual,
+                    -MAX_HOMEOSTATIC_DELTA,
+                    MAX_HOMEOSTATIC_DELTA,
+                );
+                let pred_lr = bc_f32(CFG_HOMEO_PREDICTOR_LEARNING_RATE);
+                brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] = clamp(
+                    brain_state[brain_base + O_HOMEO_PREDICTOR_BIAS] - pred_lr * pred_error,
+                    -MAX_HOMEOSTATIC_DELTA,
+                    MAX_HOMEOSTATIC_DELTA,
+                );
+                s_pred_td[S_HOMEO_PRED_ERROR] = pred_error;
+                // Previous tick's prediction: TD reward blend and telemetry.
+                s_homeo[7u] = prev_pred;
+            } else {
+                s_pred_td[S_HOMEO_PRED_ERROR] = 0.0;
+                s_homeo[7u] = 0.0;
+            }
+            // Store this tick's clamped prediction for the next tick's training.
             brain_state[brain_base + O_PREV_HOMEO_PREDICTION] = predicted_gradient;
-            // Publish pred_error for the weight-update threads
-            s_pred_td[S_HOMEO_PRED_ERROR] = pred_error;
-            // Carry previous tick's predicted gradient to TD reward blend and late telemetry
-            s_homeo[7u] = prev_pred;
         } else {
             s_pred_td[S_HOMEO_PRED_ERROR] = 0.0;
             s_homeo[7u] = 0.0;

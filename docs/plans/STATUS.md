@@ -4,7 +4,7 @@ Roll-up board for `docs/plans/` — **one row per plan, no per-task detail**. Ta
 
 **It is only useful if it is accurate.** Update the relevant row in the *same change* that moves a plan, and keep it in sync with that plan's `STATUS.md` (see [README → STATUS.md](README.md#statusmd)).
 
-_Last updated: 2026-06-27, against `develop`._
+_Last updated: 2026-09-24, against `develop`._
 
 | Plan | Title | Status | Tasks | Outcome | Detail |
 |---|---|---|---|---|---|

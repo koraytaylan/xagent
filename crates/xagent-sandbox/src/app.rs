@@ -73,6 +73,8 @@ pub(crate) struct PendingGeneration {
     pub(crate) result: AdvanceResult,
     /// Identifies the matching `RequestAgentState` / `AgentState` pair.
     pub(crate) champion_request_id: u64,
+    /// The accepted node whose champion brain the pending request captures.
+    pub(crate) champion_node_id: i64,
 }
 
 pub(crate) struct App {
@@ -164,13 +166,13 @@ pub(crate) struct App {
     pub(crate) pending_generation: Option<PendingGeneration>,
     /// Monotonic id source pairing `RequestAgentState` with its `AgentState`.
     pub(crate) champion_request_counter: u64,
-
-    // Simulation worker — owns the GPU kernel and all simulation-cadence state.
     /// Epoch of the population the main thread currently accepts snapshots
     /// for. Advanced when a generation boundary continues to a new population
     /// and handed to the worker with the reset, so snapshots of the evaluated
     /// generation are never applied to the next one.
     pub(crate) generation_epoch: u64,
+
+    // Simulation worker — owns the GPU kernel and all simulation-cadence state.
     // `None` until evolution starts; recreated on Start/Resume, dropped on Reset.
     pub(crate) sim_runtime: Option<crate::sim_runtime::SimRuntime>,
     /// Latest food state published by the worker, authoritative for the food
@@ -305,9 +307,9 @@ impl App {
             governor_config,
             pending_generation: None,
             champion_request_counter: 0,
+            generation_epoch: 0,
             sim_runtime: None,
             cached_food_state: None,
-            generation_epoch: 0,
             sent_speed: None,
             sent_paused: None,
             sent_selected_agent: None,

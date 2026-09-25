@@ -23,7 +23,7 @@ use crate::agent::{
 };
 use crate::governor::{
     compute_approach_intent_fraction, compute_avoidance_intent_fraction,
-    compute_danger_dwell_fraction, AdvanceResult, Governor,
+    compute_danger_dwell_fraction, AdvanceResult, ChampionCapture, Governor,
 };
 use crate::world::WorldState;
 
@@ -81,7 +81,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         configs
     };
 
-    // Brain state inherited from the previous generation's best performer.
+    // Brain state inherited from the stored champion of the node the current
+    // generation was bred from.
     let mut inherited_state: Option<AgentBrainState> = None;
     let mut inherited_mutation_strength: f32 = 0.0;
     let repeats = governor.config.eval_repeats.max(1);
@@ -259,18 +260,18 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         let fitness = governor.evaluate(&agents);
 
-        // Capture best agent's brain state for inheritance
+        // Learning metrics describe the top-ranked agent's brain.
         let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-        inherited_state = agents
+        let best_state = agents
             .get(best_idx)
             .map(|a| kernel.read_agent_state(a.brain_idx));
-        // The weight-norm layout must come from the champion's own config —
+        // The weight-norm layout must come from the top agent's own config —
         // configs are per-agent, and a mismatched layout would misplace the
-        // tail offsets into the champion's brain_state.
+        // tail offsets into its brain_state.
         let best_config = current_configs.get(best_idx).unwrap_or(&current_configs[0]);
         log_learning_metrics(
             &agents,
-            inherited_state.as_ref(),
+            best_state.as_ref(),
             best_config,
             first_quarter_rate,
             last_quarter_rate,
@@ -289,10 +290,19 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 configs,
                 messages,
                 mutation_strength,
+                champion_capture,
+                inherit_from_node,
             } => {
                 for msg in &messages {
                     println!("{}", msg);
                 }
+                inherited_state = resolve_inherited_brain(
+                    &governor,
+                    &kernel,
+                    &agents,
+                    champion_capture,
+                    inherit_from_node,
+                );
                 current_configs = configs;
                 inherited_mutation_strength = mutation_strength;
             }
@@ -311,6 +321,30 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         total_time.as_secs_f64(),
         governor.generation,
     );
+}
+
+/// Store the accepted node's champion brain (read synchronously from `kernel`)
+/// and return the brain the next generation inherits: the stored champion of
+/// the node its configs were bred from. Mirrors the live sandbox handoff, so a
+/// node is always evaluated with the brain lineage its config came from.
+fn resolve_inherited_brain(
+    governor: &Governor,
+    kernel: &GpuKernel,
+    agents: &[Agent],
+    champion_capture: Option<ChampionCapture>,
+    inherit_from_node: Option<i64>,
+) -> Option<AgentBrainState> {
+    let captured = champion_capture.and_then(|capture| {
+        let agent = agents.get(capture.agent_index)?;
+        let champion = kernel.read_agent_state(agent.brain_idx);
+        governor.store_champion_brain(capture.node_id, &champion);
+        Some((capture.node_id, champion))
+    });
+    let node_id = inherit_from_node?;
+    match captured {
+        Some((captured_node, champion)) if captured_node == node_id => Some(champion),
+        _ => governor.champion_brain(node_id),
+    }
 }
 
 /// Per-generation learning metrics: behavioral signal (food per 1k
@@ -879,6 +913,12 @@ pub struct ValidationStats {
 /// disproportionately more.
 const ON_SPEED_COST_EXPONENT: f32 = 2.0;
 
+/// Locomotor-drag exponent used in the baseline (legacy-regime) run: linear
+/// drag, a bit-exact no-op per the WGSL guard. Set explicitly because the
+/// constructed `BrainConfig` default is super-linear; leaving it would give
+/// the baseline arm the ON arm's drag.
+const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
+
 /// Guard value for the food-per-death denominator.
 /// Treats mean_death_count values below this threshold as effectively zero, returning
 /// f32::INFINITY instead of dividing. Chosen at 1e-4 to absorb floating-point imprecision
@@ -913,12 +953,6 @@ fn run_headless_with_flags(
     innate_instincts_enabled: bool,
 ) -> ValidationStats {
     // Set the validation flags.
-/// Locomotor-drag exponent used in the baseline (legacy-regime) run: linear
-/// drag, a bit-exact no-op per the WGSL guard. Set explicitly because the
-/// constructed `BrainConfig` default is super-linear; leaving it would give
-/// the baseline arm the ON arm's drag.
-const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
-
     // When enabling effort-rebased fitness, also engage the super-linear drag at k=2.0 — the
     // keystone mechanism that makes the energy-drain axis speed-dependent.
     // Sharing one exponent across the ON and baseline runs would make them
@@ -1140,11 +1174,6 @@ const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
         // Record for aggregate analysis
         all_fitness.push(fitness.clone());
 
-        let best_idx = fitness.first().map(|f| f.agent_index).unwrap_or(0);
-        inherited_state = agents
-            .get(best_idx)
-            .map(|a| kernel.read_agent_state(a.brain_idx));
-
         governor.log_generation(&fitness);
 
         match governor.advance(&fitness) {
@@ -1152,7 +1181,16 @@ const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
                 configs,
                 messages: _,
                 mutation_strength,
+                champion_capture,
+                inherit_from_node,
             } => {
+                inherited_state = resolve_inherited_brain(
+                    &governor,
+                    &kernel,
+                    &agents,
+                    champion_capture,
+                    inherit_from_node,
+                );
                 current_configs = configs;
                 inherited_mutation_strength = mutation_strength;
             }

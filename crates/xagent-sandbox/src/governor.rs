@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use rand::Rng;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
+use xagent_brain::buffers::AgentBrainState;
 use xagent_shared::{BrainConfig, GovernorConfig};
 
 use crate::momentum::MutationMomentum;
@@ -98,6 +99,78 @@ const K_SIGNIF: f32 = 1.0;
 /// Epsilon guard against division-by-zero in metrics that aggregate distance
 /// or energy telemetry.
 const EPSILON: f32 = 1e-6;
+
+/// Bytes per little-endian word (`u32` header field or `f32` value) in a
+/// stored champion-brain blob.
+const BRAIN_BLOB_WORD_BYTES: usize = 4;
+/// Header words in a stored champion-brain blob: the `brain_state` length and
+/// the `patterns` length, each a little-endian `u32`.
+const BRAIN_BLOB_HEADER_WORDS: usize = 2;
+
+/// Champion brain per accepted node (encoding: [`encode_brain_state`]). Only
+/// nodes that can still become spawn parents keep a row. Idempotent, so both a
+/// fresh schema and a resumed older database run it.
+const NODE_BRAIN_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS node_brain (
+    node_id INTEGER PRIMARY KEY REFERENCES node(id),
+    data    BLOB NOT NULL
+);";
+
+/// Serialize a champion brain to the `node_brain` blob format.
+///
+/// Layout (all little-endian): `u32 brain_state_len`, `u32 patterns_len`, then
+/// `brain_state_len` `f32`s followed by `patterns_len` `f32`s. Returns `None`
+/// if a length does not fit a `u32` or the byte size overflows.
+fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
+    let brain_len = u32::try_from(state.brain_state.len()).ok()?;
+    let pattern_len = u32::try_from(state.patterns.len()).ok()?;
+    let word_count = state
+        .brain_state
+        .len()
+        .checked_add(state.patterns.len())?
+        .checked_add(BRAIN_BLOB_HEADER_WORDS)?;
+    let mut bytes = Vec::with_capacity(word_count.checked_mul(BRAIN_BLOB_WORD_BYTES)?);
+    bytes.extend_from_slice(&brain_len.to_le_bytes());
+    bytes.extend_from_slice(&pattern_len.to_le_bytes());
+    for value in state.brain_state.iter().chain(&state.patterns) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(bytes)
+}
+
+/// Decode a `node_brain` blob written by [`encode_brain_state`]. Returns `None`
+/// when the header is missing or the payload size disagrees with the lengths
+/// the header declares.
+fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
+    let header_bytes = BRAIN_BLOB_HEADER_WORDS * BRAIN_BLOB_WORD_BYTES;
+    if bytes.len() < header_bytes || bytes.len() % BRAIN_BLOB_WORD_BYTES != 0 {
+        return None;
+    }
+    let read_word = |index: usize| -> [u8; BRAIN_BLOB_WORD_BYTES] {
+        let start = index * BRAIN_BLOB_WORD_BYTES;
+        [
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]
+    };
+    let brain_len = usize::try_from(u32::from_le_bytes(read_word(0))).ok()?;
+    let pattern_len = usize::try_from(u32::from_le_bytes(read_word(1))).ok()?;
+    let expected_words = brain_len
+        .checked_add(pattern_len)?
+        .checked_add(BRAIN_BLOB_HEADER_WORDS)?;
+    if bytes.len() / BRAIN_BLOB_WORD_BYTES != expected_words {
+        return None;
+    }
+    let values: Vec<f32> = (BRAIN_BLOB_HEADER_WORDS..expected_words)
+        .map(|index| f32::from_le_bytes(read_word(index)))
+        .collect();
+    let (brain_state, patterns) = values.split_at(brain_len);
+    Some(AgentBrainState {
+        brain_state: brain_state.to_vec(),
+        patterns: patterns.to_vec(),
+    })
+}
 
 /// Composite fitness: foraging-primary with a bounded survival multiplier.
 ///
@@ -245,6 +318,17 @@ impl WithinLifeTracker {
     }
 }
 
+/// The agent whose learned brain must be captured and stored as the champion
+/// brain of an accepted node (see [`Governor::store_champion_brain`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChampionCapture {
+    /// The accepted node the brain belongs to.
+    pub node_id: i64,
+    /// Index into the evaluated agent slice of the best agent in the best
+    /// config group — the group whose config became the node's config.
+    pub agent_index: usize,
+}
+
 /// Result of `Governor::advance()` — tells the caller what to do next.
 pub enum AdvanceResult {
     /// Simulation continues — spawn the given configs for the next generation.
@@ -254,6 +338,15 @@ pub enum AdvanceResult {
         /// Effective mutation strength for this generation (used to perturb
         /// inherited weights in neuroevolution).
         mutation_strength: f32,
+        /// Set when this generation was accepted: the caller must read this
+        /// agent's brain and store it with [`Governor::store_champion_brain`]
+        /// before resolving `inherit_from_node`.
+        champion_capture: Option<ChampionCapture>,
+        /// The node the next generation's configs were bred from. Its stored
+        /// champion brain ([`Governor::champion_brain`]) is the one the next
+        /// generation inherits, so a node is always evaluated with the brain
+        /// lineage its config came from — also after a rejection or backtrack.
+        inherit_from_node: Option<i64>,
     },
     /// Max generations reached — stop the simulation.
     Finished { messages: Vec<String> },
@@ -540,6 +633,7 @@ impl Governor {
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q1_food_rate REAL;");
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q4_food_rate REAL;");
+        db.execute_batch(NODE_BRAIN_SCHEMA)?;
 
         let (run_id, governor_json, spawn_parent_id, momentum_json): (
             i64,
@@ -942,6 +1036,7 @@ impl Governor {
         };
 
         let island = &mut self.islands[self.active_island];
+        let mut champion_capture = None;
 
         if accepted {
             // ★ Success — this generation's average meets or exceeds its parent's
@@ -957,6 +1052,12 @@ impl Governor {
                     "UPDATE node SET config_json = ?1 WHERE id = ?2",
                     params![best_json, self.current_node_id],
                 );
+                // `reduce_fitness` carries the best agent of the best group, so
+                // the captured brain was learned under exactly this config.
+                champion_capture = self.current_node_id.map(|node_id| ChampionCapture {
+                    node_id,
+                    agent_index: best.agent_index,
+                });
             }
             island.spawn_parent_id = self.current_node_id;
             // Store elite configs from this successful generation
@@ -1077,6 +1178,7 @@ impl Governor {
         };
 
         // Breed the next generation from the (now-rotated) island's spawn parent
+        let inherit_from_node = self.islands[self.active_island].spawn_parent_id;
         let configs = self.breed_next_generation(fitness);
 
         // Migration: every migration_interval generations, spread best config
@@ -1133,7 +1235,47 @@ impl Governor {
             configs,
             messages,
             mutation_strength: effective_strength,
+            champion_capture,
+            inherit_from_node,
         }
+    }
+
+    /// Store `state` as the champion brain of `node_id`, replacing any earlier
+    /// one. Returns `false` (and logs) when the brain cannot be encoded or
+    /// written, in which case the node's lineage restarts from a fresh brain.
+    pub fn store_champion_brain(&self, node_id: i64, state: &AgentBrainState) -> bool {
+        let Some(bytes) = encode_brain_state(state) else {
+            log::warn!("[governor] champion brain for node {node_id} is too large to store");
+            return false;
+        };
+        match self.db.execute(
+            "INSERT OR REPLACE INTO node_brain (node_id, data) VALUES (?1, ?2)",
+            params![node_id, bytes],
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                log::warn!("[governor] failed to store champion brain for node {node_id}: {err}");
+                false
+            }
+        }
+    }
+
+    /// The champion brain stored for `node_id`, or `None` if none was stored
+    /// (e.g. the capture readback failed) or the blob is malformed.
+    pub fn champion_brain(&self, node_id: i64) -> Option<AgentBrainState> {
+        let bytes: Vec<u8> = self
+            .db
+            .query_row(
+                "SELECT data FROM node_brain WHERE node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let decoded = decode_brain_state(&bytes);
+        if decoded.is_none() {
+            log::warn!("[governor] champion brain blob for node {node_id} is malformed");
+        }
+        decoded
     }
 
     /// Backtrack one level when the island exhausts patience at its current
@@ -1168,7 +1310,13 @@ impl Governor {
         match parent_id {
             Some(pid) => {
                 // Non-root: move up one level, fresh patience budget.
-                // The bar automatically lowers to pid's fitness.
+                // The bar automatically lowers to pid's fitness. The exhausted
+                // node can never be a spawn parent again (spawn parents only
+                // move to a new child or up the tree), so its brain is dropped.
+                let _ = self.db.execute(
+                    "DELETE FROM node_brain WHERE node_id = ?1",
+                    params![spawn_id],
+                );
                 island.spawn_parent_id = Some(pid);
                 island.attempts = 0;
                 messages.push(format!(
@@ -1890,6 +2038,8 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add approach_intent_fraction to behavior_metric
     let _ =
         db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN approach_intent_fraction REAL;");
+
+    db.execute_batch(NODE_BRAIN_SCHEMA)?;
 
     Ok(())
 }
@@ -5179,5 +5329,157 @@ mod tests {
             "Composite fitness must be finite and positive, got {:.4}",
             fitness_effort
         );
+    }
+
+    // ─── champion brain inheritance ─────────────────────────────────
+
+    /// A small brain whose every value identifies `tag`, so a test can tell
+    /// which node's champion came back.
+    fn tagged_brain(tag: f32) -> AgentBrainState {
+        AgentBrainState {
+            brain_state: vec![tag, tag + 0.5, -tag],
+            patterns: vec![tag * 2.0],
+        }
+    }
+
+    /// Unpack the inheritance fields of a `Continue` result.
+    fn inheritance_of(result: &AdvanceResult) -> (Option<ChampionCapture>, Option<i64>) {
+        match result {
+            AdvanceResult::Continue {
+                champion_capture,
+                inherit_from_node,
+                ..
+            } => (*champion_capture, *inherit_from_node),
+            AdvanceResult::Finished { .. } => panic!("evolution must continue"),
+        }
+    }
+
+    #[test]
+    fn brain_blob_round_trips_and_rejects_malformed_payloads() {
+        let brain = tagged_brain(1.25);
+        let bytes = encode_brain_state(&brain).expect("small brain encodes");
+        let decoded = decode_brain_state(&bytes).expect("round trip decodes");
+        assert_eq!(decoded.brain_state, brain.brain_state);
+        assert_eq!(decoded.patterns, brain.patterns);
+
+        assert!(decode_brain_state(&[]).is_none(), "empty blob");
+        assert!(
+            decode_brain_state(&bytes[..bytes.len() - BRAIN_BLOB_WORD_BYTES]).is_none(),
+            "payload shorter than the header declares"
+        );
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&0.0_f32.to_le_bytes());
+        assert!(
+            decode_brain_state(&padded).is_none(),
+            "payload longer than the header declares"
+        );
+    }
+
+    #[test]
+    fn accepted_generation_captures_best_agent_of_best_group() {
+        let mut gov = test_governor_repeats(2);
+        let root_id = gov.current_node_id.unwrap();
+        // Group 0 (agents 0,1) holds the single best individual (0.9) but the
+        // lower mean (0.5); group 1 (agents 2,3) has the best mean (0.65),
+        // so its config becomes the node config and its best agent (3) is the
+        // champion whose brain was learned under that config.
+        let fitness = mock_multi_fitness(&[(0, 0.9), (1, 0.1), (2, 0.6), (3, 0.7)]);
+
+        let result = gov.advance(&fitness);
+
+        let (capture, inherit_from) = inheritance_of(&result);
+        assert_eq!(
+            capture,
+            Some(ChampionCapture {
+                node_id: root_id,
+                agent_index: 3,
+            })
+        );
+        assert_eq!(inherit_from, Some(root_id));
+    }
+
+    #[test]
+    fn rejected_generation_inherits_spawn_parent_brain() {
+        let mut gov = test_governor(5);
+        let root_id = gov.current_node_id.unwrap();
+        let result = gov.advance(&mock_fitness(0.5));
+        let (capture, _) = inheritance_of(&result);
+        let capture = capture.expect("root generation is accepted");
+        assert!(gov.store_champion_brain(capture.node_id, &tagged_brain(7.0)));
+
+        // A worse generation is rejected: nothing to capture, and the next
+        // generation inherits the spawn parent's stored champion — not the
+        // rejected generation's top agent.
+        let result = gov.advance(&mock_fitness(0.1));
+
+        let (capture, inherit_from) = inheritance_of(&result);
+        assert_eq!(capture, None);
+        assert_eq!(inherit_from, Some(root_id));
+        let inherited = gov
+            .champion_brain(root_id)
+            .expect("root champion is stored");
+        assert_eq!(inherited.brain_state, tagged_brain(7.0).brain_state);
+    }
+
+    #[test]
+    fn resume_of_database_without_node_brain_table_can_store_brains() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let db_path_buf = temp_dir.path().join("resume_without_node_brain.db");
+        let db_path = db_path_buf
+            .to_str()
+            .expect("temp DB path must be valid UTF-8");
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let root_id = {
+            let mut gov = Governor::new(db_path, config, &BrainConfig::default(), "{}").unwrap();
+            let root_id = gov.current_node_id.unwrap();
+            gov.advance(&mock_fitness(0.2));
+            // Simulate a database written before champion brains were stored.
+            gov.db.execute_batch("DROP TABLE node_brain;").unwrap();
+            root_id
+        };
+
+        let gov = Governor::resume(db_path).unwrap();
+
+        assert!(gov.store_champion_brain(root_id, &tagged_brain(3.0)));
+        assert!(gov.champion_brain(root_id).is_some());
+    }
+
+    #[test]
+    fn backtrack_inherits_ancestor_brain_and_prunes_exhausted_node() {
+        let mut gov = test_governor(1);
+        let root_id = gov.current_node_id.unwrap();
+        let (root_capture, _) = inheritance_of(&gov.advance(&mock_fitness(0.1)));
+        gov.store_champion_brain(root_capture.unwrap().node_id, &tagged_brain(1.0));
+
+        let child_id = gov.current_node_id.unwrap();
+        let result = gov.advance(&mock_fitness(0.2));
+        let (child_capture, inherit_from) = inheritance_of(&result);
+        assert_eq!(child_capture.map(|c| c.node_id), Some(child_id));
+        assert_eq!(inherit_from, Some(child_id));
+        gov.store_champion_brain(child_id, &tagged_brain(2.0));
+
+        // Fail at the child (patience 1) → the child is exhausted and the
+        // island backtracks to root: the next generation must inherit root's
+        // champion, and the exhausted child's brain is dropped.
+        let result = gov.advance(&mock_fitness(0.15));
+
+        let (capture, inherit_from) = inheritance_of(&result);
+        assert_eq!(capture, None);
+        assert_eq!(inherit_from, Some(root_id));
+        assert_eq!(node_status(&gov, child_id), "exhausted");
+        assert!(gov.champion_brain(child_id).is_none());
+        let inherited = gov.champion_brain(root_id).expect("root champion kept");
+        assert_eq!(inherited.brain_state, tagged_brain(1.0).brain_state);
     }
 }

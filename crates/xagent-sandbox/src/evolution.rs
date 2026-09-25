@@ -229,9 +229,12 @@ impl App {
     ///
     /// The end-of-generation snapshot has already been applied to the CPU
     /// agents by the event drain. Persist the recording, evaluate fitness, and
-    /// — when evolution continues — request the champion's brain state from the
-    /// worker so the next generation can inherit it. `Finished` results pause
-    /// the run (the worker has already paused itself at the budget).
+    /// — when evolution continues — resolve the brain the next generation
+    /// inherits. An accepted generation first reads its champion's brain back
+    /// from the worker and stores it for the node; the next generation then
+    /// inherits the stored champion of the node its configs were bred from.
+    /// `Finished` results pause the run (the worker has already paused itself
+    /// at the budget).
     pub(crate) fn on_generation_budget_reached(&mut self) {
         // Persist the recording to SQLite before moving to the next generation.
         if let (Some(ref recording), Some(ref mut gov)) = (&self.recording, &mut self.governor) {
@@ -256,23 +259,20 @@ impl App {
 
             let result = gov.advance(&fitness);
 
-            // The champion is the top-ranked agent; map its array index to its
-            // kernel brain index for the readback request.
-            let champion_brain_idx = if matches!(result, AdvanceResult::Continue { .. }) {
-                fitness
-                    .first()
-                    .map(|f| f.agent_index)
-                    .and_then(|idx| self.agents.get(idx))
-                    .map(|a| a.brain_idx)
-            } else {
-                None
+            // An accepted generation names the agent whose brain becomes the
+            // node's champion; map its array index to its kernel brain index
+            // for the readback request.
+            let champion_brain_idx = match &result {
+                AdvanceResult::Continue {
+                    champion_capture: Some(capture),
+                    ..
+                } => self.agents.get(capture.agent_index).map(|a| a.brain_idx),
+                _ => None,
             };
 
             (result, champion_brain_idx)
         };
 
-        match result {
-            AdvanceResult::Continue { .. } => {
         if matches!(result, AdvanceResult::Continue { .. }) {
             // The evaluated population is final: from here on, snapshots the
             // paused worker keeps publishing for it are stale. The next
@@ -280,7 +280,11 @@ impl App {
             self.generation_epoch = self.generation_epoch.wrapping_add(1);
         }
 
-                if let Some(brain_idx) = champion_brain_idx {
+        match result {
+            AdvanceResult::Continue {
+                champion_capture, ..
+            } => match (champion_capture, champion_brain_idx) {
+                (Some(capture), Some(brain_idx)) => {
                     let request_id = self.champion_request_counter;
                     self.champion_request_counter += 1;
                     if let Some(runtime) = &self.sim_runtime {
@@ -292,12 +296,16 @@ impl App {
                     self.pending_generation = Some(PendingGeneration {
                         result,
                         champion_request_id: request_id,
+                        champion_node_id: capture.node_id,
                     });
-                } else {
-                    // No champion to inherit (no agents) — reset straight away.
-                    self.finish_generation_continue(result, None);
                 }
-            }
+                _ => {
+                    // Nothing to capture (rejected generation, or no agents):
+                    // inherit the spawn parent's stored champion right away.
+                    let inherited = self.inherited_brain(&result, None);
+                    self.finish_generation_continue(result, inherited);
+                }
+            },
             AdvanceResult::Finished { messages } => {
                 for msg in &messages {
                     self.log_msg(msg.clone());
@@ -308,8 +316,10 @@ impl App {
         }
     }
 
-    /// Apply the worker's champion brain-state reply and start the next
-    /// generation, ignoring a reply whose id does not match the pending request.
+    /// Store the worker's champion brain-state reply for the accepted node and
+    /// start the next generation, ignoring a reply whose id does not match the
+    /// pending request. A failed readback (`None`) stores nothing; the next
+    /// generation then inherits whatever the breeding node has stored.
     pub(crate) fn on_champion_state(&mut self, request_id: u64, state: Option<AgentBrainState>) {
         let Some(pending) = self.pending_generation.take() else {
             return;
@@ -319,7 +329,36 @@ impl App {
             self.pending_generation = Some(pending);
             return;
         }
-        self.finish_generation_continue(pending.result, state);
+        if let (Some(governor), Some(champion)) = (self.governor.as_ref(), state.as_ref()) {
+            governor.store_champion_brain(pending.champion_node_id, champion);
+        }
+        let captured = state.map(|champion| (pending.champion_node_id, champion));
+        let inherited = self.inherited_brain(&pending.result, captured);
+        self.finish_generation_continue(pending.result, inherited);
+    }
+
+    /// The brain the next generation inherits: the stored champion of the node
+    /// its configs were bred from (`inherit_from_node`). `captured` is the
+    /// champion just read back for an accepted node; it is returned directly
+    /// when that node is the breeding node, skipping the database round trip.
+    fn inherited_brain(
+        &self,
+        result: &AdvanceResult,
+        captured: Option<(i64, AgentBrainState)>,
+    ) -> Option<AgentBrainState> {
+        let AdvanceResult::Continue {
+            inherit_from_node: Some(node_id),
+            ..
+        } = result
+        else {
+            return None;
+        };
+        if let Some((captured_node, champion)) = captured {
+            if captured_node == *node_id {
+                return Some(champion);
+            }
+        }
+        self.governor.as_ref()?.champion_brain(*node_id)
     }
 
     /// Spawn the next generation and command the worker to reset to it.
@@ -336,6 +375,7 @@ impl App {
             configs,
             messages,
             mutation_strength,
+            ..
         } = result
         else {
             self.pending_generation = None;
@@ -363,6 +403,7 @@ impl App {
             tick_budget: self.governor_config.tick_budget,
             inherited,
             resume,
+            generation_epoch: self.generation_epoch,
         };
         if let Some(runtime) = &self.sim_runtime {
             runtime.send(SimCommand::ResetPopulation(Box::new(request)));
@@ -403,7 +444,6 @@ impl App {
         let brain_idx = self.agents.len() as u32;
         let mut child = Agent::new(
             id,
-            generation_epoch: self.generation_epoch,
             Vec3::new(cx, cy, cz),
             brain_idx,
             child_config,

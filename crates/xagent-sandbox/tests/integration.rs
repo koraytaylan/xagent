@@ -3280,7 +3280,7 @@ fn learning_probe_steering_required_is_chance() {
     /// Minimum scored evaluation samples.
     const MIN_SCORED_SAMPLES: usize = 200;
     /// Upper bound on the late-training success rate for today's learner
-    /// (measured 2026-09-25 on Linux/RADV; see the pinned values below).
+    /// (measured 0.031 on 2026-09-25, Linux/RADV).
     const MAX_BASELINE_SUCCESS_RATE: f32 = 0.3;
 
     // Geometry precondition: walking straight must miss the food.
@@ -3357,8 +3357,9 @@ fn learning_probe_steering_required_is_chance() {
         scored >= MIN_SCORED_SAMPLES,
         "only {scored} scored samples — evaluation geometry broke"
     );
-    // Pinned baseline: see the values printed above for the run this band
-    // was taken from. Re-pin upward when directional steering emerges.
+    // Pinned baseline measured 2026-09-25 on Linux/RADV (AMD Raphael iGPU):
+    // alignment 454/892 = 0.509, late success rate 0.031. Re-pin upward when
+    // directional steering emerges.
     assert!(
         (0.38..=0.62).contains(&rate),
         "steering-required alignment {rate:.3} left the chance band [0.38, 0.62] — \

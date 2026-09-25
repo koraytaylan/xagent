@@ -104,3 +104,65 @@ These are listed by expected leverage. None are implemented.
 3. **Fix the fatigue feedback.** Compare displacement with the executed (post-fatigue) command, so fatigue detects obstruction only.
 4. **Let the eye see food at range.** An odd grid (17×13) puts a row on the horizon. It costs 4.3× the features (265 → 1130).
 5. **Replace or restructure the actor credit estimator.** Centering the actor features is necessary to stop common-mode drift but not sufficient. Candidates within the homeostatic-only contract, none tried yet: normalized advantages on the GPU, an action-conditioned forward model `(s, a) → s′` whose predicted homeostatic change credits the chosen turn, and n-step or episodic returns.
+
+## Outcome of implementing the recommendations
+
+Measured the same day on the same machine. Each option was implemented, A/B-tested against the unmodified learner, and kept only if it helped. Three kinds of measurement were used:
+
+- **Free runs:** 10 agents, 100 000 ticks, default world, seeds 5 and 6.
+- **Probes:** the steering-required and standard probes above.
+- **Headless evolution:** release builds, population 10, 2 evaluation repeats, 40 000 ticks per generation, 19–20 generations. For the signed fatigue arm, 14.
+
+Mean agent composite fitness and food per agent below are for the first and last five generations.
+
+| Option | What was built | Kept? |
+|---|---|---|
+| 1. Steering-required probe | `learning_probe_steering_required_is_chance`. Food 10 units away, 3.94 off-axis, 17×13 eye. Baseline alignment 454/892 = 0.509, late success 0.031. | **yes** |
+| 2. Remove the freeze incentive | Hazard dose floored at one default step per tick; also a 0.15-step floor variant | no, reverted |
+| 3. Fatigue feedback | Staleness measured against the executed command, as the absolute-value sum; also a signed-sum variant | no, reverted |
+| 4. See food at range | 17×13 eye (existing config) | no, default stays 8×6 |
+| 5. Actor credit estimator | Actor feature centering and GPU advantage normalization, as runtime switches (not committed) | no |
+
+### Evolution
+
+| Arm | Fitness, first → last | Food/agent | Deaths/agent |
+|---|---|---|---|
+| **original learner** | **0.0330 → 0.0352** | 9.0 → 10.4 | 6.0 → 7.6 |
+| floor 1.0 + abs fatigue | 0.0171 → 0.0176 | 6.4 → 6.4 | 11.3 → 10.1 |
+| floor 1.0 + abs fatigue + 17×13 | 0.0194 → 0.0208 | 7.8 → 8.8 | 14.8 → 14.8 |
+| floor 1.0 + abs fatigue + actor centering | 0.0208 → 0.0214 | 8.0 → 7.7 | 14.0 → 11.8 |
+| floor 0.15 + abs fatigue | 0.0283 → 0.0257 | 9.0 → 8.1 | 8.5 → 7.6 |
+| abs fatigue only | 0.0218 → 0.0232 | 6.1 → 6.2 | 6.5 → 5.8 |
+| signed fatigue only | 0.0292 → 0.0301 | 8.7 → 8.8 | 7.3 → 7.1 |
+
+No arm beat the original learner. Every arm stayed at chance approach intent (0.48–0.50).
+
+### Why the mechanism fixes did not become fitness
+
+**Hazard floor.** It did what it was meant to: in free runs the forward bias stopped collapsing within a life. But the learner cannot learn to avoid danger, so a lethal dwell dose mostly adds deaths: 2.2–2.7× in free runs, about 1.8× in evolution. With the full floor, agents also explored half as many cells (136 vs 263). A floor sized to exploration speed (0.15) kept food level but still raised deaths, and the survival multiplier turned that into lower fitness.
+
+**Fatigue.** The absolute-value accumulator counts forward/backward exploration jitter that cancels in real displacement. Fatigue then punished noise, and distance fell 27%. In free runs with the absolute-value accumulator, fatigue still sat at 0.47–0.50 (original 0.48–0.61), so in hilly terrain path curvature, not the feedback loop, sets most of it. The signed version, which avoids counting jitter, was evaluated only in evolution: food stayed level (8.7–8.8) while deaths rose (7.3 vs 6.0), so the extra movement mostly bought hazard exposure.
+
+**17×13 eye.** It saw food at range but nothing used it: approach intent stayed at chance. It cost 28–32% throughput, and fitness gains were within noise.
+
+**Actor centering and normalization.** In free runs with the dose floor and absolute-value fatigue fix in place:
+
+| Arm | Food/agent (seeds 5 / 6) | Deaths/agent | Forward bias |
+|---|---|---|---|
+| control | 17.0 / 23.5 | 38 / 48 | stable |
+| centered | 18.6 / 25.3 | 40 / 44 | stable |
+| normalized | 22.3 / 24.6 | 64 / 54 | oscillates −0.90 … +0.66 |
+| centered + normalized | 24.4 / 25.0 | 67 / 59 | oscillates |
+
+Approach intent stayed at 0.487–0.501 everywhere. Normalization makes the policy unstable and adds deaths; centering shows no steering and no significant food gain. Neither was committed.
+
+### Where this leaves the learner
+
+The tested levers are mechanical: movement costs, fatigue, eye range, and actor step statistics. None of them creates the missing capability, which is turning toward food that is seen. Fitness here rewards food per unit of energy and survival, so more movement without steering only buys energy cost and hazard exposure.
+
+The remaining candidates from finding F5 need a structurally different credit signal for the turn channel:
+
+- an action-conditioned forward model `(s, a) → s′` whose predicted homeostatic change credits the chosen turn;
+- n-step or episodic returns.
+
+The steering-required probe is now the instrument to judge them. The mirrored probe cannot see steering, so it can't.

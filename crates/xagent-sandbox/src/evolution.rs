@@ -273,6 +273,13 @@ impl App {
 
         match result {
             AdvanceResult::Continue { .. } => {
+        if matches!(result, AdvanceResult::Continue { .. }) {
+            // The evaluated population is final: from here on, snapshots the
+            // paused worker keeps publishing for it are stale. The next
+            // population's reset carries this epoch to the worker.
+            self.generation_epoch = self.generation_epoch.wrapping_add(1);
+        }
+
                 if let Some(brain_idx) = champion_brain_idx {
                     let request_id = self.champion_request_counter;
                     self.champion_request_counter += 1;
@@ -396,6 +403,7 @@ impl App {
         let brain_idx = self.agents.len() as u32;
         let mut child = Agent::new(
             id,
+            generation_epoch: self.generation_epoch,
             Vec3::new(cx, cy, cz),
             brain_idx,
             child_config,

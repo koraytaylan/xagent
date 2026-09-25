@@ -97,6 +97,7 @@ impl App {
             speed_multiplier: self.speed_multiplier,
             paused: self.paused,
             selected_agent,
+            generation_epoch: self.generation_epoch,
         };
 
         self.sim_runtime = Some(SimRuntime::start(init));
@@ -169,7 +170,7 @@ impl App {
         if events.is_empty() {
             return;
         }
-        let (latest_snapshot, control) = partition_events(events);
+        let (latest_snapshot, control) = partition_events(events, self.generation_epoch);
 
         // Latest-wins: apply only the newest plain snapshot.
         if let Some(snapshot) = latest_snapshot {

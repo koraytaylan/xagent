@@ -212,7 +212,8 @@ All alive agents render their movement history simultaneously as **linear ribbon
 - Up to 100 concurrent agents (raised from 20)
 - **Food respawn**: 10-second timer, relocates to a new random food-rich position — prevents camping, forces foraging
 - **Reproduction**: currently disabled to focus on individual learning rather than evolution
-- **Directed mutations**: Per-parameter momentum vectors (one per island) bias mutations toward directions that previously improved fitness. Momentum decays each generation (configurable via `momentum_decay`) so stale signals fade. This provides directional bias, emergent correlated mutations, and selective mutation focus — all without hardcoded parameter relationships.
+- **Directed mutations**: Per-parameter momentum vectors (one per island) bias mutations toward directions that previously improved fitness. Momentum tracks the *relative* change winners made (so parameters of any scale are comparable) and shifts the multiplicative mutation factor by at most ±0.25. It decays each generation (configurable via `momentum_decay`) so stale signals fade. This provides directional bias, emergent correlated mutations, and selective mutation focus — all without hardcoded parameter relationships.
+- **Champion brain lineage**: Each accepted node stores the learned brain of its champion (the best agent of the best config group). Every generation inherits the stored champion of the node its configs were bred from, so rejected generations and backtracks never leak a different lineage's weights.
 
 See the sandbox crate source for full implementation details.
 

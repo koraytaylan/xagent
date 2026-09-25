@@ -275,6 +275,46 @@ Learning (credit assignment) then builds on this reactive foundation, associatin
 
 **Lesson:** Before asking "why can't agents learn to seek food?" ask "do agents have the reactive machinery to seek ANYTHING?" The simplest organisms don't learn to navigate — they navigate reactively and learn to refine. We were trying to learn level-3 behavior (spatial steering) without implementing level-1 (klinokinesis/klinotaxis).
 
+### 21. Momentum Pinned Every Mutant to a Clamp Bound
+
+**Symptom:** A 220-generation, 100 000-tick run (2026-09-24) plateaued at a best score of 0.243. `movement_speed` in mutants alternated between exactly 100.0 and 1.0, `memory_capacity` went 128 → 2048 → 1, and 1708 of 1744 mutants had at least one gene sitting on a clamp bound. In 27 generations, at least 6 of the 8 mutants had speed 1.0 and scored ≈ 0.003.
+
+**Root cause:** `MutationMomentum::update` accumulated *absolute* parameter deltas (`memory_capacity` −333.7, `movement_speed` +8.99), but `biased_perturb_f/u` added the momentum to a *multiplicative* factor around 1.0. A factor of ~10 or ~−332 sends every mutant to the upper or lower clamp. Nearest rounding then made integer genes absorbing: `1 × factor` rounds back to 1 for every factor below 1.5, so `memory_capacity` and `processing_slots` could never leave 1.
+
+**Fix:** Momentum now stores the mean *relative* change `(winner − parent) / |parent|` and is bounded to ±`MAX_MOMENTUM_NUDGE` (0.25) both when stored and when applied (which also neutralizes oversized momentum restored from an old database). Integer genes use stochastic rounding, so the expected value is preserved and a gene at 1 can grow.
+
+**Lesson:** A signal accumulated in one unit and applied in another is not "noisy", it is wrong — and bounded parameters hide the error by clamping it into plausible-looking values.
+
+### 22. Speed Was the Only Gene That Bought Fitness
+
+**Symptom:** Across that run, the correlation between `movement_speed` and composite fitness was 0.93. Speed sat at its 100.0 cap; survival sat at its floor (≈ 190 deaths → ×0.258); exploration was 0.98. The composite therefore topped out near 0.26, and the best agent (0.257) was already there. Brain genes had no effect on selection.
+
+**Root cause:** The time-denominated fitness (food per 1 000 alive ticks) with linear drag rewards running fast and dying often: faster agents sweep more area, death respawns them at full energy, and the survival multiplier is already floored.
+
+**Fix:** The constructed defaults (`BrainConfig::default`, `tiny`, `large`) now enable effort-rebased fitness (food per unit energy, cells per distance) with quadratic drag above baseline speed (`speed_cost_exponent = 2.0`). This makes food per energy single-peaked in speed. Serialized configs that omit these fields still load under the regime they were recorded with.
+
+**Lesson:** When one gene explains nearly all fitness variance, evolution optimizes that gene and stops. Price every free lever into the objective before asking the learner to improve.
+
+### 23. Inherited Brains Came From the Wrong Lineage
+
+**Symptom:** A node's fitness could not be reproduced from its stored config. After a backtrack, fitness collapsed and then drifted back over several generations.
+
+**Root cause:** The next generation always inherited the brain of the previous generation's single top *individual*, whether that generation was accepted or rejected, and whatever node the tree search bred from next. Configs followed the tree; brains followed wall-clock time.
+
+**Fix:** When a generation is accepted, the governor captures the best agent of the best config group (the group whose config becomes the node's config) and stores its brain in a `node_brain` table. Every generation inherits the stored champion of the node its configs were bred from, including after rejections and backtracks. Brains of exhausted nodes are pruned, and the worker rejects a stored brain whose size does not match the current layout.
+
+**Lesson:** Lamarckian inheritance makes the brain part of the genome. Anything the search can backtrack over must be stored with the node, not carried along the timeline.
+
+### 24. The Within-Life Metric Measured the Previous Generation
+
+**Symptom:** In every live-run node, `q1_food_rate` was exactly the previous generation's whole-run food rate and `q4_food_rate` was 0.
+
+**Root cause:** While the worker sat paused at the budget waiting for the champion handoff, it kept publishing snapshots of the evaluated population. The main thread fed them into the freshly reset within-life tracker (filling all four quarters with the old totals) and applied them to the next generation's agents.
+
+**Fix:** Every snapshot carries a generation epoch. The main thread advances its epoch when a boundary continues to a new population and hands the epoch to the worker with the reset (and at worker start). `partition_events` drops plain snapshots from any other epoch.
+
+**Lesson:** "Latest-wins" is only safe while every message describes the same population. Once the population changes, snapshots need an identity, not just a timestamp.
+
 ---
 
 ## Current Parameter Roles

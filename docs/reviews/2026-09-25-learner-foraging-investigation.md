@@ -111,7 +111,7 @@ Measured the same day on the same machine. Each option was implemented, A/B-test
 
 - **Free runs:** 10 agents, 100 000 ticks, default world, seeds 5 and 6.
 - **Probes:** the steering-required and standard probes above.
-- **Headless evolution:** release builds, population 10, 2 evaluation repeats, 40 000 ticks per generation, 19–20 generations. For the signed fatigue arm, 14.
+- **Headless evolution:** release builds, population 10, 2 evaluation repeats, 40 000 ticks per generation, 19–20 generations.
 
 Mean agent composite fitness and food per agent below are for the first and last five generations.
 
@@ -133,7 +133,7 @@ Mean agent composite fitness and food per agent below are for the first and last
 | floor 1.0 + abs fatigue + actor centering | 0.0208 → 0.0214 | 8.0 → 7.7 | 14.0 → 11.8 |
 | floor 0.15 + abs fatigue | 0.0283 → 0.0257 | 9.0 → 8.1 | 8.5 → 7.6 |
 | abs fatigue only | 0.0218 → 0.0232 | 6.1 → 6.2 | 6.5 → 5.8 |
-| signed fatigue only | 0.0292 → 0.0301 | 8.7 → 8.8 | 7.3 → 7.1 |
+| signed fatigue only | 0.0292 → 0.0308 | 8.7 → 9.3 | 7.3 → 7.2 |
 
 No arm beat the original learner. Every arm stayed at chance approach intent (0.48–0.50).
 
@@ -141,7 +141,7 @@ No arm beat the original learner. Every arm stayed at chance approach intent (0.
 
 **Hazard floor.** It did what it was meant to: in free runs the forward bias stopped collapsing within a life. But the learner cannot learn to avoid danger, so a lethal dwell dose mostly adds deaths: 2.2–2.7× in free runs, about 1.8× in evolution. With the full floor, agents also explored half as many cells (136 vs 263). A floor sized to exploration speed (0.15) kept food level but still raised deaths, and the survival multiplier turned that into lower fitness.
 
-**Fatigue.** The absolute-value accumulator counts forward/backward exploration jitter that cancels in real displacement. Fatigue then punished noise, and distance fell 27%. In free runs with the absolute-value accumulator, fatigue still sat at 0.47–0.50 (original 0.48–0.61), so in hilly terrain path curvature, not the feedback loop, sets most of it. The signed version, which avoids counting jitter, was evaluated only in evolution: food stayed level (8.7–8.8) while deaths rose (7.3 vs 6.0), so the extra movement mostly bought hazard exposure.
+**Fatigue.** The absolute-value accumulator counts forward/backward exploration jitter that cancels in real displacement. Fatigue then punished noise, and distance fell 27%. In free runs with the absolute-value accumulator, fatigue still sat at 0.47–0.50 (original 0.48–0.61), so in hilly terrain path curvature, not the feedback loop, sets most of it. The signed version, which avoids counting jitter, was evaluated only in evolution: food stayed level with the original (8.7 → 9.3 vs 9.0 → 10.4) while early deaths rose (7.3 vs 6.0), so the extra movement mostly bought hazard exposure.
 
 **17×13 eye.** It saw food at range but nothing used it: approach intent stayed at chance. It cost 28–32% throughput, and fitness gains were within noise.
 

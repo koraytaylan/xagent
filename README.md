@@ -129,15 +129,15 @@ Each stage runs as a cooperative function inside the fused kernel, with all 256 
 
 2. **Encode** — Projects features through a learned weight matrix and `fast_tanh` into a 128-dimensional encoded state (`ENCODED_DIMENSION`). This fixed-size representation is the common currency of all downstream passes.
 
-3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals.
+3. **Habituate & Homeostasis** — Attenuates encoded dimensions that haven't changed recently (habituation EMA), producing a habituated state that suppresses monotonous input. Simultaneously computes multi-timescale homeostatic gradients (fast ≈ 5 ticks, medium ≈ 50 ticks, slow ≈ 500 ticks) and urgency from energy and integrity signals, and labels the tick *salient* when its homeostatic change lies at least 3 standard deviations from the agent's own running normal (signed label in [−1, 1]; the first tick of a life is never salient). It also forms the memory key: the encoded state minus its running mean, since raw encodings of different scenes are nearly identical by cosine.
 
-4. **Recall Score** — Computes cosine similarity between the encoded (pre-habituation) state and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
+4. **Recall Score** — Computes cosine similarity between the memory key (centered encoded state) and all 128 stored memory patterns, producing a score vector that identifies the most contextually relevant past experiences.
 
 5. **Recall Top-K** — Selects the 16 most similar patterns from the score vector and updates their recall metadata (timestamps, access counts).
 
 6. **Predict & Act** — Computes prediction error from the previous tick's prediction against the current habituated state. Runs TD(λ) credit assignment: a linear value head estimates the discounted homeostatic return from the encoded state, and its TD error updates the critic and both policy channels through per-dimension eligibility traces. Evaluates the linear policy on the encoded state, blends in valence-weighted motor commands from recalled memories, applies exploration noise (adaptive rate 10–85%), klinotaxis turn modulation, and motor fatigue dampening (spatially stagnant agents are attenuated, forcing loop-breaking).
 
-7. **Learn & Store** — Predictor gradient descent step, encoder Hebbian weight adaptation, memory reinforcement for patterns co-occurring with low error, pattern storage to the weakest slot, and per-pattern decay.
+7. **Learn & Store** — Predictor gradient descent step, encoder Hebbian weight adaptation, memory reinforcement for patterns co-occurring with low error, episodic credit, pattern storage to the weakest slot, and per-pattern decay. Every brain tick stores a moment with no valence; a salient tick credits its label back to the moments stored over the preceding 8 brain ticks, discounted by γλ per tick. Death adds no label of its own (starving is gradual, and fatal damage is already salient as it lands). Valence is otherwise never touched, fully valued moments do not decay with time, and eviction keeps moments still awaiting their outcome first, then valued episodes, then unvalued ones. Salience is defined on the agent's own energy/integrity signal only — nothing marks what in the world caused it.
 
 ### Homeostatic Feedback
 

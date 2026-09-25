@@ -270,9 +270,23 @@ override O_TRACE_FWD: u32 = O_TRACE_CRITIC + ENCODED_DIMENSION;
 override O_TRACE_TURN: u32 = O_TRACE_FWD + ENCODED_DIMENSION;
 override O_TRACE_BIASES: u32 = O_TRACE_TURN + ENCODED_DIMENSION;
 
+// ── Episodic memory state ───────────────────────────────────────────────────
+// Running mean of the encoded state. Memory keys are the encoding minus this
+// mean: raw encodings of different scenes are 98–99% alike (cosine), so
+// uncentered similarity cannot tell scenes apart. Survives death (it describes
+// the input distribution, not an episode).
+override O_ENCODED_MEAN: u32 = O_TRACE_BIASES + 3u;
+// Running mean and variance of raw_gradient over non-salient brain ticks; the
+// salience test measures how far a tick's homeostatic change sits from them.
+override O_SALIENCE_MEAN: u32 = O_ENCODED_MEAN + ENCODED_DIMENSION;
+override O_SALIENCE_VARIANCE: u32 = O_SALIENCE_MEAN + 1u;
+// This tick's signed salience label in [-1, 1] (0 = not salient). Written by
+// the homeostasis pass, read by the store pass of the same brain tick.
+override O_SALIENCE_LABEL: u32 = O_SALIENCE_VARIANCE + 1u;
+
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-override BRAIN_STRIDE: u32 = O_TRACE_BIASES + 3u;
+override BRAIN_STRIDE: u32 = O_SALIENCE_LABEL + 1u;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
 override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
@@ -572,6 +586,50 @@ const ENCODER_CREDIT_SCALE: f32 = 0.1;
 const CREDIT_EPSILON: f32 = 1e-6;
 const KLINOTAXIS_SENSITIVITY: f32 = 500.0;
 const MEMORY_BLEND_STRENGTH: f32 = 0.4;
+
+// ── Episodic memory constants ───────────────────────────────────────────────
+// Memory stores a key every brain tick, but a stored moment only acquires
+// value when a salient homeostatic change follows it: the change's signed,
+// normalized size is credited back to the moments stored just before it.
+// Salience is a property of the agent's own energy/integrity signal only —
+// nothing here refers to food, danger, or any other world object. Death adds
+// no label of its own: starving is a gradual decline, not a salient change,
+// and damage that kills was already salient on the ticks it landed.
+
+/// Per-brain-tick rate of the encoded-state running mean (≈ 100 brain ticks
+/// of memory). Early in life the mean is the exact running average instead.
+const ENCODED_MEAN_RATE: f32 = 0.01;
+/// Per-brain-tick rate of the raw_gradient mean/variance used for salience.
+const SALIENCE_STATS_RATE: f32 = 0.01;
+/// Floor on the raw_gradient variance (standard deviation 0.005). The resting
+/// drain varies far less than this per brain tick, so without the floor any
+/// noise would read as salient; a meal (+0.12) still scores z ≈ 24.
+const SALIENCE_VARIANCE_FLOOR: f32 = 2.5e-5;
+/// A brain tick is salient when its raw_gradient lies this many standard
+/// deviations from the running mean.
+const SALIENCE_THRESHOLD_Z: f32 = 3.0;
+/// z-score that maps to a full-strength label (±1); smaller salient changes
+/// get proportionally smaller labels.
+const SALIENCE_SATURATION_Z: f32 = 10.0;
+/// Brain ticks before a salient change whose stored moments receive credit.
+/// Matches the eligibility-trace horizon 1 / (1 − γλ) ≈ 8.
+const EPISODIC_CREDIT_WINDOW: u32 = 8u;
+/// Per-brain-tick decay of that credit — the same γλ the eligibility traces use.
+const EPISODIC_CREDIT_DECAY: f32 = TD_DISCOUNT * TD_LAMBDA;
+/// Bound on a stored moment's episodic valence.
+const MAX_EPISODIC_VALENCE: f32 = 1.0;
+/// Eviction weight of |valence| relative to reinforcement (capped at 20): a
+/// fully valued memory outlasts any unvalued one.
+const EPISODIC_KEEP_WEIGHT: f32 = 20.0;
+/// Eviction bonus of a moment still inside the credit window: it outranks
+/// every valued memory (reinforcement ≤ 20 plus |valence| ≤ 1 weighted by
+/// EPISODIC_KEEP_WEIGHT), so memory full of valued episodes still keeps the
+/// recent moments a salient change must be able to credit.
+const PENDING_OUTCOME_KEEP_BONUS: f32 = 2.0 * EPISODIC_KEEP_WEIGHT * MAX_EPISODIC_VALENCE;
+/// Eviction keep score of an empty memory slot: below any occupied slot's
+/// score (reinforcement and |valence| are never negative), so a store fills
+/// an empty slot before it evicts a memory.
+const EMPTY_SLOT_KEEP_SCORE: f32 = -1.0;
 
 // ── TD(λ) credit constants ──────────────────────────────────────────────────
 

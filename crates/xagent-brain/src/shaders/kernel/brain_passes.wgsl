@@ -27,7 +27,10 @@ const DENSE_INNER_LANES: u32 = 4u;
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, ENCODED_DIMENSION>;
-var<workgroup> s_habituated: array<f32, ENCODED_DIMENSION>;
+// Centered memory key for this brain tick: s_encoded minus the running mean
+// (O_ENCODED_MEAN). Written by the homeostasis pass, read by recall,
+// reinforcement and store.
+var<workgroup> s_memory_key: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_homeo: array<f32, 8>;
 var<workgroup> s_similarities: array<f32, MEMORY_CAP>;
 var<workgroup> shared_sort_indices: array<u32, MEMORY_CAP>;
@@ -130,14 +133,15 @@ fn wg_reduce_dense(tid: u32) {
     }
 }
 
-// Cosine similarity using shared encoded state (pre-habituation)
-// for memory operations — avoids attenuation silencing recall.
+// Cosine similarity between this tick's centered memory key and stored
+// pattern `idx` (keys are pre-habituation, so attenuation cannot silence
+// recall).
 fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
     let pattern_base = agent_id * PATTERN_STRIDE;
     var dot_val: f32 = 0.0;
     var e_norm_sq: f32 = 0.0;
     for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-        let e = s_encoded[d];
+        let e = s_memory_key[d];
         let p = pattern_buffer[pattern_base + d * MEMORY_CAP + idx];
         dot_val += e * p;
         e_norm_sq += e * e;
@@ -894,7 +898,7 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
         brain_state[brain_base + O_HAB_EMA + tid] = new_ema;
         let atten = clamp(new_ema * sensitivity, ATTEN_FLOOR, 1.0);
         brain_state[brain_base + O_HAB_ATTEN + tid] = atten;
-        s_habituated[tid] = enc * atten;
+        s_memory_key[tid] = enc - brain_state[brain_base + O_ENCODED_MEAN + tid];
     }
 
     if (tid == 0u) {
@@ -916,6 +920,34 @@ fn coop_habituate_homeo(agent_id: u32, tid: u32) {
             + integrity_delta * INTEGRITY_WEIGHT
             + shaping
             + danger_shaping;
+
+        // Episodic salience: is this homeostatic change far outside the
+        // agent's recent normal? Birth and respawn zero the previous
+        // energy/integrity, so their first tick reads as a full-meter gain —
+        // an artifact, not an experience — and is skipped along with the
+        // statistics update. Salient ticks are kept out of the statistics so
+        // one meal does not mask the next.
+        let first_tick_of_life = prev_energy <= 0.0 && prev_integrity <= 0.0;
+        var salience_label: f32 = 0.0;
+        if (!first_tick_of_life) {
+            let salience_mean = brain_state[brain_base + O_SALIENCE_MEAN];
+            let salience_variance = brain_state[brain_base + O_SALIENCE_VARIANCE];
+            let deviation = raw_gradient - salience_mean;
+            let z_score = deviation / sqrt(max(salience_variance, SALIENCE_VARIANCE_FLOOR));
+            if (abs(z_score) >= SALIENCE_THRESHOLD_Z) {
+                salience_label = clamp(
+                    z_score / SALIENCE_SATURATION_Z,
+                    -MAX_EPISODIC_VALENCE,
+                    MAX_EPISODIC_VALENCE,
+                );
+            } else {
+                brain_state[brain_base + O_SALIENCE_MEAN] =
+                    salience_mean + SALIENCE_STATS_RATE * deviation;
+                brain_state[brain_base + O_SALIENCE_VARIANCE] = salience_variance
+                    + SALIENCE_STATS_RATE * (deviation * deviation - salience_variance);
+            }
+        }
+        brain_state[brain_base + O_SALIENCE_LABEL] = salience_label;
         let gradient_fast = brain_state[brain_base + O_HOMEO + 0u] * (1.0 - GRADIENT_FAST_BLEND) + raw_gradient * GRADIENT_FAST_BLEND;
         let gradient_medium = brain_state[brain_base + O_HOMEO + 1u] * (1.0 - GRADIENT_MEDIUM_BLEND) + raw_gradient * GRADIENT_MEDIUM_BLEND;
         let gradient_slow = brain_state[brain_base + O_HOMEO + 2u] * (1.0 - GRADIENT_SLOW_BLEND) + raw_gradient * GRADIENT_SLOW_BLEND;
@@ -952,11 +984,11 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
     if (tid < MEMORY_CAP) {
         let pattern_base = agent_id * PATTERN_STRIDE;
 
-        // Each thread computes query norm independently (32 shared reads — fast)
-        // Uses encoded (pre-habituation) state for memory queries.
+        // Each thread computes the query norm independently (shared reads —
+        // fast). Queries use the centered memory key.
         var q_norm_sq: f32 = 0.0;
         for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-            let v = s_encoded[d];
+            let v = s_memory_key[d];
             q_norm_sq += v * v;
         }
         let q_norm = sqrt(q_norm_sq);
@@ -967,7 +999,7 @@ fn coop_recall_score(agent_id: u32, tid: u32) {
         } else {
             var dot: f32 = 0.0;
             for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-                dot += s_encoded[d] * pattern_buffer[pattern_base + d * MEMORY_CAP + tid];
+                dot += s_memory_key[d] * pattern_buffer[pattern_base + d * MEMORY_CAP + tid];
             }
             let p_norm = pattern_buffer[pattern_base + O_PAT_NORMS + tid];
             if (q_norm < 1e-8 || p_norm < 1e-8) {
@@ -1139,10 +1171,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 total_sim += max(s_recall_similarity[k], 0.0);
             }
             if (total_sim > 1e-8) {
+                // Stored keys are centered; the running mean turns them back
+                // into encoded states for the forward model.
+                let encoded_mean = brain_state[brain_base + O_ENCODED_MEAN + tid];
                 for (var k: u32 = 0u; k < recall_count; k = k + 1u) {
                     let idx = u32(s_recall[k]);
                     let w = context_weight * max(s_recall_similarity[k], 0.0) / total_sim;
-                    s_prediction[tid] += pattern_buffer[pattern_base + tid * MEMORY_CAP + idx] * w;
+                    s_prediction[tid] +=
+                        (pattern_buffer[pattern_base + tid * MEMORY_CAP + idx] + encoded_mean) * w;
                 }
             }
         }
@@ -1718,7 +1754,9 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     let learning_rate = brain_config[1].x;
     let decay_rate = brain_config[1].y;
     let tick = brain_state[brain_base + O_TICK_COUNT];
-    let raw_gradient = s_homeo[1u];
+    // Signed salience label of this tick's homeostatic change (0 = ordinary
+    // tick), written by the homeostasis pass. Uniform across the workgroup.
+    let salience_label = brain_state[brain_base + O_SALIENCE_LABEL];
 
     // Thread 0: context weight adaptation, driven by the same forward
     // prediction error that drives novelty.
@@ -1758,11 +1796,11 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         }
     }
 
-    // ── Compute encoded-vector norm ONCE (memory reinforcement tiling) ──────────
+    // ── Compute memory-key norm ONCE (memory reinforcement tiling) ────────────
     // All threads cooperate on the tree reduction; result is shared by 7c and 7d.
     {
         if (tid < ENCODED_DIMENSION) {
-            let e = s_encoded[tid];
+            let e = s_memory_key[tid];
             s_dense_partials[tid] = e * e;
         }
         workgroupBarrier();
@@ -1771,8 +1809,8 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         workgroupBarrier();
     }
 
-    // ── 7c. Memory reinforcement: tiled with all 256 threads ────────────────────
-    // Uses encoded (pre-habituation) state for memory similarity.
+    // ── 7c. Memory reinforcement + episodic credit: tiled with all 256 threads ──
+    // Uses the centered memory key for similarity.
     // All 256 threads compute partial dot products: pattern = tid % MEMORY_CAP,
     // lane = tid / MEMORY_CAP (0 or 1). Each lane reduces over its stride-2 half
     // of ENCODED_DIMENSION. Lane 0 combines and applies reinforcement logic;
@@ -1784,7 +1822,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     {
         var dot: f32 = 0.0;
         for (var d = lane; d < ENCODED_DIMENSION; d += 2u) {
-            dot += s_encoded[d] * pattern_buffer[pattern_base + d * MEMORY_CAP + pattern];
+            dot += s_memory_key[d] * pattern_buffer[pattern_base + d * MEMORY_CAP + pattern];
         }
         s_reinf_dot[tid] = dot;
     }
@@ -1802,11 +1840,26 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
                     pattern_buffer[pattern_base + O_PAT_REINF + pattern] += sim * learning_rate * (1.0 - s_pred_td[S_PRED_ERROR]);
                     pattern_buffer[pattern_base + O_PAT_REINF + pattern] = clamp(
                         pattern_buffer[pattern_base + O_PAT_REINF + pattern], 0.0, 20.0);
-                    let valence_lr = learning_rate * 0.3;
-                    let old_valence = pattern_buffer[pattern_base + O_PAT_MOTOR + pattern * 3u + 2u];
-                    pattern_buffer[pattern_base + O_PAT_MOTOR + pattern * 3u + 2u] +=
-                        sim * valence_lr * (raw_gradient - old_valence);
                 }
+            }
+        }
+
+        // Episodic credit: a salient homeostatic change is the outcome of the
+        // moments just before it, so it is credited to the patterns stored
+        // over the last EPISODIC_CREDIT_WINDOW brain ticks, discounted by age.
+        // Ordinary ticks leave valence untouched, so a remembered outcome is
+        // not washed out by the resting drain that follows it.
+        if (salience_label != 0.0
+            && pattern_buffer[pattern_base + O_PAT_ACTIVE + pattern] >= 0.5) {
+            let age = tick - pattern_buffer[pattern_base + O_PAT_META + pattern * 3u];
+            if (age >= 1.0 && age <= f32(EPISODIC_CREDIT_WINDOW)) {
+                let valence_slot = pattern_base + O_PAT_MOTOR + pattern * 3u + 2u;
+                pattern_buffer[valence_slot] = clamp(
+                    pattern_buffer[valence_slot]
+                        + salience_label * pow(EPISODIC_CREDIT_DECAY, age - 1.0),
+                    -MAX_EPISODIC_VALENCE,
+                    MAX_EPISODIC_VALENCE,
+                );
             }
         }
     }
@@ -1817,9 +1870,9 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     // use tid < ENCODED_DIMENSION; scalar writes stay on thread 0.
     let min_idx = u32(pattern_buffer[pattern_base + O_MIN_REINF_IDX]);
 
-    // Per-dimension encoded state write (threads 0..127)
+    // Per-dimension memory-key write (threads 0..127)
     if (tid < ENCODED_DIMENSION) {
-        pattern_buffer[pattern_base + tid * MEMORY_CAP + min_idx] = s_encoded[tid];
+        pattern_buffer[pattern_base + tid * MEMORY_CAP + min_idx] = s_memory_key[tid];
     }
 
     // Scalar writes (thread 0 only)
@@ -1830,7 +1883,8 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         pattern_buffer[pattern_base + O_PAT_REINF + min_idx] = 1.0;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u] = motor_forward;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_turn;
-        pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 2u] = raw_gradient;
+        // No outcome yet: valence arrives only if a salient change follows.
+        pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 2u] = 0.0;
         pattern_buffer[pattern_base + O_PAT_META + min_idx * 3u] = tick;
         pattern_buffer[pattern_base + O_PAT_META + min_idx * 3u + 1u] = tick;
         pattern_buffer[pattern_base + O_PAT_META + min_idx * 3u + 2u] = 1.0;
@@ -1840,32 +1894,47 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     storageBarrier(); workgroupBarrier();
 
     // ── 7e. Memory decay: threads 0..127 ───────────────────────────────
-    // Reuse s_similarities for per-thread reinforcement tracking
+    // Reuse s_similarities for each slot's eviction keep score. Empty slots
+    // score EMPTY_SLOT_KEEP_SCORE, below every occupied slot, so memory fills
+    // before anything is evicted.
     if (tid < MEMORY_CAP) {
         if (pattern_buffer[pattern_base + O_PAT_ACTIVE + tid] >= 0.5) {
             let recency = tick - pattern_buffer[pattern_base + O_PAT_META + tid * 3u + 1u];
             let act_count = pattern_buffer[pattern_base + O_PAT_META + tid * 3u + 2u];
+            let valence_magnitude = abs(pattern_buffer[pattern_base + O_PAT_MOTOR + tid * 3u + 2u]);
             let freq_factor = 1.0 / (1.0 + act_count * 0.2);
             let recency_factor = min(recency / 100.0, 3.0);
-            let effective_rate = decay_rate * freq_factor * (0.2 + recency_factor);
+            // A moment that preceded a salient outcome fades in proportion to
+            // how little the outcome mattered: fully valued episodes do not
+            // fade with time and leave memory only by eviction.
+            let retention = 1.0 - valence_magnitude / MAX_EPISODIC_VALENCE;
+            let effective_rate = decay_rate * freq_factor * (0.2 + recency_factor) * retention;
             pattern_buffer[pattern_base + O_PAT_REINF + tid] -= effective_rate;
             if (pattern_buffer[pattern_base + O_PAT_REINF + tid] <= 0.0) {
                 pattern_buffer[pattern_base + O_PAT_ACTIVE + tid] = 0.0;
-                s_similarities[tid] = 999.0;
+                s_similarities[tid] = EMPTY_SLOT_KEEP_SCORE;
             } else {
-                s_similarities[tid] = pattern_buffer[pattern_base + O_PAT_REINF + tid];
+                // Eviction keep score: moments still awaiting their outcome
+                // first, then valued episodes, then unvalued ones.
+                let age = tick - pattern_buffer[pattern_base + O_PAT_META + tid * 3u];
+                let pending = age <= f32(EPISODIC_CREDIT_WINDOW);
+                s_similarities[tid] = pattern_buffer[pattern_base + O_PAT_REINF + tid]
+                    + EPISODIC_KEEP_WEIGHT * valence_magnitude
+                    + select(0.0, PENDING_OUTCOME_KEEP_BONUS, pending);
             }
         } else {
-            s_similarities[tid] = 999.0;
+            s_similarities[tid] = EMPTY_SLOT_KEEP_SCORE;
         }
     }
     workgroupBarrier();
 
     // ── 7f. Min tracking + active count: parallel reduction ──────────────────
-    // Active count: parallel tree reduction counting entries < 999.0
+    // Active count: parallel tree reduction over the active flags (each thread
+    // reads the flag it wrote in 7e).
     {
         if (tid < MEMORY_CAP) {
-            s_dense_partials[tid] = select(0.0, 1.0, s_similarities[tid] < 999.0);
+            s_dense_partials[tid] =
+                select(0.0, 1.0, pattern_buffer[pattern_base + O_PAT_ACTIVE + tid] >= 0.5);
         }
         workgroupBarrier();
         wg_reduce_dense(tid);
@@ -1906,8 +1975,13 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     workgroupBarrier();
 
     // ── 7g. Publish this tick's encoded state for the next tick's
-    // habituation delta and predictor training input ─────────────────────
+    // habituation delta and predictor training input, and fold it into the
+    // running mean that centers memory keys (an exact average early in life,
+    // an EMA afterwards) ─────────────────────────────────────────────────
     if (tid < ENCODED_DIMENSION) {
         brain_state[brain_base + O_PREV_ENCODED + tid] = s_encoded[tid];
+        let mean_rate = max(ENCODED_MEAN_RATE, 1.0 / max(tick, 1.0));
+        let mean_slot = brain_base + O_ENCODED_MEAN + tid;
+        brain_state[mean_slot] += mean_rate * (s_encoded[tid] - brain_state[mean_slot]);
     }
 }

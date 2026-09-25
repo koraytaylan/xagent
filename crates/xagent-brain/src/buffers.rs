@@ -142,7 +142,16 @@ pub const O_TRACE_CRITIC: usize = O_PREV_VALUE + 1;
 pub const O_TRACE_FWD: usize = O_TRACE_CRITIC + ENCODED_DIMENSION;
 pub const O_TRACE_TURN: usize = O_TRACE_FWD + ENCODED_DIMENSION;
 pub const O_TRACE_BIASES: usize = O_TRACE_TURN + ENCODED_DIMENSION;
-pub const BRAIN_STRIDE: usize = O_TRACE_BIASES + 3;
+
+// ── Episodic memory state ─────────────────────────────────────────────
+// Running mean of the encoded state (memory keys are encoding − mean), the
+// raw_gradient mean/variance behind the salience test, and this tick's
+// signed salience label. Mirrored by the same-named overrides in `common.wgsl`.
+pub const O_ENCODED_MEAN: usize = O_TRACE_BIASES + 3;
+pub const O_SALIENCE_MEAN: usize = O_ENCODED_MEAN + ENCODED_DIMENSION;
+pub const O_SALIENCE_VARIANCE: usize = O_SALIENCE_MEAN + 1;
+pub const O_SALIENCE_LABEL: usize = O_SALIENCE_VARIANCE + 1;
+pub const BRAIN_STRIDE: usize = O_SALIENCE_LABEL + 1;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
@@ -1052,9 +1061,8 @@ mod tests {
     #[test]
     fn brain_stride_is_consistent() {
         // The four heritable visual-genome genes are contiguous right
-        // after `O_MOVEMENT_SPEED`; the TD critic state follows them as the last
-        // region of the brain layout: value head, prev value, three trace
-        // vectors, three trace biases.
+        // after `O_MOVEMENT_SPEED`; the TD critic state follows them: value
+        // head, prev value, three trace vectors, three trace biases.
         assert_eq!(O_GABOR_WAVELENGTH, O_MOVEMENT_SPEED + 1);
         assert_eq!(O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH + 1);
         assert_eq!(O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO + 1);
@@ -1067,7 +1075,13 @@ mod tests {
         assert_eq!(O_PREV_HOMEO_PREDICTION, O_HOMEO_PREDICTOR_BIAS + 1);
         assert_eq!(O_VALUE_WEIGHTS, O_PREV_HOMEO_PREDICTION + 1);
         assert_eq!(O_TRACE_BIASES, O_VALUE_WEIGHTS + 4 * ENCODED_DIMENSION + 2);
-        assert_eq!(BRAIN_STRIDE, O_TRACE_BIASES + 3);
+        // Episodic memory state closes the layout: encoded-state mean, the
+        // salience mean and variance, and this tick's salience label.
+        assert_eq!(O_ENCODED_MEAN, O_TRACE_BIASES + 3);
+        assert_eq!(O_SALIENCE_MEAN, O_ENCODED_MEAN + ENCODED_DIMENSION);
+        assert_eq!(O_SALIENCE_VARIANCE, O_SALIENCE_MEAN + 1);
+        assert_eq!(O_SALIENCE_LABEL, O_SALIENCE_VARIANCE + 1);
+        assert_eq!(BRAIN_STRIDE, O_SALIENCE_LABEL + 1);
     }
 
     #[test]

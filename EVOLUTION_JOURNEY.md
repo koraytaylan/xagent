@@ -325,7 +325,7 @@ The generational search copies the spawn parent's `BrainConfig` into every offsp
 
 | Field | Role | Kernel reality |
 |---|---|---|
-| `learning_rate` | **Active** | Drives predictor weight updates, encoder-credit scaling, and pattern reinforcement / valence learning in [`shaders/kernel/brain_passes.wgsl`](crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl). Uploaded via `CFG_LEARNING_RATE`. Held at the spawn parent's value. |
+| `learning_rate` | **Active** | Drives predictor weight updates, encoder-credit scaling, and pattern reinforcement in [`shaders/kernel/brain_passes.wgsl`](crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl). Uploaded via `CFG_LEARNING_RATE`. Held at the spawn parent's value. |
 | `decay_rate` | **Active** | Scales the per-tick pattern-memory decay rate in `shaders/kernel/brain_passes.wgsl`. Uploaded via `CFG_DECAY_RATE`. Held at the spawn parent's value. |
 | `representation_dimension` | **Locked (compile-time)** | Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; WGSL workgroup arrays cannot resize at runtime. `build_config_for` writes `ENCODED_DIMENSION` into the GPU slot regardless and logs a one-shot warning on disagreement. Not mutated by evolution and not exposed in the UI. |
 | `memory_capacity` | **Proxy (metabolic)** | Kernel pattern memory is fixed at `MEMORY_CAP = 128`. The config value only feeds `metabolic_drain_per_tick` and `physics_state[P_MEMORY_CAP]`. Held at the spawn parent's value. |

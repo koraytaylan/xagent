@@ -3028,6 +3028,12 @@ fn vision_horizon_row_sees_food_at_range() {
 /// number was inflated by per-agent side-consistency — each agent always
 /// saw food on one side in both training and eval — not by directional
 /// learning.)
+///
+/// Blind spot: the probe food sits `5 · sin(0.405) ≈ 1.97` units off-axis,
+/// inside the 2.0 eat radius, so an agent walking straight eats it and turning
+/// earns almost nothing — this probe cannot distinguish a steering learner
+/// from a non-steering one. `learning_probe_steering_required_is_chance` is the
+/// geometry where turning is required.
 #[test]
 fn learning_probe_mirrored_steering_is_chance() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_FOOD_COUNT};
@@ -3199,6 +3205,170 @@ fn encoder_food_side_cosines() -> (f32, f32) {
     let within = cosine(&e_right, &e_right2);
     let between = cosine(&e_right, &e_left);
     (within, between)
+}
+
+/// Steering-required probe distance. At the probe bearing the food sits
+/// `10 · sin(0.405) ≈ 3.94` units off the agent's initial heading — well
+/// outside the eat radius — so walking straight misses it and only turning
+/// toward the food pays. On the 17×13 grid the food is visible at this range
+/// (`vision_horizon_row_sees_food_at_range`).
+const STEERING_PROBE_FOOD_DISTANCE: f32 = 10.0;
+/// Vision grid for the steering-required probe: odd×odd puts a ray row on the
+/// horizon and a column straight ahead, so food at the probe distance is seen.
+const STEERING_PROBE_VISION_WIDTH: u32 = 17;
+/// See [`STEERING_PROBE_VISION_WIDTH`].
+const STEERING_PROBE_VISION_HEIGHT: u32 = 13;
+/// Training episodes (food side mirrored every episode).
+const STEERING_PROBE_EPISODES: usize = 120;
+/// Ticks per episode: at default speed an agent covers ≈ 0.2 units per tick,
+/// so 150 ticks leave room for a curved approach to food 10 units away.
+const STEERING_PROBE_EPISODE_TICKS: u32 = 150;
+
+/// Probe arena with each agent's food at `distance` along the standard
+/// alternating ±`PROBE_FOOD_BEARING` bearings (mirrored layout flips them).
+fn build_probe_arena_at_distance(
+    brain: &BrainConfig,
+    brain_seed: u64,
+    distance: f32,
+) -> ProbeArena {
+    let mut arena = build_probe_arena(brain, brain_seed);
+    for (index, agent) in arena.agent_pos.iter().enumerate() {
+        let bearing = if index % 2 == 0 {
+            PROBE_FOOD_BEARING
+        } else {
+            -PROBE_FOOD_BEARING
+        };
+        arena.food_pos[index] = (
+            agent.x + bearing.sin() * distance,
+            PROBE_FOOD_Y,
+            agent.z + bearing.cos() * distance,
+        );
+        arena.mirrored_food_pos[index] = (
+            agent.x - bearing.sin() * distance,
+            PROBE_FOOD_Y,
+            agent.z + bearing.cos() * distance,
+        );
+    }
+    arena.reset_bodies();
+    arena
+}
+
+/// Honest directional probe in a geometry where steering is *required*.
+///
+/// `learning_probe_mirrored_steering_is_chance` cannot tell a steering learner
+/// from a non-steering one: its food is 1.97 units off-axis, inside the 2.0 eat
+/// radius, so walking straight eats it and turning carries no reward. Here the
+/// food is off-axis by more than the eat radius and visible at range, so only
+/// vision-conditional turning finds it. The test pins today's baseline — turn
+/// alignment at chance and few successful approaches — with the same
+/// falsifiable re-pin protocol as the other steering probes: a learner that
+/// acquires steering pushes the alignment out of the chance band (and the
+/// success rate up) and trips this test.
+#[test]
+fn learning_probe_steering_required_is_chance() {
+    use xagent_brain::buffers::{
+        fill_world_config, PHYS_STRIDE, P_FOOD_COUNT, WC_FOOD_RADIUS, WORLD_CONFIG_SIZE,
+    };
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Evaluation ticks (same scale as the other steering probes).
+    const EVAL_TICKS: usize = 60;
+    /// Minimum scored evaluation samples.
+    const MIN_SCORED_SAMPLES: usize = 200;
+    /// Upper bound on the late-training success rate for today's learner
+    /// (measured 2026-09-25 on Linux/RADV; see the pinned values below).
+    const MAX_BASELINE_SUCCESS_RATE: f32 = 0.3;
+
+    // Geometry precondition: walking straight must miss the food.
+    let mut world_constants = [0.0_f32; WORLD_CONFIG_SIZE];
+    fill_world_config(
+        &mut world_constants,
+        &WorldConfig::default(),
+        1,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1.0,
+        false,
+        false,
+    );
+    let eat_radius = world_constants[WC_FOOD_RADIUS];
+    let lateral_offset = STEERING_PROBE_FOOD_DISTANCE * PROBE_FOOD_BEARING.sin();
+    assert!(
+        lateral_offset > eat_radius,
+        "food lateral offset {lateral_offset:.2} must exceed the eat radius {eat_radius:.2} \
+         or walking straight eats it and the probe cannot measure steering"
+    );
+
+    let train_brain = BrainConfig {
+        brain_tick_stride: 1,
+        vision_stride: 1,
+        vision_width: STEERING_PROBE_VISION_WIDTH,
+        vision_height: STEERING_PROBE_VISION_HEIGHT,
+        ..Default::default()
+    };
+    let mut arena = build_probe_arena_at_distance(&train_brain, 17, STEERING_PROBE_FOOD_DISTANCE);
+
+    let mut tick_cursor = 0_u64;
+    let mut late_successes = 0.0_f32;
+    let late_window = STEERING_PROBE_EPISODES / 6;
+    for episode in 0..STEERING_PROBE_EPISODES {
+        arena.reset_bodies_with(episode % 2 == 1);
+        arena
+            .kernel
+            .dispatch_batch(tick_cursor, STEERING_PROBE_EPISODE_TICKS);
+        tick_cursor += u64::from(STEERING_PROBE_EPISODE_TICKS);
+        if episode >= STEERING_PROBE_EPISODES - late_window {
+            let state = arena.kernel.read_full_state_blocking();
+            late_successes += (0..PROBE_AGENT_COUNT)
+                .map(|a| state[a * PHYS_STRIDE + P_FOOD_COUNT].min(1.0))
+                .sum::<f32>();
+        }
+    }
+    let late_success_rate = late_successes / (late_window * PROBE_AGENT_COUNT) as f32;
+
+    // Evaluation: pin the agents (zero movement speed) keeping learned weights
+    // and the probe's vision grid, and score alignment like the other probes.
+    let eval_brain = BrainConfig {
+        vision_width: STEERING_PROBE_VISION_WIDTH,
+        vision_height: STEERING_PROBE_VISION_HEIGHT,
+        ..probe_brain_config()
+    };
+    for a in 0..PROBE_AGENT_COUNT {
+        arena
+            .kernel
+            .write_agent_heritable_config(a as u32, &eval_brain);
+    }
+    arena.reset_bodies();
+    let (correct, scored) = score_turn_alignment(&mut arena, tick_cursor, EVAL_TICKS);
+    let rate = correct as f64 / scored.max(1) as f64;
+    eprintln!(
+        "steering-required probe: late success rate {late_success_rate:.3}, \
+         turn/bearing alignment {correct}/{scored} = {rate:.3}"
+    );
+
+    assert!(
+        scored >= MIN_SCORED_SAMPLES,
+        "only {scored} scored samples — evaluation geometry broke"
+    );
+    // Pinned baseline: see the values printed above for the run this band
+    // was taken from. Re-pin upward when directional steering emerges.
+    assert!(
+        (0.38..=0.62).contains(&rate),
+        "steering-required alignment {rate:.3} left the chance band [0.38, 0.62] — \
+         if directional steering emerged, re-pin this baseline upward"
+    );
+    assert!(
+        late_success_rate <= MAX_BASELINE_SUCCESS_RATE,
+        "late success rate {late_success_rate:.3} exceeds {MAX_BASELINE_SUCCESS_RATE} — \
+         if agents learned to reach off-axis food, re-pin this baseline upward"
+    );
 }
 
 /// Diagnostic: does the encoder keep food-left and food-right linearly

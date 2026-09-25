@@ -430,7 +430,7 @@ const SQRT_2: f32 = 1.41421356237;
 // ── Physics constants ───────────────────────────────────────────────────────
 
 const GRAVITY: f32 = 20.0;
-/// Baseline locomotion speed; movement energy and the hazard-dose
+/// Baseline locomotion speed; movement energy and the path-length-hazard
 /// reference step are both normalized by it. One name, one source of truth.
 const DEFAULT_MOVE_SPEED: f32 = 20.0;
 const TURN_SPEED: f32 = 3.0;

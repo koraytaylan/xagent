@@ -197,22 +197,17 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // otherwise — the flag must match the agent's actual current biome.
     let in_danger = (biome_type == BIOME_DANGER);
     if in_danger {
-        // Hazard dose with a per-tick floor: an agent in danger takes at least
-        // the dose a default-speed agent takes per tick, and above default
-        // speed the dose is proportional to the distance traveled through
-        // danger. reference_step is a default-speed agent's per-tick
-        // displacement (DEFAULT_MOVE_SPEED * WC_DT).
-        //   - The floor makes dwelling cost damage: without it a stationary
-        //     agent took zero dose, so the learner was paid to freeze in
-        //     danger instead of leaving it, and every forward step there was
-        //     punished.
-        //   - Above the floor, loss per unit of danger distance is the
-        //     speed-invariant constant hazard*scale/reference_step, so
-        //     sprinting through danger buys no immunity.
+        // Path-length hazard dose (Layer B): integrity loss is proportional
+        // to the distance traveled through danger this tick, not to the number of ticks
+        // spent in it. reference_step is a default-speed agent's per-tick displacement
+        // (default_speed * dt = DEFAULT_MOVE_SPEED * WC_DT), so a default-speed agent (step_len ≈
+        // reference_step) takes byte-identical per-tick damage to the old per-tick model,
+        // a 2× agent pays 2× per tick over half the ticks (the same dose per crossing),
+        // and a stationary agent (step_len = 0) takes zero dose. NO floor on step_len:
+        // dose is strictly proportional to path length.
         let reference_step = DEFAULT_MOVE_SPEED * wc_f32(WC_DT);
-        let dose_steps = max(step_len / max(reference_step, EPSILON), 1.0);
         physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY]
-            - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale * dose_steps;
+            - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale * (step_len / max(reference_step, EPSILON));
         physics_state[b + P_IN_DANGER_BIOME] = 1.0;
         physics_state[b + P_DANGER_PATH_LENGTH] += step_len;
     } else {

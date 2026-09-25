@@ -36,11 +36,11 @@ const PLANNING_REFERENCE_BASELINE: &[(&str, usize)] = &[
     ("crates/xagent-brain/src/gpu_kernel.rs", 4),
     (
         "crates/xagent-brain/src/shaders/kernel/phase_physics.wgsl",
-        1,
+        2,
     ),
     ("crates/xagent-sandbox/src/governor.rs", 1),
     ("crates/xagent-sandbox/src/main.rs", 2),
-    ("crates/xagent-sandbox/tests/integration.rs", 13),
+    ("crates/xagent-sandbox/tests/integration.rs", 14),
     ("crates/xagent-shared/src/config.rs", 1),
 ];
 

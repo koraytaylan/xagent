@@ -3336,9 +3336,9 @@ fn death_applies_terminal_td_update_through_traces() {
         return;
     }
 
-    /// Under the path-length hazard model, stationary agents
-    /// (movement_speed = 0.0) take zero hazard damage (step_len = 0).
-    /// Instead, we use energy depletion to trigger death reliably on tick 1.
+    /// A stationary agent in danger loses only the per-tick floor dose, far
+    /// too slowly to die in one tick, so energy depletion triggers death
+    /// reliably on tick 1 instead.
     /// With max_energy = 0.001 and per-tick drain ≈ 0.018, the agent will
     /// be dead by tick 1, allowing us to test the terminal TD update.
     const ONE_TICK_KILL_MAX_ENERGY: f32 = 0.001;
@@ -3370,9 +3370,9 @@ fn death_applies_terminal_td_update_through_traces() {
 
     // This tick kills (energy 0.001 → 0 via depletion), respawns, and runs
     // one post-respawn brain tick whose traces were just zeroed — so the
-    // only bias change in this tick is the terminal kick. (Under the
-    // path-length hazard model a stationary probe agent takes zero hazard
-    // dose, so death is driven by energy depletion, not integrity damage.)
+    // only bias change in this tick is the terminal kick. (A stationary
+    // probe agent takes only the per-tick floor hazard dose, so death is
+    // driven by energy depletion, not integrity damage.)
     arena.kernel.dispatch_batch(1, 1);
 
     let physics = arena.kernel.read_full_state_blocking();
@@ -3414,9 +3414,9 @@ fn td_traces_bounded_across_deaths() {
         return;
     }
 
-    /// Under the path-length hazard model, stationary agents
-    /// take zero hazard damage. Instead, we use energy depletion to trigger
-    /// repeated deaths. With max_energy = 1.8 and per-tick drain ≈ 0.018,
+    /// Stationary agents in danger lose integrity only at the per-tick
+    /// floor dose (≈ 200 ticks to die), so energy depletion triggers the
+    /// repeated deaths instead. With max_energy = 1.8 and per-tick drain ≈ 0.018,
     /// agents die roughly every 100 ticks, guaranteeing multiple deaths in
     /// 350 ticks for testing trace reset and bounding.
     const RUN_TICKS: usize = 350;
@@ -3613,28 +3613,30 @@ fn hazard_probe_exit_latency_baseline() {
          mean_exit_latency={mean_latency:.1} death_fraction={death_fraction:.3}"
     );
 
-    // Pinned baseline recorded 2026-06-17 on macOS/Metal (wgpu adapter):
-    // raw exit_fraction=0.396, mean_exit_latency=315.0, death_fraction=0.000
-    // (19/48 exits, mean of exits 315.0, 0/48 deaths). This is a substantial
-    // improvement over the per-tick hazard model (raw 0.188 / 0.812 deaths);
-    // path-length hazard makes danger graded-not-lethal, so fast
-    // maneuvering agents escape more often and stationary/slow agents take
-    // zero dose. ±50% relative bands for exit_fraction and mean_latency.
-    // death_fraction is now ≈0; use an absolute upper bound (0.05 = 2/48).
+    // Pinned baseline recorded 2026-09-25 on Linux/RADV (AMD Raphael iGPU):
+    // exit_fraction=0.208, mean_exit_latency=125.0, death_fraction=0.792
+    // (10/48 exits, 38/48 deaths). The per-tick hazard floor makes dwelling
+    // lethal: an untrained agent that does not leave danger dies, matching
+    // the pre-floor per-tick model (0.188 exits / 0.812 deaths). A
+    // floor-free path-length dose let slow agents stay indefinitely (0.396
+    // exits / 0 deaths on Metal), which is exactly the freeze incentive the
+    // floor removes. ±50% relative bands for all three metrics (the death
+    // band is capped at 1.0).
     assert!(
-        (0.198..=0.594).contains(&exit_fraction),
-        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.198, 0.594] — \
+        (0.104..=0.312).contains(&exit_fraction),
+        "hazard exit_fraction {exit_fraction:.3} outside pinned band [0.104, 0.312] — \
          re-pin if avoidance improves"
     );
     assert!(
-        (157.5..=472.5).contains(&mean_latency),
-        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [157.5, 472.5] — \
+        (62.5..=187.5).contains(&mean_latency),
+        "hazard mean_exit_latency {mean_latency:.1} outside pinned band [62.5, 187.5] — \
          re-pin if avoidance improves"
     );
     assert!(
-        death_fraction <= 0.05,
-        "hazard death_fraction {death_fraction:.3} exceeds absolute bound 0.05 — \
-         path-length hazard should minimize deaths"
+        (0.396..=1.0).contains(&death_fraction),
+        "hazard death_fraction {death_fraction:.3} outside pinned band [0.396, 1.0] — \
+         dwelling in danger must stay lethal under the per-tick floor; re-pin if \
+         avoidance improves"
     );
 
     // Structural sanity: every trial resolves into exit, death, or
@@ -7668,33 +7670,33 @@ fn avoidance_potential_sign() {
     eprintln!("avoidance_potential_sign: all checks passed (shaping now zero)");
 }
 
-/// Plan 0009 (path-length-hazard-fused): hazard damage is a *dose* proportional to the
-/// distance traveled through danger, not to the number of ticks spent in it. The per-tick
-/// integrity loss is `WC_HAZARD_DAMAGE * integrity_scale * (step_len / reference_step)`,
-/// where `reference_step = 20.0 * WC_DT` is a default-speed agent's per-tick displacement.
+/// Hazard damage is a per-tick-floored dose: every tick in danger costs at
+/// least `hazard_damage_rate * integrity_scale` (what a default-speed agent
+/// takes per tick), and a tick that covers more than `reference_step =
+/// 20.0 * WC_DT` costs proportionally more. Over a run of `ticks` ticks through
+/// `danger_path_length` of danger the total dose therefore satisfies
 ///
-/// Because the loss and the danger-path accumulation use the SAME `step_len` every tick,
-/// the total integrity lost over ANY trajectory through danger equals exactly
-/// `hazard_damage_rate * integrity_scale * danger_path_length / reference_step` — so the
-/// loss *per unit danger distance* is the speed-invariant constant `hazard*scale/ref`,
-/// independent of speed or path shape (a fast sprint and a slow walk across the same band
-/// absorb the same dose). This is the falsifiable form of the spec invariant:
-/// - **default-speed-neutral**: at default speed `step_len ≈ reference_step`, so per-tick
-///   loss ≈ `hazard*scale` — byte-identical to the old per-tick model.
-/// - **speed-invariant**: a 2× agent has the SAME loss-per-distance.
+/// `max(ticks, path / ref) ≤ damage / (hazard * scale) ≤ ticks + path / ref`.
 ///
-/// The old per-tick model — and the rejected `max(step_len, reference_step)` floor —
-/// inflate the loss-per-distance for any agent moving slower than `reference_step`
-/// (a stationary agent would take full damage instead of zero), so this ratio cleanly
-/// falsifies them.
+/// Falsifiable against both rejected models:
+/// - **pure path-length dose** (no floor): a stationary agent takes zero
+///   damage — fails the exact stationary check and the per-tick floor;
+/// - **pure per-tick dose**: a fast agent (steps well above `reference_step`)
+///   takes only `ticks` doses — fails the path lower bound.
 #[test]
-fn default_speed_crossing_damage_unchanged() {
+fn hazard_dose_is_floored_per_tick_and_path_proportional_above_default_speed() {
     if !xagent_brain::GpuKernel::is_available() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
 
     use xagent_brain::buffers::{P_DANGER_PATH_LENGTH, P_DEATH_COUNT, P_INTEGRITY};
+
+    /// Relative tolerance for the dose identities (float accumulation only).
+    const DOSE_TOLERANCE: f32 = 0.02;
+    /// Run length: short enough that the fastest arm (speed 100, up to 5
+    /// reference steps per tick) cannot exhaust 100 integrity.
+    const TICKS: u32 = 30;
 
     // Disable integrity regen so the integrity delta is a PURE hazard measurement
     // (regen is the only other integrity source; collisions don't apply to one agent).
@@ -7705,8 +7707,7 @@ fn default_speed_crossing_damage_unchanged() {
     };
     // reference_step = default_speed (20.0) * dt; the shader uses the same value.
     let reference_step = 20.0_f32 / world_config.tick_rate;
-    let expected =
-        world_config.hazard_damage_rate * BrainConfig::default().integrity_scale / reference_step;
+    let dose_per_step = world_config.hazard_damage_rate * BrainConfig::default().integrity_scale;
 
     // Build a normal world to borrow its terrain/biome grid dimensions + food, then
     // overwrite every biome cell with danger (biome id 2) so the agent is in hazard
@@ -7723,10 +7724,6 @@ fn default_speed_crossing_damage_unchanged() {
     let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
     let food_count = world.food_items.len();
     let spawn = Vec3::new(0.0, world.terrain.height_at(0.0, 0.0) + 1.0, 0.0);
-
-    // 60 ticks keeps the worst-case dose (full speed at 2×) below the 100 starting
-    // integrity, so the agent never dies and the dose measurement stays valid.
-    let ticks = 60_u32;
 
     let run = |movement_speed: f32| -> (f32, f32, f32) {
         let brain = BrainConfig {
@@ -7751,34 +7748,42 @@ fn default_speed_crossing_damage_unchanged() {
         )]);
 
         let initial_integrity = kernel.read_full_state_blocking()[P_INTEGRITY];
-        kernel.dispatch_ticks(0, ticks);
+        kernel.dispatch_ticks(0, TICKS);
         let after = kernel.read_full_state_blocking();
         let damage = initial_integrity - after[P_INTEGRITY];
         (damage, after[P_DANGER_PATH_LENGTH], after[P_DEATH_COUNT])
     };
 
-    // speed=10 is below default (20): EVERY per-tick displacement is < reference_step,
-    // so the rejected `max(step_len, reference_step)` floor would be active on every tick
-    // and inflate loss-per-distance above `expected` — this case directly falsifies the
-    // floor. speed=20/40 (default / 2×) additionally falsify the old per-tick model.
-    for &speed in &[10.0_f32, 20.0_f32, 40.0_f32] {
+    let ticks = TICKS as f32;
+
+    // Stationary: exactly one floor dose per tick.
+    let (still_damage, still_path, still_deaths) = run(0.0);
+    assert_eq!(still_deaths, 0.0, "stationary agent died during the window");
+    assert!(still_path < 1e-3, "stationary agent moved ({still_path})");
+    let still_expected = dose_per_step * ticks;
+    assert!(
+        (still_damage - still_expected).abs() / still_expected < DOSE_TOLERANCE,
+        "stationary agent took {still_damage:.4} damage, expected the per-tick floor          {still_expected:.4} — dwelling in danger must not be free"
+    );
+
+    // Moving agents: bounded between the floor/path lower bound and their sum.
+    for &speed in &[10.0_f32, 20.0, 100.0] {
         let (damage, danger_path, deaths) = run(speed);
-        assert_eq!(
-            deaths, 0.0,
-            "agent died during the window at speed {speed} — shorten the run so the dose measurement stays valid"
-        );
+        assert_eq!(deaths, 0.0, "agent died during the window at speed {speed}");
         assert!(
             danger_path > 1.0,
-            "agent barely moved through danger at speed {speed} (path {danger_path}); cannot measure dose-per-distance"
+            "agent barely moved through danger at speed {speed} (path {danger_path})"
         );
-        let loss_per_distance = damage / danger_path;
+        let doses = damage / dose_per_step;
+        let path_doses = danger_path / reference_step;
+        let lower = ticks.max(path_doses);
+        let upper = ticks + path_doses;
         eprintln!(
-            "speed={speed}: damage={damage:.4}, danger_path={danger_path:.4}, loss/dist={loss_per_distance:.4} (expected {expected:.4})"
+            "speed={speed}: damage={damage:.4} doses={doses:.3} path_doses={path_doses:.3}              bounds=[{lower:.3}, {upper:.3}]"
         );
         assert!(
-            (loss_per_distance - expected).abs() / expected < 0.02,
-            "hazard loss-per-danger-distance {loss_per_distance:.4} != expected {expected:.4} at speed {speed} — \
-             dose is not proportional to path length (a per-tick floor inflates this for sub-reference steps)"
+            doses >= lower * (1.0 - DOSE_TOLERANCE) && doses <= upper * (1.0 + DOSE_TOLERANCE),
+            "speed {speed}: {doses:.3} doses outside [{lower:.3}, {upper:.3}] — dose must be              the per-tick floor or the path-proportional dose, whichever is larger"
         );
     }
 }

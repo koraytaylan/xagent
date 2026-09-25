@@ -2624,6 +2624,77 @@ fn actor_step_scales_with_actor_vector_scale() {
     );
 }
 
+/// With the steering-freeze flag set, a generation of TD updates must leave
+/// the turn weights and the turn bias untouched while the forward weights
+/// still move. Otherwise evolution would score a policy the lifetime learner
+/// had already replaced.
+#[test]
+fn frozen_steering_weights_ignore_td_updates() {
+    use xagent_brain::buffers::{
+        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_ACT_BIASES,
+    };
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    let brain = probe_brain_config();
+    let world_config = WorldConfig {
+        seed: 1,
+        ..Default::default()
+    };
+    let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+    kernel.set_freeze_steering_weights(true);
+    kernel.reset_agents_seeded(&brain, 67);
+    let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+    let biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
+    kernel.upload_agents(&[(
+        glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+        100.0,
+        100.0,
+        brain.memory_capacity,
+        brain.processing_slots,
+    )]);
+    kernel.upload_world(
+        &heights,
+        &biomes,
+        &[(0.0, PROBE_FOOD_Y, 8.0)],
+        &[false],
+        &[0.0],
+    );
+
+    let before = kernel.read_agent_state(0);
+    const TICKS: u64 = 40;
+    for tick in 0..TICKS {
+        kernel.dispatch_batch(tick, 1);
+    }
+    let after = kernel.read_agent_state(0);
+
+    let turn_before =
+        &before.brain_state[O_ACTION_TURN_WEIGHTS..O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION];
+    let turn_after =
+        &after.brain_state[O_ACTION_TURN_WEIGHTS..O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION];
+    assert_eq!(
+        turn_before, turn_after,
+        "frozen turn weights changed across {TICKS} ticks"
+    );
+    assert_eq!(
+        before.brain_state[O_ACT_BIASES + 1],
+        after.brain_state[O_ACT_BIASES + 1],
+        "frozen turn bias changed"
+    );
+    let forward_moved = (0..ENCODED_DIMENSION).any(|index| {
+        before.brain_state[O_ACTION_FORWARD_WEIGHTS + index]
+            != after.brain_state[O_ACTION_FORWARD_WEIGHTS + index]
+    });
+    assert!(
+        forward_moved,
+        "forward weights did not move, so the freeze test never exercised a TD update"
+    );
+}
+
 /// Baseline directional-learning probe: with the current learner, the sign
 /// of the turn output should be uncorrelated with the food's bearing —
 /// alignment ≈ chance. A learner that acquires food-approach behavior must
@@ -8521,10 +8592,9 @@ fn seeded_ab_arms_are_paired() {
         eprintln!("Skipping: no GPU/fallback adapter available");
         return;
     }
-    // Two runs with identical world seed and mutate_config_seeded/mutate_brain_state_seeded
-    // must produce byte-identical initial genomes and brain states. This test verifies
-    // that the A/B harness uses seeded mutations so both arms draw the same randomness
-    // and can be attributed solely to the flags, not to uncontrolled RNG differences.
+    // Two runs that draw steering genomes from the same world seed must produce
+    // byte-identical brains. The headless validation harness seeds its RNG that
+    // way, so an arm difference is the flag under test.
 
     use xagent_brain::GpuKernel;
     use xagent_sandbox::agent::{mutate_brain_state_seeded, mutate_config_seeded};
@@ -8607,6 +8677,21 @@ fn seeded_ab_arms_are_paired() {
             config1.orientation_offset, config2.orientation_offset,
             "Config [{}] orientation_offset differs",
             i
+        );
+    }
+
+    use rand::SeedableRng;
+    use xagent_sandbox::agent::{fresh_brain_state, steering_population};
+    let mut rng_a = rand::rngs::SmallRng::seed_from_u64(world_seed);
+    let mut rng_b = rand::rngs::SmallRng::seed_from_u64(world_seed);
+    let birth_a = fresh_brain_state(&brain_config, &mut rng_a);
+    let birth_b = fresh_brain_state(&brain_config, &mut rng_b);
+    let population_a = steering_population(&birth_a, 6, 2, 0.1, &mut rng_a);
+    let population_b = steering_population(&birth_b, 6, 2, 0.1, &mut rng_b);
+    for (index, (left, right)) in population_a.iter().zip(population_b.iter()).enumerate() {
+        assert_eq!(
+            left.brain_state, right.brain_state,
+            "steering genome {index} differs between arms"
         );
     }
 

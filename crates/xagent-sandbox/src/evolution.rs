@@ -154,25 +154,10 @@ impl App {
             self.brain_config.clone()
         };
         let pop_size = self.governor_config.population_size;
-        let repeats = self.governor_config.eval_repeats.max(1);
-        let unique_count = (pop_size / repeats).max(1);
-
-        // Build unique configs matching breed_next_generation structure
-        // so that reduce_fitness grouping (agent_index / eval_repeats)
-        // correctly averages same-config runs.
-        let mut unique_configs = vec![seed.clone()]; // slot 0: champion
-        for _ in 1..unique_count {
-            unique_configs.push(mutate_config(&seed));
-        }
-
-        // Repeat each config eval_repeats times
-        for uc in &unique_configs {
-            for _ in 0..repeats {
-                if self.agents.len() >= pop_size {
-                    break;
-                }
-                self.spawn_agent(uc.clone(), 0);
-            }
+        // Every agent carries the spawn parent's config. The worker groups
+        // agents by `eval_repeats` and gives each group one steering genome.
+        for _ in 0..pop_size {
+            self.spawn_agent(seed.clone(), 0);
         }
 
         // Start replay recording
@@ -404,6 +389,7 @@ impl App {
             inherited,
             resume,
             generation_epoch: self.generation_epoch,
+            freeze_steering_weights: true,
         };
         if let Some(runtime) = &self.sim_runtime {
             runtime.send(SimCommand::ResetPopulation(Box::new(request)));

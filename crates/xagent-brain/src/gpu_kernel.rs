@@ -445,6 +445,10 @@ pub struct GpuKernel {
     has_subgroup: bool, // retained for runtime diagnostics
     danger_percept_enabled: bool,
     danger_percept_blinded: bool,
+    /// When set, brain-config uploads store `1.0` in
+    /// [`CFG_FREEZE_STEERING_WEIGHTS`] so the turn policy stays at the
+    /// uploaded weights for the whole generation.
+    freeze_steering_weights: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
     world_config_scratch: [f32; WORLD_CONFIG_SIZE],
@@ -729,7 +733,30 @@ impl GpuKernel {
         self.queue.write_buffer(
             &self.brain_config_buffer,
             0,
-            bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
+            bytemuck::cast_slice(&self.packed_brain_config(brain_config)),
+        );
+    }
+
+    /// Brain-config uniform, including the steering-freeze flag stored on this kernel.
+    fn packed_brain_config(&self, brain_config: &BrainConfig) -> Vec<f32> {
+        let mut cfg = build_config_for(brain_config, &self.layout);
+        pack_freeze_steering_weights(&mut cfg, self.freeze_steering_weights);
+        cfg
+    }
+
+    /// Hold (`true`) or release (`false`) the turn-policy weights and the turn
+    /// bias. The flag is written into the brain-config uniform immediately and
+    /// again on every later agent reset, so a generation scored by evolution
+    /// keeps the steering genome that was uploaded with the brain.
+    pub fn set_freeze_steering_weights(&mut self, freeze: bool) {
+        self.freeze_steering_weights = freeze;
+        let packed = [if freeze { 1.0_f32 } else { 0.0 }];
+        let byte_offset =
+            u64::try_from(CFG_FREEZE_STEERING_WEIGHTS * std::mem::size_of::<f32>()).unwrap_or(0);
+        self.queue.write_buffer(
+            &self.brain_config_buffer,
+            byte_offset,
+            bytemuck::cast_slice(&packed),
         );
     }
 
@@ -1523,6 +1550,7 @@ impl GpuKernel {
             speed_cost_exponent: brain_config.speed_cost_exponent,
             danger_percept_enabled: brain_config.danger_percept_enabled,
             danger_percept_blinded: brain_config.danger_percept_blinded,
+            freeze_steering_weights: false,
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
@@ -3033,7 +3061,7 @@ impl GpuKernel {
         self.queue.write_buffer(
             &self.brain_config_buffer,
             0,
-            bytemuck::cast_slice(&build_config_for(brain_config, &self.layout)),
+            bytemuck::cast_slice(&self.packed_brain_config(brain_config)),
         );
         true
     }

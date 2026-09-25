@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use xagent_brain::buffers::{BrainLayout, PATTERN_STRIDE};
 use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
-use xagent_sandbox::agent::mutate_brain_state;
+use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
 use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::app::{PendingUpload, SIM_DT};
@@ -108,9 +108,11 @@ pub struct StateSnapshot {
 
 /// Champion brain state to seed into the next generation on reset.
 ///
-/// The first `champion_slots` agents inherit the champion's exact weights; the
-/// rest inherit mutated copies, reproducing the neuroevolution seeding the
-/// main-thread transition used to perform.
+/// The first `champion_slots` agents inherit the champion's exact brain. The
+/// rest inherit mutated copies. When the reset freezes steering weights, each
+/// following group of `champion_slots` agents shares one mutation of the turn
+/// weights and the turn bias, and every other weight stays equal to the
+/// champion's.
 pub struct InheritedBrain {
     pub champion: AgentBrainState,
     pub mutation_strength: f32,
@@ -129,6 +131,9 @@ pub struct ResetRequest {
     pub inherited: Option<InheritedBrain>,
     /// Whether the worker should resume (unpause) once the reset completes.
     pub resume: bool,
+    /// Hold the turn-policy weights fixed for this generation and vary them
+    /// across repeat-groups instead of varying `BrainConfig`.
+    pub freeze_steering_weights: bool,
     /// Generation epoch of the new population; every snapshot the worker
     /// publishes after the reset carries it.
     pub generation_epoch: u64,
@@ -192,6 +197,14 @@ pub struct SimInit {
     /// Generation epoch of the initial population (see
     /// [`StateSnapshot::generation_epoch`]).
     pub generation_epoch: u64,
+    /// Hold the turn policy fixed and search it. Free play and tests leave
+    /// this false so lifetime learning still updates the turn weights.
+    pub freeze_steering_weights: bool,
+    /// Agents that share one steering genome. Matches `eval_repeats`.
+    pub steering_group_size: usize,
+    /// Turn-policy mutation strength for the first generation, before a
+    /// champion brain exists. Later generations use [`InheritedBrain`].
+    pub steering_mutation_strength: f32,
 }
 
 /// Partition a batch of drained events into the newest current-epoch state
@@ -337,6 +350,8 @@ struct Worker {
 
     counters: WorkerCounters,
     last_counters_log: Instant,
+    steering_group_size: usize,
+    steering_mutation_strength: f32,
 }
 
 /// Whether an inherited champion brain matches the layout `brain_config`
@@ -377,7 +392,7 @@ fn patch_agent_configs(kernel: &GpuKernel, configs: &[BrainConfig]) {
 impl Worker {
     /// Create the kernel and upload the initial world + agents.
     fn new(init: SimInit) -> Self {
-        let kernel = GpuKernel::new(
+        let mut kernel = GpuKernel::new(
             init.agent_count,
             init.food_count,
             &init.brain_config,
@@ -391,6 +406,20 @@ impl Worker {
             &init.upload.food_timers,
         );
         kernel.upload_agents(&init.upload.agent_data);
+        if init.freeze_steering_weights {
+            kernel.set_freeze_steering_weights(true);
+            let mut rng = rand::rng();
+            let birth = fresh_brain_state(&init.brain_config, &mut rng);
+            let count = usize::try_from(kernel.agent_count()).unwrap_or(0);
+            let genomes = steering_population(
+                &birth,
+                count,
+                init.steering_group_size,
+                init.steering_mutation_strength,
+                &mut rng,
+            );
+            kernel.batch_write_agent_states(count, |index| genomes[index].clone());
+        }
         patch_agent_configs(&kernel, &init.upload.agent_configs);
         Self {
             kernel,
@@ -411,6 +440,8 @@ impl Worker {
             last_telemetry_agent: None,
             counters: WorkerCounters::default(),
             last_counters_log: Instant::now(),
+            steering_group_size: init.steering_group_size.max(1),
+            steering_mutation_strength: init.steering_mutation_strength,
         }
     }
 
@@ -459,6 +490,8 @@ impl Worker {
         let next_agent_count = u32::try_from(request.upload.agent_data.len()).unwrap_or(u32::MAX);
         self.brain_config = request.brain_config;
         self.generation_epoch = request.generation_epoch;
+        self.kernel
+            .set_freeze_steering_weights(request.freeze_steering_weights);
 
         if self.kernel.agent_count() == next_agent_count {
             // Population size unchanged — reseed in place. Spin on the
@@ -492,19 +525,41 @@ impl Worker {
                 &request.upload.food_consumed,
                 &request.upload.food_timers,
             );
+            if request.freeze_steering_weights {
+                self.kernel.set_freeze_steering_weights(true);
+            }
         }
         self.kernel.upload_agents(&request.upload.agent_data);
 
         let inherited = request
             .inherited
             .filter(|inherited| inherited_brain_fits(&inherited.champion, &self.brain_config));
-        if let Some(inherited) = inherited {
-            let count = self.kernel.agent_count() as usize;
+        if request.freeze_steering_weights {
+            let mut rng = rand::rng();
+            let (template, strength, group_size) = if let Some(inherited) = inherited {
+                (
+                    inherited.champion,
+                    inherited.mutation_strength,
+                    inherited.champion_slots,
+                )
+            } else {
+                (
+                    fresh_brain_state(&self.brain_config, &mut rng),
+                    self.steering_mutation_strength,
+                    self.steering_group_size,
+                )
+            };
+            let count = usize::try_from(self.kernel.agent_count()).unwrap_or(0);
+            let genomes = steering_population(&template, count, group_size, strength, &mut rng);
+            self.kernel
+                .batch_write_agent_states(count, |index| genomes[index].clone());
+        } else if let Some(inherited) = inherited {
+            let count = usize::try_from(self.kernel.agent_count()).unwrap_or(0);
             let champion = inherited.champion;
             let strength = inherited.mutation_strength;
             let champion_slots = inherited.champion_slots;
-            self.kernel.batch_write_agent_states(count, |i| {
-                if i < champion_slots {
+            self.kernel.batch_write_agent_states(count, |index| {
+                if index < champion_slots {
                     champion.clone()
                 } else {
                     mutate_brain_state(&champion, strength)
@@ -1039,6 +1094,9 @@ mod tests {
             paused,
             selected_agent: 0,
             generation_epoch: 0,
+            freeze_steering_weights: false,
+            steering_group_size: 1,
+            steering_mutation_strength: 0.0,
         }
     }
 
@@ -1133,6 +1191,9 @@ mod tests {
             paused: true,
             selected_agent: 0,
             generation_epoch: 0,
+            freeze_steering_weights: false,
+            steering_group_size: 1,
+            steering_mutation_strength: 0.0,
         });
 
         // The champion is agent 0's inherited state: it carries WAVELENGTH_A in
@@ -1157,6 +1218,7 @@ mod tests {
             }),
             resume: false,
             generation_epoch: 1,
+            freeze_steering_weights: false,
         });
 
         // Snapshots published after the reset carry the request's epoch.
@@ -1260,6 +1322,7 @@ mod tests {
             }),
             resume: true,
             generation_epoch: 1,
+            freeze_steering_weights: false,
         })));
 
         // The worker logs the reset once it processes the command...

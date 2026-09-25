@@ -20,19 +20,23 @@ use serde::{Deserialize, Serialize};
 ///   does not change with this value.
 /// - **legacy** — carried through config/UI/evolution for backwards
 ///   compatibility but currently has no kernel-side effect.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// The generational search copies the spawn parent's config into every
+/// offspring and searches the turn-policy weights instead. `mutate_config`
+/// still perturbs the fields whose docs name it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrainConfig {
     /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
     /// via `metabolic_drain_per_tick` and `physics_state[P_MEMORY_CAP]`. The
     /// kernel's actual pattern-memory size is fixed at
     /// `xagent_brain::buffers::MEMORY_CAP = 128`, independent of this value.
-    /// Mutated by evolution; clamped to `[1, 2048]` at breeding time.
+    /// Perturbed by `mutate_config`; clamped to `[1, 2048]`.
     pub memory_capacity: usize,
     /// **Proxy (metabolic).** Scales the per-tick metabolic brain-drain cost
     /// via `metabolic_drain_per_tick` and `physics_state[P_PROCESSING_SLOTS]`.
     /// The kernel's actual recall width is fixed at
     /// `xagent_brain::buffers::RECALL_K = 16`, independent of this value.
-    /// Mutated by evolution; clamped to `[1, 128]` at breeding time.
+    /// Perturbed by `mutate_config`; clamped to `[1, 128]`.
     pub processing_slots: usize,
     /// **Legacy.** Superseded by the visual-cortex config (`retina_*`,
     /// `gabor_*`); retained only for deserialization back-compat (issue #106).
@@ -56,19 +60,19 @@ pub struct BrainConfig {
     /// Decay rate for unreinforced patterns per tick.
     pub decay_rate: f32,
     /// Exponent for the homeostatic distress curve. Higher = calm longer, panic harder.
-    /// Heritable: mutated during breeding, clamped to [1.5, 5.0]. Default 2.0.
+    /// Heritable: perturbed by `mutate_config`, clamped to [1.5, 5.0]. Default 2.0.
     #[serde(default = "default_distress_exponent")]
     pub distress_exponent: f32,
     /// Scales per-dimension variance into attenuation range. Higher = faster boredom.
-    /// Heritable: mutated during breeding, clamped to [5.0, 50.0]. Default 20.0.
+    /// Heritable: perturbed by `mutate_config`, clamped to [5.0, 50.0]. Default 20.0.
     #[serde(default = "default_habituation_sensitivity")]
     pub habituation_sensitivity: f32,
     /// Maximum curiosity bonus from sensory monotony. Higher = stronger exploration drive.
-    /// Heritable: mutated during breeding, clamped to [0.1, 1.0]. Default 0.6.
+    /// Heritable: perturbed by `mutate_config`, clamped to [0.1, 1.0]. Default 0.6.
     #[serde(default = "default_max_curiosity_bonus")]
     pub max_curiosity_bonus: f32,
     /// Minimum motor output under fatigue. Lower = harsher dampening.
-    /// Heritable: mutated during breeding, clamped to [0.05, 0.4]. Default 0.1.
+    /// Heritable: perturbed by `mutate_config`, clamped to [0.05, 0.4]. Default 0.1.
     #[serde(default = "default_fatigue_floor")]
     pub fatigue_floor: f32,
     /// Visual field width in pixels. Default 8. Odd × odd grids (e.g. 17×13)
@@ -116,7 +120,7 @@ pub struct BrainConfig {
     #[serde(default = "default_integrity_scale")]
     pub integrity_scale: f32,
     /// Base movement speed (units per second). Default 20.0.
-    /// Heritable: mutated during breeding, clamped to [1.0, 100.0].
+    /// Heritable: perturbed by `mutate_config`, clamped to [1.0, 100.0].
     #[serde(default = "default_movement_speed")]
     pub movement_speed: f32,
     /// Exponent for speed-cost drag curve in the fused kernel's energy drain.
@@ -195,20 +199,20 @@ pub struct BrainConfig {
     /// **Heritable (visual genome).** V1 Gabor carrier wavelength λ
     /// in retina pixels for the whole simple-cell bank. The envelope σ is tied
     /// as `0.56·λ` (≈ 1-octave V1 bandwidth, Jones & Palmer 1987). Seed 5.0;
-    /// mutated during breeding, clamped to
+    /// perturbed by `mutate_config`, clamped to
     /// `[GABOR_WAVELENGTH_MIN, GABOR_WAVELENGTH_MAX]` = `[2.0, 12.0]`. The shader
     /// re-imposes the clamp and the Gabor DC-balance invariant after reading it.
     #[serde(default = "default_gabor_wavelength")]
     pub gabor_wavelength: f32,
     /// **Heritable (visual genome).** Gabor envelope aspect ratio γ
     /// (long axis / short axis) for the whole bank; at 1.0 the envelope is
-    /// isotropic. Seed 0.5; mutated during breeding, clamped to
+    /// isotropic. Seed 0.5; perturbed by `mutate_config`, clamped to
     /// `[GABOR_ASPECT_RATIO_MIN, GABOR_ASPECT_RATIO_MAX]` = `[0.25, 1.0]`.
     #[serde(default = "default_gabor_aspect_ratio")]
     pub gabor_aspect_ratio: f32,
     /// **Heritable (visual genome).** DoG surround:center sigma ratio
     /// for the Stage-1 center-surround kernel. Seed 1.6 (Marr & Hildreth 1980
-    /// edge operator); mutated during breeding, clamped to
+    /// edge operator); perturbed by `mutate_config`, clamped to
     /// `[DOG_SURROUND_RATIO_MIN, DOG_SURROUND_RATIO_MAX]` = `[1.2, 3.0]` so a
     /// mutated value can never degenerate the kernel into a non-edge blur. The
     /// shader re-imposes the clamp and the DoG zero-sum invariant after reading.
@@ -216,20 +220,20 @@ pub struct BrainConfig {
     pub dog_surround_ratio: f32,
     /// **Heritable (visual genome).** Whole-bank orientation offset in
     /// radians, added to the even `[0, π)` tiling of the Gabor bank. Seed 0.0;
-    /// mutated during breeding and wrapped back into `[0, π)` (orientation is
+    /// perturbed by `mutate_config` and wrapped back into `[0, π)` (orientation is
     /// half-circle periodic for an unsigned bar), so it has no hard clamp — the
     /// wrap is the bound the shader and the mutation path both apply.
     #[serde(default = "default_orientation_offset")]
     pub orientation_offset: f32,
     /// **Heritable (innate instinct gene).** Multiplier for the danger instinct
     /// pattern's negative valence, controlling how strongly aversive the seeded danger
-    /// prior is. Seed 0.8; mutated during breeding, clamped to
+    /// prior is. Seed 0.8; perturbed by `mutate_config`, clamped to
     /// `[INSTINCT_DANGER_STRENGTH_MIN, INSTINCT_DANGER_STRENGTH_MAX]` = `[0.1, 1.0]`.
     #[serde(default = "default_instinct_danger_strength")]
     pub instinct_danger_strength: f32,
     /// **Heritable (innate instinct gene).** Multiplier for the food instinct
     /// pattern's positive valence, controlling how strongly appetitive the seeded
-    /// food/energy-gain prior is. Seed 0.8; mutated during breeding, clamped to
+    /// food/energy-gain prior is. Seed 0.8; perturbed by `mutate_config`, clamped to
     /// `[INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX]` = `[0.1, 1.0]`.
     #[serde(default = "default_instinct_food_strength")]
     pub instinct_food_strength: f32,
@@ -466,16 +470,19 @@ pub struct GovernorConfig {
     pub population_size: usize,
     /// Simulation ticks per generation before evaluation.
     pub tick_budget: u64,
-    /// Number of top agents whose configs survive to the next generation.
+    /// Number of top configs remembered for island migration. Breeding copies
+    /// the spawn parent and does not consult this list.
     pub elitism_count: usize,
     /// Maximum number of generations to run (0 = unlimited).
     pub max_generations: u64,
     /// Consecutive generations of fitness regression before backtracking.
     pub patience: u32,
-    /// Base mutation strength (0.1 = ±10%). Scales up with failed attempts.
+    /// Base strength of the turn-policy mutation. Scales up with failed
+    /// attempts, from this value toward 0.5.
     #[serde(default = "default_mutation_strength")]
     pub mutation_strength: f32,
-    /// How many times each unique config is evaluated per generation (noise reduction).
+    /// How many agents share one steering genome per generation. Their fitness
+    /// is averaged.
     #[serde(default = "default_eval_repeats")]
     pub eval_repeats: usize,
     /// Number of independent evolutionary lineages (island model).

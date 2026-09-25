@@ -14,8 +14,9 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
 use xagent_brain::buffers::{
-    AgentBrainState, ENCODED_DIMENSION, FIXED_TAIL_SIZE, O_ACTION_FORWARD_WEIGHTS,
-    O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
+    init_brain_state_for, init_pattern_memory, seed_instinct_patterns, AgentBrainState,
+    BrainLayout, ENCODED_DIMENSION, FIXED_TAIL_SIZE, MAX_WEIGHT_NORM, O_ACTION_FORWARD_WEIGHTS,
+    O_ACTION_TURN_WEIGHTS, O_ACT_BIASES, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
 };
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
@@ -389,10 +390,152 @@ pub fn mutate_config_with_strength(
     mutate_config_with_strength_rng(parent, strength, momentum, &mut rng)
 }
 
-/// Perturb inherited GPU brain state for neuroevolution.
+/// Fraction of turn-policy weights a single steering mutant redraws.
+/// A quarter moves `w · encoded` enough for siblings to behave differently
+/// while most of an inherited steering map stays in place.
+const STEERING_MUTATION_FRACTION: f32 = 0.25;
+
+/// Half-width of the uniform kick on one touched turn weight, multiplied by
+/// the governor's mutation strength (about 0.1 at the start of a lineage and
+/// at most 0.5). At strength 0.5 a touched weight moves by up to ±0.5, which
+/// is visible in the turn command after exploration noise averages out over a
+/// generation and still fits in the shader's weight ball.
+const STEERING_WEIGHT_STEP: f32 = 1.0;
+
+/// Half-width of the turn-bias kick, in the same units as
+/// [`STEERING_WEIGHT_STEP`]. The bias is added to every scene, so every mutant
+/// touches it.
+const STEERING_BIAS_STEP: f32 = 1.0;
+
+/// Locations of the actor weights inside one `brain_state` buffer.
+struct BrainWeightOffsets {
+    feature_count: usize,
+    predictor_weights: usize,
+    forward_weights: usize,
+    turn_weights: usize,
+    turn_bias: usize,
+}
+
+fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
+    let variable_part = state
+        .brain_state
+        .len()
+        .checked_sub(ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE)
+        .expect("brain_state too short for layout");
+    assert!(
+        variable_part % ENCODED_DIMENSION == 0,
+        "brain_state length not aligned to ENCODED_DIMENSION"
+    );
+    let feature_count = variable_part / ENCODED_DIMENSION;
+    let predictor_weights = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION;
+    let predictor_context = predictor_weights + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+    let forward_weights =
+        predictor_context + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let turn_weights = predictor_context + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let turn_bias = predictor_context + (O_ACT_BIASES - O_PREDICTOR_CONTEXT_WEIGHT) + 1;
+    assert!(
+        turn_bias < state.brain_state.len(),
+        "computed offsets exceed brain_state bounds"
+    );
+    BrainWeightOffsets {
+        feature_count,
+        predictor_weights,
+        forward_weights,
+        turn_weights,
+        turn_bias,
+    }
+}
+
+/// Scale the turn-weight vector into the shader's L2 ball so the first brain
+/// tick does not change the genome by rescaling it.
+fn rescale_turn_weights(state: &mut [f32], turn_weights: usize) {
+    let mut norm_sq = 0.0_f32;
+    for weight in state.iter().skip(turn_weights).take(ENCODED_DIMENSION) {
+        norm_sq += weight * weight;
+    }
+    let norm = norm_sq.sqrt();
+    if norm > MAX_WEIGHT_NORM {
+        let scale = MAX_WEIGHT_NORM / norm;
+        for weight in state.iter_mut().skip(turn_weights).take(ENCODED_DIMENSION) {
+            *weight *= scale;
+        }
+    }
+}
+
+/// Birth brain shared by one generation before a champion exists: one encoder
+/// draw plus blank (or instinct) pattern memory. Steering mutants of this
+/// brain differ only in the turn policy, so selection compares the same
+/// representation.
+pub fn fresh_brain_state(config: &BrainConfig, rng: &mut impl Rng) -> AgentBrainState {
+    let layout = BrainLayout::from_config(config);
+    let patterns = if config.innate_instincts_enabled {
+        seed_instinct_patterns(
+            config.instinct_danger_strength,
+            config.instinct_food_strength,
+        )
+    } else {
+        init_pattern_memory()
+    };
+    AgentBrainState {
+        brain_state: init_brain_state_for(config, &layout, rng),
+        patterns,
+    }
+}
+
+/// Perturb the turn-policy weights and the turn bias. Encoder, forward-policy,
+/// predictor, and value weights are copied unchanged: those are not the
+/// genome evolution scores.
+pub fn mutate_steering_weights(
+    state: &AgentBrainState,
+    strength: f32,
+    rng: &mut impl Rng,
+) -> AgentBrainState {
+    let mut mutated = state.clone();
+    let offsets = brain_weight_offsets(state);
+    for index in 0..ENCODED_DIMENSION {
+        if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
+            let kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
+            mutated.brain_state[offsets.turn_weights + index] += kick;
+        }
+    }
+    rescale_turn_weights(&mut mutated.brain_state, offsets.turn_weights);
+    let bias_kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_BIAS_STEP;
+    mutated.brain_state[offsets.turn_bias] = (mutated.brain_state[offsets.turn_bias] + bias_kick)
+        .clamp(-MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
+    mutated
+}
+
+/// One brain per agent. Group 0 keeps `template`. Each later group of
+/// `group_size` agents shares one [`mutate_steering_weights`] draw, matching
+/// the way fitness is averaged over `eval_repeats` slots.
+pub fn steering_population(
+    template: &AgentBrainState,
+    count: usize,
+    group_size: usize,
+    strength: f32,
+    rng: &mut impl Rng,
+) -> Vec<AgentBrainState> {
+    let group_size = group_size.max(1);
+    let mut genomes = Vec::with_capacity(count);
+    let mut cached: Vec<AgentBrainState> = Vec::new();
+    for index in 0..count {
+        let group = index / group_size;
+        if group == 0 {
+            genomes.push(template.clone());
+        } else {
+            let slot = group - 1;
+            if slot == cached.len() {
+                cached.push(mutate_steering_weights(template, strength, rng));
+            }
+            genomes.push(cached[slot].clone());
+        }
+    }
+    genomes
+}
+
+/// Perturb inherited GPU brain state.
 /// Mutates encoder weights (10%), action weights (20%), and predictor weights (5%)
-/// with configurable strength. This lets evolution explore behavioral
-/// variations that within-lifetime learning might miss.
+/// with configurable strength.
 ///
 /// Creates a thread-local RNG internally. Use `mutate_brain_state_with_rng`
 /// directly when reproducible draws are required (e.g. seeded A/B paired tests).
@@ -563,56 +706,34 @@ fn mutate_brain_state_with_rng(
     rng: &mut impl rand::Rng,
 ) -> AgentBrainState {
     let mut mutated = state.clone();
-
-    // Derive layout from actual state length (supports dynamic vision_width × vision_height).
-    // brain_stride = fc * ENCODED_DIMENSION + ENCODED_DIMENSION + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE
-    let variable_part = state
-        .brain_state
-        .len()
-        .checked_sub(ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE)
-        .expect("brain_state too short for layout");
-    assert!(
-        variable_part % ENCODED_DIMENSION == 0,
-        "brain_state length not aligned to ENCODED_DIMENSION"
-    );
-    let fc = variable_part / ENCODED_DIMENSION;
-
-    let predictor_weights_offset = fc * ENCODED_DIMENSION + ENCODED_DIMENSION;
-    let predictor_context_offset =
-        predictor_weights_offset + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
-    // Fixed deltas from O_PREDICTOR_CONTEXT_WEIGHT are layout-independent
-    let act_fwd =
-        predictor_context_offset + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
-    let act_turn = predictor_context_offset + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
-
-    assert!(
-        act_turn + ENCODED_DIMENSION <= state.brain_state.len(),
-        "computed offsets exceed brain_state bounds"
-    );
+    let offsets = brain_weight_offsets(state);
 
     // Mutate encoder weights (small perturbation)
-    for i in 0..(fc * ENCODED_DIMENSION) {
+    for i in 0..(offsets.feature_count * ENCODED_DIMENSION) {
         if rng.random::<f32>() < 0.1 {
             mutated.brain_state[i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[i] = mutated.brain_state[i].clamp(-2.0, 2.0);
+            mutated.brain_state[i] =
+                mutated.brain_state[i].clamp(-MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
         }
     }
 
     // Mutate action weights
     for i in 0..ENCODED_DIMENSION {
         if rng.random::<f32>() < 0.2 {
-            mutated.brain_state[act_fwd + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
-            mutated.brain_state[act_turn + i] += (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
+            mutated.brain_state[offsets.forward_weights + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
+            mutated.brain_state[offsets.turn_weights + i] +=
+                (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.2;
         }
     }
 
     // Mutate predictor weights
     for i in 0..(PREDICTOR_DIMENSION * ENCODED_DIMENSION) {
         if rng.random::<f32>() < 0.05 {
-            mutated.brain_state[predictor_weights_offset + i] +=
+            mutated.brain_state[offsets.predictor_weights + i] +=
                 (rng.random::<f32>() * 2.0 - 1.0) * strength * 0.1;
-            mutated.brain_state[predictor_weights_offset + i] =
-                mutated.brain_state[predictor_weights_offset + i].clamp(-3.0, 3.0);
+            mutated.brain_state[offsets.predictor_weights + i] =
+                mutated.brain_state[offsets.predictor_weights + i].clamp(-3.0, 3.0);
         }
     }
 
@@ -895,6 +1016,73 @@ mod tests {
         assert!(
             !fwd_same,
             "mutate_brain_state should perturb action weights"
+        );
+    }
+
+    #[test]
+    fn mutate_steering_weights_touches_only_the_turn_policy() {
+        use rand::SeedableRng;
+        use xagent_brain::buffers::O_ACT_BIASES;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
+        let mut state = fresh_brain_state(&BrainConfig::default(), &mut rng);
+        for index in 0..ENCODED_DIMENSION {
+            state.brain_state[O_ACTION_FORWARD_WEIGHTS + index] = 0.25;
+            state.brain_state[O_ACTION_TURN_WEIGHTS + index] = 0.1;
+        }
+        state.brain_state[O_ACT_BIASES + 1] = 0.2;
+        let forward_before = state.brain_state[O_ACTION_FORWARD_WEIGHTS];
+        let encoder_before = state.brain_state[0];
+
+        let mut mutate_rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let mutated = mutate_steering_weights(&state, 0.4, &mut mutate_rng);
+
+        assert_eq!(
+            mutated.brain_state[O_ACTION_FORWARD_WEIGHTS],
+            forward_before
+        );
+        assert_eq!(mutated.brain_state[0], encoder_before);
+        let turn_moved = (0..ENCODED_DIMENSION).any(|index| {
+            mutated.brain_state[O_ACTION_TURN_WEIGHTS + index]
+                != state.brain_state[O_ACTION_TURN_WEIGHTS + index]
+        });
+        let bias_moved =
+            mutated.brain_state[O_ACT_BIASES + 1] != state.brain_state[O_ACT_BIASES + 1];
+        assert!(
+            turn_moved || bias_moved,
+            "a steering mutant must change the turn policy"
+        );
+        let norm_sq: f32 = (0..ENCODED_DIMENSION)
+            .map(|index| {
+                let weight = mutated.brain_state[O_ACTION_TURN_WEIGHTS + index];
+                weight * weight
+            })
+            .sum();
+        assert!(norm_sq.sqrt() <= MAX_WEIGHT_NORM + 1e-4);
+
+        let mut zero_rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let held = mutate_steering_weights(&state, 0.0, &mut zero_rng);
+        assert_eq!(held.brain_state, state.brain_state);
+    }
+
+    #[test]
+    fn steering_population_shares_a_genome_within_each_repeat_group() {
+        use rand::SeedableRng;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(3);
+        let template = fresh_brain_state(&BrainConfig::default(), &mut rng);
+        let mut population_rng = rand::rngs::SmallRng::seed_from_u64(9);
+        let genomes = steering_population(&template, 6, 2, 0.5, &mut population_rng);
+
+        assert_eq!(genomes[0].brain_state, template.brain_state);
+        assert_eq!(genomes[1].brain_state, template.brain_state);
+        assert_eq!(genomes[2].brain_state, genomes[3].brain_state);
+        assert_eq!(genomes[4].brain_state, genomes[5].brain_state);
+        assert_ne!(genomes[2].brain_state, template.brain_state);
+        assert_ne!(genomes[4].brain_state, genomes[2].brain_state);
+        assert_eq!(
+            genomes[2].brain_state[O_ACTION_FORWARD_WEIGHTS],
+            template.brain_state[O_ACTION_FORWARD_WEIGHTS]
         );
     }
 

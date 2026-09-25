@@ -23,6 +23,12 @@ static REPR_DIM_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 // ── Dimensions ───────────────────────────────────────────────────────
 
 pub const ENCODED_DIMENSION: usize = 128;
+
+/// L2 radius of one actor or critic weight vector, and the per-component clamp
+/// on the motor biases. The shader rescales a vector that grows past this on
+/// the next brain tick, so a mutant steering genome is scaled into the same
+/// ball before it is uploaded. Mirrored by `MAX_WEIGHT_NORM` in `common.wgsl`.
+pub const MAX_WEIGHT_NORM: f32 = 2.0;
 pub const PREDICTOR_DIMENSION: usize = ENCODED_DIMENSION;
 
 /// Factor for Xavier/Glorot uniform initialization of tanh-activated linear
@@ -588,7 +594,12 @@ pub const CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED: usize = 12;
 pub const CFG_HOMEO_PREDICTOR_LEARNING_RATE: usize = 13;
 /// β blend for predicted gradient into TD reward (homeostatic gradient predictor head).
 pub const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: usize = 14;
-pub const CONFIG_SIZE: usize = 16; // padded for uniform vec4 alignment (4 × vec4); 15 values used, last reserved
+/// `1.0` holds the turn-policy weights and the turn bias fixed. Evolution sets
+/// this so the inherited steering map is the policy being scored; lifetime TD
+/// would otherwise replace it before selection runs. `0.0` leaves the actor
+/// update on. Mirrored by `CFG_FREEZE_STEERING_WEIGHTS` in `common.wgsl`.
+pub const CFG_FREEZE_STEERING_WEIGHTS: usize = 15;
+pub const CONFIG_SIZE: usize = 16; // padded for uniform vec4 alignment (4 × vec4)
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
 
@@ -1001,6 +1012,13 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     cfg
 }
 
+/// Write the steering-freeze flag into a buffer previously filled by
+/// [`build_config_for`]. `true` stores `1.0` (turn weights and turn bias stay
+/// at the values uploaded with the brain); `false` stores `0.0`.
+pub fn pack_freeze_steering_weights(cfg: &mut [f32], freeze: bool) {
+    cfg[CFG_FREEZE_STEERING_WEIGHTS] = if freeze { 1.0 } else { 0.0 };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,6 +1282,35 @@ mod tests {
         assert!(CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED < CONFIG_SIZE);
         assert!(CFG_HOMEO_PREDICTOR_LEARNING_RATE < CONFIG_SIZE);
         assert!(CFG_HOMEO_PREDICTIVE_CREDIT_BETA < CONFIG_SIZE);
+        assert!(CFG_FREEZE_STEERING_WEIGHTS < CONFIG_SIZE);
+    }
+
+    #[test]
+    fn pack_freeze_steering_weights_uses_the_reserved_slot() {
+        let mut packed = build_config(&BrainConfig::default());
+        assert_eq!(packed[CFG_FREEZE_STEERING_WEIGHTS], 0.0);
+        pack_freeze_steering_weights(&mut packed, true);
+        assert_eq!(packed[CFG_FREEZE_STEERING_WEIGHTS], 1.0);
+        pack_freeze_steering_weights(&mut packed, false);
+        assert_eq!(packed[CFG_FREEZE_STEERING_WEIGHTS], 0.0);
+    }
+
+    #[test]
+    fn shader_max_weight_norm_matches_rust() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let line = src
+            .lines()
+            .find(|line| line.contains("const MAX_WEIGHT_NORM:"))
+            .expect("MAX_WEIGHT_NORM missing from common.wgsl");
+        let value: f32 = line
+            .split('=')
+            .nth(1)
+            .expect("MAX_WEIGHT_NORM has no value")
+            .trim()
+            .trim_end_matches(';')
+            .parse()
+            .expect("MAX_WEIGHT_NORM is not an f32");
+        assert_eq!(value, MAX_WEIGHT_NORM);
     }
 
     #[test]
@@ -1497,6 +1544,10 @@ mod tests {
         assert_eq!(
             wgsl["CFG_CORTEX_STAGE_LIMIT"],
             CFG_CORTEX_STAGE_LIMIT as u32
+        );
+        assert_eq!(
+            wgsl["CFG_FREEZE_STEERING_WEIGHTS"],
+            CFG_FREEZE_STEERING_WEIGHTS as u32
         );
     }
 

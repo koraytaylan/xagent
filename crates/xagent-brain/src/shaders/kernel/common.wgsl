@@ -336,6 +336,9 @@ const CFG_CORTEX_STAGE_LIMIT: u32 = 11u;
 const CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED: u32 = 12u;
 const CFG_HOMEO_PREDICTOR_LEARNING_RATE: u32 = 13u;
 const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: u32 = 14u;
+// 1.0 holds the turn-policy weights and the turn bias fixed (evolution scores
+// the inherited map). 0.0 lets the actor's TD update change them.
+const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
@@ -651,6 +654,10 @@ fn wc_u32(idx: u32) -> u32 {
 
 fn bc_f32(idx: u32) -> f32 {
     return brain_config[idx / 4u][idx % 4u];
+}
+
+fn steering_weights_learn() -> bool {
+    return bc_f32(CFG_FREEZE_STEERING_WEIGHTS) < 0.5;
 }
 
 // ── RNG (PCG hash) ──────────────────────────────────────────────────────────

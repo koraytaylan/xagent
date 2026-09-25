@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use log::info;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use xagent_shared::{BrainConfig, FullConfig};
 
@@ -18,9 +19,7 @@ use xagent_brain::buffers::{
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
-use crate::agent::{
-    mutate_brain_state, mutate_brain_state_seeded, mutate_config, mutate_config_seeded, Agent,
-};
+use crate::agent::{fresh_brain_state, steering_population, Agent};
 use crate::governor::{
     compute_approach_intent_fraction, compute_avoidance_intent_fraction,
     compute_danger_dwell_fraction, AdvanceResult, ChampionCapture, Governor,
@@ -37,6 +36,27 @@ const HEATMAP_INTERVAL: u32 = 100;
 /// actual dispatch batch size is `tick_budget / VALIDATION_HEATMAP_SAMPLES`, clamped
 /// to at least `HEATMAP_INTERVAL` (100 ticks) so it is always a valid batch.
 const VALIDATION_HEATMAP_SAMPLES: u32 = 4;
+
+fn repeated_config(seed: &BrainConfig, count: usize) -> Vec<BrainConfig> {
+    vec![seed.clone(); count]
+}
+
+/// Upload one shared steering genome per `group_size` agents. `template` is
+/// the champion when a generation inherits one, and a fresh birth brain when
+/// it does not.
+fn write_steering_population(
+    kernel: &GpuKernel,
+    agents: &[Agent],
+    template: &AgentBrainState,
+    group_size: usize,
+    strength: f32,
+    rng: &mut impl Rng,
+) {
+    let genomes = steering_population(template, agents.len(), group_size, strength, rng);
+    for (agent, genome) in agents.iter().zip(genomes.iter()) {
+        kernel.write_agent_state(agent.brain_idx, genome);
+    }
+}
 
 /// Run the headless evolution loop: no window, no rendering, max speed.
 /// Creates a Governor, runs generations until complete or interrupted.
@@ -62,29 +82,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         governor.config.patience,
     );
 
-    let mut current_configs: Vec<BrainConfig> = {
-        let repeats = governor.config.eval_repeats.max(1);
-        let unique_count = (governor.config.population_size / repeats).max(1);
-        let mut unique_configs = vec![seed_config.clone()];
-        for _ in 1..unique_count {
-            unique_configs.push(mutate_config(&seed_config));
-        }
-        let mut configs = Vec::with_capacity(governor.config.population_size);
-        for uc in &unique_configs {
-            for _ in 0..repeats {
-                if configs.len() >= governor.config.population_size {
-                    break;
-                }
-                configs.push(uc.clone());
-            }
-        }
-        configs
-    };
+    let mut current_configs = repeated_config(&seed_config, governor.config.population_size);
 
     // Brain state inherited from the stored champion of the node the current
-    // generation was bred from.
+    // generation was bred from. The first generation has none, so it starts
+    // from one shared birth brain.
     let mut inherited_state: Option<AgentBrainState> = None;
-    let mut inherited_mutation_strength: f32 = 0.0;
+    let mut inherited_mutation_strength: f32 = governor.config.mutation_strength;
     let repeats = governor.config.eval_repeats.max(1);
 
     // Create GpuKernel once — reused across generations via reset_agents().
@@ -92,6 +96,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
     let world = WorldState::new(config.world.clone());
     let food_count = world.food_items.len();
     let mut kernel = GpuKernel::new(pop_size as u32, food_count, &seed_config, &config.world);
+    kernel.set_freeze_steering_weights(true);
 
     loop {
         if governor.evolution_complete() {
@@ -160,17 +165,19 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         // overrides the reset-seeded brain_state values.
         kernel.reset_agents(&current_configs[0]);
 
-        // Inherit learned weights for champions and mutants
-        if let Some(ref state) = inherited_state {
-            for (i, agent) in agents.iter().enumerate() {
-                if i < repeats {
-                    kernel.write_agent_state(agent.brain_idx, state);
-                } else {
-                    let mutated = mutate_brain_state(state, inherited_mutation_strength);
-                    kernel.write_agent_state(agent.brain_idx, &mutated);
-                }
-            }
-        }
+        let mut rng = rand::rng();
+        let template = match &inherited_state {
+            Some(state) => state.clone(),
+            None => fresh_brain_state(&current_configs[0], &mut rng),
+        };
+        write_steering_population(
+            &kernel,
+            &agents,
+            &template,
+            repeats,
+            inherited_mutation_strength,
+            &mut rng,
+        );
 
         // Patch per-agent heritable config values so each agent's
         // brain_state reflects its own BrainConfig genome (not just
@@ -989,44 +996,26 @@ fn run_headless_with_flags(
         .expect("Failed to initialize validation governor");
 
     let seed_config = config.brain.clone();
-    // Derive a stable seed for population initialization from the world seed, ensuring both arms
-    // (baseline and ON) get identical initial genomes when run with the same world seed.
-    let pop_init_seed = config.world.seed;
-    let mut current_configs: Vec<BrainConfig> = {
-        let repeats = governor.config.eval_repeats.max(1);
-        let unique_count = (governor.config.population_size / repeats).max(1);
-        let mut unique_configs = vec![seed_config.clone()];
-        for i in 1..unique_count {
-            // Each mutation gets a deterministic seed derived from the world seed and the index.
-            let mutation_seed = pop_init_seed.wrapping_add(i as u64);
-            unique_configs.push(mutate_config_seeded(&seed_config, mutation_seed));
-        }
-        let mut configs = Vec::with_capacity(governor.config.population_size);
-        for uc in &unique_configs {
-            for _ in 0..repeats {
-                if configs.len() >= governor.config.population_size {
-                    break;
-                }
-                configs.push(uc.clone());
-            }
-        }
-        configs
-    };
+    // Both arms share this config. Steering genomes are drawn from a seed
+    // derived from the world seed, so the same world seed makes the arms'
+    // initial turn policies identical.
+    let mut current_configs = repeated_config(&seed_config, governor.config.population_size);
 
     let mut inherited_state: Option<AgentBrainState> = None;
-    let mut inherited_mutation_strength: f32 = 0.0;
+    let mut inherited_mutation_strength: f32 = governor.config.mutation_strength;
     let repeats = governor.config.eval_repeats.max(1);
 
     let pop_size = governor.config.population_size;
     let world = WorldState::new(config.world.clone());
     let food_count = world.food_items.len();
     let mut kernel = GpuKernel::new(pop_size as u32, food_count, &seed_config, &config.world);
+    kernel.set_freeze_steering_weights(true);
 
     let mut all_fitness: Vec<Vec<crate::governor::AgentFitness>> = Vec::new();
     // Per-generation mean movement_speed (for the trajectory check).
     let mut speed_trajectory_per_gen: Vec<f32> = Vec::new();
 
-    for _ in 0..num_generations {
+    for generation_index in 0..num_generations {
         if governor.evolution_complete() {
             break;
         }
@@ -1072,23 +1061,20 @@ fn run_headless_with_flags(
         kernel.upload_agents(&agent_data);
         kernel.reset_agents_seeded(&current_configs[0], config.world.seed);
 
-        if let Some(ref state) = inherited_state {
-            for (i, agent) in agents.iter().enumerate() {
-                if i < repeats {
-                    kernel.write_agent_state(agent.brain_idx, state);
-                } else {
-                    // Derive a seeded mutation for this agent: world seed wrapping_add the agent index.
-                    // This ensures both baseline and ON arms draw identical brain-state mutations.
-                    let mutation_seed = config.world.seed.wrapping_add(i as u64);
-                    let mutated = mutate_brain_state_seeded(
-                        state,
-                        inherited_mutation_strength,
-                        mutation_seed,
-                    );
-                    kernel.write_agent_state(agent.brain_idx, &mutated);
-                }
-            }
-        }
+        let mut rng =
+            rand::rngs::SmallRng::seed_from_u64(config.world.seed.wrapping_add(generation_index));
+        let template = match &inherited_state {
+            Some(state) => state.clone(),
+            None => fresh_brain_state(&current_configs[0], &mut rng),
+        };
+        write_steering_population(
+            &kernel,
+            &agents,
+            &template,
+            repeats,
+            inherited_mutation_strength,
+            &mut rng,
+        );
 
         for (i, agent) in agents.iter().enumerate() {
             kernel.write_agent_heritable_config(agent.brain_idx, &current_configs[i]);

@@ -1,14 +1,15 @@
 //! Evolution governor — orchestrates natural selection across generations.
 //!
 //! The governor manages a population of agents, evaluates their fitness after
-//! a fixed tick budget, selects the best performers, and breeds mutated offspring.
+//! a fixed tick budget, selects the best performers, and breeds the next
+//! generation from the spawn parent's config. Steering-weight mutation is
+//! applied when that generation's brains are uploaded.
 //! All state is persisted in a SQLite database (`xagent.db`), enabling resume
 //! and post-hoc analysis of the evolution tree.
 
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
 
-use rand::Rng;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_brain::buffers::AgentBrainState;
@@ -24,7 +25,7 @@ struct RecordingPayload {
     data: Vec<u8>,
 }
 
-use crate::agent::{crossover_config, mutate_config_with_strength, Agent, HEATMAP_RES};
+use crate::agent::{Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
@@ -377,9 +378,10 @@ struct Island {
 /// a fresh patience budget. If the island is already at root, attempts
 /// reset and exploration continues with the root as spawn parent.
 ///
-/// The population includes an unmutated copy of the spawn parent's config
-/// (the champion), elite configs from the last successful generation, and
-/// mutated variants from the spawn parent with adaptive mutation strength.
+/// Every agent in the next generation receives the spawn parent's `BrainConfig`.
+/// The variation selection scores is the turn-policy genome, mutated when the
+/// brains are uploaded, with a mutation strength that grows as an island
+/// exhausts its patience.
 pub struct Governor {
     pub db: Connection,
     pub config: GovernorConfig,
@@ -1337,8 +1339,9 @@ impl Governor {
     }
 
     /// Create the next generation node as a child of `spawn_parent_id`.
-    /// Increments the parent's spawn_attempts and returns population configs.
-    /// Uses elitism to preserve top configs and adaptive mutation strength.
+    /// Increments the parent's spawn_attempts and returns one copy of the
+    /// spawn parent's config per population slot. Steering weights, not these
+    /// config fields, are what the generation varies.
     fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
         let spawn_parent = match self.islands[self.active_island].spawn_parent_id {
             Some(id) => id,
@@ -1354,22 +1357,9 @@ impl Governor {
             Err(_) => BrainConfig::default(),
         };
 
-        // Adaptive mutation: linearly ramp from base to max across patience range
-        let attempts = self.islands[self.active_island].attempts;
-        let base = self.config.mutation_strength;
-        let max_strength = 0.5_f32;
-        let patience = self.config.patience.max(1) as f32;
-        let effective_strength =
-            base + (max_strength - base) * (attempts as f32 / patience).min(1.0);
-
-        let momentum = &self.momentums[self.active_island];
-        let base_config = mutate_config_with_strength(&parent_config, effective_strength, momentum);
-
         self.generation += 1;
-        // Store the champion config (parent_config) as the node's config.
-        // base_config is only used for mutation records; parent_config is the
-        // actual champion that will be evaluated, ensuring future spawn parents
-        // reference a tested config rather than an untested random mutant.
+        // The node's config is the spawn parent's config. Every offspring is
+        // evaluated with that same config; the turn-policy genome is what varies.
         let config_json = serde_json::to_string(&parent_config).unwrap_or_default();
         let _ = self.db.execute(
             "INSERT INTO node (run_id, parent_id, generation, config_json, status, island_id)
@@ -1395,90 +1385,21 @@ impl Governor {
             params![spawn_parent],
         );
 
-        // Record which parameters were mutated
+        // Offspring carry the parent's config unchanged, so this writes no rows.
         let parent_fitness = self.spawn_parent_fitness();
         record_mutations(
             &self.db,
             new_node_id,
             &parent_config,
-            &base_config,
+            &parent_config,
             parent_fitness,
         );
 
-        // Split the population into unique configs × eval_repeats: the
-        // population is spent on search breadth (distinct genomes), while
-        // Split the population into unique configs × eval_repeats: population
-        // buys search breadth (distinct genomes), `eval_repeats` buys per-config
-        // noise reduction. At the default population of 10 and 2 repeats that is
-        // 5 distinct configs per generation, each run twice. Population is kept
-        // small deliberately — the agents share one world, so a large population
-        // competes for finite food and yields no measured fitness gain (see
-        // `default_population_size`).
-        let pop_size = self.config.population_size;
-        let repeats = self.config.eval_repeats.max(1);
-        let unique_count = (pop_size / repeats).max(1);
-        let elite_count = self
-            .config
-            .elitism_count
-            .min(unique_count.saturating_sub(1));
-
-        // Population slot 0: unmutated champion (the spawn parent's exact config)
-        let mut unique_configs = vec![parent_config.clone()];
-
-        // Elitism: mutate top configs from the last SUCCESSFUL generation
-        let island = &self.islands[self.active_island];
-        for elite in island.elite_configs.iter().take(elite_count) {
-            if unique_configs.len() >= unique_count {
-                break;
-            }
-            unique_configs.push(mutate_config_with_strength(
-                elite,
-                effective_strength,
-                momentum,
-            ));
-        }
-
-        // Crossover offspring from elite pairs
-        if island.elite_configs.len() >= 2 {
-            let crossover_count = 3.min(unique_count / 3);
-            let mut rng = rand::rng();
-            for _ in 0..crossover_count {
-                if unique_configs.len() >= unique_count {
-                    break;
-                }
-                let idx_a = rng.random_range(0..island.elite_configs.len());
-                let idx_b = rng.random_range(0..island.elite_configs.len());
-                let child =
-                    crossover_config(&island.elite_configs[idx_a], &island.elite_configs[idx_b]);
-                unique_configs.push(mutate_config_with_strength(
-                    &child,
-                    effective_strength,
-                    momentum,
-                ));
-            }
-        }
-
-        // Fill remaining unique slots from the spawn parent's config
-        while unique_configs.len() < unique_count {
-            unique_configs.push(mutate_config_with_strength(
-                &parent_config,
-                effective_strength,
-                momentum,
-            ));
-        }
-
-        // Repeat each config eval_repeats times to fill pop_size slots
-        let mut configs = Vec::with_capacity(pop_size);
-        for uc in &unique_configs {
-            for _ in 0..repeats {
-                if configs.len() >= pop_size {
-                    break;
-                }
-                configs.push(uc.clone());
-            }
-        }
-
-        configs
+        // One config, repeated. `eval_repeats` still groups agents for fitness
+        // averaging; the worker assigns one steering genome per group.
+        // Population stays small because the agents share one world and compete
+        // for finite food.
+        vec![parent_config; self.config.population_size]
     }
 
     /// Persist best_score, spawn_parent_id, and momentum for resume.
@@ -3686,7 +3607,7 @@ mod tests {
     }
 
     #[test]
-    fn elitism_preserves_top_configs() {
+    fn breed_copies_the_spawn_parent_config() {
         let config = GovernorConfig {
             population_size: 5,
             tick_budget: 100,
@@ -3771,33 +3692,14 @@ mod tests {
         gov.advance(&elite_fitness);
         assert!(!gov.islands[gov.active_island].elite_configs.is_empty());
 
-        // Reset momentum so it doesn't bias the elitism check below
-        gov.momentums[gov.active_island] = crate::momentum::MutationMomentum::new(0.9);
-
-        // breed_next_generation uses stored elite_configs from the successful gen
         let configs = gov.breed_next_generation(&mock_fitness(0.01));
         assert_eq!(configs.len(), 5);
-
-        // With high patience and low mutation_strength, elite configs should
-        // stay recognizable by their magnitude (5000 and 3000 vs default 128)
-        let has_elite1_like = configs.iter().any(|c| c.memory_capacity > 4000);
-        let has_elite2_like = configs
-            .iter()
-            .any(|c| (2000..=4000).contains(&c.memory_capacity));
         assert!(
-            has_elite1_like,
-            "Expected a config near memory_capacity=5000 from elite1; got {:?}",
+            configs.iter().all(|config| config.memory_capacity == 5000),
+            "every offspring config should be the best agent's config, got {:?}",
             configs
                 .iter()
-                .map(|c| c.memory_capacity)
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            has_elite2_like,
-            "Expected a config near memory_capacity=3000 from elite2; got {:?}",
-            configs
-                .iter()
-                .map(|c| c.memory_capacity)
+                .map(|config| config.memory_capacity)
                 .collect::<Vec<_>>()
         );
     }
@@ -3824,15 +3726,7 @@ mod tests {
         // Breed next generation
         let configs = gov.breed_next_generation(&mock_fitness(0.05));
 
-        // configs[0] should be the EXACT spawn parent config (unmutated champion)
-        assert_eq!(configs[0].memory_capacity, parent_config.memory_capacity);
-        assert_eq!(configs[0].processing_slots, parent_config.processing_slots);
-        assert_eq!(
-            configs[0].representation_dimension,
-            parent_config.representation_dimension
-        );
-        assert!((configs[0].learning_rate - parent_config.learning_rate).abs() < f32::EPSILON);
-        assert!((configs[0].decay_rate - parent_config.decay_rate).abs() < f32::EPSILON);
+        assert!(configs.iter().all(|config| config == &parent_config));
     }
 
     #[test]

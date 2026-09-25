@@ -1325,8 +1325,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 CRITIC_LEARNING_RATE * td_error * critic_bias_trace;
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
-            brain_state[brain_base + O_ACT_BIASES + 1u] +=
-                ACTION_WEIGHT_LEARNING_RATE * td_error * turn_bias_trace;
+            // The turn bias is part of the inherited steering genome. While
+            // evolution is scoring that genome, a lifetime step would replace
+            // it before selection reads the brain back.
+            if (steering_weights_learn()) {
+                brain_state[brain_base + O_ACT_BIASES + 1u] +=
+                    ACTION_WEIGHT_LEARNING_RATE * td_error * turn_bias_trace;
+            }
         }
         workgroupBarrier();
 
@@ -1340,8 +1345,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * td_error * critic_trace;
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
                 ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * forward_trace;
-            brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] +=
-                ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * turn_trace;
+            if (steering_weights_learn()) {
+                brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] +=
+                    ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * turn_trace;
+            }
             // Encoder credit: which encoded dimensions carried the policy's
             // eligibility when this outcome arrived.
             s_credit[tid] = td_error * (forward_trace + turn_trace);

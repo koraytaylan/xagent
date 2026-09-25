@@ -166,3 +166,38 @@ The remaining candidates from finding F5 need a structurally different credit si
 - n-step or episodic returns.
 
 The steering-required probe is now the instrument to judge them. The mirrored probe cannot see steering, so it can't.
+
+## Episodic memory with homeostatic salience
+
+Implemented after the above as the episodic-return candidate. The agent is not told what to remember. Every brain tick stores a moment with no valence. A tick is *salient* when its homeostatic change (the energy/integrity `raw_gradient`) lies at least 3 standard deviations from the agent's own running normal. A salient tick credits its signed, normalized label back to the moments stored over the preceding 8 brain ticks, discounted by γλ per tick. Death adds no label of its own. Fully valued moments do not fade with time, and eviction keeps moments that are still awaiting their outcome.
+
+Memory keys are now the encoded state minus its running mean. Raw encodings of different scenes are 98–99% alike by cosine, so uncentered recall could not tell scenes apart.
+
+The work also fixed an eviction bug: inactive slots scored 999 as a keep score, so every store overwrote the same slot. Before the fix, memory never held more than one pattern.
+
+**Free runs.** Setup: default 8×6 eye, 10 agents, 100k ticks, seeds 5–10. Each arm's food per agent is paired against the original learner (19.88) on the same seeds:
+
+| Arm | Valued memories/agent | Food/agent | Paired difference |
+|---|---|---|---|
+| original learner (one-pattern memory) | 0 | 19.88 | — |
+| salience credit, death labeled −1, valued memories fade (seeds 5/6 only) | 3–10 | 19.4 | −0.3 |
+| valued memories retained, death labeled −1 | 118–119 | 18.57 | −1.32 (t = −2.4) |
+| valued memories retained, no death label (**committed**) | 95–113 | 18.75 | −1.13 (t = −1.9) |
+| committed, memory motor replay off | 97–116 | 19.12 | −0.77 (t = −0.9) |
+
+Approach intent stayed at 0.484–0.501 in every arm. With the 17×13 eye (seeds 5/6), the committed arm ate 18.7 / 19.8 against 19.5 / 18.4.
+
+**Probes.** Seeds 17 / 23. The committed arm against the original learner:
+
+| Probe | Metric | Original learner | Committed arm |
+|---|---|---|---|
+| Standard | success | 0.542 → 0.545 / 0.544 → 0.538 | 0.533 → 0.530 / 0.541 → 0.533 |
+| Standard | alignment | 0.466 / 0.488 | 0.398 / 0.462 |
+| Steering-required | success | 0.020 → 0.097 / 0.022 → 0.094 | 0.023 → 0.131 / 0.023 → 0.106 |
+| Steering-required | alignment | 0.465 / 0.487 | 0.453 / 0.477 |
+
+The mechanism works as designed: the tests in `crates/xagent-brain/tests/episodic_memory.rs` pin salience, credit, retention and eviction, and memory fills with valued episodes. What the brain does with those episodes does not steer.
+
+Recall blends in the stored motor commands of similar valued moments. That blend neither raises approach intent nor aligns turns with the food's side. Food per agent falls by about 1 unit (5–7%). Switching the replay off recovers about a third of that loss. The rest is within noise of the original learner.
+
+A valued memory therefore needs a use other than replaying the motor command it was stored with. The salience label is a candidate reward event for an action-conditioned model or an n-step return.

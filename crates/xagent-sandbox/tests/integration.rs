@@ -9448,10 +9448,14 @@ fn auxiliary_steering_probe_with_loss_enabled() {
 /// in absolute terms, but the split exposes post-food versus pre-food variance.
 /// Also measures raw_gradient (energy_delta + integrity_delta) per context to
 /// confirm that the homeostatic signal itself is genuinely sparse during foraging.
-/// MEASURED 2026-06-25 Metal (movement-enabled foraging, median_energy=98):
-///   lower_half_td: mean|δ|≈4.3e-5, upper_half_td: mean|δ|≈8.7e-4
-///   (post-food half has ~20× larger credit signal than pre-food half).
-///   lower_half_raw_gradient: mean≈1.1e-4, upper_half_raw_gradient: mean≈8.1e-4.
+/// MEASURED 2026-09-26 Linux/RADV (movement-enabled foraging, birth tick
+/// excluded, median_energy=99.1):
+///   lower_half_td: mean|δ|≈4.7e-5, upper_half_td: mean|δ|≈2.9e-4
+///   (post-food half has ~6× larger credit signal than pre-food half).
+///   lower_half_raw_gradient: mean≈1.1e-4, upper_half_raw_gradient: mean≈2.3e-4.
+/// The 2026-06-25 Metal values (upper mean|δ|≈8.7e-4, ~20×) still counted the
+/// birth tick, whose artifact gain alone contributes ≈6e-4 to the half that
+/// holds the spawn energy.
 #[test]
 fn gradient_variance_per_context_breakdown() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_ENERGY};
@@ -9476,6 +9480,13 @@ fn gradient_variance_per_context_breakdown() {
 
     for t in 0..TICKS {
         arena.kernel.dispatch_batch(t, 1);
+        // The first tick of life reads the zeroed previous energy/integrity as
+        // a full-meter gain (≈ +0.3 raw_gradient per agent). That is a birth
+        // artifact, not a foraging credit signal, and it would land in
+        // whichever half holds the spawn energy, so it is left out.
+        if t == 0 {
+            continue;
+        }
 
         // Extract energy values into an owned Vec first so the mutable borrow
         // on read_full_state_blocking ends before the immutable telemetry reads.
@@ -9571,21 +9582,21 @@ fn gradient_variance_per_context_breakdown() {
     );
     // Falsifiable range bounds matching the MEASURED values in the doc-comment.
     // The lower bucket (pre-food energy ≤ median) has smaller |δ| than the
-    // upper bucket (post-food energy > median).  Bounds are calibrated to the
-    // 2026-06-25 Metal run and accommodate ±1 order-of-magnitude hardware variance
-    // while still catching a regression to near-zero or an explosion.
+    // upper bucket (post-food energy > median).  Bounds accommodate ±1
+    // order-of-magnitude hardware variance while still catching a regression
+    // to near-zero or an explosion.
     //
-    // lower ≈ 4.3e-5: band [1e-5, 5e-4] catches near-zero (< 1e-5) or explosion (> 5e-4).
+    // lower ≈ 4.7e-5: band [1e-5, 5e-4] catches near-zero (< 1e-5) or explosion (> 5e-4).
     assert!(
         (1e-5..=5e-4).contains(&lower_td_mean),
         "lower-half mean|δ| {lower_td_mean:.3e} outside expected band [1e-5, 5e-4] \
-         (measured ≈ 4.3e-5 on 2026-06-25 Metal) — credit signal may have regressed"
+         (measured ≈ 4.7e-5 on 2026-09-26 Linux/RADV) — credit signal may have regressed"
     );
-    // upper ≈ 8.7e-4: band [1e-4, 5e-3] catches near-zero (< 1e-4) or explosion (> 5e-3).
+    // upper ≈ 2.9e-4: band [1e-4, 5e-3] catches near-zero (< 1e-4) or explosion (> 5e-3).
     assert!(
         (1e-4..=5e-3).contains(&upper_td_mean),
         "upper-half mean|δ| {upper_td_mean:.3e} outside expected band [1e-4, 5e-3] \
-         (measured ≈ 8.7e-4 on 2026-06-25 Metal) — credit signal may have regressed"
+         (measured ≈ 2.9e-4 on 2026-09-26 Linux/RADV) — credit signal may have regressed"
     );
     // raw_gradient (energy_delta + integrity_delta) must also be small during steady
     // foraging — confirming the homeostatic signal is genuinely sparse, not an

@@ -1542,9 +1542,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         forward = fast_tanh(forward);
         turn = fast_tanh(turn);
 
-        // Position-based staleness: record current XZ position and
-        // accumulated forward output, then compare displacement against
-        // expected travel to detect agents that aren't making progress.
+        // Position-based staleness: record the current XZ position, then
+        // compare displacement over the ring window against the travel the
+        // executed forward commands should have produced, to detect agents
+        // that are pushing without making progress.
         let phys_base_fat = agent_id * PHYS_STRIDE;
         let cur_x = physics_state[phys_base_fat + P_POS_X];
         let cur_z = physics_state[phys_base_fat + P_POS_Z];
@@ -1556,17 +1557,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         brain_state[brain_base + O_POS_RING_LEN] = new_pos_len;
         brain_state[brain_base + O_POS_RING_CURSOR] = f32((pos_cursor + 1u) % POS_RING_LEN);
 
-        // Accumulate forward motor output (pre-noise) for expected displacement.
-        // This is an approximate running total: when the position ring is full,
-        // we do not subtract the overwritten slot's exact forward contribution.
-        let old_accum = brain_state[brain_base + O_ACCUM_FWD];
-        var new_accum = old_accum + max(forward, 0.0);
-        if (new_pos_len >= f32(POS_RING_LEN)) {
-            // We do not track per-slot forward values, so approximate a bounded
-            // window by decaying the accumulator proportionally each overwrite.
-            new_accum *= (f32(POS_RING_LEN) - 1.0) / f32(POS_RING_LEN);
-        }
-        brain_state[brain_base + O_ACCUM_FWD] = new_accum;
+        // Forward commands the physics has already executed over the ring
+        // window. This tick's command moves the agent only after this
+        // comparison, so it is accumulated below, once noise and fatigue
+        // have shaped it.
+        let executed_forward_accum = brain_state[brain_base + O_ACCUM_FWD];
 
         // Compute staleness: compare actual displacement to expected
         let p_len = u32(new_pos_len);
@@ -1587,7 +1582,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // Expected displacement: accumulated forward * move_speed * DT * stride
             // Each brain tick, the agent moves forward * move_speed * DT * stride units
             let move_speed = brain_state[brain_base + O_MOVEMENT_SPEED];
-            let expected = new_accum * move_speed * wc_f32(WC_DT) * f32(wc_u32(WC_BRAIN_TICK_STRIDE));
+            let expected = executed_forward_accum * move_speed * wc_f32(WC_DT) * f32(wc_u32(WC_BRAIN_TICK_STRIDE));
             // Only penalize when the agent is actually trying to move;
             // idle agents (expected ≈ 0) keep fatigue_factor = 1.0.
             let expected_epsilon = 0.001;
@@ -1615,6 +1610,22 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
         forward *= fatigue_factor;
         turn *= fatigue_factor;
+
+        // Record the command the physics will execute: its magnitude after
+        // noise and fatigue (backward travel displaces the agent too). The
+        // expected travel must include the fatigue already applied —
+        // comparing fatigue-slowed displacement with unslowed intended travel
+        // fed back on itself and settled fatigue near
+        // floor / (1 − k·(1 − floor)) for any path efficiency k < 1, i.e.
+        // ≈ 0.4–0.6 even in open terrain. This is an approximate running
+        // total: when the position ring is full we do not subtract the
+        // overwritten slot's exact contribution, so the window is bounded by
+        // decaying the accumulator proportionally each overwrite.
+        var new_accum = executed_forward_accum + abs(forward);
+        if (new_pos_len >= f32(POS_RING_LEN)) {
+            new_accum *= (f32(POS_RING_LEN) - 1.0) / f32(POS_RING_LEN);
+        }
+        brain_state[brain_base + O_ACCUM_FWD] = new_accum;
 
         // Klinotaxis: use fast-vs-medium gradient deviation.
         // Fast responds in ~2 ticks and recovers in ~5. Medium responds in ~25.

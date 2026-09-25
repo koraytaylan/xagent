@@ -9675,3 +9675,51 @@ fn run_innate_instinct_ab_produces_valid_stats() {
         );
     }
 }
+
+/// Fatigue must only react to obstruction, not to its own slowdown: an agent
+/// moving freely on flat, open ground keeps its fatigue factor near 1. The
+/// staleness ratio compares displacement with the travel of the *executed*
+/// (post-noise, post-fatigue) forward commands; comparing it with the
+/// unslowed policy output fed back on itself and settled fatigue near
+/// `floor / (1 − k·(1 − floor))` (≈ 0.4–0.6) for any path efficiency k < 1.
+#[test]
+fn fatigue_stays_high_for_unobstructed_movement() {
+    use xagent_brain::buffers::{PHYS_STRIDE, P_ALIVE, P_FATIGUE_FACTOR_OUT};
+
+    if !xagent_brain::GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    /// Physics ticks simulated: many ring windows at the default strides.
+    const RUN_TICKS: u64 = 4000;
+    /// Minimum mean fatigue factor for unobstructed agents. The feedback
+    /// loop measured 0.48–0.61 in the default world; open flat ground with
+    /// noise-curved paths should stay well above that.
+    const MIN_MEAN_FATIGUE: f64 = 0.8;
+
+    let brain = BrainConfig::default();
+    let mut arena = build_probe_arena(&brain, 41);
+    let batch = u64::from(arena.kernel.kernel_batch_size());
+    let (mut sum, mut samples) = (0.0_f64, 0_u64);
+    let mut tick = 0_u64;
+    while tick < RUN_TICKS {
+        arena.kernel.dispatch_batch(tick, batch as u32);
+        tick += batch;
+        let state = arena.kernel.read_full_state_blocking();
+        for a in 0..PROBE_AGENT_COUNT {
+            let base = a * PHYS_STRIDE;
+            if state[base + P_ALIVE] > 0.5 {
+                sum += f64::from(state[base + P_FATIGUE_FACTOR_OUT]);
+                samples += 1;
+            }
+        }
+    }
+    let mean = sum / samples.max(1) as f64;
+    eprintln!("unobstructed fatigue: mean {mean:.3} over {samples} samples");
+    assert!(
+        mean >= MIN_MEAN_FATIGUE,
+        "mean fatigue {mean:.3} < {MIN_MEAN_FATIGUE} for unobstructed agents — \
+         the staleness check is feeding back on its own slowdown"
+    );
+}

@@ -243,3 +243,20 @@ The turn trace credits the raw noise kick, `noise_turn × exploration_rate`. The
 Clamping almost never erases the kick, because the learned turn output stays far from saturation. The mismatch that does exist is multiplicative: fatigue halves the turn on about half of the free-run ticks, and klinotaxis rescales it by 0.3–3. As a result, the credited noise explains only about 60% of the variance of the noise the agent actually expressed (correlation 0.78).
 
 That weakens the actor's signal but cannot explain chance-level steering. Meanwhile the turn output grows during learning (free-run |policy turn| 0.08 → 0.23) while alignment stays at chance: the learned turn is side-blind, not suppressed.
+
+## Does the critic's value change with where the food is?
+
+Between meals, the only TD signal that could reward turning toward food is the critic's value rising as food gets nearer and more centered in view. This test only measured and changed nothing in the agent.
+
+**Setup.** Same pinned-agent arena as the readout test. Food was placed in view (2.5–5 units, 0–0.7 rad off-center) in 70% of scenes and directly behind the agent (out of view) in the rest. Each scene was evaluated with each brain's own critic weights, `V = value_bias + value_weights · encoded`, 640 scenes per brain. A meal is worth about 0.12 reward. As a ceiling, a ridge regression tested whether food distance is linearly present in the encoded state (held-out R²).
+
+| Brains | Mean V | SD of V across scenes | V(food near, centered) − V(food behind) | corr(V, distance) | Distance R² from encoded |
+|---|---|---|---|---|---|
+| fresh (critic weights start at 0) | 0 | 0 | 0 | — | 0.86 |
+| free run 100k ticks, seed 5 | −0.151 | 0.0004 | −0.0004 meals | +0.15 | 0.85 |
+| free run 100k ticks, seed 6 | −0.167 | 0.0005 | −0.0021 meals | +0.30 | 0.85 |
+| standard probe, 240 episodes | −0.002 | 0.0003 | +0.0028 meals | −0.49 | 0.82 |
+
+No brain valued nearby, centered food more than 0.007 of a meal above food behind it. The free-run critics even lean the wrong way: value rises with distance.
+
+The mean value is the resting-drain baseline and nothing else. Food distance is linearly available in the encoded state (R² ≈ 0.85), so a linear critic could represent it, but the trained critic is flat. Between meals, then, δ carries no information about approaching food, and the turn weights only ever receive the sparse meal-time credit. The critic's vector step is `CRITIC_LEARNING_RATE × TD_VECTOR_SCALE` = 0.01 / 128 per dimension, and a free-running agent eats about once every 5k ticks. That combination leaves the value weights almost untouched by food within a lifetime.

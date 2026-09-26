@@ -271,10 +271,11 @@ override O_TRACE_TURN: u32 = O_TRACE_FWD + ENCODED_DIMENSION;
 override O_TRACE_BIASES: u32 = O_TRACE_TURN + ENCODED_DIMENSION;
 
 // ── Episodic memory state ───────────────────────────────────────────────────
-// Running mean of the encoded state. Memory keys are the encoding minus this
-// mean: raw encodings of different scenes are 98–99% alike (cosine), so
-// uncentered similarity cannot tell scenes apart. Survives death (it describes
-// the input distribution, not an episode).
+// Running mean of the encoded state. Memory keys and the critic's input are
+// the encoding minus this mean: raw encodings of different scenes are 98–99%
+// alike (cosine), so uncentered similarity cannot tell scenes apart and an
+// uncentered critic update moves the value of every scene together. Survives
+// death (it describes the input distribution, not an episode).
 override O_ENCODED_MEAN: u32 = O_TRACE_BIASES + 3u;
 // Running mean and variance of raw_gradient over non-salient brain ticks; the
 // salience test measures how far a tick's homeostatic change sits from them.
@@ -646,10 +647,12 @@ const TD_DISCOUNT: f32 = 0.97;
 // TD_DISCOUNT × TD_LAMBDA ≈ 0.87; the critic's bootstrapping propagates
 // credit beyond the raw trace span across repeated experiences.
 const TD_LAMBDA: f32 = 0.9;
-// Normalized-LMS rate of the critic. The value head (bias and weights)
-// steps by CRITIC_LEARNING_RATE / ‖[1, x]‖² per unit of δ·trace, where x is
-// the encoded state whose value δ corrects (O_PREV_ENCODED) and the 1 is the
-// bias feature. Normalizing by the input's own squared size keeps the change
+// Normalized-LMS rate of the critic. The critic reads the centered encoding
+// x = encoded − O_ENCODED_MEAN, so its bias carries the baseline value and its
+// weights only what separates scenes. The value head (bias and weights) steps
+// by CRITIC_LEARNING_RATE / ‖[1, x]‖² per unit of δ·trace, where x is the
+// centered input whose value δ corrects (from O_PREV_ENCODED) and the 1 is
+// the bias feature. Normalizing by the input's own squared size keeps the change
 // in V(x) at CRITIC_LEARNING_RATE·δ per unit trace whatever the encoding's
 // scale or dimensionality — the linear-TD stability bound — without the fixed
 // 1/ENCODED_DIMENSION factor that, at typical encodings (‖x‖² ≈ 2–35), made
@@ -724,13 +727,14 @@ fn steering_weights_learn() -> bool {
 }
 
 // Normalized-LMS critic step (see CRITIC_LEARNING_RATE) for the transition
-// out of the state stored in O_PREV_ENCODED. Serial; used by the death paths,
-// which run once per death. The brain pass computes the same value with a
-// workgroup reduction.
+// out of the state stored in O_PREV_ENCODED, centered by O_ENCODED_MEAN.
+// Serial; used by the death paths, which run once per death. The brain pass
+// computes the same value with a workgroup reduction.
 fn critic_step_for_prev_encoded(brain_base: u32) -> f32 {
     var norm_sq: f32 = 1.0;
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
-        let x = brain_state[brain_base + O_PREV_ENCODED + i];
+        let x = brain_state[brain_base + O_PREV_ENCODED + i]
+            - brain_state[brain_base + O_ENCODED_MEAN + i];
         norm_sq += x * x;
     }
     return CRITIC_LEARNING_RATE / norm_sq;

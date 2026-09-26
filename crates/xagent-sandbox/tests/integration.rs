@@ -2475,7 +2475,7 @@ fn shaped_reward_rewards_approach() {
 /// The actor (forward/turn) weight step must scale with `ACTOR_VECTOR_SCALE`
 /// (1/16), and the critic's must be the normalized-LMS step
 /// `CRITIC_LEARNING_RATE / (1 + ‖x‖²)`, where `x` is the previous brain tick's
-/// encoded state. One TD update adds `step · δ · trace` to each weight
+/// encoded state centered by the running mean. One TD update adds `step · δ · trace` to each weight
 /// dimension; reading the per-dimension weight delta against the snapshotted
 /// trace and δ recovers the step exactly. The ratio cancels δ and the trace,
 /// so it is robust to their magnitude. Mirrors of the in-shader constants are
@@ -2483,8 +2483,8 @@ fn shaped_reward_rewards_approach() {
 #[test]
 fn actor_step_scales_with_actor_vector_scale() {
     use xagent_brain::buffers::{
-        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_PREV_ENCODED,
-        O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS,
+        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_ENCODED_MEAN,
+        O_PREV_ENCODED, O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS,
     };
     use xagent_brain::GpuKernel;
 
@@ -2543,7 +2543,11 @@ fn actor_step_scales_with_actor_vector_scale() {
     let critic_step = CRITIC_LEARNING_RATE
         / (1.0
             + (0..ENCODED_DIMENSION)
-                .map(|d| before.brain_state[O_PREV_ENCODED + d].powi(2))
+                .map(|d| {
+                    (before.brain_state[O_PREV_ENCODED + d]
+                        - before.brain_state[O_ENCODED_MEAN + d])
+                        .powi(2)
+                })
                 .sum::<f32>());
 
     // Measured tick: jump the food closer (still produces a metabolic δ from movement cost).
@@ -3570,15 +3574,16 @@ fn baseline_encoder_separability_vs_steering_gap() {
 /// the dying life's eligibility traces before they are cleared. With
 /// preset traces the kick is exactly computable:
 /// Δvalue_bias = 0.01/(1 + ‖x‖²)·(−1)·5, the normalized critic step for the
-/// last encoded state x, and Δactor_bias = 0.1·(−1)·1 = −0.10. The
+/// last encoded state x centered by the running mean, and Δactor_bias = 0.1·(−1)·1 = −0.10. The
 /// post-respawn brain tick in the same cycle applies δ through freshly
 /// zeroed traces, so it cannot move the biases — any deviation from the
 /// exact kick is a real defect.
 #[test]
 fn death_applies_terminal_td_update_through_traces() {
     use xagent_brain::buffers::{
-        BrainLayout, ENCODED_DIMENSION, O_ACT_BIASES, O_PREDICTOR_CONTEXT_WEIGHT, O_PREV_ENCODED,
-        O_TRACE_BIASES, O_VALUE_BIAS, PHYS_STRIDE, PREDICTOR_DIMENSION, P_DEATH_COUNT,
+        BrainLayout, ENCODED_DIMENSION, O_ACT_BIASES, O_ENCODED_MEAN, O_PREDICTOR_CONTEXT_WEIGHT,
+        O_PREV_ENCODED, O_TRACE_BIASES, O_VALUE_BIAS, PHYS_STRIDE, PREDICTOR_DIMENSION,
+        P_DEATH_COUNT,
     };
 
     if !xagent_brain::GpuKernel::is_available() {
@@ -3614,6 +3619,7 @@ fn death_applies_terminal_td_update_through_traces() {
     let trace_biases_offset = tail_base + (O_TRACE_BIASES - O_PREDICTOR_CONTEXT_WEIGHT);
     let act_biases_offset = tail_base + (O_ACT_BIASES - O_PREDICTOR_CONTEXT_WEIGHT);
     let prev_encoded_offset = tail_base + (O_PREV_ENCODED - O_PREDICTOR_CONTEXT_WEIGHT);
+    let encoded_mean_offset = tail_base + (O_ENCODED_MEAN - O_PREDICTOR_CONTEXT_WEIGHT);
 
     let agent = 0_u32;
     let mut state = arena.kernel.read_agent_state(agent);
@@ -3627,7 +3633,11 @@ fn death_applies_terminal_td_update_through_traces() {
     let critic_step = CRITIC_LEARNING_RATE
         / (1.0
             + (0..ENCODED_DIMENSION)
-                .map(|d| state.brain_state[prev_encoded_offset + d].powi(2))
+                .map(|d| {
+                    (state.brain_state[prev_encoded_offset + d]
+                        - state.brain_state[encoded_mean_offset + d])
+                        .powi(2)
+                })
                 .sum::<f32>());
     let expected_value_bias = VALUE_BIAS_BEFORE - critic_step * VALUE_BIAS_TRACE;
     arena.kernel.write_agent_state(agent, &state);
@@ -8171,8 +8181,9 @@ fn split_fused_integrity_through_danger_crossing() {
 #[test]
 fn death_path_actor_update_uses_actor_vector_scale() {
     use xagent_brain::buffers::{
-        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_PREV_ENCODED,
-        O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS, P_DEATH_COUNT, P_ENERGY,
+        ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_ENCODED_MEAN,
+        O_PREV_ENCODED, O_TRACE_CRITIC, O_TRACE_FWD, O_TRACE_TURN, O_VALUE_WEIGHTS, P_DEATH_COUNT,
+        P_ENERGY,
     };
     use xagent_brain::GpuKernel;
 
@@ -8259,7 +8270,11 @@ fn death_path_actor_update_uses_actor_vector_scale() {
     let critic_step = CRITIC_LEARNING_RATE
         / (1.0
             + (0..ENCODED_DIMENSION)
-                .map(|d| before.brain_state[O_PREV_ENCODED + d].powi(2))
+                .map(|d| {
+                    (before.brain_state[O_PREV_ENCODED + d]
+                        - before.brain_state[O_ENCODED_MEAN + d])
+                        .powi(2)
+                })
                 .sum::<f32>());
 
     // Kill the agent with PHYSICS-ONLY remainder ticks (1 tick each, < brain_tick_stride),
@@ -9169,8 +9184,12 @@ fn sparse_encoder_food_separability() {
 /// higher TD errors than the 0017 pinned-movement condition (movement_speed=0,
 /// mean|δ| ≈ 8.7e-5). The movement-enabled result is the measurement gate
 /// for all downstream credit-path fixes.
-/// MEASURED 2026-06-25 Metal (movement-enabled foraging): mean|δ|=4.547e-4,
-/// std=9.805e-3, min=2.421e-8, max=3.000e-1.
+/// MEASURED 2026-09-26 Linux/RADV (movement-enabled foraging, centered
+/// normalized-LMS critic): mean|δ|=9.511e-4, std=1.001e-2, min=2.561e-8,
+/// max=3.000e-1. The 2026-06-25 Metal measurement (mean|δ|=4.547e-4) predates
+/// the critic reading the centered encoding: centered inputs are small, so the
+/// normalized step is close to CRITIC_LEARNING_RATE itself and the value moves
+/// more between consecutive states.
 #[test]
 fn baseline_td_error_variance_during_foraging() {
     if !xagent_brain::GpuKernel::is_available() {
@@ -9217,12 +9236,13 @@ fn baseline_td_error_variance_during_foraging() {
         );
     }
 
-    // Movement-enabled foraging baseline measured 2026-06-25 Metal: mean|δ|=4.547e-4.
-    // Range [2e-4, 6e-4] brackets that measurement and flags regressions or
-    // hardware-specific outliers before subsequent credit-path fixes build on it.
+    // Movement-enabled foraging baseline measured 2026-09-26 Linux/RADV:
+    // mean|δ|=9.511e-4. Range [4e-4, 1.3e-3] brackets that measurement and flags
+    // regressions or hardware-specific outliers before subsequent credit-path
+    // fixes build on it.
     assert!(
-        (2e-4..=6e-4).contains(&mean),
-        "mean|δ| {mean:.3e} left the movement-enabled foraging baseline band [2e-4, 6e-4] — \
+        (4e-4..=1.3e-3).contains(&mean),
+        "mean|δ| {mean:.3e} left the movement-enabled foraging baseline band [4e-4, 1.3e-3] — \
          re-pin before building on it"
     );
 }

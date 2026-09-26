@@ -27,9 +27,9 @@ const DENSE_INNER_LANES: u32 = 4u;
 
 var<workgroup> s_features: array<f32, FEATURE_COUNT>;
 var<workgroup> s_encoded: array<f32, ENCODED_DIMENSION>;
-// Centered memory key for this brain tick: s_encoded minus the running mean
-// (O_ENCODED_MEAN). Written by the homeostasis pass, read by recall,
-// reinforcement and store.
+// Centered encoding for this brain tick: s_encoded minus the running mean
+// (O_ENCODED_MEAN). Written by the homeostasis pass; it is the memory key
+// (recall, reinforcement, store) and the critic's input.
 var<workgroup> s_memory_key: array<f32, ENCODED_DIMENSION>;
 var<workgroup> s_homeo: array<f32, 8>;
 var<workgroup> s_similarities: array<f32, MEMORY_CAP>;
@@ -1318,7 +1318,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // reduction below has consumed these partials.
         if (tid < ENCODED_DIMENSION) {
             s_credit[tid] =
-                brain_state[brain_base + O_VALUE_WEIGHTS + tid] * s_encoded[tid];
+                brain_state[brain_base + O_VALUE_WEIGHTS + tid] * s_memory_key[tid];
         }
         workgroupBarrier();
 
@@ -1338,10 +1338,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
         // Normalized critic step: δ corrects the value of the previous
         // brain tick's state (O_PREV_ENCODED), so the step is normalized by
-        // that input's squared size plus the bias feature's 1.
+        // that state's centered input's squared size plus the bias feature's 1.
         {
             if (tid < ENCODED_DIMENSION) {
-                let x = brain_state[brain_base + O_PREV_ENCODED + tid];
+                let x = brain_state[brain_base + O_PREV_ENCODED + tid]
+                    - brain_state[brain_base + O_ENCODED_MEAN + tid];
                 s_dense_partials[tid] = x * x;
             } else {
                 s_dense_partials[tid] = 0.0;
@@ -1734,16 +1735,16 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
     // ── Eligibility trace update (all dims in parallel) ─────────────────
     // Accumulating traces: z ← γλ·z + feature term. The critic trace
-    // carries the state; the actor traces carry exploration-noise ×
-    // state — the likelihood-ratio direction of the action actually
-    // taken — so future TD errors credit exactly the noise kicks (and the
-    // states they occurred in) that caused them.
+    // carries the critic's centered input; the actor traces carry
+    // exploration-noise × state — the likelihood-ratio direction of the
+    // action actually taken — so future TD errors credit exactly the noise
+    // kicks (and the states they occurred in) that caused them.
     {
         let trace_decay = TD_DISCOUNT * TD_LAMBDA;
         if (tid < ENCODED_DIMENSION) {
             let enc = s_encoded[tid];
             brain_state[brain_base + O_TRACE_CRITIC + tid] =
-                brain_state[brain_base + O_TRACE_CRITIC + tid] * trace_decay + enc;
+                brain_state[brain_base + O_TRACE_CRITIC + tid] * trace_decay + s_memory_key[tid];
             brain_state[brain_base + O_TRACE_FWD + tid] =
                 brain_state[brain_base + O_TRACE_FWD + tid] * trace_decay + s_explore[0u] * enc;
             brain_state[brain_base + O_TRACE_TURN + tid] =

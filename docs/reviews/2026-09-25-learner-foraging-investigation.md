@@ -201,3 +201,30 @@ The mechanism works as designed: the tests in `crates/xagent-brain/tests/episodi
 Recall blends in the stored motor commands of similar valued moments. That blend neither raises approach intent nor aligns turns with the food's side. Food per agent falls by about 1 unit (5–7%). Switching the replay off recovers about a third of that loss. The rest is within noise of the original learner.
 
 A valued memory therefore needs a use other than replaying the motor command it was stored with. The salience label is a candidate reward event for an action-conditioned model or an n-step return.
+
+## Does the encoded state carry the food's side?
+
+This test only measured and changed nothing in the agent. It fit a linear readout on the encoded state, the 128 values the turn head reads.
+
+**Brains tested:**
+
+- 10 fresh brains, with random encoders;
+- 20 brains trained by 100k-tick free runs, seeds 5 and 6.
+
+**Setup.** Each brain was copied to 16 agents, pinned in place on flat ground. One food item was placed per agent:
+
+- side: left or right at random;
+- bearing: 0.1–0.6 rad;
+- distance: 2.5–5 units, inside the default 8×6 eye's range.
+
+That gave 640 scenes per brain. Scoring used an L2 logistic regression with 5-fold held-out accuracy, taking the best of three regularization strengths.
+
+| Brains | Encoded state | Input features | Encoded, shuffled labels | Sign of the policy's own turn output |
+|---|---|---|---|---|
+| fresh | 0.994 ± 0.002 | 0.996 ± 0.002 | 0.506 | 0.499 |
+| trained, seed 5 | 0.995 ± 0.002 | 0.997 ± 0.003 | 0.497 | 0.505 |
+| trained, seed 6 | 0.997 ± 0.003 | 0.998 ± 0.002 | 0.498 | 0.499 |
+
+No brain scored below 0.991.
+
+The food's side is linearly present in exactly the space the turn head reads, and the encoder keeps it whether trained or not. The learned turn weights still point at chance, so the missing capability is not perception or representation. It is the learning of the turn weights from the homeostatic signal.

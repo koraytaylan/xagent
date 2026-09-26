@@ -228,3 +228,18 @@ That gave 640 scenes per brain. Scoring used an L2 logistic regression with 5-fo
 No brain scored below 0.991.
 
 The food's side is linearly present in exactly the space the turn head reads, and the encoder keeps it whether trained or not. The learned turn weights still point at chance, so the missing capability is not perception or representation. It is the learning of the turn weights from the homeostatic signal.
+
+## Does the executed turn erase the exploration noise the actor credits?
+
+The turn trace credits the raw noise kick, `noise_turn × exploration_rate`. The executed turn is different: `clamp(tanh(policy) + kick)`, scaled by fatigue and klinotaxis, then clamped to ±1 again by physics. A scratch build counted, on every brain tick, how much of the recorded kick survived into the executed turn:
+
+| Run | Kick erased | Kick partly clipped | Fraction surviving the clamps | \|policy turn\| | Fatigue × klinotaxis below 0.5 | corr(recorded, expressed) |
+|---|---|---|---|---|---|---|
+| free run, 100k ticks, seed 5 | 0.0% | 0.7% | 0.998 | 0.135 | 49% | 0.78 |
+| free run, 100k ticks, seed 6 | 0.1% | 2.3% | 0.991 | 0.188 | 46% | 0.78 |
+| standard probe, 240 episodes | 0.3% | 2.0% | 0.990 | 0.147 | 23% | 0.85 |
+| steering-required probe, 240 episodes | 0.0% | 0.1% | 1.000 | 0.030 | 11% | 0.95 |
+
+Clamping almost never erases the kick, because the learned turn output stays far from saturation. The mismatch that does exist is multiplicative: fatigue halves the turn on about half of the free-run ticks, and klinotaxis rescales it by 0.3–3. As a result, the credited noise explains only about 60% of the variance of the noise the agent actually expressed (correlation 0.78).
+
+That weakens the actor's signal but cannot explain chance-level steering. Meanwhile the turn output grows during learning (free-run |policy turn| 0.08 → 0.23) while alignment stays at chance: the learned turn is side-blind, not suppressed.

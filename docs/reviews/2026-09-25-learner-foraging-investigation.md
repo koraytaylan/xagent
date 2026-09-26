@@ -291,3 +291,23 @@ The critic now moves 25–50× more across scenes, but not along the food. Nearb
 Food per agent recovers to the level before the episodic-memory change. Steering does not appear: approach intent and alignment stay at chance.
 
 A faster critic is therefore not enough. Raw encodings of different scenes are 98–99% alike by cosine, so each update moves the value of nearly every scene together. The part of an update that separates "food near" from "food behind" is a few percent of it.
+
+## Centered critic input
+
+The critic now reads the centered encoding, `encoded − O_ENCODED_MEAN`, for its value, its trace and its normalized step. The bias carries the baseline, and the weights can only learn what separates scenes.
+
+**Critic value over food position.** Same test as above. Each cell shows the centered critic, then the uncentered normalized critic, then the original critic:
+
+| Brains | V(food near, centered) − V(food behind) | Brains with that difference > 0 | corr(V, distance) |
+|---|---|---|---|
+| standard probe, 240 episodes | +0.044 / +0.007 / +0.003 meals | 14 of 16 | −0.40 / −0.49 / −0.49 (all 16 negative) |
+| free run, seed 5 | −0.005 / +0.026 / −0.0004 meals | 5 of 10 | +0.11 / +0.15 / +0.15 |
+| free run, seed 6 | +0.043 / −0.009 / −0.002 meals | 6 of 10 | −0.05 / +0.23 / +0.30 |
+
+**Free runs** (seeds 5–10):
+
+- Food/agent: 19.38, against 19.68 for the uncentered normalized critic.
+- Deaths/agent: 17.7, against 17.1.
+- Approach intent: 0.490.
+
+With food as the only thing that varies (the probe), centering raises the value of nearby, centered food about sixfold, to about 4% of a meal. In free runs the per-brain differences grow (−0.17 to +0.15 meals) but their sign is a coin flip. The free-run critic still does not consistently value approaching food: its value spreads over scenes along something other than the food.

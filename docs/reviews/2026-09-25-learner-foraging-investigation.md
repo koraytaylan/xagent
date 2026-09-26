@@ -260,3 +260,34 @@ Between meals, the only TD signal that could reward turning toward food is the c
 No brain valued nearby, centered food more than 0.007 of a meal above food behind it. The free-run critics even lean the wrong way: value rises with distance.
 
 The mean value is the resting-drain baseline and nothing else. Food distance is linearly available in the encoded state (R² ≈ 0.85), so a linear critic could represent it, but the trained critic is flat. Between meals, then, δ carries no information about approaching food, and the turn weights only ever receive the sparse meal-time credit. The critic's vector step is `CRITIC_LEARNING_RATE × TD_VECTOR_SCALE` = 0.01 / 128 per dimension, and a free-running agent eats about once every 5k ticks. That combination leaves the value weights almost untouched by food within a lifetime.
+
+## Normalized critic step
+
+The critic now takes a normalized-LMS step, `CRITIC_LEARNING_RATE / (1 + ‖x‖²)`, where x is the encoded state whose value δ corrects. It used to take a fixed `CRITIC_LEARNING_RATE / 128` per dimension. At the measured encodings (‖x‖² ≈ 2–35), that makes the critic about 4–45× faster.
+
+**Critic value over food position.** Same test as above:
+
+| Brains | SD of V across scenes | V(food near, centered) − V(food behind) | corr(V, distance) |
+|---|---|---|---|
+| free run, seed 5 | 0.0180 (was 0.0004) | +0.026 meals (was −0.0004) | +0.15 (was +0.15) |
+| free run, seed 6 | 0.0090 (was 0.0005) | −0.009 meals (was −0.0021) | +0.23 (was +0.30) |
+| standard probe, 240 episodes | 0.0007 (was 0.0003) | +0.007 meals (was +0.0028) | −0.49 (was −0.49) |
+
+**Free runs.** Default 8×6 eye, 10 agents, 100k ticks, seeds 5–10, paired against the previous critic:
+
+- Food/agent: 19.68 vs 18.75 (+0.93, paired t = 1.9).
+- Deaths/agent: 17.1 vs 17.6.
+- Approach intent: 0.490 vs 0.496.
+
+**Probes.** Seeds 17 / 23:
+
+| Probe | Success | Turn alignment |
+|---|---|---|
+| Standard | 0.530 → 0.541 / 0.536 → 0.542 | 0.462 / 0.494 (was 0.398 / 0.462) |
+| Steering-required | 0.023 → 0.092 / 0.023 → 0.067 (was 0.131 / 0.106) | 0.486 / 0.478 |
+
+The critic now moves 25–50× more across scenes, but not along the food. Nearby, centered food is still worth at most a few percent of a meal more than food behind the agent, and in free-run brains value still rises with distance.
+
+Food per agent recovers to the level before the episodic-memory change. Steering does not appear: approach intent and alignment stay at chance.
+
+A faster critic is therefore not enough. Raw encodings of different scenes are 98–99% alike by cosine, so each update moves the value of nearly every scene together. The part of an update that separates "food near" from "food behind" is a few percent of it.

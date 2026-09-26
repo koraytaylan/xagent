@@ -44,11 +44,13 @@ var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 // array frees a slot for the visual-cortex scratch (`s_visual`) without
 // changing any value. `s_pred_td[0]` == the former `s_pred_error`,
 // `s_pred_td[1]` == the former `s_td_error`.
-// Index 2 carries homeo predictor error (homeostatic gradient predictor head) — still one binding.
+// Index 2 carries homeo predictor error (homeostatic gradient predictor head),
+// index 3 this tick's normalized critic step — still one binding.
 const S_PRED_ERROR: u32 = 0u;
 const S_TD_ERROR: u32 = 1u;
 const S_HOMEO_PRED_ERROR: u32 = 2u;
-var<workgroup> s_pred_td: array<f32, 3>;
+const S_CRITIC_STEP: u32 = 3u;
+var<workgroup> s_pred_td: array<f32, 4>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 2>;
@@ -1334,6 +1336,24 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             workgroupBarrier();
         }
 
+        // Normalized critic step: δ corrects the value of the previous
+        // brain tick's state (O_PREV_ENCODED), so the step is normalized by
+        // that input's squared size plus the bias feature's 1.
+        {
+            if (tid < ENCODED_DIMENSION) {
+                let x = brain_state[brain_base + O_PREV_ENCODED + tid];
+                s_dense_partials[tid] = x * x;
+            } else {
+                s_dense_partials[tid] = 0.0;
+            }
+            workgroupBarrier();
+            wg_reduce_dense(tid);
+            if (tid == 0u) {
+                s_pred_td[S_CRITIC_STEP] = CRITIC_LEARNING_RATE / (1.0 + s_dense_partials[0]);
+            }
+            workgroupBarrier();
+        }
+
         // Thread 0: form δ (using s_value) and update the scalar biases.
         if (tid == 0u) {
             var value: f32 = brain_state[brain_base + O_VALUE_BIAS] + s_value;
@@ -1358,7 +1378,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
             let turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
             brain_state[brain_base + O_VALUE_BIAS] +=
-                CRITIC_LEARNING_RATE * td_error * critic_bias_trace;
+                s_pred_td[S_CRITIC_STEP] * td_error * critic_bias_trace;
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
             // The turn bias is part of the inherited steering genome. While
@@ -1378,7 +1398,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let forward_trace = brain_state[brain_base + O_TRACE_FWD + tid];
             let turn_trace = brain_state[brain_base + O_TRACE_TURN + tid];
             brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
-                CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * td_error * critic_trace;
+                s_pred_td[S_CRITIC_STEP] * td_error * critic_trace;
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
                 ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * forward_trace;
             if (steering_weights_learn()) {

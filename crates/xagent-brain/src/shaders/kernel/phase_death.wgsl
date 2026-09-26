@@ -129,6 +129,10 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     brain_state[brain_base + O_ACCUM_FWD] = 0.0;
     brain_state[brain_base + O_FATIGUE_FACTOR] = 1.0;
 
+    // The terminal critic step is normalized by the last state's encoding,
+    // which the habituation reset below clears.
+    let terminal_critic_step = critic_step_for_prev_encoded(brain_base);
+
     // Reset habituation (fresh start for new life's perceptual context)
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_HAB_EMA + i] = 0.0;
@@ -145,13 +149,13 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     let terminal_value_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
     let terminal_forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
     let terminal_turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
-    brain_state[brain_base + O_VALUE_BIAS] += CRITIC_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
+    brain_state[brain_base + O_VALUE_BIAS] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
     brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_forward_bias_trace;
     if (steering_weights_learn()) {
         brain_state[brain_base + O_ACT_BIASES + 1u] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_turn_bias_trace;
     }
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
-        brain_state[brain_base + O_VALUE_WEIGHTS + i] += CRITIC_LEARNING_RATE * TD_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
+        brain_state[brain_base + O_VALUE_WEIGHTS + i] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
         brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
         if (steering_weights_learn()) {
             brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];

@@ -646,18 +646,23 @@ const TD_DISCOUNT: f32 = 0.97;
 // TD_DISCOUNT × TD_LAMBDA ≈ 0.87; the critic's bootstrapping propagates
 // credit beyond the raw trace span across repeated experiences.
 const TD_LAMBDA: f32 = 0.9;
-// Critic learns 10× slower than the actor: the value estimate must be
-// stabler than the policy it evaluates.
+// Normalized-LMS rate of the critic. The value head (bias and weights)
+// steps by CRITIC_LEARNING_RATE / ‖[1, x]‖² per unit of δ·trace, where x is
+// the encoded state whose value δ corrects (O_PREV_ENCODED) and the 1 is the
+// bias feature. Normalizing by the input's own squared size keeps the change
+// in V(x) at CRITIC_LEARNING_RATE·δ per unit trace whatever the encoding's
+// scale or dimensionality — the linear-TD stability bound — without the fixed
+// 1/ENCODED_DIMENSION factor that, at typical encodings (‖x‖² ≈ 2–35), made
+// the critic about 4–45× slower than that and left its value flat over food.
+// 10× below the actor's rate: the value estimate must be stabler than the
+// policy it evaluates.
 const CRITIC_LEARNING_RATE: f32 = 0.01;
-// Per-dimension trace updates scale inversely with the feature dimension:
-// the aggregate step (a sum of ENCODED_DIMENSION products of trace ×
-// feature, each O(1)) would otherwise grow with dimensionality and push
-// the bootstrapped critic past the linear-TD stability limit.
+// Per-dimension scale of the homeostatic gradient predictor's weight step:
+// the aggregate step (a sum of ENCODED_DIMENSION products, each O(1)) would
+// otherwise grow with dimensionality.
 const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
-// Actor (forward/turn) weight-step scale, separate from the critic's
-// TD_VECTOR_SCALE. The 1/ENCODED_DIMENSION factor is a critic-bootstrapping
-// stability bound; applied to the actor it throttled the policy step to
-// 0.10/128 ≈ 8e-4. The actor only needs to stay inside the MAX_WEIGHT_NORM L2
+// Actor (forward/turn) weight-step scale. A 1/ENCODED_DIMENSION factor
+// throttled the policy step to 0.10/128 ≈ 8e-4. The actor only needs to stay inside the MAX_WEIGHT_NORM L2
 // ball (enforced every tick), so it can latch onto a sign-correct δ at a usable
 // rate. 1/16 lifts the step ~8× while staying well within that bound.
 const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
@@ -716,6 +721,19 @@ fn bc_f32(idx: u32) -> f32 {
 
 fn steering_weights_learn() -> bool {
     return bc_f32(CFG_FREEZE_STEERING_WEIGHTS) < 0.5;
+}
+
+// Normalized-LMS critic step (see CRITIC_LEARNING_RATE) for the transition
+// out of the state stored in O_PREV_ENCODED. Serial; used by the death paths,
+// which run once per death. The brain pass computes the same value with a
+// workgroup reduction.
+fn critic_step_for_prev_encoded(brain_base: u32) -> f32 {
+    var norm_sq: f32 = 1.0;
+    for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+        let x = brain_state[brain_base + O_PREV_ENCODED + i];
+        norm_sq += x * x;
+    }
+    return CRITIC_LEARNING_RATE / norm_sq;
 }
 
 // ── RNG (PCG hash) ──────────────────────────────────────────────────────────

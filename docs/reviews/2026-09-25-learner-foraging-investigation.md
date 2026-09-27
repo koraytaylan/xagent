@@ -475,3 +475,40 @@ Categories:
 | **stride 1, seed 6** | **0.0540** | **22.7** | 8.9 | 0.0642 | 0.0566 → 0.0549 |
 
 Mean fitness rises 76% (0.0465 vs 0.0264) and food per agent 1.6–3.1×. The gain is immediate rather than evolved: fitness is flat across generations in every run. This matches the free-run measurement above (meals 1.9× with fresh frames), where the learned turn policy stays at chance. The better foraging comes from acting on current rather than 3-second-old perception, not from learned steering.
+
+## Critic replay of remembered outcomes
+
+Re-measured under fresh perception, the critic valued nearby, centered food only 0.05 / 0.07 of a meal above food behind (free-run seeds 5 / 6). The agent's experience holds about half a meal, and the learned turn policy stayed at chance (0.49).
+
+Each remembered moment now keeps a return: the reward the critic sees (`raw_gradient × (1 + urgency)`) from salient changes that followed within the credit window, discounted by γ per brain tick. Every brain tick one settled memory slot, chosen by hash, steps the critic's weights toward that return, `w += 0.1 / (1 + ‖key‖²) · (return − w·key) · key`. The bias keeps carrying the baseline. Only the agent's own homeostatic outcomes enter; nothing refers to food.
+
+**Critic value over food position** (the same test as above):
+
+| Brains | V(near, centered) − V(behind), before replay | With replay | Brains positive |
+|---|---|---|---|
+| free run, seed 5 | +0.050 meals | +0.321 meals | 5 of 10 |
+| free run, seed 6 | +0.072 | +0.216 | 7 of 10 |
+| standard probe | +0.034 | +0.172 | 14 of 16 |
+
+**Learned turn policy** (sign over the scene grid): 0.470 free-run and 0.481 probe-trained, against 0.492 / 0.466 before — still chance.
+
+**Free runs.** Default config (fresh perception), 10 agents, 100k ticks, seeds 5–10:
+
+| | Before | With replay |
+|---|---|---|
+| Food/agent | 36.4 | 59.9 (paired +23.6, t = 14.1) |
+| Distance/agent | 7.1–7.5k | 12.7–15.2k |
+| Deaths/agent | 15.8 | 27.6 |
+| Food per quarter of the run | falls, q1 112–156 → q4 50–87 | holds or rises, q1 113–185 → q4 124–202 |
+| Approach intent | 0.495 | 0.495 |
+
+**Headless evolution** (`evo_default` with fresh perception, 20 generations):
+
+| Seed | Mean fitness, before → replay | Food/agent | Deaths/agent |
+|---|---|---|---|
+| 5 | 0.0390 → 0.0561 | 11.5 → 30.8 | 5.3 → 18.6 |
+| 6 | 0.0540 → 0.0443 | 22.7 → 15.8 | 8.9 → 7.0 |
+
+Mean fitness is 0.0502 against 0.0465.
+
+Replay makes the critic learn a large share of the food-ahead lesson (0.2–0.3 of the ~0.5-meal gap on average), though brain-to-brain spread is wide. It also changes behavior. Agents keep moving instead of slowing over a life, and foraging no longer declines within a lifetime. In the free runs they cover about twice the ground, eat 65% more, and die 75% more often. Steering still does not appear: approach intent and the learned turn policy stay at chance.

@@ -346,3 +346,32 @@ Scores below are the alignment of the policy's own turn sign with the food's sid
 **No arm learns the sequential task in 20k ticks.** With the reward only on centering, exploration noise almost never centers the food by chance. Fresh brains succeed in 0–1% of episodes. The one strategy that pays off is a constant rotation, which the bias learns and which sweeps through the food in about half the episodes. That is the "saturated constant rotation" of finding F5, now reproduced without any reset artifacts.
 
 Fixing the update rule is therefore necessary but not sufficient. The turn learner also needs a between-meals signal that grows as the food gets centered, which is the critic's job — and in free runs the critic does not yet learn that.
+
+## Centered, normalized turn channel
+
+The turn policy and its trace now read the centered encoding, and its weights and bias take the critic's normalized step at the actor's rate, `ACTION_WEIGHT_LEARNING_RATE / (1 + ‖x‖²)`. In the replay above, this variant reached bandit alignment 0.99 / 1.00 / 0.69 for fresh / free-run / probe-trained encoders, against 0.98 / 0.99 / 0.66 with a fixed 16× step.
+
+**Free runs** (seeds 5–10), against the centered-critic code:
+
+- Food/agent: 19.88 vs 19.38 (paired +0.5; the per-seed differences range from −2.1 to +3.1).
+- Approach intent: 0.493–0.503.
+
+**Probes** (seeds 17 / 23):
+
+| Probe | Success, fix | Success, before | Alignment, fix | Alignment, before |
+|---|---|---|---|---|
+| Standard | 0.538 → 0.523 / 0.522 → 0.542 | 0.527 → 0.525 / 0.534 → 0.480 | 0.463 / 0.458 | 0.448 / 0.431 |
+| Steering-required | 0.020 → 0.038 / 0.022 → 0.030 | 0.023 → 0.130 / 0.023 → 0.159 | 0.498 / 0.496 | 0.457 / 0.476 |
+
+**Headless evolution.** Release builds, `evo_default` config, 20 generations, seeds 5 and 6. Lifetime turn learning is frozen during evolution, so only the centered turn input takes part.
+
+| Run | Mean fitness | Food/agent | Fitness, first 5 → last 5 generations |
+|---|---|---|---|
+| before, seed 5 | 0.0315 | 8.1 | 0.0348 → 0.0333 |
+| fix, seed 5 | 0.0268 | 7.3 | 0.0293 → 0.0258 |
+| before, seed 6 | 0.0244 | 6.7 | 0.0257 → 0.0235 |
+| fix, seed 6 | 0.0293 | 8.0 | 0.0303 → 0.0294 |
+
+The fix is neutral in free runs and in evolution, and steering still does not appear. Steering-required success falls because the turn weights can no longer absorb the constant spin that used to sweep through the food there.
+
+This is the replay's prediction for the sequential task: once the rule is able to learn, the missing piece is a signal between meals that grows as the food gets centered. Exploration alone almost never finds the reward, so a lifetime yields too few meals to learn steering from.

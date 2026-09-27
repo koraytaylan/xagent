@@ -3581,7 +3581,8 @@ fn baseline_encoder_separability_vs_steering_gap() {
 /// preset traces the kick is exactly computable:
 /// Δvalue_bias = 0.01/(1 + ‖x‖²)·(−1)·5, the normalized critic step for the
 /// last encoded state x centered by the running mean, Δforward_bias =
-/// 0.1·(−1)·1 = −0.10, and Δturn_bias = 0.1/(1 + ‖x‖²)·(−1)·1. The
+/// 0.1·(−1)·1 = −0.10, and the turn channel, which has no bias, leaves the
+/// unused turn-bias slot unchanged even with a preset trace. The
 /// post-respawn brain tick in the same cycle applies δ through freshly
 /// zeroed traces, so it cannot move the biases — any deviation from the
 /// exact kick is a real defect.
@@ -3598,9 +3599,8 @@ fn death_applies_terminal_td_update_through_traces() {
         return;
     }
 
-    /// Mirrors of `CRITIC_LEARNING_RATE` and `ACTION_WEIGHT_LEARNING_RATE` in `common.wgsl`.
+    /// Mirror of `CRITIC_LEARNING_RATE` in `common.wgsl`.
     const CRITIC_LEARNING_RATE: f32 = 0.01;
-    const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
     /// Preset critic bias trace and value bias.
     const VALUE_BIAS_TRACE: f32 = 5.0;
     const VALUE_BIAS_BEFORE: f32 = 0.5;
@@ -3649,8 +3649,6 @@ fn death_applies_terminal_td_update_through_traces() {
                 .sum::<f32>());
     let expected_value_bias =
         VALUE_BIAS_BEFORE - CRITIC_LEARNING_RATE * step_normalizer * VALUE_BIAS_TRACE;
-    // The turn bias takes the normalized turn step through its preset trace of 1.
-    let expected_turn_bias = turn_bias_before - ACTION_WEIGHT_LEARNING_RATE * step_normalizer;
     arena.kernel.write_agent_state(agent, &state);
 
     // This tick kills (energy 0.001 → 0 via depletion), respawns, and runs
@@ -3678,10 +3676,9 @@ fn death_applies_terminal_td_update_through_traces() {
         (forward_bias - (forward_bias_before - 0.10)).abs() < 1e-3,
         "forward bias {forward_bias} (was {forward_bias_before}): terminal actor kick missing"
     );
-    assert!(
-        (turn_bias - expected_turn_bias).abs() < 1e-4,
-        "turn bias {turn_bias} != {expected_turn_bias} (was {turn_bias_before}): \
-         terminal turn kick missing or wrong"
+    assert_eq!(
+        turn_bias, turn_bias_before,
+        "the turn channel has no bias, but death moved the turn-bias slot"
     );
 }
 

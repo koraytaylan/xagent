@@ -664,12 +664,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // and the full-energy respawn makes death read as a free heal.
     let terminal_value_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
     let terminal_forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
-    let terminal_turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
     brain_state[brain_base + O_VALUE_BIAS] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
     brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_forward_bias_trace;
-    if (steering_weights_learn()) {
-        brain_state[brain_base + O_ACT_BIASES + 1u] += terminal_turn_step * TERMINAL_DEATH_TD_ERROR * terminal_turn_bias_trace;
-    }
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_VALUE_WEIGHTS + i] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
         brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
@@ -689,6 +685,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     brain_state[brain_base + O_TRACE_BIASES] = 0.0;
     brain_state[brain_base + O_TRACE_BIASES + 1u] = 0.0;
     brain_state[brain_base + O_TRACE_BIASES + 2u] = 0.0;
+    brain_state[brain_base + O_TURN_NOISE] = 0.0;
     brain_state[brain_base + O_PREV_VALUE] = 0.0;
     // Episodic slot for the homeostatic gradient predictor. Weights survive.
     // Zero would be a legal prediction, so store the out-of-range sentinel.

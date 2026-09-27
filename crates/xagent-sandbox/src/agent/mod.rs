@@ -16,7 +16,7 @@ const MAX_PROCESSING_SLOTS: usize = 128;
 use xagent_brain::buffers::{
     init_brain_state_for, init_pattern_memory, seed_instinct_patterns, AgentBrainState,
     BrainLayout, ENCODED_DIMENSION, FIXED_TAIL_SIZE, MAX_WEIGHT_NORM, O_ACTION_FORWARD_WEIGHTS,
-    O_ACTION_TURN_WEIGHTS, O_ACT_BIASES, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
+    O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
 };
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
@@ -402,18 +402,12 @@ const STEERING_MUTATION_FRACTION: f32 = 0.25;
 /// generation and still fits in the shader's weight ball.
 const STEERING_WEIGHT_STEP: f32 = 1.0;
 
-/// Half-width of the turn-bias kick, in the same units as
-/// [`STEERING_WEIGHT_STEP`]. The bias is added to every scene, so every mutant
-/// touches it.
-const STEERING_BIAS_STEP: f32 = 1.0;
-
 /// Locations of the actor weights inside one `brain_state` buffer.
 struct BrainWeightOffsets {
     feature_count: usize,
     predictor_weights: usize,
     forward_weights: usize,
     turn_weights: usize,
-    turn_bias: usize,
 }
 
 fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
@@ -432,9 +426,8 @@ fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
     let forward_weights =
         predictor_context + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
     let turn_weights = predictor_context + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
-    let turn_bias = predictor_context + (O_ACT_BIASES - O_PREDICTOR_CONTEXT_WEIGHT) + 1;
     assert!(
-        turn_bias < state.brain_state.len(),
+        turn_weights + ENCODED_DIMENSION <= state.brain_state.len(),
         "computed offsets exceed brain_state bounds"
     );
     BrainWeightOffsets {
@@ -442,7 +435,6 @@ fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
         predictor_weights,
         forward_weights,
         turn_weights,
-        turn_bias,
     }
 }
 
@@ -482,9 +474,10 @@ pub fn fresh_brain_state(config: &BrainConfig, rng: &mut impl Rng) -> AgentBrain
     }
 }
 
-/// Perturb the turn-policy weights and the turn bias. Encoder, forward-policy,
-/// predictor, and value weights are copied unchanged: those are not the
-/// genome evolution scores.
+/// Perturb the turn-policy weights. Encoder, forward-policy, predictor, and
+/// value weights are copied unchanged: those are not the genome evolution
+/// scores. The turn channel has no bias to perturb: a bias turns the same way
+/// in every scene, which is a spin, not steering.
 pub fn mutate_steering_weights(
     state: &AgentBrainState,
     strength: f32,
@@ -499,9 +492,6 @@ pub fn mutate_steering_weights(
         }
     }
     rescale_turn_weights(&mut mutated.brain_state, offsets.turn_weights);
-    let bias_kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_BIAS_STEP;
-    mutated.brain_state[offsets.turn_bias] = (mutated.brain_state[offsets.turn_bias] + bias_kick)
-        .clamp(-MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
     mutated
 }
 
@@ -1046,11 +1036,11 @@ mod tests {
             mutated.brain_state[O_ACTION_TURN_WEIGHTS + index]
                 != state.brain_state[O_ACTION_TURN_WEIGHTS + index]
         });
-        let bias_moved =
-            mutated.brain_state[O_ACT_BIASES + 1] != state.brain_state[O_ACT_BIASES + 1];
-        assert!(
-            turn_moved || bias_moved,
-            "a steering mutant must change the turn policy"
+        assert!(turn_moved, "a steering mutant must change the turn weights");
+        assert_eq!(
+            mutated.brain_state[O_ACT_BIASES + 1],
+            state.brain_state[O_ACT_BIASES + 1],
+            "the unused turn-bias slot is not part of the genome"
         );
         let norm_sq: f32 = (0..ENCODED_DIMENSION)
             .map(|index| {

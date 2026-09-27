@@ -90,7 +90,8 @@ pub const O_HOMEO: usize = O_PREV_ENCODED + ENCODED_DIMENSION;
 pub const O_ACTION_FORWARD_WEIGHTS: usize = O_HOMEO + 6;
 pub const O_ACTION_TURN_WEIGHTS: usize = O_ACTION_FORWARD_WEIGHTS + ENCODED_DIMENSION;
 
-// act_biases: [fwd_bias, turn_bias]
+// act_biases: [fwd_bias, unused]. The turn channel has no bias: a learned or
+// inherited turn bias only ever became a side-blind constant spin.
 pub const O_ACT_BIASES: usize = O_ACTION_TURN_WEIGHTS + ENCODED_DIMENSION;
 pub const O_EXPLORATION_RATE: usize = O_ACT_BIASES + 2;
 pub const POS_RING_LEN: usize = 16;
@@ -133,7 +134,7 @@ pub const O_PREV_HOMEO_PREDICTION: usize = O_HOMEO_PREDICTOR_BIAS + 1;
 // ── TD(λ) critic state ────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
-// [critic_bias, forward_bias, turn_bias].
+// [critic_bias, forward_bias, unused] — the turn channel has no bias.
 
 pub const O_VALUE_WEIGHTS: usize = O_PREV_HOMEO_PREDICTION + 1;
 pub const O_VALUE_BIAS: usize = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
@@ -151,7 +152,10 @@ pub const O_ENCODED_MEAN: usize = O_TRACE_BIASES + 3;
 pub const O_SALIENCE_MEAN: usize = O_ENCODED_MEAN + ENCODED_DIMENSION;
 pub const O_SALIENCE_VARIANCE: usize = O_SALIENCE_MEAN + 1;
 pub const O_SALIENCE_LABEL: usize = O_SALIENCE_VARIANCE + 1;
-pub const BRAIN_STRIDE: usize = O_SALIENCE_LABEL + 1;
+/// Persistent turn exploration noise (`TURN_NOISE_PERSISTENCE` in
+/// `common.wgsl`); episodic, zeroed on death.
+pub const O_TURN_NOISE: usize = O_SALIENCE_LABEL + 1;
+pub const BRAIN_STRIDE: usize = O_TURN_NOISE + 1;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
 /// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
@@ -1081,7 +1085,8 @@ mod tests {
         assert_eq!(O_SALIENCE_MEAN, O_ENCODED_MEAN + ENCODED_DIMENSION);
         assert_eq!(O_SALIENCE_VARIANCE, O_SALIENCE_MEAN + 1);
         assert_eq!(O_SALIENCE_LABEL, O_SALIENCE_VARIANCE + 1);
-        assert_eq!(BRAIN_STRIDE, O_SALIENCE_LABEL + 1);
+        assert_eq!(O_TURN_NOISE, O_SALIENCE_LABEL + 1);
+        assert_eq!(BRAIN_STRIDE, O_TURN_NOISE + 1);
     }
 
     #[test]

@@ -260,7 +260,7 @@ override O_PREV_HOMEO_PREDICTION: u32 = O_HOMEO_PREDICTOR_BIAS + 1u;
 // ── TD(λ) critic state ──────────────────────────────────────────────────────
 // Value head (learned, inherited) plus eligibility traces (episodic,
 // zeroed on death). Trace biases pack three scalars:
-// [critic_bias, forward_bias, turn_bias].
+// [critic_bias, forward_bias, unused] — the turn channel has no bias.
 
 override O_VALUE_WEIGHTS: u32 = O_PREV_HOMEO_PREDICTION + 1u;
 override O_VALUE_BIAS: u32 = O_VALUE_WEIGHTS + ENCODED_DIMENSION;
@@ -284,10 +284,13 @@ override O_SALIENCE_VARIANCE: u32 = O_SALIENCE_MEAN + 1u;
 // This tick's signed salience label in [-1, 1] (0 = not salient). Written by
 // the homeostasis pass, read by the store pass of the same brain tick.
 override O_SALIENCE_LABEL: u32 = O_SALIENCE_VARIANCE + 1u;
+// Persistent turn exploration noise (see TURN_NOISE_PERSISTENCE). Episodic:
+// zeroed on death.
+override O_TURN_NOISE: u32 = O_SALIENCE_LABEL + 1u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-override BRAIN_STRIDE: u32 = O_SALIENCE_LABEL + 1u;
+override BRAIN_STRIDE: u32 = O_TURN_NOISE + 1u;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
 override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
@@ -678,6 +681,16 @@ const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
 // every lesson into a side-blind constant turn. Centered and normalized, the
 // same replay reached 0.99–1.00.
 const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
+// Per-brain-tick persistence of the turn exploration noise: an AR(1) process
+// n ← ρ·n + √(1 − ρ²)·draw with the same marginal variance as the uniform
+// draw, held for ~1/(1 − ρ) = 10 brain ticks. Independent draws average out
+// before a turn can centre food; in a replay of the turn learner, fresh
+// brains then never found the centring reward (0% of episodes) and learned
+// nothing, while persistent noise found it in a third to a half of them.
+const TURN_NOISE_PERSISTENCE: f32 = 0.9;
+// √(1 − TURN_NOISE_PERSISTENCE²): keeps the persistent noise's variance equal
+// to one uniform draw's.
+const TURN_NOISE_INNOVATION: f32 = 0.4358899;
 // Bound on the TD error. No single transition is allowed to teach more
 // than this; protects against respawn/clamp artifacts (mirrors the intent
 // of MAX_HOMEOSTATIC_DELTA on the reward side).

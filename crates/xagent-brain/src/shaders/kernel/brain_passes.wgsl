@@ -1379,18 +1379,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
 
             let critic_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
             let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
-            let turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
             brain_state[brain_base + O_VALUE_BIAS] +=
                 CRITIC_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * critic_bias_trace;
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
-            // The turn bias is part of the inherited steering genome. While
-            // evolution is scoring that genome, a lifetime step would replace
-            // it before selection reads the brain back.
-            if (steering_weights_learn()) {
-                brain_state[brain_base + O_ACT_BIASES + 1u] +=
-                    ACTION_WEIGHT_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * turn_bias_trace;
-            }
+            // The turn channel has no bias (see O_ACT_BIASES).
         }
         workgroupBarrier();
 
@@ -1468,7 +1461,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // initial forward bias that provides exploration mobility. The
             // L2 balls below are the sole magnitude bound.
             brain_state[brain_base + O_ACT_BIASES] = clamp(brain_state[brain_base + O_ACT_BIASES], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
-            brain_state[brain_base + O_ACT_BIASES + 1u] = clamp(brain_state[brain_base + O_ACT_BIASES + 1u], -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM);
 
             var fwd_scale: f32 = 1.0;
             let fwd_norm = sqrt(s_fwd_norm_sq);
@@ -1560,9 +1552,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         let urgency = s_homeo[2u];
         let prediction_error = s_pred_td[S_PRED_ERROR];
 
-        // Policy evaluation with bias and dot products
+        // Policy evaluation: forward bias plus dot product; the turn channel
+        // has no bias, so it can only turn in response to what it sees.
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
-        var turn: f32 = brain_state[brain_base + O_ACT_BIASES + 1u] + s_turn_dot;
+        var turn: f32 = s_turn_dot;
 
         // Memory blend: recalled experiences influence motor output via valence.
         // Positive valence (food memory) + similar state → reproduce approach action.
@@ -1676,7 +1669,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         let tick_u = u32(tick_count);
         let exploration_seed = pcg_hash(agent_id ^ (tick_u * 747796405u));
         let noise_forward = (hash_to_float(exploration_seed) * 2.0 - 1.0) * 0.5;
-        let noise_turn = (hash_to_float(pcg_hash(exploration_seed)) * 2.0 - 1.0) * 0.5;
+        // Turn noise persists across brain ticks (see TURN_NOISE_PERSISTENCE)
+        // so an exploratory turn is held long enough to bring food to the
+        // centre of view.
+        let turn_draw = (hash_to_float(pcg_hash(exploration_seed)) * 2.0 - 1.0) * 0.5;
+        let noise_turn = TURN_NOISE_PERSISTENCE * brain_state[brain_base + O_TURN_NOISE]
+            + TURN_NOISE_INNOVATION * turn_draw;
+        brain_state[brain_base + O_TURN_NOISE] = noise_turn;
         forward = clamp(forward + noise_forward * exploration_rate, -1.0, 1.0);
         turn = clamp(turn + noise_turn * exploration_rate, -1.0, 1.0);
 
@@ -1758,8 +1757,6 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 brain_state[brain_base + O_TRACE_BIASES] * trace_decay + 1.0;
             brain_state[brain_base + O_TRACE_BIASES + 1u] =
                 brain_state[brain_base + O_TRACE_BIASES + 1u] * trace_decay + s_explore[0u];
-            brain_state[brain_base + O_TRACE_BIASES + 2u] =
-                brain_state[brain_base + O_TRACE_BIASES + 2u] * trace_decay + s_explore[1u];
         }
     }
 }

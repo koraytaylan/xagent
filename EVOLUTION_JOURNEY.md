@@ -321,7 +321,7 @@ Learning (credit assignment) then builds on this reactive foundation, associatin
 
 This section is a fixed point of reference for what each `BrainConfig` field does in the live fused-kernel architecture. The historical sections above and below treat several of these fields as a single class of "evolved brain parameters" — that framing pre-dates the issue #106 reconciliation. The canonical labels and docstrings live in [`crates/xagent-shared/src/config.rs`](crates/xagent-shared/src/config.rs); the table here mirrors them so readers do not have to cross-reference code to understand a section's claims.
 
-The generational search copies the spawn parent's `BrainConfig` into every offspring. What it varies is the turn-policy weights and the turn bias: the champion brain is copied, each later group of `eval_repeats` agents shares one perturbation of those weights, and `CFG_FREEZE_STEERING_WEIGHTS` keeps lifetime TD from rewriting them before selection reads the brain back.
+The generational search copies the spawn parent's `BrainConfig` into every offspring. What it varies is the turn-policy weights (the turn channel has no bias — a bias turns the same way in every scene, so it can only encode a spin): the champion brain is copied, each later group of `eval_repeats` agents shares one perturbation of those weights, and `CFG_FREEZE_STEERING_WEIGHTS` keeps lifetime TD from rewriting them before selection reads the brain back.
 
 | Field | Role | Kernel reality |
 |---|---|---|

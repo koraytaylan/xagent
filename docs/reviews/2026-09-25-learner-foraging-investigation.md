@@ -395,3 +395,36 @@ Neither change makes the task learnable, so neither was ported.
 - **Every arm still converges to the constant spin.** The common turn grows to 1–1.6, the side component stays near zero, and success settles at the spin's ceiling of about 0.5.
 
 So even with a value gradient between meals, the turn learner falls into the spin attractor. A saturated constant turn clips the exploration kicks that push further along the spin while still crediting them, and the turn bias carries the spin directly. The next candidates are inside the actor: credit the kick that was actually expressed after clipping, and stop the turn bias learning a spin.
+
+## Bias-free turn channel with persistent exploration
+
+The replay tested the two actor-internal candidates, crediting the kick that was actually expressed and stopping the turn bias, each with persistent noise (ρ = 0.9). The table shows sequential-task alignment over 20k brain ticks:
+
+| Arm | Fresh | Free-run | Probe-trained | Success, first → last fifth |
+|---|---|---|---|---|
+| persistent noise (the previous table) | 0.50 | 0.49 | 0.55 | ≈ 0.45 → 0.50 (spin) |
+| + expressed kick | 0.50 | 0.49 | 0.55 | ≈ 0.46 → 0.51 (spin) |
+| + turn bias frozen at its starting value | 0.95 | 0.66 | 0.55 | 0.12–0.27 → 0.14–0.36 |
+| **+ turn bias fixed at 0** | **0.96** | **0.95** | **0.81** | 0.07–0.13 → 0.09–0.15 |
+| + expressed kick + bias 0 | 0.95 | 0.97 | 0.84 | 0.09–0.13 → 0.08–0.21 |
+| bias 0, independent noise | 0.61 | 0.57 | 0.55 | 0.00 → 0.00 |
+
+- **The turn bias is what carries the spin.** A frozen bias keeps whatever spin a trained brain already had. Without persistent noise the reward is never found.
+- **The ported version:** the turn channel has no bias. The policy ignores the slot, TD never updates it, and evolution no longer perturbs it. The turn noise is an AR(1) process, ρ = 0.9, with the variance of one uniform draw.
+- **What the replay's success rests on:** its task rewards centering the food directly. That is a test-bench stand-in for checking whether the rule can learn, not a signal the agent has.
+
+**In the simulator.** Free runs (seeds 5–10):
+
+- Food/agent: 20.48 vs 19.88 (paired +0.6).
+- Deaths/agent: 17.9 vs 18.2.
+
+Headless evolution (20 generations, seeds 5 and 6): mean fitness 0.0263 / 0.0264, against 0.0268 / 0.0293 for the previous turn channel. Fitness is flat across generations. The probes' executed-turn alignment is no longer interpretable. With persistent noise, an agent rotating in place spends more scored ticks past the food than approaching it, which alone pushes the score below 0.5 (0.41 measured). Steering-required success of 0.21–0.24 from the first episode is noise finding food, not learning.
+
+The learned policy itself (sign of `w · (encoded − mean)` over the scene grid) stays at chance:
+
+| Brains | Before the turn fix | Centered, normalized turn | Bias-free, persistent noise |
+|---|---|---|---|
+| free run, 100k ticks | 0.490 | 0.499 | 0.494 |
+| standard probe, 240 episodes | 0.428 | 0.461 | 0.466 (per brain 0.32–0.73) |
+
+In the simulator the only signal is the agent's own energy gain when it eats, and the free-run critic has not learned that food ahead predicts one. The rule can now learn steering, but the agent's experience does not yet teach it.

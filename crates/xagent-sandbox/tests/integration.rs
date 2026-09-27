@@ -2472,10 +2472,11 @@ fn shaped_reward_rewards_approach() {
     );
 }
 
-/// The actor (forward/turn) weight step must scale with `ACTOR_VECTOR_SCALE`
-/// (1/16), and the critic's must be the normalized-LMS step
-/// `CRITIC_LEARNING_RATE / (1 + ‖x‖²)`, where `x` is the previous brain tick's
-/// encoded state centered by the running mean. One TD update adds `step · δ · trace` to each weight
+/// The forward weight step must scale with `ACTOR_VECTOR_SCALE` (1/16), and
+/// the critic's and the turn channel's must be the normalized-LMS steps
+/// `CRITIC_LEARNING_RATE / (1 + ‖x‖²)` and `ACTION_WEIGHT_LEARNING_RATE /
+/// (1 + ‖x‖²)`, where `x` is the previous brain tick's encoded state centered
+/// by the running mean. One TD update adds `step · δ · trace` to each weight
 /// dimension; reading the per-dimension weight delta against the snapshotted
 /// trace and δ recovers the step exactly. The ratio cancels δ and the trace,
 /// so it is robust to their magnitude. Mirrors of the in-shader constants are
@@ -2493,13 +2494,14 @@ fn actor_step_scales_with_actor_vector_scale() {
         return;
     }
 
-    // Mirrors of common.wgsl. The actor weight step uses ACTOR_VECTOR_SCALE; the
-    // critic (value) step is normalized by the previous encoded state.
+    // Mirrors of common.wgsl. The forward weight step uses ACTOR_VECTOR_SCALE;
+    // the critic (value) and turn steps are normalized by the previous
+    // centered encoding.
     const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
     const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
     const CRITIC_LEARNING_RATE: f32 = 0.01;
     const MAX_WEIGHT_NORM: f32 = 2.0;
-    /// Expected `Δw / (δ·trace)` for the actor.
+    /// Expected `Δw / (δ·trace)` for the forward channel.
     const ACTOR_STEP: f32 = ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE;
 
     // Stationary agent (no eat, no respawn), one food whose distance we drive to
@@ -2540,7 +2542,7 @@ fn actor_step_scales_with_actor_vector_scale() {
     }
     let before = kernel.read_agent_state(0);
     // δ corrects the value of the state encoded on the last warm-up tick.
-    let critic_step = CRITIC_LEARNING_RATE
+    let step_normalizer = 1.0
         / (1.0
             + (0..ENCODED_DIMENSION)
                 .map(|d| {
@@ -2549,6 +2551,8 @@ fn actor_step_scales_with_actor_vector_scale() {
                         .powi(2)
                 })
                 .sum::<f32>());
+    let critic_step = CRITIC_LEARNING_RATE * step_normalizer;
+    let turn_step = ACTION_WEIGHT_LEARNING_RATE * step_normalizer;
 
     // Measured tick: jump the food closer (still produces a metabolic δ from movement cost).
     place_food(&mut kernel, 6.0);
@@ -2598,11 +2602,11 @@ fn actor_step_scales_with_actor_vector_scale() {
     };
 
     let (fwd_step, fwd_cond) = recovered_step(O_ACTION_FORWARD_WEIGHTS, O_TRACE_FWD);
-    let (turn_step, turn_cond) = recovered_step(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
+    let (turn_recovered, turn_cond) = recovered_step(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
     let (val_step, val_cond) = recovered_step(O_VALUE_WEIGHTS, O_TRACE_CRITIC);
     eprintln!(
-        "actor step: forward={fwd_step:.6} turn={turn_step:.6} value={val_step:.8} \
-         (expect actor {ACTOR_STEP:.6}, critic {critic_step:.8})"
+        "actor step: forward={fwd_step:.6} turn={turn_recovered:.6} value={val_step:.8} \
+         (expect forward {ACTOR_STEP:.6}, turn {turn_step:.6}, critic {critic_step:.8})"
     );
 
     // Non-triviality: the conditioning factor δ·trace must be well above noise.
@@ -2617,15 +2621,17 @@ fn actor_step_scales_with_actor_vector_scale() {
         );
     }
 
-    // Actor steps use the 1/16 scale; the critic step is normalized.
+    // The forward step uses the 1/16 scale; the turn and critic steps are
+    // normalized.
     let rel = 0.05_f32;
     assert!(
         (fwd_step - ACTOR_STEP).abs() < ACTOR_STEP * rel,
         "forward step {fwd_step} != actor scale {ACTOR_STEP} (critic step is {critic_step})"
     );
     assert!(
-        (turn_step - ACTOR_STEP).abs() < ACTOR_STEP * rel,
-        "turn step {turn_step} != actor scale {ACTOR_STEP}"
+        (turn_recovered - turn_step).abs() < turn_step * rel,
+        "turn step {turn_recovered} != normalized turn step {turn_step} \
+         (the old 1/16 scale would give {ACTOR_STEP})"
     );
     assert!(
         (val_step - critic_step).abs() < critic_step * rel,
@@ -3574,7 +3580,8 @@ fn baseline_encoder_separability_vs_steering_gap() {
 /// the dying life's eligibility traces before they are cleared. With
 /// preset traces the kick is exactly computable:
 /// Δvalue_bias = 0.01/(1 + ‖x‖²)·(−1)·5, the normalized critic step for the
-/// last encoded state x centered by the running mean, and Δactor_bias = 0.1·(−1)·1 = −0.10. The
+/// last encoded state x centered by the running mean, Δforward_bias =
+/// 0.1·(−1)·1 = −0.10, and Δturn_bias = 0.1/(1 + ‖x‖²)·(−1)·1. The
 /// post-respawn brain tick in the same cycle applies δ through freshly
 /// zeroed traces, so it cannot move the biases — any deviation from the
 /// exact kick is a real defect.
@@ -3591,8 +3598,9 @@ fn death_applies_terminal_td_update_through_traces() {
         return;
     }
 
-    /// Mirror of `CRITIC_LEARNING_RATE` in `common.wgsl`.
+    /// Mirrors of `CRITIC_LEARNING_RATE` and `ACTION_WEIGHT_LEARNING_RATE` in `common.wgsl`.
     const CRITIC_LEARNING_RATE: f32 = 0.01;
+    const ACTION_WEIGHT_LEARNING_RATE: f32 = 0.10;
     /// Preset critic bias trace and value bias.
     const VALUE_BIAS_TRACE: f32 = 5.0;
     const VALUE_BIAS_BEFORE: f32 = 0.5;
@@ -3630,7 +3638,7 @@ fn death_applies_terminal_td_update_through_traces() {
     let forward_bias_before = state.brain_state[act_biases_offset];
     let turn_bias_before = state.brain_state[act_biases_offset + 1];
     // The terminal critic step is normalized by the dying life's last encoding.
-    let critic_step = CRITIC_LEARNING_RATE
+    let step_normalizer = 1.0
         / (1.0
             + (0..ENCODED_DIMENSION)
                 .map(|d| {
@@ -3639,7 +3647,10 @@ fn death_applies_terminal_td_update_through_traces() {
                         .powi(2)
                 })
                 .sum::<f32>());
-    let expected_value_bias = VALUE_BIAS_BEFORE - critic_step * VALUE_BIAS_TRACE;
+    let expected_value_bias =
+        VALUE_BIAS_BEFORE - CRITIC_LEARNING_RATE * step_normalizer * VALUE_BIAS_TRACE;
+    // The turn bias takes the normalized turn step through its preset trace of 1.
+    let expected_turn_bias = turn_bias_before - ACTION_WEIGHT_LEARNING_RATE * step_normalizer;
     arena.kernel.write_agent_state(agent, &state);
 
     // This tick kills (energy 0.001 → 0 via depletion), respawns, and runs
@@ -3668,8 +3679,9 @@ fn death_applies_terminal_td_update_through_traces() {
         "forward bias {forward_bias} (was {forward_bias_before}): terminal actor kick missing"
     );
     assert!(
-        (turn_bias - (turn_bias_before - 0.10)).abs() < 1e-3,
-        "turn bias {turn_bias} (was {turn_bias_before}): terminal actor kick missing"
+        (turn_bias - expected_turn_bias).abs() < 1e-4,
+        "turn bias {turn_bias} != {expected_turn_bias} (was {turn_bias_before}): \
+         terminal turn kick missing or wrong"
     );
 }
 
@@ -8267,7 +8279,7 @@ fn death_path_actor_update_uses_actor_vector_scale() {
     let before = kernel.read_agent_state(0);
     // The terminal critic step is normalized by the last brain tick's encoding,
     // which physics-only remainder ticks leave untouched.
-    let critic_step = CRITIC_LEARNING_RATE
+    let step_normalizer = 1.0
         / (1.0
             + (0..ENCODED_DIMENSION)
                 .map(|d| {
@@ -8276,6 +8288,8 @@ fn death_path_actor_update_uses_actor_vector_scale() {
                         .powi(2)
                 })
                 .sum::<f32>());
+    let critic_step = CRITIC_LEARNING_RATE * step_normalizer;
+    let turn_step = ACTION_WEIGHT_LEARNING_RATE * step_normalizer;
 
     // Kill the agent with PHYSICS-ONLY remainder ticks (1 tick each, < brain_tick_stride),
     // which run `phase_physics` + `phase_death` — the M4 fix's path. The brain does
@@ -8335,11 +8349,12 @@ fn death_path_actor_update_uses_actor_vector_scale() {
         )
     };
     let (fwd_step, fwd_cond) = recover(O_ACTION_FORWARD_WEIGHTS, O_TRACE_FWD);
-    let (turn_step, turn_cond) = recover(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
+    let (turn_recovered, turn_cond) = recover(O_ACTION_TURN_WEIGHTS, O_TRACE_TURN);
     let (val_step, val_cond) = recover(O_VALUE_WEIGHTS, O_TRACE_CRITIC);
     eprintln!(
-        "death-path step: forward={fwd_step:.6} turn={turn_step:.6} value={val_step:.8} \
-         (expect actor {ACTOR_STEP:.6}, critic {critic_step:.8}; TD-bug actor would be {:.6})",
+        "death-path step: forward={fwd_step:.6} turn={turn_recovered:.6} value={val_step:.8} \
+         (expect forward {ACTOR_STEP:.6}, turn {turn_step:.6}, critic {critic_step:.8}; \
+         TD-bug actor would be {:.6})",
         ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE
     );
 
@@ -8360,8 +8375,8 @@ fn death_path_actor_update_uses_actor_vector_scale() {
         ACTION_WEIGHT_LEARNING_RATE * TD_VECTOR_SCALE
     );
     assert!(
-        (turn_step - ACTOR_STEP).abs() < actor_tol,
-        "death-path turn step {turn_step:.6} != ACTOR step {ACTOR_STEP:.6}"
+        (turn_recovered - turn_step).abs() < turn_step * 0.05,
+        "death-path turn step {turn_recovered:.6} != normalized turn step {turn_step:.6}"
     );
     // The critic takes the same normalized step as in the brain pass.
     assert!(

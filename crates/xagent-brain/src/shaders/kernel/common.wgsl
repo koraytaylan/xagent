@@ -664,10 +664,19 @@ const CRITIC_LEARNING_RATE: f32 = 0.01;
 // the aggregate step (a sum of ENCODED_DIMENSION products, each O(1)) would
 // otherwise grow with dimensionality.
 const TD_VECTOR_SCALE: f32 = 1.0 / f32(ENCODED_DIMENSION);
-// Actor (forward/turn) weight-step scale. A 1/ENCODED_DIMENSION factor
+// Forward-channel weight-step scale. A 1/ENCODED_DIMENSION factor
 // throttled the policy step to 0.10/128 ≈ 8e-4. The actor only needs to stay inside the MAX_WEIGHT_NORM L2
 // ball (enforced every tick), so it can latch onto a sign-correct δ at a usable
 // rate. 1/16 lifts the step ~8× while staying well within that bound.
+//
+// The turn channel instead reads the centered encoding and takes the same
+// normalized step as the critic, ACTION_WEIGHT_LEARNING_RATE / ‖[1, x]‖² for
+// its weights and bias. Uncentered, the food-side signal in the encoding is
+// ~10× smaller than what every scene shares, and a replay of this update on
+// real encodings could not learn even a one-step turn-toward-food bandit
+// (alignment 0.51–0.57): the shared component and the 16× faster bias turned
+// every lesson into a side-blind constant turn. Centered and normalized, the
+// same replay reached 0.99–1.00.
 const ACTOR_VECTOR_SCALE: f32 = 1.0 / 16.0;
 // Bound on the TD error. No single transition is allowed to teach more
 // than this; protects against respawn/clamp artifacts (mirrors the intent
@@ -726,18 +735,19 @@ fn steering_weights_learn() -> bool {
     return bc_f32(CFG_FREEZE_STEERING_WEIGHTS) < 0.5;
 }
 
-// Normalized-LMS critic step (see CRITIC_LEARNING_RATE) for the transition
-// out of the state stored in O_PREV_ENCODED, centered by O_ENCODED_MEAN.
-// Serial; used by the death paths, which run once per death. The brain pass
-// computes the same value with a workgroup reduction.
-fn critic_step_for_prev_encoded(brain_base: u32) -> f32 {
+// Step normalizer 1 / ‖[1, x]‖² of the critic and the turn channel (see
+// CRITIC_LEARNING_RATE and ACTOR_VECTOR_SCALE) for the transition out of the
+// state stored in O_PREV_ENCODED, centered by O_ENCODED_MEAN. Serial; used by
+// the death paths, which run once per death. The brain pass computes the same
+// value with a workgroup reduction.
+fn step_normalizer_for_prev_encoded(brain_base: u32) -> f32 {
     var norm_sq: f32 = 1.0;
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         let x = brain_state[brain_base + O_PREV_ENCODED + i]
             - brain_state[brain_base + O_ENCODED_MEAN + i];
         norm_sq += x * x;
     }
-    return CRITIC_LEARNING_RATE / norm_sq;
+    return 1.0 / norm_sq;
 }
 
 // ── RNG (PCG hash) ──────────────────────────────────────────────────────────

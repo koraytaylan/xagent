@@ -45,11 +45,12 @@ var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 // changing any value. `s_pred_td[0]` == the former `s_pred_error`,
 // `s_pred_td[1]` == the former `s_td_error`.
 // Index 2 carries homeo predictor error (homeostatic gradient predictor head),
-// index 3 this tick's normalized critic step — still one binding.
+// index 3 this tick's step normalizer 1 / (1 + ‖x‖²) for the critic and the
+// turn channel — still one binding.
 const S_PRED_ERROR: u32 = 0u;
 const S_TD_ERROR: u32 = 1u;
 const S_HOMEO_PRED_ERROR: u32 = 2u;
-const S_CRITIC_STEP: u32 = 3u;
+const S_STEP_NORMALIZER: u32 = 3u;
 var<workgroup> s_pred_td: array<f32, 4>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
@@ -1336,9 +1337,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             workgroupBarrier();
         }
 
-        // Normalized critic step: δ corrects the value of the previous
-        // brain tick's state (O_PREV_ENCODED), so the step is normalized by
-        // that state's centered input's squared size plus the bias feature's 1.
+        // Step normalizer for the critic and the turn channel: δ corrects the
+        // previous brain tick's state (O_PREV_ENCODED), so both steps are
+        // normalized by that state's centered input's squared size plus the
+        // bias feature's 1.
         {
             if (tid < ENCODED_DIMENSION) {
                 let x = brain_state[brain_base + O_PREV_ENCODED + tid]
@@ -1350,7 +1352,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             workgroupBarrier();
             wg_reduce_dense(tid);
             if (tid == 0u) {
-                s_pred_td[S_CRITIC_STEP] = CRITIC_LEARNING_RATE / (1.0 + s_dense_partials[0]);
+                s_pred_td[S_STEP_NORMALIZER] = 1.0 / (1.0 + s_dense_partials[0]);
             }
             workgroupBarrier();
         }
@@ -1379,7 +1381,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
             let turn_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 2u];
             brain_state[brain_base + O_VALUE_BIAS] +=
-                s_pred_td[S_CRITIC_STEP] * td_error * critic_bias_trace;
+                CRITIC_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * critic_bias_trace;
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
             // The turn bias is part of the inherited steering genome. While
@@ -1387,7 +1389,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // it before selection reads the brain back.
             if (steering_weights_learn()) {
                 brain_state[brain_base + O_ACT_BIASES + 1u] +=
-                    ACTION_WEIGHT_LEARNING_RATE * td_error * turn_bias_trace;
+                    ACTION_WEIGHT_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * turn_bias_trace;
             }
         }
         workgroupBarrier();
@@ -1399,12 +1401,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let forward_trace = brain_state[brain_base + O_TRACE_FWD + tid];
             let turn_trace = brain_state[brain_base + O_TRACE_TURN + tid];
             brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
-                s_pred_td[S_CRITIC_STEP] * td_error * critic_trace;
+                CRITIC_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * critic_trace;
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
                 ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * forward_trace;
             if (steering_weights_learn()) {
                 brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] +=
-                    ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * turn_trace;
+                    ACTION_WEIGHT_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * turn_trace;
             }
             // Encoder credit: which encoded dimensions carried the policy's
             // eligibility when this outcome arrived.
@@ -1525,7 +1527,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Turn policy dot reduction
         {
             if (tid < ENCODED_DIMENSION) {
-                s_dense_partials[tid] = brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] * s_encoded[tid];
+                // The turn channel reads the centered encoding, like the critic.
+                s_dense_partials[tid] = brain_state[brain_base + O_ACTION_TURN_WEIGHTS + tid] * s_memory_key[tid];
             } else {
                 s_dense_partials[tid] = 0.0;
             }
@@ -1736,7 +1739,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     // ── Eligibility trace update (all dims in parallel) ─────────────────
     // Accumulating traces: z ← γλ·z + feature term. The critic trace
     // carries the critic's centered input; the actor traces carry
-    // exploration-noise × state — the likelihood-ratio direction of the
+    // exploration-noise × each channel's input (centered for turn) — the likelihood-ratio direction of the
     // action actually taken — so future TD errors credit exactly the noise
     // kicks (and the states they occurred in) that caused them.
     {
@@ -1748,7 +1751,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             brain_state[brain_base + O_TRACE_FWD + tid] =
                 brain_state[brain_base + O_TRACE_FWD + tid] * trace_decay + s_explore[0u] * enc;
             brain_state[brain_base + O_TRACE_TURN + tid] =
-                brain_state[brain_base + O_TRACE_TURN + tid] * trace_decay + s_explore[1u] * enc;
+                brain_state[brain_base + O_TRACE_TURN + tid] * trace_decay + s_explore[1u] * s_memory_key[tid];
         }
         if (tid == 0u) {
             brain_state[brain_base + O_TRACE_BIASES] =

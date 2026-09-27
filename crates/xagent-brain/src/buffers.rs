@@ -172,7 +172,9 @@ pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP;
 pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3;
 // meta: [created_at, last_accessed, activation_count] × cap
 pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3;
-pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP;
+/// Remembered return per moment (see `O_PAT_RETURN` in `common.wgsl`).
+pub const O_PAT_RETURN: usize = O_PAT_ACTIVE + MEMORY_CAP;
+pub const O_ACTIVE_COUNT: usize = O_PAT_RETURN + MEMORY_CAP;
 pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1;
 pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1;
 pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1;

@@ -9196,9 +9196,11 @@ fn sparse_encoder_food_separability() {
 /// higher TD errors than the 0017 pinned-movement condition (movement_speed=0,
 /// mean|δ| ≈ 8.7e-5). The movement-enabled result is the measurement gate
 /// for all downstream credit-path fixes.
-/// MEASURED 2026-09-26 Linux/RADV (movement-enabled foraging, centered
-/// normalized-LMS critic): mean|δ|=9.511e-4, std=1.001e-2, min=2.561e-8,
-/// max=3.000e-1. The 2026-06-25 Metal measurement (mean|δ|=4.547e-4) predates
+/// MEASURED 2026-09-28 Linux/RADV (movement-enabled foraging, centered
+/// normalized-LMS critic with episodic value replay): mean|δ|=2.303e-3,
+/// std=1.150e-2, min=9.313e-10, max=3.887e-1. Before the replay (2026-09-26)
+/// mean|δ| was 9.511e-4: replaying remembered returns makes the critic's value
+/// differ between states, so consecutive values differ more. The 2026-06-25 Metal measurement (mean|δ|=4.547e-4) predates
 /// the critic reading the centered encoding: centered inputs are small, so the
 /// normalized step is close to CRITIC_LEARNING_RATE itself and the value moves
 /// more between consecutive states.
@@ -9248,13 +9250,13 @@ fn baseline_td_error_variance_during_foraging() {
         );
     }
 
-    // Movement-enabled foraging baseline measured 2026-09-26 Linux/RADV:
-    // mean|δ|=9.511e-4. Range [4e-4, 1.3e-3] brackets that measurement and flags
+    // Movement-enabled foraging baseline measured 2026-09-28 Linux/RADV:
+    // mean|δ|=2.303e-3. Range [1e-3, 3.2e-3] brackets that measurement and flags
     // regressions or hardware-specific outliers before subsequent credit-path
     // fixes build on it.
     assert!(
-        (4e-4..=1.3e-3).contains(&mean),
-        "mean|δ| {mean:.3e} left the movement-enabled foraging baseline band [4e-4, 1.3e-3] — \
+        (1e-3..=3.2e-3).contains(&mean),
+        "mean|δ| {mean:.3e} left the movement-enabled foraging baseline band [1e-3, 3.2e-3] — \
          re-pin before building on it"
     );
 }
@@ -9517,7 +9519,8 @@ fn auxiliary_steering_probe_with_loss_enabled() {
 ///   lower_half_raw_gradient: mean≈1.1e-4, upper_half_raw_gradient: mean≈2.3e-4.
 /// The 2026-06-25 Metal values (upper mean|δ|≈8.7e-4, ~20×) still counted the
 /// birth tick, whose artifact gain alone contributes ≈6e-4 to the half that
-/// holds the spawn energy.
+/// holds the spawn energy. With the critic's episodic value replay
+/// (2026-09-28 Linux/RADV, median_energy=99.7): lower ≈6.8e-5, upper ≈3.9e-3.
 #[test]
 fn gradient_variance_per_context_breakdown() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_ENERGY};
@@ -9654,11 +9657,11 @@ fn gradient_variance_per_context_breakdown() {
         "lower-half mean|δ| {lower_td_mean:.3e} outside expected band [1e-5, 5e-4] \
          (measured ≈ 4.7e-5 on 2026-09-26 Linux/RADV) — credit signal may have regressed"
     );
-    // upper ≈ 2.9e-4: band [1e-4, 5e-3] catches near-zero (< 1e-4) or explosion (> 5e-3).
+    // upper ≈ 3.9e-3: band [1e-4, 2e-2] catches near-zero (< 1e-4) or explosion (> 2e-2).
     assert!(
-        (1e-4..=5e-3).contains(&upper_td_mean),
-        "upper-half mean|δ| {upper_td_mean:.3e} outside expected band [1e-4, 5e-3] \
-         (measured ≈ 2.9e-4 on 2026-09-26 Linux/RADV) — credit signal may have regressed"
+        (1e-4..=2e-2).contains(&upper_td_mean),
+        "upper-half mean|δ| {upper_td_mean:.3e} outside expected band [1e-4, 2e-2] \
+         (measured ≈ 3.9e-3 on 2026-09-28 Linux/RADV) — credit signal may have regressed"
     );
     // raw_gradient (energy_delta + integrity_delta) must also be small during steady
     // foraging — confirming the homeostatic signal is genuinely sparse, not an
@@ -9692,6 +9695,9 @@ fn gradient_variance_per_context_breakdown() {
 /// magnitude is necessary but not sufficient for improved steering).
 ///
 /// MEASURED 2026-06-25 Metal: raw mean|δ|=4.547e-4, normalized mean|δ_norm|≈0.18.
+/// MEASURED 2026-09-28 Linux/RADV (critic with episodic value replay): raw
+/// mean|δ|=2.523e-3, normalized mean|δ_norm|≈0.98 — replay makes the critic's
+/// value move between states, so δ is larger than the old degenerate level.
 #[test]
 fn gradient_shaping_normalization_prototype_amplifies_td_error() {
     if !xagent_brain::GpuKernel::is_available() {
@@ -9751,11 +9757,11 @@ fn gradient_shaping_normalization_prototype_amplifies_td_error() {
         raw_samples.len()
     );
 
-    // The raw td_error should be in the typical foraging magnitude range [1e-4, 2e-3]
-    // (degenerate but non-zero — the baseline probe pins the exact value separately).
+    // The raw td_error should be in the typical foraging magnitude range [1e-4, 5e-3]
+    // (the baseline probe pins the exact value separately).
     assert!(
-        (1e-4..=2e-3).contains(&raw_mean),
-        "raw mean|δ| {raw_mean:.3e} left the expected foraging magnitude range [1e-4, 2e-3] — \
+        (1e-4..=5e-3).contains(&raw_mean),
+        "raw mean|δ| {raw_mean:.3e} left the expected foraging magnitude range [1e-4, 5e-3] — \
          the credit signal may be degenerate or the arena is not foraging"
     );
     // After EMA normalization the mean should be in [0.05, 2.0]:

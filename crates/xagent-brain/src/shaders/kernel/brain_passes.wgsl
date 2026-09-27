@@ -63,6 +63,8 @@ var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
 // Each reduction writes its final scalar here so thread 0 can read without
 // barrier deadlock. All 256 threads participate in the reductions.
 var<workgroup> s_err_sum: f32;
+// The critic's value in the TD block; reused by the episodic value replay
+// at the end of the store pass (after the TD block has consumed it).
 var<workgroup> s_value: f32;
 var<workgroup> s_fwd_norm_sq: f32;
 var<workgroup> s_trn_norm_sq: f32;
@@ -1881,6 +1883,10 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
                     -MAX_EPISODIC_VALENCE,
                     MAX_EPISODIC_VALENCE,
                 );
+                // The same change, as the reward the critic sees, discounted
+                // from the moment it followed: the moment's remembered return.
+                pattern_buffer[pattern_base + O_PAT_RETURN + pattern] +=
+                    s_homeo[1u] * pow(TD_DISCOUNT, age - 1.0);
             }
         }
     }
@@ -1902,6 +1908,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
         pattern_buffer[pattern_base + O_PAT_NORMS + min_idx] = s_enc_norm;
         pattern_buffer[pattern_base + O_PAT_REINF + min_idx] = 1.0;
+        pattern_buffer[pattern_base + O_PAT_RETURN + min_idx] = 0.0;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u] = motor_forward;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_turn;
         // No outcome yet: valence arrives only if a salient change follows.
@@ -2004,5 +2011,40 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         let mean_rate = max(ENCODED_MEAN_RATE, 1.0 / max(tick, 1.0));
         let mean_slot = brain_base + O_ENCODED_MEAN + tid;
         brain_state[mean_slot] += mean_rate * (s_encoded[tid] - brain_state[mean_slot]);
+    }
+
+    // ── 7h. Episodic value replay ───────────────────────────────────────────
+    // One remembered moment per brain tick, chosen by hash, steps the
+    // critic's weights toward its remembered return (the salient homeostatic
+    // rewards that followed it): V(key) − value_bias → return. The bias keeps
+    // carrying the baseline. Only settled moments (older than the credit
+    // window) are replayed; the barriers stay uniform, so an unusable slot
+    // takes a zero step instead of branching.
+    let replay_slot = pcg_hash(agent_id ^ (u32(tick) * REPLAY_HASH_SALT)) % MEMORY_CAP;
+    let replay_age = tick - pattern_buffer[pattern_base + O_PAT_META + replay_slot * 3u];
+    let replay_settled = pattern_buffer[pattern_base + O_PAT_ACTIVE + replay_slot] >= 0.5
+        && replay_age > f32(EPISODIC_CREDIT_WINDOW);
+    if (tid < ENCODED_DIMENSION) {
+        s_dense_partials[tid] = brain_state[brain_base + O_VALUE_WEIGHTS + tid]
+            * pattern_buffer[pattern_base + tid * MEMORY_CAP + replay_slot];
+    } else {
+        s_dense_partials[tid] = 0.0;
+    }
+    workgroupBarrier();
+    wg_reduce_dense(tid);
+    if (tid == 0u) {
+        let key_norm = pattern_buffer[pattern_base + O_PAT_NORMS + replay_slot];
+        let replay_error = pattern_buffer[pattern_base + O_PAT_RETURN + replay_slot]
+            - s_dense_partials[0];
+        s_value = select(
+            0.0,
+            CRITIC_REPLAY_RATE * replay_error / (1.0 + key_norm * key_norm),
+            replay_settled,
+        );
+    }
+    workgroupBarrier();
+    if (tid < ENCODED_DIMENSION) {
+        brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
+            s_value * pattern_buffer[pattern_base + tid * MEMORY_CAP + replay_slot];
     }
 }

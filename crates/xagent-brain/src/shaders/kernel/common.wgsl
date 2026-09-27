@@ -327,7 +327,11 @@ const O_PAT_REINF: u32 = O_PAT_NORMS + MEMORY_CAP;
 const O_PAT_MOTOR: u32 = O_PAT_REINF + MEMORY_CAP;
 const O_PAT_META: u32 = O_PAT_MOTOR + MEMORY_CAP * 3u;
 const O_PAT_ACTIVE: u32 = O_PAT_META + MEMORY_CAP * 3u;
-const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
+// Remembered return per moment: the discounted rewards of the salient
+// homeostatic changes that followed it (see EPISODIC_CREDIT_WINDOW); the
+// target the critic's value replay moves toward.
+const O_PAT_RETURN: u32 = O_PAT_ACTIVE + MEMORY_CAP;
+const O_ACTIVE_COUNT: u32 = O_PAT_RETURN + MEMORY_CAP;
 const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
 const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
 
@@ -634,6 +638,16 @@ const PENDING_OUTCOME_KEEP_BONUS: f32 = 2.0 * EPISODIC_KEEP_WEIGHT * MAX_EPISODI
 /// score (reinforcement and |valence| are never negative), so a store fills
 /// an empty slot before it evicts a memory.
 const EMPTY_SLOT_KEEP_SCORE: f32 = -1.0;
+// Normalized-LMS rate of the critic's episodic value replay. Every brain
+// tick one remembered moment whose outcome has settled (older than the
+// credit window) steps the critic's weights toward its remembered return,
+// CRITIC_REPLAY_RATE / (1 + ‖key‖²) per unit of error. Each moment comes up
+// about once per MEMORY_CAP brain ticks, so at this rate a few dozen replays
+// close most of the gap: the rare moments that preceded a meal teach the
+// critic many times instead of once.
+const CRITIC_REPLAY_RATE: f32 = 0.1;
+// Salt that decorrelates the replayed slot's hash from the exploration noise.
+const REPLAY_HASH_SALT: u32 = 2654435761u;
 
 // ── TD(λ) credit constants ──────────────────────────────────────────────────
 

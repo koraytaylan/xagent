@@ -9,8 +9,10 @@
 //! awaiting their outcome are never evicted in favor of valued ones.
 
 use xagent_brain::buffers::{
-    BRAIN_STRIDE, MEMORY_CAP, O_PAT_ACTIVE, O_PAT_META, O_PAT_MOTOR, O_PAT_REINF, O_SALIENCE_LABEL,
-    O_SALIENCE_MEAN, O_SALIENCE_VARIANCE, O_TICK_COUNT, P_DEATH_COUNT, P_ENERGY, P_MAX_ENERGY,
+    BRAIN_STRIDE, ENCODED_DIMENSION, MEMORY_CAP, O_MIN_REINF_IDX, O_PAT_ACTIVE, O_PAT_META,
+    O_PAT_MOTOR, O_PAT_NORMS, O_PAT_REINF, O_PAT_RETURN, O_PAT_STATES, O_SALIENCE_LABEL,
+    O_SALIENCE_MEAN, O_SALIENCE_VARIANCE, O_TICK_COUNT, O_VALUE_WEIGHTS, P_DEATH_COUNT, P_ENERGY,
+    P_MAX_ENERGY,
 };
 use xagent_brain::GpuKernel;
 use xagent_shared::{BrainConfig, WorldConfig};
@@ -52,6 +54,19 @@ const SMALL_MEAL_ENERGY: f32 = 4.0;
 const MEAL_INTERVAL: u64 = 10;
 /// Enough meals to credit more moments than memory holds.
 const MEAL_COUNT: u64 = 20;
+/// Mirrors `TD_DISCOUNT` in `common.wgsl`: the remembered return discounts
+/// the reward by γ per brain tick of age.
+const RETURN_DISCOUNT: f32 = 0.97;
+/// Remembered return planted on one settled moment for the replay probe.
+const PLANTED_RETURN: f32 = 0.5;
+/// Age (brain ticks) of the planted moment: well past the credit window.
+const PLANTED_AGE: f32 = 100.0;
+/// Brain ticks the replay probe runs: the planted slot comes up about
+/// REPLAY_TICKS / MEMORY_CAP ≈ 16 times.
+const REPLAY_TICKS: u64 = 2000;
+/// After ~16 replays at CRITIC_REPLAY_RATE 0.1 and ‖key‖ = 1, the critic
+/// closes ~1 − 0.95¹⁶ ≈ 56% of the gap; require well over a fifth of it.
+const MIN_REPLAYED_FRACTION: f32 = 0.2;
 
 /// Brain of the stationary probe agent. Single-tick strides make every
 /// physics tick a brain tick.
@@ -372,5 +387,98 @@ fn memory_full_of_valued_episodes_still_credits_the_whole_window() {
     assert!(
         valued >= MEMORY_CAP - MEAL_INTERVAL as usize,
         "only {valued} valued episodes; the probe must fill memory with them to test eviction"
+    );
+}
+
+#[test]
+fn salient_gain_is_remembered_as_the_preceding_moments_return() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let mut kernel = stationary_kernel();
+    let mut tick = 0_u64;
+    set_energy(&mut kernel, FULL_METER - HUNGER_DEFICIT);
+    run_ticks(&mut kernel, &mut tick, WARMUP_TICKS);
+    let energy = kernel.read_full_state_blocking()[P_ENERGY];
+    set_energy(&mut kernel, energy + MEAL_ENERGY);
+    run_ticks(&mut kernel, &mut tick, 1);
+
+    let state = kernel.read_agent_state(0);
+    let now = state.brain_state[O_TICK_COUNT];
+    let returns: Vec<(f32, f32)> = (0..MEMORY_CAP)
+        .filter(|&slot| state.patterns[O_PAT_ACTIVE + slot] >= 0.5)
+        .map(|slot| {
+            (
+                now - state.patterns[O_PAT_META + slot * 3],
+                state.patterns[O_PAT_RETURN + slot],
+            )
+        })
+        .collect();
+    let newest = returns
+        .iter()
+        .find(|(age, _)| *age == 1.0)
+        .map(|(_, r)| *r)
+        .expect("the moment right before the meal is in memory");
+    assert!(
+        newest > 0.0,
+        "the meal left no return on the moment before it"
+    );
+    for (age, remembered) in &returns {
+        if (1.0..=CREDIT_WINDOW).contains(age) {
+            let expected = newest * RETURN_DISCOUNT.powf(age - 1.0);
+            assert!(
+                (remembered - expected).abs() < VALENCE_TOLERANCE,
+                "moment {age} ticks before the meal remembers {remembered}, expected {expected}"
+            );
+        } else {
+            assert_eq!(
+                *remembered, 0.0,
+                "moment at age {age} outside the window gained a return"
+            );
+        }
+    }
+}
+
+#[test]
+fn value_replay_moves_the_critic_toward_a_remembered_return() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let mut kernel = stationary_kernel();
+    let mut tick = 0_u64;
+    run_ticks(&mut kernel, &mut tick, WARMUP_TICKS);
+
+    // Plant one settled, fully valued moment whose key is the first unit
+    // vector, so the critic's value of it is simply value_weights[0].
+    let mut state = kernel.read_agent_state(0);
+    let now = state.brain_state[O_TICK_COUNT];
+    let slot = (state.patterns[O_MIN_REINF_IDX] as usize + 1) % MEMORY_CAP;
+    for d in 0..ENCODED_DIMENSION {
+        state.patterns[O_PAT_STATES + d * MEMORY_CAP + slot] = if d == 0 { 1.0 } else { 0.0 };
+        state.brain_state[O_VALUE_WEIGHTS + d] = 0.0;
+    }
+    state.patterns[O_PAT_NORMS + slot] = 1.0;
+    state.patterns[O_PAT_REINF + slot] = 1.0;
+    state.patterns[O_PAT_MOTOR + slot * 3 + 2] = 1.0;
+    state.patterns[O_PAT_META + slot * 3] = now - PLANTED_AGE;
+    state.patterns[O_PAT_ACTIVE + slot] = 1.0;
+    state.patterns[O_PAT_RETURN + slot] = PLANTED_RETURN;
+    kernel.write_agent_state(0, &state);
+
+    run_ticks(&mut kernel, &mut tick, REPLAY_TICKS);
+
+    let after = kernel.read_agent_state(0);
+    assert_eq!(
+        after.patterns[O_PAT_RETURN + slot],
+        PLANTED_RETURN,
+        "the planted moment was evicted or rewritten"
+    );
+    let value = after.brain_state[O_VALUE_WEIGHTS];
+    assert!(
+        value > MIN_REPLAYED_FRACTION * PLANTED_RETURN && value <= PLANTED_RETURN,
+        "the critic values the remembered moment at {value}; replay should move it toward \
+         {PLANTED_RETURN} (without replay it stays near 0)"
     );
 }

@@ -311,3 +311,38 @@ The critic now reads the centered encoding, `encoded − O_ENCODED_MEAN`, for it
 - Approach intent: 0.490.
 
 With food as the only thing that varies (the probe), centering raises the value of nearby, centered food about sixfold, to about 4% of a meal. In free runs the per-brain differences grow (−0.17 to +0.15 meals) but their sign is a coin flip. The free-run critic still does not consistently value approaching food: its value spreads over scenes along something other than the food.
+
+## Can the turn learner learn steering from a clean signal?
+
+This was a CPU replay of the brain's turn learner, run in scratch code outside the repo. It uses the exact per-brain-tick order and constants from `coop_predict_and_act`:
+
+- the centered, normalized TD critic;
+- trace-weighted updates, `AWLR · ACTOR_VECTOR_SCALE · δ · z` for the weights and `AWLR · δ · z` for the bias;
+- the L2 ball;
+- a tanh policy with uniform exploration noise;
+- the traces updated with `noise · encoded`;
+- the running mean updated as in pass 7g.
+
+The inputs were real encodings of food at 29 bearings × 3 distances, dumped from 12 brains: 4 fresh, 4 trained by a 100k-tick free run, and 4 trained by the standard probe. Each brain started from its own weights and learned for 20k brain ticks on two tasks:
+
+- **Bandit**: each tick shows a random in-view scene. The next tick's reward is `0.12 × executed turn × side of the food`. This is the easiest possible steering problem: immediate, dense, and linearly separable.
+- **Steering**: turning rotates the food's bearing (0.1 rad per tick at full turn). The only reward is 0.12 on centering the food (|bearing| < 0.05); an episode times out after 30 ticks.
+
+Scores below are the alignment of the policy's own turn sign with the food's side over all scenes.
+
+| Arm | Bandit alignment (fresh / free-run / probe brains) | Steering alignment | Steering success (first → last fifth) |
+|---|---|---|---|
+| exact rule | 0.51 / 0.57 / 0.56 | 0.49 / 0.49 / 0.43 | 0.00→0.15 / 0.38→0.48 / 0.50→0.51 |
+| actor input centered | 0.51 / 0.65 / 0.57 | 0.51 / 0.49 / 0.55 | 0.01→0.00 / 0.41→0.49 / 0.14→0.36 |
+| `ACTOR_VECTOR_SCALE` 1 (was 1/16) | 0.54 / 0.72 / 0.56 | 0.49 / 0.49 / 0.55 | 0.04→0.26 / 0.49→0.50 / 0.49→0.50 |
+| **centered + scale 1** | **0.98 / 0.99 / 0.66** | 0.51 / 0.49 / 0.55 | 0.00→0.01 / 0.38→0.51 / 0.16→0.30 |
+| reward × 8.3 (1.0 per unit) | 0.51 / 0.49 / 0.56 | 0.49 / 0.49 / 0.43 | 0.08→0.25 / 0.48→0.52 / 0.51→0.50 |
+| no L2 ball | 0.62 / 0.60 / 0.57 | 0.50 / 0.49 / 0.43 | 0.02→0.26 / 0.42→0.49 / 0.48→0.50 |
+
+**The exact rule cannot learn even the bandit.** The side signal in the encodings is small next to what every scene shares: the left/right half-difference has norm 0.23–0.28, against a scene mean of norm 2.5–4.2 (0.04–0.11 for probe-trained encoders, whose shared component grew to 10–11). An uncentered update is dominated by that shared component and by the turn bias. The bias steps 16× faster than the per-dimension weights, so learning goes into a side-blind constant turn. The per-dimension step, `0.10 / 16`, then moves the side direction too slowly to matter within a lifetime.
+
+**Two changes together make the bandit learnable** (alignment 0.98–0.99 for fresh and free-run encoders): centering the actor's input as the critic's already is, and an actor step 16× larger. Neither is enough alone, and a larger reward or removing the L2 ball does not help. Probe-trained encoders reach only 0.66: there the side signal is under 1% of the shared component, and centering does not recover it.
+
+**No arm learns the sequential task in 20k ticks.** With the reward only on centering, exploration noise almost never centers the food by chance. Fresh brains succeed in 0–1% of episodes. The one strategy that pays off is a constant rotation, which the bias learns and which sweeps through the food in about half the episodes. That is the "saturated constant rotation" of finding F5, now reproduced without any reset artifacts.
+
+Fixing the update rule is therefore necessary but not sufficient. The turn learner also needs a between-meals signal that grows as the food gets centered, which is the critic's job — and in free runs the critic does not yet learn that.

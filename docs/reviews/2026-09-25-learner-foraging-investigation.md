@@ -375,3 +375,23 @@ The turn policy and its trace now read the centered encoding, and its weights an
 The fix is neutral in free runs and in evolution, and steering still does not appear. Steering-required success falls because the turn weights can no longer absorb the constant spin that used to sweep through the food there.
 
 This is the replay's prediction for the sequential task: once the rule is able to learn, the missing piece is a signal between meals that grows as the food gets centered. Exploration alone almost never finds the reward, so a lifetime yields too few meals to learn steering from.
+
+## Faster critic or persistent exploration in the sequential task
+
+Both candidates for a between-meals signal were tested in the replay's sequential task (reward only on centering the food), starting from the landed rule: centered turn input, normalized turn step. Each run was 20k brain ticks. The persistent noise is an AR(1) process with the same marginal variance as the independent uniform draw.
+
+| Arm | Steering alignment (fresh / free-run / probe brains) | Side component | \|Common turn\| | Success, first → last fifth | V(centered) − V(off-center) |
+|---|---|---|---|---|---|
+| landed rule | 0.49 / 0.49 / 0.55 | +0.00 / −0.01 / +0.21 | 0.01 / 0.54 / 0.56 | 0.00→0.00 / 0.34→0.50 / 0.14→0.24 | +0.00 / +0.71 / +0.06 meals |
+| `CRITIC_LEARNING_RATE` 0.1 | 0.49 / 0.49 / 0.55 | −0.00 / +0.00 / +0.19 | 0.00 / 0.90 / 0.88 | 0.00→0.00 / 0.45→0.51 / 0.24→0.51 | +0.00 / +0.55 / +0.30 |
+| noise persistence ρ = 0.8 | 0.51 / 0.49 / 0.55 | +0.03 / −0.01 / +0.21 | 0.99 / 1.27 / 1.28 | 0.34→0.48 / 0.46→0.52 / 0.41→0.50 | +0.63 / +0.70 / +0.17 |
+| noise persistence ρ = 0.9 | 0.50 / 0.49 / 0.55 | +0.02 / −0.01 / +0.22 | 1.34 / 1.51 / 1.39 | 0.45→0.49 / 0.48→0.52 / 0.44→0.47 | +0.63 / +0.68 / +0.17 |
+| both | 0.51 / 0.49 / 0.56 | +0.06 / +0.02 / +0.22 | 1.46 / 1.60 / 1.61 | 0.46→0.49 / 0.49→0.50 / 0.48→0.49 | +0.46 / +0.57 / +0.10 |
+
+Neither change makes the task learnable, so neither was ported.
+
+- **Persistent noise lets fresh brains find the reward** (0.34–0.46 success from the start, where independent noise gets 0), and their critic learns that centered food is worth about two thirds of a meal more than off-center food.
+- **A faster critic** strengthens that value gradient for probe-trained brains (+0.30 meals).
+- **Every arm still converges to the constant spin.** The common turn grows to 1–1.6, the side component stays near zero, and success settles at the spin's ceiling of about 0.5.
+
+So even with a value gradient between meals, the turn learner falls into the spin attractor. A saturated constant turn clips the exploration kicks that push further along the spin while still crediting them, and the turn bias carries the spin directly. The next candidates are inside the actor: credit the kick that was actually expressed after clipping, and stop the turn bias learning a spin.

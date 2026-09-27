@@ -452,3 +452,26 @@ Categories:
 - **The lesson is in the experience, and it is large.** Food ahead is worth about half a meal more than no food in view, and 0.15–0.3 of a meal more than the same food off-axis — exactly the gradient a turn toward food would climb. The trained critics measured above value nearby, centered food at most 0.04 of a meal above food behind. They have learned less than a tenth of what the agent's own experience teaches.
 - **The lesson is rare.** Food is in view on only 1–3% of ticks.
 - **Perception rate matters by itself.** With a fresh frame every brain tick, the same learner eats 1.9× as many meals with no other change. Under the default strides the agent walks about 9 units (more than the ~5.5-unit food visibility range) between frames. Only 27–37% of meals are preceded by food in view on the previous frame, against 75–79% with fresh frames. Headless evolution and free runs use the default strides.
+
+## Fresh perception by default
+
+`vision_stride` now defaults to 1, so the agent gets a fresh frame every brain tick. The same knob also runs the other global passes (grid rebuild, food respawn, collisions) every brain tick.
+
+**Throughput** (10 agents, `--bench`, 30k ticks):
+
+| `vision_stride` | Ticks/s | Change |
+|---|---|---|
+| 10 | 6458 | — |
+| 2 | 5666 | −12% |
+| 1 | 5021 | −22% |
+
+**Headless evolution.** Release builds, `evo_default` config with only `vision_stride` changed, 20 generations; the same code at `vision_stride` 10 is the baseline.
+
+| Run | Mean fitness | Food/agent | Deaths/agent | Best | Fitness, first 5 → last 5 generations |
+|---|---|---|---|---|---|
+| stride 10, seed 5 | 0.0263 | 6.9 | 6.2 | 0.0342 | 0.0267 → 0.0265 |
+| **stride 1, seed 5** | **0.0390** | **11.5** | 5.3 | 0.0531 | 0.0417 → 0.0400 |
+| stride 10, seed 6 | 0.0264 | 7.3 | 6.3 | 0.0334 | 0.0272 → 0.0259 |
+| **stride 1, seed 6** | **0.0540** | **22.7** | 8.9 | 0.0642 | 0.0566 → 0.0549 |
+
+Mean fitness rises 76% (0.0465 vs 0.0264) and food per agent 1.6–3.1×. The gain is immediate rather than evolved: fitness is flat across generations in every run. This matches the free-run measurement above (meals 1.9× with fresh frames), where the learned turn policy stays at chance. The better foraging comes from acting on current rather than 3-second-old perception, not from learned steering.

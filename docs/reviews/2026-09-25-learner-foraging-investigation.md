@@ -428,3 +428,27 @@ The learned policy itself (sign of `w · (encoded − mean)` over the scene grid
 | standard probe, 240 episodes | 0.428 | 0.461 | 0.466 (per brain 0.32–0.73) |
 
 In the simulator the only signal is the agent's own energy gain when it eats, and the free-run critic has not learned that food ahead predicts one. The rule can now learn steering, but the agent's experience does not yet teach it.
+
+## Does the agent's own experience contain the lesson?
+
+This test only measured, using ground truth from the physics state (nearest food distance and bearing each sample). It ran on the current code: free runs of 10 agents × 100k ticks, seeds 5–7, with the default perception (a new visual frame every `vision_stride × brain_tick_stride` = 100 physics ticks = 10 brain ticks) and with a fresh frame every brain tick (`vision_stride` 1).
+
+Categories:
+
+- **near ahead**: food < 3 units away, |bearing| < 0.4;
+- **ahead**: food 3–5.5 units away, |bearing| < 0.4;
+- **in view off-axis**: food < 5.5 units away, 0.4 ≤ |bearing| < π/4;
+- **not in view**: everything else.
+
+"Value" is the discounted next meal, E[γ^(brain ticks to next meal)] with the critic's γ = 0.97, in meals.
+
+| Regime (seeds 5 / 6 / 7) | Meals per agent | Share of ticks with food in view | P(meal within 10 brain ticks): ahead / off-axis / not in view | Value, meals: ahead / off-axis / not in view |
+|---|---|---|---|---|
+| default perception | 19.5 / 17.0 / 15.2 | 1.2–1.5% | 0.46–0.59 / 0.23–0.36 / 0.011–0.013 | 0.45–0.61 / 0.29–0.41 / 0.04–0.05 |
+| frame every brain tick | 35.8 / 37.8 / 28.9 | 2.3–3.1% | 0.54–0.74 / 0.35–0.41 / 0.016–0.020 | 0.55–0.72 / 0.40–0.46 / 0.07–0.09 |
+
+(Near-ahead food behaves like ahead: 0.43–0.74 meals.)
+
+- **The lesson is in the experience, and it is large.** Food ahead is worth about half a meal more than no food in view, and 0.15–0.3 of a meal more than the same food off-axis — exactly the gradient a turn toward food would climb. The trained critics measured above value nearby, centered food at most 0.04 of a meal above food behind. They have learned less than a tenth of what the agent's own experience teaches.
+- **The lesson is rare.** Food is in view on only 1–3% of ticks.
+- **Perception rate matters by itself.** With a fresh frame every brain tick, the same learner eats 1.9× as many meals with no other change. Under the default strides the agent walks about 9 units (more than the ~5.5-unit food visibility range) between frames. Only 27–37% of meals are preceded by food in view on the previous frame, against 75–79% with fresh frames. Headless evolution and free runs use the default strides.

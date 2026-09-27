@@ -106,7 +106,11 @@ pub struct BrainConfig {
     pub brain_tick_stride: u32,
     /// Brain cycles between global passes (grid rebuild, collisions, vision).
     /// Higher = more brain throughput, less frequent vision updates.
-    /// Default 10, clamped to `[1, MAX_VISION_STRIDE]` in the UI. Combined with
+    /// Default 1 — a fresh frame every brain tick — clamped to
+    /// `[1, MAX_VISION_STRIDE]` in the UI. At 10 a free-running agent walked
+    /// ~9 units between frames, farther than it can see food (~5.5 units), and
+    /// ate about half as much (15–20 vs 29–38 meals per 100k ticks); a frame
+    /// every brain tick costs ~22% throughput. Combined with
     /// `brain_tick_stride` this sets the one-batch sensory lag — see
     /// [`BrainConfig::sensory_lag_ticks`].
     #[serde(default = "default_vision_stride")]
@@ -363,7 +367,7 @@ fn default_brain_tick_stride() -> u32 {
 }
 
 fn default_vision_stride() -> u32 {
-    10
+    1
 }
 
 fn default_metabolic_rate() -> f32 {
@@ -801,7 +805,7 @@ mod tests {
     fn brain_config_tuned_defaults() {
         let config = BrainConfig::default();
         assert_eq!(config.brain_tick_stride, 10);
-        assert_eq!(config.vision_stride, 10);
+        assert_eq!(config.vision_stride, 1);
         assert_eq!(config.vision_width, 8);
         assert_eq!(config.vision_height, 6);
         assert!((config.metabolic_rate - 0.5).abs() < 1e-6);
@@ -828,8 +832,8 @@ mod tests {
     #[test]
     fn default_sensory_lag_is_within_bound() {
         let config = BrainConfig::default();
-        // Default 10 * 10 = 100 ticks, well under the bound.
-        assert_eq!(config.sensory_lag_ticks(), 100);
+        // Default 1 * 10 = 10 ticks: one brain tick, well under the bound.
+        assert_eq!(config.sensory_lag_ticks(), 10);
         assert!(config.sensory_lag_ticks() <= BrainConfig::MAX_SENSORY_LAG_TICKS);
     }
 

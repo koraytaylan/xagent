@@ -117,7 +117,7 @@ All per-agent simulation runs inside `xagent_brain::GpuKernel`. A call to `dispa
 
 The brain stage in step 2 reads its sensory input from the buffer that step 4 wrote in the **previous** batch, so the pipeline has a one-batch sensory lag. This lag is intentional and consistent across stride settings — it lets the costly global+vision passes run once per kernel-batch instead of once per simulated tick.
 
-The `vision_stride` parameter (default 10) is the inner-loop count of the `kernel` pass — how many brain+physics cycles run between global/vision updates. `brain_tick_stride` (default 10) controls how many physics ticks run per brain cycle. CPU work per simulated tick is dominated by command-encoder setup and a fixed-size world-config uniform write per kernel-batch — not per-tick — which is what makes 60,000+ brain ticks/second per agent achievable.
+The `vision_stride` parameter (default 1: a fresh frame every brain tick) is the inner-loop count of the `kernel` pass — how many brain+physics cycles run between global/vision updates. `brain_tick_stride` (default 10) controls how many physics ticks run per brain cycle. CPU work per simulated tick is dominated by command-encoder setup and a fixed-size world-config uniform write per kernel-batch — not per-tick — which is what makes 60,000+ brain ticks/second per agent achievable.
 
 The 7 brain stages are inlined as cooperative WGSL functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) defined in `brain_passes.wgsl` and composed into `kernel_tick.wgsl` at pipeline creation. They share the same buffer layout (`BrainLayout`, `O_*` offset constants in `buffers.rs`) and operate on the agent-local 256-thread workgroup with `workgroupBarrier()` between stages.
 
@@ -325,7 +325,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `fatigue_floor` | Minimum motor output under fatigue (default 0.1). Lower → harsher dampening. Heritable. |
 | `vision_rays` | Number of vision rays, W×H (default 48 = 8×6). Affects sensory buffer size. |
 | `brain_tick_stride` | Physics ticks per brain+vision cycle (default 10). Higher → faster but less responsive. |
-| `vision_stride` | Brain cycles between global passes — grid rebuild, food respawn, collisions, vision (default 10). Higher → more brain throughput, less frequent vision updates. |
+| `vision_stride` | Brain cycles between global passes — grid rebuild, food respawn, collisions, vision (default 1). Higher → more brain throughput, less frequent vision updates; at 10 a free-running agent walks farther between frames than it can see food. |
 | `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |
 | `integrity_scale` | Multiplier for integrity damage and regen (default 0.5). Higher → deadlier hazards. |
 
@@ -357,7 +357,7 @@ Additional world parameters: `world_size` (default 256), `integrity_regen_rate` 
     "fatigue_floor": 0.1,
     "vision_rays": 48,
     "brain_tick_stride": 10,
-    "vision_stride": 10,
+    "vision_stride": 1,
     "metabolic_rate": 0.5,
     "integrity_scale": 0.5
   },

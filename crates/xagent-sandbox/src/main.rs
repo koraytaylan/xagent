@@ -150,7 +150,7 @@ struct Cli {
     /// (e.g., 10_000) dramatically reduces wall-clock time while preserving the evolutionary
     /// signal across 50 generations; both A/B arms always use the same budget, so the
     /// relative comparison is unbiased. Values must be a non-zero multiple of
-    /// vision_stride × brain_tick_stride (100 at default strides); 0 means no override.
+    /// vision_stride × brain_tick_stride (10 at default strides); 0 means no override.
     #[arg(long, default_value_t = 0)]
     validation_tick_budget: u64,
 

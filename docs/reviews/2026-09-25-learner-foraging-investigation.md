@@ -622,3 +622,24 @@ This was an offline check in the world, not a shader change. On the same in-view
 - **It carries no centring gradient either:** +0.05 ± 0.05, half the seeds each way. Recall by whole-scene similarity pools centred and off-axis moments together. Each moment's return is also cut at the 8-tick credit window, so the difference between "reached food in 3 ticks" and "in 10" is mostly lost.
 
 Porting it would give the agent a reliable sense that food is in view, but still no gradient for turning toward it.
+
+## Is it rarity? Food five and ten times as common
+
+The same 1M-tick in-world measurement on current code (with the critic's replay), seeds 5–7, with `food_density` multiplied by 5 and by 10. In-view reads were subsampled 1-in-5 and 1-in-10 to keep the run cheap.
+
+| Window (100k ticks) | 5× food: meals/agent | food in view | V(in view) − V(not) | centred − off | policy toward food | 10× food: meals/agent | food in view | V(in view) − V(not) | centred − off | policy toward food |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 293 | 8.0% | −0.40 | −1.95 | 0.49 | 535 | 11.0% | +0.01 | −1.55 | 0.47 |
+| 2 | 341 | 7.4% | −0.80 | −0.11 | 0.47 | 692 | 10.6% | −0.40 | −1.67 | 0.48 |
+| 4 | 372 | 7.8% | −2.36 | −0.41 | 0.50 | 692 | 10.7% | +0.18 | −0.20 | 0.49 |
+| 6 | 370 | 7.7% | −0.22 | +0.99 | 0.50 | 693 | 10.3% | −0.03 | +0.10 | 0.49 |
+| 8 | 377 | 7.6% | −15.23 | −6.12 | 0.49 | 723 | 10.4% | −0.56 | −0.30 | 0.49 |
+| 9 | 376 | 7.3% | −7.63 | −10.25 | 0.50 | 703 | 10.1% | +0.15 | +0.55 | 0.50 |
+
+With 10–20× the reward events (meals) of the default world, and food in view on 7–11% of ticks instead of 1–3%:
+
+- **The turn policy stays at chance** (0.46–0.54 per seed) in every window of both worlds.
+- **The critic still prefers neither centred nor off-axis food.** At 5× food it even destabilizes: late in the life it values food in view 8–15 meals *below* no food.
+- **Meals do rise 28–31% over the life,** but without any steering.
+
+So rarity is not the explanation. Even with plenty of the right data, this TD actor-critic does not learn to turn toward food it can see, and a food-rich early world would not by itself teach steering. The ceiling is the learner.

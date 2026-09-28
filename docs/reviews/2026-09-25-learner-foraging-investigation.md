@@ -544,3 +544,25 @@ Setup: default config (fresh perception), 10 agents, 100k ticks, seeds 5–7. Un
 - **In the world, the critic already values food in view** (+0.1 to +0.6 meals before replay), well above what the probe scenes showed. Replay raises this further early in a life.
 - **Whether it prefers centred food cannot be resolved at this sample size.** Only 135–275 in-view samples fell in each half-run, so the distance bins hold 8–48 samples and swing by ±0.5 meals. The sign is inconsistent in both arms.
 - **Replay's left/right swings appear in the world too:** 0.20–1.44 meals, against 0.03–0.27 before.
+
+### Ten seeds, and a gentler replay
+
+The same in-world measurement over seeds 5–14 (whole runs, about 470–545 in-view samples per seed). A third arm replays at `CRITIC_REPLAY_RATE` 0.02 instead of 0.1. Values are in meals, shown as mean ± standard error over seeds:
+
+| Arm | V(in view) − V(not in view) | V(centred) − V(off-axis), same distance | \|V(left) − V(right)\| |
+|---|---|---|---|
+| no replay | +0.27 ± 0.05 | −0.03 ± 0.04 (4/10 positive) | 0.14 ± 0.02 |
+| replay 0.1 (on develop) | +0.26 ± 0.28 | +0.14 ± 0.19 (6/10) | 0.70 ± 0.15 |
+| replay 0.02 | +0.23 ± 0.48 | −0.60 ± 0.51 (3/10) | 1.24 ± 0.32 |
+
+Free runs, seeds 5–10:
+
+| Arm | Food/agent | Deaths/agent | Distance/agent |
+|---|---|---|---|
+| no replay | 36.4 | 15.8 | 7.3k |
+| replay 0.1 | 59.9 | 27.6 | 13.9k |
+| replay 0.02 | 57.6 | 23.8 | 11.9k |
+
+- **Without replay, the in-world critic already values food in view** (+0.27 ± 0.05 meals), but not centred food over off-axis food (−0.03 ± 0.04). The centring gradient that steering needs is absent.
+- **Replay at either rate leaves that gradient absent** while making the critic's value 6–10× noisier across seeds and inflating left/right differences 5–9×. The gentler rate does not reduce the swings.
+- **Replay's foraging gain works through movement, not a better critic.** Agents keep moving (1.6–1.9× the distance), eat more, and die more.

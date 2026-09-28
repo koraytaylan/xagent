@@ -591,3 +591,18 @@ The same in-world measurement over a single life of 1M ticks: 10 agents, default
 - Without replay, the critic's value grows noisier as the life goes on. Left/right differences reach 0.4–4.4 meals after the first 200k ticks, against 0.18–0.26 before, and the value of food in view even turns negative in some windows.
 
 So this is not data starvation. The critic gets less reliable with more experience, which points at something underneath it drifting. A likely suspect is its input: the encoder keeps learning while the critic fits it. That remains a hypothesis to test.
+
+## Does encoder drift make the critic noisy?
+
+A scratch build (not committed) repeated the 1M-tick life on the current code without replay, seeds 5–7. At tick 200k it could freeze the encoder's weights, the only weights the encoder credit step changes, alone or together with the running mean the critic's input is centred by. Drift is the relative change of each over a 100k-tick window (‖Δ‖/‖·‖).
+
+| Arm | Encoder change per window (from 200k on) | V(centred) − V(off-axis), windows 2–9 | \|V(left) − V(right)\|, windows 2–9 | Policy toward food |
+|---|---|---|---|---|
+| no freeze | 1.44 → 0.44–0.70 | −0.70 … +3.52 | 0.69 – 3.36 | 0.48 – 0.51 |
+| encoder frozen | 0 | −0.50 … +2.11 | 0.59 – 2.04 | 0.49 – 0.53 |
+| encoder + mean frozen | 0 (mean change 0) | −9.12 … +7.45 | 0.27 – 6.73 | 0.48 – 0.53 |
+
+- **The encoder does rewrite itself heavily.** Its weights change by 124–146% per 100k ticks in the first 400k ticks and by 44–70% per window afterwards. The earlier readout shows the food's side survives that.
+- **But freezing it does not calm the critic.** With the encoder and the mean both frozen from tick 200k, its value of food in view still swings by up to ±9 meals between windows. It still shows no stable centring preference, and the turn policy stays at chance.
+
+So drift is not the cause. What is left is the critic itself. Scenes with food in view make up only about 1–3% of its data and sit far from the average scene it learns from. Their values are barely constrained, so they swing with every update fitted to common scenes. Meanwhile the weight norm grows from 0.25 to 1.0–1.3 over the life, which amplifies the swings. The lesson is in the experience, but this linear critic cannot hold it for rare scenes.

@@ -527,3 +527,20 @@ Steering needs the value to rise as the food's bearing narrows at the same dista
 The steering gradient is not there. With replay, free-run critics value "food present" (near vs behind: +0.2–0.3 meals). But their value of the same food at the same distance swings with which side it is on, by 2.3 meals on average and by up to ~4 meals in single brains, while centred and off-axis food come out even on average.
 
 Those magnitudes are far beyond any real return (a meal is 1), so the replayed weights extrapolate wildly on these flat-ground probe scenes. Replay of a few remembered moments at rate 0.1 fits the directions those moments happen to share, including a side, rather than learning centring. A turn learner climbing such a value would learn a side preference, not steering.
+
+## The critic's value of food in the world itself
+
+The flat-ground probe scenes are unlike anything a free-run brain has seen. So this test read each free-running agent's own critic value (`O_PREV_VALUE`) on the ticks where food was in view, paired with the true bearing and distance of the food in the frame it perceived. Each value is compared with the same agent's value when no food was in view, in the same 10k-tick window.
+
+Setup: default config (fresh perception), 10 agents, 100k ticks, seeds 5–7. Units are meals.
+
+| Arm, half of run | V(in view) − V(not in view) | V(centred) − V(off-axis), same distance bins | \|V(left) − V(right)\| |
+|---|---|---|---|
+| before replay, first half | +0.10 / +0.59 / +0.41 | −0.03 / +0.27 / +0.22 | 0.10 / 0.16 / 0.13 |
+| before replay, second half | +0.12 / +0.38 / +0.46 | −0.35 / +0.43 / +0.10 | 0.19 / 0.03 / 0.27 |
+| with replay, first half | +0.97 / +1.33 / +0.55 | +0.92 / −0.02 / +0.02 | 0.63 / 0.38 / 0.31 |
+| with replay, second half | −0.00 / +0.44 / +0.19 | −0.22 / +0.38 / +0.15 | 0.25 / 0.20 / 1.44 |
+
+- **In the world, the critic already values food in view** (+0.1 to +0.6 meals before replay), well above what the probe scenes showed. Replay raises this further early in a life.
+- **Whether it prefers centred food cannot be resolved at this sample size.** Only 135–275 in-view samples fell in each half-run, so the distance bins hold 8–48 samples and swing by ±0.5 meals. The sign is inconsistent in both arms.
+- **Replay's left/right swings appear in the world too:** 0.20–1.44 meals, against 0.03–0.27 before.

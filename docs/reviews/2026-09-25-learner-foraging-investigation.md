@@ -606,3 +606,19 @@ A scratch build (not committed) repeated the 1M-tick life on the current code wi
 - **But freezing it does not calm the critic.** With the encoder and the mean both frozen from tick 200k, its value of food in view still swings by up to ±9 meals between windows. It still shows no stable centring preference, and the turn policy stays at chance.
 
 So drift is not the cause. What is left is the critic itself. Scenes with food in view make up only about 1–3% of its data and sit far from the average scene it learns from. Their values are barely constrained, so they swing with every update fitted to common scenes. Meanwhile the weight norm grows from 0.25 to 1.0–1.3 over the life, which amplifies the swings. The lesson is in the experience, but this linear critic cannot hold it for rare scenes.
+
+## Would an episodic value hold what the linear critic cannot?
+
+This was an offline check in the world, not a shader change. On the same in-view and baseline ticks as the in-world measurement (current code, seeds 5–14, 100k ticks each), it computed the similarity-weighted remembered return of the 16 settled memories most similar to the agent's current memory key. Moments still inside the credit window were excluded. Values are in meals, shown as mean ± standard error over seeds:
+
+| Value | V(in view) − V(not in view) | V(centred) − V(off-axis), same distance | \|V(left) − V(right)\| |
+|---|---|---|---|
+| linear critic, whole run | +0.48 ± 0.26 | +0.13 ± 0.15 (6/10 positive) | 0.58 ± 0.10 |
+| linear critic, second half | +0.76 ± 0.35 | −0.24 ± 0.62 (5/10) | 1.49 ± 0.51 |
+| episodic value, whole run | +0.22 ± 0.05 | +0.05 ± 0.05 (5/10) | 0.22 ± 0.04 |
+| episodic value, second half | +0.14 ± 0.05 | +0.01 ± 0.06 (4/10) | 0.32 ± 0.07 |
+
+- **The episodic value is what the linear critic is not: stable.** It values food in view consistently (+0.22 ± 0.05 meals, positive in every seed) with a fifth to a sixth of the linear critic's seed-to-seed error, and its left/right differences stay small.
+- **It carries no centring gradient either:** +0.05 ± 0.05, half the seeds each way. Recall by whole-scene similarity pools centred and off-axis moments together. Each moment's return is also cut at the 8-tick credit window, so the difference between "reached food in 3 ticks" and "in 10" is mostly lost.
+
+Porting it would give the agent a reliable sense that food is in view, but still no gradient for turning toward it.

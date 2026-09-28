@@ -566,3 +566,28 @@ Free runs, seeds 5–10:
 - **Without replay, the in-world critic already values food in view** (+0.27 ± 0.05 meals), but not centred food over off-axis food (−0.03 ± 0.04). The centring gradient that steering needs is absent.
 - **Replay at either rate leaves that gradient absent** while making the critic's value 6–10× noisier across seeds and inflating left/right differences 5–9×. The gentler rate does not reduce the swings.
 - **Replay's foraging gain works through movement, not a better critic.** Agents keep moving (1.6–1.9× the distance), eat more, and die more.
+
+## Is it data starvation? One life ten times longer
+
+The same in-world measurement over a single life of 1M ticks: 10 agents, default config, seeds 5–7, with and without the critic's replay. It reports per 100k-tick window, and also the in-world turn policy: how often the policy's own turn before noise, `w_turn · (encoded − mean)`, points toward food in view with |bearing| > 0.1. Values are means over the three seeds.
+
+| Window (100k ticks) | No replay: V(in view) − V(not) | centred − off | \|left − right\| | policy toward food | Replay: V(in view) − V(not) | centred − off | \|left − right\| | policy toward food |
+|---|---|---|---|---|---|---|---|---|
+| 0 | +0.39 | +0.12 | 0.26 | 0.531 | +0.32 | +0.98 | 0.91 | 0.524 |
+| 1 | +0.28 | −0.20 | 0.18 | 0.518 | −2.46 | +1.65 | 3.71 | 0.495 |
+| 2 | +0.10 | +0.47 | 0.55 | 0.489 | +0.39 | −3.01 | 1.98 | 0.501 |
+| 3 | +0.79 | +0.33 | 4.43 | 0.493 | +0.59 | +1.45 | 1.42 | 0.499 |
+| 4 | −0.04 | −2.90 | 0.85 | 0.510 | −0.12 | +0.42 | 0.67 | 0.491 |
+| 5 | +0.78 | +0.02 | 0.68 | 0.503 | −0.59 | +0.48 | 2.54 | 0.501 |
+| 6 | −0.29 | +0.04 | 0.60 | 0.503 | −0.08 | +1.56 | 1.16 | 0.495 |
+| 7 | +0.31 | −0.46 | 0.40 | 0.512 | −1.12 | −1.31 | 1.09 | 0.513 |
+| 8 | +0.44 | +0.26 | 1.16 | 0.505 | +0.46 | +0.26 | 0.73 | 0.500 |
+| 9 | +0.20 | −0.66 | 1.19 | 0.494 | +1.02 | −0.26 | 0.49 | 0.497 |
+
+**Ten times the experience does not help.**
+
+- The turn policy points toward food 49–53% of the time in every window of both arms. Its best value, 0.52–0.53, came in the first window and then settled at chance.
+- The critic never settles on a centring preference; its sign flips window to window.
+- Without replay, the critic's value grows noisier as the life goes on. Left/right differences reach 0.4–4.4 meals after the first 200k ticks, against 0.18–0.26 before, and the value of food in view even turns negative in some windows.
+
+So this is not data starvation. The critic gets less reliable with more experience, which points at something underneath it drifting. A likely suspect is its input: the encoder keeps learning while the critic fits it. That remains a hypothesis to test.

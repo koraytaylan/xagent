@@ -512,3 +512,18 @@ Each remembered moment now keeps a return: the reward the critic sees (`raw_grad
 Mean fitness is 0.0502 against 0.0465.
 
 Replay makes the critic learn a large share of the food-ahead lesson (0.2–0.3 of the ~0.5-meal gap on average), though brain-to-brain spread is wide. It also changes behavior. Agents keep moving instead of slowing over a life, and foraging no longer declines within a lifetime. In the free runs they cover about twice the ground, eat 65% more, and die 75% more often. Steering still does not appear: approach intent and the learned turn policy stay at chance.
+
+## Does the critic's value rise as food moves toward the centre of view?
+
+Steering needs the value to rise as the food's bearing narrows at the same distance, not only when food is present. From the same scene dumps (29 bearings × 3 distances, 10 brains per group, each brain's own critic), in meals:
+
+| Brains | V(centred, \|b\| < 0.15) − V(off-axis, \|b\| > 0.45), same distance | Brains positive | dV/d\|bearing\| | \|V(food left) − V(food right)\| |
+|---|---|---|---|---|
+| free run, before replay | +0.05 | 8/10 | −0.10 per rad | 0.09 |
+| free run, with replay | +0.03 (per brain −3.87 … +1.64) | 5/10 | −0.11 per rad | 2.30 |
+| probe, before replay | −0.03 | 0/10 | +0.06 per rad | 0.02 |
+| probe, with replay | −0.14 | 2/10 | +0.18 per rad | 0.09 |
+
+The steering gradient is not there. With replay, free-run critics value "food present" (near vs behind: +0.2–0.3 meals). But their value of the same food at the same distance swings with which side it is on, by 2.3 meals on average and by up to ~4 meals in single brains, while centred and off-axis food come out even on average.
+
+Those magnitudes are far beyond any real return (a meal is 1), so the replayed weights extrapolate wildly on these flat-ground probe scenes. Replay of a few remembered moments at rate 0.1 fits the directions those moments happen to share, including a side, rather than learning centring. A turn learner climbing such a value would learn a side preference, not steering.

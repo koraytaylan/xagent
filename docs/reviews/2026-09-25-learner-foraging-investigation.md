@@ -681,3 +681,26 @@ But even a direct least-squares fit of the same linear value to those very retur
 
 - the fit spends its capacity on the 97–99% of ticks with no food in view;
 - the encoder rewrites itself by 50–150% per 100k ticks, so later encodings mean something else.
+
+### Drift or capacity? Two more fits
+
+The same logging on seeds 5–9 (50 agents, 200k ticks). Each fit regresses the actual discounted returns on the centred encoding, and is then scored on how it values centred against off-axis food on held-out ticks, next to what the returns themselves show on those ticks. Two splits:
+
+- **time-ordered:** the first 70% of the life is fitted, the last 30% held out;
+- **mixed:** interleaved 500-tick blocks, 70% fitted, all from the same period. 40 agents had enough held-out in-view ticks.
+
+Two fitting sets: all ticks, or only ticks with food in view (about 300–360 per agent), at two ridge strengths. Values in meals:
+
+| Fit | Fitted V(centred) − V(off-axis) | Agents positive | Actual returns on the same held-out ticks |
+|---|---|---|---|
+| time-ordered, all ticks | −0.08 ± 0.29 | 32/50 | +0.44 ± 0.12 (34/50) |
+| mixed, all ticks | +0.00 ± 0.07 | 20/40 | +0.52 ± 0.10 (36/40) |
+| time-ordered, in view only, ridge 10 | +0.11 ± 0.03 | 33/50 | +0.44 ± 0.12 |
+| mixed, in view only, ridge 10 | +0.02 ± 0.04 | 24/40 | +0.52 ± 0.10 |
+| time-ordered, in view only, ridge 100 | −0.00 ± 0.02 | 28/50 | +0.44 ± 0.12 |
+| mixed, in view only, ridge 100 | −0.01 ± 0.02 | 22/40 | +0.52 ± 0.10 |
+
+- **Drift is not the cause.** A fit from the same period (mixed split) does no better than one from earlier in the life.
+- **Capacity spent on common scenes is not the cause either.** Fitting only in-view ticks recovers at most a fifth of the gap (+0.11 of about +0.5), and nothing at a stronger ridge.
+
+The centring lesson is robust in the returns: 36 of 40 agents on the mixed split. Yet no linear fit on the agent's own experience recovers it, even though centring is linearly readable from the encoding (R² 0.88 above). What differs from that readout is the target. Individual returns are dominated by whether a meal happens to follow, and each agent has only ~300 in-view ticks to find a 0.5-meal signal in 128 dimensions. **The limit is statistical: the signal in a single life's noisy returns is too small to locate in a 128-dimensional linear value.**

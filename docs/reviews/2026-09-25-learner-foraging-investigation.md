@@ -721,3 +721,20 @@ On seed 5, food per agent rises by a third across the 20 generations (28 → 38)
 The stored champions show no steering. A generation's brain is stored only when its node is accepted, so there are only 1–3 per run. On the probe scene grid, their policy points toward the food's side 0.49–0.52 of the time (seed 5, generations 0, 14 and 15). Seed 6's generation-0 champion scores 0.26, turning away with a large turn command. The frozen champions score 0.51–0.66, with near-zero turn output.
 
 Accumulating turn learning along the lineage raises foraging on one of two seeds, but it has not produced steering in 20 generations of 40k ticks.
+
+## Would a smaller input let a linear value keep the lesson?
+
+This tests the statistical diagnosis on the same logging (seeds 5–9, 50 agents, 200k ticks). The actual returns were regressed on the top k principal components of the centred encoding (unsupervised, fitted on the same ticks as the value fit) instead of all 128 dimensions. Values in meals:
+
+| Fit | Time-ordered split: V(centred) − V(off-axis) | Agents positive | Mixed split | Agents positive |
+|---|---|---|---|---|
+| actual returns (held out) | +0.60 ± 0.12 | 38/50 | +0.54 ± 0.10 | 32/40 |
+| top 4 components | +0.06 ± 0.03 | 32/50 | +0.04 ± 0.04 | 24/40 |
+| top 8 | +0.06 ± 0.04 | 25/50 | +0.05 ± 0.03 | 24/40 |
+| top 16 | +0.14 ± 0.07 | 30/50 | +0.05 ± 0.07 | 24/40 |
+| top 32 | +0.30 ± 0.08 | 32/50 | −0.00 ± 0.09 | 26/40 |
+
+- **Unsupervised compression does not isolate the lesson.** The top 4–16 components carry almost none of it (+0.04 to +0.14 of about +0.55). The 32-component result is inconsistent: half the gap on the time-ordered split, none on the mixed split from the same period.
+- **This is what rarity predicts.** Food is in view on 1–3% of ticks, so the directions of greatest variance in the encoding describe common scenes (terrain, motion), not where the food is.
+
+A compression that could help would have to be weighted toward the moments that mattered homeostatically, not toward overall variance.

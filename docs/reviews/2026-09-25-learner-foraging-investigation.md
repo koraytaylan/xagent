@@ -790,3 +790,22 @@ So the limit is not sample size, as an earlier section concluded. A follow-up on
 - the encoder keeps rewriting itself, by 50–150% per 100k ticks, so no single linear map reads food from it across a life.
 
 That is why more time, more food or more agents cannot help. There is nothing linear for the value or the turn policy to latch onto.
+
+## Sensory adaptation: dimming what is always there
+
+In a scratch build (not committed), each vision and depth feature is replaced by its deviation from a slow running mean before the encoder sees it. The non-visual senses are left alone. A steady sky and ground fade, while anything new stands out. Nothing refers to food.
+
+The rate was set per run: off, 0.01 or 0.1 per brain tick (a time constant of about 30 s or about 3 s). Setup: 300k-tick free runs, seeds 5 and 6, 20 agents per arm, pre-replay code. This run also replaced the block-split hash with splitmix64; the old one gave seed 6 no held-out blocks. Readability is held-out R² of a linear readout from the critic's input. Values are in meals.
+
+| Arm | R²: food in view | R²: \|bearing\| (in view) | R²: distance (in view) | Returns: centred − off | Least squares: centred − off (agents positive) | Online TD: centred − off |
+|---|---|---|---|---|---|---|
+| no adaptation | 0.04 ± 0.04 | 0.27 ± 0.04 | 0.05 ± 0.03 | +0.71 ± 0.18 | +0.11 ± 0.11 (12/20) | +0.06 ± 0.37 |
+| adaptation 0.01 | 0.15 ± 0.03 | 0.46 ± 0.02 | 0.11 ± 0.03 | +0.60 ± 0.13 | **+0.27 ± 0.10 (18/20)** | −0.51 ± 1.02 |
+| adaptation 0.1 | 0.08 ± 0.02 | 0.37 ± 0.03 | 0.05 ± 0.04 | +0.39 ± 0.12 | +0.26 ± 0.15 (13/20) | +0.29 ± 0.26 |
+
+- **Slow adaptation (0.01) makes food markedly more readable in the world:** its presence 4×, its bearing 1.7×, its distance 2×.
+- **With it, the ideal linear value captures about half of the centring lesson with a consistent sign:** +0.27 of +0.60, positive in 18 of 20 agents, against 12 of 20 without.
+- **Fast adaptation (0.1) helps less.** It fades food too, and the lesson in the returns shrinks.
+- **The online TD critic still does not use it.** Its centring estimate stays noisy, with standard errors of 0.3–1.0 meals.
+
+The representation problem is partly fixable in a natural way. What remains is the critic's noise.

@@ -199,7 +199,7 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                               └───────────────────────────┘
 
   Persistent GPU buffers (live across ticks; sizes shown for default 8×6 vision, `ENCODED_DIMENSION = 128`):
-  ─── brain_state_buf ────  `BrainLayout::brain_stride` (51,898 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces)
+  ─── brain_state_buf ────  `BrainLayout::brain_stride` (52,429 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces, sensory means)
   ─── pattern_buf ────────  `PATTERN_STRIDE` (17,539 f32/agent)            (128 patterns: states, norms, reinforcement, motor, meta, active)
   ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
   ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
@@ -217,6 +217,7 @@ The `kernel_tick.wgsl` per-agent pass runs the seven cooperative brain functions
 ```
 brain cycle (executed vision_stride times per kernel-batch):
   1. coop_feature_extract   sensory_buf (`SENSORY_STRIDE`, 267 f32 for 8×6) → features (`BrainLayout::feature_count` = `VISION_RAYS * 5 + 25`, 265 f32 for 8×6)
+     coop_sensory_adapt     visual features minus their running means (sensory adaptation)
   2. coop_encode            features → encoded (`ENCODED_DIMENSION` = 128 f32)
   3. coop_habituate_homeo   habituation EMA + homeostatic gradient/urgency
   4. coop_recall_score      cosine similarity vs 128 patterns
@@ -278,7 +279,7 @@ Buffer offsets, strides, and dimension constants live in two coordinated source-
 | `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
 | `TD_DISCOUNT` / `TD_LAMBDA` | 0.97 / 0.9 | TD(λ) credit horizon and trace decay |
 
-The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 51,898` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
+The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 52,429` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
 
 ### Sensory Buffer Layout (GPU-produced)
 
@@ -290,7 +291,7 @@ The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configu
 
 Total for the default 8×6 vision: `SENSORY_STRIDE = 267` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, and up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
 
-### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 51,898 f32 for the default 8×6 layout)
+### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 52,429 f32 for the default 8×6 layout)
 
 Regions (in offset order; concrete offsets are dimension-dependent and emitted by `BrainLayout` — see `crates/xagent-brain/src/buffers.rs`):
 
@@ -298,6 +299,7 @@ Regions (in offset order; concrete offsets are dimension-dependent and emitted b
 - `O_ENCODER_BIASES` — `ENCODED_DIMENSION` (128) per-dimension bias.
 - `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
 - `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, per-agent `movement_speed`, and the TD critic state — value weights (`O_VALUE_WEIGHTS`, `ENCODED_DIMENSION`) + bias + previous value, the three eligibility-trace vectors (`O_TRACE_CRITIC` / `O_TRACE_FWD` / `O_TRACE_TURN`, `ENCODED_DIMENSION` each), and the three scalar trace biases (`O_TRACE_BIASES`).
+- `O_SENSORY_MEAN` — `feature_count` running means for sensory adaptation (§6.1); only the visual block is used. It follows the fixed tail, so it is the one region after the encoder that scales with the vision dimensions.
 
 ### Pattern Memory Buffer (per agent: `PATTERN_STRIDE` = 17,539 f32, a fixed constant)
 
@@ -332,6 +334,8 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 6. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
 
 **Feature layout**: `[192 RGBA | 48 depth | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 265`
+
+**Sensory adaptation** -- `coop_sensory_adapt`: before encoding, each visual feature (the raw vision block, or the cortex output when the visual cortex is on) is replaced by its difference from a per-agent running mean kept at `O_SENSORY_MEAN`, and the mean then moves toward the feature at `SENSORY_ADAPTATION_RATE` (0.01 per brain tick, about 100 brain ticks). What is always in view -- sky, the ground's colour -- fades toward zero, the way a constant odour stops being noticed, while what comes and goes stays. The mean survives death: it describes the surroundings, not an episode. The non-visual features are not adapted. The split/tiled path applies the same step in `phase_brain_features`.
 
 ---
 

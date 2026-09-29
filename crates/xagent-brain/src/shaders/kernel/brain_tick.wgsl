@@ -31,6 +31,9 @@ fn brain_tick(
     coop_visual_cortex(agent_id, tid);
     workgroupBarrier();
 
+    coop_sensory_adapt(agent_id, tid);
+    workgroupBarrier();
+
     coop_encode(agent_id, tid);
     workgroupBarrier();
 

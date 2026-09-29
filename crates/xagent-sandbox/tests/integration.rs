@@ -2712,6 +2712,84 @@ fn frozen_steering_weights_ignore_td_updates() {
     );
 }
 
+/// Sensory adaptation: a view that never changes fades from what the encoder
+/// sees. On a flat, single-biome arena with its only food eaten, the view is
+/// the same whichever way the agent faces, so once the running sensory mean
+/// has caught up the adapted vision features are near zero — whatever colour
+/// the ground is. Two arenas that differ only in biome show the raw views
+/// differ while the adapted ones coincide.
+#[test]
+fn sensory_adaptation_fades_a_steady_view() {
+    use xagent_brain::buffers::{BrainLayout, O_SENSORY_MEAN, SCRATCH_FEATURES};
+    use xagent_brain::GpuKernel;
+
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+
+    // At a rate of 0.01 per brain tick (one brain tick per tick here), 0.99^1000
+    // leaves about 4e-5 of the initial gap between the mean and the view.
+    const ADAPTATION_TICKS: u32 = 1_000;
+    const ADAPTED_TOLERANCE: f32 = 1e-3;
+    const MIN_VIEW_DIFFERENCE: f32 = 0.05;
+
+    let brain = probe_brain_config();
+    let layout = BrainLayout::default();
+    let vision_count = layout.vision_color_count + layout.vision_depth_count;
+    let steady_view = |biome: u32| -> (Vec<f32>, Vec<f32>) {
+        let world_config = WorldConfig {
+            seed: 1,
+            ..Default::default()
+        };
+        let mut kernel = GpuKernel::new(1, 1, &brain, &world_config);
+        kernel.reset_agents_seeded(&brain, 67);
+        let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
+        let biomes = vec![biome; PROBE_BIOME_RES * PROBE_BIOME_RES];
+        kernel.upload_agents(&[(
+            glam::Vec3::new(0.0, PROBE_AGENT_Y, 0.0),
+            100.0,
+            100.0,
+            brain.memory_capacity,
+            brain.processing_slots,
+        )]);
+        kernel.upload_world(
+            &heights,
+            &biomes,
+            &[(0.0, PROBE_FOOD_Y, 8.0)],
+            &[true],
+            &[f32::MAX],
+        );
+        kernel.dispatch_ticks(0, ADAPTATION_TICKS);
+        let state = kernel.read_agent_state(0);
+        let mean = state.brain_state[O_SENSORY_MEAN..O_SENSORY_MEAN + vision_count].to_vec();
+        kernel.dispatch_feature_phase_for_test();
+        let scratch = kernel.read_brain_scratch_blocking();
+        let adapted = scratch[SCRATCH_FEATURES..SCRATCH_FEATURES + vision_count].to_vec();
+        (mean, adapted)
+    };
+
+    let (mean_a, adapted_a) = steady_view(0);
+    let (mean_b, adapted_b) = steady_view(1);
+    let view_difference = mean_a
+        .iter()
+        .zip(&mean_b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        view_difference > MIN_VIEW_DIFFERENCE,
+        "the two biomes should look different before adaptation \
+         (largest difference {view_difference})"
+    );
+    for (biome, adapted) in [(0, &adapted_a), (1, &adapted_b)] {
+        let largest = adapted.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        assert!(
+            largest < ADAPTED_TOLERANCE,
+            "biome {biome}: a steady view should adapt away (largest adapted feature {largest})"
+        );
+    }
+}
+
 /// Baseline directional-learning probe: with the current learner, the sign
 /// of the turn output should be uncorrelated with the food's bearing —
 /// alignment ≈ chance. A learner that acquires food-approach behavior must
@@ -6396,7 +6474,7 @@ fn parallel_tiled_bounded_drift_vs_fused() {
 #[test]
 fn worker_reset_applies_per_agent_heritable_configs_after_inheritance() {
     use xagent_brain::buffers::{
-        FIXED_TAIL_SIZE, O_FATIGUE_FLOOR, O_MOVEMENT_SPEED, O_PREDICTOR_CONTEXT_WEIGHT,
+        fixed_tail_base, O_FATIGUE_FLOOR, O_MOVEMENT_SPEED, O_PREDICTOR_CONTEXT_WEIGHT,
     };
 
     if !xagent_brain::GpuKernel::is_available() {
@@ -6478,8 +6556,7 @@ fn worker_reset_applies_per_agent_heritable_configs_after_inheritance() {
     assert!(brain_stride > 0, "Agent 0 brain state is empty");
 
     // Compute the indices for fatigue_floor and movement_speed in the tail.
-    // The tail starts at `brain_stride - FIXED_TAIL_SIZE`.
-    let tail_base = brain_stride - FIXED_TAIL_SIZE;
+    let tail_base = fixed_tail_base(brain_stride);
     let fatigue_floor_delta = O_FATIGUE_FLOOR - O_PREDICTOR_CONTEXT_WEIGHT;
     let movement_speed_delta = O_MOVEMENT_SPEED - O_PREDICTOR_CONTEXT_WEIGHT;
     let fatigue_floor_idx = tail_base + fatigue_floor_delta;
@@ -6529,7 +6606,7 @@ fn worker_reset_applies_per_agent_heritable_configs_after_inheritance() {
 #[test]
 fn heritable_visual_genes_round_trip() {
     use xagent_brain::buffers::{
-        FIXED_TAIL_SIZE, O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH,
+        fixed_tail_base, O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH,
         O_ORIENTATION_OFFSET, O_PREDICTOR_CONTEXT_WEIGHT,
     };
 
@@ -6600,7 +6677,7 @@ fn heritable_visual_genes_round_trip() {
     let state_0 = kernel.read_agent_state(0);
     let state_1 = kernel.read_agent_state(1);
 
-    let tail_base = state_0.brain_state.len() - FIXED_TAIL_SIZE;
+    let tail_base = fixed_tail_base(state_0.brain_state.len());
     let wavelength_idx = tail_base + (O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT);
     let aspect_idx = tail_base + (O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT);
     let surround_idx = tail_base + (O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT);

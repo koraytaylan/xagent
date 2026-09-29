@@ -2776,7 +2776,7 @@ impl GpuKernel {
         // Heritable slots are contiguous in the fixed tail of brain_state.
         // Use dynamic base so this works with any BrainLayout, not
         // just the default FEATURE_COUNT (see init_brain_state_for).
-        let tail_base = bs - FIXED_TAIL_SIZE;
+        let tail_base = fixed_tail_base(bs);
         let first_delta = O_HAB_SENSITIVITY - O_PREDICTOR_CONTEXT_WEIGHT;
         debug_assert_eq!(
             O_HAB_MAX_CURIOSITY - O_PREDICTOR_CONTEXT_WEIGHT,

@@ -155,12 +155,38 @@ pub const O_SALIENCE_LABEL: usize = O_SALIENCE_VARIANCE + 1;
 /// Persistent turn exploration noise (`TURN_NOISE_PERSISTENCE` in
 /// `common.wgsl`); episodic, zeroed on death.
 pub const O_TURN_NOISE: usize = O_SALIENCE_LABEL + 1;
-pub const BRAIN_STRIDE: usize = O_TURN_NOISE + 1;
+/// Running mean of each sensory feature for sensory adaptation
+/// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
+/// slots, so it is the one layout-sized region after the fixed tail.
+pub const O_SENSORY_MEAN: usize = O_TURN_NOISE + 1;
+pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
-/// to `BRAIN_STRIDE` (exclusive). This tail is layout-independent: it
-/// doesn't change with feature_count / vision dimensions.
-pub const FIXED_TAIL_SIZE: usize = BRAIN_STRIDE - O_PREDICTOR_CONTEXT_WEIGHT;
+/// to `O_SENSORY_MEAN` (exclusive). This tail is layout-independent: it
+/// doesn't change with feature_count / vision dimensions. The sensory mean
+/// (`feature_count` slots) follows it.
+pub const FIXED_TAIL_SIZE: usize = O_SENSORY_MEAN - O_PREDICTOR_CONTEXT_WEIGHT;
+
+/// Feature count of the layout that produced a `brain_state` of length
+/// `brain_stride`. The stride is `feature_count × (ENCODED_DIMENSION + 1) +
+/// ENCODED_DIMENSION + PREDICTOR_DIMENSION × ENCODED_DIMENSION +
+/// FIXED_TAIL_SIZE` (encoder weights plus the sensory mean scale with the
+/// feature count), so the length alone determines it. `None` if no layout
+/// has this length.
+pub fn feature_count_for_brain_stride(brain_stride: usize) -> Option<usize> {
+    let variable = brain_stride.checked_sub(
+        ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE,
+    )?;
+    (variable % (ENCODED_DIMENSION + 1) == 0).then_some(variable / (ENCODED_DIMENSION + 1))
+}
+
+/// Offset of the fixed tail (this layout's `O_PREDICTOR_CONTEXT_WEIGHT`) in a
+/// `brain_state` of length `brain_stride`. Panics if no layout has that length.
+pub fn fixed_tail_base(brain_stride: usize) -> usize {
+    let feature_count = feature_count_for_brain_stride(brain_stride)
+        .expect("brain_state length matches no BrainLayout");
+    feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+}
 
 // ── Pattern memory buffer offsets (per agent) ─────────────────────────
 
@@ -436,14 +462,17 @@ impl BrainLayout {
             .checked_add(depth_count)
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
             .expect("vision dimensions overflow sensory stride");
-        // brain_stride = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE
+        // brain_stride = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION
+        //   + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE + feature_count
         // (FIXED_TAIL_SIZE = fixed fields starting at O_PREDICTOR_CONTEXT_WEIGHT
-        // through the TD critic state, incl. position ring and traces)
+        // through the TD critic state, incl. position ring and traces; the
+        // trailing feature_count slots are the sensory-adaptation mean)
         let brain_stride = feature_count
             .checked_mul(ENCODED_DIMENSION)
             .and_then(|v| v.checked_add(ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(PREDICTOR_DIMENSION * ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
+            .and_then(|v| v.checked_add(feature_count))
             .expect("vision dimensions overflow brain stride");
         let brain_scratch_stride = feature_count
             .checked_add(ENCODED_DIMENSION) // encoded
@@ -1088,7 +1117,8 @@ mod tests {
         assert_eq!(O_SALIENCE_VARIANCE, O_SALIENCE_MEAN + 1);
         assert_eq!(O_SALIENCE_LABEL, O_SALIENCE_VARIANCE + 1);
         assert_eq!(O_TURN_NOISE, O_SALIENCE_LABEL + 1);
-        assert_eq!(BRAIN_STRIDE, O_TURN_NOISE + 1);
+        assert_eq!(O_SENSORY_MEAN, O_TURN_NOISE + 1);
+        assert_eq!(BRAIN_STRIDE, O_SENSORY_MEAN + FEATURE_COUNT);
     }
 
     #[test]
@@ -1197,7 +1227,7 @@ mod tests {
             let o_pred_ctx_wt = fc * ENCODED_DIMENSION
                 + ENCODED_DIMENSION
                 + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
-            assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE);
+            assert_eq!(layout.brain_stride, o_pred_ctx_wt + FIXED_TAIL_SIZE + fc);
         }
     }
 
@@ -1262,7 +1292,8 @@ mod tests {
         let expected = layout.feature_count * ENCODED_DIMENSION
             + ENCODED_DIMENSION
             + PREDICTOR_DIMENSION * ENCODED_DIMENSION
-            + FIXED_TAIL_SIZE;
+            + FIXED_TAIL_SIZE
+            + layout.feature_count;
         assert_eq!(layout.brain_stride, expected);
     }
 

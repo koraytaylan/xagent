@@ -287,10 +287,15 @@ override O_SALIENCE_LABEL: u32 = O_SALIENCE_VARIANCE + 1u;
 // Persistent turn exploration noise (see TURN_NOISE_PERSISTENCE). Episodic:
 // zeroed on death.
 override O_TURN_NOISE: u32 = O_SALIENCE_LABEL + 1u;
+// Running mean of each sensory feature for sensory adaptation (see
+// SENSORY_ADAPTATION_RATE); only the visual block is used. Sized by the
+// layout (FEATURE_COUNT slots), so it follows the fixed tail. Survives death:
+// it describes the surroundings, not an episode.
+override O_SENSORY_MEAN: u32 = O_TURN_NOISE + 1u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
-override BRAIN_STRIDE: u32 = O_TURN_NOISE + 1u;
+override BRAIN_STRIDE: u32 = O_SENSORY_MEAN + FEATURE_COUNT;
 const PATTERN_STRIDE: u32 = O_LAST_STORED_IDX + 1u;
 override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
@@ -607,6 +612,14 @@ const MEMORY_BLEND_STRENGTH: f32 = 0.4;
 /// Per-brain-tick rate of the encoded-state running mean (≈ 100 brain ticks
 /// of memory). Early in life the mean is the exact running average instead.
 const ENCODED_MEAN_RATE: f32 = 0.01;
+/// Per-brain-tick rate of sensory adaptation. Every visual feature reaches the
+/// encoder as its deviation from its own running mean at this rate (≈ 100
+/// brain ticks, about 30 s at default strides), so whatever is always in view
+/// (sky, the ground's colour) fades while anything new stands out — like an
+/// odour that stops being noticed. Nothing about food is involved. Measured in
+/// free runs: a linear readout of whether food is in view rises from R² 0.04 to
+/// 0.15 and of its bearing from 0.27 to 0.46; 0.1 adapted food away as well.
+const SENSORY_ADAPTATION_RATE: f32 = 0.01;
 /// Per-brain-tick rate of the raw_gradient mean/variance used for salience.
 const SALIENCE_STATS_RATE: f32 = 0.01;
 /// Floor on the raw_gradient variance (standard deviation 0.005). The resting

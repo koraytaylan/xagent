@@ -736,6 +736,10 @@ fn brain_tick_inner(agent_id: u32, tid: u32 /* KERNEL_SUBGROUP_TOPK_PARAMS */) {
     if (alive && 0u < limit) { coop_visual_cortex(agent_id, tid); }
     workgroupBarrier();
 
+    // Sensory adaptation shares the early-visual profiling slot as well.
+    if (alive && 0u < limit) { coop_sensory_adapt(agent_id, tid); }
+    workgroupBarrier();
+
     if (alive && 1u < limit) { coop_encode(agent_id, tid); }
     workgroupBarrier();
 

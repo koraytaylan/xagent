@@ -30,9 +30,15 @@ fn phase_brain_features(
     // is workgroup-uniform.
     let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
     if (!visual_cortex_enabled) {
-        // All threads cooperatively copy vision color + depth into brain_scratch.
+        // All threads cooperatively copy vision color + depth into brain_scratch,
+        // adapted exactly as `coop_sensory_adapt` does on the fused path.
+        let brain_base = agent_id * BRAIN_STRIDE;
         for (var i = tid; i < vision_count; i += 256u) {
-            brain_scratch[agent_base + SCRATCH_FEATURES + i] = sensory_buffer[s_base + i];
+            let slot = brain_base + O_SENSORY_MEAN + i;
+            let feature = sensory_buffer[s_base + i];
+            let running_mean = brain_state[slot];
+            brain_scratch[agent_base + SCRATCH_FEATURES + i] = feature - running_mean;
+            brain_state[slot] = running_mean + SENSORY_ADAPTATION_RATE * (feature - running_mean);
         }
     }
     let non_visual_base = select(VISUAL_FEATURE_COUNT, vision_count, !visual_cortex_enabled);

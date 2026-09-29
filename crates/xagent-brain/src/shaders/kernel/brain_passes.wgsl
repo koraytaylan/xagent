@@ -853,6 +853,25 @@ fn coop_visual_cortex(agent_id: u32, tid: u32) {
 // Pass 2: Encode (dense tiling: all 256 lanes, 64 output rows × 4 lanes)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Sensory adaptation: every visual feature (the raw vision slice, or the
+// visual cortex's output when it is enabled) is replaced by its deviation from
+// its own running mean, which then moves toward the current value at
+// SENSORY_ADAPTATION_RATE. Proprioception, interoception and touch are left
+// as they are. Runs after the visual cortex and before encode.
+fn coop_sensory_adapt(agent_id: u32, tid: u32) {
+    let brain_base = agent_id * BRAIN_STRIDE;
+    let vision_count = VISION_COLOR_COUNT + VISION_DEPTH_COUNT;
+    let visual_cortex_enabled = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
+    let visual_block = select(VISUAL_FEATURE_COUNT, vision_count, !visual_cortex_enabled);
+    for (var j = tid; j < visual_block; j += BRAIN_WORKGROUP_SIZE) {
+        let slot = brain_base + O_SENSORY_MEAN + j;
+        let feature = s_features[j];
+        let running_mean = brain_state[slot];
+        s_features[j] = feature - running_mean;
+        brain_state[slot] = running_mean + SENSORY_ADAPTATION_RATE * (feature - running_mean);
+    }
+}
+
 fn coop_encode(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let output_in_tile = tid / DENSE_INNER_LANES;   // 0..63

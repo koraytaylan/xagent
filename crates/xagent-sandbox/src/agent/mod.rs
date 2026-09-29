@@ -14,9 +14,10 @@ const MAX_MEMORY_CAPACITY: usize = 2048;
 /// Large preset uses 32; 128 gives ~4x evolutionary headroom.
 const MAX_PROCESSING_SLOTS: usize = 128;
 use xagent_brain::buffers::{
-    init_brain_state_for, init_pattern_memory, seed_instinct_patterns, AgentBrainState,
-    BrainLayout, ENCODED_DIMENSION, FIXED_TAIL_SIZE, MAX_WEIGHT_NORM, O_ACTION_FORWARD_WEIGHTS,
-    O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PREDICTOR_DIMENSION,
+    feature_count_for_brain_stride, init_brain_state_for, init_pattern_memory,
+    seed_instinct_patterns, AgentBrainState, BrainLayout, ENCODED_DIMENSION, MAX_WEIGHT_NORM,
+    O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT,
+    PREDICTOR_DIMENSION,
 };
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
@@ -411,16 +412,8 @@ struct BrainWeightOffsets {
 }
 
 fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
-    let variable_part = state
-        .brain_state
-        .len()
-        .checked_sub(ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE)
-        .expect("brain_state too short for layout");
-    assert!(
-        variable_part % ENCODED_DIMENSION == 0,
-        "brain_state length not aligned to ENCODED_DIMENSION"
-    );
-    let feature_count = variable_part / ENCODED_DIMENSION;
+    let feature_count = feature_count_for_brain_stride(state.brain_state.len())
+        .expect("brain_state length matches no BrainLayout");
     let predictor_weights = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION;
     let predictor_context = predictor_weights + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
     let forward_weights =
@@ -1118,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "brain_state too short for layout")]
+    #[should_panic(expected = "brain_state length matches no BrainLayout")]
     fn mutate_brain_state_rejects_short_buffer() {
         let state = AgentBrainState::new_for(10); // way too small
         let _ = mutate_brain_state(&state, 0.1);

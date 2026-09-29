@@ -1146,11 +1146,11 @@ mod tests {
     /// never a hardcoded stride, so this works for any `BrainLayout`.
     fn read_gabor_wavelength(kernel: &GpuKernel, index: u32) -> f32 {
         use xagent_brain::buffers::{
-            FIXED_TAIL_SIZE, O_GABOR_WAVELENGTH, O_PREDICTOR_CONTEXT_WEIGHT,
+            fixed_tail_base, O_GABOR_WAVELENGTH, O_PREDICTOR_CONTEXT_WEIGHT,
         };
 
         let state = kernel.read_agent_state(index);
-        let tail_base = state.brain_state.len() - FIXED_TAIL_SIZE;
+        let tail_base = fixed_tail_base(state.brain_state.len());
         let slot = tail_base + (O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT);
         state.brain_state[slot]
     }

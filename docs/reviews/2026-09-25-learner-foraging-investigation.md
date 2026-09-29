@@ -655,3 +655,29 @@ The side and distance of food were already known to be linearly present in the e
 | standard probe (10) | 0.78 (min 0.27) | 0.79 | 0.68 | 0.67 |
 
 How centred the food is can be read linearly from the encoding about as well as its signed bearing. A linear value function can therefore express "centred food is worth more" for fresh and free-run encoders. The function class is not what stops the critic, though a few probe-trained encoders have degraded (R² down to 0.27).
+
+## Implementation or algorithm? A shadow critic on logged experience
+
+A scratch build (not committed) logged, for every agent and every brain tick of a 200k-tick life, the encoding, the running mean, the GPU critic's value and the exact reward, `raw_gradient × (1 + urgency) + β × predicted_gradient`. This was on the pre-replay code, pure TD, seeds 5–7, 30 agents. Offline, from the same logs:
+
+- **Shadow critic:** the GPU critic's TD(λ) update replayed on the CPU from the same starting weights. It uses the centred, normalized step, the traces, the δ clamp, the L2 ball, and death's terminal lesson and reset.
+- **Returns:** the actual discounted return after each tick, Σ γᵏ r, cut at death with the −1 terminal.
+- **Least-squares fit:** a ridge regression of those returns on the same centred encoding, fitted on the first 70% of each life.
+
+All four were scored on the held-out last 30% of each life (in meals, mean ± standard error over 30 agents):
+
+| Value | V(in view) − V(not) | V(centred) − V(off-axis), same distance | Agents positive |
+|---|---|---|---|
+| actual returns (ground truth) | +1.41 ± 0.16 | **+0.76 ± 0.35** | 23/30 |
+| least-squares fit of returns | +0.54 ± 0.11 | −0.87 ± 0.47 | 11/30 |
+| shadow TD critic | +0.53 ± 0.40 | −0.44 ± 0.82 | 10/30 |
+| GPU critic | +0.53 ± 0.40 | −0.44 ± 0.82 | 10/30 |
+
+The shadow reproduces the GPU critic exactly: correlation 1.0000, mean difference ≤ 0.0006 meals. **The implementation is faithful.**
+
+The lesson is in the returns. Centred food is followed by 0.76 meals more discounted return than off-axis food at the same distance, in 23 of 30 agents.
+
+But even a direct least-squares fit of the same linear value to those very returns does not carry it to the rest of the life: −0.87, 11 of 30 positive. Its held-out R² for the returns is negative on average (−1.28, best 0.16). So TD is not what loses the lesson. A single fixed linear value over this input cannot hold it across a life, for two likely reasons:
+
+- the fit spends its capacity on the 97–99% of ticks with no food in view;
+- the encoder rewrites itself by 50–150% per 100k ticks, so later encodings mean something else.

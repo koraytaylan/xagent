@@ -447,7 +447,7 @@ pub struct GpuKernel {
     danger_percept_blinded: bool,
     /// When set, brain-config uploads store `1.0` in
     /// [`CFG_FREEZE_STEERING_WEIGHTS`] so the turn policy stays at the
-    /// uploaded weights for the whole generation.
+    /// uploaded weights. Unset by default, including during evolution.
     freeze_steering_weights: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
@@ -744,10 +744,10 @@ impl GpuKernel {
         cfg
     }
 
-    /// Hold (`true`) or release (`false`) the turn-policy weights and the turn
-    /// bias. The flag is written into the brain-config uniform immediately and
-    /// again on every later agent reset, so a generation scored by evolution
-    /// keeps the steering genome that was uploaded with the brain.
+    /// Hold (`true`) or release (`false`) the turn-policy weights. The flag is
+    /// written into the brain-config uniform immediately and again on every
+    /// later agent reset. Evolution leaves it released so lifetime learning
+    /// accumulates along a lineage.
     pub fn set_freeze_steering_weights(&mut self, freeze: bool) {
         self.freeze_steering_weights = freeze;
         let packed = [if freeze { 1.0_f32 } else { 0.0 }];

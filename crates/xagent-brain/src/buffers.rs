@@ -609,10 +609,10 @@ pub const CFG_HOMEO_PREDICTIVE_CREDIT_ENABLED: usize = 12;
 pub const CFG_HOMEO_PREDICTOR_LEARNING_RATE: usize = 13;
 /// β blend for predicted gradient into TD reward (homeostatic gradient predictor head).
 pub const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: usize = 14;
-/// `1.0` holds the turn-policy weights and the turn bias fixed. Evolution sets
-/// this so the inherited steering map is the policy being scored; lifetime TD
-/// would otherwise replace it before selection runs. `0.0` leaves the actor
-/// update on. Mirrored by `CFG_FREEZE_STEERING_WEIGHTS` in `common.wgsl`.
+/// `1.0` holds the turn-policy weights fixed; `0.0` (the default, including
+/// during evolution) leaves the actor update on, so a lineage's champion
+/// carries its lifetime learning into the next generation. Mirrored by
+/// `CFG_FREEZE_STEERING_WEIGHTS` in `common.wgsl`.
 pub const CFG_FREEZE_STEERING_WEIGHTS: usize = 15;
 pub const CONFIG_SIZE: usize = 16; // padded for uniform vec4 alignment (4 × vec4)
 

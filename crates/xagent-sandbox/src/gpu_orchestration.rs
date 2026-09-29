@@ -98,7 +98,7 @@ impl App {
             paused: self.paused,
             selected_agent,
             generation_epoch: self.generation_epoch,
-            freeze_steering_weights: self.governor.is_some(),
+            search_steering_genome: self.governor.is_some(),
             steering_group_size: self.governor_config.eval_repeats.max(1),
             steering_mutation_strength: self.governor_config.mutation_strength,
         };

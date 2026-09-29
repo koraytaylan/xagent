@@ -389,7 +389,7 @@ impl App {
             inherited,
             resume,
             generation_epoch: self.generation_epoch,
-            freeze_steering_weights: true,
+            search_steering_genome: true,
         };
         if let Some(runtime) = &self.sim_runtime {
             runtime.send(SimCommand::ResetPopulation(Box::new(request)));

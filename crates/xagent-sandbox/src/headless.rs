@@ -96,7 +96,6 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
     let world = WorldState::new(config.world.clone());
     let food_count = world.food_items.len();
     let mut kernel = GpuKernel::new(pop_size as u32, food_count, &seed_config, &config.world);
-    kernel.set_freeze_steering_weights(true);
 
     loop {
         if governor.evolution_complete() {
@@ -1009,7 +1008,6 @@ fn run_headless_with_flags(
     let world = WorldState::new(config.world.clone());
     let food_count = world.food_items.len();
     let mut kernel = GpuKernel::new(pop_size as u32, food_count, &seed_config, &config.world);
-    kernel.set_freeze_steering_weights(true);
 
     let mut all_fitness: Vec<Vec<crate::governor::AgentFitness>> = Vec::new();
     // Per-generation mean movement_speed (for the trajectory check).

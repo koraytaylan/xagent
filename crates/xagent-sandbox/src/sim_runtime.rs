@@ -131,9 +131,10 @@ pub struct ResetRequest {
     pub inherited: Option<InheritedBrain>,
     /// Whether the worker should resume (unpause) once the reset completes.
     pub resume: bool,
-    /// Hold the turn-policy weights fixed for this generation and vary them
-    /// across repeat-groups instead of varying `BrainConfig`.
-    pub freeze_steering_weights: bool,
+    /// Vary the turn-policy weights across repeat-groups (the steering
+    /// genome search) instead of varying `BrainConfig`. Lifetime learning
+    /// keeps updating them, so a lineage's champion carries what it learned.
+    pub search_steering_genome: bool,
     /// Generation epoch of the new population; every snapshot the worker
     /// publishes after the reset carries it.
     pub generation_epoch: u64,
@@ -197,9 +198,10 @@ pub struct SimInit {
     /// Generation epoch of the initial population (see
     /// [`StateSnapshot::generation_epoch`]).
     pub generation_epoch: u64,
-    /// Hold the turn policy fixed and search it. Free play and tests leave
-    /// this false so lifetime learning still updates the turn weights.
-    pub freeze_steering_weights: bool,
+    /// Search the turn policy across repeat-groups (see
+    /// [`ResetRequest::search_steering_genome`]). Free play and tests leave
+    /// this false.
+    pub search_steering_genome: bool,
     /// Agents that share one steering genome. Matches `eval_repeats`.
     pub steering_group_size: usize,
     /// Turn-policy mutation strength for the first generation, before a
@@ -392,7 +394,7 @@ fn patch_agent_configs(kernel: &GpuKernel, configs: &[BrainConfig]) {
 impl Worker {
     /// Create the kernel and upload the initial world + agents.
     fn new(init: SimInit) -> Self {
-        let mut kernel = GpuKernel::new(
+        let kernel = GpuKernel::new(
             init.agent_count,
             init.food_count,
             &init.brain_config,
@@ -406,8 +408,7 @@ impl Worker {
             &init.upload.food_timers,
         );
         kernel.upload_agents(&init.upload.agent_data);
-        if init.freeze_steering_weights {
-            kernel.set_freeze_steering_weights(true);
+        if init.search_steering_genome {
             let mut rng = rand::rng();
             let birth = fresh_brain_state(&init.brain_config, &mut rng);
             let count = usize::try_from(kernel.agent_count()).unwrap_or(0);
@@ -490,8 +491,6 @@ impl Worker {
         let next_agent_count = u32::try_from(request.upload.agent_data.len()).unwrap_or(u32::MAX);
         self.brain_config = request.brain_config;
         self.generation_epoch = request.generation_epoch;
-        self.kernel
-            .set_freeze_steering_weights(request.freeze_steering_weights);
 
         if self.kernel.agent_count() == next_agent_count {
             // Population size unchanged — reseed in place. Spin on the
@@ -525,16 +524,13 @@ impl Worker {
                 &request.upload.food_consumed,
                 &request.upload.food_timers,
             );
-            if request.freeze_steering_weights {
-                self.kernel.set_freeze_steering_weights(true);
-            }
         }
         self.kernel.upload_agents(&request.upload.agent_data);
 
         let inherited = request
             .inherited
             .filter(|inherited| inherited_brain_fits(&inherited.champion, &self.brain_config));
-        if request.freeze_steering_weights {
+        if request.search_steering_genome {
             let mut rng = rand::rng();
             let (template, strength, group_size) = if let Some(inherited) = inherited {
                 (
@@ -1094,7 +1090,7 @@ mod tests {
             paused,
             selected_agent: 0,
             generation_epoch: 0,
-            freeze_steering_weights: false,
+            search_steering_genome: false,
             steering_group_size: 1,
             steering_mutation_strength: 0.0,
         }
@@ -1191,7 +1187,7 @@ mod tests {
             paused: true,
             selected_agent: 0,
             generation_epoch: 0,
-            freeze_steering_weights: false,
+            search_steering_genome: false,
             steering_group_size: 1,
             steering_mutation_strength: 0.0,
         });
@@ -1218,7 +1214,7 @@ mod tests {
             }),
             resume: false,
             generation_epoch: 1,
-            freeze_steering_weights: false,
+            search_steering_genome: false,
         });
 
         // Snapshots published after the reset carry the request's epoch.
@@ -1322,7 +1318,7 @@ mod tests {
             }),
             resume: true,
             generation_epoch: 1,
-            freeze_steering_weights: false,
+            search_steering_genome: false,
         })));
 
         // The worker logs the reset once it processes the command...

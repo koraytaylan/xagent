@@ -755,3 +755,38 @@ This is the same test, except the principal components were computed only over t
 - **The earlier +0.30 is not reproduced.** The all-ticks, time-ordered, 32-component fit came out at +0.01 here. The simulator's trajectories differ from run to run on the same seeds, so single-run differences of that size are noise.
 
 The directions along which remembered salient moments vary most are not the direction that separates centred from off-axis food.
+
+## Why the learner does not benefit from more data
+
+A scratch harness (not committed) logged whole free-running lives in three worlds: default food over 1M ticks, 3× food over 1M ticks, and 10× food over 300k ticks. Each world had seeds 5 and 6, 10 agents each, on the pre-replay code. On the same logs it compared:
+
+- the lesson in the actual returns;
+- an ideal least-squares linear value, fitted on 70% of 500-tick blocks spread over the whole life, with a variant using a tenth of that data;
+- online TD variants replayed from the same starting weights: the exact GPU rule (it matched the GPU to 0.0000 meals), 10× slower and 10× faster steps, TD(0) and λ = 1.
+
+The mixed block split came out degenerate for seed 6 (no held-out blocks), so its mixed-split numbers are excluded. Values are in meals, mean ± standard error:
+
+| World | Food in view | Returns: in view − not | Returns: centred − off | Least squares: in view − not | Least squares: centred − off | Least squares on a tenth of the data: centred − off |
+|---|---|---|---|---|---|---|
+| default food, 1M | 2.1% | +1.49 ± 0.09 | +0.55 ± 0.11 | +0.10 ± 0.03 | +0.04 ± 0.05 | −0.07 ± 0.04 |
+| 3× food, 1M | 5.4% | +1.83 ± 0.07 | +0.57 ± 0.11 | +0.10 ± 0.02 | +0.02 ± 0.02 | −0.05 ± 0.06 |
+| 10× food, 300k | 10.5% | +3.04 ± 0.24 | +1.22 ± 0.32 | +0.26 ± 0.07 | −0.00 ± 0.04 | +0.03 ± 0.15 |
+
+- **The lesson grows with food; it does not fade.**
+- **The best possible linear value captures under a tenth of even the food-in-view difference, and none of the centring difference. More data does not change that:** ten times the fitting data gives the same result.
+- **The online variants are either inert (TD(0), slow steps) or noisy without a consistent centring sign** (the exact rule, fast steps, λ = 1).
+
+So the limit is not sample size, as an earlier section concluded. A follow-up on seed 5 (300k ticks) asked whether food is linearly readable from the critic's input in the world itself, rather than on the flat probe ground (held-out R², fitted on the same spread of blocks):
+
+| World | Food in view | \|Bearing\|, among in-view ticks | Distance, among in-view ticks |
+|---|---|---|---|
+| probe arena (flat ground, section above) | — | 0.78–0.91 | 0.67–0.80 |
+| default food, in the world | 0.06 (−0.09 … 0.28) | 0.24 (0.08 … 0.50) | 0.07 (−0.25 … 0.24) |
+| 10× food, in the world | 0.02 | −0.01 | 0.00 |
+
+**In the world, the critic's input hardly encodes where food is.** The in-view label is a physics proxy that terrain can occlude, which costs some R², but not the gap from about 0.9 to about 0.1. Two likely reasons:
+
+- on terrain, the rest of the scene (ground, slope, sky) dominates the encoding;
+- the encoder keeps rewriting itself, by 50–150% per 100k ticks, so no single linear map reads food from it across a life.
+
+That is why more time, more food or more agents cannot help. There is nothing linear for the value or the turn policy to latch onto.

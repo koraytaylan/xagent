@@ -643,3 +643,15 @@ With 10–20× the reward events (meals) of the default world, and food in view 
 - **Meals do rise 28–31% over the life,** but without any steering.
 
 So rarity is not the explanation. Even with plenty of the right data, this TD actor-critic does not learn to turn toward food it can see, and a food-rich early world would not by itself teach steering. The ceiling is the learner.
+
+## Can a linear critic even express "centred is better"?
+
+The side and distance of food were already known to be linearly present in the encoding. A centring gradient needs something else: a V-shaped function of bearing, |bearing|. On the scene dumps (29 bearings × 3 distances per brain, current code), a held-out ridge regression (5-fold, best of three ridge strengths) read each property from the encoding:
+
+| Encoders | \|bearing\| R² | bearing R² | side R² | distance R² |
+|---|---|---|---|---|
+| fresh (10) | 0.91 (min 0.91) | 0.92 | 0.81 | 0.80 |
+| free run, 100k ticks (10) | 0.88 (min 0.78) | 0.89 | 0.76 | 0.75 |
+| standard probe (10) | 0.78 (min 0.27) | 0.79 | 0.68 | 0.67 |
+
+How centred the food is can be read linearly from the encoding about as well as its signed bearing. A linear value function can therefore express "centred food is worth more" for fresh and free-run encoders. The function class is not what stops the critic, though a few probe-trained encoders have degraded (R² down to 0.27).

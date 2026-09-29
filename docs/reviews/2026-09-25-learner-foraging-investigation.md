@@ -704,3 +704,20 @@ Two fitting sets: all ticks, or only ticks with food in view (about 300–360 pe
 - **Capacity spent on common scenes is not the cause either.** Fitting only in-view ticks recovers at most a fifth of the gap (+0.11 of about +0.5), and nothing at a stronger ridge.
 
 The centring lesson is robust in the returns: 36 of 40 agents on the mixed split. Yet no linear fit on the agent's own experience recovers it, even though centring is linearly readable from the encoding (R² 0.88 above). What differs from that readout is the target. Individual returns are dominated by whether a meal happens to follow, and each agent has only ~300 in-view ticks to find a 0.5-meal signal in 128 dimensions. **The limit is statistical: the signal in a single life's noisy returns is too small to locate in a 128-dimensional linear value.**
+
+## Turn learning unfrozen in evolution
+
+Evolution no longer freezes lifetime turn learning. The steering-genome search stays: repeat-groups still share one perturbation of the champion's turn weights, via the renamed `search_steering_genome` flag. Each agent now keeps learning its turn weights through its life, and the champion read back after a generation carries that learning into the next one. The kernel's freeze switch remains for tests.
+
+**Headless evolution.** Release builds, `evo_default` config with fresh perception, 20 generations, against current develop (frozen):
+
+| Seed | Mean fitness, frozen → unfrozen | Last 5 generations | Food/agent, first 5 → last 5 generations | Deaths/agent |
+|---|---|---|---|---|
+| 5 | 0.0561 → 0.0595 | 0.0585 → 0.0630 | frozen 27.0 → 31.8; unfrozen 28.2 → 37.8 | 18.6 → 17.1 |
+| 6 | 0.0443 → 0.0445 | 0.0441 → 0.0430 | frozen 16.4 → 15.0; unfrozen 22.4 → 21.3 | 7.0 → 13.1 |
+
+On seed 5, food per agent rises by a third across the 20 generations (28 → 38), against 27 → 32 frozen. Seed 6 is flat in both arms.
+
+The stored champions show no steering. A generation's brain is stored only when its node is accepted, so there are only 1–3 per run. On the probe scene grid, their policy points toward the food's side 0.49–0.52 of the time (seed 5, generations 0, 14 and 15). Seed 6's generation-0 champion scores 0.26, turning away with a large turn command. The frozen champions score 0.51–0.66, with near-zero turn output.
+
+Accumulating turn learning along the lineage raises foraging on one of two seeds, but it has not produced steering in 20 generations of 40k ticks.

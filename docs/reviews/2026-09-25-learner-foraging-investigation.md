@@ -738,3 +738,20 @@ This tests the statistical diagnosis on the same logging (seeds 5–9, 50 agents
 - **This is what rarity predicts.** Food is in view on 1–3% of ticks, so the directions of greatest variance in the encoding describe common scenes (terrain, motion), not where the food is.
 
 A compression that could help would have to be weighted toward the moments that mattered homeostatically, not toward overall variance.
+
+### Compression built from salient moments
+
+This is the same test, except the principal components were computed only over the moments the episodic memory would credit: ticks in the 8-brain-tick window before a salient homeostatic change of either sign (|reward| > 0.05; a meal is about 0.12). That is about 600–750 moments per agent. The returns were still fitted over all ticks. Values in meals:
+
+| Components | Time-ordered: over all ticks | Time-ordered: over salient moments | Mixed: over all ticks | Mixed: over salient moments |
+|---|---|---|---|---|
+| actual returns (held out) | +0.40 ± 0.13 | +0.40 ± 0.13 | +0.56 ± 0.11 | +0.56 ± 0.11 |
+| top 4 | −0.00 ± 0.03 | −0.03 ± 0.03 | +0.03 ± 0.02 | +0.07 ± 0.02 |
+| top 8 | +0.01 ± 0.04 | +0.03 ± 0.04 | +0.05 ± 0.03 | +0.04 ± 0.03 |
+| top 16 | −0.02 ± 0.07 | −0.03 ± 0.07 | −0.01 ± 0.04 | +0.01 ± 0.05 |
+| top 32 | +0.01 ± 0.08 | +0.05 ± 0.09 | +0.14 ± 0.04 | +0.12 ± 0.05 |
+
+- **Weighting the compression toward salient moments does not help.** Fits recover at most about a quarter of the gap (+0.12–0.14 of +0.56) and usually nothing.
+- **The earlier +0.30 is not reproduced.** The all-ticks, time-ordered, 32-component fit came out at +0.01 here. The simulator's trajectories differ from run to run on the same seeds, so single-run differences of that size are noise.
+
+The directions along which remembered salient moments vary most are not the direction that separates centred from off-axis food.

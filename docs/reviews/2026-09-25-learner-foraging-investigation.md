@@ -809,3 +809,21 @@ The rate was set per run: off, 0.01 or 0.1 per brain tick (a time constant of ab
 - **The online TD critic still does not use it.** Its centring estimate stays noisy, with standard errors of 0.3–1.0 meals.
 
 The representation problem is partly fixable in a natural way. What remains is the critic's noise.
+
+## Sensory adaptation in the learner
+
+Sensory adaptation at 0.01 per brain tick is now part of the learner (`coop_sensory_adapt`). Each visual feature reaches the encoder relative to its own running mean; the mean survives death. Headless evolution, `evo_vs1` config, 20 generations, seeds 5–8. Both arms run the same code apart from adaptation. Generation 0 compares the same fresh brains in the same world, so it measures lifetime learning alone.
+
+| Seed | Gen 0 fitness (off → on) | Gen 0 meals | Mean fitness, all generations | Mean meals | Best score |
+|---|---|---|---|---|---|
+| 5 | 0.052 → 0.061 | 19 → 24 | 0.0595 → 0.0638 | 32.7 → 34.1 | 0.0658 → 0.0702 |
+| 6 | 0.056 → 0.061 | 22 → 25 | 0.0445 → **0.0307** | 21.8 → **10.4** | 0.0564 → 0.0614 |
+| 7 | 0.049 → 0.052 | 17 → 19 | 0.0484 → 0.0570 | 23.5 → 29.5 | 0.0540 → 0.0609 |
+| 8 | 0.053 → 0.058 | 20 → 23 | 0.0516 → 0.0550 | 25.8 → 22.7 | 0.0584 → 0.0648 |
+| mean | 0.0525 → 0.0580 | 19.5 → 22.8 | 0.0510 → 0.0516 | 26.0 → 24.2 | 0.0587 → 0.0643 |
+
+- **Within a lifetime, adaptation helps in every seed:** generation-0 fitness rises about 10% and each agent eats about three more meals.
+- **The best score rises in every seed, and mean fitness in three of four.**
+- **Seed 6's lineage collapsed after its first champion.** Its descendants moved half as far (about 2,900 against 6,900 units per agent) and ate 9–12 meals instead of about 22. The baseline shows the same drop after inheritance on that seed, only smaller (0.056 → 0.045). Averaged over the four seeds, evolution is a wash.
+
+Adaptation makes the world easier to learn from within one life. Whether a learned brain passes on well depends on the lineage.

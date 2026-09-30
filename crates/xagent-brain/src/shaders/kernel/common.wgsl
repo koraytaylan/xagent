@@ -287,11 +287,22 @@ override O_SALIENCE_LABEL: u32 = O_SALIENCE_VARIANCE + 1u;
 // Persistent turn exploration noise (see TURN_NOISE_PERSISTENCE). Episodic:
 // zeroed on death.
 override O_TURN_NOISE: u32 = O_SALIENCE_LABEL + 1u;
+// The critic's recent-experience ring: the last RECENT_CAP brain ticks, kept
+// regardless of outcome, which value replay draws on (see the store pass).
+// Keys are slot-major (O_RECENT_KEYS + slot * ENCODED_DIMENSION + d). Each
+// moment gathers TD's own return as it unfolds; RECENT_* states mark a slot
+// empty, still gathering (open) or replayable (settled). Survives death: the
+// moments are real experience, and death settles the open ones.
+override O_RECENT_KEYS: u32 = O_TURN_NOISE + 1u;
+override O_RECENT_RETURNS: u32 = O_RECENT_KEYS + RECENT_CAP * ENCODED_DIMENSION;
+override O_RECENT_TICKS: u32 = O_RECENT_RETURNS + RECENT_CAP;
+override O_RECENT_STATE: u32 = O_RECENT_TICKS + RECENT_CAP;
+override O_RECENT_NORMS: u32 = O_RECENT_STATE + RECENT_CAP;
 // Running mean of each sensory feature for sensory adaptation (see
 // SENSORY_ADAPTATION_RATE); only the visual block is used. Sized by the
 // layout (FEATURE_COUNT slots), so it follows the fixed tail. Survives death:
 // it describes the surroundings, not an episode.
-override O_SENSORY_MEAN: u32 = O_TURN_NOISE + 1u;
+override O_SENSORY_MEAN: u32 = O_RECENT_NORMS + RECENT_CAP;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
@@ -332,11 +343,7 @@ const O_PAT_REINF: u32 = O_PAT_NORMS + MEMORY_CAP;
 const O_PAT_MOTOR: u32 = O_PAT_REINF + MEMORY_CAP;
 const O_PAT_META: u32 = O_PAT_MOTOR + MEMORY_CAP * 3u;
 const O_PAT_ACTIVE: u32 = O_PAT_META + MEMORY_CAP * 3u;
-// Remembered return per moment: the discounted rewards of the salient
-// homeostatic changes that followed it (see EPISODIC_CREDIT_WINDOW); the
-// target the critic's value replay moves toward.
-const O_PAT_RETURN: u32 = O_PAT_ACTIVE + MEMORY_CAP;
-const O_ACTIVE_COUNT: u32 = O_PAT_RETURN + MEMORY_CAP;
+const O_ACTIVE_COUNT: u32 = O_PAT_ACTIVE + MEMORY_CAP;
 const O_MIN_REINF_IDX: u32 = O_ACTIVE_COUNT + 1u;
 const O_LAST_STORED_IDX: u32 = O_MIN_REINF_IDX + 1u;
 
@@ -651,14 +658,25 @@ const PENDING_OUTCOME_KEEP_BONUS: f32 = 2.0 * EPISODIC_KEEP_WEIGHT * MAX_EPISODI
 /// score (reinforcement and |valence| are never negative), so a store fills
 /// an empty slot before it evicts a memory.
 const EMPTY_SLOT_KEEP_SCORE: f32 = -1.0;
-// Normalized-LMS rate of the critic's episodic value replay. Every brain
-// tick one remembered moment whose outcome has settled (older than the
-// credit window) steps the critic's weights toward its remembered return,
-// CRITIC_REPLAY_RATE / (1 + ‖key‖²) per unit of error. Each moment comes up
-// about once per MEMORY_CAP brain ticks, so at this rate a few dozen replays
-// close most of the gap: the rare moments that preceded a meal teach the
-// critic many times instead of once.
+// Normalized-LMS rate of the critic's value replay. Every brain tick one
+// settled moment from the recent-experience ring steps the critic's whole
+// value (weights and bias) toward that moment's return,
+// CRITIC_REPLAY_RATE / (1 + ‖key‖²) per unit of error, so each lived moment
+// teaches the critic several times instead of once. The ring keeps moments
+// regardless of outcome: replaying the outcome-filtered pattern memory taught
+// the value of a moment given that a meal followed, and with the bias left
+// out it flipped the critic's sign on food in view.
 const CRITIC_REPLAY_RATE: f32 = 0.1;
+// Moments in the recent-experience ring: the last RECENT_CAP brain ticks
+// (about 43 s at the default strides). Mirrors `RECENT_CAP` in buffers.rs.
+const RECENT_CAP: u32 = 128u;
+// Brain ticks of reward a ring moment gathers before it settles and is
+// completed with the critic's value; matches EPISODIC_CREDIT_WINDOW.
+const REPLAY_RETURN_TICKS: u32 = 8u;
+// Ring slot states. Mirrors `RECENT_*` in buffers.rs.
+const RECENT_EMPTY: f32 = 0.0;
+const RECENT_OPEN: f32 = 1.0;
+const RECENT_SETTLED: f32 = 2.0;
 // Salt that decorrelates the replayed slot's hash from the exploration noise.
 const REPLAY_HASH_SALT: u32 = 2654435761u;
 
@@ -729,6 +747,23 @@ const MAX_TD_ERROR: f32 = 1.0;
 // but never stronger than the per-transition bound that protects
 // against artifacts.
 const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
+
+// Death settles every recent-experience moment still gathering its return:
+// the end of the life is its last outcome, the terminal lesson discounted by
+// the moment's age at the life's last brain tick, with no state left to
+// bootstrap from. Single-threaded: called from the death paths.
+fn settle_recent_moments_at_death(brain_base: u32) {
+    let last_tick = brain_state[brain_base + O_TICK_COUNT];
+    for (var slot = 0u; slot < RECENT_CAP; slot++) {
+        let state_slot = brain_base + O_RECENT_STATE + slot;
+        if (brain_state[state_slot] == RECENT_OPEN) {
+            let age = last_tick - brain_state[brain_base + O_RECENT_TICKS + slot];
+            brain_state[brain_base + O_RECENT_RETURNS + slot] +=
+                pow(TD_DISCOUNT, age) * TERMINAL_DEATH_TD_ERROR;
+            brain_state[state_slot] = RECENT_SETTLED;
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Buffer bindings — 14 storage + 2 uniform, single bind group

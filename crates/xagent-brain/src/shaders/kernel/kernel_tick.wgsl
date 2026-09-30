@@ -674,6 +674,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
         }
     }
 
+    settle_recent_moments_at_death(brain_base);
+
     // Reset TD transients: eligibility traces and the previous-state value
     // are episodic — credit must never leak across the death boundary.
     // The value weights themselves are learned knowledge and survive.

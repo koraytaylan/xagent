@@ -155,10 +155,32 @@ pub const O_SALIENCE_LABEL: usize = O_SALIENCE_VARIANCE + 1;
 /// Persistent turn exploration noise (`TURN_NOISE_PERSISTENCE` in
 /// `common.wgsl`); episodic, zeroed on death.
 pub const O_TURN_NOISE: usize = O_SALIENCE_LABEL + 1;
+/// Moments in the critic's recent-experience ring (`O_RECENT_KEYS` in
+/// `common.wgsl`): the last `RECENT_CAP` brain ticks, kept regardless of
+/// outcome, which the critic's value replay draws on.
+pub const RECENT_CAP: usize = 128;
+/// Ring keys (the centred encoding of each moment), slot-major:
+/// `O_RECENT_KEYS + slot * ENCODED_DIMENSION + d`.
+pub const O_RECENT_KEYS: usize = O_TURN_NOISE + 1;
+/// Each moment's return so far: TD's discounted reward over the next
+/// `REPLAY_RETURN_TICKS` brain ticks, completed with the critic's value when
+/// it settles, or the terminal outcome if the life ends first.
+pub const O_RECENT_RETURNS: usize = O_RECENT_KEYS + RECENT_CAP * ENCODED_DIMENSION;
+/// Brain tick (`O_TICK_COUNT`) at which each moment was stored.
+pub const O_RECENT_TICKS: usize = O_RECENT_RETURNS + RECENT_CAP;
+/// Slot state: `RECENT_EMPTY`, `RECENT_OPEN` (still gathering its return) or
+/// `RECENT_SETTLED` (replayable).
+pub const O_RECENT_STATE: usize = O_RECENT_TICKS + RECENT_CAP;
+/// Squared size of each stored key (the replay step's normaliser).
+pub const O_RECENT_NORMS: usize = O_RECENT_STATE + RECENT_CAP;
+/// Ring slot states (mirrors `common.wgsl`).
+pub const RECENT_EMPTY: f32 = 0.0;
+pub const RECENT_OPEN: f32 = 1.0;
+pub const RECENT_SETTLED: f32 = 2.0;
 /// Running mean of each sensory feature for sensory adaptation
 /// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
 /// slots, so it is the one layout-sized region after the fixed tail.
-pub const O_SENSORY_MEAN: usize = O_TURN_NOISE + 1;
+pub const O_SENSORY_MEAN: usize = O_RECENT_NORMS + RECENT_CAP;
 pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
@@ -198,9 +220,7 @@ pub const O_PAT_MOTOR: usize = O_PAT_REINF + MEMORY_CAP;
 pub const O_PAT_META: usize = O_PAT_MOTOR + MEMORY_CAP * 3;
 // meta: [created_at, last_accessed, activation_count] × cap
 pub const O_PAT_ACTIVE: usize = O_PAT_META + MEMORY_CAP * 3;
-/// Remembered return per moment (see `O_PAT_RETURN` in `common.wgsl`).
-pub const O_PAT_RETURN: usize = O_PAT_ACTIVE + MEMORY_CAP;
-pub const O_ACTIVE_COUNT: usize = O_PAT_RETURN + MEMORY_CAP;
+pub const O_ACTIVE_COUNT: usize = O_PAT_ACTIVE + MEMORY_CAP;
 pub const O_MIN_REINF_IDX: usize = O_ACTIVE_COUNT + 1;
 pub const O_LAST_STORED_IDX: usize = O_MIN_REINF_IDX + 1;
 pub const PATTERN_STRIDE: usize = O_LAST_STORED_IDX + 1;
@@ -1117,7 +1137,8 @@ mod tests {
         assert_eq!(O_SALIENCE_VARIANCE, O_SALIENCE_MEAN + 1);
         assert_eq!(O_SALIENCE_LABEL, O_SALIENCE_VARIANCE + 1);
         assert_eq!(O_TURN_NOISE, O_SALIENCE_LABEL + 1);
-        assert_eq!(O_SENSORY_MEAN, O_TURN_NOISE + 1);
+        assert_eq!(O_RECENT_KEYS, O_TURN_NOISE + 1);
+        assert_eq!(O_SENSORY_MEAN, O_RECENT_NORMS + RECENT_CAP);
         assert_eq!(BRAIN_STRIDE, O_SENSORY_MEAN + FEATURE_COUNT);
     }
 

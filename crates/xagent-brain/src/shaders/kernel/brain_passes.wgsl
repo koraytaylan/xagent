@@ -46,12 +46,14 @@ var<workgroup> s_credit: array<f32, ENCODED_DIMENSION>;
 // `s_pred_td[1]` == the former `s_td_error`.
 // Index 2 carries homeo predictor error (homeostatic gradient predictor head),
 // index 3 this tick's step normalizer 1 / (1 + ‖x‖²) for the critic and the
-// turn channel — still one binding.
+// turn channel, index 4 this tick's TD reward for the recent-experience ring —
+// still one binding.
 const S_PRED_ERROR: u32 = 0u;
 const S_TD_ERROR: u32 = 1u;
 const S_HOMEO_PRED_ERROR: u32 = 2u;
 const S_STEP_NORMALIZER: u32 = 3u;
-var<workgroup> s_pred_td: array<f32, 4>;
+const S_REWARD: u32 = 4u;
+var<workgroup> s_pred_td: array<f32, 5>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 2>;
@@ -63,7 +65,7 @@ var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
 // Each reduction writes its final scalar here so thread 0 can read without
 // barrier deadlock. All 256 threads participate in the reductions.
 var<workgroup> s_err_sum: f32;
-// The critic's value in the TD block; reused by the episodic value replay
+// The critic's value in the TD block; reused by the recent-experience value replay
 // at the end of the store pass (after the TD block has consumed it).
 var<workgroup> s_value: f32;
 var<workgroup> s_fwd_norm_sq: f32;
@@ -1390,6 +1392,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // improve survival. β scales the blend (0= pure TD, 0.3=moderate).
             let predictive_bonus = s_homeo[7u] * bc_f32(CFG_HOMEO_PREDICTIVE_CREDIT_BETA);
             let reward = s_homeo[1u] + predictive_bonus;
+            s_pred_td[S_REWARD] = reward;
             let prev_value = brain_state[brain_base + O_PREV_VALUE];
             let td_error = clamp(
                 reward + TD_DISCOUNT * value - prev_value,
@@ -1902,10 +1905,6 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
                     -MAX_EPISODIC_VALENCE,
                     MAX_EPISODIC_VALENCE,
                 );
-                // The same change, as the reward the critic sees, discounted
-                // from the moment it followed: the moment's remembered return.
-                pattern_buffer[pattern_base + O_PAT_RETURN + pattern] +=
-                    s_homeo[1u] * pow(TD_DISCOUNT, age - 1.0);
             }
         }
     }
@@ -1927,7 +1926,6 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
         pattern_buffer[pattern_base + O_PAT_NORMS + min_idx] = s_enc_norm;
         pattern_buffer[pattern_base + O_PAT_REINF + min_idx] = 1.0;
-        pattern_buffer[pattern_base + O_PAT_RETURN + min_idx] = 0.0;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u] = motor_forward;
         pattern_buffer[pattern_base + O_PAT_MOTOR + min_idx * 3u + 1u] = motor_turn;
         // No outcome yet: valence arrives only if a salient change follows.
@@ -2032,38 +2030,73 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         brain_state[mean_slot] += mean_rate * (s_encoded[tid] - brain_state[mean_slot]);
     }
 
-    // ── 7h. Episodic value replay ───────────────────────────────────────────
-    // One remembered moment per brain tick, chosen by hash, steps the
-    // critic's weights toward its remembered return (the salient homeostatic
-    // rewards that followed it): V(key) − value_bias → return. The bias keeps
-    // carrying the baseline. Only settled moments (older than the credit
-    // window) are replayed; the barriers stay uniform, so an unusable slot
-    // takes a zero step instead of branching.
-    let replay_slot = pcg_hash(agent_id ^ (u32(tick) * REPLAY_HASH_SALT)) % MEMORY_CAP;
-    let replay_age = tick - pattern_buffer[pattern_base + O_PAT_META + replay_slot * 3u];
-    let replay_settled = pattern_buffer[pattern_base + O_PAT_ACTIVE + replay_slot] >= 0.5
-        && replay_age > f32(EPISODIC_CREDIT_WINDOW);
+    // ── 7h. Recent-experience value replay ─────────────────────────────────
+    // The critic replays the last RECENT_CAP brain ticks, kept regardless of
+    // outcome. Each moment gathers TD's own target as it unfolds: this tick's
+    // TD reward discounted by the moment's age, and after
+    // REPLAY_RETURN_TICKS brain ticks the critic's value of the current state
+    // (O_PREV_VALUE, written by the TD pass this tick), when it settles.
+    // Death settles the moments still open (settle_recent_moments_at_death).
+    let reward_now = s_pred_td[S_REWARD];
+    let value_now = brain_state[brain_base + O_PREV_VALUE];
+    if (tid < RECENT_CAP) {
+        let state_slot = brain_base + O_RECENT_STATE + tid;
+        if (brain_state[state_slot] == RECENT_OPEN) {
+            let age = tick - brain_state[brain_base + O_RECENT_TICKS + tid];
+            if (age >= 1.0) {
+                let return_slot = brain_base + O_RECENT_RETURNS + tid;
+                var gathered = brain_state[return_slot] + pow(TD_DISCOUNT, age - 1.0) * reward_now;
+                if (age >= f32(REPLAY_RETURN_TICKS)) {
+                    gathered += pow(TD_DISCOUNT, age) * value_now;
+                    brain_state[state_slot] = RECENT_SETTLED;
+                }
+                brain_state[return_slot] = gathered;
+            }
+        }
+    }
+    // Store this tick's moment over the oldest one (RECENT_CAP ticks old,
+    // long settled).
+    let store_slot = u32(tick) % RECENT_CAP;
+    if (tid < ENCODED_DIMENSION) {
+        brain_state[brain_base + O_RECENT_KEYS + store_slot * ENCODED_DIMENSION + tid] =
+            s_memory_key[tid];
+    }
+    if (tid == 0u) {
+        brain_state[brain_base + O_RECENT_RETURNS + store_slot] = 0.0;
+        brain_state[brain_base + O_RECENT_TICKS + store_slot] = tick;
+        brain_state[brain_base + O_RECENT_STATE + store_slot] = RECENT_OPEN;
+        brain_state[brain_base + O_RECENT_NORMS + store_slot] = s_enc_norm * s_enc_norm;
+    }
+    storageBarrier(); workgroupBarrier();
+
+    // One settled moment per brain tick, chosen by hash, steps the whole
+    // value, bias included, toward its return:
+    // V(key) → return at CRITIC_REPLAY_RATE / (1 + ‖key‖²). The barriers stay
+    // uniform, so an empty or open slot takes a zero step instead of branching.
+    let replay_slot = pcg_hash(agent_id ^ (u32(tick) * REPLAY_HASH_SALT)) % RECENT_CAP;
+    let replay_key = brain_base + O_RECENT_KEYS + replay_slot * ENCODED_DIMENSION;
+    let replay_settled = brain_state[brain_base + O_RECENT_STATE + replay_slot] == RECENT_SETTLED;
     if (tid < ENCODED_DIMENSION) {
         s_dense_partials[tid] = brain_state[brain_base + O_VALUE_WEIGHTS + tid]
-            * pattern_buffer[pattern_base + tid * MEMORY_CAP + replay_slot];
+            * brain_state[replay_key + tid];
     } else {
         s_dense_partials[tid] = 0.0;
     }
     workgroupBarrier();
     wg_reduce_dense(tid);
     if (tid == 0u) {
-        let key_norm = pattern_buffer[pattern_base + O_PAT_NORMS + replay_slot];
-        let replay_error = pattern_buffer[pattern_base + O_PAT_RETURN + replay_slot]
-            - s_dense_partials[0];
+        let key_norm_sq = brain_state[brain_base + O_RECENT_NORMS + replay_slot];
+        let replay_value = brain_state[brain_base + O_VALUE_BIAS] + s_dense_partials[0];
+        let replay_error = brain_state[brain_base + O_RECENT_RETURNS + replay_slot] - replay_value;
         s_value = select(
             0.0,
-            CRITIC_REPLAY_RATE * replay_error / (1.0 + key_norm * key_norm),
+            CRITIC_REPLAY_RATE * replay_error / (1.0 + key_norm_sq),
             replay_settled,
         );
+        brain_state[brain_base + O_VALUE_BIAS] += s_value;
     }
     workgroupBarrier();
     if (tid < ENCODED_DIMENSION) {
-        brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
-            s_value * pattern_buffer[pattern_base + tid * MEMORY_CAP + replay_slot];
+        brain_state[brain_base + O_VALUE_WEIGHTS + tid] += s_value * brain_state[replay_key + tid];
     }
 }

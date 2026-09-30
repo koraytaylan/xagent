@@ -899,3 +899,20 @@ A scratch build (not committed) adds a critical period: encoder plasticity falls
 | whole birth brain, T = 300 | 0.0558 | 0.0561 → 0.0550 | 0.0075 | 0.0076 |
 
 So the encoder's drift is not what keeps the critic from learning. Given a steady input on which food is linearly readable, the online critic learns the wrong sign. The fault lies in the critic's own update, not in its input.
+
+## Which part of the critic's update learns the wrong sign
+
+The scratch build switches off one part of the critic's update at a time, with the steadiest encoder (critical period T = 300) as the test bench. Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm. The actual returns are computed with each arm's own reward, so they are the target that arm's critic should learn. Values are in meals; the critic is scored on its GPU values over the last 30% of each life.
+
+| Arm | Returns: in view − not | Returns: centred − off | GPU critic: in view − not | GPU critic: centred − off (agents positive) | Meals |
+|---|---|---|---|---|---|
+| as shipped | +1.6 | +0.57 | **−3.5 ± 0.9** | **−2.6 ± 0.6** (14/40) | 166 |
+| no episodic value replay | +1.3 | +0.66 | **+0.24 ± 0.04** | +0.07 ± 0.05 (23/40) | 83 |
+| no −1 at death | +1.3 | +0.66 | −5.0 ± 1.1 | −4.1 ± 1.1 (12/40) | 177 |
+| no urgency weighting of the reward | +0.8 | +0.34 | −1.8 ± 0.4 | −1.3 ± 0.4 (13/40) | 153 |
+| none of the three | +0.6 | +0.31 | +0.16 ± 0.01 | +0.04 ± 0.01 (30/40) | 134 |
+
+- **The episodic value replay is what makes the critic learn the wrong sign.** Without it, the critic values food in view above the rest in every seed (+0.17 to +0.32 meals), and does so from early in life. With it, the in-view value is 1.2–4.3 meals below the rest in every seed.
+- **Neither the death penalty nor the urgency weighting causes the flip.** Removing the death penalty makes it worse. Removing the urgency weighting only shrinks everything, the true lesson included.
+- **Replay still roughly doubles how much the agents eat (166 against 83 meals),** even while it teaches the critic the wrong sign. Its benefit to behaviour comes from something other than a correct value of food.
+- **Even without replay the critic captures only a sixth of the in-view lesson** (+0.24 of +1.3) and almost none of the centring lesson (+0.07 of +0.66).

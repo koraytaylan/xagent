@@ -812,7 +812,7 @@ The representation problem is partly fixable in a natural way. What remains is t
 
 ## Sensory adaptation in the learner
 
-Sensory adaptation at 0.01 per brain tick is now part of the learner (`coop_sensory_adapt`). Each visual feature reaches the encoder relative to its own running mean; the mean survives death. Headless evolution, `evo_vs1` config, 20 generations, seeds 5–8. Both arms run the same code apart from adaptation. Generation 0 compares the same fresh brains in the same world, so it measures lifetime learning alone.
+Sensory adaptation at 0.01 per brain tick is now part of the learner (`coop_sensory_adapt`). Each visual feature reaches the encoder relative to its own running mean; the mean survives death. Headless evolution, `evo_vs1` config, 20 generations, seeds 5–8. Both arms run the same code apart from adaptation. Generation 0 starts from fresh brains in the same world, so it measures lifetime learning alone. The fresh brains are drawn unseeded, so they differ between arms.
 
 | Seed | Gen 0 fitness (off → on) | Gen 0 meals | Mean fitness, all generations | Mean meals | Best score |
 |---|---|---|---|---|---|
@@ -827,3 +827,19 @@ Sensory adaptation at 0.01 per brain tick is now part of the learner (`coop_sens
 - **Seed 6's lineage collapsed after its first champion.** Its descendants moved half as far (about 2,900 against 6,900 units per agent) and ate 9–12 meals instead of about 22. The baseline shows the same drop after inheritance on that seed, only smaller (0.056 → 0.045). Averaged over the four seeds, evolution is a wash.
 
 Adaptation makes the world easier to learn from within one life. Whether a learned brain passes on well depends on the lineage.
+
+## Inheriting the birth brain
+
+Until now a champion passed on its end-of-life brain: everything it had learned, its memories included. Its fitness, though, was earned with the brain it was born with. Offspring now inherit that birth brain, mutated as before, and learn again from birth. Headless evolution, same config, 20 generations, seeds 5–8. Both arms have sensory adaptation.
+
+| Seed | Mean fitness (learned → birth brain) | Mean meals | Birth brain: first 5 → last 5 generations | Best score |
+|---|---|---|---|---|
+| 5 | 0.0638 → 0.0554 | 34.1 → 21.1 | 0.0567 → 0.0557 | 0.0702 → 0.0626 |
+| 6 | 0.0307 → **0.0581** | 10.4 → 23.3 | 0.0576 → 0.0601 | 0.0614 → 0.0690 |
+| 7 | 0.0570 → 0.0523 | 29.5 → 18.6 | 0.0516 → 0.0528 | 0.0609 → 0.0595 |
+| 8 | 0.0550 → 0.0575 | 22.7 → 22.7 | 0.0555 → 0.0574 | 0.0648 → 0.0628 |
+| mean | 0.0516 → 0.0558 | 24.2 → 21.4 | 0.0554 → 0.0565 | 0.0643 → 0.0635 |
+
+- **No lineage collapses any more.** Seed 6 goes from 0.031 to 0.058, and every generation stays near the first.
+- **Scores stop falling across generations, but they do not rise either.** Evolution now selects only the birth turn weights, and those are still at chance.
+- **Passing on learned brains had helped two lineages.** Seeds 5 and 7 ate about ten more meals: those learned brains carried more foraging skill than a new life gains within one generation. The same mechanism passed on the seed-6 collapse, and it is not how nature inherits.

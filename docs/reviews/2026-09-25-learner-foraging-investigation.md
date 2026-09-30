@@ -984,3 +984,24 @@ A lean behaviour harness compared replay on and off (scratch switch), with and w
 - **Replay's gain is movement, not steering.** Agents with replay drive forward about four times as hard. They cover twice the ground, come across food 1.7 times as often, and reach it sooner once seen. They turn toward visible food no more often than chance, as without replay.
 - **The mechanism is a lasting positive TD error.** Replay holds the critic's values below what TD would settle on, so the TD error stays positive, 4–5 times larger than without replay. Forward exploration that runs into moments resembling remembered pre-meal ones then keeps being reinforced, and the forward bias grows. In effect it works like an optimism about places that looked like food before.
 - **The price is more deaths** (89 against 49), although meals double and mean energy rises. This harness does not record the cause of death.
+
+## Replaying recent experience instead
+
+The same offline replica tried replay drawn without regard to outcome. The source was either the last 128 or 1024 settled moments, or an even sample of the whole life so far (reservoir of 128). The target was TD's: the full eight-tick return with the drain, plus the critic's value at the window's end as it was then, and replay moved the bias as well. Setup: 300k-tick logged lives, steady encoder (T = 300), seeds 5–8, 40 agents; late-life values in meals (agents positive).
+
+| Replay | In view − not | Centred − off | R² vs true return |
+|---|---|---|---|
+| none (TD only) | +0.29 ± 0.13 (32/40) | −0.01 ± 0.08 (18/40) | 0.05 |
+| as shipped (outcome-filtered memory) | −2.48 ± 0.70 (17/40) | −2.31 ± 0.54 (10/40) | 0.01 |
+| outcome-filtered memory, TD's target, bias too | −0.36 ± 0.33 (24/40) | −0.67 ± 0.27 (14/40) | 0.01 |
+| **last 128 moments, TD's target, bias too** | **+0.64 ± 0.06 (38/40)** | **+0.25 ± 0.09 (26/40)** | 0.08 |
+| last 128 moments, no bootstrap, bias too | +0.48 ± 0.05 (36/40) | +0.24 ± 0.06 (33/40) | 0.05 |
+| last 1024 moments, TD's target, bias too | +0.54 ± 0.05 (40/40) | +0.13 ± 0.06 (25/40) | 0.16 |
+| even sample of the life (128), TD's target, bias too | +0.35 ± 0.10 (34/40) | +0.19 ± 0.18 (23/40) | 0.08 |
+| ideal least squares (reference) | +0.96 ± 0.05 (40/40) | +0.27 ± 0.08 (29/40) | 0.25 |
+
+- **Replaying recent experience makes the critic clearly better than TD alone.** With the last 128 moments, the in-view lesson doubles (+0.64 against +0.29, of an ideal +0.96) and holds in 38 of 40 agents. The centring lesson appears at almost its ideal size (+0.25 against +0.27), where TD alone learns none.
+- **What mattered was not filtering by outcome.** The same target on the outcome-filtered memory stays below TD alone.
+- **A longer window (1024) predicts returns best (R² 0.16) but centres less.** An even sample of the whole life is noisier than a recent one.
+
+These are offline results on the behaviour of today's replay agents. The GPU critic, the steering and the meals have yet to be measured with this replay in place.

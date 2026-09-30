@@ -960,3 +960,27 @@ The same offline replica tested replay targets consistent with TD's. The full re
 
 - **A consistent target removes the flip, but every replay variant still leaves the critic worse than TD alone,** most of all on centring.
 - **The remaining fault is what memory keeps, not the target.** Eviction keeps moments by their outcome, and 92% of remembered moments preceded a meal. Replay therefore learns what a moment is worth *given that a meal followed*. An off-axis sighting that the agent then turned into a meal looks as good as a centred one, and the in-view advantage shrinks as well. Among remembered moments the true in-view advantage is +0.43 meals; among lived moments it is +1.60. Replaying that sample more faithfully cannot recover a difference the sample no longer contains.
+
+## What replay does to behaviour
+
+A lean behaviour harness compared replay on and off (scratch switch), with and without the critical period. Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm. A sighting is a run of brain ticks with food in view; it converts when a meal follows within 30 brain ticks of its start. "Toward" is the share of in-view ticks on which the turn command points at the food. Values are in meals where marked.
+
+| | Replay | No replay | Replay, T = 300 | No replay, T = 300 |
+|---|---|---|---|---|
+| Meals | **173 ± 12** | 83 ± 4 | 154 ± 14 | 83 ± 5 |
+| Distance travelled | 42,700 | 20,600 | 35,900 | 19,700 |
+| Mean speed | 4.26 | 2.06 | 3.59 | 1.97 |
+| Mean forward command | 0.126 | 0.034 | 0.117 | 0.041 |
+| Forward bias at the end | +0.48 | −0.04 | +0.36 | +0.01 |
+| Sightings | 303 | 181 | 265 | 175 |
+| Sightings that end in a meal | 45% | 35% | 46% | 37% |
+| Brain ticks from sighting to meal | 5.4 | 7.9 | 6.1 | 7.7 |
+| Turning toward visible food | **49%** | **51%** | **51%** | **52%** |
+| Deaths | 89 | 49 | 75 | 46 |
+| Mean energy | 0.81 | 0.63 | 0.78 | 0.63 |
+| Critic's mean value (meals) | −4.0 | −1.7 | −3.2 | −1.6 |
+| Mean TD error per brain tick (meals) | +0.088 | +0.019 | +0.067 | +0.016 |
+
+- **Replay's gain is movement, not steering.** Agents with replay drive forward about four times as hard. They cover twice the ground, come across food 1.7 times as often, and reach it sooner once seen. They turn toward visible food no more often than chance, as without replay.
+- **The mechanism is a lasting positive TD error.** Replay holds the critic's values below what TD would settle on, so the TD error stays positive, 4–5 times larger than without replay. Forward exploration that runs into moments resembling remembered pre-meal ones then keeps being reinforced, and the forward bias grows. In effect it works like an optimism about places that looked like food before.
+- **The price is more deaths** (89 against 49), although meals double and mean energy rises. This harness does not record the cause of death.

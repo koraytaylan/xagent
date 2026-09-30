@@ -873,3 +873,29 @@ Headless evolution: same config, 20 generations, seeds 5–8, with 10 or 40 agen
 | whole birth brain, 40 agents | 0.0084 | 0.0069 | 0.0060 |
 
 So the birth brain's heritable differences do not show in fitness: whatever a genome starts with, the life it then lives decides the score.
+
+## An encoder critical period
+
+The encoder keeps rewriting itself through life, so two questions follow. Does that erase the differences between birth brains, and does it keep the critic's input moving under it?
+
+A scratch build (not committed) adds a critical period: encoder plasticity falls as T / (T + age), with age in brain ticks since birth. The setup: 300k-tick free runs, seeds 5–8, 40 agents per arm, current code (sensory adaptation, episodic value replay). The critic is scored on its own GPU values over the last 30% of each life. The earlier CPU replay of the TD rule predates value replay and no longer matches the GPU critic. Values are in meals.
+
+| Arm | Encoder drift per 100k ticks | R²: food in view | R²: \|bearing\| | R²: distance | Returns: in view − not | Least squares: in view − not | Least squares: centred − off (agents positive) | GPU critic, late: in view − not | GPU critic, late: centred − off (agents positive) | Meals |
+|---|---|---|---|---|---|---|---|---|---|---|
+| no critical period | 0.77–0.89 | 0.13 | 0.29 | 0.06 | +1.6 | +0.49 | +0.29 (30/40) | −1.8 ± 1.6 | −1.4 ± 1.1 (21/40) | 166 ± 13 |
+| T = 3000 | 0.10–0.21 | 0.19 | 0.50 | 0.15 | +1.5 | +0.64 | +0.33 (32/40) | +1.2 ± 0.7 | −0.1 ± 0.2 (20/40) | 152 ± 16 |
+| T = 300 | 0.01–0.03 | 0.22 | 0.52 | 0.18 | +1.4 | +0.76 | +0.36 (31/40) | **−4.0 ± 1.1** | **−2.7 ± 0.8** (15/40) | 157 ± 15 |
+
+- **A critical period does steady the encoder.** At T = 300 it changes by 1–3% per 100k ticks instead of 77–89%.
+- **A steady encoder makes food more readable:** its presence by 1.7×, its bearing by 1.8×, its distance by 3×. The ideal linear value then captures more of the in-view lesson (+0.76 of about +1.4 meals).
+- **The online critic still does not use it. With the steadiest encoder it is confidently wrong.** At T = 300 it values food in view 2.9–6.1 meals *below* the rest in every seed, while the actual returns there are 1.1–1.7 meals higher.
+- **Evolution is unchanged** (headless, T = 300, seeds 5–8, 10 agents):
+
+| Arm | Mean fitness | First 5 → last 5 generations | SD between genome means | SD expected from noise alone |
+|---|---|---|---|---|
+| turn weights only, no critical period | 0.0558 | 0.0553 → 0.0565 | 0.0067 | 0.0072 |
+| turn weights only, T = 300 | 0.0560 | 0.0557 → 0.0561 | 0.0066 | 0.0070 |
+| whole birth brain, no critical period | 0.0542 | 0.0542 → 0.0554 | 0.0070 | 0.0082 |
+| whole birth brain, T = 300 | 0.0558 | 0.0561 → 0.0550 | 0.0075 | 0.0076 |
+
+So the encoder's drift is not what keeps the critic from learning. Given a steady input on which food is linearly readable, the online critic learns the wrong sign. The fault lies in the critic's own update, not in its input.

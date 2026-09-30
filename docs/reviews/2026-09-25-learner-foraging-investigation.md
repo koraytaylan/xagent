@@ -1005,3 +1005,38 @@ The same offline replica tried replay drawn without regard to outcome. The sourc
 - **A longer window (1024) predicts returns best (R² 0.16) but centres less.** An even sample of the whole life is noisier than a recent one.
 
 These are offline results on the behaviour of today's replay agents. The GPU critic, the steering and the meals have yet to be measured with this replay in place.
+
+## Recent-experience replay in the learner
+
+The critic's value replay now draws on a ring of the last 128 brain ticks, kept whatever followed them. Each moment gathers TD's own eight-tick return, completed with the critic's value, or −1 if the life ends first, and replay moves the bias with the weights. Pattern memory no longer carries a return.
+
+**Free runs** (300k ticks, seeds 5–8, 40 agents, shipped config without a critical period; GPU values, in meals):
+
+| | Memory replay (before) | Recent replay (now) | No replay (scratch, for reference) |
+|---|---|---|---|
+| Critic, early life: in view − not | +0.33 ± 0.16 | +0.67 ± 0.05 | — |
+| Critic, late life: in view − not | −1.85 ± 1.59 | **+0.51 ± 0.08** | — |
+| Critic, late life: centred − off (agents positive) | −1.43 ± 1.08 (21/40) | +0.13 ± 0.13 (23/40) | — |
+| Returns: centred − off | +0.64 | +0.78 | — |
+| R²: \|bearing\| from the critic's input | 0.29 | 0.48 | — |
+| Meals | 173 ± 12 | **88 ± 4** | 83 ± 4 |
+| Distance travelled | 42,700 | 19,900 | 20,600 |
+| Forward bias at the end | +0.48 | +0.05 | −0.04 |
+| Sightings that end in a meal | 45% | 39% | 35% |
+| Turning toward visible food | 49% | 50% | 51% |
+| Deaths | 89 | 47 | 49 |
+
+**Headless evolution** (`evo_vs1`, 20 generations, seeds 5–8, 10 agents):
+
+| | Memory replay (before) | Recent replay (now) |
+|---|---|---|
+| Mean fitness | 0.0558 | 0.0554 |
+| First generation | 0.0560 | 0.0576 |
+| First 5 → last 5 generations | 0.0553 → 0.0565 | 0.0562 → 0.0552 |
+| Meals per agent per generation | 21.4 | 19.9 |
+| SD between genome means / from noise alone | 0.0067 / 0.0072 | 0.0069 / 0.0074 |
+
+- **The critic now has the right sign, consistently.** Food in view is worth more than the rest early and late in life, with a small spread across agents. The centring lesson is positive but not yet significant.
+- **Long lives eat half as much, as expected.** The doubling of meals came from the old replay's accidental optimism, which drove forward movement. Without it, agents move and eat like agents with no replay at all.
+- **Steering is unchanged:** turning toward visible food stays at chance.
+- **Evolution is unchanged.** A 40k-tick generation is too short for the old optimism to have built up much movement.

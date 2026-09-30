@@ -1040,3 +1040,27 @@ The critic's value replay now draws on a ring of the last 128 brain ticks, kept 
 - **Long lives eat half as much, as expected.** The doubling of meals came from the old replay's accidental optimism, which drove forward movement. Without it, agents move and eat like agents with no replay at all.
 - **Steering is unchanged:** turning toward visible food stays at chance.
 - **Evolution is unchanged.** A 40k-tick generation is too short for the old optimism to have built up much movement.
+
+## Do the actors get a learning signal now?
+
+The setup: a scratch harness on the current code (recent-experience replay), 300k-tick free runs, seeds 5–8, 40 agents. It logged every brain tick and measured the credit the eligibility traces give each tick's exploration noise: later TD errors, decayed by γλ per tick and cut at death. For steering, the credit is multiplied by the turn noise signed toward the food, on in-view ticks. For moving, it is multiplied by the forward noise, on all ticks. The same products with the true advantage (return minus the critic's value) give the ceiling a perfect critic would provide.
+
+| Signal | Mean | Agents positive | Agents with t > 2 / t < −2 |
+|---|---|---|---|
+| Steering: credit from the traces | +1.6e-3 ± 0.3e-3 | 34/40 | 16 / 1 |
+| Steering: true advantage (ceiling) | +1.6e-3 ± 0.4e-3 | 31/40 | 12 / 0 |
+| Steering: credit through the encoding's side readout | +1.1e-3 ± 0.2e-3 | 31/40 | 12 / 0 |
+| Moving: credit from the traces | −7.1e-5 ± 0.7e-5 | 3/40 | 0 / 2 |
+| Moving: true advantage | −3.3e-5 ± 2.2e-5 | 14/40 | 1 / 1 |
+
+Other measures:
+
+- The food's side is readable from the critic's input on in-view ticks (R² 0.61).
+- Over a life, the learned change in the turn weights aligns with that readout at cos +0.045 ± 0.006.
+- Turning toward visible food stays at 49%.
+- Fatigue averages 0.55, and on 49% of ticks it cuts the executed action below half.
+
+- **Steering now has a right-signed signal, as strong as a perfect critic would give.** It also reaches the turn weights through the encoding.
+- **But it barely moves the weights.** Food is in view on about 2.5% of ticks, and on the other 97.5% the trace updates are noise times encoding, a random walk in the same weights. What the turn weights learn over a life points only faintly at the food's side (cos 0.045).
+- **Moving forward gets no positive signal, and the ceiling offers none either.** A one-tick forward kick costs energy for certain, while the food it might lead to comes too late and too rarely for the traces. Even the true advantage of a forward kick is about zero. The earlier doubling of meals came from optimism, not from a lesson available in the data.
+- **Fatigue damps the executed action on half the ticks.** It does not damp the noise the traces credit, so the actors are credited for actions the body only partly carried out.

@@ -200,7 +200,7 @@ impl App {
                     self.runtime_counters.generation_boundaries += 1;
                     self.on_generation_budget_reached();
                 }
-                SimEvent::AgentState { request_id, state } => {
+                SimEvent::BirthState { request_id, state } => {
                     self.on_champion_state(request_id, state);
                 }
                 SimEvent::Log(message) => self.log_msg(message),

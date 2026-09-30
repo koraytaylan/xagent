@@ -184,6 +184,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         for (i, agent) in agents.iter().enumerate() {
             kernel.write_agent_heritable_config(agent.brain_idx, &current_configs[i]);
         }
+        let birth_states: Vec<AgentBrainState> = agents
+            .iter()
+            .map(|agent| kernel.read_agent_state(agent.brain_idx))
+            .collect();
 
         governor.gen_tick = 0;
 
@@ -304,8 +308,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
                 }
                 inherited_state = resolve_inherited_brain(
                     &governor,
-                    &kernel,
-                    &agents,
+                    &birth_states,
                     champion_capture,
                     inherit_from_node,
                 );
@@ -329,20 +332,20 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
     );
 }
 
-/// Store the accepted node's champion brain (read synchronously from `kernel`)
-/// and return the brain the next generation inherits: the stored champion of
-/// the node its configs were bred from. Mirrors the live sandbox handoff, so a
-/// node is always evaluated with the brain lineage its config came from.
+/// Store the accepted node's champion brain and return the brain the next
+/// generation inherits: the stored champion of the node its configs were bred
+/// from. The champion's brain is the one it was born with (`birth_states`,
+/// indexed like the agents), the genome its fitness was earned with; what it
+/// learned in its life is not passed on. Mirrors the live sandbox handoff, so
+/// a node is always evaluated with the brain lineage its config came from.
 fn resolve_inherited_brain(
     governor: &Governor,
-    kernel: &GpuKernel,
-    agents: &[Agent],
+    birth_states: &[AgentBrainState],
     champion_capture: Option<ChampionCapture>,
     inherit_from_node: Option<i64>,
 ) -> Option<AgentBrainState> {
     let captured = champion_capture.and_then(|capture| {
-        let agent = agents.get(capture.agent_index)?;
-        let champion = kernel.read_agent_state(agent.brain_idx);
+        let champion = birth_states.get(capture.agent_index)?.clone();
         governor.store_champion_brain(capture.node_id, &champion);
         Some((capture.node_id, champion))
     });
@@ -1077,6 +1080,10 @@ fn run_headless_with_flags(
         for (i, agent) in agents.iter().enumerate() {
             kernel.write_agent_heritable_config(agent.brain_idx, &current_configs[i]);
         }
+        let birth_states: Vec<AgentBrainState> = agents
+            .iter()
+            .map(|agent| kernel.read_agent_state(agent.brain_idx))
+            .collect();
 
         governor.gen_tick = 0;
 
@@ -1170,8 +1177,7 @@ fn run_headless_with_flags(
             } => {
                 inherited_state = resolve_inherited_brain(
                     &governor,
-                    &kernel,
-                    &agents,
+                    &birth_states,
                     champion_capture,
                     inherit_from_node,
                 );

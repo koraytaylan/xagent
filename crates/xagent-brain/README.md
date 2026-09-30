@@ -783,7 +783,7 @@ pub struct AgentBrainState {
 }
 ```
 
-Used for cross-generation inheritance (the governor reads parent state, mutates it, writes to offspring) and mutation. The two vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` slice uses the fixed `PATTERN_STRIDE` constant. The learned policy and the TD value head live in `brain_state` and so are inherited; the episodic eligibility traces also live there but are zeroed on the first post-respawn tick of a new life.
+Used for cross-generation inheritance (the sandbox reads each agent's state at birth, before its first tick, and offspring inherit the champion's birth state, mutated) and mutation. The two vectors are the exact GPU buffer contents for one agent slice. Only the `brain_state` slice length is vision-dependent (`BrainLayout::brain_stride`, via `feature_count`); the `patterns` slice uses the fixed `PATTERN_STRIDE` constant. Because the birth state is what is passed on, nothing an agent learns in its life — policy, value head, encoder drift or memories — reaches its offspring. The episodic eligibility traces also live in `brain_state` and are zeroed on the first post-respawn tick of a new life.
 
 ### Death / Respawn on the GPU
 

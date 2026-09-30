@@ -3,7 +3,7 @@
 //!
 //! This module hosts `App::handle_evolution_action` plus the cluster of
 //! methods that together drive a generation boundary — evaluating fitness,
-//! reading back the champion's brain state, resetting or recreating the
+//! fetching the brain the champion was born with, resetting or recreating the
 //! GPU kernel, and spawning the next generation's agents.
 
 use std::time::Instant;
@@ -215,9 +215,10 @@ impl App {
     /// The end-of-generation snapshot has already been applied to the CPU
     /// agents by the event drain. Persist the recording, evaluate fitness, and
     /// — when evolution continues — resolve the brain the next generation
-    /// inherits. An accepted generation first reads its champion's brain back
-    /// from the worker and stores it for the node; the next generation then
-    /// inherits the stored champion of the node its configs were bred from.
+    /// inherits. An accepted generation first fetches the brain its champion
+    /// was born with from the worker and stores it for the node; the next
+    /// generation then inherits the stored champion of the node its configs
+    /// were bred from. What the champion learned in its life is not passed on.
     /// `Finished` results pause the run (the worker has already paused itself
     /// at the budget).
     pub(crate) fn on_generation_budget_reached(&mut self) {
@@ -273,7 +274,7 @@ impl App {
                     let request_id = self.champion_request_counter;
                     self.champion_request_counter += 1;
                     if let Some(runtime) = &self.sim_runtime {
-                        runtime.send(SimCommand::RequestAgentState {
+                        runtime.send(SimCommand::RequestBirthState {
                             agent_index: brain_idx,
                             request_id,
                         });
@@ -301,10 +302,11 @@ impl App {
         }
     }
 
-    /// Store the worker's champion brain-state reply for the accepted node and
-    /// start the next generation, ignoring a reply whose id does not match the
-    /// pending request. A failed readback (`None`) stores nothing; the next
-    /// generation then inherits whatever the breeding node has stored.
+    /// Store the worker's reply with the champion's birth brain for the
+    /// accepted node and start the next generation, ignoring a reply whose id
+    /// does not match the pending request. A missing reply (`None`) stores
+    /// nothing; the next generation then inherits whatever the breeding node
+    /// has stored.
     pub(crate) fn on_champion_state(&mut self, request_id: u64, state: Option<AgentBrainState>) {
         let Some(pending) = self.pending_generation.take() else {
             return;
@@ -324,8 +326,9 @@ impl App {
 
     /// The brain the next generation inherits: the stored champion of the node
     /// its configs were bred from (`inherit_from_node`). `captured` is the
-    /// champion just read back for an accepted node; it is returned directly
-    /// when that node is the breeding node, skipping the database round trip.
+    /// champion's birth brain just fetched for an accepted node; it is
+    /// returned directly when that node is the breeding node, skipping the
+    /// database round trip.
     fn inherited_brain(
         &self,
         result: &AdvanceResult,

@@ -64,14 +64,15 @@ pub(crate) struct RuntimeCounters {
 }
 
 /// In-flight generation handoff: the worker reached the tick budget and the
-/// main thread has evaluated fitness and requested the champion's brain state.
+/// main thread has evaluated fitness and requested the brain the champion was
+/// born with.
 ///
-/// When the champion `AgentState` reply arrives, the main thread spawns the
+/// When the champion `BirthState` reply arrives, the main thread spawns the
 /// next population and sends `ResetPopulation` to the worker. `Finished`
 /// results complete immediately and never produce a pending handoff.
 pub(crate) struct PendingGeneration {
     pub(crate) result: AdvanceResult,
-    /// Identifies the matching `RequestAgentState` / `AgentState` pair.
+    /// Identifies the matching `RequestBirthState` / `BirthState` pair.
     pub(crate) champion_request_id: u64,
     /// The accepted node whose champion brain the pending request captures.
     pub(crate) champion_node_id: i64,
@@ -164,7 +165,7 @@ pub(crate) struct App {
     // In-flight generation handoff (worker reached the tick budget; awaiting
     // champion brain-state reply before sending the population reset).
     pub(crate) pending_generation: Option<PendingGeneration>,
-    /// Monotonic id source pairing `RequestAgentState` with its `AgentState`.
+    /// Monotonic id source pairing `RequestBirthState` with its `BirthState`.
     pub(crate) champion_request_counter: u64,
     /// Epoch of the population the main thread currently accepts snapshots
     /// for. Advanced when a generation boundary continues to a new population

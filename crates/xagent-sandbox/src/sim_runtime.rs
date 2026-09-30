@@ -133,7 +133,8 @@ pub struct ResetRequest {
     pub resume: bool,
     /// Vary the turn-policy weights across repeat-groups (the steering
     /// genome search) instead of varying `BrainConfig`. Lifetime learning
-    /// keeps updating them, so a lineage's champion carries what it learned.
+    /// keeps updating them, but a lineage passes on the weights its champion
+    /// was born with, not what it learned.
     pub search_steering_genome: bool,
     /// Generation epoch of the new population; every snapshot the worker
     /// publishes after the reset carries it.
@@ -148,8 +149,9 @@ pub enum SimCommand {
     SetSpeed(u32),
     /// Set the selected agent (by kernel brain index) for telemetry.
     SelectAgent(u32),
-    /// Request a blocking champion brain-state readback while paused.
-    RequestAgentState { agent_index: u32, request_id: u64 },
+    /// Request the brain an agent was born with this generation: the genome
+    /// its fitness was earned with, before any lifetime learning.
+    RequestBirthState { agent_index: u32, request_id: u64 },
     /// Reset to the next generation's population (boxed: much larger than the
     /// other variants, which would otherwise bloat every `SimCommand`).
     ResetPopulation(Box<ResetRequest>),
@@ -172,8 +174,8 @@ pub enum SimEvent {
     /// The generation tick budget was reached; carries the final state of the
     /// generation. The worker has paused itself and awaits the handoff.
     GenerationBudgetReached(StateSnapshot),
-    /// Reply to [`SimCommand::RequestAgentState`].
-    AgentState {
+    /// Reply to [`SimCommand::RequestBirthState`].
+    BirthState {
         request_id: u64,
         state: Option<AgentBrainState>,
     },
@@ -354,6 +356,19 @@ struct Worker {
     last_counters_log: Instant,
     steering_group_size: usize,
     steering_mutation_strength: f32,
+    /// Each agent's brain as written at the start of the current generation,
+    /// indexed by brain index. What a champion passes on.
+    birth_states: Vec<AgentBrainState>,
+}
+
+/// Read back every agent's brain before the generation's first tick
+/// (blocking; the worker is between generations). Inheritance passes these
+/// on, so offspring get a champion's genome rather than what it learned in
+/// its life.
+fn read_birth_states(kernel: &GpuKernel) -> Vec<AgentBrainState> {
+    (0..kernel.agent_count())
+        .map(|index| kernel.read_agent_state(index))
+        .collect()
 }
 
 /// Whether an inherited champion brain matches the layout `brain_config`
@@ -422,6 +437,7 @@ impl Worker {
             kernel.batch_write_agent_states(count, |index| genomes[index].clone());
         }
         patch_agent_configs(&kernel, &init.upload.agent_configs);
+        let birth_states = read_birth_states(&kernel);
         Self {
             kernel,
             brain_config: init.brain_config,
@@ -443,6 +459,7 @@ impl Worker {
             last_counters_log: Instant::now(),
             steering_group_size: init.steering_group_size.max(1),
             steering_mutation_strength: init.steering_mutation_strength,
+            birth_states,
         }
     }
 
@@ -457,19 +474,15 @@ impl Worker {
             }
             SimCommand::SetSpeed(speed) => self.speed_multiplier = speed.max(1),
             SimCommand::SelectAgent(index) => self.selected_agent = index,
-            SimCommand::RequestAgentState {
+            SimCommand::RequestBirthState {
                 agent_index,
                 request_id,
             } => {
-                // Blocking readback is safe here: the handoff only requests
-                // champion state while the worker is paused at a generation
-                // boundary.
-                let state = if agent_index < self.kernel.agent_count() {
-                    Some(self.kernel.read_agent_state(agent_index))
-                } else {
-                    None
-                };
-                let _ = event_tx.send(SimEvent::AgentState { request_id, state });
+                let state = usize::try_from(agent_index)
+                    .ok()
+                    .and_then(|index| self.birth_states.get(index))
+                    .cloned();
+                let _ = event_tx.send(SimEvent::BirthState { request_id, state });
             }
             SimCommand::ResetPopulation(request) => {
                 let resume = request.resume;
@@ -563,6 +576,7 @@ impl Worker {
             });
         }
         patch_agent_configs(&self.kernel, &request.upload.agent_configs);
+        self.birth_states = read_birth_states(&self.kernel);
 
         self.tick_budget = request.tick_budget;
         self.tick = 0;
@@ -994,7 +1008,7 @@ mod tests {
             SimEvent::KernelReady { agent_count: 4 },
             SimEvent::Snapshot(snapshot_with_tick(10)),
             SimEvent::GenerationBudgetReached(snapshot_with_tick(99)),
-            SimEvent::AgentState {
+            SimEvent::BirthState {
                 request_id: 7,
                 state: None,
             },
@@ -1015,7 +1029,7 @@ mod tests {
         ));
         assert!(matches!(
             control[2],
-            SimEvent::AgentState { request_id: 7, .. }
+            SimEvent::BirthState { request_id: 7, .. }
         ));
     }
 
@@ -1234,6 +1248,65 @@ mod tests {
         );
     }
 
+    /// A champion passes on the brain it was born with, not what it learned:
+    /// after a stretch of lifetime learning, the worker's reply to
+    /// `RequestBirthState` must still equal the state written before the
+    /// first tick. GPU-gated.
+    #[test]
+    fn worker_passes_on_the_birth_brain_not_the_learned_one() {
+        if !GpuKernel::is_available() {
+            eprintln!("Skipping: no GPU/fallback adapter available");
+            return;
+        }
+
+        const LIFETIME_TICKS: u32 = 300;
+        const REQUEST_ID: u64 = 3;
+
+        let (upload, food_count) = two_agent_upload_with_wavelengths(5.0, 5.0);
+        let mut worker = Worker::new(SimInit {
+            agent_count: 2,
+            food_count,
+            brain_config: BrainConfig::default(),
+            world_config: WorldConfig::default(),
+            upload,
+            tick_budget: 0,
+            speed_multiplier: 1,
+            paused: true,
+            selected_agent: 0,
+            generation_epoch: 0,
+            search_steering_genome: true,
+            steering_group_size: 1,
+            steering_mutation_strength: 0.1,
+        });
+        let birth = worker.kernel.read_agent_state(0);
+        worker.kernel.dispatch_batch(0, LIFETIME_TICKS);
+        let learned = worker.kernel.read_agent_state(0);
+        assert_ne!(
+            learned.brain_state, birth.brain_state,
+            "precondition: {LIFETIME_TICKS} ticks of lifetime learning should change the brain"
+        );
+
+        let (event_tx, event_rx) = sync_channel(1);
+        worker.handle_command(
+            SimCommand::RequestBirthState {
+                agent_index: 0,
+                request_id: REQUEST_ID,
+            },
+            &event_tx,
+        );
+        let Ok(SimEvent::BirthState {
+            request_id: REQUEST_ID,
+            state: Some(passed_on),
+        }) = event_rx.try_recv()
+        else {
+            panic!("the worker should reply with agent 0's birth state");
+        };
+        assert!(
+            passed_on.brain_state == birth.brain_state && passed_on.patterns == birth.patterns,
+            "the champion passed on its learned brain instead of its birth brain"
+        );
+    }
+
     /// Drain events through `pick`, returning the first non-`None` mapping or
     /// `None` if nothing matched within ~10 s (generous for a slow GPU).
     fn drain_until<T>(
@@ -1267,7 +1340,7 @@ mod tests {
 
     /// End-to-end generation handoff at the worker boundary: the worker reaches
     /// the tick budget and emits `GenerationBudgetReached`, replies to a champion
-    /// `RequestAgentState` while paused, and resumes the next generation on
+    /// `RequestBirthState` while paused, and resumes the next generation on
     /// `ResetPopulation`. Exercises the orchestration the kernel-level tests do
     /// not. GPU-gated.
     #[test]
@@ -1291,18 +1364,18 @@ mod tests {
         );
 
         // 2. Champion brain-state readback while paused.
-        runtime.send(SimCommand::RequestAgentState {
+        runtime.send(SimCommand::RequestBirthState {
             agent_index: 0,
             request_id: 42,
         });
         let champion = drain_until(&runtime, |event| match event {
-            SimEvent::AgentState {
+            SimEvent::BirthState {
                 request_id: 42,
                 state,
             } => Some(state),
             _ => None,
         })
-        .expect("AgentState reply should arrive");
+        .expect("BirthState reply should arrive");
         assert!(champion.is_some(), "champion brain state should read back");
 
         // 3. Reset to the next generation and resume.

@@ -843,3 +843,33 @@ Until now a champion passed on its end-of-life brain: everything it had learned,
 - **No lineage collapses any more.** Seed 6 goes from 0.031 to 0.058, and every generation stays near the first.
 - **Scores stop falling across generations, but they do not rise either.** Evolution now selects only the birth turn weights, and those are still at chance.
 - **Passing on learned brains had helped two lineages.** Seeds 5 and 7 ate about ten more meals: those learned brains carried more foraging skill than a new life gains within one generation. The same mechanism passed on the seed-6 collapse, and it is not how nature inherits.
+
+## Evolving the whole birth brain
+
+A scratch build (not committed) let mutation vary the whole birth brain, not just the turn weights. It perturbs:
+
+- the turn weights, as before;
+- the forward and value weights, on the same scale as the turn weights;
+- the encoder weights and biases, and the predictor weights, as in `mutate_brain_state`.
+
+Headless evolution: same config, 20 generations, seeds 5–8, with 10 or 40 agents per generation (two evaluations per genome).
+
+| Arm | Mean fitness | First 5 → last 5 generations | Mean meals | Best score | Accepted nodes |
+|---|---|---|---|---|---|
+| turn weights only, 10 agents | 0.0558 | 0.0553 → 0.0565 | 21.4 | 0.0635 | 3.0 |
+| whole birth brain, 10 agents | 0.0542 | 0.0542 → 0.0554 | 21.0 | 0.0614 | 3.0 |
+| turn weights only, 40 agents | 0.0444 | 0.0445 → 0.0448 | 14.6 | 0.0463 | 1.8 |
+| whole birth brain, 40 agents | 0.0434 | 0.0438 → 0.0433 | 15.0 | 0.0450 | 1.0 |
+
+- **Varying the whole birth brain made no difference:** no arm improves across generations.
+- **More agents lowers every score.** All agents share one world, so four times the agents means about a third fewer meals each.
+- **Evolution is selecting on noise.** The differences between genomes are no larger than the noise of evaluating one genome:
+
+| Arm | SD of one evaluation | SD between genome means | SD expected from noise alone |
+|---|---|---|---|
+| turn weights only, 10 agents | 0.0102 | 0.0067 | 0.0072 |
+| whole birth brain, 10 agents | 0.0117 | 0.0070 | 0.0082 |
+| turn weights only, 40 agents | 0.0085 | 0.0060 | 0.0060 |
+| whole birth brain, 40 agents | 0.0084 | 0.0069 | 0.0060 |
+
+So the birth brain's heritable differences do not show in fitness: whatever a genome starts with, the life it then lives decides the score.

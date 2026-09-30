@@ -943,3 +943,20 @@ Memory keys matched the log exactly (cosine 1.000), and the stored returns equal
 | TD + replay that also moves the bias | −0.06 ± 0.35 (29/40) |
 
 Replay moves only the weights, never the bias. It teaches them that nearly every remembered moment is worth about two meals, because its target counts the coming meal but not the steady drain, and memory holds almost nothing else. TD shares those weights and must pull lived moments back to their true value. The tug of war leaves food in view valued below the rest. Slowing replay tenfold changes nothing, so this is where the two updates settle, not a matter of step size. Letting replay move the bias as well removes most of the flip, but it is still no better than TD alone: replay's target still leaves out the drain that TD's target includes.
+
+## Giving replay TD's target
+
+The same offline replica tested replay targets consistent with TD's. The full return is every reward in the eight brain ticks after the moment, the steady drain included, with the −1 at death. The bootstrapped variant adds the critic's value at the window's end, as it was then. Setup: 300k-tick logged lives, steady encoder (T = 300), seeds 5–8, 40 agents; late-life values in meals (agents positive). R² is how much of the variance in the true return the value explains late in life.
+
+| Replay | In view − not | Centred − off | R² vs true return |
+|---|---|---|---|
+| none (TD only) | **+0.36 ± 0.14** (34/40) | **+0.07 ± 0.12** (24/40) | 0.07 |
+| as shipped (salient-only target, weights only) | −2.08 ± 0.89 (23/40) | −2.10 ± 0.61 (12/40) | 0.01 |
+| salient-only target, bias too | −0.12 ± 0.41 (30/40) | −0.39 ± 0.29 (18/40) | 0.02 |
+| full return, bias too | −0.08 ± 0.40 (30/40) | −0.54 ± 0.28 (17/40) | 0.02 |
+| full return + bootstrap, bias too | −0.12 ± 0.41 (29/40) | −0.62 ± 0.28 (16/40) | 0.02 |
+| full return + bootstrap, weights only | +0.41 ± 0.19 (33/40) | −0.21 ± 0.24 (20/40) | 0.02 |
+| ideal least squares (reference) | +0.82 ± 0.05 (40/40) | +0.41 ± 0.09 (30/40) | 0.26 |
+
+- **A consistent target removes the flip, but every replay variant still leaves the critic worse than TD alone,** most of all on centring.
+- **The remaining fault is what memory keeps, not the target.** Eviction keeps moments by their outcome, and 92% of remembered moments preceded a meal. Replay therefore learns what a moment is worth *given that a meal followed*. An off-axis sighting that the agent then turned into a meal looks as good as a centred one, and the in-view advantage shrinks as well. Among remembered moments the true in-view advantage is +0.43 meals; among lived moments it is +1.60. Replaying that sample more faithfully cannot recover a difference the sample no longer contains.

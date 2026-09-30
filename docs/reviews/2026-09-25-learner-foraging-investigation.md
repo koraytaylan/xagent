@@ -916,3 +916,30 @@ The scratch build switches off one part of the critic's update at a time, with t
 - **Neither the death penalty nor the urgency weighting causes the flip.** Removing the death penalty makes it worse. Removing the urgency weighting only shrinks everything, the true lesson included.
 - **Replay still roughly doubles how much the agents eat (166 against 83 meals),** even while it teaches the critic the wrong sign. Its benefit to behaviour comes from something other than a correct value of food.
 - **Even without replay the critic captures only a sixth of the in-view lesson** (+0.24 of +1.3) and almost none of the centring lesson (+0.07 of +0.66).
+
+## Why replay teaches the wrong sign
+
+A scratch harness logged whole lives with the steadiest encoder (T = 300; 300k ticks, seeds 5–8, 40 agents). It recorded:
+
+- every salient tick, classified by cause;
+- memory snapshots every 30k ticks;
+- replay's target for every moment: the discounted salient rewards in the eight brain ticks that follow it.
+
+Memory keys matched the log exactly (cosine 1.000), and the stored returns equalled the recomputed targets. An offline replica of the critic's update ran on each logged life. It tracks the GPU critic: a late in-view gap of −2.4 ± 0.7 meals, against −2.6 ± 0.7 on the GPU. Without the critical period the encoder moves under the logged keys and the replica drifts, so this section uses the T = 300 arm.
+
+**The target is not wrong.**
+- Every positive salient tick is a meal (154 per agent). The only negative ones are hazard damage (6 per agent). No sudden energy losses occur near food.
+- Memory keeps almost only moments before a meal: 48% of it is food in view (2.4% of lived moments), 92% has a positive return and none a negative one.
+- Replay's target values food in view above the rest: +0.83 meals over all moments and +0.16 among remembered ones. The true returns give +1.60 and +0.43.
+- A value fitted to replay's target on memory alone would rank food in view correctly on every lived moment (+1.27 meals; the ideal TD value gives +0.89).
+
+**The flip comes from how replay and TD share the critic.** Offline replica, late in-view gap in meals (agents positive):
+
+| Update | In view − not |
+|---|---|
+| TD only | +0.19 ± 0.17 (33/40) |
+| TD + replay, as shipped | −2.37 ± 0.66 (16/40) |
+| TD + replay at a tenth of the rate | −2.36 ± 0.68 (19/40) |
+| TD + replay that also moves the bias | −0.06 ± 0.35 (29/40) |
+
+Replay moves only the weights, never the bias. It teaches them that nearly every remembered moment is worth about two meals, because its target counts the coming meal but not the steady drain, and memory holds almost nothing else. TD shares those weights and must pull lived moments back to their true value. The tug of war leaves food in view valued below the rest. Slowing replay tenfold changes nothing, so this is where the two updates settle, not a matter of step size. Letting replay move the bias as well removes most of the flip, but it is still no better than TD alone: replay's target still leaves out the drain that TD's target includes.

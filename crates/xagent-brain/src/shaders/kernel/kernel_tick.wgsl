@@ -675,7 +675,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     }
 
     settle_recent_moments_at_death(brain_base);
-    settle_scent_pathway_at_death(brain_base);
+    settle_turn_pathways_at_death(brain_base);
 
     // Reset TD transients: eligibility traces and the previous-state value
     // are episodic — credit must never leak across the death boundary.

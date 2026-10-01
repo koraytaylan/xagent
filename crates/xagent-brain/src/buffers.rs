@@ -199,6 +199,30 @@ pub const O_SCENT_WHITENED: usize = O_SCENT_COVARIANCE + 3;
 pub const O_SCENT_TURN_WEIGHTS: usize = O_SCENT_WHITENED + 2;
 /// Eligibility traces of the scent turn weights; episodic, zeroed on death.
 pub const O_TRACE_SCENT: usize = O_SCENT_TURN_WEIGHTS + 2;
+/// Inputs of the visual pathway to the turn policy: mean adapted red,
+/// green, blue and depth over the left half of the field, then the right
+/// (`VISION_PATHWAY_INPUTS` in `common.wgsl`).
+pub const VISION_PATHWAY_INPUTS: usize = 8;
+/// Running mean of the visual pathway's inputs. Survives death.
+pub const O_VISION_PATHWAY_MEAN: usize = O_TRACE_SCENT + 2;
+/// Running covariance of the visual pathway's inputs, row-major
+/// `VISION_PATHWAY_INPUTS²`. Survives death.
+pub const O_VISION_PATHWAY_COVARIANCE: usize = O_VISION_PATHWAY_MEAN + VISION_PATHWAY_INPUTS;
+/// The whitening matrix C^(−1/2), row-major, refreshed from the covariance
+/// every `VISION_WHITENING_REFRESH` brain ticks. Survives death.
+pub const O_VISION_PATHWAY_WHITENING: usize =
+    O_VISION_PATHWAY_COVARIANCE + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+/// This brain tick's whitened visual input.
+pub const O_VISION_PATHWAY_INPUT: usize =
+    O_VISION_PATHWAY_WHITENING + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+/// Turn weights on the whitened visual input. Heritable (part of the
+/// steering genome) and learned.
+pub const O_VISION_TURN_WEIGHTS: usize = O_VISION_PATHWAY_INPUT + VISION_PATHWAY_INPUTS;
+/// Eligibility traces of the visual turn weights; episodic.
+pub const O_TRACE_VISION: usize = O_VISION_TURN_WEIGHTS + VISION_PATHWAY_INPUTS;
+/// Starting variance of each visual pathway input (mirrors
+/// `VISION_PATHWAY_INITIAL_VARIANCE` in `common.wgsl`).
+pub const VISION_PATHWAY_INITIAL_VARIANCE: f32 = 1e-4;
 /// Starting variance of each nostril in the whitening covariance (mirrors
 /// `SCENT_INITIAL_VARIANCE` in `common.wgsl`).
 pub const SCENT_INITIAL_VARIANCE: f32 = 1e-4;
@@ -209,7 +233,7 @@ pub const RECENT_SETTLED: f32 = 2.0;
 /// Running mean of each sensory feature for sensory adaptation
 /// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
 /// slots, so it is the one layout-sized region after the fixed tail.
-pub const O_SENSORY_MEAN: usize = O_TRACE_SCENT + 2;
+pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
 pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
@@ -1003,6 +1027,16 @@ pub fn init_brain_state_for(
     let delta_scent_covariance = O_SCENT_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
     state[o_pred_ctx_wt + delta_scent_covariance] = SCENT_INITIAL_VARIANCE;
     state[o_pred_ctx_wt + delta_scent_covariance + 2] = SCENT_INITIAL_VARIANCE;
+    // The visual pathway's whitening starts from a small isotropic variance
+    // and the matching whitening matrix.
+    let delta_vision_covariance = O_VISION_PATHWAY_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_vision_whitening = O_VISION_PATHWAY_WHITENING - O_PREDICTOR_CONTEXT_WEIGHT;
+    for input in 0..VISION_PATHWAY_INPUTS {
+        let diagonal = input * VISION_PATHWAY_INPUTS + input;
+        state[o_pred_ctx_wt + delta_vision_covariance + diagonal] = VISION_PATHWAY_INITIAL_VARIANCE;
+        state[o_pred_ctx_wt + delta_vision_whitening + diagonal] =
+            1.0 / VISION_PATHWAY_INITIAL_VARIANCE.sqrt();
+    }
 
     state
 }
@@ -1184,7 +1218,8 @@ mod tests {
         assert_eq!(O_TURN_NOISE, O_SALIENCE_LABEL + 1);
         assert_eq!(O_RECENT_KEYS, O_TURN_NOISE + 1);
         assert_eq!(O_SCENT_MEAN, O_RECENT_NORMS + RECENT_CAP);
-        assert_eq!(O_SENSORY_MEAN, O_TRACE_SCENT + 2);
+        assert_eq!(O_VISION_PATHWAY_MEAN, O_TRACE_SCENT + 2);
+        assert_eq!(O_SENSORY_MEAN, O_TRACE_VISION + VISION_PATHWAY_INPUTS);
         assert_eq!(BRAIN_STRIDE, O_SENSORY_MEAN + FEATURE_COUNT);
     }
 

@@ -323,7 +323,20 @@ override O_SCENT_COVARIANCE: u32 = O_SCENT_MEAN + 2u;
 override O_SCENT_WHITENED: u32 = O_SCENT_COVARIANCE + 3u;
 override O_SCENT_TURN_WEIGHTS: u32 = O_SCENT_WHITENED + 2u;
 override O_TRACE_SCENT: u32 = O_SCENT_TURN_WEIGHTS + 2u;
-override O_SENSORY_MEAN: u32 = O_TRACE_SCENT + 2u;
+// The visual pathway to the turn policy: the left and right halves of the
+// adapted visual field (red, green, blue, depth each), centred and whitened by
+// their running mean and covariance, read by learned turn weights. The
+// statistics and whitening matrix survive death; the traces do not. See
+// `vision_pathway_step`.
+override O_VISION_PATHWAY_MEAN: u32 = O_TRACE_SCENT + 2u;
+override O_VISION_PATHWAY_COVARIANCE: u32 = O_VISION_PATHWAY_MEAN + VISION_PATHWAY_INPUTS;
+override O_VISION_PATHWAY_WHITENING: u32 =
+    O_VISION_PATHWAY_COVARIANCE + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+override O_VISION_PATHWAY_INPUT: u32 =
+    O_VISION_PATHWAY_WHITENING + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+override O_VISION_TURN_WEIGHTS: u32 = O_VISION_PATHWAY_INPUT + VISION_PATHWAY_INPUTS;
+override O_TRACE_VISION: u32 = O_VISION_TURN_WEIGHTS + VISION_PATHWAY_INPUTS;
+override O_SENSORY_MEAN: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
@@ -577,6 +590,21 @@ const SCENT_WHITENING_RATE: f32 = 0.01;
 // buffers.rs), and the floor on the covariance's eigenvalues.
 const SCENT_INITIAL_VARIANCE: f32 = 1e-4;
 const SCENT_EIGEN_FLOOR: f32 = 1e-8;
+// Visual pathway: mean adapted red, green, blue and depth over each half of
+// the field (mirrors VISION_PATHWAY_INPUTS in buffers.rs).
+const VISION_PATHWAY_CHANNELS: u32 = 4u;
+const VISION_PATHWAY_INPUTS: u32 = 2u * VISION_PATHWAY_CHANNELS;
+// Rate of the running mean and covariance, and how often (in brain ticks)
+// the whitening matrix is recomputed from the covariance: the statistics move
+// at 1% per tick, so a refresh every 20 ticks loses nothing measurable.
+const VISION_PATHWAY_RATE: f32 = 0.01;
+const VISION_WHITENING_REFRESH: u32 = 20u;
+// Starting variance (mirrors VISION_PATHWAY_INITIAL_VARIANCE in buffers.rs).
+const VISION_PATHWAY_INITIAL_VARIANCE: f32 = 1e-4;
+// Jacobi sweeps for the 8×8 eigen-decomposition, and the eigenvalue floor
+// relative to the mean eigenvalue.
+const JACOBI_SWEEPS: u32 = 12u;
+const WHITENING_RELATIVE_FLOOR: f32 = 1e-6;
 
 // Whiten a centred 2-nostril scent by the covariance [a, b, c] =
 // [left², left·right, right²]: rotate onto the covariance's eigenvectors,
@@ -829,18 +857,93 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 // the end of the life is its last outcome, the terminal lesson discounted by
 // the moment's age at the life's last brain tick, with no state left to
 // bootstrap from. Single-threaded: called from the death paths.
-// Death's terminal lesson reaches the smell pathway's turn weights through
-// their traces, as it does the other channels, and the traces are cleared.
-// Single-threaded: called from the death paths.
-fn settle_scent_pathway_at_death(brain_base: u32) {
-    if (steering_weights_learn()) {
-        for (var k = 0u; k < 2u; k++) {
+// Death's terminal lesson reaches the smell and visual pathways' turn weights
+// through their traces, as it does the other channels, and the traces are
+// cleared. Single-threaded: called from the death paths.
+fn settle_turn_pathways_at_death(brain_base: u32) {
+    let learns = steering_weights_learn();
+    for (var k = 0u; k < 2u; k++) {
+        if (learns) {
             brain_state[brain_base + O_SCENT_TURN_WEIGHTS + k] += ACTION_WEIGHT_LEARNING_RATE
                 * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_SCENT + k];
         }
+        brain_state[brain_base + O_TRACE_SCENT + k] = 0.0;
     }
-    brain_state[brain_base + O_TRACE_SCENT] = 0.0;
-    brain_state[brain_base + O_TRACE_SCENT + 1u] = 0.0;
+    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+        if (learns) {
+            brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] += ACTION_WEIGHT_LEARNING_RATE
+                * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_VISION + k];
+        }
+        brain_state[brain_base + O_TRACE_VISION + k] = 0.0;
+    }
+}
+
+// Recompute the visual pathway's whitening matrix C^(−1/2) from its running
+// covariance: cyclic Jacobi eigen-decomposition of the symmetric 8×8 matrix,
+// eigenvalues floored relative to their mean, W = V · diag(1/√λ) · Vᵀ (the
+// symmetric, ZCA whitening, which keeps each input closest to its own axis so
+// learned and inherited weights keep their meaning). Single-threaded.
+fn refresh_vision_whitening(brain_base: u32) {
+    var a: array<array<f32, 8>, 8>;
+    var v: array<array<f32, 8>, 8>;
+    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
+        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
+            a[i][j] = brain_state[brain_base + O_VISION_PATHWAY_COVARIANCE + i * VISION_PATHWAY_INPUTS + j];
+            v[i][j] = select(0.0, 1.0, i == j);
+        }
+    }
+    for (var sweep = 0u; sweep < JACOBI_SWEEPS; sweep++) {
+        var off = 0.0;
+        for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
+            for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
+                off += a[p][q] * a[p][q];
+            }
+        }
+        if (off < 1e-30) { break; }
+        for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
+            for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
+                let apq = a[p][q];
+                if (abs(apq) < 1e-30) { continue; }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * apq);
+                var t = sign(theta) / (abs(theta) + sqrt(theta * theta + 1.0));
+                if (theta == 0.0) { t = 1.0; }
+                let c = 1.0 / sqrt(t * t + 1.0);
+                let s = t * c;
+                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                    let akp = a[k][p];
+                    let akq = a[k][q];
+                    a[k][p] = c * akp - s * akq;
+                    a[k][q] = s * akp + c * akq;
+                }
+                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                    let apk = a[p][k];
+                    let aqk = a[q][k];
+                    a[p][k] = c * apk - s * aqk;
+                    a[q][k] = s * apk + c * aqk;
+                }
+                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                    let vkp = v[k][p];
+                    let vkq = v[k][q];
+                    v[k][p] = c * vkp - s * vkq;
+                    v[k][q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    var trace = 0.0;
+    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+        trace += a[k][k];
+    }
+    let floor_value = WHITENING_RELATIVE_FLOOR * trace / f32(VISION_PATHWAY_INPUTS) + 1e-14;
+    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
+        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
+            var w = 0.0;
+            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                w += v[i][k] * v[j][k] / sqrt(max(a[k][k], floor_value));
+            }
+            brain_state[brain_base + O_VISION_PATHWAY_WHITENING + i * VISION_PATHWAY_INPUTS + j] = w;
+        }
+    }
 }
 
 fn settle_recent_moments_at_death(brain_base: u32) {

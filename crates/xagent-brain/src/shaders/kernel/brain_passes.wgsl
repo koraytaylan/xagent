@@ -878,6 +878,70 @@ fn coop_sensory_adapt(agent_id: u32, tid: u32) {
     }
 }
 
+// The visual pathway's raw input: mean adapted red, green, blue and depth
+// over the left half of the field (the first VISION_W / 2 columns, matching
+// the left nostril's side), then the right half. Reads the adapted visual
+// block of s_features (raw vision layout; the cortex layout has no rays).
+fn vision_hemifields() -> array<f32, 8> {
+    var out: array<f32, 8>;
+    let half = VISION_W / 2u;
+    let left_count = f32(half * VISION_H);
+    let right_count = f32((VISION_W - half) * VISION_H);
+    for (var row = 0u; row < VISION_H; row++) {
+        for (var col = 0u; col < VISION_W; col++) {
+            let ray = row * VISION_W + col;
+            let right = col >= half;
+            let side = select(0u, VISION_PATHWAY_CHANNELS, right);
+            let count = select(left_count, right_count, right);
+            out[side] += s_features[ray * 4u] / count;
+            out[side + 1u] += s_features[ray * 4u + 1u] / count;
+            out[side + 2u] += s_features[ray * 4u + 2u] / count;
+            out[side + 3u] += s_features[VISION_COLOR_COUNT + ray] / count;
+        }
+    }
+    return out;
+}
+
+// One brain tick of the visual pathway (thread 0): refresh the whitening
+// matrix on schedule, whiten the centred hemifields with it, store the
+// result, and fold the new input into the running mean and covariance.
+// Returns the turn contribution, weights · whitened input. With the visual
+// cortex on there are no rays to pool, so the pathway stays silent.
+fn vision_pathway_step(brain_base: u32, tick: f32, cortex_on: bool) -> f32 {
+    if (cortex_on) {
+        for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+            brain_state[brain_base + O_VISION_PATHWAY_INPUT + k] = 0.0;
+        }
+        return 0.0;
+    }
+    if (u32(tick) % VISION_WHITENING_REFRESH == 0u) {
+        refresh_vision_whitening(brain_base);
+    }
+    let raw = vision_hemifields();
+    var centred: array<f32, 8>;
+    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+        centred[k] = raw[k] - brain_state[brain_base + O_VISION_PATHWAY_MEAN + k];
+    }
+    var turn = 0.0;
+    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
+        var whitened = 0.0;
+        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
+            whitened += brain_state[brain_base + O_VISION_PATHWAY_WHITENING + i * VISION_PATHWAY_INPUTS + j]
+                * centred[j];
+        }
+        brain_state[brain_base + O_VISION_PATHWAY_INPUT + i] = whitened;
+        turn += brain_state[brain_base + O_VISION_TURN_WEIGHTS + i] * whitened;
+    }
+    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
+        brain_state[brain_base + O_VISION_PATHWAY_MEAN + i] += VISION_PATHWAY_RATE * centred[i];
+        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
+            let slot = brain_base + O_VISION_PATHWAY_COVARIANCE + i * VISION_PATHWAY_INPUTS + j;
+            brain_state[slot] += VISION_PATHWAY_RATE * (centred[i] * centred[j] - brain_state[slot]);
+        }
+    }
+    return turn;
+}
+
 fn coop_encode(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let output_in_tile = tid / DENSE_INNER_LANES;   // 0..63
@@ -1428,6 +1492,20 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 }
                 brain_state[brain_base + O_SCENT_TURN_WEIGHTS] = scent_weights.x;
                 brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] = scent_weights.y;
+                // Visual pathway weights, the same way.
+                var vision_norm_sq = 0.0;
+                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                    let slot = brain_base + O_VISION_TURN_WEIGHTS + k;
+                    brain_state[slot] += ACTION_WEIGHT_LEARNING_RATE * td_error
+                        * brain_state[brain_base + O_TRACE_VISION + k];
+                    vision_norm_sq += brain_state[slot] * brain_state[slot];
+                }
+                let vision_norm = sqrt(vision_norm_sq);
+                if (vision_norm > MAX_WEIGHT_NORM) {
+                    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                        brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] *= MAX_WEIGHT_NORM / vision_norm;
+                    }
+                }
             }
         }
         workgroupBarrier();
@@ -1631,11 +1709,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         brain_state[brain_base + O_SCENT_COVARIANCE + 2u] = next_scent_covariance.z;
         let scent_dot = brain_state[brain_base + O_SCENT_TURN_WEIGHTS] * scent_whitened.x
             + brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] * scent_whitened.y;
+        // Visual pathway: the two halves of the adapted field, whitened.
+        let vision_dot = vision_pathway_step(
+            brain_base, brain_state[brain_base + O_TICK_COUNT], visual_cortex_on);
 
         // Policy evaluation: forward bias plus dot product; the turn channel
         // has no bias, so it can only turn in response to what it senses.
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
-        var turn: f32 = s_turn_dot + scent_dot;
+        var turn: f32 = s_turn_dot + scent_dot + vision_dot;
 
         // Memory blend: recalled experiences influence motor output via valence.
         // Positive valence (food memory) + similar state → reproduce approach action.
@@ -1857,6 +1938,18 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 brain_state[brain_base + O_TRACE_SCENT] * trace_decay + scent_term.x;
             brain_state[brain_base + O_TRACE_SCENT + 1u] =
                 brain_state[brain_base + O_TRACE_SCENT + 1u] * trace_decay + scent_term.y;
+            // Visual pathway trace, the same way.
+            var vision_sq = 0.0;
+            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                let input = brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
+                vision_sq += input * input;
+            }
+            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                let input = brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
+                let slot = brain_base + O_TRACE_VISION + k;
+                brain_state[slot] = brain_state[slot] * trace_decay
+                    + s_explore[2u] * input / (1.0 + vision_sq);
+            }
         }
     }
 }

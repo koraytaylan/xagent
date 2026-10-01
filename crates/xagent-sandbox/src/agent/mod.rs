@@ -17,7 +17,8 @@ use xagent_brain::buffers::{
     feature_count_for_brain_stride, init_brain_state_for, init_pattern_memory,
     seed_instinct_patterns, AgentBrainState, BrainLayout, ENCODED_DIMENSION, MAX_WEIGHT_NORM,
     O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT,
-    PREDICTOR_DIMENSION,
+    O_SCENT_TURN_WEIGHTS, O_VISION_TURN_WEIGHTS, PREDICTOR_DIMENSION, SCENT_CHANNELS,
+    VISION_PATHWAY_INPUTS,
 };
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
@@ -446,6 +447,8 @@ struct BrainWeightOffsets {
     predictor_weights: usize,
     forward_weights: usize,
     turn_weights: usize,
+    scent_turn_weights: usize,
+    vision_turn_weights: usize,
 }
 
 fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
@@ -456,8 +459,13 @@ fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
     let forward_weights =
         predictor_context + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
     let turn_weights = predictor_context + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let scent_turn_weights =
+        predictor_context + (O_SCENT_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let vision_turn_weights =
+        predictor_context + (O_VISION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
     assert!(
-        turn_weights + ENCODED_DIMENSION <= state.brain_state.len(),
+        turn_weights + ENCODED_DIMENSION <= state.brain_state.len()
+            && vision_turn_weights + VISION_PATHWAY_INPUTS <= state.brain_state.len(),
         "computed offsets exceed brain_state bounds"
     );
     BrainWeightOffsets {
@@ -465,20 +473,27 @@ fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
         predictor_weights,
         forward_weights,
         turn_weights,
+        scent_turn_weights,
+        vision_turn_weights,
     }
 }
 
 /// Scale the turn-weight vector into the shader's L2 ball so the first brain
 /// tick does not change the genome by rescaling it.
 fn rescale_turn_weights(state: &mut [f32], turn_weights: usize) {
+    rescale_into_ball(state, turn_weights, ENCODED_DIMENSION);
+}
+
+/// Scale `len` weights starting at `start` into the shader's L2 ball.
+fn rescale_into_ball(state: &mut [f32], start: usize, len: usize) {
     let mut norm_sq = 0.0_f32;
-    for weight in state.iter().skip(turn_weights).take(ENCODED_DIMENSION) {
+    for weight in state.iter().skip(start).take(len) {
         norm_sq += weight * weight;
     }
     let norm = norm_sq.sqrt();
     if norm > MAX_WEIGHT_NORM {
         let scale = MAX_WEIGHT_NORM / norm;
-        for weight in state.iter_mut().skip(turn_weights).take(ENCODED_DIMENSION) {
+        for weight in state.iter_mut().skip(start).take(len) {
             *weight *= scale;
         }
     }
@@ -504,10 +519,14 @@ pub fn fresh_brain_state(config: &BrainConfig, rng: &mut impl Rng) -> AgentBrain
     }
 }
 
-/// Perturb the turn-policy weights. Encoder, forward-policy, predictor, and
-/// value weights are copied unchanged: those are not the genome evolution
-/// scores. The turn channel has no bias to perturb: a bias turns the same way
-/// in every scene, which is a spin, not steering.
+/// Perturb the turn-policy weights: the encoding's turn weights and the
+/// smell and visual pathways' turn weights, each kept in the shader's L2 ball.
+/// The pathway weights make steering heritable: offspring are born with them,
+/// so evolution can build in what lifetime learning would otherwise rediscover
+/// every life. Encoder, forward-policy, predictor, and value weights are
+/// copied unchanged: those are not the genome evolution scores. The turn
+/// channel has no bias to perturb: a bias turns the same way in every scene,
+/// which is a spin, not steering.
 pub fn mutate_steering_weights(
     state: &AgentBrainState,
     strength: f32,
@@ -522,6 +541,18 @@ pub fn mutate_steering_weights(
         }
     }
     rescale_turn_weights(&mut mutated.brain_state, offsets.turn_weights);
+    for (start, len) in [
+        (offsets.scent_turn_weights, SCENT_CHANNELS),
+        (offsets.vision_turn_weights, VISION_PATHWAY_INPUTS),
+    ] {
+        for index in 0..len {
+            if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
+                let kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
+                mutated.brain_state[start + index] += kick;
+            }
+        }
+        rescale_into_ball(&mut mutated.brain_state, start, len);
+    }
     mutated
 }
 
@@ -1105,6 +1136,15 @@ mod tests {
                 != state.brain_state[O_ACTION_TURN_WEIGHTS + index]
         });
         assert!(turn_moved, "a steering mutant must change the turn weights");
+        // The smell and visual pathways' turn weights are part of the genome.
+        let pathway_moved = (0..SCENT_CHANNELS)
+            .map(|index| O_SCENT_TURN_WEIGHTS + index)
+            .chain((0..VISION_PATHWAY_INPUTS).map(|index| O_VISION_TURN_WEIGHTS + index))
+            .any(|slot| mutated.brain_state[slot] != state.brain_state[slot]);
+        assert!(
+            pathway_moved,
+            "a steering mutant must change the pathways' turn weights"
+        );
         assert_eq!(
             mutated.brain_state[O_ACT_BIASES + 1],
             state.brain_state[O_ACT_BIASES + 1],

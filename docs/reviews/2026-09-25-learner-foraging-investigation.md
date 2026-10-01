@@ -1360,3 +1360,30 @@ Scores are the correlation of the policy's turn output with the food's side over
 - **Sight works the same way as smell.** A turn policy that reads the two hemifields, whitened online, learns within a life to turn toward food in view, in 37 of 40 agents (+0.33).
 - **Fewer, balanced inputs learn better, at every step:** 8 hemifield inputs > 32 columns > 240 raw values > the 128-dimensional encoding. Whitening roughly doubles to triples what each input set learns.
 - **The pattern matches smell exactly.** Steering is learnable from the agent's own homeostatic signal when the steering cue reaches the turn policy through a few inputs whose differences vary as much as what they share.
+
+## Heritable pathway weights, the visual pathway, and the danger measurement
+
+Three changes, measured in headless evolution (`evo_vs1.json`, seeds 5–8, 20 generations, 40k ticks each):
+
+- **The visual pathway, ported.** The turn policy reads the whitened hemifields (left and right means of red, green, blue and depth) through eight learned weights. They use the smell pathway's credit. The whitening matrix is C^(−1/2) of the running 8×8 covariance, recomputed by Jacobi every 20 brain ticks.
+- **Heritable pathway weights.** Evolution now perturbs the smell and visual pathway weights along with the turn-policy weights. Under birth-brain inheritance, both pathways had been born at zero in every generation, so selection had nothing in them to act on.
+- **A fixed danger measurement.** The kernel measured the nearest danger only when the brain was given the danger percept, which is off by default. The avoidance-intent counters then read a stale distance of 0 with a bearing of 0: every tick counted as in range, none as a turn away, and avoidance intent read 0 whatever the agents did. The measurement now always runs, as the observer's. The brain still never sees it, so hazard ground can only be learned from homeostasis.
+
+| | Smell pathway | + visual pathway | + heritable pathway weights (2 × 4 runs) |
+|---|---|---|---|
+| Mean fitness | 0.0581 | 0.0600 | **0.112 / 0.120** |
+| First 5 → last 5 generations | 0.0578 → 0.0574 | 0.0615 → 0.0583 | **0.075 → 0.138 / 0.098 → 0.140** |
+| Runs whose last 5 beat their first 5 | 2 / 4 | 0 / 4 | **8 / 8** |
+| Accepted generations | 3.3 | 2.0 | 7.5 / 6.0 |
+| Best score | 0.0646 | 0.0653 | 0.185 / 0.183 |
+| Meals per agent per generation | 21.5 | 22.3 | 30.9 / 34.0 |
+| Deaths per agent per generation | 6.94 | 6.67 | 3.11 / 3.12 |
+| Share of distance travelled on hazard ground | 26.5% | 26.1% | 12.9% / 14.6% |
+| Avoidance intent (turns away from danger within 30 units) | 0.514 | — | 0.519 |
+| Approach intent (turns toward food within 30 units) | 0.497 | 0.497 | 0.513 / 0.524 |
+
+The smell-pathway column and the second heritable batch carry the fixed danger measurement. The other runs predate it, so they have no avoidance intent. GPU runs are not bit-reproducible, so the two heritable batches differ by run-to-run variation.
+
+- **Evolution finally climbs.** With the pathway weights heritable, the last five generations beat the first five in all 8 runs. Fitness doubles, meals rise by half, and deaths halve. Without heritability, the visual pathway adds nothing (0.0600 against 0.0581), and the smell pathway had added only 6%. What one life teaches is not passed on, so every generation starts again from zero.
+- **What evolved is chemotaxis.** In 3 of the 4 seeds of the second batch, the champion's smell weights are negative on the left nostril and positive on the right: turn toward the stronger side. The fourth (seed 5) has only the right one positive. The visual weights follow no pattern shared across seeds, so steering by sight has not been selected yet.
+- **Agents spend half as long on hazard ground, but they do not turn away from it.** Avoidance intent stays at chance (0.519). Food grows only on food-rich ground, the opposite end of the biome noise from hazard. Agents that follow scent therefore stay near food and away from hazards without ever reacting to them. Learned danger avoidance, where an agent turns away from red ground because its integrity fell there, is still missing.

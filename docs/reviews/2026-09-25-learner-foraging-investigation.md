@@ -1273,3 +1273,29 @@ The same offline rebuild tried a turn policy that reads the two nostrils directl
 - **The policy still barely steers, because what the nostrils share drowns what tells them apart.** Overall odour strength varies about thirty times more than the right − left difference. The rule's step along each direction scales with that direction's variation, so the shared weight random-walks thirty times faster than the difference weight drifts. Turning then follows how strong the smell is, not which side it comes from. Adapting each nostril to its running mean helps a little; feeding the nostrils in beside the encoding dilutes them again.
 
 So the limit is not only how many inputs there are but how unequal their variation is. The informative directions — the nostrils' difference, food's side in view — have small variance next to what they share with the rest of the input, and a learning rule whose step scales with input size learns along them slowest.
+
+## Normalising and whitening the turn policy's input
+
+The same offline rebuild tried transforms that equalise how much each input direction varies, so that the rule's step no longer favours the shared component. Setup: smell strength 1, 300k-tick lives, seeds 5–8, 40 agents. All variants are credited with the fresh noise innovation.
+
+- **Divisive normalisation:** each nostril divided by the pooled odour, plus a semi-saturation constant of 0.01; optionally adapted to its running mean.
+- **Online whitening:** a running mean and covariance of the two nostrils (rate 0.01 per brain tick), with the input transformed by C^(−1/2).
+- **Preconditioned (the best case for whitening):** the rule's summed update over the first 70% of the life, multiplied by the inverse input covariance (a natural-gradient step), scored on the last 30%.
+
+| Turn policy input | Turns toward food: corr | Agents positive | Agents above 0.2 |
+|---|---|---|---|
+| encoding, the GPU's rule (reference) | +0.008 ± 0.003 | 24/40 | 0 |
+| raw nostrils | −0.013 ± 0.009 | 15/40 | 0 |
+| adapted nostrils | +0.021 ± 0.010 | 26/40 | 1 |
+| nostrils, divisive normalisation | +0.138 ± 0.025 | 33/40 | 14 |
+| nostrils, divisive normalisation, adapted | +0.137 ± 0.022 | 33/40 | 12 |
+| **nostrils, whitened online** | **+0.414 ± 0.034** | **39/40** | **36** |
+| nostrils, preconditioned | +0.538 ± 0.028 | 39/40 | 38 |
+| encoding, preconditioned | +0.048 ± 0.008 | 34/40 | 0 |
+| encoding + nostrils, preconditioned | +0.086 ± 0.010 | 38/40 | 3 |
+
+- **Whitening the nostrils makes the turn policy steer by smell within one life,** for the first time in this investigation: correlation +0.41 with the food's side, positive in 39 of 40 agents. The online version comes close to the best case (+0.54).
+- **Divisive normalisation helps, but a third as much.** Dividing by the pooled odour removes overall strength, but the left–right balance it leaves is still small next to the remaining variation.
+- **Whitening does not rescue the 128-dimensional encoding.** Even preconditioned, the encoding route stays near zero (+0.05), and adding the nostrils to it gives only +0.09. Estimating one good direction among 128 from credit this noisy needs far more than one life.
+
+So steering by smell is learnable from the agent's own homeostatic signal. It takes a low-dimensional input in which the left–right difference varies as much as the shared part. The encoding the turn policy reads today is neither.

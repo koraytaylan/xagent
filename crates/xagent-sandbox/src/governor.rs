@@ -25,7 +25,7 @@ struct RecordingPayload {
     data: Vec<u8>,
 }
 
-use crate::agent::{Agent, HEATMAP_RES};
+use crate::agent::{mutate_sensory_genes, Agent, HEATMAP_RES};
 
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
@@ -78,6 +78,9 @@ const DEATH_PENALTY: f32 = 0.5;
 /// Foraging is the primary objective; exploration is a smaller secondary term.
 const FORAGING_WEIGHT: f32 = 0.85;
 const EXPLORATION_WEIGHT: f32 = 0.15;
+/// Ceiling the adaptive mutation strength ramps toward as failed attempts at
+/// one spawn parent approach the patience limit.
+const MAX_MUTATION_STRENGTH: f32 = 0.5;
 
 /// Recording format version 1: legacy format with implicit 15-float stride.
 #[allow(dead_code)]
@@ -378,9 +381,11 @@ struct Island {
 /// a fresh patience budget. If the island is already at root, attempts
 /// reset and exploration continues with the root as spawn parent.
 ///
-/// Every agent in the next generation receives the spawn parent's `BrainConfig`.
-/// The variation selection scores is the turn-policy genome, mutated when the
-/// brains are uploaded, with a mutation strength that grows as an island
+/// The next generation's first group of `eval_repeats` agents receives the
+/// spawn parent's `BrainConfig`; every later group shares one mutation of the
+/// heritable sensory genes (angles of view, smell strength). The variation
+/// selection scores is those genes plus the turn-policy genome, mutated when
+/// the brains are uploaded, with a mutation strength that grows as an island
 /// exhausts its patience.
 pub struct Governor {
     pub db: Connection,
@@ -1169,15 +1174,9 @@ impl Governor {
             self.active_island = (self.active_island + 1) % self.islands.len();
         }
 
-        // Compute effective mutation strength for neuroevolution weight perturbation.
-        // This mirrors the adaptive strength calculation inside breed_next_generation().
-        let effective_strength = {
-            let attempts = self.islands[self.active_island].attempts;
-            let base = self.config.mutation_strength;
-            let max_strength = 0.5_f32;
-            let patience = self.config.patience.max(1) as f32;
-            base + (max_strength - base) * (attempts as f32 / patience).min(1.0)
-        };
+        // Effective mutation strength for the steering-weight perturbation;
+        // breed_next_generation() uses the same strength for the sensory genes.
+        let effective_strength = self.adaptive_mutation_strength();
 
         // Breed the next generation from the (now-rotated) island's spawn parent
         let inherit_from_node = self.islands[self.active_island].spawn_parent_id;
@@ -1339,14 +1338,18 @@ impl Governor {
     }
 
     /// Create the next generation node as a child of `spawn_parent_id`.
-    /// Increments the parent's spawn_attempts and returns one copy of the
-    /// spawn parent's config per population slot. Steering weights, not these
-    /// config fields, are what the generation varies.
+    /// Increments the parent's spawn_attempts and returns one config per
+    /// population slot. The first group of `eval_repeats` slots keeps the
+    /// spawn parent's config; every later group shares one mutation of the
+    /// heritable sensory genes (angles of view, smell strength). Those genes
+    /// and each group's steering weights are what the generation varies; the
+    /// accepted generation's best group becomes the node's config.
     fn breed_next_generation(&mut self, _fitness: &[AgentFitness]) -> Vec<BrainConfig> {
         let spawn_parent = match self.islands[self.active_island].spawn_parent_id {
             Some(id) => id,
             None => return Vec::new(),
         };
+        let strength = self.adaptive_mutation_strength();
 
         let parent_config = match self.db.query_row(
             "SELECT config_json FROM node WHERE id = ?1",
@@ -1358,8 +1361,8 @@ impl Governor {
         };
 
         self.generation += 1;
-        // The node's config is the spawn parent's config. Every offspring is
-        // evaluated with that same config; the turn-policy genome is what varies.
+        // The node starts with the spawn parent's config; if the generation is
+        // accepted, `advance` replaces it with the best group's config.
         let config_json = serde_json::to_string(&parent_config).unwrap_or_default();
         let _ = self.db.execute(
             "INSERT INTO node (run_id, parent_id, generation, config_json, status, island_id)
@@ -1385,21 +1388,43 @@ impl Governor {
             params![spawn_parent],
         );
 
-        // Offspring carry the parent's config unchanged, so this writes no rows.
+        // One config per group of `eval_repeats` agents, which also share a
+        // steering genome. Population stays small because the agents share
+        // one world and compete for finite food.
         let parent_fitness = self.spawn_parent_fitness();
-        record_mutations(
-            &self.db,
-            new_node_id,
-            &parent_config,
-            &parent_config,
-            parent_fitness,
-        );
+        let group_size = self.config.eval_repeats.max(1);
+        let mut rng = rand::rng();
+        let mut configs = Vec::with_capacity(self.config.population_size);
+        let mut group_config = parent_config.clone();
+        for slot in 0..self.config.population_size {
+            if slot > 0 && slot % group_size == 0 {
+                group_config = mutate_sensory_genes(
+                    &parent_config,
+                    strength,
+                    &self.momentums[self.active_island],
+                    &mut rng,
+                );
+                record_mutations(
+                    &self.db,
+                    new_node_id,
+                    &parent_config,
+                    &group_config,
+                    parent_fitness,
+                );
+            }
+            configs.push(group_config.clone());
+        }
+        configs
+    }
 
-        // One config, repeated. `eval_repeats` still groups agents for fitness
-        // averaging; the worker assigns one steering genome per group.
-        // Population stays small because the agents share one world and compete
-        // for finite food.
-        vec![parent_config; self.config.population_size]
+    /// Mutation strength for this island's next generation: the base
+    /// strength, ramped toward `MAX_MUTATION_STRENGTH` as failed attempts at
+    /// the current spawn parent approach the patience limit.
+    fn adaptive_mutation_strength(&self) -> f32 {
+        let attempts = self.islands[self.active_island].attempts;
+        let base = self.config.mutation_strength;
+        let patience = self.config.patience.max(1) as f32;
+        base + (MAX_MUTATION_STRENGTH - base) * (attempts as f32 / patience).min(1.0)
     }
 
     /// Persist best_score, spawn_parent_id, and momentum for resume.
@@ -3720,8 +3745,12 @@ mod tests {
         );
     }
 
+    /// The champion's group keeps the spawn parent's config exactly; every
+    /// other group varies only the heritable sensory genes, so evolution can
+    /// select the angles of view and smell strength without drifting the rest
+    /// of the config.
     #[test]
-    fn champion_is_unmutated() {
+    fn champion_is_unmutated_and_others_vary_only_sensory_genes() {
         let mut gov = test_governor(5);
 
         // Gen 0: success — root becomes spawn parent
@@ -3742,7 +3771,30 @@ mod tests {
         // Breed next generation
         let configs = gov.breed_next_generation(&mock_fitness(0.05));
 
-        assert!(configs.iter().all(|config| config == &parent_config));
+        assert_eq!(
+            configs[0], parent_config,
+            "the champion's slot must be unmutated"
+        );
+        for (slot, config) in configs.iter().enumerate().skip(1) {
+            let sensory_moved = config.horizontal_fov_degrees
+                != parent_config.horizontal_fov_degrees
+                || config.vertical_fov_degrees != parent_config.vertical_fov_degrees
+                || config.smell_strength != parent_config.smell_strength;
+            assert!(
+                sensory_moved,
+                "slot {slot} should carry mutated sensory genes"
+            );
+            let rest = BrainConfig {
+                horizontal_fov_degrees: parent_config.horizontal_fov_degrees,
+                vertical_fov_degrees: parent_config.vertical_fov_degrees,
+                smell_strength: parent_config.smell_strength,
+                ..config.clone()
+            };
+            assert_eq!(
+                rest, parent_config,
+                "slot {slot} changed a non-sensory field"
+            );
+        }
     }
 
     #[test]
@@ -4234,7 +4286,17 @@ mod tests {
                 pair_start,
                 pair_start + 1
             );
+            assert_eq!(
+                configs[pair_start],
+                configs[pair_start + 1],
+                "Agents {} and {} should share their sensory genes too",
+                pair_start,
+                pair_start + 1
+            );
         }
+        // Each later group carries its own sensory mutation.
+        assert_ne!(configs[0], configs[2]);
+        assert_ne!(configs[2], configs[4]);
     }
 
     #[test]

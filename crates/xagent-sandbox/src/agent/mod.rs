@@ -393,6 +393,41 @@ pub fn mutate_config_with_strength(
     mutate_config_with_strength_rng(parent, strength, momentum, &mut rng)
 }
 
+/// Perturb only the heritable sensory genes — the horizontal and vertical
+/// angles of view and the smell strength — with momentum, clamped to the
+/// bounds the vision and senses passes re-impose. Every other field is the
+/// parent's. These are the config genes evolution varies across repeat
+/// groups, alongside each group's steering genome.
+pub fn mutate_sensory_genes(
+    parent: &BrainConfig,
+    strength: f32,
+    momentum: &MutationMomentum,
+    rng: &mut impl Rng,
+) -> BrainConfig {
+    BrainConfig {
+        horizontal_fov_degrees: momentum
+            .biased_perturb_f(
+                rng,
+                parent.horizontal_fov_degrees,
+                "horizontal_fov_degrees",
+                strength,
+            )
+            .clamp(HORIZONTAL_FOV_MIN, HORIZONTAL_FOV_MAX),
+        vertical_fov_degrees: momentum
+            .biased_perturb_f(
+                rng,
+                parent.vertical_fov_degrees,
+                "vertical_fov_degrees",
+                strength,
+            )
+            .clamp(VERTICAL_FOV_MIN, VERTICAL_FOV_MAX),
+        smell_strength: momentum
+            .biased_perturb_f(rng, parent.smell_strength, "smell_strength", strength)
+            .clamp(SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX),
+        ..parent.clone()
+    }
+}
+
 /// Fraction of turn-policy weights a single steering mutant redraws.
 /// A quarter moves `w · encoded` enough for siblings to behave differently
 /// while most of an inherited steering map stays in place.

@@ -1165,3 +1165,46 @@ The idea is a capacity limit rather than a drive, like a motor whose torque fall
 - **Capacity changes nothing measurable,** in behaviour or in learning, even with only a tenth of the visual inputs always passing.
 - **Sensory adaptation already does the narrowing.** After adaptation the strongest deviations are what is new in view, food included, while the steady background is already near zero. Keeping only the strongest leaves the food's side exactly as readable (R² 0.61).
 - **The limit is still in the actors.** The steering credit is right-signed in nearly every agent, but the turn weights barely follow it (cos 0.055), and moving forward is still credited negatively.
+
+## Heritable angles of view and a sense of smell
+
+Three new heritable sensory genes:
+
+- **Horizontal and vertical angle of view** (seed 90° × 90°): the vision rays span them per agent.
+- **Smell strength** (seed 1): sensitivity of two nostrils, 0.5 units ahead of the body and 1 unit to either side.
+
+Each uneaten food item within 30 units adds exp(−d / 10) to a nostril's concentration C, and the nostril perceives 1 − exp(−strength · C). Breeding now gives every repeat group after the first its own mutation of the three genes; until now no config gene evolved, because every slot copied the parent's config.
+
+**Free runs** (300k ticks, seeds 5–8, 40 agents per arm). "Near" ticks are those with food within smelling range (30 units). "Toward" is the share of those ticks on which the turn command points at the nearest food.
+
+| | 90° view, no smell | 60° view | 150° view | Smell strength 1 | Smell strength 3 |
+|---|---|---|---|---|---|
+| Meals | 107 ± 6 | 103 ± 4 | **121 ± 5** | 100 ± 6 | 108 ± 5 |
+| Sightings | 210 | 154 | 301 | 201 | 210 |
+| Sightings that end in a meal | 45% | 55% | 36% | 43% | 45% |
+| Mean energy | 0.66 | 0.64 | 0.68 | 0.65 | 0.65 |
+| Share of ticks with food in smelling range | 90% | 90% | 88% | 89% | 89% |
+| Toward the nearest food (in smelling range) | 49.7% | 49.5% | 49.8% | 49.6% | 49.6% |
+
+| Learning signal (40 agents) | 90° view, no smell | 150° view | Smell strength 3 |
+|---|---|---|---|
+| Steering credit, food in view (agents positive) | +1.9e-3 (40/40) | +1.9e-3 (40/40) | +1.8e-3 (36/40) |
+| Steering credit, food in smelling range (agents positive) | +5.6e-4 (40/40) | +5.4e-4 (40/40) | +5.6e-4 (40/40) |
+| Turn-weight change vs food side (cos) | +0.046 | +0.059 | +0.053 |
+| Forward credit (agents positive) | −5.5e-5 (6/40) | −5.9e-5 (2/40) | −7.8e-5 (0/40) |
+
+**Headless evolution** (`evo_vs1`, 20 generations, seeds 5–8, 10 agents):
+
+| | Before (no sensory genes) | Genes present, not varied | Genes evolving |
+|---|---|---|---|
+| Mean fitness | 0.0555 | 0.0563 | 0.0555 |
+| First 5 → last 5 generations | 0.0562 → 0.0541 | 0.0559 → 0.0578 | 0.0566 → 0.0572 |
+| Best score | 0.0601 | 0.0615 | 0.0630 |
+| SD between genome means / from noise alone | 0.0066 / 0.0071 | 0.0060 / 0.0066 | 0.0067 / 0.0071 |
+
+The accepted champions' genes wander without a common direction. Seeds sampled horizontal views of 45–138° and smell strengths of 0.6–1.5. Accepted champions ranged from 64° to 105° and from 0.86 to 1.22.
+
+- **A wider view is the one sense that helps.** At 150°, agents come across food 43% more often and eat 13% more, although fewer sightings end in a meal. A 60° view loses as many sightings as it gains in conversion.
+- **Smell does not change behaviour yet.** Food is within smelling range on about 90% of ticks, but turning toward it stays at chance at either strength.
+- **The credit for turning toward food in smelling range is positive in every agent even without a nose.** The nose does not strengthen it. The turn policy, which reads the nostrils only through the learned encoding, does not pick up the side.
+- **Evolution cannot yet tell the genes apart.** Differences between genomes stay within evaluation noise, so the champions' angles of view and smell strengths drift at random rather than climbing.

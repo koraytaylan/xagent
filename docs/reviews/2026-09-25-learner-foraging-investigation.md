@@ -1208,3 +1208,31 @@ The accepted champions' genes wander without a common direction. Seeds sampled h
 - **Smell does not change behaviour yet.** Food is within smelling range on about 90% of ticks, but turning toward it stays at chance at either strength.
 - **The credit for turning toward food in smelling range is positive in every agent even without a nose.** The nose does not strengthen it. The turn policy, which reads the nostrils only through the learned encoding, does not pick up the side.
 - **Evolution cannot yet tell the genes apart.** Differences between genomes stay within evaluation noise, so the champions' angles of view and smell strengths drift at random rather than climbing.
+
+## Why smell does not help steering
+
+Smell gives the cleanest test of the steering problem, because its cue is just the difference between two inputs: right nostril minus left. A scratch harness followed that cue link by link through whole lives. Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm, current code. Ticks counted are those with food within smelling range (about 89% of all ticks). The learning signal is the credit the traces give each tick's executed turn noise, multiplied by the cue in question; t is per agent, over a life.
+
+| Link | No nose | Smell 1 | Smell 3 |
+|---|---|---|---|
+| Nostrils: corr(right − left, food side) | — | **0.64** | 0.52 |
+| Nostrils: R² of food side from the raw pair | — | 0.41 | 0.27 |
+| Encoding: R² of food side from the turn policy's input | 0.09 | **0.19** | 0.18 |
+| Encoding: R² of (right − left) from the turn policy's input | — | 0.37 | 0.47 |
+| Credit for turns toward the food: mean t (agents t > 2) | +5.6 (36/40) | +6.0 (35/40) | +6.3 (38/40) |
+| Learning signal along raw right − left: mean t (agents t > 2) | — | +6.1 (37/40) | +4.1 (34/40) |
+| Learning signal along the encoding's side readout: mean t (agents t > 2) | +5.5 (35/40) | +5.2 (31/40) | +5.2 (34/40) |
+| Turn-weight change along the side readout | +0.020 | **+0.010** | +0.011 |
+| Turn-weight change in all other directions | 0.41 | **0.42** | 0.45 |
+| Final policy: corr(turn output, food side) | +0.002 | +0.007 | +0.006 |
+
+For smell strength 1, the learning rule was also rebuilt offline from the logged lives:
+
+- The actual turn-weight change follows it (cos 0.72).
+- Its first and second halves of life point the same way (cos +0.34; above 0.3 in 24 of 40 agents).
+- A policy pointing along its whole-life direction does not steer either (corr with the food side +0.014).
+- The large change is not the agent learning from its own rotation: the change along the encoding's readout of the body's angular velocity is +0.002.
+
+**Every link works except the last.** The nostrils tell the food's side. The encoding keeps part of it, doubling what the turn policy's input says about the side over vision alone. Turns toward food are credited. The update drifts significantly along the food's side. But the turn weights change about 40 times more in other directions than along the side. That change is partly consistent through a life, so the rule is also learning other things, and partly noise. The policy's turning reflects those other directions and never the food's side.
+
+This is the same failure as with vision: the side of food in view is readable (R² 0.6) and correctly credited, yet the turn weights barely align with it (cos 0.05). The bottleneck is not the senses, the encoding or the credit. It is the turn actor: one linear readout of a 128-dimensional encoding, trained by an update in which the food-side component is a few percent of the whole.

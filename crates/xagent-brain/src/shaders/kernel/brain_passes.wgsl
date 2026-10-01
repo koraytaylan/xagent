@@ -1720,9 +1720,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // zero-mean, so only noise directions that correlate with TD errors
         // get reinforced. Using the full motor (policy + noise) creates a
         // feedback loop where any turn bias gets reinforced by every
-        // positive credit event.
-        s_explore[0u] = noise_forward * exploration_rate;
-        s_explore[1u] = noise_turn * exploration_rate;
+        // positive credit event. The noise is credited as the body executed
+        // it, after the fatigue damping (and, for turning, the klinotaxis
+        // factor) scaled the command: crediting the full draw credited
+        // actions the body only partly carried out on half the ticks.
+        s_explore[0u] = noise_forward * exploration_rate * fatigue_factor;
+        s_explore[1u] = noise_turn * exploration_rate * fatigue_factor * klinotaxis_factor;
 
         // Save tick + decision buffer motor
         brain_state[brain_base + O_TICK_COUNT] = tick_count + 1.0;

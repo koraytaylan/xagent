@@ -1145,3 +1145,23 @@ Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm.
 - **More exploration alone hurts.** Urgency is near its cap most of the time, so exploration is pinned high. Behaviour becomes more random, fewer sightings end in a meal, and meals fall by a fifth.
 - **Vigour raises meals by half, but only by amplifying motion.** Agents cover 2.7 times the ground while the learned forward bias turns negative. Deaths more than double even though mean energy rises, so the extra deaths are not starvation; the harness does not record their cause.
 - **Stronger learning when hungry adds nothing,** and turning toward visible food stays at chance in every arm.
+
+## Energy-limited processing capacity
+
+The idea is a capacity limit rather than a drive, like a motor whose torque falls with its supply voltage, or the narrowing of attention under depletion. A scratch build (not committed) let only the k visual inputs that deviate most from their adapted level reach the encoder. k was the whole block (240) while the lower of energy and integrity stayed at or above a threshold, and shrank in proportion below it, down to 10%. A control held k at 10% always. Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm.
+
+| | Current code | Threshold 0.5 | Threshold 0.8 | Always 10% |
+|---|---|---|---|---|
+| Meals | 107 ± 6 | 104 ± 6 | 95 ± 5 | 103 ± 5 |
+| Distance travelled | 21,200 | 21,000 | 20,100 | 20,900 |
+| Sightings that end in a meal | 44% | 45% | 40% | 45% |
+| Deaths | 47 | 47 | 47 | 46 |
+| Turning toward visible food | 50% | 50% | 50% | 49% |
+| R²: food side from the critic's input (in view) | 0.61 | 0.62 | 0.62 | 0.61 |
+| Steering credit (agents positive) | +2.3e-3 (39/40) | +2.1e-3 (38/40) | +1.9e-3 (37/40) | +2.1e-3 (39/40) |
+| Turn-weight change vs food side (cos) | +0.056 | +0.054 | +0.053 | +0.055 |
+| Forward credit (agents positive) | −6.4e-5 (2/40) | −7.3e-5 (0/40) | −8.0e-5 (0/40) | −7.2e-5 (4/40) |
+
+- **Capacity changes nothing measurable,** in behaviour or in learning, even with only a tenth of the visual inputs always passing.
+- **Sensory adaptation already does the narrowing.** After adaptation the strongest deviations are what is new in view, food included, while the steady background is already near zero. Keeping only the strongest leaves the food's side exactly as readable (R² 0.61).
+- **The limit is still in the actors.** The steering credit is right-signed in nearly every agent, but the turn weights barely follow it (cos 0.055), and moving forward is still credited negatively.

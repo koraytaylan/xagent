@@ -1333,3 +1333,30 @@ The turn policy now also reads the two nostrils directly through two learned wei
 - **That small turning bias is worth a lot.** Long lives eat 44% more and die less. Agents come across food more often (274 sightings against 215) and more sightings end in a meal.
 - **Evolution benefits too, though a 40k-tick generation leaves little time to learn.** Mean fitness rises 6% and meals 9%. Genome differences still sit at the noise level, and the sensory genes still drift at random.
 - **A stronger nose (3) steers less than the seed nose (1),** because saturation narrows the left–right difference.
+
+## A whitened visual pathway, offline
+
+The smell recipe applied to vision: turn policies rebuilt offline that read a small visual input instead of the 128-dimensional encoding. They use the smell pathway's rule: the fresh turn-noise innovation as eligibility, credit from the traces, and inputs normalised by 1 + |input|². The lives were logged with the current learner, smell pathway on (183 meals per life on average). Setup: 300k ticks, seeds 5–8, 40 agents.
+
+The inputs:
+
+- **Hemifields:** the left and right halves of the 8×6 field, averaged into red, green, blue and depth (8 inputs).
+- **Columns:** each of the 8 columns averaged the same way (32 inputs).
+
+Every value is adapted to its own running mean (rate 0.01). "Learned" means learned online through the life, whitened online where marked. "Preconditioned" is the best case: the summed update over the first 70% of life, multiplied by the inverse input covariance, scored on the last 30%.
+
+Scores are the correlation of the policy's turn output with the food's side over the last 30% of life (agents positive; agents above 0.2). "Food in view" is within 5.5 units inside the 90° field; "food visible" is within 30 units inside it.
+
+| Turn policy input | Food in view | Food visible |
+|---|---|---|
+| hemifields, raw, learned | +0.13 ± 0.03 (31/40; 10) | +0.05 ± 0.01 (32/40; 0) |
+| **hemifields, whitened, learned** | **+0.33 ± 0.04 (37/40; 29)** | **+0.18 ± 0.02 (34/40; 21)** |
+| columns, whitened, learned | +0.16 ± 0.03 (32/40; 17) | +0.09 ± 0.02 (34/40; 6) |
+| hemifields, preconditioned | +0.52 ± 0.03 (38/40; 37) | +0.28 ± 0.02 (40/40; 33) |
+| columns, preconditioned | +0.34 ± 0.03 (37/40; 31) | +0.16 ± 0.02 (37/40; 16) |
+| raw vision (240), preconditioned | +0.15 ± 0.03 (36/40; 16) | +0.09 ± 0.01 (37/40; 2) |
+| encoding (128), preconditioned | +0.09 ± 0.02 (33/40; 6) | +0.05 ± 0.01 (35/40; 0) |
+
+- **Sight works the same way as smell.** A turn policy that reads the two hemifields, whitened online, learns within a life to turn toward food in view, in 37 of 40 agents (+0.33).
+- **Fewer, balanced inputs learn better, at every step:** 8 hemifield inputs > 32 columns > 240 raw values > the 128-dimensional encoding. Whitening roughly doubles to triples what each input set learns.
+- **The pattern matches smell exactly.** Steering is learnable from the agent's own homeostatic signal when the steering cue reaches the turn policy through a few inputs whose differences vary as much as what they share.

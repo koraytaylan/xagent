@@ -56,7 +56,7 @@ const S_REWARD: u32 = 4u;
 var<workgroup> s_pred_td: array<f32, 5>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
-var<workgroup> s_explore: array<f32, 2>;
+var<workgroup> s_explore: array<f32, 3>;
 // Reused cooperative dense-dot scratch, indexed by local invocation id; each
 // group of DENSE_INNER_LANES entries reduces one output row.
 var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
@@ -1412,6 +1412,23 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
             // The turn channel has no bias (see O_ACT_BIASES).
+            // Smell pathway: the two scent turn weights learn through their
+            // own traces (already normalised per input), kept in the L2 ball.
+            if (steering_weights_learn()) {
+                var scent_weights = vec2<f32>(
+                    brain_state[brain_base + O_SCENT_TURN_WEIGHTS],
+                    brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u],
+                ) + ACTION_WEIGHT_LEARNING_RATE * td_error * vec2<f32>(
+                    brain_state[brain_base + O_TRACE_SCENT],
+                    brain_state[brain_base + O_TRACE_SCENT + 1u],
+                );
+                let scent_norm = length(scent_weights);
+                if (scent_norm > MAX_WEIGHT_NORM) {
+                    scent_weights *= MAX_WEIGHT_NORM / scent_norm;
+                }
+                brain_state[brain_base + O_SCENT_TURN_WEIGHTS] = scent_weights.x;
+                brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] = scent_weights.y;
+            }
         }
         workgroupBarrier();
 
@@ -1580,10 +1597,45 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         let urgency = s_homeo[2u];
         let prediction_error = s_pred_td[S_PRED_ERROR];
 
+        // Smell pathway: whiten this tick's two nostrils by their running
+        // mean and covariance (then fold the scent into those statistics),
+        // so the turn policy reads them with overall strength and left−right
+        // difference on an equal footing.
+        let visual_cortex_on = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
+        let scent_base = select(VISUAL_FEATURE_COUNT, VISION_COLOR_COUNT + VISION_DEPTH_COUNT, !visual_cortex_on)
+            + SCENT_FEATURE_OFFSET;
+        let scent = vec2<f32>(s_features[scent_base], s_features[scent_base + 1u]);
+        let scent_mean = vec2<f32>(
+            brain_state[brain_base + O_SCENT_MEAN],
+            brain_state[brain_base + O_SCENT_MEAN + 1u],
+        );
+        let scent_covariance = vec3<f32>(
+            brain_state[brain_base + O_SCENT_COVARIANCE],
+            brain_state[brain_base + O_SCENT_COVARIANCE + 1u],
+            brain_state[brain_base + O_SCENT_COVARIANCE + 2u],
+        );
+        let scent_centred = scent - scent_mean;
+        let scent_whitened = whiten_scent(scent_centred, scent_covariance);
+        brain_state[brain_base + O_SCENT_WHITENED] = scent_whitened.x;
+        brain_state[brain_base + O_SCENT_WHITENED + 1u] = scent_whitened.y;
+        let next_scent_mean = scent_mean + SCENT_WHITENING_RATE * scent_centred;
+        let next_scent_covariance = scent_covariance + SCENT_WHITENING_RATE * (vec3<f32>(
+            scent_centred.x * scent_centred.x,
+            scent_centred.x * scent_centred.y,
+            scent_centred.y * scent_centred.y,
+        ) - scent_covariance);
+        brain_state[brain_base + O_SCENT_MEAN] = next_scent_mean.x;
+        brain_state[brain_base + O_SCENT_MEAN + 1u] = next_scent_mean.y;
+        brain_state[brain_base + O_SCENT_COVARIANCE] = next_scent_covariance.x;
+        brain_state[brain_base + O_SCENT_COVARIANCE + 1u] = next_scent_covariance.y;
+        brain_state[brain_base + O_SCENT_COVARIANCE + 2u] = next_scent_covariance.z;
+        let scent_dot = brain_state[brain_base + O_SCENT_TURN_WEIGHTS] * scent_whitened.x
+            + brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] * scent_whitened.y;
+
         // Policy evaluation: forward bias plus dot product; the turn channel
-        // has no bias, so it can only turn in response to what it sees.
+        // has no bias, so it can only turn in response to what it senses.
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
-        var turn: f32 = s_turn_dot;
+        var turn: f32 = s_turn_dot + scent_dot;
 
         // Memory blend: recalled experiences influence motor output via valence.
         // Positive valence (food memory) + similar state → reproduce approach action.
@@ -1730,6 +1782,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // actions the body only partly carried out on half the ticks.
         s_explore[0u] = noise_forward * exploration_rate * fatigue_factor;
         s_explore[1u] = noise_turn * exploration_rate * fatigue_factor * klinotaxis_factor;
+        // The smell pathway credits only this tick's fresh innovation of the
+        // persistent turn noise, executed: the part independent of the state.
+        // Crediting the whole persistent noise would let the pathway learn to
+        // echo its own exploration, since the nostrils feel earlier turns.
+        s_explore[2u] = TURN_NOISE_INNOVATION * turn_draw * exploration_rate
+            * fatigue_factor * klinotaxis_factor;
 
         // Save tick + decision buffer motor
         brain_state[brain_base + O_TICK_COUNT] = tick_count + 1.0;
@@ -1788,6 +1846,17 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 brain_state[brain_base + O_TRACE_BIASES] * trace_decay + 1.0;
             brain_state[brain_base + O_TRACE_BIASES + 1u] =
                 brain_state[brain_base + O_TRACE_BIASES + 1u] * trace_decay + s_explore[0u];
+            // Smell pathway trace: innovation × whitened scent, normalised by
+            // 1 + |whitened scent|² as it enters.
+            let whitened = vec2<f32>(
+                brain_state[brain_base + O_SCENT_WHITENED],
+                brain_state[brain_base + O_SCENT_WHITENED + 1u],
+            );
+            let scent_term = s_explore[2u] * whitened / (1.0 + dot(whitened, whitened));
+            brain_state[brain_base + O_TRACE_SCENT] =
+                brain_state[brain_base + O_TRACE_SCENT] * trace_decay + scent_term.x;
+            brain_state[brain_base + O_TRACE_SCENT + 1u] =
+                brain_state[brain_base + O_TRACE_SCENT + 1u] * trace_decay + scent_term.y;
         }
     }
 }

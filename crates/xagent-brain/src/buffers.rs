@@ -186,6 +186,22 @@ pub const O_RECENT_TICKS: usize = O_RECENT_RETURNS + RECENT_CAP;
 pub const O_RECENT_STATE: usize = O_RECENT_TICKS + RECENT_CAP;
 /// Squared size of each stored key (the replay step's normaliser).
 pub const O_RECENT_NORMS: usize = O_RECENT_STATE + RECENT_CAP;
+/// Running mean of the two nostrils' scent, for whitening the smell pathway
+/// to the turn policy (`O_SCENT_MEAN` in `common.wgsl`). Survives death.
+pub const O_SCENT_MEAN: usize = O_RECENT_NORMS + RECENT_CAP;
+/// Running covariance of the two nostrils, packed `[left², left·right,
+/// right²]`. Survives death.
+pub const O_SCENT_COVARIANCE: usize = O_SCENT_MEAN + 2;
+/// This brain tick's whitened scent, the smell pathway's input.
+pub const O_SCENT_WHITENED: usize = O_SCENT_COVARIANCE + 3;
+/// Learned turn weights on the whitened scent (left, right). Learned, not
+/// mutated; zero at birth.
+pub const O_SCENT_TURN_WEIGHTS: usize = O_SCENT_WHITENED + 2;
+/// Eligibility traces of the scent turn weights; episodic, zeroed on death.
+pub const O_TRACE_SCENT: usize = O_SCENT_TURN_WEIGHTS + 2;
+/// Starting variance of each nostril in the whitening covariance (mirrors
+/// `SCENT_INITIAL_VARIANCE` in `common.wgsl`).
+pub const SCENT_INITIAL_VARIANCE: f32 = 1e-4;
 /// Ring slot states (mirrors `common.wgsl`).
 pub const RECENT_EMPTY: f32 = 0.0;
 pub const RECENT_OPEN: f32 = 1.0;
@@ -193,7 +209,7 @@ pub const RECENT_SETTLED: f32 = 2.0;
 /// Running mean of each sensory feature for sensory adaptation
 /// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
 /// slots, so it is the one layout-sized region after the fixed tail.
-pub const O_SENSORY_MEAN: usize = O_RECENT_NORMS + RECENT_CAP;
+pub const O_SENSORY_MEAN: usize = O_TRACE_SCENT + 2;
 pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
@@ -983,6 +999,10 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_horizontal_fov] = config.horizontal_fov_degrees;
     state[o_pred_ctx_wt + delta_vertical_fov] = config.vertical_fov_degrees;
     state[o_pred_ctx_wt + delta_smell_strength] = config.smell_strength;
+    // The smell pathway's whitening starts from a small isotropic variance.
+    let delta_scent_covariance = O_SCENT_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
+    state[o_pred_ctx_wt + delta_scent_covariance] = SCENT_INITIAL_VARIANCE;
+    state[o_pred_ctx_wt + delta_scent_covariance + 2] = SCENT_INITIAL_VARIANCE;
 
     state
 }
@@ -1163,7 +1183,8 @@ mod tests {
         assert_eq!(O_SALIENCE_LABEL, O_SALIENCE_VARIANCE + 1);
         assert_eq!(O_TURN_NOISE, O_SALIENCE_LABEL + 1);
         assert_eq!(O_RECENT_KEYS, O_TURN_NOISE + 1);
-        assert_eq!(O_SENSORY_MEAN, O_RECENT_NORMS + RECENT_CAP);
+        assert_eq!(O_SCENT_MEAN, O_RECENT_NORMS + RECENT_CAP);
+        assert_eq!(O_SENSORY_MEAN, O_TRACE_SCENT + 2);
         assert_eq!(BRAIN_STRIDE, O_SENSORY_MEAN + FEATURE_COUNT);
     }
 

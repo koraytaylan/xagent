@@ -314,7 +314,16 @@ override O_RECENT_NORMS: u32 = O_RECENT_STATE + RECENT_CAP;
 // SENSORY_ADAPTATION_RATE); only the visual block is used. Sized by the
 // layout (FEATURE_COUNT slots), so it follows the fixed tail. Survives death:
 // it describes the surroundings, not an episode.
-override O_SENSORY_MEAN: u32 = O_RECENT_NORMS + RECENT_CAP;
+// The smell pathway to the turn policy: a running mean and covariance of the
+// two nostrils (surviving death: they describe the agent's odour world), this
+// tick's whitened scent, two learned turn weights on it, and their episodic
+// eligibility traces. See `whiten_scent` and the turn policy evaluation.
+override O_SCENT_MEAN: u32 = O_RECENT_NORMS + RECENT_CAP;
+override O_SCENT_COVARIANCE: u32 = O_SCENT_MEAN + 2u;
+override O_SCENT_WHITENED: u32 = O_SCENT_COVARIANCE + 3u;
+override O_SCENT_TURN_WEIGHTS: u32 = O_SCENT_WHITENED + 2u;
+override O_TRACE_SCENT: u32 = O_SCENT_TURN_WEIGHTS + 2u;
+override O_SENSORY_MEAN: u32 = O_TRACE_SCENT + 2u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
@@ -557,6 +566,45 @@ const NOSTRIL_FORWARD_OFFSET: f32 = 0.5;
 const NOSTRIL_SIDE_OFFSET: f32 = 1.0;
 const SMELL_STRENGTH_MIN: f32 = 0.0;
 const SMELL_STRENGTH_MAX: f32 = 5.0;
+// Position of the two scent features inside the non-visual feature tail
+// (after speed, facing, angular velocity, energy, integrity, the two deltas and
+// the touch contacts).
+const SCENT_FEATURE_OFFSET: u32 = 25u;
+// Per-brain-tick rate of the running scent mean and covariance that whiten
+// the smell pathway: the same ~100-brain-tick memory as sensory adaptation.
+const SCENT_WHITENING_RATE: f32 = 0.01;
+// Starting variance of each nostril (mirrors SCENT_INITIAL_VARIANCE in
+// buffers.rs), and the floor on the covariance's eigenvalues.
+const SCENT_INITIAL_VARIANCE: f32 = 1e-4;
+const SCENT_EIGEN_FLOOR: f32 = 1e-8;
+
+// Whiten a centred 2-nostril scent by the covariance [a, b, c] =
+// [left², left·right, right²]: rotate onto the covariance's eigenvectors,
+// divide each component by the square root of its eigenvalue, rotate back
+// (C^(−1/2) · centred). Both directions of the odour field — overall
+// strength and the left−right difference — then vary equally, so the turn
+// rule's step no longer favours what the nostrils share over what tells them
+// apart.
+fn whiten_scent(centred: vec2<f32>, covariance: vec3<f32>) -> vec2<f32> {
+    let a = covariance.x;
+    let b = covariance.y;
+    let c = covariance.z;
+    let half_trace = 0.5 * (a + c);
+    let radius = sqrt(0.25 * (a - c) * (a - c) + b * b);
+    let major = max(half_trace + radius, SCENT_EIGEN_FLOOR);
+    let minor = max(half_trace - radius, SCENT_EIGEN_FLOOR);
+    var axis = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a >= c);
+    if (abs(b) > 1e-12) {
+        axis = vec2<f32>(major - c, b);
+    }
+    let unit = axis / max(length(axis), 1e-30);
+    let along_major = dot(unit, centred) / sqrt(major);
+    let along_minor = (-unit.y * centred.x + unit.x * centred.y) / sqrt(minor);
+    return vec2<f32>(
+        unit.x * along_major - unit.y * along_minor,
+        unit.y * along_major + unit.x * along_minor,
+    );
+}
 const TOUCH_AGENT_RANGE: f32 = 5.0;
 const TOUCH_EDGE_RANGE: f32 = 3.0;
 
@@ -781,6 +829,20 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 // the end of the life is its last outcome, the terminal lesson discounted by
 // the moment's age at the life's last brain tick, with no state left to
 // bootstrap from. Single-threaded: called from the death paths.
+// Death's terminal lesson reaches the smell pathway's turn weights through
+// their traces, as it does the other channels, and the traces are cleared.
+// Single-threaded: called from the death paths.
+fn settle_scent_pathway_at_death(brain_base: u32) {
+    if (steering_weights_learn()) {
+        for (var k = 0u; k < 2u; k++) {
+            brain_state[brain_base + O_SCENT_TURN_WEIGHTS + k] += ACTION_WEIGHT_LEARNING_RATE
+                * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_SCENT + k];
+        }
+    }
+    brain_state[brain_base + O_TRACE_SCENT] = 0.0;
+    brain_state[brain_base + O_TRACE_SCENT + 1u] = 0.0;
+}
+
 fn settle_recent_moments_at_death(brain_base: u32) {
     let last_tick = brain_state[brain_base + O_TICK_COUNT];
     for (var slot = 0u; slot < RECENT_CAP; slot++) {

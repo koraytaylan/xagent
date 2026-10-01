@@ -41,6 +41,9 @@ var<workgroup> s_alive: u32;
 // measured for sensory steering feedback.
 var<workgroup> s_food_dist_sq: array<f32, MEMORY_CAP>;
 
+// Cell index meaning "no danger cell found" in `agent_danger_detect`.
+const NO_DANGER_CELL: u32 = 0xFFFFFFFFu;
+
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
 // ══════════════════════════════════════════════════════════════════════════
@@ -292,71 +295,108 @@ fn agent_approach_accumulate(agent_id: u32, motor_turn: f32) {
     }
 }
 
-fn agent_danger_detect(agent_id: u32) {
+// Nearest danger cell within DANGER_SENSE_RADIUS and its signed bearing from
+// the agent's facing, scanned by the whole workgroup: each thread takes a share
+// of the square of cells around the agent, then a two-phase reduction keeps the
+// nearest, ties going to the earliest cell in row-major order, as one thread
+// scanning in that order would. This is the observer's measurement, not a
+// sense: the avoidance-intent counters read it, and the brain reads it only
+// when the danger percept is enabled (off by default), so an agent learns that
+// hazard ground hurts only from its own homeostasis. Every thread must call
+// it: the barriers are unconditional.
+fn agent_danger_detect(agent_id: u32, tid: u32) {
     let b = agent_id * PHYS_STRIDE;
-    let alive = physics_state[b + P_ALIVE];
-    if alive < 0.5 {
-        physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
-        physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
-        return;
-    }
-
-    let agent_pos = vec3f(
-        physics_state[b + P_POS_X],
-        physics_state[b + P_POS_Y],
-        physics_state[b + P_POS_Z]);
+    let alive = s_alive != 0u;
 
     let biome_inv = wc_f32(WC_BIOME_INV_CELL);
     let biome_half = wc_f32(WC_TERRAIN_HALF);
-
-    // Scan biome cells within DANGER_SENSE_RADIUS
-    let sense_radius = DANGER_SENSE_RADIUS;
     let cell_size = 1.0 / biome_inv;
-    let max_cell_delta = u32(ceil(sense_radius / cell_size)) + 1u;
+    let max_cell_delta = u32(ceil(DANGER_SENSE_RADIUS / cell_size)) + 1u;
+    let side = 2u * max_cell_delta + 1u;
 
-    var best_distance = sense_radius;
-    var best_bearing = 0.0;
-    var found_danger = false;
-
-    // Scan square region of cells around agent
-    let agent_col_i = i32((agent_pos.x + biome_half) * biome_inv);
-    let agent_row_i = i32((agent_pos.z + biome_half) * biome_inv);
-
-    for (var dr = -i32(max_cell_delta); dr <= i32(max_cell_delta); dr++) {
-        for (var dc = -i32(max_cell_delta); dc <= i32(max_cell_delta); dc++) {
+    // "No danger in range" sentinel, so the reduction runs safely when dead.
+    var local_best_distance = DANGER_SENSE_RADIUS;
+    var local_best_cell = NO_DANGER_CELL;
+    if (alive) {
+        let agent_x = physics_state[b + P_POS_X];
+        let agent_z = physics_state[b + P_POS_Z];
+        let agent_col_i = i32((agent_x + biome_half) * biome_inv);
+        let agent_row_i = i32((agent_z + biome_half) * biome_inv);
+        // Cells in increasing order with a strict `<`, so each thread keeps
+        // the earliest of its nearest cells.
+        for (var cell = tid; cell < side * side; cell += BRAIN_WORKGROUP_SIZE) {
+            let dr = i32(cell / side) - i32(max_cell_delta);
+            let dc = i32(cell % side) - i32(max_cell_delta);
             let row = u32(clamp(agent_row_i + dr, 0, i32(BIOME_GRID_MAX_INDEX)));
             let col = u32(clamp(agent_col_i + dc, 0, i32(BIOME_GRID_MAX_INDEX)));
-
-            if (sample_biome(f32(col) / biome_inv - biome_half + 0.5 / biome_inv,
-                             f32(row) / biome_inv - biome_half + 0.5 / biome_inv) == BIOME_DANGER) {
-                // Compute world position of cell center
-                let cell_x = (f32(col) + 0.5) / biome_inv - biome_half;
-                let cell_z = (f32(row) + 0.5) / biome_inv - biome_half;
-                let to_danger = vec3f(cell_x - agent_pos.x, 0.0, cell_z - agent_pos.z);
-                let dist = length(to_danger);
-
-                if (dist < best_distance && dist < sense_radius && dist > EPSILON) {
-                    best_distance = dist;
-                    found_danger = true;
-
-                    // Compute signed bearing from facing direction
-                    let facing_x = physics_state[b + P_FACING_X];
-                    let facing_z = physics_state[b + P_FACING_Z];
-                    let cross_y = facing_x * to_danger.z - facing_z * to_danger.x;
-                    let dot_val = facing_x * to_danger.x + facing_z * to_danger.z;
-                    best_bearing = atan2(cross_y, dot_val);
+            let cell_x = (f32(col) + 0.5) / biome_inv - biome_half;
+            let cell_z = (f32(row) + 0.5) / biome_inv - biome_half;
+            if (sample_biome(cell_x, cell_z) == BIOME_DANGER) {
+                let distance = length(vec2f(cell_x - agent_x, cell_z - agent_z));
+                if (distance < local_best_distance && distance > EPSILON) {
+                    local_best_distance = distance;
+                    local_best_cell = cell;
                 }
             }
         }
     }
 
-    if (found_danger) {
-        physics_state[b + P_NEAREST_DANGER_DISTANCE] = best_distance;
-        physics_state[b + P_NEAREST_DANGER_BEARING] = best_bearing;
-    } else {
-        physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
-        physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
+    // Two-phase shared-memory reduction over the MEMORY_CAP-wide scratch the
+    // food scan also uses (its last reader passed the barrier before this call).
+    if (tid < MEMORY_CAP) {
+        s_similarities[tid] = local_best_distance;
+        shared_sort_indices[tid] = local_best_cell;
     }
+    workgroupBarrier();
+    if (tid >= MEMORY_CAP) {
+        let slot = tid - MEMORY_CAP;
+        if (danger_cell_precedes(local_best_distance, local_best_cell,
+                                 s_similarities[slot], shared_sort_indices[slot])) {
+            s_similarities[slot] = local_best_distance;
+            shared_sort_indices[slot] = local_best_cell;
+        }
+    }
+    workgroupBarrier();
+
+    if (tid == 0u) {
+        var best_distance = DANGER_SENSE_RADIUS;
+        var best_cell = NO_DANGER_CELL;
+        for (var i = 0u; i < MEMORY_CAP; i++) {
+            if (danger_cell_precedes(s_similarities[i], shared_sort_indices[i],
+                                     best_distance, best_cell)) {
+                best_distance = s_similarities[i];
+                best_cell = shared_sort_indices[i];
+            }
+        }
+        if (alive && best_cell != NO_DANGER_CELL) {
+            let agent_x = physics_state[b + P_POS_X];
+            let agent_z = physics_state[b + P_POS_Z];
+            let agent_col_i = i32((agent_x + biome_half) * biome_inv);
+            let agent_row_i = i32((agent_z + biome_half) * biome_inv);
+            let dr = i32(best_cell / side) - i32(max_cell_delta);
+            let dc = i32(best_cell % side) - i32(max_cell_delta);
+            let row = u32(clamp(agent_row_i + dr, 0, i32(BIOME_GRID_MAX_INDEX)));
+            let col = u32(clamp(agent_col_i + dc, 0, i32(BIOME_GRID_MAX_INDEX)));
+            let to_danger_x = (f32(col) + 0.5) / biome_inv - biome_half - agent_x;
+            let to_danger_z = (f32(row) + 0.5) / biome_inv - biome_half - agent_z;
+            // Signed bearing from the facing direction (cross and dot in XZ).
+            let facing_x = physics_state[b + P_FACING_X];
+            let facing_z = physics_state[b + P_FACING_Z];
+            let cross_y = facing_x * to_danger_z - facing_z * to_danger_x;
+            let dot_val = facing_x * to_danger_x + facing_z * to_danger_z;
+            physics_state[b + P_NEAREST_DANGER_DISTANCE] = best_distance;
+            physics_state[b + P_NEAREST_DANGER_BEARING] = atan2(cross_y, dot_val);
+        } else {
+            physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
+            physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
+        }
+    }
+}
+
+// Whether a danger candidate (distance, row-major cell index) comes before
+// another: nearer first, then the earlier cell.
+fn danger_cell_precedes(distance: f32, cell: u32, other_distance: f32, other_cell: u32) -> bool {
+    return distance < other_distance || (distance == other_distance && cell < other_cell);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -849,10 +889,10 @@ fn kernel_tick(
         agent_food_detect(agent_id, tid);
         workgroupBarrier();
 
-        // Danger detection: thread 0 scans biome grid for nearest danger
-        if (tid == 0u && wc_u32(WC_DANGER_PERCEPT_ENABLED) != 0u) {
-            agent_danger_detect(agent_id);
-        }
+        // Danger measurement: all 256 threads scan the biome grid for the
+        // nearest danger. Always on, because the avoidance-intent counters
+        // need it; the brain sees it only with the danger percept enabled.
+        agent_danger_detect(agent_id, tid);
         workgroupBarrier();
 
         // Avoidance and approach accumulation: thread 0 increments the counters based on

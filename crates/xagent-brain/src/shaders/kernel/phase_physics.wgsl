@@ -199,8 +199,10 @@ fn phase_physics(tid: u32, tick: u32) {
         physics_state[b + P_TICKS_ALIVE] = physics_state[b + P_TICKS_ALIVE] + 1.0;
     }
 
-    // Danger detection: scan biome grid for nearest danger cell
-    if (wc_u32(WC_DANGER_PERCEPT_ENABLED) != 0u) {
+    // Danger measurement: scan the biome grid for the nearest danger cell.
+    // Always on, because the avoidance-intent counters below need it; the
+    // brain sees it only with the danger percept enabled.
+    {
         let biome_inv = wc_f32(WC_BIOME_INV_CELL);
         let biome_half = wc_f32(WC_TERRAIN_HALF);
 
@@ -251,10 +253,6 @@ fn phase_physics(tid: u32, tick: u32) {
             physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
             physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
         }
-    } else {
-        // Flag is off: ensure danger is not detected
-        physics_state[b + P_NEAREST_DANGER_DISTANCE] = DANGER_SENSE_RADIUS;
-        physics_state[b + P_NEAREST_DANGER_BEARING] = 0.0;
     }
 
     // Avoidance intent: accumulate fraction of ticks where danger was in sense range

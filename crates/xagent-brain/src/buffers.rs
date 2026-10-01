@@ -632,6 +632,8 @@ pub const WC_BRAIN_TICK_STRIDE: usize = 23;
 pub const WC_SPEED_COST_EXPONENT: usize = 24;
 /// Danger percept gate flag. `1.0` = pack nearest-danger bearing and
 /// distance into non-visual features, `0.0` = no-op (feature count unchanged).
+/// The nearest danger is measured either way, for the avoidance-intent
+/// counters; the flag only decides whether the brain is given it.
 /// Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is unchanged.
 /// Mirrored by `WC_DANGER_PERCEPT_ENABLED` in `common.wgsl`.
 pub const WC_DANGER_PERCEPT_ENABLED: usize = 25;

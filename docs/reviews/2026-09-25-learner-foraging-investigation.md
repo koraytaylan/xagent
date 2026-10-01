@@ -1299,3 +1299,37 @@ The same offline rebuild tried transforms that equalise how much each input dire
 - **Whitening does not rescue the 128-dimensional encoding.** Even preconditioned, the encoding route stays near zero (+0.05), and adding the nostrils to it gives only +0.09. Estimating one good direction among 128 from credit this noisy needs far more than one life.
 
 So steering by smell is learnable from the agent's own homeostatic signal. It takes a low-dimensional input in which the left–right difference varies as much as the shared part. The encoding the turn policy reads today is neither.
+
+## The whitened smell pathway in the learner
+
+The turn policy now also reads the two nostrils directly through two learned weights, zero at birth. Each brain tick the nostrils are centred and whitened by their running mean and covariance (rate 0.01). The pathway's trace gathers the turn noise's fresh innovation, as executed, times the whitened scent over 1 + |whitened|².
+
+**Free runs** (300k ticks, seeds 5–8, 40 agents per arm, current code):
+
+| | No smell | Smell strength 1 (default) | Smell strength 3 |
+|---|---|---|---|
+| Meals | 111 ± 5 | **160 ± 12** | 131 ± 7 |
+| Sightings | 215 | 274 | 243 |
+| Sightings that end in a meal | 46% | 51% | 48% |
+| Deaths | 45 | 38 | 41 |
+| Mean energy | 0.67 | 0.78 | 0.68 |
+| Toward the nearest food in smelling range, whole life | 49.6% | 52.7% | 51.6% |
+| Toward the nearest food in smelling range, last 30% | 49.7% | **53.6%** | 52.0% |
+| Toward visible food | 49.2% | 52.0% | 51.0% |
+| Pathway output vs food side, last 30% (agents positive; above 0.2) | — | **+0.41 ± 0.03 (38/40; 34)** | +0.31 ± 0.03 (36/40; 32) |
+
+**Headless evolution** (`evo_vs1`, 20 generations, seeds 5–8, 10 agents):
+
+| | Before | With the smell pathway |
+|---|---|---|
+| Mean fitness | 0.0555 | **0.0589** (higher in all 4 seeds) |
+| First 5 → last 5 generations | 0.0566 → 0.0572 | 0.0598 → 0.0584 |
+| Meals per agent per generation | 19.9 | 21.7 |
+| Best score | 0.0630 | 0.0653 |
+| Accepted generations | 2.8 | 3.8 |
+| SD between genome means / from noise alone | 0.0067 / 0.0071 | 0.0072 / 0.0075 |
+
+- **For the first time in this investigation, agents learn to steer toward food within one life,** from their own homeostatic signal alone. The pathway's turning tracks the food's side in 38 of 40 agents, as strongly as the offline rebuild predicted (+0.41). Over the last 30% of life, turning toward food in smelling range rises from chance to 53.6%.
+- **That small turning bias is worth a lot.** Long lives eat 44% more and die less. Agents come across food more often (274 sightings against 215) and more sightings end in a meal.
+- **Evolution benefits too, though a 40k-tick generation leaves little time to learn.** Mean fitness rises 6% and meals 9%. Genome differences still sit at the noise level, and the sensory genes still drift at random.
+- **A stronger nose (3) steers less than the seed nose (1),** because saturation narrows the left–right difference.

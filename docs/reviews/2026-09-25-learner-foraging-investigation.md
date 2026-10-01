@@ -1094,3 +1094,28 @@ Setup: 300k-tick free runs, seeds 5–8. The behaviour figures cover 40 agents p
 - **Persistent forward noise raises meals by two thirds, but through exploration, not learning.** The noise's own longer runs cover twice the ground. The learned forward command stays at about zero, and the bias turns negative. Deaths nearly double, and mean energy rises; the harness does not record the cause of death.
 - **Crediting the executed action helps modestly, and it is a correctness fix.** Meals rise by a quarter at the same distance, more sightings end in a meal (45% against 36%), and the steering credit becomes positive in every agent.
 - **Turning toward visible food stays at chance in every arm.** More movement adds more no-food updates to the turn weights, which dilutes the steering signal (cos 0.019 and 0.006 against 0.047).
+
+## Executed-action credit in the learner
+
+The actors' eligibility traces now carry the exploration noise as the body executed it, scaled by fatigue and, for turning, by the klinotaxis factor.
+
+**Free runs** (300k ticks, seeds 5–8, 40 agents):
+
+| | Before | Now |
+|---|---|---|
+| Meals | 86 ± 5 | **107 ± 6** |
+| Distance travelled | 19,600 | 21,000 |
+| Sightings | 191 | 207 |
+| Sightings that end in a meal | 36% | **45%** |
+| Mean forward command | 0.053 | 0.080 |
+| Deaths | 47 | 46 |
+| Turning toward visible food | 50% | 50% |
+| Steering credit (agents positive) | +1.7e-3 (29/30) | **+2.6e-3 (39/40)** |
+| Turn-weight change vs food side (cos) | +0.047 | +0.059 |
+| Forward credit (agents positive) | −7.8e-5 (1/30) | −6.7e-5 (1/40) |
+
+**Headless evolution** (`evo_vs1`, 20 generations, seeds 5–8, 10 agents): mean fitness 0.0555 against 0.0554, with 19.9 meals per agent per generation in both. The SD between genome means is 0.0066, against 0.0071 from noise alone.
+
+- **The port reproduces the scratch result.** Long lives eat a quarter more at about the same distance, because more sightings end in a meal. The steering credit is positive in 39 of 40 agents.
+- **Neither steering nor moving is learned yet.** Turning toward visible food stays at chance, and the forward credit stays negative.
+- **Evolution is unchanged.**

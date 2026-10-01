@@ -1119,3 +1119,29 @@ The actors' eligibility traces now carry the exploration noise as the body execu
 - **The port reproduces the scratch result.** Long lives eat a quarter more at about the same distance, because more sightings end in a meal. The steering credit is positive in 39 of 40 agents.
 - **Neither steering nor moving is learned yet.** Turning toward visible food stays at chance, and the forward credit stays negative.
 - **Evolution is unchanged.**
+
+## Hunger arousal
+
+Urgency (the agent's own energy and integrity distress) currently scales the reward by (1 + urgency). It also *lowers* exploration as hunger grows, by up to 0.5, reaching the 10% floor when the agent is starving. A scratch build (not committed) tried three switches of its own, applied cumulatively, all driven only by urgency:
+
+- **Exploration:** rises with hunger by the same amount instead of falling.
+- **Vigour:** the executed command, and the noise the traces credit, are scaled by up to ×1.5.
+- **Plasticity:** the actors' learning rate is scaled by up to ×2.
+
+Setup: 300k-tick free runs, seeds 5–8, 40 agents per arm.
+
+| | Current code | Exploration rises | + vigour | + plasticity |
+|---|---|---|---|---|
+| Meals | 105 ± 6 | 84 ± 5 | **156 ± 11** | 139 ± 13 |
+| Distance travelled | 20,700 | 26,000 | 56,700 | 50,400 |
+| Sightings | 210 | 211 | 322 | 301 |
+| Sightings that end in a meal | 43% | 30% | 33% | 32% |
+| Deaths | 46 | 55 | **114** | 101 |
+| Mean energy | 0.66 | 0.65 | 0.78 | 0.76 |
+| Mean exploration rate | 0.41 | 0.82 | 0.80 | 0.80 |
+| Forward bias at the end | +0.06 | −0.02 | −0.36 | −0.17 |
+| Turning toward visible food | 50% | 49% | 49% | 49% |
+
+- **More exploration alone hurts.** Urgency is near its cap most of the time, so exploration is pinned high. Behaviour becomes more random, fewer sightings end in a meal, and meals fall by a fifth.
+- **Vigour raises meals by half, but only by amplifying motion.** Agents cover 2.7 times the ground while the learned forward bias turns negative. Deaths more than double even though mean energy rises, so the extra deaths are not starvation; the harness does not record their cause.
+- **Stronger learning when hungry adds nothing,** and turning toward visible food stays at chance in every arm.

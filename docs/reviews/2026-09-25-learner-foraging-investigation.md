@@ -1257,3 +1257,19 @@ The real GPU policy, for reference: +0.007 ± 0.005 (23/40).
 - **The consistent unrelated change is an artefact: the policy learns to echo its own exploration.** The turn noise persists from tick to tick (AR(1)), and the encoding shows the effects of earlier turns. The trace term noise × input therefore has a non-zero mean, and the rule drifts toward "keep turning the way you are". Crediting only each tick's fresh innovation, the part independent of the state, removes the echo in full. Centring the credit does nothing, because its mean is already about zero.
 - **Removing the artefact does not uncover steering.** No variant gets the policy to turn toward food beyond a correlation of 0.025. Weight decay makes it worse, and a sparse input helps only marginally.
 - **The remaining limit is dimensionality.** The same credit, applied to a one-parameter policy reading the raw nostril difference, points the right way in 37 of 40 agents (t ≈ 6, previous section). Spread over 128 dense inputs, the food-side drift is a few percent of the update and stays buried in the others' noise for the whole life.
+
+## A turn policy reading the nostrils directly
+
+The same offline rebuild tried a turn policy that reads the two nostrils directly, as separate left and right inputs with two learned weights, so no symmetry is built in. It was credited with the fresh noise innovation, the cleanest rule from the previous section. Inputs were tried raw, adapted (each nostril minus its running mean, rate 0.01 per brain tick), and adapted alongside the 128-dimensional encoding. Setup: smell strength 1, 300k-tick lives, seeds 5–8, 40 agents.
+
+| Turn policy input | Learned right − left weight (agents positive) | Turns toward food: corr (agents positive) |
+|---|---|---|
+| raw nostrils | +3.5e-3 ± 0.6e-3 (**33/40**) | −0.002 ± 0.010 (21/40) |
+| adapted nostrils | +4.4e-3 ± 0.6e-3 (**35/40**) | +0.048 ± 0.012 (28/40) |
+| encoding + adapted nostrils | — | +0.014 ± 0.005 (24/40) |
+| encoding only (the GPU's rule, for reference) | — | +0.017 ± 0.004 (31/40) |
+
+- **With two inputs the rule learns the right direction.** The right nostril's weight ends above the left's in 33 of 40 agents raw and 35 of 40 adapted.
+- **The policy still barely steers, because what the nostrils share drowns what tells them apart.** Overall odour strength varies about thirty times more than the right − left difference. The rule's step along each direction scales with that direction's variation, so the shared weight random-walks thirty times faster than the difference weight drifts. Turning then follows how strong the smell is, not which side it comes from. Adapting each nostril to its running mean helps a little; feeding the nostrils in beside the encoding dilutes them again.
+
+So the limit is not only how many inputs there are but how unequal their variation is. The informative directions — the nostrils' difference, food's side in view — have small variance next to what they share with the rest of the input, and a learning rule whose step scales with input size learns along them slowest.

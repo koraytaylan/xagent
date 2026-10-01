@@ -1064,3 +1064,33 @@ Other measures:
 - **But it barely moves the weights.** Food is in view on about 2.5% of ticks, and on the other 97.5% the trace updates are noise times encoding, a random walk in the same weights. What the turn weights learn over a life points only faintly at the food's side (cos 0.045).
 - **Moving forward gets no positive signal, and the ceiling offers none either.** A one-tick forward kick costs energy for certain, while the food it might lead to comes too late and too rarely for the traces. Even the true advantage of a forward kick is about zero. The earlier doubling of meals came from optimism, not from a lesson available in the data.
 - **Fatigue damps the executed action on half the ticks.** It does not damp the noise the traces credit, so the actors are credited for actions the body only partly carried out.
+
+## Persistent forward exploration and crediting the executed action
+
+A scratch build (not committed) tried two switches on the current code:
+
+- **Persistent forward noise:** forward exploration becomes AR(1) with the turn noise's persistence (0.9), so each exploratory run lasts several ticks instead of one.
+- **Credit for the executed action:** the actor traces carry the exploration noise as the body actually executed it, scaled by fatigue (and by the klinotaxis factor for turning).
+
+Setup: 300k-tick free runs, seeds 5–8. The behaviour figures cover 40 agents per arm; the signal figures cover 30, because the fourth seed ran out of time under eight-way GPU sharing.
+
+| | Current code | Persistent forward noise | Executed-action credit | Both |
+|---|---|---|---|---|
+| Meals | 86 ± 5 | **143 ± 9** | 107 ± 6 | **138 ± 8** |
+| Distance travelled | 19,600 | 41,600 | 20,700 | 35,800 |
+| Mean forward command | 0.053 | 0.007 | 0.088 | 0.098 |
+| Forward bias at the end | +0.05 | −0.14 | +0.10 | +0.12 |
+| Sightings | 191 | 255 | 208 | 253 |
+| Sightings that end in a meal | 36% | 36% | **45%** | 42% |
+| Turning toward visible food | 50% | 48% | 50% | 49% |
+| Deaths | 47 | 84 | 45 | 72 |
+| Mean energy | 0.63 | 0.76 | 0.65 | 0.76 |
+| Forward credit (agents positive) | −7.8e-5 (1/30) | −2.2e-4 (5/30) | −6.8e-5 (1/30) | −3.7e-5 (15/30) |
+| Forward true advantage (agents positive) | −1.4e-5 (10/30) | −5.2e-5 (14/30) | −5.2e-5 (8/30) | +1.7e-4 ± 1.4e-4 (20/30) |
+| Steering credit (agents positive) | +1.7e-3 (29/30) | +1.3e-3 (22/30) | **+2.1e-3 (30/30)** | +1.1e-3 (24/30) |
+| Turn-weight change vs food side (cos) | +0.047 | +0.019 | +0.056 | +0.006 |
+
+- **Neither switch gives moving forward a positive learning signal.** The forward credit stays negative, and it only reaches about zero with both switches. Even the true advantage becomes positive only with both, and then not significantly.
+- **Persistent forward noise raises meals by two thirds, but through exploration, not learning.** The noise's own longer runs cover twice the ground. The learned forward command stays at about zero, and the bias turns negative. Deaths nearly double, and mean energy rises; the harness does not record the cause of death.
+- **Crediting the executed action helps modestly, and it is a correctness fix.** Meals rise by a quarter at the same distance, more sightings end in a meal (45% against 36%), and the steering credit becomes positive in every agent.
+- **Turning toward visible food stays at chance in every arm.** More movement adds more no-food updates to the turn weights, which dilutes the steering signal (cos 0.019 and 0.006 against 0.047).

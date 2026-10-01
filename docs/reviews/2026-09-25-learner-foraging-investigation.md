@@ -1236,3 +1236,24 @@ For smell strength 1, the learning rule was also rebuilt offline from the logged
 **Every link works except the last.** The nostrils tell the food's side. The encoding keeps part of it, doubling what the turn policy's input says about the side over vision alone. Turns toward food are credited. The update drifts significantly along the food's side. But the turn weights change about 40 times more in other directions than along the side. That change is partly consistent through a life, so the rule is also learning other things, and partly noise. The policy's turning reflects those other directions and never the food's side.
 
 This is the same failure as with vision: the side of food in view is readable (R² 0.6) and correctly credited, yet the turn weights barely align with it (cos 0.05). The bottleneck is not the senses, the encoding or the credit. It is the turn actor: one linear readout of a 128-dimensional encoding, trained by an update in which the food-side component is a few percent of the whole.
+
+## Fixing the turn actor offline
+
+The same logged lives were used to rebuild the turn weights offline under variants of the actor's rule. The baseline is the GPU's rule: rate 0.1, step normalised by 1 + |x|², credit from the traces, noise as executed. Each variant was scored on its late-life policy, by the correlation of its turn output with the food's side on ticks with food in smelling range. "Echo" is the correlation of the turn output with the agent's own current turn noise. Setup: smell strength 1, 300k-tick lives, seeds 5–8, 40 agents.
+
+| Actor rule | Turns toward food: corr (agents positive) | Echoes its own turn noise: corr (agents positive) |
+|---|---|---|
+| as on the GPU | +0.015 ± 0.005 (28/40) | **+0.137 ± 0.021 (34/40)** |
+| credit only the fresh noise innovation | +0.019 ± 0.004 (26/40) | −0.021 ± 0.025 (18/40) |
+| credit centred on its mean | +0.015 ± 0.004 (28/40) | +0.139 ± 0.021 (35/40) |
+| both | +0.019 ± 0.004 (24/40) | −0.022 ± 0.025 (18/40) |
+| both + weight decay 1e-4 per tick | +0.009 ± 0.006 (24/40) | — |
+| both + weight decay 1e-3 per tick | +0.001 ± 0.006 (21/40) | — |
+| both + only the 16 strongest inputs active | +0.025 ± 0.006 (30/40) | — |
+| both + sparse 16 + decay 1e-4 | +0.009 ± 0.006 (21/40) | — |
+
+The real GPU policy, for reference: +0.007 ± 0.005 (23/40).
+
+- **The consistent unrelated change is an artefact: the policy learns to echo its own exploration.** The turn noise persists from tick to tick (AR(1)), and the encoding shows the effects of earlier turns. The trace term noise × input therefore has a non-zero mean, and the rule drifts toward "keep turning the way you are". Crediting only each tick's fresh innovation, the part independent of the state, removes the echo in full. Centring the credit does nothing, because its mean is already about zero.
+- **Removing the artefact does not uncover steering.** No variant gets the policy to turn toward food beyond a correlation of 0.025. Weight decay makes it worse, and a sparse input helps only marginally.
+- **The remaining limit is dimensionality.** The same credit, applied to a one-parameter policy reading the raw nostril difference, points the right way in 37 of 40 agents (t ≈ 6, previous section). Spread over 128 dense inputs, the food-side drift is a few percent of the update and stays buried in the others' noise for the whole life.

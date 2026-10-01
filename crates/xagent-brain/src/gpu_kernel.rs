@@ -331,7 +331,7 @@ pub struct AgentTelemetry {
     pub vision_color: Vec<f32>,
     /// Non-visual sensory tail exactly as packed by `phase_vision_senses`:
     /// [velocity(3), facing(3), angular(1), energy, integrity,
-    ///  energy_delta, integrity_delta, touch(4 contacts × 4)].
+    ///  energy_delta, integrity_delta, touch(4 contacts × 4), scent(left, right)].
     /// One vision batch stale, like all of `sensory_buffer`.
     pub sensory_non_visual: Vec<f32>,
     pub motor_fwd: f32,
@@ -2758,14 +2758,16 @@ impl GpuKernel {
     /// Patch per-agent heritable config values in brain_state buffer.
     ///
     /// Writes habituation_sensitivity, max_curiosity_bonus, fatigue_floor,
-    /// movement_speed, and the four plan-0008 visual-genome genes
+    /// movement_speed, the four plan-0008 visual-genome genes
     /// (gabor_wavelength, gabor_aspect_ratio, dog_surround_ratio,
-    /// orientation_offset) from the given BrainConfig into the agent's
-    /// brain_state slots. Use this after `reset_agents()` to apply
-    /// per-agent config variation.
+    /// orientation_offset) and the three sensory-genome genes
+    /// (horizontal_fov_degrees, vertical_fov_degrees, smell_strength) from the
+    /// given BrainConfig into the agent's brain_state slots. Use this after
+    /// `reset_agents()` to apply per-agent config variation.
     ///
-    /// All eight slots are one contiguous run in the fixed tail — `O_MOVEMENT_SPEED`
-    /// is followed immediately by `O_GABOR_WAVELENGTH .. O_ORIENTATION_OFFSET`
+    /// All eleven slots are one contiguous run in the fixed tail —
+    /// `O_MOVEMENT_SPEED` is followed immediately by `O_GABOR_WAVELENGTH ..
+    /// O_ORIENTATION_OFFSET` and then `O_HORIZONTAL_FOV .. O_SMELL_STRENGTH`
     /// (see `buffers.rs`) — so a single `write_buffer` covers them; the
     /// `debug_assert_eq!`s pin the contiguity.
     pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
@@ -2807,6 +2809,16 @@ impl GpuKernel {
             first_delta + 7
         );
 
+        debug_assert_eq!(
+            O_HORIZONTAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 8
+        );
+        debug_assert_eq!(O_VERTICAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT, first_delta + 9);
+        debug_assert_eq!(
+            O_SMELL_STRENGTH - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 10
+        );
+
         let values = [
             config.habituation_sensitivity,
             config.max_curiosity_bonus,
@@ -2816,6 +2828,9 @@ impl GpuKernel {
             config.gabor_aspect_ratio,
             config.dog_surround_ratio,
             config.orientation_offset,
+            config.horizontal_fov_degrees,
+            config.vertical_fov_degrees,
+            config.smell_strength,
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(

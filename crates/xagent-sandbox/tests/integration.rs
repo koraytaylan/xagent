@@ -4607,13 +4607,13 @@ fn visual_cortex_passthrough_is_byte_identical() {
     let depth = (flag_off.vision_width * flag_off.vision_height) as usize;
     assert_eq!(
         off_layout.feature_count,
-        color + depth + 25,
+        color + depth + xagent_brain::buffers::NON_VISUAL_FEATURE_COUNT,
         "flag-off feature_count must keep the legacy raw-vision width"
     );
     assert_eq!(
         on_layout.feature_count,
-        xagent_brain::VISUAL_FEATURE_COUNT + 25,
-        "flag-on feature_count must be VISUAL_FEATURE_COUNT + 25 (the redefined encoder input)"
+        xagent_brain::VISUAL_FEATURE_COUNT + xagent_brain::buffers::NON_VISUAL_FEATURE_COUNT,
+        "flag-on feature_count must be VISUAL_FEATURE_COUNT + the non-visual tail (the redefined encoder input)"
     );
 
     // Baseline: the flag-off path is the pre-cortex build's behavior. Run twice to

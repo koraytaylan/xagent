@@ -201,7 +201,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
     }
     let non_visual_base = select(VISUAL_FEATURE_COUNT, vision_count, !visual_cortex_enabled);
 
-    // Non-visual features (25 values) — thread 0 only.
+    // Non-visual features (27 values, 29 with the danger percept) — thread 0 only.
     // Velocity magnitude requires a sqrt, so this can't be a bulk copy.
     if (tid == 0u) {
         var fi = non_visual_base;
@@ -241,6 +241,10 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
             s_features[fi] = sensory_buffer[s_base + to + 2u]; fi = fi + 1u;
             s_features[fi] = sensory_buffer[s_base + to + 3u]; fi = fi + 1u;
         }
+        // Smell: the left and right nostrils, packed after the touch contacts.
+        let scent_offset = touch_offset + MAX_TOUCH_CONTACTS * 4u;
+        s_features[fi] = sensory_buffer[s_base + scent_offset]; fi = fi + 1u;
+        s_features[fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;
         // Danger percept: when enabled, pack the nearest-danger distance and
         // bearing from `physics_state` into the two extra feature slots. These
         // are read same-cycle from physics — exactly the pattern used for
@@ -249,7 +253,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         // override constant (0u or 1u), so `NON_VISUAL_FEATURE_COUNT` already
         // accounts for the 2 extra slots when the flag is on and the write is
         // always in-bounds. With the flag off, this block is unreachable
-        // (NON_VISUAL_FEATURE_COUNT == 25u, fi stays at non_visual_base + 25).
+        // (NON_VISUAL_FEATURE_COUNT == 27u, fi stays at non_visual_base + 27).
         if (DANGER_PERCEPT_FEATURES_ACTIVE != 0u) {
             // Ablation mask (measurement-only): when blinded, present the brain with
             // the "no danger in range" sentinel — distance 1.0 (normalized

@@ -153,7 +153,10 @@ override VISION_RAYS: u32 = VISION_W * VISION_H;
 override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
 override VISION_DEPTH_COUNT: u32 = VISION_RAYS;
 const MAX_TOUCH_CONTACTS: u32 = 4u;
-override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u;
+// Scent channels: the perceived odour at the left and right nostrils, packed
+// after the touch contacts. Mirrors `SCENT_CHANNELS` in `buffers.rs`.
+const SCENT_CHANNELS: u32 = 2u;
+override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u + SCENT_CHANNELS;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
@@ -181,15 +184,15 @@ override VISUAL_CORTEX_FEATURES_ACTIVE: u32 = 0u;
 override DANGER_PERCEPT_FEATURES_ACTIVE: u32 = 0u;
 
 // Non-visual feature tail (wire-visual-features-into-encoder): the
-// proprioception / interoception / touch features `coop_feature_extract` writes
-// after the visual block — velocity magnitude(1) + facing(3) + angular(1) +
-// energy ratio(1) + integrity ratio(1) + energy delta(1) + integrity delta(1) +
-// touch(16) = 25 base. When danger_percept is enabled, add danger
-// bearing(1) + distance(1) = 27 total. Single canonical source, mirrored by
+// proprioception / interoception / touch / smell features `coop_feature_extract`
+// writes after the visual block — velocity magnitude(1) + facing(3) +
+// angular(1) + energy ratio(1) + integrity ratio(1) + energy delta(1) +
+// integrity delta(1) + touch(16) + scent(2) = 27 base. When danger_percept is
+// enabled, add danger bearing(1) + distance(1) = 29 total. Single canonical source, mirrored by
 // `NON_VISUAL_FEATURE_COUNT` in `buffers.rs`. The base is constant but the
 // tail width changes with the danger-percept flag; the leading visual block
 // changes independently with the cortex flag.
-override NON_VISUAL_FEATURE_COUNT: u32 = 25u + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
+override NON_VISUAL_FEATURE_COUNT: u32 = 25u + SCENT_CHANNELS + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
 // Encoder input width. Flag off: the legacy raw-vision slice
 // (VISION_COLOR_COUNT + VISION_DEPTH_COUNT) + the non-visual tail — byte-identical
 // to the pre-cortex build. Flag on: the compact complex-cell vector
@@ -247,13 +250,22 @@ override O_GABOR_ASPECT_RATIO: u32 = O_GABOR_WAVELENGTH + 1u;
 override O_DOG_SURROUND_RATIO: u32 = O_GABOR_ASPECT_RATIO + 1u;
 override O_ORIENTATION_OFFSET: u32 = O_DOG_SURROUND_RATIO + 1u;
 
+// ── Sensory-genome tail (heritable eye and nose genes) ─────────────────
+// Horizontal and vertical angle of view in degrees (read by the vision pass)
+// and smell sensitivity (read by the senses pass), contiguous after the
+// visual-genome genes. Each reader re-imposes the gene clamps below. Mirrors
+// O_HORIZONTAL_FOV / O_VERTICAL_FOV / O_SMELL_STRENGTH in `buffers.rs`.
+override O_HORIZONTAL_FOV: u32 = O_ORIENTATION_OFFSET + 1u;
+override O_VERTICAL_FOV: u32 = O_HORIZONTAL_FOV + 1u;
+override O_SMELL_STRENGTH: u32 = O_VERTICAL_FOV + 1u;
+
 // ── Homeostatic gradient predictor head ─────────────────────────────
 // Linear head (128→1) on top of the forward model's predicted state s_prediction.
 // Trained online to predict raw_gradient; the previous tick's prediction provides
 // an anticipatory credit signal that bridges the ~10-tick sensory latency.
 // Weights are heritable (seeded at birth, inherited, mutated); the prev-prediction
 // slot is episodic (zeroed on death), like O_PREV_VALUE.
-override O_HOMEO_PREDICTOR_WEIGHTS: u32 = O_ORIENTATION_OFFSET + 1u;
+override O_HOMEO_PREDICTOR_WEIGHTS: u32 = O_SMELL_STRENGTH + 1u;
 override O_HOMEO_PREDICTOR_BIAS: u32 = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
 override O_PREV_HOMEO_PREDICTION: u32 = O_HOMEO_PREDICTOR_BIAS + 1u;
 
@@ -508,7 +520,12 @@ const FOOD_RESPAWN_ATTEMPTS: u32 = 64u;
 
 // ── Vision constants ────────────────────────────────────────────────────────
 
-const VISION_FOV_HALF: f32 = PI / 4.0;   // PI/4 = 45 degrees half-FOV
+// Clamp bounds (degrees) for the heritable angles of view. Mirror
+// HORIZONTAL_FOV_* / VERTICAL_FOV_* in xagent-shared `config.rs`.
+const HORIZONTAL_FOV_MIN: f32 = 30.0;
+const HORIZONTAL_FOV_MAX: f32 = 170.0;
+const VERTICAL_FOV_MIN: f32 = 20.0;
+const VERTICAL_FOV_MAX: f32 = 150.0;
 const VISION_MAX_DIST: f32 = 30.0;
 // World-units radius of the nearest-food sense scan in agent_food_detect.
 // Set to VISION_MAX_DIST to match the visual field range.
@@ -528,6 +545,18 @@ const TOUCH_TERRAIN_EDGE: u32 = 2u;
 const TOUCH_HAZARD: u32 = 3u;
 const TOUCH_AGENT: u32 = 4u;
 const TOUCH_FOOD_RANGE: f32 = 3.0;
+
+// ── Smell constants ─────────────────────────────────────────────────────────
+// Food odour: each uneaten item contributes exp(−d / SCENT_DECAY_LENGTH) to
+// the concentration at a nostril d units away, up to SCENT_RANGE. A nostril
+// perceives 1 − exp(−smell_strength · concentration). Mirror the same-named
+// constants in xagent-shared `sensory.rs` and `config.rs`.
+const SCENT_DECAY_LENGTH: f32 = 10.0;
+const SCENT_RANGE: f32 = 3.0 * SCENT_DECAY_LENGTH;
+const NOSTRIL_FORWARD_OFFSET: f32 = 0.5;
+const NOSTRIL_SIDE_OFFSET: f32 = 1.0;
+const SMELL_STRENGTH_MIN: f32 = 0.0;
+const SMELL_STRENGTH_MAX: f32 = 5.0;
 const TOUCH_AGENT_RANGE: f32 = 5.0;
 const TOUCH_EDGE_RANGE: f32 = 3.0;
 

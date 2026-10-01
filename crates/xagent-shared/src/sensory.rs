@@ -7,6 +7,24 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+/// Distance over which a food item's odour concentration falls by a factor
+/// of e. Each food item contributes `exp(−d / SCENT_DECAY_LENGTH)` to the
+/// concentration at a nostril `d` units away, so odour reaches well past the
+/// distance at which a single item is still resolvable by eye. Mirrors
+/// `SCENT_DECAY_LENGTH` in the brain crate's `common.wgsl`.
+pub const SCENT_DECAY_LENGTH: f32 = 10.0;
+/// Food farther than this from a nostril adds nothing: three decay lengths,
+/// beyond which an item contributes under 5% of its value at the nose.
+/// Mirrors `SCENT_RANGE` in `common.wgsl`.
+pub const SCENT_RANGE: f32 = 3.0 * SCENT_DECAY_LENGTH;
+/// The nostrils sit this far ahead of the body's centre, along the facing
+/// direction. Mirrors `NOSTRIL_FORWARD_OFFSET` in `common.wgsl`.
+pub const NOSTRIL_FORWARD_OFFSET: f32 = 0.5;
+/// Each nostril sits this far to the side of the facing line, so the two
+/// sample the odour field at points 2 units apart. Mirrors
+/// `NOSTRIL_SIDE_OFFSET` in `common.wgsl`.
+pub const NOSTRIL_SIDE_OFFSET: f32 = 1.0;
+
 /// Raw visual data from the agent's point of view.
 /// A low-resolution grid of color+depth samples within the agent's field of view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +82,12 @@ pub struct SensoryFrame {
     /// Active touch contacts this tick.
     pub touch_contacts: Vec<TouchContact>,
 
+    // -- Smell --
+    /// Perceived food odour at the left and right nostrils, each in
+    /// `[0, 1)`: `1 − exp(−smell_strength · C)`, where `C` is the odour
+    /// concentration at the nostril (see [`SCENT_DECAY_LENGTH`]).
+    pub scent: [f32; 2],
+
     /// Current simulation tick.
     pub tick: u64,
 }
@@ -81,6 +105,7 @@ impl SensoryFrame {
             energy_delta: 0.0,
             integrity_delta: 0.0,
             touch_contacts: Vec::with_capacity(8),
+            scent: [0.0; 2],
             tick: 0,
         }
     }

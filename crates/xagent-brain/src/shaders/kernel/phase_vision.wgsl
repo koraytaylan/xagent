@@ -32,9 +32,17 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
     let row = ray_idx / VISION_W;
     let u = (f32(col) / f32(VISION_W - 1u)) * 2.0 - 1.0;
     let v = (f32(row) / f32(VISION_H - 1u)) * 2.0 - 1.0;
-    let tan_hf = tan(VISION_FOV_HALF);
+    // Heritable angles of view (degrees), clamped as the genes are bounded.
+    let gene_base = agent_id * BRAIN_STRIDE;
+    let horizontal_fov = clamp(
+        brain_state[gene_base + O_HORIZONTAL_FOV], HORIZONTAL_FOV_MIN, HORIZONTAL_FOV_MAX);
+    let vertical_fov = clamp(
+        brain_state[gene_base + O_VERTICAL_FOV], VERTICAL_FOV_MIN, VERTICAL_FOV_MAX);
+    let tan_half_horizontal = tan(radians(horizontal_fov) * 0.5);
+    let tan_half_vertical = tan(radians(vertical_fov) * 0.5);
     let right = vec3<f32>(facing.z, 0.0, -facing.x);
-    let ray_dir = normalize(facing + right * u * tan_hf + vec3<f32>(0.0, -v * tan_hf, 0.0));
+    let ray_dir = normalize(
+        facing + right * u * tan_half_horizontal + vec3<f32>(0.0, -v * tan_half_vertical, 0.0));
 
     // ── Ray march ─────────────────────────────────────────────────────
     var hit_color = vec4<f32>(0.53, 0.81, 0.92, 1.0);
@@ -348,4 +356,53 @@ fn phase_vision_senses(tid: u32) {
             touch_count += 1u;
         }
     }
+
+    // ── Smell ─────────────────────────────────────────────────────────
+    let scent_base = touch_base + MAX_TOUCH_CONTACTS * 4u;
+    let facing = vec3<f32>(
+        physics_state[base + P_FACING_X],
+        physics_state[base + P_FACING_Y],
+        physics_state[base + P_FACING_Z],
+    );
+    let smell_strength = clamp(
+        brain_state[tid * BRAIN_STRIDE + O_SMELL_STRENGTH], SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX);
+    let scent = sense_scent(pos, facing, smell_strength);
+    sensory_buffer[scent_base] = scent.x;
+    sensory_buffer[scent_base + 1u] = scent.y;
+}
+
+// Perceived food odour at the left and right nostrils. The nostrils sit
+// NOSTRIL_FORWARD_OFFSET ahead of the body and NOSTRIL_SIDE_OFFSET to either
+// side (left = −right, matching the vision columns). Every uneaten food item
+// within SCENT_RANGE of a nostril adds exp(−d / SCENT_DECAY_LENGTH) to that
+// nostril's concentration C; the nostril perceives 1 − exp(−strength · C),
+// so 0 strength smells nothing and a strong nose saturates up close.
+// Mirrors `sense_scent` in the sandbox's agent/senses.rs.
+fn sense_scent(pos: vec3<f32>, facing: vec3<f32>, strength: f32) -> vec2<f32> {
+    let right = vec3<f32>(facing.z, 0.0, -facing.x);
+    let nose = pos + facing * NOSTRIL_FORWARD_OFFSET;
+    let left_nostril = nose - right * NOSTRIL_SIDE_OFFSET;
+    let right_nostril = nose + right * NOSTRIL_SIDE_OFFSET;
+    let range_sq = SCENT_RANGE * SCENT_RANGE;
+    var concentration = vec2<f32>(0.0, 0.0);
+    let food_count = wc_u32(WC_FOOD_COUNT);
+    for (var f: u32 = 0u; f < food_count; f++) {
+        if (atomicLoad(&food_flags[f]) != 0u) { continue; }
+        let fbase = f * FOOD_STATE_STRIDE;
+        let fx = food_state[fbase + FOOD_POSITION_X];
+        let fz = food_state[fbase + FOOD_POSITION_Z];
+        let left_dx = fx - left_nostril.x;
+        let left_dz = fz - left_nostril.z;
+        let left_sq = left_dx * left_dx + left_dz * left_dz;
+        if (left_sq < range_sq) {
+            concentration.x += exp(-sqrt(left_sq) / SCENT_DECAY_LENGTH);
+        }
+        let right_dx = fx - right_nostril.x;
+        let right_dz = fz - right_nostril.z;
+        let right_sq = right_dx * right_dx + right_dz * right_dz;
+        if (right_sq < range_sq) {
+            concentration.y += exp(-sqrt(right_sq) / SCENT_DECAY_LENGTH);
+        }
+    }
+    return vec2<f32>(1.0, 1.0) - exp(-strength * concentration);
 }

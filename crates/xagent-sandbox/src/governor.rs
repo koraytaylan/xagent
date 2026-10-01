@@ -2042,6 +2042,22 @@ fn record_mutations(
             parent.orientation_offset as f64,
             child.orientation_offset as f64,
         ),
+        // Heritable sensory genes: angles of view and smell sensitivity.
+        (
+            "horizontal_fov_degrees",
+            parent.horizontal_fov_degrees as f64,
+            child.horizontal_fov_degrees as f64,
+        ),
+        (
+            "vertical_fov_degrees",
+            parent.vertical_fov_degrees as f64,
+            child.vertical_fov_degrees as f64,
+        ),
+        (
+            "smell_strength",
+            parent.smell_strength as f64,
+            child.smell_strength as f64,
+        ),
     ];
 
     for (name, old_val, new_val) in params_to_check {

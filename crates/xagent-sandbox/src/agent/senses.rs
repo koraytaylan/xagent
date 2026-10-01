@@ -1,5 +1,8 @@
 use glam::Vec3;
-use xagent_shared::{SensoryFrame, TouchContact, VisualField};
+use xagent_shared::{
+    BrainConfig, SensoryFrame, TouchContact, VisualField, NOSTRIL_FORWARD_OFFSET,
+    NOSTRIL_SIDE_OFFSET, SCENT_DECAY_LENGTH, SCENT_RANGE,
+};
 
 use super::AgentBody;
 use crate::world::biome::BiomeType;
@@ -84,6 +87,12 @@ pub fn fill_frame_non_vision(
         agent_grid,
         &mut frame.touch_contacts,
     );
+    frame.scent = sense_scent(
+        agent.body.position,
+        agent.body.facing,
+        BrainConfig::default().smell_strength,
+        world,
+    );
     frame.tick = tick;
 }
 
@@ -106,7 +115,50 @@ pub fn extract_senses_with_others(
     frame.integrity_delta = agent.integrity_delta();
     frame.touch_contacts.clear();
     detect_touch_with_others(agent, world, others, &mut frame.touch_contacts);
+    frame.scent = sense_scent(
+        agent.body.position,
+        agent.body.facing,
+        BrainConfig::default().smell_strength,
+        world,
+    );
     frame.tick = tick;
+}
+
+// ── smell ───────────────────────────────────────────────────────────────
+
+/// Perceived food odour at the left and right nostrils — the CPU mirror of
+/// `sense_scent` in the brain crate's `phase_vision.wgsl`. The nostrils sit
+/// `NOSTRIL_FORWARD_OFFSET` ahead of the body and `NOSTRIL_SIDE_OFFSET` to
+/// either side (left is the negative `right` side, matching the vision
+/// columns). Every uneaten food item within `SCENT_RANGE` of a nostril adds
+/// `exp(−d / SCENT_DECAY_LENGTH)` to that nostril's concentration `C`, and the
+/// nostril perceives `1 − exp(−smell_strength · C)`. The CPU frame builders
+/// use the seed smell strength; the live GPU pass reads each agent's gene.
+pub fn sense_scent(
+    position: Vec3,
+    facing: Vec3,
+    smell_strength: f32,
+    world: &WorldState,
+) -> [f32; 2] {
+    let right = Vec3::new(facing.z, 0.0, -facing.x);
+    let nose = position + facing * NOSTRIL_FORWARD_OFFSET;
+    let nostrils = [
+        nose - right * NOSTRIL_SIDE_OFFSET,
+        nose + right * NOSTRIL_SIDE_OFFSET,
+    ];
+    let range_sq = SCENT_RANGE * SCENT_RANGE;
+    let mut concentration = [0.0_f32; 2];
+    for food in world.food_items.iter().filter(|food| !food.consumed) {
+        for (side, nostril) in nostrils.iter().enumerate() {
+            let dx = food.position.x - nostril.x;
+            let dz = food.position.z - nostril.z;
+            let distance_sq = dx * dx + dz * dz;
+            if distance_sq < range_sq {
+                concentration[side] += (-distance_sq.sqrt() / SCENT_DECAY_LENGTH).exp();
+            }
+        }
+    }
+    concentration.map(|c| 1.0 - (-smell_strength * c).exp())
 }
 
 // ── vision ──────────────────────────────────────────────────────────────
@@ -433,5 +485,64 @@ fn detect_touch_positions(
                 surface_tag: TOUCH_AGENT,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::entity::FoodItem;
+    use xagent_shared::WorldConfig;
+
+    /// Distance of the probe food from the body: close enough for a single
+    /// item to be felt clearly by the seed nose.
+    const NEAR_DISTANCE: f32 = 4.0;
+    /// Distance of the probe food for the sensitivity comparison: far enough
+    /// that a weak nose is far from saturation.
+    const FAR_DISTANCE: f32 = 15.0;
+    const WEAK_NOSE: f32 = 0.5;
+    const STRONG_NOSE: f32 = 5.0;
+
+    fn world_with_food(positions: &[Vec3]) -> WorldState {
+        let mut world = WorldState::new(WorldConfig::default());
+        world.food_items = positions.iter().map(|&p| FoodItem::new(p)).collect();
+        world
+    }
+
+    #[test]
+    fn food_on_one_side_smells_stronger_in_that_nostril() {
+        // Facing +Z, `right` is +X, so the left nostril sits on the −X side.
+        let world = world_with_food(&[Vec3::new(-NEAR_DISTANCE, 0.0, 0.0)]);
+        let [left, right] = sense_scent(Vec3::ZERO, Vec3::Z, 1.0, &world);
+        assert!(
+            left > right && right > 0.0,
+            "food on the left should smell stronger on the left: left {left}, right {right}"
+        );
+    }
+
+    #[test]
+    fn no_nose_or_no_food_in_range_smells_nothing() {
+        let near = world_with_food(&[Vec3::new(NEAR_DISTANCE, 0.0, 0.0)]);
+        assert_eq!(sense_scent(Vec3::ZERO, Vec3::Z, 0.0, &near), [0.0, 0.0]);
+        let far = world_with_food(&[Vec3::new(2.0 * SCENT_RANGE, 0.0, 0.0)]);
+        assert_eq!(sense_scent(Vec3::ZERO, Vec3::Z, 1.0, &far), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn eaten_food_has_no_odour() {
+        let mut world = world_with_food(&[Vec3::new(NEAR_DISTANCE, 0.0, 0.0)]);
+        world.food_items[0].consumed = true;
+        assert_eq!(sense_scent(Vec3::ZERO, Vec3::Z, 1.0, &world), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_stronger_nose_smells_more_but_stays_below_saturation() {
+        let world = world_with_food(&[Vec3::new(0.0, 0.0, FAR_DISTANCE)]);
+        let weak = sense_scent(Vec3::ZERO, Vec3::Z, WEAK_NOSE, &world)[0];
+        let strong = sense_scent(Vec3::ZERO, Vec3::Z, STRONG_NOSE, &world)[0];
+        assert!(
+            weak > 0.0 && strong > weak && strong < 1.0,
+            "weak nose {weak}, strong nose {strong}"
+        );
     }
 }

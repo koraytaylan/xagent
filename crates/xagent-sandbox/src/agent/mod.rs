@@ -22,8 +22,10 @@ use xagent_brain::buffers::{
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
     DOG_SURROUND_RATIO_MIN, GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX,
-    GABOR_WAVELENGTH_MIN, INSTINCT_DANGER_STRENGTH_MAX, INSTINCT_DANGER_STRENGTH_MIN,
-    INSTINCT_FOOD_STRENGTH_MAX, INSTINCT_FOOD_STRENGTH_MIN, ORIENTATION_OFFSET_PERIOD,
+    GABOR_WAVELENGTH_MIN, HORIZONTAL_FOV_MAX, HORIZONTAL_FOV_MIN, INSTINCT_DANGER_STRENGTH_MAX,
+    INSTINCT_DANGER_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX, INSTINCT_FOOD_STRENGTH_MIN,
+    ORIENTATION_OFFSET_PERIOD, SMELL_STRENGTH_MAX, SMELL_STRENGTH_MIN, VERTICAL_FOV_MAX,
+    VERTICAL_FOV_MIN,
 };
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -643,6 +645,28 @@ fn mutate_config_with_strength_rng(
                 strength,
             )
             .rem_euclid(ORIENTATION_OFFSET_PERIOD),
+        // Heritable sensory genes: angles of view and smell sensitivity,
+        // perturbed with momentum and clamped to the bounds the vision and
+        // senses passes re-impose after reading them.
+        horizontal_fov_degrees: momentum
+            .biased_perturb_f(
+                rng,
+                parent.horizontal_fov_degrees,
+                "horizontal_fov_degrees",
+                strength,
+            )
+            .clamp(HORIZONTAL_FOV_MIN, HORIZONTAL_FOV_MAX),
+        vertical_fov_degrees: momentum
+            .biased_perturb_f(
+                rng,
+                parent.vertical_fov_degrees,
+                "vertical_fov_degrees",
+                strength,
+            )
+            .clamp(VERTICAL_FOV_MIN, VERTICAL_FOV_MAX),
+        smell_strength: momentum
+            .biased_perturb_f(rng, parent.smell_strength, "smell_strength", strength)
+            .clamp(SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX),
         // Heritable instinct genes: instinct strengths perturbed with
         // momentum and clamped to [INSTINCT_*_STRENGTH_MIN, INSTINCT_*_STRENGTH_MAX].
         instinct_danger_strength: momentum
@@ -820,6 +844,22 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.orientation_offset
         } else {
             b.orientation_offset
+        },
+        // Heritable sensory genes: uniform per-gene crossover.
+        horizontal_fov_degrees: if rng.random::<f32>() < 0.5 {
+            a.horizontal_fov_degrees
+        } else {
+            b.horizontal_fov_degrees
+        },
+        vertical_fov_degrees: if rng.random::<f32>() < 0.5 {
+            a.vertical_fov_degrees
+        } else {
+            b.vertical_fov_degrees
+        },
+        smell_strength: if rng.random::<f32>() < 0.5 {
+            a.smell_strength
+        } else {
+            b.smell_strength
         },
         // Heritable instinct genes: uniform per-gene crossover.
         instinct_danger_strength: if rng.random::<f32>() < 0.5 {
@@ -1175,6 +1215,9 @@ mod tests {
             orientation_offset: 10.0,
             instinct_danger_strength: 10.0,
             instinct_food_strength: 10.0,
+            horizontal_fov_degrees: 500.0,
+            vertical_fov_degrees: 500.0,
+            smell_strength: 50.0,
             ..BrainConfig::default()
         };
         let low = BrainConfig {
@@ -1184,6 +1227,9 @@ mod tests {
             orientation_offset: -10.0,
             instinct_danger_strength: -1.0,
             instinct_food_strength: -1.0,
+            horizontal_fov_degrees: 1.0,
+            vertical_fov_degrees: 1.0,
+            smell_strength: -1.0,
             ..BrainConfig::default()
         };
 
@@ -1226,6 +1272,25 @@ mod tests {
                     && child.instinct_food_strength <= INSTINCT_FOOD_STRENGTH_MAX,
                 "instinct_food_strength out of [{INSTINCT_FOOD_STRENGTH_MIN}, {INSTINCT_FOOD_STRENGTH_MAX}]: {}",
                 child.instinct_food_strength,
+            );
+            // Sensory genes: angles of view and smell sensitivity.
+            assert!(
+                child.horizontal_fov_degrees >= HORIZONTAL_FOV_MIN
+                    && child.horizontal_fov_degrees <= HORIZONTAL_FOV_MAX,
+                "horizontal_fov_degrees out of [{HORIZONTAL_FOV_MIN}, {HORIZONTAL_FOV_MAX}]: {}",
+                child.horizontal_fov_degrees,
+            );
+            assert!(
+                child.vertical_fov_degrees >= VERTICAL_FOV_MIN
+                    && child.vertical_fov_degrees <= VERTICAL_FOV_MAX,
+                "vertical_fov_degrees out of [{VERTICAL_FOV_MIN}, {VERTICAL_FOV_MAX}]: {}",
+                child.vertical_fov_degrees,
+            );
+            assert!(
+                child.smell_strength >= SMELL_STRENGTH_MIN
+                    && child.smell_strength <= SMELL_STRENGTH_MAX,
+                "smell_strength out of [{SMELL_STRENGTH_MIN}, {SMELL_STRENGTH_MAX}]: {}",
+                child.smell_strength,
             );
         };
 

@@ -1655,6 +1655,42 @@ impl<'a> TabContext<'a> {
                             .max_decimals(3),
                     );
                     ui.end_row();
+
+                    // Heritable sensory genes. Ranges match the mutation clamps.
+                    ui.label("horizontal_fov_degrees");
+                    ui.add(
+                        egui::DragValue::new(&mut b.horizontal_fov_degrees)
+                            .range(
+                                xagent_shared::HORIZONTAL_FOV_MIN
+                                    ..=xagent_shared::HORIZONTAL_FOV_MAX,
+                            )
+                            .speed(1.0)
+                            .max_decimals(1),
+                    );
+                    ui.end_row();
+
+                    ui.label("vertical_fov_degrees");
+                    ui.add(
+                        egui::DragValue::new(&mut b.vertical_fov_degrees)
+                            .range(
+                                xagent_shared::VERTICAL_FOV_MIN..=xagent_shared::VERTICAL_FOV_MAX,
+                            )
+                            .speed(1.0)
+                            .max_decimals(1),
+                    );
+                    ui.end_row();
+
+                    ui.label("smell_strength");
+                    ui.add(
+                        egui::DragValue::new(&mut b.smell_strength)
+                            .range(
+                                xagent_shared::SMELL_STRENGTH_MIN
+                                    ..=xagent_shared::SMELL_STRENGTH_MAX,
+                            )
+                            .speed(0.05)
+                            .max_decimals(2),
+                    );
+                    ui.end_row();
                 });
         });
 
@@ -2149,6 +2185,16 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("orientation_offset");
                         ui.monospace(format!("{:.3}", cfg.orientation_offset));
+                        ui.end_row();
+                        // Heritable sensory genes.
+                        ui.label("horizontal_fov_degrees");
+                        ui.monospace(format!("{:.1}", cfg.horizontal_fov_degrees));
+                        ui.end_row();
+                        ui.label("vertical_fov_degrees");
+                        ui.monospace(format!("{:.1}", cfg.vertical_fov_degrees));
+                        ui.end_row();
+                        ui.label("smell_strength");
+                        ui.monospace(format!("{:.2}", cfg.smell_strength));
                         ui.end_row();
                     });
             });

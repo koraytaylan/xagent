@@ -241,6 +241,29 @@ pub struct BrainConfig {
     /// `[INSTINCT_FOOD_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX]` = `[0.1, 1.0]`.
     #[serde(default = "default_instinct_food_strength")]
     pub instinct_food_strength: f32,
+    /// **Heritable (sensory genome).** Horizontal angle of view in degrees,
+    /// spread across the `vision_width` ray columns. Seed 90; perturbed by
+    /// `mutate_config`, clamped to `[HORIZONTAL_FOV_MIN, HORIZONTAL_FOV_MAX]`
+    /// = `[30, 170]`. A wider view sees more of the world at once with the
+    /// same rays, so each ray covers more angle. The vision pass re-imposes
+    /// the clamp after reading the gene.
+    #[serde(default = "default_horizontal_fov_degrees")]
+    pub horizontal_fov_degrees: f32,
+    /// **Heritable (sensory genome).** Vertical angle of view in degrees,
+    /// spread across the `vision_height` ray rows. Seed 90; perturbed by
+    /// `mutate_config`, clamped to `[VERTICAL_FOV_MIN, VERTICAL_FOV_MAX]` =
+    /// `[20, 150]`, and re-imposed by the vision pass.
+    #[serde(default = "default_vertical_fov_degrees")]
+    pub vertical_fov_degrees: f32,
+    /// **Heritable (sensory genome).** Sensitivity of the sense of smell.
+    /// Each nostril perceives `1 − exp(−smell_strength · C)`, where `C` is the
+    /// food odour concentration at the nostril (see `SCENT_DECAY_LENGTH` in
+    /// `sensory.rs`). 0 means no sense of smell; larger values detect fainter
+    /// odour from farther away and saturate sooner up close. Seed 1; perturbed
+    /// by `mutate_config`, clamped to `[SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX]`
+    /// = `[0, 5]`, and re-imposed by the senses pass.
+    #[serde(default = "default_smell_strength")]
+    pub smell_strength: f32,
     /// Profiling stage limit for the visual-cortex pass. `0` = run all stages
     /// (default, no short-circuit). `1` = retina fill only. `2` = retina + DoG
     /// center-surround. `3` = all stages (same as `0`). Non-zero values
@@ -284,6 +307,27 @@ pub const GABOR_ASPECT_RATIO_MAX: f32 = 1.0;
 pub const DOG_SURROUND_RATIO_MIN: f32 = 1.2;
 /// See [`GABOR_WAVELENGTH_MIN`].
 pub const DOG_SURROUND_RATIO_MAX: f32 = 3.0;
+
+/// Inclusive clamp bounds, in degrees, for the heritable horizontal angle of
+/// view. These mirror the WGSL `HORIZONTAL_FOV_*` constants in `common.wgsl`
+/// (the vision pass re-imposes them after reading the gene). The upper bound
+/// stays short of 180°, where the pinhole projection the rays use breaks
+/// down; the lower bound keeps food from slipping between rays entirely.
+pub const HORIZONTAL_FOV_MIN: f32 = 30.0;
+/// See [`HORIZONTAL_FOV_MIN`].
+pub const HORIZONTAL_FOV_MAX: f32 = 170.0;
+/// Inclusive clamp bounds, in degrees, for the heritable vertical angle of
+/// view. Mirrors `VERTICAL_FOV_*` in `common.wgsl`.
+pub const VERTICAL_FOV_MIN: f32 = 20.0;
+/// See [`VERTICAL_FOV_MIN`].
+pub const VERTICAL_FOV_MAX: f32 = 150.0;
+/// Inclusive clamp bounds for the heritable smell sensitivity. Mirrors
+/// `SMELL_STRENGTH_*` in `common.wgsl`. 0 switches the sense off; at the
+/// upper bound a single food item is still felt at the edge of
+/// `SCENT_RANGE`.
+pub const SMELL_STRENGTH_MIN: f32 = 0.0;
+/// See [`SMELL_STRENGTH_MIN`].
+pub const SMELL_STRENGTH_MAX: f32 = 5.0;
 
 /// Configuration for the world simulation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,6 +463,21 @@ fn default_dog_surround_ratio() -> f32 {
 /// `GABOR_ORIENTATION_OFFSET_SEED`.
 fn default_orientation_offset() -> f32 {
     0.0
+}
+
+/// Seed horizontal angle of view: the 90° the eye has always had.
+fn default_horizontal_fov_degrees() -> f32 {
+    90.0
+}
+
+/// Seed vertical angle of view: the 90° the eye has always had.
+fn default_vertical_fov_degrees() -> f32 {
+    90.0
+}
+
+/// Seed smell sensitivity.
+fn default_smell_strength() -> f32 {
+    1.0
 }
 
 fn default_instinct_danger_strength() -> f32 {
@@ -598,6 +657,9 @@ impl Default for BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            horizontal_fov_degrees: default_horizontal_fov_degrees(),
+            vertical_fov_degrees: default_vertical_fov_degrees(),
+            smell_strength: default_smell_strength(),
             cortex_stage_limit: 0,
         }
     }
@@ -696,6 +758,9 @@ impl BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            horizontal_fov_degrees: default_horizontal_fov_degrees(),
+            vertical_fov_degrees: default_vertical_fov_degrees(),
+            smell_strength: default_smell_strength(),
             cortex_stage_limit: 0,
         }
     }
@@ -737,6 +802,9 @@ impl BrainConfig {
             orientation_offset: default_orientation_offset(),
             instinct_danger_strength: default_instinct_danger_strength(),
             instinct_food_strength: default_instinct_food_strength(),
+            horizontal_fov_degrees: default_horizontal_fov_degrees(),
+            vertical_fov_degrees: default_vertical_fov_degrees(),
+            smell_strength: default_smell_strength(),
             cortex_stage_limit: 0,
         }
     }
@@ -887,6 +955,9 @@ mod tests {
         assert!((config.gabor_aspect_ratio - default_gabor_aspect_ratio()).abs() < 1e-6);
         assert!((config.dog_surround_ratio - default_dog_surround_ratio()).abs() < 1e-6);
         assert!((config.orientation_offset - default_orientation_offset()).abs() < 1e-6);
+        assert!((config.horizontal_fov_degrees - default_horizontal_fov_degrees()).abs() < 1e-6);
+        assert!((config.vertical_fov_degrees - default_vertical_fov_degrees()).abs() < 1e-6);
+        assert!((config.smell_strength - default_smell_strength()).abs() < 1e-6);
 
         // Older configs that also omit `visual_encoding_size` entirely must load
         // too — the retained serde default supplies it.

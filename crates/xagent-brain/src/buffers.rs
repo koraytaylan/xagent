@@ -44,16 +44,17 @@ const XAVIER_TANH_UNIFORM_FACTOR: f32 = 6.0;
 /// every layout, because the tail is vision-independent.
 const FEATURE_COUNT: usize = 8 * 6 * 4 + 8 * 6 + NON_VISUAL_FEATURE_COUNT;
 /// Non-visual feature tail width (wire-visual-features-into-encoder):
-/// the proprioception / interoception / touch features `coop_feature_extract`
-/// writes after the visual block — velocity magnitude(1) + facing(3) +
-/// angular(1) + energy ratio(1) + integrity ratio(1) + energy delta(1) +
-/// integrity delta(1) + touch(16) = 25. It is the same in both encoder layouts;
-/// only the leading visual block changes width with the cortex flag. Single
-/// canonical source mirrored by `NON_VISUAL_FEATURE_COUNT` in `common.wgsl`. Note
-/// this differs from `NON_VISUAL_COUNT` (27, the *sensory upload* width) by the
-/// two energy/integrity delta slots the brain re-reads same-cycle from physics
+/// the proprioception / interoception / touch / smell features
+/// `coop_feature_extract` writes after the visual block — velocity
+/// magnitude(1) + facing(3) + angular(1) + energy ratio(1) + integrity
+/// ratio(1) + energy delta(1) + integrity delta(1) + touch(16) + scent(2) =
+/// 27. It is the same in both encoder layouts; only the leading visual block
+/// changes width with the cortex flag. Single canonical source mirrored by
+/// `NON_VISUAL_FEATURE_COUNT` in `common.wgsl`. Note this differs from
+/// `NON_VISUAL_COUNT` (29, the *sensory upload* width) by the two
+/// energy/integrity delta slots the brain re-reads same-cycle from physics
 /// rather than from the batch-lagged sensory buffer.
-pub const NON_VISUAL_FEATURE_COUNT: usize = 25;
+pub const NON_VISUAL_FEATURE_COUNT: usize = 27;
 pub const MEMORY_CAP: usize = 128;
 pub const RECALL_K: usize = 16;
 pub const INITIAL_FORWARD_BIAS: f32 = 0.3;
@@ -63,9 +64,12 @@ pub const TOUCH_FEATURES: usize = 4; // dir_x, dir_z, intensity, tag/4
 
 // ── Sensory input layout (CPU → GPU upload) ───────────────────────────
 
+/// Scent channels: the perceived odour at the left and right nostrils.
+pub const SCENT_CHANNELS: usize = 2;
 /// Non-visual sensory channels (vision-independent).
-/// velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16)
-pub const NON_VISUAL_COUNT: usize = 3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTACTS * TOUCH_FEATURES;
+/// velocity(3) + facing(3) + angular_vel(1) + energy(1) + integrity(1) + e_delta(1) + i_delta(1) + touch(16) + scent(2)
+pub const NON_VISUAL_COUNT: usize =
+    3 + 3 + 1 + 1 + 1 + 1 + 1 + MAX_TOUCH_CONTACTS * TOUCH_FEATURES + SCENT_CHANNELS;
 
 // ── Brain state buffer offsets (reference 8×6 layout) ─────────────────
 // Absolute values are valid only for an 8×6 vision grid; for live layouts
@@ -119,6 +123,15 @@ pub const O_GABOR_ASPECT_RATIO: usize = O_GABOR_WAVELENGTH + 1;
 pub const O_DOG_SURROUND_RATIO: usize = O_GABOR_ASPECT_RATIO + 1;
 pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
 
+// ── Sensory-genome tail (heritable eye and nose genes) ─────────────────
+// Horizontal and vertical angle of view (degrees, read by the vision pass)
+// and smell sensitivity (read by the senses pass), contiguous after the
+// visual-genome genes and written per agent by `write_agent_heritable_config`.
+// Mirrored by the same-named overrides in `common.wgsl`.
+pub const O_HORIZONTAL_FOV: usize = O_ORIENTATION_OFFSET + 1;
+pub const O_VERTICAL_FOV: usize = O_HORIZONTAL_FOV + 1;
+pub const O_SMELL_STRENGTH: usize = O_VERTICAL_FOV + 1;
+
 // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
 // Linear head (128→1) on top of the forward model's predicted state s_prediction.
 // Trained online to predict raw_gradient; the previous tick's prediction provides
@@ -127,7 +140,7 @@ pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
 // mutation does not perturb them; lifetime gradient steps are the update.
 // The previous-prediction slot is episodic (marked absent at birth and on
 // death, because zero is a legal prediction), like O_PREV_VALUE.
-pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_ORIENTATION_OFFSET + 1;
+pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_SMELL_STRENGTH + 1;
 pub const O_HOMEO_PREDICTOR_BIAS: usize = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
 pub const O_PREV_HOMEO_PREDICTION: usize = O_HOMEO_PREDICTOR_BIAS + 1;
 
@@ -773,6 +786,9 @@ pub fn pack_sensory_frame(frame: &SensoryFrame, layout: &BrainLayout, out: &mut 
         }
         offset += TOUCH_FEATURES;
     }
+
+    // Scent (2): left and right nostrils
+    out[offset..offset + SCENT_CHANNELS].copy_from_slice(&frame.scent);
 }
 
 /// Fill a caller-owned world-config buffer in place.
@@ -913,6 +929,9 @@ pub fn init_brain_state_for(
     let delta_gabor_aspect_ratio = O_GABOR_ASPECT_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_dog_surround_ratio = O_DOG_SURROUND_RATIO - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_orientation_offset = O_ORIENTATION_OFFSET - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_horizontal_fov = O_HORIZONTAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_vertical_fov = O_VERTICAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_smell_strength = O_SMELL_STRENGTH - O_PREDICTOR_CONTEXT_WEIGHT;
 
     // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
     // Xavier-uniform for the 128→1 head weights (same fan-in as value head).
@@ -961,6 +980,9 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_gabor_aspect_ratio] = config.gabor_aspect_ratio;
     state[o_pred_ctx_wt + delta_dog_surround_ratio] = config.dog_surround_ratio;
     state[o_pred_ctx_wt + delta_orientation_offset] = config.orientation_offset;
+    state[o_pred_ctx_wt + delta_horizontal_fov] = config.horizontal_fov_degrees;
+    state[o_pred_ctx_wt + delta_vertical_fov] = config.vertical_fov_degrees;
+    state[o_pred_ctx_wt + delta_smell_strength] = config.smell_strength;
 
     state
 }
@@ -1091,26 +1113,26 @@ mod tests {
     #[test]
     fn default_layout_sensory_and_feature_counts() {
         let layout = BrainLayout::default();
-        // Default 8×6: 192 color + 48 depth + 27 non-visual = 267 sensory
-        assert_eq!(layout.sensory_stride, 267);
+        // Default 8×6: 192 color + 48 depth + 29 non-visual = 269 sensory
+        assert_eq!(layout.sensory_stride, 269);
         // Feature count excludes 2 non-visual fields (energy_delta, integrity_delta)
-        assert_eq!(layout.feature_count, 265);
+        assert_eq!(layout.feature_count, 267);
         assert!(layout.sensory_stride >= layout.feature_count);
         // The static offset constants anchor to the default layout.
         assert_eq!(layout.brain_stride, BRAIN_STRIDE);
-        // Brain scratch stride at 8×6: 265 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 822 (homeo region +2 for gradient predictor head)
-        assert_eq!(layout.brain_scratch_stride, 822);
+        // Brain scratch stride at 8×6: 267 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 824 (homeo region +2 for gradient predictor head)
+        assert_eq!(layout.brain_scratch_stride, 824);
     }
 
     #[test]
     fn odd_grid_layout_counts() {
         // 17×13 (the range-visibility grid): 884 color + 221 depth +
-        // 27 non-visual = 1132 sensory; feature_count drops the 2 deltas.
+        // 29 non-visual = 1134 sensory; feature_count drops the 2 deltas.
         let layout = BrainLayout::new(17, 13);
-        assert_eq!(layout.sensory_stride, 1132);
-        assert_eq!(layout.feature_count, 1130);
-        // Brain scratch stride at 17×13: 1130 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 1687 (homeo +2)
-        assert_eq!(layout.brain_scratch_stride, 1687);
+        assert_eq!(layout.sensory_stride, 1134);
+        assert_eq!(layout.feature_count, 1132);
+        // Brain scratch stride at 17×13: 1132 + 128 + 128 + 8 + 17 + 16 + 128 + 128 + 4 = 1689 (homeo +2)
+        assert_eq!(layout.brain_scratch_stride, 1689);
     }
 
     #[test]
@@ -1122,7 +1144,10 @@ mod tests {
         assert_eq!(O_GABOR_ASPECT_RATIO, O_GABOR_WAVELENGTH + 1);
         assert_eq!(O_DOG_SURROUND_RATIO, O_GABOR_ASPECT_RATIO + 1);
         assert_eq!(O_ORIENTATION_OFFSET, O_DOG_SURROUND_RATIO + 1);
-        assert_eq!(O_HOMEO_PREDICTOR_WEIGHTS, O_ORIENTATION_OFFSET + 1);
+        assert_eq!(O_HORIZONTAL_FOV, O_ORIENTATION_OFFSET + 1);
+        assert_eq!(O_VERTICAL_FOV, O_HORIZONTAL_FOV + 1);
+        assert_eq!(O_SMELL_STRENGTH, O_VERTICAL_FOV + 1);
+        assert_eq!(O_HOMEO_PREDICTOR_WEIGHTS, O_SMELL_STRENGTH + 1);
         assert_eq!(
             O_HOMEO_PREDICTOR_BIAS,
             O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION
@@ -1228,7 +1253,7 @@ mod tests {
         assert_eq!(layout.vision_color_count, pixels * 4);
         assert_eq!(layout.vision_depth_count, pixels);
         assert_eq!(layout.sensory_stride, pixels * 5 + NON_VISUAL_COUNT);
-        assert_eq!(layout.feature_count, pixels * 5 + 25);
+        assert_eq!(layout.feature_count, pixels * 5 + NON_VISUAL_FEATURE_COUNT);
     }
 
     #[test]
@@ -1241,7 +1266,7 @@ mod tests {
             assert_eq!(layout.vision_color_count, pixels * 4);
             assert_eq!(
                 layout.feature_count,
-                layout.vision_color_count + layout.vision_depth_count + 25
+                layout.vision_color_count + layout.vision_depth_count + NON_VISUAL_FEATURE_COUNT
             );
             // Verify brain_stride matches the offset chain
             let fc = layout.feature_count;

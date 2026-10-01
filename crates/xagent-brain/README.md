@@ -50,17 +50,17 @@ sense --> extract --> encode --> habituate/homeo --> recall --> predict+act --> 
 
 The most important thing to understand about this architecture: **the brain has zero semantic knowledge of its inputs**.
 
-In the live runtime sensory features are produced on-GPU: the vision pass raycasts colors and depths into `sensory_buffer`, and the same vision pipeline's `phase_vision_senses` (`src/shaders/kernel/phase_vision.wgsl`) appends per-agent proprioception, interoception, energy/integrity deltas, and touch contacts in a fixed positional layout — touch slots are filled in 3×3-cell discovery order (food cells first, then agent cells) up to `MAX_TOUCH_CONTACTS`, with each contact encoded as `(direction_x, direction_z, normalized_proximity, surface_tag / 4.0)`. The CPU-side `buffers::pack_sensory_frame()` is only exercised by `buffers` tests; it does not feed the live brain. The brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` then projects `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 267` f32 = 192 RGBA + 48 depth + 27 non-visual) into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 25`, = 265 f32 for the default 8×6). The packing is not free of inductive bias — the modality layout, contact-cap, and `surface_tag` category channel are all hand-chosen priors — but they live entirely in shader/packer code, not as named fields the brain reads. (The `surface_tag` enum reserves `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, and `TOUCH_AGENT`, but `phase_vision_senses` currently emits only `TOUCH_FOOD` and `TOUCH_AGENT` contacts.) From `coop_feature_extract` onward, the brain operates on opaque numerical vectors: no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
+In the live runtime sensory features are produced on-GPU: the vision pass raycasts colors and depths into `sensory_buffer`, and the same vision pipeline's `phase_vision_senses` (`src/shaders/kernel/phase_vision.wgsl`) appends per-agent proprioception, interoception, energy/integrity deltas, and touch contacts in a fixed positional layout — touch slots are filled in 3×3-cell discovery order (food cells first, then agent cells) up to `MAX_TOUCH_CONTACTS`, with each contact encoded as `(direction_x, direction_z, normalized_proximity, surface_tag / 4.0)`. The CPU-side `buffers::pack_sensory_frame()` is only exercised by `buffers` tests; it does not feed the live brain. The brain's first stage `coop_feature_extract` in `src/shaders/kernel/brain_passes.wgsl` then projects `sensory_buffer` (default 8×6: `SENSORY_STRIDE = 269` f32 = 192 RGBA + 48 depth + 29 non-visual) into the feature vector (`BrainLayout::feature_count = VISION_RAYS * 5 + 27`, = 267 f32 for the default 8×6). The packing is not free of inductive bias — the modality layout, contact-cap, and `surface_tag` category channel are all hand-chosen priors — but they live entirely in shader/packer code, not as named fields the brain reads. (The `surface_tag` enum reserves `TOUCH_FOOD`, `TOUCH_TERRAIN_EDGE`, `TOUCH_HAZARD`, and `TOUCH_AGENT`, but `phase_vision_senses` currently emits only `TOUCH_FOOD` and `TOUCH_AGENT` contacts.) From `coop_feature_extract` onward, the brain operates on opaque numerical vectors: no concept of "vision," no awareness of "eyes," no understanding that index 47 was once an RGBA pixel and index 73 was once an energy level.
 
 A biologically-grounded early visual cortex now sits in this path (plan 0008, *Hubel-Wiesel Visual Encoder*). When `visual_cortex_enabled` is set, the cooperative `coop_visual_cortex` pass — inserted between `coop_feature_extract` and `coop_encode` in `brain_passes.wgsl` — turns the dense luminance retina into Difference-of-Gaussians center-surround responses, an oriented Gabor simple-cell bank, and quadrature-energy + MAX-pooled complex cells, and writes that compact vector into the head of the feature array in place of the raw vision slice. Its receptive fields are biologically-seeded heritable genes (`retina_*`, `gabor_wavelength`, `gabor_aspect_ratio`, `dog_surround_ratio`, `orientation_offset`). This **supersedes the legacy `visual_encoding_size` field** (issue #106): that field was a never-wired stand-in for a visual encoder; the structured visual-cortex config is its replacement. `visual_encoding_size` is retained only so older saved configs still deserialize. None of this changes the point above — the cortex output is still a label-free numerical vector the brain must learn to interpret; it adds biological *structure*, not semantics.
 
 ```
-World --> GPU vision pass --> sensory_buffer [267 f32] --> coop_feature_extract --> [265 f32]
+World --> GPU vision pass --> sensory_buffer [269 f32] --> coop_feature_extract --> [267 f32]
               |                                                  |
      phase_vision_raycast +                            Brain sees only a
      phase_vision_senses (GPU)                         flat array<f32>
 
-(the test-only pack_sensory_frame() mirrors the same [267 f32] layout — not in the live path)
+(the test-only pack_sensory_frame() mirrors the same [269 f32] layout — not in the live path)
 ```
 
 Consider what happens when another agent -- say, a magenta-colored one -- enters the visual field. The brain doesn't receive "agent detected" or "entity of type Agent at bearing 30 degrees." It experiences indices 12--15 shifting from `[0.3, 0.6, 0.2, 1.0]` to `[0.9, 0.2, 0.6, 1.0]`. Simultaneously, a touch contact might add nonzero values at indices 199--202 (direction, intensity, tag). The brain has no legend for any of this. It doesn't know that `surface_tag=4` means "agent." It doesn't know that the shifted values represent magenta. Over hundreds of ticks, if this pattern of input correlates with energy dropping (food competition), the brain discovers -- through prediction error and homeostatic gradient alone -- that "those numerical patterns are bad for me." The concept of "that's a competitor" *emerges* from experience, not from labels.
@@ -199,7 +199,7 @@ xagent-brain/src/shaders/kernel/   -- All shader fragments live here.
                               └───────────────────────────┘
 
   Persistent GPU buffers (live across ticks; sizes shown for default 8×6 vision, `ENCODED_DIMENSION = 128`):
-  ─── brain_state_buf ────  `BrainLayout::brain_stride` (69,325 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces, recent-experience ring, sensory means)
+  ─── brain_state_buf ────  `BrainLayout::brain_stride` (69,586 f32/agent)  (encoder weights, predictor, habituation, homeo, action, fatigue, TD value head + traces, recent-experience ring, sensory means)
   ─── pattern_buf ────────  `PATTERN_STRIDE` (17,539 f32/agent)            (128 patterns: states, norms, reinforcement, motor, meta, active)
   ─── physics_state_buf ──     per-agent     (position, velocity, vitals, motor telemetry echoes)
   ─── food_state_buf ─────     per-food      (position, consumed flag, respawn timer)
@@ -216,7 +216,7 @@ The `kernel_tick.wgsl` per-agent pass runs the seven cooperative brain functions
 
 ```
 brain cycle (executed vision_stride times per kernel-batch):
-  1. coop_feature_extract   sensory_buf (`SENSORY_STRIDE`, 267 f32 for 8×6) → features (`BrainLayout::feature_count` = `VISION_RAYS * 5 + 25`, 265 f32 for 8×6)
+  1. coop_feature_extract   sensory_buf (`SENSORY_STRIDE`, 269 f32 for 8×6) → features (`BrainLayout::feature_count` = `VISION_RAYS * 5 + 27`, 267 f32 for 8×6)
      coop_sensory_adapt     visual features minus their running means (sensory adaptation)
   2. coop_encode            features → encoded (`ENCODED_DIMENSION` = 128 f32)
   3. coop_habituate_homeo   habituation EMA + homeostatic gradient/urgency
@@ -273,32 +273,32 @@ Buffer offsets, strides, and dimension constants live in two coordinated source-
 | Constant | Value (default 8×6) | Description |
 |----------|--------------------:|-------------|
 | `ENCODED_DIMENSION` | 128 | Internal encoded state dimensionality (`crates/xagent-brain/src/buffers.rs`) |
-| `BrainLayout::feature_count` | 265 = `VISION_RAYS * 5 + 25` | Feature vector size (192 RGBA + 48 depth + 25 derived non-visual; scales with `VISION_W`/`VISION_H`) |
+| `BrainLayout::feature_count` | 267 = `VISION_RAYS * 5 + 27` | Feature vector size (192 RGBA + 48 depth + 27 derived non-visual; scales with `VISION_W`/`VISION_H`) |
 | `MEMORY_CAP` | 128 | Maximum patterns per agent |
 | `RECALL_K` | 16 | Top-K recalled patterns per tick |
 | `ERROR_HISTORY_LEN` | 128 | Prediction-error ring-buffer size |
 | `TD_DISCOUNT` / `TD_LAMBDA` | 0.97 / 0.9 | TD(λ) credit horizon and trace decay |
 
-The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 265`): `brain_stride = 69,325` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
+The feature/encoded sizes and `BrainLayout::brain_stride` scale with the configured vision dimensions (via `feature_count`). `PATTERN_STRIDE` does **not** — it is a fixed `pub const` derived from `MEMORY_CAP` and `ENCODED_DIMENSION`. `BrainLayout::new(vision_width, vision_height)` is the single source of truth for the vision-dependent values — see `crates/xagent-brain/src/buffers.rs`. For the default 8×6 layout (`ENCODED_DIMENSION = 128`, `feature_count = 267`): `brain_stride = 69,586` f32, with the fixed `PATTERN_STRIDE = 17,539` f32. The matching `O_*` offsets and per-region sizes are surfaced to WGSL via the `override` constants in `common.wgsl`, with the values supplied at pipeline creation by `gpu_kernel.rs`.
 
 ### Sensory Buffer Layout (GPU-produced)
 
 ```
-[  192 RGBA vision  |  48 depth  |  vel(3)  fac(3)  ang(1)  e(1)  i(1)  ed(1)  id(1)  touch(16)  ]
- ^                   ^            ^                                                                ^
- 0                   192          240                                                              267
+[  192 RGBA vision  |  48 depth  |  vel(3)  fac(3)  ang(1)  e(1)  i(1)  ed(1)  id(1)  touch(16)  scent(2)  ]
+ ^                   ^            ^                                                                          ^
+ 0                   192          240                                                                        269
 ```
 
-Total for the default 8×6 vision: `SENSORY_STRIDE = 267` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, and up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
+Total for the default 8×6 vision: `SENSORY_STRIDE = 269` f32 per agent. In the live `GpuKernel` runtime this layout is written directly into `sensory_buffer` by the vision pass — RGBA + depth come from `phase_vision_raycast`, and the non-visual tail (velocity, facing, angular velocity, normalized energy/integrity, energy/integrity deltas, up to `MAX_TOUCH_CONTACTS` × 4-channel touch contacts, and the left and right nostrils' perceived food odour) is written by `phase_vision_senses`. Touch contacts are filled in 3×3-cell discovery order, food cells before agent cells, and stop at `MAX_TOUCH_CONTACTS`; unused slots stay zeroed. The CPU-side `buffers::pack_sensory_frame()` mirrors this layout but is only used by `buffers` tests — it is not in the per-tick data path.
 
-### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 69,325 f32 for the default 8×6 layout)
+### Brain State Buffer (per agent: `BrainLayout::brain_stride`, 69,586 f32 for the default 8×6 layout)
 
 Regions (in offset order; concrete offsets are dimension-dependent and emitted by `BrainLayout` — see `crates/xagent-brain/src/buffers.rs`):
 
 - `O_ENCODER_WEIGHTS` — `feature_count * ENCODED_DIMENSION` (= 33,920 for 8×6) encoder weight matrix.
 - `O_ENCODER_BIASES` — `ENCODED_DIMENSION` (128) per-dimension bias.
 - `O_PREDICTOR_WEIGHTS` — `PREDICTOR_DIMENSION * ENCODED_DIMENSION` predictor matrix (operates in encoded space).
-- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, per-agent `movement_speed`, and the TD critic state — value weights (`O_VALUE_WEIGHTS`, `ENCODED_DIMENSION`) + bias + previous value, the three eligibility-trace vectors (`O_TRACE_CRITIC` / `O_TRACE_FWD` / `O_TRACE_TURN`, `ENCODED_DIMENSION` each), and the three scalar trace biases (`O_TRACE_BIASES`).
+- `O_PREDICTOR_CONTEXT_WEIGHT` and the rest of the fixed-size tail (`FIXED_TAIL_SIZE`): predictor error ring, habituation EMA + attenuation, previous-encoded snapshot, homeostasis state, action/turn policy weights + biases, exploration rate, motor-fatigue ring + cursor + factor + length, previous prediction, tick counter, heritable config, per-agent `movement_speed`, the heritable visual-genome genes and the sensory-genome genes (`O_HORIZONTAL_FOV` / `O_VERTICAL_FOV` in degrees, read by the vision pass, and `O_SMELL_STRENGTH`, read by the senses pass), and the TD critic state — value weights (`O_VALUE_WEIGHTS`, `ENCODED_DIMENSION`) + bias + previous value, the three eligibility-trace vectors (`O_TRACE_CRITIC` / `O_TRACE_FWD` / `O_TRACE_TURN`, `ENCODED_DIMENSION` each), and the three scalar trace biases (`O_TRACE_BIASES`).
 - `O_RECENT_KEYS`, `O_RECENT_RETURNS`, `O_RECENT_TICKS`, `O_RECENT_STATE`, `O_RECENT_NORMS` — the critic's recent-experience ring (§ TD credit, value replay): `RECENT_CAP × ENCODED_DIMENSION` slot-major keys plus a return, stored tick, state (empty / open / settled) and squared key size per slot. They are the last part of the fixed tail.
 - `O_SENSORY_MEAN` — `feature_count` running means for sensory adaptation (§6.1); only the visual block is used. It follows the fixed tail, so it is the one region after the encoder that scales with the vision dimensions.
 
@@ -314,11 +314,11 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ## 6. Component Deep Dive: The 7 Brain Stages
 
-> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The canonical dimensions and offsets are emitted by `BrainLayout` in `crates/xagent-brain/src/buffers.rs` and surfaced to WGSL via `common.wgsl`; for the default 8×6 vision they evaluate to `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = 265`. Any older `DIM = 32` / `FEATURE_COUNT = 217` literals in the §§6.1–6.7 prose are legacy — defer to `buffers.rs` and `common.wgsl` whenever the numbers disagree.
+> **Note:** the seven stages described below are the conceptual pipeline. They live in `src/shaders/kernel/brain_passes.wgsl` as cooperative functions (`coop_feature_extract`, `coop_encode`, `coop_habituate_homeo`, `coop_recall_score`, `coop_recall_topk`, `coop_predict_and_act`, `coop_learn_and_store`) and are inlined into `kernel_tick.wgsl` and `brain_tick.wgsl` at composition time. There are no per-stage shader files. The canonical dimensions and offsets are emitted by `BrainLayout` in `crates/xagent-brain/src/buffers.rs` and surfaced to WGSL via `common.wgsl`; for the default 8×6 vision they evaluate to `ENCODED_DIMENSION = 128` and `BrainLayout::feature_count = 267`. Any older `DIM = 32` / `FEATURE_COUNT = 217` literals in the §§6.1–6.7 prose are legacy — defer to `buffers.rs` and `common.wgsl` whenever the numbers disagree.
 
 ### 6.1 Feature Extraction -- `coop_feature_extract`
 
-**What it does**: Transforms raw sensory input (`SENSORY_STRIDE = 267` f32: 192 color + 48 depth + 27 non-visual) into the brain feature vector (`FEATURE_COUNT = 265` f32: 192 color + 48 depth + 25 derived non-visual). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
+**What it does**: Transforms raw sensory input (`SENSORY_STRIDE = 269` f32: 192 color + 48 depth + 29 non-visual) into the brain feature vector (`FEATURE_COUNT = 267` f32: 192 color + 48 depth + 27 derived non-visual). This is the first stage of the semantic firewall -- structured sensory data becomes a flat feature array.
 
 **How it works**:
 
@@ -334,7 +334,9 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 6. **Touch contacts**: Copies 4 contact slots x 4 features = 16 values `[dir_x, dir_z, intensity, surface_tag/4]`.
 
-**Feature layout**: `[192 RGBA | 48 depth | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch] = 265`
+7. **Smell**: Copies the two nostrils' perceived food odour `[left, right]`. The senses pass sums `exp(−d / SCENT_DECAY_LENGTH)` (10 units) over every uneaten food item within `SCENT_RANGE` (30 units) of each nostril, which sit 0.5 units ahead of the body and 1 unit to either side. Each nostril perceives `1 − exp(−smell_strength · C)`, where `smell_strength` is the agent's heritable gene (0 = no sense of smell).
+
+**Feature layout**: `[192 RGBA | 48 depth | 1 speed | 3 facing | 1 angular | 1 energy | 1 integrity | 1 e_delta | 1 i_delta | 16 touch | 2 scent] = 267`
 
 **Sensory adaptation** -- `coop_sensory_adapt`: before encoding, each visual feature (the raw vision block, or the cortex output when the visual cortex is on) is replaced by its difference from a per-agent running mean kept at `O_SENSORY_MEAN`, and the mean then moves toward the feature at `SENSORY_ADAPTATION_RATE` (0.01 per brain tick, about 100 brain ticks). What is always in view -- sky, the ground's colour -- fades toward zero, the way a constant odour stops being noticed, while what comes and goes stays. The mean survives death: it describes the surroundings, not an episode. The non-visual features are not adapted. The split/tiled path applies the same step in `phase_brain_features`.
 
@@ -342,7 +344,7 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 
 ### 6.2 Encoding -- `coop_encode`
 
-**What it does**: Projects the 265-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 265 inputs compressed to 128 outputs, forcing the brain to learn what matters.
+**What it does**: Projects the 267-dimensional feature vector into a 128-dimensional encoded representation (`ENCODED_DIMENSION`) via a learned weight matrix and tanh nonlinearity. This is the **information bottleneck** -- 267 inputs compressed to 128 outputs, forcing the brain to learn what matters.
 
 **How it works**:
 
@@ -350,13 +352,13 @@ Integer values (cursors, counts, tick counters) are stored as `f32` in GPU buffe
 encoded[d] = fast_tanh( sum_f( features[f] * weights[f * ENCODED_DIMENSION + d] ) + biases[d] )
 ```
 
-For each of the 128 output dimensions, the shader computes a weighted sum across all 265 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
+For each of the 128 output dimensions, the shader computes a weighted sum across all 267 features (column-major weight layout: `weights[f * ENCODED_DIMENSION + d]`) plus a per-dimension bias, then squashes through `fast_tanh`.
 
 **Weight initialization** (in `buffers::init_brain_state`): Xavier/Glorot uniform -- `uniform(-scale, scale)` where `scale = 1/sqrt(FEATURE_COUNT)`. This prevents tanh saturation at initialization.
 
 **Weight layout**: The encoder weight matrix is stored column-major (`[FEATURE_COUNT x ENCODED_DIMENSION]`, indexed as `[f * ENCODED_DIMENSION + d]`). This layout means each output dimension's weights are scattered across memory at stride `ENCODED_DIMENSION` -- not cache-optimal on CPU, but irrelevant on GPU where each invocation computes one agent's full encoding.
 
-**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA + 48 depth + 25 non-visual features = 265 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
+**Emergent property**: The encoder creates a **selectivity bottleneck**. 192 RGBA + 48 depth + 27 non-visual features = 267 inputs compressed to 128 floats. What gets through this bottleneck is what the brain "pays attention to." The tanh squashing bounds all encoded values to [-1, 1], making cosine similarity a natural distance metric for downstream recall.
 
 ---
 
@@ -637,7 +639,7 @@ None of these behaviors are explicitly programmed. They arise from the interacti
 
 | Phenomenon | How It Emerges | Contributing Stages |
 |------------|---------------|---------------------|
-| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 265 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
+| **Attention** | Memory capacity (128) forces selective recall; encoder bottleneck (`feature_count` → `ENCODED_DIMENSION`, e.g. 267 → 128 for 8×6) compresses information | `coop_encode`, `coop_recall_score` + `coop_recall_topk` |
 | **Fear / Avoidance** | Damage produces a negative per-tick homeostatic delta (urgency-amplified — the TD reward) --> negative TD error --> eligibility traces blame the recently active state-action directions --> policy weights learn to avoid danger-associated features, while the value head marks danger-correlated states as low-value so later TD errors penalize approaching them | `coop_habituate_homeo`, `coop_predict_and_act` (TD credit) |
 | **Curiosity** | High prediction error in safe situations --> exploration noise increases; habituation produces a curiosity bonus when input is monotonous, further boosting exploration | `coop_habituate_homeo`, `coop_predict_and_act` (exploration) |
 | **Habit Formation** | Repeated successful actions build strong policy weights --> exploitation ratio increases --> behavior becomes automatic | `coop_predict_and_act` (credit), `coop_learn_and_store` (reinforcement) |

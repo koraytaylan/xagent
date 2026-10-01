@@ -43,7 +43,7 @@ fn phase_brain_features(
     }
     let non_visual_base = select(VISUAL_FEATURE_COUNT, vision_count, !visual_cortex_enabled);
 
-    // Non-visual features (25 values) — thread 0 only.
+    // Non-visual features (27 values) — thread 0 only.
     if (tid == 0u) {
         var fi = non_visual_base;
         let vel_offset = vision_count;
@@ -74,5 +74,10 @@ fn phase_brain_features(
             brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + to + 2u]; fi = fi + 1u;
             brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + to + 3u]; fi = fi + 1u;
         }
+        // Smell: the left and right nostrils, packed after the touch contacts,
+        // exactly as `coop_feature_extract` places them.
+        let scent_offset = touch_offset + MAX_TOUCH_CONTACTS * 4u;
+        brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset]; fi = fi + 1u;
+        brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;
     }
 }

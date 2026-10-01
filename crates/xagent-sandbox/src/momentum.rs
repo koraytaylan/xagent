@@ -177,6 +177,9 @@ impl MutationMomentum {
             ("gabor_aspect_ratio", parent.gabor_aspect_ratio),
             ("dog_surround_ratio", parent.dog_surround_ratio),
             ("orientation_offset", parent.orientation_offset),
+            ("horizontal_fov_degrees", parent.horizontal_fov_degrees),
+            ("vertical_fov_degrees", parent.vertical_fov_degrees),
+            ("smell_strength", parent.smell_strength),
         ];
 
         for (name, parent_val) in &params {
@@ -199,6 +202,9 @@ impl MutationMomentum {
                         "gabor_aspect_ratio" => w.gabor_aspect_ratio,
                         "dog_surround_ratio" => w.dog_surround_ratio,
                         "orientation_offset" => w.orientation_offset,
+                        "horizontal_fov_degrees" => w.horizontal_fov_degrees,
+                        "vertical_fov_degrees" => w.vertical_fov_degrees,
+                        "smell_strength" => w.smell_strength,
                         _ => *parent_val,
                     };
                     (w_val - parent_val) / denominator

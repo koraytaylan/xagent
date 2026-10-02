@@ -2067,7 +2067,8 @@ fn record_mutations(
             parent.orientation_offset as f64,
             child.orientation_offset as f64,
         ),
-        // Heritable sensory genes: angles of view and smell sensitivity.
+        // Heritable sensory genes: angles of view, smell sensitivity and
+        // the visual pathway's plasticity.
         (
             "horizontal_fov_degrees",
             parent.horizontal_fov_degrees as f64,
@@ -2082,6 +2083,11 @@ fn record_mutations(
             "smell_strength",
             parent.smell_strength as f64,
             child.smell_strength as f64,
+        ),
+        (
+            "vision_plasticity",
+            parent.vision_plasticity as f64,
+            child.vision_plasticity as f64,
         ),
     ];
 
@@ -3779,7 +3785,8 @@ mod tests {
             let sensory_moved = config.horizontal_fov_degrees
                 != parent_config.horizontal_fov_degrees
                 || config.vertical_fov_degrees != parent_config.vertical_fov_degrees
-                || config.smell_strength != parent_config.smell_strength;
+                || config.smell_strength != parent_config.smell_strength
+                || config.vision_plasticity != parent_config.vision_plasticity;
             assert!(
                 sensory_moved,
                 "slot {slot} should carry mutated sensory genes"
@@ -3788,6 +3795,7 @@ mod tests {
                 horizontal_fov_degrees: parent_config.horizontal_fov_degrees,
                 vertical_fov_degrees: parent_config.vertical_fov_degrees,
                 smell_strength: parent_config.smell_strength,
+                vision_plasticity: parent_config.vision_plasticity,
                 ..config.clone()
             };
             assert_eq!(

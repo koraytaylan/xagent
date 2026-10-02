@@ -180,6 +180,7 @@ impl MutationMomentum {
             ("horizontal_fov_degrees", parent.horizontal_fov_degrees),
             ("vertical_fov_degrees", parent.vertical_fov_degrees),
             ("smell_strength", parent.smell_strength),
+            ("vision_plasticity", parent.vision_plasticity),
         ];
 
         for (name, parent_val) in &params {
@@ -205,6 +206,7 @@ impl MutationMomentum {
                         "horizontal_fov_degrees" => w.horizontal_fov_degrees,
                         "vertical_fov_degrees" => w.vertical_fov_degrees,
                         "smell_strength" => w.smell_strength,
+                        "vision_plasticity" => w.vision_plasticity,
                         _ => *parent_val,
                     };
                     (w_val - parent_val) / denominator

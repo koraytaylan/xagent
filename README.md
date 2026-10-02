@@ -327,6 +327,7 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 | `horizontal_fov_degrees` | Horizontal angle of view the vision rays span (default 90, bounds 30–170). Wider → sees more at once, each ray covers more angle. Heritable. |
 | `vertical_fov_degrees` | Vertical angle of view (default 90, bounds 20–150). Heritable. |
 | `smell_strength` | Sensitivity of the two nostrils to food odour (default 1, bounds 0–5; 0 = no smell). Higher → faint odour from farther away, saturating sooner up close. Heritable. |
+| `vision_plasticity` | Multiplier on the visual pathway's learning rate (default 1, bounds 0–30; 0 = the pathway keeps its inherited weights). Higher → a life learns sooner to turn by sight, toward food and away from hazard ground, with noisier weights. Heritable. |
 | `brain_tick_stride` | Physics ticks per brain+vision cycle (default 10). Higher → faster but less responsive. |
 | `vision_stride` | Brain cycles between global passes — grid rebuild, food respawn, collisions, vision (default 1). Higher → more brain throughput, less frequent vision updates; at 10 a free-running agent walks farther between frames than it can see food. |
 | `metabolic_rate` | Multiplier for all energy costs (default 0.5). Lower → agents survive longer. |

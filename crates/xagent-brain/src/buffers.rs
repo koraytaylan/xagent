@@ -124,13 +124,16 @@ pub const O_DOG_SURROUND_RATIO: usize = O_GABOR_ASPECT_RATIO + 1;
 pub const O_ORIENTATION_OFFSET: usize = O_DOG_SURROUND_RATIO + 1;
 
 // ── Sensory-genome tail (heritable eye and nose genes) ─────────────────
-// Horizontal and vertical angle of view (degrees, read by the vision pass)
-// and smell sensitivity (read by the senses pass), contiguous after the
-// visual-genome genes and written per agent by `write_agent_heritable_config`.
-// Mirrored by the same-named overrides in `common.wgsl`.
+// Horizontal and vertical angle of view (degrees, read by the vision pass),
+// smell sensitivity (read by the senses pass) and the visual pathway's
+// plasticity (a multiplier on its learning rate, read by the brain passes),
+// contiguous after the visual-genome genes and written per agent by
+// `write_agent_heritable_config`. Mirrored by the same-named overrides in
+// `common.wgsl`.
 pub const O_HORIZONTAL_FOV: usize = O_ORIENTATION_OFFSET + 1;
 pub const O_VERTICAL_FOV: usize = O_HORIZONTAL_FOV + 1;
 pub const O_SMELL_STRENGTH: usize = O_VERTICAL_FOV + 1;
+pub const O_VISION_PLASTICITY: usize = O_SMELL_STRENGTH + 1;
 
 // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
 // Linear head (128→1) on top of the forward model's predicted state s_prediction.
@@ -140,7 +143,7 @@ pub const O_SMELL_STRENGTH: usize = O_VERTICAL_FOV + 1;
 // mutation does not perturb them; lifetime gradient steps are the update.
 // The previous-prediction slot is episodic (marked absent at birth and on
 // death, because zero is a legal prediction), like O_PREV_VALUE.
-pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_SMELL_STRENGTH + 1;
+pub const O_HOMEO_PREDICTOR_WEIGHTS: usize = O_VISION_PLASTICITY + 1;
 pub const O_HOMEO_PREDICTOR_BIAS: usize = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
 pub const O_PREV_HOMEO_PREDICTION: usize = O_HOMEO_PREDICTOR_BIAS + 1;
 
@@ -974,6 +977,7 @@ pub fn init_brain_state_for(
     let delta_horizontal_fov = O_HORIZONTAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_vertical_fov = O_VERTICAL_FOV - O_PREDICTOR_CONTEXT_WEIGHT;
     let delta_smell_strength = O_SMELL_STRENGTH - O_PREDICTOR_CONTEXT_WEIGHT;
+    let delta_vision_plasticity = O_VISION_PLASTICITY - O_PREDICTOR_CONTEXT_WEIGHT;
 
     // ── Homeostatic gradient predictor (homeostatic gradient predictor head) ─────────────────────────
     // Xavier-uniform for the 128→1 head weights (same fan-in as value head).
@@ -1025,6 +1029,7 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_horizontal_fov] = config.horizontal_fov_degrees;
     state[o_pred_ctx_wt + delta_vertical_fov] = config.vertical_fov_degrees;
     state[o_pred_ctx_wt + delta_smell_strength] = config.smell_strength;
+    state[o_pred_ctx_wt + delta_vision_plasticity] = config.vision_plasticity;
     // The smell pathway's whitening starts from a small isotropic variance.
     let delta_scent_covariance = O_SCENT_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
     state[o_pred_ctx_wt + delta_scent_covariance] = SCENT_INITIAL_VARIANCE;
@@ -1203,7 +1208,8 @@ mod tests {
         assert_eq!(O_HORIZONTAL_FOV, O_ORIENTATION_OFFSET + 1);
         assert_eq!(O_VERTICAL_FOV, O_HORIZONTAL_FOV + 1);
         assert_eq!(O_SMELL_STRENGTH, O_VERTICAL_FOV + 1);
-        assert_eq!(O_HOMEO_PREDICTOR_WEIGHTS, O_SMELL_STRENGTH + 1);
+        assert_eq!(O_VISION_PLASTICITY, O_SMELL_STRENGTH + 1);
+        assert_eq!(O_HOMEO_PREDICTOR_WEIGHTS, O_VISION_PLASTICITY + 1);
         assert_eq!(
             O_HOMEO_PREDICTOR_BIAS,
             O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION

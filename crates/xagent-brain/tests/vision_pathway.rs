@@ -3,13 +3,14 @@
 //! centred on their running mean and whitened by C^(−1/2) of their running
 //! covariance, refreshed every `VISION_WHITENING_REFRESH` brain ticks; the
 //! visual turn weights' traces gather the turn noise's fresh innovation times
-//! the whitened input, normalised by 1 + |input|².
+//! the whitened input, normalised by 1 + |input|². The weights learn at the
+//! actors' rate scaled by the agent's heritable plasticity gene.
 
 use xagent_brain::buffers::{
-    BrainLayout, O_HOMEO, O_SENSORY_MEAN, O_TICK_COUNT, O_TRACE_VISION, O_TURN_NOISE,
-    O_VISION_PATHWAY_COVARIANCE, O_VISION_PATHWAY_INPUT, O_VISION_PATHWAY_MEAN,
-    O_VISION_PATHWAY_WHITENING, P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT,
-    VISION_PATHWAY_INPUTS,
+    BrainLayout, O_HOMEO, O_SCENT_TURN_WEIGHTS, O_SENSORY_MEAN, O_TICK_COUNT, O_TRACE_SCENT,
+    O_TRACE_VISION, O_TURN_NOISE, O_VISION_PATHWAY_COVARIANCE, O_VISION_PATHWAY_INPUT,
+    O_VISION_PATHWAY_MEAN, O_VISION_PATHWAY_WHITENING, O_VISION_PLASTICITY, O_VISION_TURN_WEIGHTS,
+    P_EXPLORATION_RATE_OUT, P_FATIGUE_FACTOR_OUT, VISION_PATHWAY_INPUTS,
 };
 use xagent_brain::GpuKernel;
 use xagent_shared::{BrainConfig, WorldConfig};
@@ -38,14 +39,27 @@ const KLINOTAXIS_MAX: f32 = 3.0;
 const WHITENING_TOLERANCE: f32 = 2e-3;
 const INPUT_TOLERANCE: f32 = 1e-4;
 const N: usize = VISION_PATHWAY_INPUTS;
+/// Mirrors `ACTION_WEIGHT_LEARNING_RATE` in `common.wgsl`.
+const ACTOR_RATE: f32 = 0.10;
+/// A plasticity gene away from its seed of 1, so the scaling shows.
+const PLASTICITY: f32 = 3.0;
+/// Traces planted before the step (non-zero, so both pathways move).
+const PLANTED_SCENT_TRACE: f32 = 0.5;
+const PLANTED_VISION_TRACE: f32 = 0.3;
+/// Relative tolerance on the inferred step.
+const STEP_TOLERANCE: f32 = 1e-3;
 
-fn probe_kernel() -> GpuKernel {
-    let brain = BrainConfig {
+fn probe_config() -> BrainConfig {
+    BrainConfig {
         brain_tick_stride: 1,
         vision_stride: 1,
         movement_speed: 0.0,
         ..BrainConfig::default()
-    };
+    }
+}
+
+fn probe_kernel() -> GpuKernel {
+    let brain = probe_config();
     let world = WorldConfig {
         seed: 6,
         ..WorldConfig::default()
@@ -248,6 +262,47 @@ fn pathway_reads_the_hemifields_and_credits_the_fresh_innovation() {
             (after[O_TRACE_VISION + k] - expected).abs() < INPUT_TOLERANCE,
             "vision trace {k}: GPU {} vs {expected}",
             after[O_TRACE_VISION + k]
+        );
+    }
+}
+
+#[test]
+fn plasticity_gene_scales_the_visual_weight_step() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let mut kernel = probe_kernel();
+    let config = BrainConfig {
+        vision_plasticity: PLASTICITY,
+        ..probe_config()
+    };
+    kernel.write_agent_heritable_config(0, &config);
+    // The smell pathway learns at the actors' rate from the same TD error,
+    // so its step reveals the error the visual step is scaled against.
+    let mut state = kernel.read_agent_state(0);
+    assert_eq!(state.brain_state[O_VISION_PLASTICITY], PLASTICITY);
+    for k in 0..2 {
+        state.brain_state[O_SCENT_TURN_WEIGHTS + k] = 0.0;
+        state.brain_state[O_TRACE_SCENT + k] = PLANTED_SCENT_TRACE;
+    }
+    for k in 0..N {
+        state.brain_state[O_VISION_TURN_WEIGHTS + k] = 0.0;
+        state.brain_state[O_TRACE_VISION + k] = PLANTED_VISION_TRACE;
+    }
+    state.brain_state[O_TICK_COUNT] = PLAIN_TICK;
+    kernel.write_agent_state(0, &state);
+    kernel.dispatch_batch(WARMUP_TICKS, 1);
+    let after = kernel.read_agent_state(0).brain_state;
+
+    let td_error = after[O_SCENT_TURN_WEIGHTS] / (ACTOR_RATE * PLANTED_SCENT_TRACE);
+    assert!(td_error.abs() > 1e-6, "the TD error vanished: {td_error}");
+    let expected = ACTOR_RATE * PLASTICITY * td_error * PLANTED_VISION_TRACE;
+    for k in 0..N {
+        let step = after[O_VISION_TURN_WEIGHTS + k];
+        assert!(
+            (step - expected).abs() <= STEP_TOLERANCE * expected.abs(),
+            "visual weight {k}: step {step} vs {expected} (plasticity {PLASTICITY})"
         );
     }
 }

@@ -1691,6 +1691,18 @@ impl<'a> TabContext<'a> {
                             .max_decimals(2),
                     );
                     ui.end_row();
+
+                    ui.label("vision_plasticity");
+                    ui.add(
+                        egui::DragValue::new(&mut b.vision_plasticity)
+                            .range(
+                                xagent_shared::VISION_PLASTICITY_MIN
+                                    ..=xagent_shared::VISION_PLASTICITY_MAX,
+                            )
+                            .speed(0.1)
+                            .max_decimals(2),
+                    );
+                    ui.end_row();
                 });
         });
 
@@ -2195,6 +2207,9 @@ impl<'a> TabContext<'a> {
                         ui.end_row();
                         ui.label("smell_strength");
                         ui.monospace(format!("{:.2}", cfg.smell_strength));
+                        ui.end_row();
+                        ui.label("vision_plasticity");
+                        ui.monospace(format!("{:.2}", cfg.vision_plasticity));
                         ui.end_row();
                     });
             });

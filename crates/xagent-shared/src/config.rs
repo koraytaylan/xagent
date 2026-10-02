@@ -264,6 +264,14 @@ pub struct BrainConfig {
     /// = `[0, 5]`, and re-imposed by the senses pass.
     #[serde(default = "default_smell_strength")]
     pub smell_strength: f32,
+    /// **Heritable.** Plasticity of the visual pathway to the turn policy: a
+    /// multiplier on the learning rate of its eight turn weights, so how fast
+    /// a life learns to turn by sight (toward food, away from hazard ground).
+    /// 0 freezes the pathway at its inherited weights. Seed 1; perturbed by
+    /// `mutate_config`, clamped to `[VISION_PLASTICITY_MIN,
+    /// VISION_PLASTICITY_MAX]` = `[0, 30]`, and re-imposed by the brain passes.
+    #[serde(default = "default_vision_plasticity")]
+    pub vision_plasticity: f32,
     /// Profiling stage limit for the visual-cortex pass. `0` = run all stages
     /// (default, no short-circuit). `1` = retina fill only. `2` = retina + DoG
     /// center-surround. `3` = all stages (same as `0`). Non-zero values
@@ -328,6 +336,11 @@ pub const VERTICAL_FOV_MAX: f32 = 150.0;
 pub const SMELL_STRENGTH_MIN: f32 = 0.0;
 /// See [`SMELL_STRENGTH_MIN`].
 pub const SMELL_STRENGTH_MAX: f32 = 5.0;
+/// Inclusive clamp bounds for the heritable visual pathway plasticity.
+/// Mirrors `VISION_PLASTICITY_*` in `common.wgsl`.
+pub const VISION_PLASTICITY_MIN: f32 = 0.0;
+/// See [`VISION_PLASTICITY_MIN`].
+pub const VISION_PLASTICITY_MAX: f32 = 30.0;
 
 /// Configuration for the world simulation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -477,6 +490,11 @@ fn default_vertical_fov_degrees() -> f32 {
 
 /// Seed smell sensitivity.
 fn default_smell_strength() -> f32 {
+    1.0
+}
+
+/// Seed visual pathway plasticity: the actors' own learning rate.
+fn default_vision_plasticity() -> f32 {
     1.0
 }
 
@@ -660,6 +678,7 @@ impl Default for BrainConfig {
             horizontal_fov_degrees: default_horizontal_fov_degrees(),
             vertical_fov_degrees: default_vertical_fov_degrees(),
             smell_strength: default_smell_strength(),
+            vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
         }
     }
@@ -761,6 +780,7 @@ impl BrainConfig {
             horizontal_fov_degrees: default_horizontal_fov_degrees(),
             vertical_fov_degrees: default_vertical_fov_degrees(),
             smell_strength: default_smell_strength(),
+            vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
         }
     }
@@ -805,6 +825,7 @@ impl BrainConfig {
             horizontal_fov_degrees: default_horizontal_fov_degrees(),
             vertical_fov_degrees: default_vertical_fov_degrees(),
             smell_strength: default_smell_strength(),
+            vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
         }
     }
@@ -958,6 +979,7 @@ mod tests {
         assert!((config.horizontal_fov_degrees - default_horizontal_fov_degrees()).abs() < 1e-6);
         assert!((config.vertical_fov_degrees - default_vertical_fov_degrees()).abs() < 1e-6);
         assert!((config.smell_strength - default_smell_strength()).abs() < 1e-6);
+        assert!((config.vision_plasticity - default_vision_plasticity()).abs() < 1e-6);
 
         // Older configs that also omit `visual_encoding_size` entirely must load
         // too — the retained serde default supplies it.

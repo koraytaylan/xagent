@@ -251,13 +251,16 @@ override O_DOG_SURROUND_RATIO: u32 = O_GABOR_ASPECT_RATIO + 1u;
 override O_ORIENTATION_OFFSET: u32 = O_DOG_SURROUND_RATIO + 1u;
 
 // ── Sensory-genome tail (heritable eye and nose genes) ─────────────────
-// Horizontal and vertical angle of view in degrees (read by the vision pass)
-// and smell sensitivity (read by the senses pass), contiguous after the
-// visual-genome genes. Each reader re-imposes the gene clamps below. Mirrors
-// O_HORIZONTAL_FOV / O_VERTICAL_FOV / O_SMELL_STRENGTH in `buffers.rs`.
+// Horizontal and vertical angle of view in degrees (read by the vision pass),
+// smell sensitivity (read by the senses pass) and the visual pathway's
+// plasticity (read by the brain passes), contiguous after the visual-genome
+// genes. Each reader re-imposes the gene clamps below. Mirrors
+// O_HORIZONTAL_FOV / O_VERTICAL_FOV / O_SMELL_STRENGTH / O_VISION_PLASTICITY
+// in `buffers.rs`.
 override O_HORIZONTAL_FOV: u32 = O_ORIENTATION_OFFSET + 1u;
 override O_VERTICAL_FOV: u32 = O_HORIZONTAL_FOV + 1u;
 override O_SMELL_STRENGTH: u32 = O_VERTICAL_FOV + 1u;
+override O_VISION_PLASTICITY: u32 = O_SMELL_STRENGTH + 1u;
 
 // ── Homeostatic gradient predictor head ─────────────────────────────
 // Linear head (128→1) on top of the forward model's predicted state s_prediction.
@@ -265,7 +268,7 @@ override O_SMELL_STRENGTH: u32 = O_VERTICAL_FOV + 1u;
 // an anticipatory credit signal that bridges the ~10-tick sensory latency.
 // Weights are heritable (seeded at birth, inherited, mutated); the prev-prediction
 // slot is episodic (zeroed on death), like O_PREV_VALUE.
-override O_HOMEO_PREDICTOR_WEIGHTS: u32 = O_SMELL_STRENGTH + 1u;
+override O_HOMEO_PREDICTOR_WEIGHTS: u32 = O_VISION_PLASTICITY + 1u;
 override O_HOMEO_PREDICTOR_BIAS: u32 = O_HOMEO_PREDICTOR_WEIGHTS + ENCODED_DIMENSION;
 override O_PREV_HOMEO_PREDICTION: u32 = O_HOMEO_PREDICTOR_BIAS + 1u;
 
@@ -605,6 +608,11 @@ const VISION_PATHWAY_INITIAL_VARIANCE: f32 = 1e-4;
 // relative to the mean eigenvalue.
 const JACOBI_SWEEPS: u32 = 12u;
 const WHITENING_RELATIVE_FLOOR: f32 = 1e-6;
+// Bounds of the heritable visual pathway plasticity gene, a multiplier on
+// the pathway's learning rate (mirror VISION_PLASTICITY_* in xagent-shared
+// `config.rs`).
+const VISION_PLASTICITY_MIN: f32 = 0.0;
+const VISION_PLASTICITY_MAX: f32 = 30.0;
 
 // Whiten a centred 2-nostril scent by the covariance [a, b, c] =
 // [left², left·right, right²]: rotate onto the covariance's eigenvectors,
@@ -857,6 +865,14 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 // the end of the life is its last outcome, the terminal lesson discounted by
 // the moment's age at the life's last brain tick, with no state left to
 // bootstrap from. Single-threaded: called from the death paths.
+// The visual pathway's learning rate: the actors' rate scaled by the agent's
+// heritable plasticity gene.
+fn vision_pathway_learning_rate(brain_base: u32) -> f32 {
+    let plasticity = clamp(
+        brain_state[brain_base + O_VISION_PLASTICITY], VISION_PLASTICITY_MIN, VISION_PLASTICITY_MAX);
+    return ACTION_WEIGHT_LEARNING_RATE * plasticity;
+}
+
 // Death's terminal lesson reaches the smell and visual pathways' turn weights
 // through their traces, as it does the other channels, and the traces are
 // cleared. Single-threaded: called from the death paths.
@@ -871,7 +887,7 @@ fn settle_turn_pathways_at_death(brain_base: u32) {
     }
     for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
         if (learns) {
-            brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] += ACTION_WEIGHT_LEARNING_RATE
+            brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] += vision_pathway_learning_rate(brain_base)
                 * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_VISION + k];
         }
         brain_state[brain_base + O_TRACE_VISION + k] = 0.0;

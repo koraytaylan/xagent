@@ -2760,14 +2760,15 @@ impl GpuKernel {
     /// Writes habituation_sensitivity, max_curiosity_bonus, fatigue_floor,
     /// movement_speed, the four plan-0008 visual-genome genes
     /// (gabor_wavelength, gabor_aspect_ratio, dog_surround_ratio,
-    /// orientation_offset) and the three sensory-genome genes
-    /// (horizontal_fov_degrees, vertical_fov_degrees, smell_strength) from the
-    /// given BrainConfig into the agent's brain_state slots. Use this after
-    /// `reset_agents()` to apply per-agent config variation.
+    /// orientation_offset) and the four sensory-genome genes
+    /// (horizontal_fov_degrees, vertical_fov_degrees, smell_strength,
+    /// vision_plasticity) from the given BrainConfig into the agent's
+    /// brain_state slots. Use this after `reset_agents()` to apply per-agent
+    /// config variation.
     ///
-    /// All eleven slots are one contiguous run in the fixed tail —
+    /// All twelve slots are one contiguous run in the fixed tail —
     /// `O_MOVEMENT_SPEED` is followed immediately by `O_GABOR_WAVELENGTH ..
-    /// O_ORIENTATION_OFFSET` and then `O_HORIZONTAL_FOV .. O_SMELL_STRENGTH`
+    /// O_ORIENTATION_OFFSET` and then `O_HORIZONTAL_FOV .. O_VISION_PLASTICITY`
     /// (see `buffers.rs`) — so a single `write_buffer` covers them; the
     /// `debug_assert_eq!`s pin the contiguity.
     pub fn write_agent_heritable_config(&self, index: u32, config: &BrainConfig) {
@@ -2818,6 +2819,10 @@ impl GpuKernel {
             O_SMELL_STRENGTH - O_PREDICTOR_CONTEXT_WEIGHT,
             first_delta + 10
         );
+        debug_assert_eq!(
+            O_VISION_PLASTICITY - O_PREDICTOR_CONTEXT_WEIGHT,
+            first_delta + 11
+        );
 
         let values = [
             config.habituation_sensitivity,
@@ -2831,6 +2836,7 @@ impl GpuKernel {
             config.horizontal_fov_degrees,
             config.vertical_fov_degrees,
             config.smell_strength,
+            config.vision_plasticity,
         ];
         let byte_offset = ((i * bs + tail_base + first_delta) * 4) as u64;
         self.queue.write_buffer(

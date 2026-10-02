@@ -1492,11 +1492,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 }
                 brain_state[brain_base + O_SCENT_TURN_WEIGHTS] = scent_weights.x;
                 brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] = scent_weights.y;
-                // Visual pathway weights, the same way.
+                // Visual pathway weights, the same way at the agent's own
+                // heritable plasticity.
+                let vision_rate = vision_pathway_learning_rate(brain_base);
                 var vision_norm_sq = 0.0;
                 for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
                     let slot = brain_base + O_VISION_TURN_WEIGHTS + k;
-                    brain_state[slot] += ACTION_WEIGHT_LEARNING_RATE * td_error
+                    brain_state[slot] += vision_rate * td_error
                         * brain_state[brain_base + O_TRACE_VISION + k];
                     vision_norm_sq += brain_state[slot] * brain_state[slot];
                 }

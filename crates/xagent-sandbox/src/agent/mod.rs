@@ -26,7 +26,7 @@ use xagent_shared::{
     GABOR_WAVELENGTH_MIN, HORIZONTAL_FOV_MAX, HORIZONTAL_FOV_MIN, INSTINCT_DANGER_STRENGTH_MAX,
     INSTINCT_DANGER_STRENGTH_MIN, INSTINCT_FOOD_STRENGTH_MAX, INSTINCT_FOOD_STRENGTH_MIN,
     ORIENTATION_OFFSET_PERIOD, SMELL_STRENGTH_MAX, SMELL_STRENGTH_MIN, VERTICAL_FOV_MAX,
-    VERTICAL_FOV_MIN,
+    VERTICAL_FOV_MIN, VISION_PLASTICITY_MAX, VISION_PLASTICITY_MIN,
 };
 
 /// Heatmap grid resolution (cells per axis). Covers the world in a
@@ -395,10 +395,11 @@ pub fn mutate_config_with_strength(
 }
 
 /// Perturb only the heritable sensory genes — the horizontal and vertical
-/// angles of view and the smell strength — with momentum, clamped to the
-/// bounds the vision and senses passes re-impose. Every other field is the
-/// parent's. These are the config genes evolution varies across repeat
-/// groups, alongside each group's steering genome.
+/// angles of view, the smell strength and the visual pathway's plasticity —
+/// with momentum, clamped to the bounds the vision, senses and brain passes
+/// re-impose. Every other field is the parent's. These are the config genes
+/// evolution varies across repeat groups, alongside each group's steering
+/// genome.
 pub fn mutate_sensory_genes(
     parent: &BrainConfig,
     strength: f32,
@@ -425,6 +426,9 @@ pub fn mutate_sensory_genes(
         smell_strength: momentum
             .biased_perturb_f(rng, parent.smell_strength, "smell_strength", strength)
             .clamp(SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX),
+        vision_plasticity: momentum
+            .biased_perturb_f(rng, parent.vision_plasticity, "vision_plasticity", strength)
+            .clamp(VISION_PLASTICITY_MIN, VISION_PLASTICITY_MAX),
         ..parent.clone()
     }
 }
@@ -733,6 +737,9 @@ fn mutate_config_with_strength_rng(
         smell_strength: momentum
             .biased_perturb_f(rng, parent.smell_strength, "smell_strength", strength)
             .clamp(SMELL_STRENGTH_MIN, SMELL_STRENGTH_MAX),
+        vision_plasticity: momentum
+            .biased_perturb_f(rng, parent.vision_plasticity, "vision_plasticity", strength)
+            .clamp(VISION_PLASTICITY_MIN, VISION_PLASTICITY_MAX),
         // Heritable instinct genes: instinct strengths perturbed with
         // momentum and clamped to [INSTINCT_*_STRENGTH_MIN, INSTINCT_*_STRENGTH_MAX].
         instinct_danger_strength: momentum
@@ -926,6 +933,11 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
             a.smell_strength
         } else {
             b.smell_strength
+        },
+        vision_plasticity: if rng.random::<f32>() < 0.5 {
+            a.vision_plasticity
+        } else {
+            b.vision_plasticity
         },
         // Heritable instinct genes: uniform per-gene crossover.
         instinct_danger_strength: if rng.random::<f32>() < 0.5 {
@@ -1293,6 +1305,7 @@ mod tests {
             horizontal_fov_degrees: 500.0,
             vertical_fov_degrees: 500.0,
             smell_strength: 50.0,
+            vision_plasticity: 500.0,
             ..BrainConfig::default()
         };
         let low = BrainConfig {
@@ -1305,6 +1318,7 @@ mod tests {
             horizontal_fov_degrees: 1.0,
             vertical_fov_degrees: 1.0,
             smell_strength: -1.0,
+            vision_plasticity: -1.0,
             ..BrainConfig::default()
         };
 
@@ -1366,6 +1380,12 @@ mod tests {
                     && child.smell_strength <= SMELL_STRENGTH_MAX,
                 "smell_strength out of [{SMELL_STRENGTH_MIN}, {SMELL_STRENGTH_MAX}]: {}",
                 child.smell_strength,
+            );
+            assert!(
+                child.vision_plasticity >= VISION_PLASTICITY_MIN
+                    && child.vision_plasticity <= VISION_PLASTICITY_MAX,
+                "vision_plasticity out of [{VISION_PLASTICITY_MIN}, {VISION_PLASTICITY_MAX}]: {}",
+                child.vision_plasticity,
             );
         };
 

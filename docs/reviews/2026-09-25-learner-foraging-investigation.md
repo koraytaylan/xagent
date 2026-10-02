@@ -1442,3 +1442,21 @@ The visual pathway's weight step was scaled by 3 and by 10 (scratch build only),
 - **There is a cost on the food side.** At ×10, the pathway's turn toward food in view within the generation window drops from +0.22 to +0.13: a faster rate makes the weights noisier. Meals hold, because smell still carries food steering.
 - **Avoidance intent does not register any of this.** It counts every tick with any hazard cell within 30 units, including hazard cells behind the agent and ticks spent standing on hazard ground, so it stays near chance. Deaths and time on hazard ground are the measures that move.
 - The trend has not levelled off at ×10.
+
+## A heritable plasticity gene for the visual pathway
+
+The visual pathway's turn weights now learn at the actors' rate times a heritable gene, `vision_plasticity` (seed 1, bounds 0–30). Like the other sensory genes, each later repeat group shares one momentum-biased mutation of it, at most ±10% per generation. Headless evolution, `evo_vs1.json`, seeds 5–8, 20 generations. One arm seeds the gene at 1 (the default). The other seeds it at 10 through the run config. The comparison is the last batch without the gene.
+
+| | Without the gene | Gene seeded at 1 | Gene seeded at 10 |
+|---|---|---|---|
+| Mean fitness | 0.120 | 0.133 | 0.113 |
+| First 5 → last 5 generations | 0.098 → 0.140 | 0.084 → 0.166 | 0.082 → 0.138 |
+| Meals per agent per generation | 34.0 | 37.3 | 33.9 |
+| Deaths per agent per generation | 3.12 | 2.58 | 3.54 |
+| Share of distance travelled on hazard ground | 14.6% | 12.8% | 15.6% |
+| Gene at the last generation, per seed | — | 1.00, 1.20, 0.88, 1.49 | 9.1, 8.8, 10.4, 11.4 |
+
+Two batches of the same code without the gene gave mean fitness 0.112 and 0.120, so differences of about 0.01 are run-to-run variation.
+
+- **Seeding plasticity at 10 does not help an evolving lineage.** Fitness, deaths and time on hazard ground are no better than at 1, and one seed (7) stalled at 0.069. Free lives showed fast learning cutting hazard deaths when the pathway starts from zero weights. An evolved lineage is born with large food-steering weights, and fast learning mostly adds noise to them: the free-life runs already showed food steering dropping from +0.22 to +0.13 at ×10.
+- **Selection does not push the gene either way within 20 generations.** In each arm one run drifted up and another down, with no shared direction. The gene stays heritable at seed 1, so a lineage can tune it, but the speed of visual learning is not what limits hazard avoidance in evolution today.

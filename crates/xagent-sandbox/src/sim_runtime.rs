@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 use xagent_brain::buffers::{BrainLayout, PATTERN_STRIDE};
 use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
-use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
+use xagent_sandbox::agent::{
+    fresh_brain_state, mutate_brain_state, recombine_steering, steering_population,
+};
 use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::app::{PendingUpload, SIM_DT};
@@ -149,9 +151,18 @@ pub enum SimCommand {
     SetSpeed(u32),
     /// Set the selected agent (by kernel brain index) for telemetry.
     SelectAgent(u32),
-    /// Request the brain an agent was born with this generation: the genome
-    /// its fitness was earned with, before any lifetime learning.
-    RequestBirthState { agent_index: u32, request_id: u64 },
+    /// Request the champion brain built from this generation's birth brains,
+    /// the genomes fitness was earned with, before any lifetime learning:
+    /// agent `agent_index`'s, with its steering weights recombined from
+    /// `parents` (kernel brain index, weight) around agent `template_index`'s
+    /// (see `recombine_steering`). A single parent of weight 1 that is also
+    /// the template returns that agent's birth brain unchanged.
+    RequestBirthState {
+        agent_index: u32,
+        template_index: u32,
+        parents: Vec<(u32, f32)>,
+        request_id: u64,
+    },
     /// Reset to the next generation's population (boxed: much larger than the
     /// other variants, which would otherwise bloat every `SimCommand`).
     ResetPopulation(Box<ResetRequest>),
@@ -463,6 +474,31 @@ impl Worker {
         }
     }
 
+    /// The champion brain a [`SimCommand::RequestBirthState`] describes, built
+    /// from this generation's birth brains; `None` when an index is out of
+    /// range.
+    fn recombined_birth_state(
+        &self,
+        agent_index: u32,
+        template_index: u32,
+        parents: &[(u32, f32)],
+    ) -> Option<AgentBrainState> {
+        let birth = |index: u32| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| self.birth_states.get(index))
+        };
+        let parents = parents
+            .iter()
+            .map(|&(index, weight)| birth(index).map(|state| (state, weight)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(recombine_steering(
+            birth(agent_index)?,
+            birth(template_index)?,
+            &parents,
+        ))
+    }
+
     /// Apply a command. Returns `true` if the worker should exit.
     fn handle_command(&mut self, command: SimCommand, event_tx: &SyncSender<SimEvent>) -> bool {
         match command {
@@ -476,12 +512,11 @@ impl Worker {
             SimCommand::SelectAgent(index) => self.selected_agent = index,
             SimCommand::RequestBirthState {
                 agent_index,
+                template_index,
+                parents,
                 request_id,
             } => {
-                let state = usize::try_from(agent_index)
-                    .ok()
-                    .and_then(|index| self.birth_states.get(index))
-                    .cloned();
+                let state = self.recombined_birth_state(agent_index, template_index, &parents);
                 let _ = event_tx.send(SimEvent::BirthState { request_id, state });
             }
             SimCommand::ResetPopulation(request) => {
@@ -1290,6 +1325,8 @@ mod tests {
         worker.handle_command(
             SimCommand::RequestBirthState {
                 agent_index: 0,
+                template_index: 0,
+                parents: vec![(0, 1.0)],
                 request_id: REQUEST_ID,
             },
             &event_tx,
@@ -1366,6 +1403,8 @@ mod tests {
         // 2. Champion brain-state readback while paused.
         runtime.send(SimCommand::RequestBirthState {
             agent_index: 0,
+            template_index: 0,
+            parents: vec![(0, 1.0)],
             request_id: 42,
         });
         let champion = drain_until(&runtime, |event| match event {

@@ -322,15 +322,40 @@ impl WithinLifeTracker {
     }
 }
 
-/// The agent whose learned brain must be captured and stored as the champion
-/// brain of an accepted node (see [`Governor::store_champion_brain`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the caller must build and store as the champion brain of an accepted
+/// node (see [`Governor::store_champion_brain`]): the birth brain of the best
+/// agent of the best group, with its steering weights recombined from the
+/// fitter half of the groups (see `recombine_steering` in `agent`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChampionCapture {
     /// The accepted node the brain belongs to.
     pub node_id: i64,
     /// Index into the evaluated agent slice of the best agent in the best
-    /// config group — the group whose config became the node's config.
+    /// config group — the group whose config became the node's config. Its
+    /// birth brain supplies everything but the steering weights.
     pub agent_index: usize,
+    /// An agent of the unperturbed first group: its birth brain carries the
+    /// steering weights every group's perturbation was drawn around.
+    pub template_index: usize,
+    /// The recombination parents, best first: one agent of each of the
+    /// fitter half of the groups, with log-rank weights summing to 1.
+    pub parents: Vec<(usize, f32)>,
+}
+
+/// Offset in the log-rank recombination weights `ln(μ + offset) − ln(rank)`:
+/// with 0.5 the last of the μ parents still gets a positive weight.
+const RECOMBINATION_RANK_OFFSET: f32 = 0.5;
+
+/// Log-rank recombination weights for the best `ceil(groups / 2)` of
+/// `groups` ranked groups, best first, summing to 1: each parent counts by
+/// its rank, not its raw score, so one noisy outlier cannot dominate.
+fn recombination_weights(groups: usize) -> Vec<f32> {
+    let parents = groups.div_ceil(2).max(1);
+    let raw: Vec<f32> = (1..=parents)
+        .map(|rank| (parents as f32 + RECOMBINATION_RANK_OFFSET).ln() - (rank as f32).ln())
+        .collect();
+    let total: f32 = raw.iter().sum();
+    raw.iter().map(|weight| weight / total).collect()
 }
 
 /// Result of `Governor::advance()` — tells the caller what to do next.
@@ -1061,9 +1086,24 @@ impl Governor {
                 );
                 // `reduce_fitness` carries the best agent of the best group, so
                 // the captured brain was learned under exactly this config.
+                // Its steering weights are recombined from the fitter half of
+                // the groups (`reduced` is sorted best first; every agent of
+                // a group shares its steering genome).
+                let parents = reduced
+                    .iter()
+                    .zip(recombination_weights(reduced.len()))
+                    .map(|(group, weight)| (group.agent_index, weight))
+                    .collect();
+                let template_index = fitness
+                    .iter()
+                    .map(|f| f.agent_index)
+                    .min()
+                    .unwrap_or(best.agent_index);
                 champion_capture = self.current_node_id.map(|node_id| ChampionCapture {
                     node_id,
                     agent_index: best.agent_index,
+                    template_index,
+                    parents,
                 });
             }
             island.spawn_parent_id = self.current_node_id;
@@ -5329,7 +5369,7 @@ mod tests {
                 champion_capture,
                 inherit_from_node,
                 ..
-            } => (*champion_capture, *inherit_from_node),
+            } => (champion_capture.clone(), *inherit_from_node),
             AdvanceResult::Finished { .. } => panic!("evolution must continue"),
         }
     }
@@ -5362,7 +5402,9 @@ mod tests {
         // Group 0 (agents 0,1) holds the single best individual (0.9) but the
         // lower mean (0.5); group 1 (agents 2,3) has the best mean (0.65),
         // so its config becomes the node config and its best agent (3) is the
-        // champion whose brain was learned under that config.
+        // champion whose brain was learned under that config. With two groups
+        // the fitter half is group 1 alone, recombined around group 0 (agent
+        // 0 carries the unperturbed template).
         let fitness = mock_multi_fitness(&[(0, 0.9), (1, 0.1), (2, 0.6), (3, 0.7)]);
 
         let result = gov.advance(&fitness);
@@ -5373,9 +5415,24 @@ mod tests {
             Some(ChampionCapture {
                 node_id: root_id,
                 agent_index: 3,
+                template_index: 0,
+                parents: vec![(3, 1.0)],
             })
         );
         assert_eq!(inherit_from, Some(root_id));
+    }
+
+    #[test]
+    fn recombination_weights_favour_the_fitter_half_by_rank() {
+        // Five groups: the best three are parents, best first.
+        let weights = recombination_weights(5);
+        assert_eq!(weights.len(), 3);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(weights
+            .windows(2)
+            .all(|pair| pair[0] > pair[1] && pair[1] > 0.0));
+        // One group is its own sole parent.
+        assert_eq!(recombination_weights(1), vec![1.0]);
     }
 
     #[test]

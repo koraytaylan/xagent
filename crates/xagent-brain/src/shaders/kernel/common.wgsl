@@ -1081,6 +1081,22 @@ fn sample_height(x: f32, z: f32) -> f32 {
 
 // ── Biome grid lookup ───────────────────────────────────────────────────────
 
+// Whether this tick counts for the avoidance-intent counters: the nearest
+// hazard cell lies within the sense radius and inside the agent's own
+// horizontal field of view (its heritable gene, clamped as the vision pass
+// clamps it), and the agent is not standing on hazard ground. A hazard behind
+// the agent cannot be seen, and on hazard ground there is no side to turn
+// away from, so neither says anything about deliberate avoidance.
+fn danger_in_view_for_avoidance(agent_id: u32) -> bool {
+    let b = agent_id * PHYS_STRIDE;
+    let horizontal_fov = clamp(
+        brain_state[agent_id * BRAIN_STRIDE + O_HORIZONTAL_FOV], HORIZONTAL_FOV_MIN, HORIZONTAL_FOV_MAX);
+    let half_view = radians(horizontal_fov) * 0.5;
+    return physics_state[b + P_NEAREST_DANGER_DISTANCE] < DANGER_SENSE_RADIUS
+        && abs(physics_state[b + P_NEAREST_DANGER_BEARING]) <= half_view
+        && physics_state[b + P_IN_DANGER_BIOME] < 0.5;
+}
+
 fn sample_biome(x: f32, z: f32) -> u32 {
     let biome_half = wc_f32(WC_TERRAIN_HALF);
     let biome_inv = wc_f32(WC_BIOME_INV_CELL);

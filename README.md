@@ -160,7 +160,7 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ### Intent & Awareness as Observational Lenses
 
-Two count-based intent signals measure whether the learned steering behavior aligns with sensed state — **approach-intent** (fraction of in-range ticks the motor turn rotated toward food) and **avoidance-intent** (fraction of in-range ticks it rotated away from danger). These are **measurement-only**: they have zero impact on learning, fitness computation, or agent selection. They serve as an observational lens on emergence — when steering consistently aligns with sensed food/danger, intent is high and behavior appears deliberate; when uncorrelated, motion is incidental. The counters are generation-cumulative (preserved across respawn) and exposed on `AgentTelemetry` for per-frame sampling; the population fractions are computed at each fitness evaluation and recorded in the `behavior_metric` table. A baseline distribution measured under pure homeostatic learning (post-Plan-0012) provides the reference for future comparisons. See the [brain crate README § Intent & Awareness Telemetry](crates/xagent-brain/README.md#8-intent--awareness-telemetry) for detailed computation and interpretation.
+Two count-based intent signals measure whether the learned steering behavior aligns with sensed state — **approach-intent** (fraction of in-range ticks the motor turn rotated toward food) and **avoidance-intent** (fraction of ticks with hazard ahead in view, the agent off it, on which it rotated away from danger). These are **measurement-only**: they have zero impact on learning, fitness computation, or agent selection. They serve as an observational lens on emergence — when steering consistently aligns with sensed food/danger, intent is high and behavior appears deliberate; when uncorrelated, motion is incidental. The counters are generation-cumulative (preserved across respawn) and exposed on `AgentTelemetry` for per-frame sampling; the population fractions are computed at each fitness evaluation and recorded in the `behavior_metric` table. A baseline distribution measured under pure homeostatic learning (post-Plan-0012) provides the reference for future comparisons. See the [brain crate README § Intent & Awareness Telemetry](crates/xagent-brain/README.md#8-intent--awareness-telemetry) for detailed computation and interpretation.
 
 ---
 
@@ -577,7 +577,7 @@ A core research question for emergent cognition is: does learned behavior reflec
 xagent provides two **count-based intent metrics** for answering this empirically. Each agent accumulates generation-cumulative counters tracking whether steering aligns with sensed food or danger:
 
 - **Approach-Intent Fraction** = (brain cycles the agent turned *toward* sensed food) / (brain cycles food was in sensory range). Measures food-seeking alignment.
-- **Avoidance-Intent Fraction** = (brain cycles the agent turned *away* from sensed danger) / (brain cycles danger was in sensory range). Measures danger-avoidance alignment.
+- **Avoidance-Intent Fraction** = (brain cycles the agent turned *away* from hazard ahead) / (brain cycles a hazard cell was within sensory range inside the agent's horizontal field of view, with the agent off hazard ground). Measures danger-avoidance alignment.
 
 ### Telemetry & Aggregation
 

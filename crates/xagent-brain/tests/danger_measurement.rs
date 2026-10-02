@@ -1,10 +1,11 @@
 //! The nearest-danger measurement behind the avoidance-intent counters runs
 //! whether or not the brain is given the danger percept: with the percept off
 //! (the default) the kernel still finds the nearest hazard cell and its
-//! bearing, matching a CPU scan of the same grid, and counts the in-range
-//! ticks. Before, the percept flag also switched the measurement off, so the
-//! counters read a stale distance with a zero bearing and never registered a
-//! turn away.
+//! bearing, matching a CPU scan of the same grid. Before, the percept flag
+//! also switched the measurement off, so the counters read a stale distance
+//! with a zero bearing and never registered a turn away. The counters count
+//! only ticks with the hazard ahead, inside the agent's horizontal field of
+//! view, and the agent off hazard ground.
 
 use xagent_brain::buffers::{
     DANGER_SENSE_RADIUS, PHYS_STRIDE, P_AVOIDANCE_SENSE_RANGE_TICKS, P_FACING_X, P_FACING_Z,
@@ -25,6 +26,12 @@ const TICKS: u64 = 4;
 /// of it, inside the sense radius.
 const HAZARD_FIRST_COLUMN: usize = BIOME_SIDE / 2;
 const AGENT_X: f32 = -10.0;
+/// The agent faces +Z, so hazard ground from this biome row on lies ahead of
+/// an agent standing at `AGENT_Z_BEFORE_HAZARD`, and under one at
+/// `AGENT_Z_ON_HAZARD`.
+const HAZARD_FIRST_ROW: usize = BIOME_SIDE / 2;
+const AGENT_Z_BEFORE_HAZARD: f32 = -10.0;
+const AGENT_Z_ON_HAZARD: f32 = 10.0;
 /// f32 rounding between the GPU and the f64 reference.
 const TOLERANCE: f32 = 1e-4;
 
@@ -66,12 +73,9 @@ fn nearest_danger(
     (distance as f32, bearing as f32)
 }
 
-#[test]
-fn danger_is_measured_with_the_percept_off() {
-    if !GpuKernel::is_available() {
-        eprintln!("Skipping: no GPU/fallback adapter available");
-        return;
-    }
+/// Run one agent at `position` over `biomes` for a few ticks with the danger
+/// percept off; returns its physics row.
+fn probe(biomes: &[u32], position: glam::Vec3) -> (Vec<f32>, f32) {
     let brain = BrainConfig {
         brain_tick_stride: 1,
         vision_stride: 1,
@@ -86,18 +90,9 @@ fn danger_is_measured_with_the_percept_off() {
     let mut kernel = GpuKernel::new(1, 1, &brain, &world);
     kernel.reset_agents_seeded(&brain, 17);
     let heights = vec![0.0_f32; TERRAIN_SIDE * TERRAIN_SIDE];
-    let biomes: Vec<u32> = (0..BIOME_SIDE * BIOME_SIDE)
-        .map(|cell| {
-            if cell % BIOME_SIDE >= HAZARD_FIRST_COLUMN {
-                BIOME_DANGER
-            } else {
-                0
-            }
-        })
-        .collect();
-    kernel.upload_world(&heights, &biomes, &[(-60.0, 0.35, 6.0)], &[false], &[0.0]);
+    kernel.upload_world(&heights, biomes, &[(-60.0, 0.35, 6.0)], &[false], &[0.0]);
     kernel.upload_agents(&[(
-        glam::Vec3::new(AGENT_X, 1.0, 0.0),
+        position,
         FULL_METER,
         FULL_METER,
         brain.memory_capacity,
@@ -106,11 +101,37 @@ fn danger_is_measured_with_the_percept_off() {
     for tick in 0..TICKS {
         kernel.dispatch_batch(tick, 1);
     }
-    let physics = kernel.read_full_state_blocking()[..PHYS_STRIDE].to_vec();
+    (
+        kernel.read_full_state_blocking()[..PHYS_STRIDE].to_vec(),
+        world.world_size,
+    )
+}
+
+fn hazard_where(is_hazard: impl Fn(usize, usize) -> bool) -> Vec<u32> {
+    (0..BIOME_SIDE * BIOME_SIDE)
+        .map(|cell| {
+            if is_hazard(cell / BIOME_SIDE, cell % BIOME_SIDE) {
+                BIOME_DANGER
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn danger_is_measured_with_the_percept_off() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    // Hazard ground to the east, beside an agent facing +Z.
+    let biomes = hazard_where(|_, col| col >= HAZARD_FIRST_COLUMN);
+    let (physics, world_size) = probe(&biomes, glam::Vec3::new(AGENT_X, 1.0, 0.0));
 
     let (distance, bearing) = nearest_danger(
         &biomes,
-        world.world_size,
+        world_size,
         (physics[P_POS_X], physics[P_POS_Z]),
         (physics[P_FACING_X], physics[P_FACING_Z]),
     );
@@ -125,9 +146,31 @@ fn danger_is_measured_with_the_percept_off() {
         "nearest danger bearing: GPU {} vs CPU {bearing}",
         physics[P_NEAREST_DANGER_BEARING]
     );
+    // Beside the agent, outside its 90° view: not an avoidance tick.
+    assert_eq!(
+        physics[P_AVOIDANCE_SENSE_RANGE_TICKS], 0.0,
+        "a hazard beside the agent should not count"
+    );
+}
+
+#[test]
+fn only_hazard_ahead_and_off_it_counts_for_avoidance() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let biomes = hazard_where(|row, _| row >= HAZARD_FIRST_ROW);
+
+    let (ahead, _) = probe(&biomes, glam::Vec3::new(0.0, 1.0, AGENT_Z_BEFORE_HAZARD));
     assert!(
-        physics[P_AVOIDANCE_SENSE_RANGE_TICKS] >= 1.0,
-        "the in-range ticks were not counted: {}",
-        physics[P_AVOIDANCE_SENSE_RANGE_TICKS]
+        ahead[P_AVOIDANCE_SENSE_RANGE_TICKS] >= 1.0,
+        "hazard ahead in view should count: {}",
+        ahead[P_AVOIDANCE_SENSE_RANGE_TICKS]
+    );
+
+    let (on, _) = probe(&biomes, glam::Vec3::new(0.0, 1.0, AGENT_Z_ON_HAZARD));
+    assert_eq!(
+        on[P_AVOIDANCE_SENSE_RANGE_TICKS], 0.0,
+        "standing on hazard ground should not count"
     );
 }

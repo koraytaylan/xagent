@@ -255,12 +255,12 @@ fn phase_physics(tid: u32, tick: u32) {
         }
     }
 
-    // Avoidance intent: accumulate fraction of ticks where danger was in sense range
-    // and motor turn opposed the danger bearing (deliberate turn-away).
-    let danger_distance = physics_state[b + P_NEAREST_DANGER_DISTANCE];
+    // Avoidance intent: accumulate fraction of ticks where hazard was ahead in
+    // view (agent off it) and motor turn opposed the danger bearing
+    // (deliberate turn-away).
     let danger_bearing = physics_state[b + P_NEAREST_DANGER_BEARING];
-    if danger_distance < DANGER_SENSE_RADIUS {
-        // Danger is in sense range; count this tick
+    if danger_in_view_for_avoidance(agent) {
+        // Hazard ahead in view, agent off it: count this tick
         physics_state[b + P_AVOIDANCE_SENSE_RANGE_TICKS] += 1.0;
 
         // danger_bearing is the signed facing-relative angle to the nearest danger:

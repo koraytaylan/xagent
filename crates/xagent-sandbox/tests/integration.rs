@@ -7730,11 +7730,12 @@ fn nearest_danger_bearing_points_at_danger() {
 /// danger is to the left. A genuine avoidance turn satisfies
 /// `(motor_turn * danger_bearing) > 0.0`.
 ///
-/// This test places danger on a known side (+X, right), sets the agent's facing
-/// to +Z (forward), and runs two dispatch cycles: one with a left turn
-/// (motor_turn < 0, avoidance turn → counter increments) and one with a right
-/// turn (motor_turn > 0, toward danger → counter does NOT increment). Both
-/// fused and split paths must agree.
+/// This test places danger ahead and to the right (+Z forward, +X right, about
+/// 20° off the agent's +Z facing, inside its field of view so the tick counts),
+/// and runs two dispatch cycles: one with a left turn (motor_turn < 0,
+/// avoidance turn → counter increments) and one with a right turn
+/// (motor_turn > 0, toward danger → counter does NOT increment). Both fused
+/// and split paths must agree.
 #[test]
 fn avoidance_counter_increments_only_on_turn_away() {
     use xagent_brain::buffers::{PHYS_STRIDE, P_AVOIDANCE_TURNS_OPPOSING};
@@ -7755,14 +7756,15 @@ fn avoidance_counter_increments_only_on_turn_away() {
 
     let heights = vec![0.0_f32; PROBE_TERRAIN_VPS * PROBE_TERRAIN_VPS];
 
-    // Place danger on the right: cells around col 140 in the biome grid.
+    // Place danger ahead and to the right: cells in col 132, rows 140..143.
     // With biome_inv = 1.0 (world is 256 units, grid is 256x256, so cell_size = 1.0),
     // and biome_half = 128:
-    // - Agent at (0, 1, 0) → row = 128, col = 128 (grid center)
-    // - Danger at col 140 → world X = 140/1.0 - 128 = 12.0 (to the right)
+    // - Agent at (0, 1, 0) → row = 128, col = 128 (grid center), facing +Z
+    // - Nearest danger cell centre at world (4.5, 12.5): bearing about −20°,
+    //   to the right and inside the 90° field of view
     let mut biomes = vec![0_u32; PROBE_BIOME_RES * PROBE_BIOME_RES];
-    for row in 127..130 {
-        biomes[row * PROBE_BIOME_RES + 140] = 2u32; // BIOME_DANGER
+    for row in 140..143 {
+        biomes[row * PROBE_BIOME_RES + 132] = 2u32; // BIOME_DANGER
     }
 
     let agent_data = vec![(

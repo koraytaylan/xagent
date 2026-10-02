@@ -1417,3 +1417,28 @@ Scores are correlations over the last 30% of life. Each one compares a turn outp
 - **But what one life learns is too weak, and none of it is inherited.** After 200k ticks, five generations' worth, the learned visual weights are only 0.026 in size. Their turn is a small fraction of the exploration noise. A generation lasts 40k ticks, and the next one starts from the champion's birth weights.
 - **Evolution has spent the visual weights on food instead.** The champions' inherited visual weights are seven times larger and steer toward food in every agent (+0.48), more than a whole fresh life learns (+0.32). In those agents, lifetime learning barely turns them away from hazard (+0.06). So the earlier reading that steering by sight had not been selected was wrong. Sight was selected, for food, which is worth more per generation than the deaths avoided so far.
 - **So the bottleneck is neither signal nor credit, but rate and inheritance.** The cue is there and the credit points the right way. Within a 40k-tick life, the pathway learns avoidance too slowly to matter, and evolution has not yet found that direction among its mutations.
+
+## A faster visual pathway
+
+The visual pathway's weight step was scaled by 3 and by 10 (scratch build only), in fresh-brain free lives: evolution config, 200k ticks, 20 agents, seeds 5–8. Each row gives the mean per agent ± standard error over 80 agents. "Generation window" covers ticks 28k–40k, the last 30% of a generation-length life. "Late" covers the last 30% of the 200k-tick life.
+
+| Visual pathway rate | ×1 | ×3 | ×10 |
+|---|---|---|---|
+| Deaths per life | 26.6 ± 0.6 | 23.1 ± 0.5 | **20.8 ± 0.6** |
+| Deaths on hazard ground per life | 18.7 ± 0.7 | 14.8 ± 0.6 | **11.2 ± 0.5** |
+| Time on hazard ground | 19.6% | 16.8% | **14.1%** |
+| Meals per life | 103 ± 5 | 110 ± 5 | 109 ± 4 |
+| Generation window: deaths | 2.15 ± 0.08 | 1.84 ± 0.09 | **1.40 ± 0.09** |
+| Generation window: time on hazard ground | 24.7% | 22.4% | **17.4%** |
+| Generation window: size of the visual turn weights | 0.013 | 0.040 | 0.111 |
+| Late: deaths on hazard ground | 3.4 ± 0.4 | 2.2 ± 0.2 | **1.6 ± 0.2** |
+| Late: time on hazard ground | 15.7% | 12.4% | **10.4%** |
+| GPU pathway, away from visible hazard, late | +0.19 (77/80) | +0.17 (73/80) | +0.15 (75/80) |
+| GPU pathway, toward food in view, generation window | +0.22 | +0.23 | +0.13 |
+| Avoidance intent, late | 0.530 | 0.528 | 0.523 |
+
+- **A faster visual pathway avoids hazards within a single generation.** At ten times the rate, deaths on hazard ground fall by 40% over a life. Within the generation window, deaths fall by 35% and time on hazard ground by 30%. All four seeds move the same way at each step. Meals do not suffer.
+- **The direction was already right; the size was missing.** The turn's correlation with the side away from hazard barely changes with rate. The weights grow eightfold, and by the end of a generation-length life they reach the size evolution gave the champions' food-steering weights (0.11 against 0.19).
+- **There is a cost on the food side.** At ×10, the pathway's turn toward food in view within the generation window drops from +0.22 to +0.13: a faster rate makes the weights noisier. Meals hold, because smell still carries food steering.
+- **Avoidance intent does not register any of this.** It counts every tick with any hazard cell within 30 units, including hazard cells behind the agent and ticks spent standing on hazard ground, so it stays near chance. Deaths and time on hazard ground are the measures that move.
+- The trend has not levelled off at ×10.

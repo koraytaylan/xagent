@@ -75,6 +75,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
     };
 
     let seed_config = governor.current_config().unwrap_or(config.brain.clone());
+    let mut simulation_ticks = governor.simulation_ticks();
     println!(
         "Population: {} | Tick budget: {} | Elitism: {} | Patience: {}",
         governor.config.population_size,
@@ -297,6 +298,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         );
 
         governor.update_wall_time(start_time.elapsed().as_secs_f64());
+        simulation_ticks = simulation_ticks.saturating_add(governor.config.tick_budget);
+        governor.update_simulation_ticks(simulation_ticks);
 
         match governor.advance(&fitness) {
             AdvanceResult::Continue {

@@ -1482,6 +1482,35 @@ fn cpu_vision_produces_correct_buffer_shape() {
     );
 }
 
+// ── Simulation Tick Persistence ───────────────────────────────────────
+
+#[test]
+fn simulation_ticks_survive_resume() {
+    use xagent_sandbox::governor::Governor;
+
+    let _tmp = tempfile::NamedTempFile::new()
+        .expect("failed to create temp file")
+        .into_temp_path();
+    let db_path = _tmp.to_str().expect("non-UTF-8 temp path").to_owned();
+    let world_cfg_json = serde_json::to_string(&WorldConfig::default()).unwrap();
+    let persisted_ticks = 123_456u64;
+
+    {
+        let gov = Governor::new(
+            &db_path,
+            xagent_shared::GovernorConfig::default(),
+            &BrainConfig::default(),
+            &world_cfg_json,
+        )
+        .expect("Governor::new");
+        assert_eq!(gov.simulation_ticks(), 0, "a new run starts at zero ticks");
+        gov.update_simulation_ticks(persisted_ticks);
+    }
+
+    let resumed = Governor::resume(&db_path).expect("Governor::resume");
+    assert_eq!(resumed.simulation_ticks(), persisted_ticks);
+}
+
 // ── Async Recording Persistence ───────────────────────────────────────
 
 #[test]

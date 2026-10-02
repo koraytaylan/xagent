@@ -676,6 +676,7 @@ impl Governor {
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q1_food_rate REAL;");
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q4_food_rate REAL;");
+        let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
         db.execute_batch(NODE_BRAIN_SCHEMA)?;
 
         let (run_id, governor_json, spawn_parent_id, momentum_json): (
@@ -1547,6 +1548,31 @@ impl Governor {
         );
     }
 
+    /// Simulation ticks the current run has completed across all sessions,
+    /// as last persisted at a generation boundary. Lets a resumed session's
+    /// simulated-time clock continue where the previous session left off.
+    pub fn simulation_ticks(&self) -> u64 {
+        self.db
+            .query_row(
+                "SELECT COALESCE(simulation_ticks, 0) FROM run WHERE id = ?1",
+                params![self.run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|ticks| u64::try_from(ticks).ok())
+            .unwrap_or(0)
+    }
+
+    /// Persist the total simulation ticks the current run has completed.
+    /// SQLite integers are signed, so the count saturates at `i64::MAX`.
+    pub fn update_simulation_ticks(&self, ticks: u64) {
+        let stored = i64::try_from(ticks).unwrap_or(i64::MAX);
+        let _ = self.db.execute(
+            "UPDATE run SET simulation_ticks = ?1 WHERE id = ?2",
+            params![stored, self.run_id],
+        );
+    }
+
     /// Serialize a generation's recording (synchronous) and send the
     /// resulting blob to the background writer thread for asynchronous
     /// SQLite persistence.  The channel send is non-blocking — if the
@@ -2007,6 +2033,9 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
 
     // Backwards-compatible migration: add momentum_json if missing
     let _ = db.execute_batch("ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';");
+
+    // Backwards-compatible migration: cumulative simulation ticks of the run.
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
 
     // Backwards-compatible migration: add island_id if missing
     let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");

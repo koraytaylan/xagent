@@ -157,8 +157,9 @@ pub(crate) struct App {
     pub(crate) evo_wall_accumulated: f64,
     pub(crate) evo_wall_segment_start: Option<Instant>,
     pub(crate) tps_tick_count: u64,
-    /// Simulation ticks advanced since the current run was started or resumed;
-    /// drives the top-bar simulated-time clock.
+    /// Simulation ticks the current run has advanced, seeded on resume from the
+    /// count persisted at the last generation boundary; drives the top-bar
+    /// simulated-time clock.
     pub(crate) session_tick_count: u64,
     pub(crate) tps_last_reset: Instant,
     pub(crate) tps_display: f64,

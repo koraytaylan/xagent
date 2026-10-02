@@ -93,9 +93,11 @@ impl App {
                     if let Some(c) = &cfg {
                         self.brain_config = c.clone();
                     }
+                    // The resumed generation restarts from tick 0, so the clock
+                    // continues from the ticks persisted at the last boundary.
+                    self.session_tick_count = gov.simulation_ticks();
                     self.governor = Some(gov);
                     self.evo_wall_accumulated = 0.0;
-                    self.session_tick_count = 0;
                     self.evo_wall_segment_start = Some(Instant::now());
                     self.tps_tick_count = 0;
                     self.tps_last_reset = Instant::now();
@@ -244,6 +246,7 @@ impl App {
             let fitness = gov.evaluate(&self.agents);
             gov.log_generation(&fitness);
             gov.update_wall_time(wall_secs);
+            gov.update_simulation_ticks(self.session_tick_count);
 
             let result = gov.advance(&fitness);
 

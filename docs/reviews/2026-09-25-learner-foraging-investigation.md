@@ -1547,3 +1547,22 @@ An accepted node's champion brain is now the best agent's birth brain with its s
 
 - **Recombination lets evolution climb faster.** Mean fitness rises by a quarter, and the last five generations end higher, mostly through more meals: the fitter groups' perturbations agree on better food steering, and averaging keeps that.
 - **Hazard avoidance still does not emerge.** Deaths and time on hazard ground do not change beyond noise. Over 20 generations, the direction that turns away from hazard is still not among what the fitter groups share. Food steering pays off sooner and more reliably, so it wins the rank-weighted average first.
+
+## Eighty generations with recombined steering
+
+The current develop learner, with recombined steering, ran headless for 80 generations (`evo_vs1.json`, seeds 5–8). There was no control lineage, so the trend cannot be attributed to recombination alone. Values pool the four runs within each block of ten generations.
+
+| Generations | Fitness | Meals per agent | Deaths per agent | Share of distance on hazard ground |
+|---|---|---|---|---|
+| 0–9 | 0.127 | 41.1 | 3.74 | 17.3% |
+| 10–19 | 0.174 | 49.3 | 1.96 | 11.2% |
+| 20–29 | 0.181 | 51.2 | 1.90 | 10.7% |
+| 30–39 | 0.193 | 52.2 | 1.49 | 9.9% |
+| 40–49 | 0.190 | 51.3 | 1.56 | 9.9% |
+| 50–59 | 0.200 | 51.8 | 1.28 | 9.1% |
+| 60–69 | 0.192 | 49.2 | 1.47 | 9.8% |
+| 70–79 | 0.199 | 51.5 | 1.32 | 9.1% |
+
+- **Food steering is settled by generation 20.** Meals rise from 41 to about 51 per agent in the first twenty generations and stay there.
+- **After that, deaths keep falling slowly while meals stay flat.** From generations 10–19 to 70–79, deaths fall by a third (1.96 → 1.32) and time on hazard ground by a fifth (11.2% → 9.1%). Fitness creeps from 0.17 to about 0.20. Three of the four seeds die less (seed 5: 2.65 → 1.56; seed 7: 1.18 → 0.80; seed 8: 2.74 → 1.19). Seed 6 dies slightly more (1.28 → 1.74).
+- **So avoidance arrives by slow accumulation, not as a step.** Once food steering stops improving, survival is what still improves, which fits the rank-weighted recombination gradually keeping the direction away from hazard. Even so, at about 1.3 deaths per generation, agents are still far from what a single life's avoidance lesson was worth when added directly: 81% fewer hazard deaths.

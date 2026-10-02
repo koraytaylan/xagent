@@ -1489,3 +1489,28 @@ The same free lives as before: evolution config, 200k ticks, 20 agents, seeds 5�
 - **Saturation is not the cause.** Fewer than 0.3% of turns hit the clamp.
 - **Food credit does not drown the hazard lesson.** Rebuilt from non-hazard ticks alone, the rule still points away from hazard, as strongly as from the hazard ticks themselves.
 - **Champions learn less for two smaller reasons.** Their stronger policy turn (0.18 against 0.07) lowers the adaptive exploration rate, so the credited innovations are 20% smaller. They also spend 11% of their time on hazard ground against 19%, which halves the credit gathered there.
+
+## Removing the three suspected causes
+
+Each suspected cause of weak lifetime avoidance in evolved agents was removed in a scratch build, alone and all together. Free lives started from the stored champions: evolution config, 200k ticks, 20 agents, seeds 5–8. Values are means ± standard error over 80 agents.
+
+- **Exploration:** the policy-confidence cut to the exploration rate is removed, so a strong policy no longer explores less.
+- **Clamp:** only the part of the turn noise the ±1 clamp let through is credited.
+- **TD clip:** the TD error the visual pathway learns from is clipped at ±0.05, so meal-sized errors (about 0.24) cannot dominate its steps.
+
+| | Champions as they are | Exploration | Clamp | TD clip | All three |
+|---|---|---|---|---|---|
+| Learned change, away from visible hazard | +0.090 ± 0.014 | +0.098 | +0.097 | +0.106 | **+0.121 ± 0.013** |
+| Learned change, away from near hazard | +0.123 ± 0.019 | +0.126 | +0.131 | +0.133 | **+0.147 ± 0.017** |
+| Size of the learned change | 0.015 | 0.018 | 0.015 | 0.011 | 0.012 |
+| Whole turn, away from visible hazard | +0.052 | +0.044 | +0.049 | +0.056 | +0.048 |
+| Whole turn, toward food in view | +0.466 | +0.480 | +0.467 | +0.469 | +0.464 |
+| Exploration rate | 0.351 | 0.397 | 0.357 | 0.354 | 0.402 |
+| Deaths per life | 11.7 ± 0.6 | 11.9 | 12.1 | 11.9 | 11.7 ± 0.5 |
+| Deaths on hazard ground per life | 8.3 ± 0.7 | 8.3 | 8.9 | 8.2 | 8.0 ± 0.6 |
+| Time on hazard ground | 11.0% | 11.0% | 11.4% | 11.0% | 11.2% |
+| Meals per life | 178 ± 4 | 173 | 179 | 175 | 175 ± 4 |
+
+- **Each fix sharpens the direction of what a life learns a little, and together they add about a third.** The learned change points away from visible hazard at +0.12 against +0.09, closer to a fresh brain's +0.16. Removing the exploration cut brings the exploration rate and innovation size back to a fresh brain's level. The TD clip points the lesson better but makes it smaller.
+- **Behaviour does not change at all.** Deaths, deaths on hazard ground, time on hazard ground and meals are the same in every arm, within one standard error. The whole turn still reacts to hazard at about +0.05.
+- **So these three were not what limits avoidance.** The learned change stays 13–16 times smaller than the inherited food-steering weights, and the next generation does not inherit it. It is the size of the lifetime lesson relative to the inherited steering, and its loss at every generation, that keeps evolved agents walking onto hazard ground.

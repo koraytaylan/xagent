@@ -156,6 +156,10 @@ pub enum EvolutionAction {
     Reset,
 }
 
+/// Simulation ticks that make up one second of simulated time on the session
+/// clock, independent of how fast the simulation actually runs.
+pub const SIMULATION_TICKS_PER_SECOND: f64 = 60.0;
+
 /// Snapshot of evolution state for UI rendering (rebuilt from governor each frame).
 pub struct EvolutionSnapshot {
     pub state: EvolutionState,
@@ -170,6 +174,9 @@ pub struct EvolutionSnapshot {
     pub num_islands: usize,
     pub migration_interval: u32,
     pub wall_time_secs: f64,
+    /// Simulated time of the current session: ticks advanced divided by
+    /// [`SIMULATION_TICKS_PER_SECOND`].
+    pub simulation_time_secs: f64,
     pub ticks_per_sec: f64,
     pub best_fitness: f32,
     pub tree_nodes: Vec<crate::governor::TreeNode>,
@@ -208,6 +215,7 @@ impl Default for EvolutionSnapshot {
             num_islands: 3,
             migration_interval: 5,
             wall_time_secs: 0.0,
+            simulation_time_secs: 0.0,
             ticks_per_sec: 0.0,
             best_fitness: -1.0,
             tree_nodes: Vec::new(),

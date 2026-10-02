@@ -13,7 +13,7 @@ pub(crate) struct TopBarState<'a> {
     pub(crate) fps: f32,
     pub(crate) agent_count: usize,
     pub(crate) evo_state: &'a EvolutionState,
-    pub(crate) wall_time_secs: f64,
+    pub(crate) simulation_time_secs: f64,
     pub(crate) speed_multiplier: u32,
     pub(crate) ticks_per_sec: f64,
     pub(crate) best_fitness: f32,
@@ -75,9 +75,9 @@ pub(crate) fn draw_top_bar(
                 EvolutionState::Running | EvolutionState::Paused
             ) {
                 ui.separator();
-                let hours = (state.wall_time_secs / 3600.0) as u64;
-                let mins = ((state.wall_time_secs % 3600.0) / 60.0) as u64;
-                let secs = (state.wall_time_secs % 60.0) as u64;
+                let hours = (state.simulation_time_secs / 3600.0) as u64;
+                let mins = ((state.simulation_time_secs % 3600.0) / 60.0) as u64;
+                let secs = (state.simulation_time_secs % 60.0) as u64;
                 ui.label(format!("{}h {:02}m {:02}s", hours, mins, secs));
                 ui.separator();
                 let speed_label = crate::speed_label(state.speed_multiplier);

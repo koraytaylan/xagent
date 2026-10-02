@@ -68,6 +68,7 @@ impl App {
                         self.evo_snapshot.num_islands = gov_config.num_islands;
                         self.evo_snapshot.migration_interval = gov_config.migration_interval;
                         self.evo_wall_accumulated = 0.0;
+                        self.session_tick_count = 0;
                         self.evo_wall_segment_start = Some(Instant::now());
                         self.tps_tick_count = 0;
                         self.tps_last_reset = Instant::now();
@@ -94,6 +95,7 @@ impl App {
                     }
                     self.governor = Some(gov);
                     self.evo_wall_accumulated = 0.0;
+                    self.session_tick_count = 0;
                     self.evo_wall_segment_start = Some(Instant::now());
                     self.tps_tick_count = 0;
                     self.tps_last_reset = Instant::now();

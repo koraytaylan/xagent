@@ -220,7 +220,9 @@ impl App {
         // the delta between published snapshots (it resets to 0 across a
         // generation boundary, which `saturating_sub` reports as no progress
         // rather than a spurious spike).
-        self.tps_tick_count += snapshot.tick.saturating_sub(self.tick);
+        let advanced_ticks = snapshot.tick.saturating_sub(self.tick);
+        self.tps_tick_count += advanced_ticks;
+        self.session_tick_count += advanced_ticks;
         self.tick = snapshot.tick;
         // Sync the governor's per-generation counter from the snapshot to keep
         // the evolution UI's progress accurate.

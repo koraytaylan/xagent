@@ -13,7 +13,7 @@ use xagent_brain::buffers::{
     FOOD_POSITION_X, FOOD_POSITION_Z, FOOD_RESPAWN_TIMER, FOOD_STATE_STRIDE,
 };
 use xagent_sandbox::agent::Agent;
-use xagent_sandbox::ui::AgentSnapshot;
+use xagent_sandbox::ui::{AgentSnapshot, SIMULATION_TICKS_PER_SECOND};
 
 use crate::app::{App, REBUILD_THROTTLE};
 
@@ -164,6 +164,8 @@ impl App {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
         self.evo_snapshot.wall_time_secs = wall;
+        self.evo_snapshot.simulation_time_secs =
+            self.session_tick_count as f64 / SIMULATION_TICKS_PER_SECOND;
         let tps_elapsed = self.tps_last_reset.elapsed().as_secs_f64();
         if tps_elapsed >= 1.0 {
             self.tps_display = self.tps_tick_count as f64 / tps_elapsed;

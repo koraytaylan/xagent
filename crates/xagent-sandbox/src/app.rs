@@ -157,6 +157,9 @@ pub(crate) struct App {
     pub(crate) evo_wall_accumulated: f64,
     pub(crate) evo_wall_segment_start: Option<Instant>,
     pub(crate) tps_tick_count: u64,
+    /// Simulation ticks advanced since the current run was started or resumed;
+    /// drives the top-bar simulated-time clock.
+    pub(crate) session_tick_count: u64,
     pub(crate) tps_last_reset: Instant,
     pub(crate) tps_display: f64,
     pub(crate) db_path: String,
@@ -303,6 +306,7 @@ impl App {
             evo_wall_accumulated: 0.0,
             evo_wall_segment_start: None,
             tps_tick_count: 0,
+            session_tick_count: 0,
             tps_last_reset: Instant::now(),
             tps_display: 0.0,
             db_path: db_path.to_string(),

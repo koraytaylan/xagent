@@ -443,7 +443,7 @@ impl App {
                         };
 
                         let fps = self.fps;
-                        let wall_time_secs = self.evo_snapshot.wall_time_secs;
+                        let simulation_time_secs = self.evo_snapshot.simulation_time_secs;
                         let ticks_per_sec = self.evo_snapshot.ticks_per_sec;
                         let render_3d = self.render_3d;
                         let speed_multiplier = self.speed_multiplier;
@@ -486,7 +486,7 @@ impl App {
                             fps,
                             agent_count: agent_snaps.len(),
                             evo_state: &evo_state,
-                            wall_time_secs,
+                            simulation_time_secs,
                             speed_multiplier,
                             ticks_per_sec,
                             best_fitness,

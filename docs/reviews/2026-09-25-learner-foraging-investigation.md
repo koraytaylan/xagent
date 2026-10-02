@@ -1385,5 +1385,35 @@ Three changes, measured in headless evolution (`evo_vs1.json`, seeds 5–8, 20 g
 The smell-pathway column and the second heritable batch carry the fixed danger measurement. The other runs predate it, so they have no avoidance intent. GPU runs are not bit-reproducible, so the two heritable batches differ by run-to-run variation.
 
 - **Evolution finally climbs.** With the pathway weights heritable, the last five generations beat the first five in all 8 runs. Fitness doubles, meals rise by half, and deaths halve. Without heritability, the visual pathway adds nothing (0.0600 against 0.0581), and the smell pathway had added only 6%. What one life teaches is not passed on, so every generation starts again from zero.
-- **What evolved is chemotaxis.** In 3 of the 4 seeds of the second batch, the champion's smell weights are negative on the left nostril and positive on the right: turn toward the stronger side. The fourth (seed 5) has only the right one positive. The visual weights follow no pattern shared across seeds, so steering by sight has not been selected yet.
+- **What evolved is steering toward food, by smell and by sight.** In 3 of the 4 seeds of the second batch, the champion's smell weights are negative on the left nostril and positive on the right: turn toward the stronger side. The fourth (seed 5) has only the right one positive. The visual weights share no sign pattern across seeds, but they act on each agent's whitened coordinates, so their signs alone say little. Measured by behaviour (next section), the evolved visual weights steer toward food in view in every agent.
 - **Agents spend half as long on hazard ground, but they do not turn away from it.** Avoidance intent stays at chance (0.519). Food grows only on food-rich ground, the opposite end of the biome noise from hazard. Agents that follow scent therefore stay near food and away from hazards without ever reacting to them. Learned danger avoidance, where an agent turns away from red ground because its integrity fell there, is still missing.
+
+## Why sight does not learn to avoid hazards
+
+Free lives under the evolution config (`evo_vs1.json`), 200k ticks, 20 agents, seeds 5–8. One arm starts from fresh brains (pathway weights zero). The other starts every agent from the last stored champion of the matching seed's second heritable batch (its birth brain, unmutated). Hazard ground covers 33% of the world.
+
+Scores are correlations over the last 30% of life. Each one compares a turn output with the side to turn: away from the nearest hazard cell or toward the nearest food. "Hazard visible" means a hazard cell within 30 units inside the field of view, with the agent not on hazard ground; "near" means within 10 units; "food in view" means within 5.5 units. The figure in parentheses counts agents scoring above 0. Rows:
+
+- **Readout:** the best linear map from the whitened hemifields (as the GPU pathway saw them) to the hazard side. It is trained supervised on the first 70% of life and is a measurement only.
+- **Offline rule:** the pathway's own learning rule, rebuilt from the logged homeostatic credit.
+- **GPU pathway:** what the pathway actually learned, or inherited and then learned.
+
+| | Fresh brains | Evolved champions |
+|---|---|---|
+| Deaths per agent | 26.2 | 12.2 |
+| Deaths with integrity below energy | 60% | 69% |
+| Deaths on hazard ground | 68% | 73% |
+| Time on hazard ground | 19.4% | 11.5% |
+| Meals per agent | 99 | 177 |
+| TD error on stepping onto hazard ground | −0.010 | −0.012 |
+| Readout of the hazard side, visible / near | +0.33 / +0.38 (80/80) | +0.34 / +0.41 (80/80) |
+| Offline rule, away from hazard, visible / near | +0.19 / +0.22 (76/80) | +0.12 / +0.15 (66/80) |
+| GPU pathway, away from hazard, visible / near | +0.18 / +0.22 (75/80) | +0.06 / +0.08 (60/80) |
+| GPU pathway, toward food in view | +0.32 (68/80) | **+0.48 (80/80)** |
+| Size of the visual turn weights at the end | 0.026 | 0.19 |
+
+- **Hazards are what kill, even for evolved agents.** Two thirds of deaths happen on hazard ground with integrity as the failing meter. Fitness counts every death through its survival multiplier, 0.25 + 0.75 / (1 + 0.5 · deaths), so going from three deaths to one raises the score by 36%. The selection pressure to avoid hazards is there.
+- **The hazard side is in the input, and the homeostatic credit carries it.** A linear readout of the eight whitened hemifield values finds the hazard side in every agent. The critic's TD error turns negative on stepping onto hazard ground. Fresh brains' visual pathways learn, from that credit alone, to turn away from hazard in 75 of 80 agents, about half as strongly as the supervised readout.
+- **But what one life learns is too weak, and none of it is inherited.** After 200k ticks, five generations' worth, the learned visual weights are only 0.026 in size. Their turn is a small fraction of the exploration noise. A generation lasts 40k ticks, and the next one starts from the champion's birth weights.
+- **Evolution has spent the visual weights on food instead.** The champions' inherited visual weights are seven times larger and steer toward food in every agent (+0.48), more than a whole fresh life learns (+0.32). In those agents, lifetime learning barely turns them away from hazard (+0.06). So the earlier reading that steering by sight had not been selected was wrong. Sight was selected, for food, which is worth more per generation than the deaths avoided so far.
+- **So the bottleneck is neither signal nor credit, but rate and inheritance.** The cue is there and the credit points the right way. Within a 40k-tick life, the pathway learns avoidance too slowly to matter, and evolution has not yet found that direction among its mutations.

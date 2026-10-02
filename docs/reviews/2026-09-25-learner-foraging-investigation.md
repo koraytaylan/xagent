@@ -1460,3 +1460,32 @@ Two batches of the same code without the gene gave mean fitness 0.112 and 0.120,
 
 - **Seeding plasticity at 10 does not help an evolving lineage.** Fitness, deaths and time on hazard ground are no better than at 1, and one seed (7) stalled at 0.069. Free lives showed fast learning cutting hazard deaths when the pathway starts from zero weights. An evolved lineage is born with large food-steering weights, and fast learning mostly adds noise to them: the free-life runs already showed food steering dropping from +0.22 to +0.13 at ×10.
 - **Selection does not push the gene either way within 20 generations.** In each arm one run drifted up and another down, with no shared direction. The gene stays heritable at seed 1, so a lineage can tune it, but the speed of visual learning is not what limits hazard avoidance in evolution today.
+
+## Why evolved agents barely learn avoidance in their own lives
+
+The same free lives as before: evolution config, 200k ticks, 20 agents, seeds 5–8, fresh brains against the matching seed's stored champion. The new measures separate three explanations: smaller exploration noise, a saturated turn, and food rewards drowning out the hazard credit.
+
+- **Learned change:** the visual turn weights now minus at birth, scored on its own against the side away from hazard. This isolates what the life learned from what it inherited.
+- **Saturation:** the share of brain ticks on which `tanh(policy) + noise` hits the ±1 clamp. The trace credits the noise even where the clamp swallowed it.
+- **Credit split:** the pathway's rule rebuilt offline from two disjoint sets of ticks: those with hazard visible or underfoot, and all the rest. Each is scored on late hazard ticks.
+
+| | Fresh brains | Evolved champions |
+|---|---|---|
+| Size of the visual weights at birth | 0 | 0.194 |
+| Size of what the life changed them by | 0.0275 | 0.0152 |
+| Learned change, away from visible hazard / near hazard | +0.16 / +0.20 (73/80) | +0.09 / +0.12 (62/80) |
+| Whole turn output, away from visible hazard | +0.16 | +0.05 |
+| Whole turn output, toward food in view | +0.27 | +0.47 (80/80) |
+| Exploration rate (hazard visible) | 0.389 (0.407) | 0.351 (0.360) |
+| Mean size of the credited turn innovation | 0.0301 | 0.0241 |
+| Saturated turns (hazard visible) | 0.18% (0.17%) | 0.23% (0.27%) |
+| Policy's own turn, mean size | 0.067 | 0.181 |
+| Time on hazard ground | 19.4% | 11.0% |
+| Offline rule from hazard ticks only, away from hazard | +0.11 (size 0.021) | +0.08 (size 0.010) |
+| Offline rule from all other ticks only, away from hazard | +0.14 (size 0.016) | +0.08 (size 0.011) |
+| Mean TD error size on meals / otherwise | 0.35 / 0.021 | 0.24 / 0.019 |
+
+- **Evolved agents do learn to turn away from hazards; the inherited weights hide it.** What a champion's life adds points away from hazard (+0.09 / +0.12), at about 60% of a fresh brain's strength. But it is 13 times smaller than the inherited weights, which steer toward food and barely react to hazard, so the whole turn barely shows it (+0.05). The lesson is then lost, because the next generation inherits the champion's birth weights.
+- **Saturation is not the cause.** Fewer than 0.3% of turns hit the clamp.
+- **Food credit does not drown the hazard lesson.** Rebuilt from non-hazard ticks alone, the rule still points away from hazard, as strongly as from the hazard ticks themselves.
+- **Champions learn less for two smaller reasons.** Their stronger policy turn (0.18 against 0.07) lowers the adaptive exploration rate, so the credited innovations are 20% smaller. They also spend 11% of their time on hazard ground against 19%, which halves the credit gathered there.

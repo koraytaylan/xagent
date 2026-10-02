@@ -1514,3 +1514,20 @@ Each suspected cause of weak lifetime avoidance in evolved agents was removed in
 - **Each fix sharpens the direction of what a life learns a little, and together they add about a third.** The learned change points away from visible hazard at +0.12 against +0.09, closer to a fresh brain's +0.16. Removing the exploration cut brings the exploration rate and innovation size back to a fresh brain's level. The TD clip points the lesson better but makes it smaller.
 - **Behaviour does not change at all.** Deaths, deaths on hazard ground, time on hazard ground and meals are the same in every arm, within one standard error. The whole turn still reacts to hazard at about +0.05.
 - **So these three were not what limits avoidance.** The learned change stays 13–16 times smaller than the inherited food-steering weights, and the next generation does not inherit it. It is the size of the lifetime lesson relative to the inherited steering, and its loss at every generation, that keeps evolved agents walking onto hazard ground.
+
+## Is avoidance worth anything to evolution?
+
+Every agent started from a stored champion's birth brain, with a vector added to its eight visual turn weights. The vector is either the champion's own lifetime lesson or a random direction of the same size. The lesson is the mean change those weights made over twenty 200k-tick lives from that champion: it points away from hazard. Lives ran for one generation (40k ticks) under the evolution config, 20 agents, seeds 5–8, 3 repeats each. They were scored with the governor's effort-rebased composite fitness, with exploration from the same 64×64 heatmap sampled every 100 ticks. Spawn positions and exploration noise are fixed per seed and repeat, so every arm is paired with the unmodified champion. Differences are means ± standard error over the 12 seed × repeat runs. The inherited visual weights are about 0.2 in size.
+
+| Added to the visual weights | Fitness | Deaths | Deaths on hazard ground | Meals |
+|---|---|---|---|---|
+| Nothing (champion as is) | 0.123 | 2.35 | 1.78 | 35.6 |
+| Lesson direction, size 0.05 | +0.020 ± 0.002 | −0.68 ± 0.08 | −0.55 ± 0.10 | +2.3 ± 0.4 |
+| Lesson direction, size 0.10 | +0.029 ± 0.004 | −1.02 ± 0.19 | −0.93 ± 0.19 | +3.1 ± 0.6 |
+| Lesson direction, size 0.20 | **+0.040 ± 0.007** | **−1.50 ± 0.31** | **−1.45 ± 0.33** | +2.2 ± 0.6 |
+| Random direction, size 0.10 | −0.015 ± 0.008 | +0.32 ± 0.34 | +0.24 ± 0.37 | −2.5 ± 1.5 |
+| Random direction, size 0.20 | −0.038 ± 0.011 | +1.35 ± 0.71 | +0.72 ± 0.80 | −8.7 ± 2.4 |
+
+- **Avoidance is worth a lot to fitness.** The lesson direction at the inherited weights' size raises fitness by a third (0.123 → 0.163). Deaths on hazard ground fall by 81% and meals rise. Every seed gains at every size, from +0.010 to +0.071.
+- **The direction matters, not the size.** Random vectors of the same size lower fitness and cost up to a quarter of the meals, because they disturb the inherited food steering.
+- **So the fitness function rewards avoidance; evolution's search cannot find it.** A single life finds the avoidance direction and selection would reward it. But the steering mutations are random kicks to a quarter of the weights, and random moves of a useful size mostly hurt. A lineage of a few repeat groups per generation is unlikely to stumble on the narrow direction that helps, and the next generation never inherits what each life learned.

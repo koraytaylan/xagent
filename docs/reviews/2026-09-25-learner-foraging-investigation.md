@@ -1565,4 +1565,34 @@ The current develop learner, with recombined steering, ran headless for 80 gener
 
 - **Food steering is settled by generation 20.** Meals rise from 41 to about 51 per agent in the first twenty generations and stay there.
 - **After that, deaths keep falling slowly while meals stay flat.** From generations 10–19 to 70–79, deaths fall by a third (1.96 → 1.32) and time on hazard ground by a fifth (11.2% → 9.1%). Fitness creeps from 0.17 to about 0.20. Three of the four seeds die less (seed 5: 2.65 → 1.56; seed 7: 1.18 → 0.80; seed 8: 2.74 → 1.19). Seed 6 dies slightly more (1.28 → 1.74).
-- **So avoidance arrives by slow accumulation, not as a step.** Once food steering stops improving, survival is what still improves, which fits the rank-weighted recombination gradually keeping the direction away from hazard. Even so, at about 1.3 deaths per generation, agents are still far from what a single life's avoidance lesson was worth when added directly: 81% fewer hazard deaths.
+- **So avoidance arrives by slow accumulation, not as a step.** Once food steering stops improving, survival is what still improves. At about 1.3 deaths per generation, agents are still far from what a single life's avoidance lesson was worth when added directly: 81% fewer hazard deaths. (The control lineage in the next section shows that recombination slows this rather than causing it.)
+
+## Eighty generations: the control, and twice the population
+
+Two more 80-generation lineages on seeds 5–8, to set beside the recombined one above:
+
+- **Champion only:** develop before recombination, where the stored brain is the best group's birth brain unchanged.
+- **Recombined, population 20:** recombination with 20 agents in 10 repeat groups instead of 10 agents in 5. This doubles the agents competing for the same food, so meals are not comparable with the other arms.
+
+The population-20 runs reached generation 78 within the time limit. The table pools the four seeds per block of ten generations.
+
+| Generations | Champion only: deaths / hazard / fitness | Recombined, population 10 | Recombined, population 20 |
+|---|---|---|---|
+| 0–9 | 3.37 / 15.6% / 0.123 | 3.74 / 17.3% / 0.127 | 3.47 / 15.5% / 0.114 |
+| 10–19 | 1.83 / 10.2% / 0.171 | 1.96 / 11.2% / 0.174 | 1.93 / 10.2% / 0.148 |
+| 30–39 | 1.25 / 8.6% / 0.194 | 1.49 / 9.9% / 0.193 | 1.31 / 8.2% / 0.172 |
+| 50–59 | 0.92 / 7.5% / 0.219 | 1.28 / 9.1% / 0.200 | 1.06 / 7.4% / 0.188 |
+| 70–79 | **0.57 / 6.0% / 0.246** | 1.32 / 9.1% / 0.199 | 0.93 / 6.9% / 0.197 |
+
+Generations 60–78, per seed (5, 6, 7, 8):
+
+| | Deaths per agent | Fitness |
+|---|---|---|
+| Champion only | 1.06, 0.87, 0.42, 0.48 | 0.226, 0.223, 0.230, 0.259 |
+| Recombined, population 10 | 1.58, 1.81, 0.94, 1.28 | 0.168, 0.190, 0.204, 0.219 |
+| Recombined, population 20 | 1.63, 0.67, 1.08, 0.68 | 0.170, 0.206, 0.177, 0.214 |
+
+- **Given enough generations, the champion-only lineage evolves avoidance on its own.** Deaths fall by 83% (3.37 → 0.57), time on hazard ground from 15.6% to 6.0%, and fitness keeps rising to 0.246. Meals keep rising too (38 → 57).
+- **Recombination slows this down.** Over the first twenty generations the two lineages are indistinguishable, and the +25% seen earlier over 20 generations was early-phase variation. From generation 30 on, the champion-only lineage pulls ahead in all four seeds, on fitness, deaths and time on hazard ground. A recombined brain is stored without ever having been evaluated, and averaging pulls in the unperturbed group and weaker perturbations, so each accepted step is smaller and less sure than the best group's own.
+- **More groups help recombination, but not enough.** With ten groups the recombined lineage dies and wanders onto hazard ground less than with five (0.93 against 1.32 deaths). It still trails the champion-only lineage, and it has less food per agent to work with.
+- **What a lineage needed was time, not a better search.** Twenty generations were too few to see avoidance evolve. Eighty are enough for the original champion-only search, while recombination costs it ground.

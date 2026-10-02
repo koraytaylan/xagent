@@ -19,7 +19,7 @@ use xagent_brain::buffers::{
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
-use crate::agent::{fresh_brain_state, recombine_steering, steering_population, Agent};
+use crate::agent::{fresh_brain_state, steering_population, Agent};
 use crate::governor::{
     compute_approach_intent_fraction, compute_avoidance_intent_fraction,
     compute_danger_dwell_fraction, AdvanceResult, ChampionCapture, Governor,
@@ -334,12 +334,10 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
 /// Store the accepted node's champion brain and return the brain the next
 /// generation inherits: the stored champion of the node its configs were bred
-/// from. The champion's brain is built from birth brains (`birth_states`,
-/// indexed like the agents), the genomes fitness was earned with: the best
-/// agent's, with its steering weights recombined from the fitter half of the
-/// groups. What any agent learned in its life is not passed on. Mirrors the
-/// live sandbox handoff, so a node is always evaluated with the brain lineage
-/// its config came from.
+/// from. The champion's brain is the one it was born with (`birth_states`,
+/// indexed like the agents), the genome its fitness was earned with; what it
+/// learned in its life is not passed on. Mirrors the live sandbox handoff, so
+/// a node is always evaluated with the brain lineage its config came from.
 fn resolve_inherited_brain(
     governor: &Governor,
     birth_states: &[AgentBrainState],
@@ -347,7 +345,7 @@ fn resolve_inherited_brain(
     inherit_from_node: Option<i64>,
 ) -> Option<AgentBrainState> {
     let captured = champion_capture.and_then(|capture| {
-        let champion = recombined_champion(birth_states, &capture)?;
+        let champion = birth_states.get(capture.agent_index)?.clone();
         governor.store_champion_brain(capture.node_id, &champion);
         Some((capture.node_id, champion))
     });
@@ -356,22 +354,6 @@ fn resolve_inherited_brain(
         Some((captured_node, champion)) if captured_node == node_id => Some(champion),
         _ => governor.champion_brain(node_id),
     }
-}
-
-/// The champion brain a capture describes, built from `birth_states`; `None`
-/// when an index is out of range.
-pub(crate) fn recombined_champion(
-    birth_states: &[AgentBrainState],
-    capture: &ChampionCapture,
-) -> Option<AgentBrainState> {
-    let base = birth_states.get(capture.agent_index)?;
-    let template = birth_states.get(capture.template_index)?;
-    let parents = capture
-        .parents
-        .iter()
-        .map(|&(index, weight)| birth_states.get(index).map(|state| (state, weight)))
-        .collect::<Option<Vec<_>>>()?;
-    Some(recombine_steering(base, template, &parents))
 }
 
 /// Per-generation learning metrics: behavioral signal (food per 1k

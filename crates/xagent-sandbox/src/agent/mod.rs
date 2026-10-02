@@ -560,43 +560,6 @@ pub fn mutate_steering_weights(
     mutated
 }
 
-/// Recombine the steering genomes of several fit parents into one child.
-///
-/// Every parent was bred from `template`, so each one's steering weights (the
-/// encoding's turn weights and the smell and visual pathways' turn weights)
-/// are the template's plus that parent's own perturbation. The child takes
-/// the template's steering weights plus the `weight`-weighted sum of the
-/// parents' perturbations, each block kept in the shader's L2 ball; with
-/// weights summing to 1 this is the weighted mean of the parents. Averaging
-/// keeps the part of the perturbations the fitter parents share and cancels
-/// the parts that differ, the way sexual reproduction blends fit parents.
-/// Everything else, including the heritable config slots, is copied from
-/// `base`.
-pub fn recombine_steering(
-    base: &AgentBrainState,
-    template: &AgentBrainState,
-    parents: &[(&AgentBrainState, f32)],
-) -> AgentBrainState {
-    let mut child = base.clone();
-    let offsets = brain_weight_offsets(template);
-    for (start, len) in [
-        (offsets.turn_weights, ENCODED_DIMENSION),
-        (offsets.scent_turn_weights, SCENT_CHANNELS),
-        (offsets.vision_turn_weights, VISION_PATHWAY_INPUTS),
-    ] {
-        for index in start..start + len {
-            let origin = template.brain_state[index];
-            child.brain_state[index] = origin
-                + parents
-                    .iter()
-                    .map(|(parent, weight)| weight * (parent.brain_state[index] - origin))
-                    .sum::<f32>();
-        }
-        rescale_into_ball(&mut child.brain_state, start, len);
-    }
-    child
-}
-
 /// One brain per agent. Group 0 keeps `template`. Each later group of
 /// `group_size` agents shares one [`mutate_steering_weights`] draw, matching
 /// the way fitness is averaged over `eval_repeats` slots.
@@ -1155,48 +1118,6 @@ mod tests {
             !fwd_same,
             "mutate_brain_state should perturb action weights"
         );
-    }
-
-    #[test]
-    fn recombine_steering_takes_the_weighted_mean_of_the_parents() {
-        use rand::SeedableRng;
-
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(3);
-        let template = fresh_brain_state(&BrainConfig::default(), &mut rng);
-        let first = mutate_steering_weights(&template, 0.5, &mut rng);
-        let second = mutate_steering_weights(&template, 0.5, &mut rng);
-        let offsets = brain_weight_offsets(&template);
-        let (first_weight, second_weight) = (0.75_f32, 0.25_f32);
-
-        let child = recombine_steering(
-            &first,
-            &template,
-            &[(&first, first_weight), (&second, second_weight)],
-        );
-        for (start, len) in [
-            (offsets.turn_weights, ENCODED_DIMENSION),
-            (offsets.scent_turn_weights, SCENT_CHANNELS),
-            (offsets.vision_turn_weights, VISION_PATHWAY_INPUTS),
-        ] {
-            for index in start..start + len {
-                let expected = first_weight * first.brain_state[index]
-                    + second_weight * second.brain_state[index];
-                assert!(
-                    (child.brain_state[index] - expected).abs() < 1e-5,
-                    "steering weight {index}: {} vs {expected}",
-                    child.brain_state[index]
-                );
-            }
-        }
-        // Everything outside the steering blocks is the base's.
-        assert_eq!(child.patterns, first.patterns);
-        for index in 0..offsets.turn_weights {
-            assert_eq!(child.brain_state[index], first.brain_state[index]);
-        }
-
-        // A single parent of weight 1 is reproduced exactly.
-        let alone = recombine_steering(&second, &template, &[(&second, 1.0)]);
-        assert_eq!(alone.brain_state, second.brain_state);
     }
 
     #[test]

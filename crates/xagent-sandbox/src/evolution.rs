@@ -245,31 +245,14 @@ impl App {
 
             let result = gov.advance(&fitness);
 
-            // An accepted generation names the agents whose birth brains make
-            // the node's champion; map their array indices to kernel brain
-            // indices for the readback request.
+            // An accepted generation names the agent whose brain becomes the
+            // node's champion; map its array index to its kernel brain index
+            // for the readback request.
             let champion_brain_idx = match &result {
                 AdvanceResult::Continue {
                     champion_capture: Some(capture),
                     ..
-                } => {
-                    let brain_of = |index: usize| self.agents.get(index).map(|a| a.brain_idx);
-                    let parents = capture
-                        .parents
-                        .iter()
-                        .map(|&(index, weight)| brain_of(index).map(|brain| (brain, weight)))
-                        .collect::<Option<Vec<_>>>();
-                    match (
-                        brain_of(capture.agent_index),
-                        brain_of(capture.template_index),
-                        parents,
-                    ) {
-                        (Some(base), Some(template), Some(parents)) => {
-                            Some((base, template, parents))
-                        }
-                        _ => None,
-                    }
-                }
+                } => self.agents.get(capture.agent_index).map(|a| a.brain_idx),
                 _ => None,
             };
 
@@ -285,27 +268,21 @@ impl App {
 
         match result {
             AdvanceResult::Continue {
-                ref champion_capture,
-                ..
-            } => match (
-                champion_capture.as_ref().map(|c| c.node_id),
-                champion_brain_idx,
-            ) {
-                (Some(champion_node_id), Some((base, template, parents))) => {
+                champion_capture, ..
+            } => match (champion_capture, champion_brain_idx) {
+                (Some(capture), Some(brain_idx)) => {
                     let request_id = self.champion_request_counter;
                     self.champion_request_counter += 1;
                     if let Some(runtime) = &self.sim_runtime {
                         runtime.send(SimCommand::RequestBirthState {
-                            agent_index: base,
-                            template_index: template,
-                            parents,
+                            agent_index: brain_idx,
                             request_id,
                         });
                     }
                     self.pending_generation = Some(PendingGeneration {
                         result,
                         champion_request_id: request_id,
-                        champion_node_id,
+                        champion_node_id: capture.node_id,
                     });
                 }
                 _ => {

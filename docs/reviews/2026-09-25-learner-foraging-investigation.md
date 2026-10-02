@@ -1531,3 +1531,19 @@ Every agent started from a stored champion's birth brain, with a vector added to
 - **Avoidance is worth a lot to fitness.** The lesson direction at the inherited weights' size raises fitness by a third (0.123 → 0.163). Deaths on hazard ground fall by 81% and meals rise. Every seed gains at every size, from +0.010 to +0.071.
 - **The direction matters, not the size.** Random vectors of the same size lower fitness and cost up to a quarter of the meals, because they disturb the inherited food steering.
 - **So the fitness function rewards avoidance; evolution's search cannot find it.** A single life finds the avoidance direction and selection would reward it. But the steering mutations are random kicks to a quarter of the weights, and random moves of a useful size mostly hurt. A lineage of a few repeat groups per generation is unlikely to stumble on the narrow direction that helps, and the next generation never inherits what each life learned.
+
+## Recombining the champion's steering from the fitter groups
+
+An accepted node's champion brain is now the best agent's birth brain with its steering weights (turn policy, smell and visual pathways) recombined from the fitter half of the repeat groups. The recombined weights are the unperturbed template plus the log-rank-weighted mean of those groups' perturbations; with five groups the weights are 0.64, 0.28 and 0.08. Headless evolution, `evo_vs1.json`, 20 generations, seeds 5–12. The control is develop without recombination, run alongside on the same seeds.
+
+| | Champion only (control) | Recombined | Seed-paired difference |
+|---|---|---|---|
+| Mean fitness | 0.126 | **0.157** | +0.032 ± 0.014 (5/8 seeds higher) |
+| First 5 → last 5 generations | 0.093 → 0.162 | 0.103 → 0.196 | last 5: +0.034 ± 0.019 (6/8) |
+| Meals per agent per generation | 36.3 | **44.5** | +8.2 ± 3.7 (5/8) |
+| Deaths per agent per generation | 2.89 | 2.49 | −0.40 ± 0.41 (5/8 lower) |
+| Share of distance travelled on hazard ground | 13.8% | 12.9% | −0.9 ± 1.5 points |
+| Avoidance intent / approach intent | 0.524 / 0.529 | 0.532 / 0.549 | |
+
+- **Recombination lets evolution climb faster.** Mean fitness rises by a quarter, and the last five generations end higher, mostly through more meals: the fitter groups' perturbations agree on better food steering, and averaging keeps that.
+- **Hazard avoidance still does not emerge.** Deaths and time on hazard ground do not change beyond noise. Over 20 generations, the direction that turns away from hazard is still not among what the fitter groups share. Food steering pays off sooner and more reliably, so it wins the rank-weighted average first.

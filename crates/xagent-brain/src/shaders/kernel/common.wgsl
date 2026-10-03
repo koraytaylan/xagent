@@ -566,6 +566,13 @@ const DANGER_SENSE_RADIUS: f32 = 30.0;
 const VISION_STEP_SIZE: f32 = 1.2;
 const VISION_NUM_STEPS: u32 = 25u;
 const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
+// Half-width of the box around a ray sample point whose food-grid cells the
+// ray probes. A food item is hit only within sqrt(FOOD_RAY_RADIUS_SQ) = 1.0
+// of the point, so its x and z each lie within 1.0 of it and the cell it is
+// registered in overlaps this box; the 1% margin keeps float rounding in the
+// box edges from ever leaving such a cell out. Probing a superset of those
+// cells finds exactly the hits the full 3x3 block finds.
+const FOOD_PROBE_HALF_WIDTH: f32 = 1.01;
 const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
 
 // ── Touch constants ─────────────────────────────────────────────────────────

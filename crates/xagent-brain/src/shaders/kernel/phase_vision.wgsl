@@ -56,15 +56,18 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
         let ray_pos = pos + ray_dir * t;
 
         // ── Check food grid ───────────────────────────────────────
-        let food_cx = cell_coord(ray_pos.x) + grid_offset;
-        let food_cz = cell_coord(ray_pos.z) + grid_offset;
+        // Only the cells overlapping the box around the sample point can
+        // hold a food item within reach (see FOOD_PROBE_HALF_WIDTH): one to
+        // four cells instead of the 3x3 block.
+        let food_cx_low = cell_coord(ray_pos.x - FOOD_PROBE_HALF_WIDTH) + grid_offset;
+        let food_cx_high = cell_coord(ray_pos.x + FOOD_PROBE_HALF_WIDTH) + grid_offset;
+        let food_cz_low = cell_coord(ray_pos.z - FOOD_PROBE_HALF_WIDTH) + grid_offset;
+        let food_cz_high = cell_coord(ray_pos.z + FOOD_PROBE_HALF_WIDTH) + grid_offset;
 
-        for (var di: i32 = -1; di <= 1; di++) {
+        for (var ncx = food_cx_low; ncx <= food_cx_high; ncx++) {
             if hit { break; }
-            for (var dj: i32 = -1; dj <= 1; dj++) {
+            for (var ncz = food_cz_low; ncz <= food_cz_high; ncz++) {
                 if hit { break; }
-                let ncx = food_cx + di;
-                let ncz = food_cz + dj;
                 if ncx < 0 || ncz < 0 { continue; }
                 let uncx = u32(ncx);
                 let uncz = u32(ncz);

@@ -91,6 +91,10 @@ fn subgroup_bitonic_supported(has_feature: bool, min_subgroup_size: u32) -> bool
 /// `RETINA_PIXEL_COUNT` into the WGSL override cascade. The returned map is the
 /// single source of truth for the vision-grid and retina dimensions at pipeline
 /// creation time.
+/// Threads in a brain workgroup (`BRAIN_WORKGROUP_SIZE` in the shaders), also
+/// the width of the vision workgroups in the brain-beside-vision dispatch.
+const BRAIN_WORKGROUP_THREADS: u32 = 256;
+
 /// Rays per vision workgroup at or below `SMALL_POPULATION` agents: one, so
 /// every ray of a small population runs in its own workgroup, in parallel.
 const SMALL_POPULATION_RAYS_PER_WORKGROUP: u32 = 1;
@@ -328,6 +332,15 @@ struct DispatchProbe {
     /// any smaller value deliberately produces wrong results and is for timing
     /// only — never on in tests or release.
     kernel_pass_limit: u32,
+    /// `XAGENT_BRAIN_BESIDE_VISION=1`: with one brain cycle per kernel batch,
+    /// run the brain beside the vision pass after the global pass instead of
+    /// inside the kernel before it (brain_vision_tick.wgsl). The results are
+    /// bit-identical either way; which is faster depends on the GPU. The
+    /// overlap pays where a small population leaves most cores idle, but the
+    /// vision workgroups then carry the brain's shared memory, and on a GPU
+    /// with few cores (an AMD Raphael iGPU: 25% slower at 10 agents) the
+    /// separate vision pass wins. Off by default.
+    brain_beside_vision: bool,
 }
 
 impl DispatchProbe {
@@ -352,6 +365,7 @@ impl DispatchProbe {
             skip_global: skip_both || flag("XAGENT_SKIP_GLOBAL"),
             skip_vision: skip_both || flag("XAGENT_SKIP_VISION"),
             kernel_pass_limit,
+            brain_beside_vision: flag("XAGENT_BRAIN_BESIDE_VISION"),
         }
     }
 }
@@ -554,6 +568,17 @@ pub struct GpuKernel {
     /// Workgroups in one vision dispatch: `VISION_GROUPS_PER_AGENT` per agent
     /// (see `vision_rays_per_workgroup`).
     vision_workgroups: u32,
+    /// Brain-beside-vision dispatch (fused path, vision_stride 1): the brain
+    /// workgroups and the vision workgroups of a cycle in one dispatch.
+    brain_vision_pipeline: wgpu::ComputePipeline,
+    /// Copies `sensory_next` into the sensory buffer after `brain_vision_pipeline`.
+    sensory_publish_pipeline: wgpu::ComputePipeline,
+    /// Workgroups in one brain-beside-vision dispatch: one per agent's brain
+    /// plus `COMBINED_VISION_GROUPS_PER_AGENT` per agent's rays.
+    brain_vision_workgroups: u32,
+    /// Kept alive for the bind groups; written by the brain-beside-vision
+    /// dispatch and read by `sensory_publish_pipeline`.
+    _sensory_next_buffer: wgpu::Buffer,
     /// Brain execution mode (FusedSerial, SplitSerial, or ParallelTiled).
     execution_mode: BrainExecutionMode,
     /// Accumulated wall nanoseconds from recording start to the last
@@ -1063,6 +1088,14 @@ impl GpuKernel {
             usage: storage_rw,
             mapped_at_creation: false,
         });
+        // Where vision writes while the brain reads `sensory_buffer` in the
+        // same dispatch (brain_vision_tick.wgsl); published each cycle.
+        let sensory_next_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kernel_sensory_next"),
+            size: (n * layout.sensory_stride * 4) as u64,
+            usage: storage_rw,
+            mapped_at_creation: false,
+        });
         let brain_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_brain_state"),
             size: (n * layout.brain_stride * 4) as u64,
@@ -1212,12 +1245,36 @@ impl GpuKernel {
             has_subgroup,
         );
 
-        // Fused kernel pipeline: common + brain_passes + kernel entry
+        // Fused kernel pipeline: common + brain_passes + brain cycle + kernel entry
         let kernel_source = apply_subgroup_markers(
             &[
                 common_src,
                 include_str!("shaders/kernel/brain_passes.wgsl"),
+                include_str!("shaders/kernel/brain_inner.wgsl"),
                 include_str!("shaders/kernel/kernel_tick.wgsl"),
+            ]
+            .join("\n"),
+            has_subgroup,
+        );
+
+        // Brain-beside-vision pipeline (fused path, vision_stride 1): the brain
+        // cycle and the vision fragments in one module, vision writing
+        // `sensory_next` instead of the buffer the brain reads (see
+        // brain_vision_tick.wgsl). Vision only reads the grids, as in the
+        // vision pipeline.
+        let vision_into_next = include_str!("shaders/kernel/phase_vision.wgsl")
+            .replace("sensory_buffer[", "sensory_next[");
+        assert!(
+            !vision_into_next.contains("sensory_buffer"),
+            "phase_vision.wgsl uses sensory_buffer in a form the redirect misses"
+        );
+        let brain_vision_source = apply_subgroup_markers(
+            &[
+                vision_common.as_str(),
+                include_str!("shaders/kernel/brain_passes.wgsl"),
+                include_str!("shaders/kernel/brain_inner.wgsl"),
+                vision_into_next.as_str(),
+                include_str!("shaders/kernel/brain_vision_tick.wgsl"),
             ]
             .join("\n"),
             has_subgroup,
@@ -1252,7 +1309,7 @@ impl GpuKernel {
             zero_initialize_workgroup_memory: true,
         };
 
-        // ── Explicit bind group layout (all 17 bindings) ──
+        // ── Explicit bind group layout (all 18 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
         // need a single shared layout so one bind group works for all 3 pipelines.
         use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
@@ -1312,6 +1369,7 @@ impl GpuKernel {
                 uniform_entry(14),    // brain_config
                 storage_rw_entry(15), // dispatch_args
                 storage_rw_entry(16), // trail_ring
+                storage_rw_entry(17), // sensory_next
             ],
         });
         // ── Physics pipeline layout (has push constants) ──
@@ -1533,6 +1591,32 @@ impl GpuKernel {
             cache: None,
         });
 
+        // ── Brain-beside-vision and sensory-publish pipelines ──
+        let brain_vision_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("brain_vision_tick"),
+            source: wgpu::ShaderSource::Wgsl(brain_vision_source.into()),
+        });
+        let brain_vision_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("brain_vision_tick"),
+                layout: Some(&kernel_layout),
+                module: &brain_vision_module,
+                entry_point: Some("brain_vision_tick"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+        let sensory_publish_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("sensory_publish"),
+                layout: Some(&kernel_layout),
+                module: &brain_vision_module,
+                entry_point: Some("sensory_publish"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+        let brain_vision_workgroups =
+            agent_count + agent_count * vision_rays.div_ceil(BRAIN_WORKGROUP_THREADS);
+
         // ── Create global pipeline ──
         let global_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("global_tick"),
@@ -1621,6 +1705,10 @@ impl GpuKernel {
                         binding: 16,
                         resource: trail_ring_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 17,
+                        resource: sensory_next_buffer.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -1697,6 +1785,10 @@ impl GpuKernel {
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
             vision_workgroups,
+            brain_vision_pipeline,
+            sensory_publish_pipeline,
+            brain_vision_workgroups,
+            _sensory_next_buffer: sensory_next_buffer,
             execution_mode: BrainExecutionMode::from_env(),
             probe_submit_nanos: 0,
             probe_complete_nanos: 0,
@@ -1786,6 +1878,13 @@ impl GpuKernel {
     /// XAGENT_BRAIN_EXECUTION_MODE at construction.
     pub fn set_execution_mode(&mut self, mode: BrainExecutionMode) {
         self.execution_mode = mode;
+    }
+
+    /// Override whether the fused path runs the brain beside the vision pass
+    /// (tests + benches). Default is read from XAGENT_BRAIN_BESIDE_VISION at
+    /// construction; see `DispatchProbe::brain_beside_vision`.
+    pub fn set_brain_beside_vision(&mut self, beside: bool) {
+        self.probe.brain_beside_vision = beside;
     }
 
     /// Write world config uniform with batch parameters.
@@ -2086,6 +2185,13 @@ impl GpuKernel {
         // The global pass samples every agent's position into the trail ring on
         // each kernel-batch boundary of the simulated tick count.
         let trail_interval = self.kernel_batch_size();
+        // Opt-in (`XAGENT_BRAIN_BESIDE_VISION=1`, see `DispatchProbe`): with one
+        // brain cycle per kernel batch, run the brain beside the vision pass
+        // after the global pass instead of inside the kernel before it, so the
+        // two overlap. The results are the same. With the vision pass skipped
+        // (measurement only) the cycle keeps its serial shape.
+        let brain_beside_vision =
+            self.probe.brain_beside_vision && self.vision_stride == 1 && !skip_vision;
         // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to
         // the optional GPU-complete time below distinguishes CPU submit/recording
         // cost from queue back-pressure / GPU execution.
@@ -2144,13 +2250,18 @@ impl GpuKernel {
                         pass.set_pipeline(&self.kernel_pipeline);
                         // Per-batch start_tick + measurement-only pass_limit via
                         // push constant (both exact u32; pass_limit defaults to 7
-                        // = all passes ⇒ byte-identical).
+                        // = all passes ⇒ byte-identical). With the brain beside
+                        // vision, the kernel runs only its prefix (physics,
+                        // food and danger detection, death/respawn): a pass
+                        // limit of 0 skips every brain pass.
+                        let kernel_pass_limit = if brain_beside_vision {
+                            0
+                        } else {
+                            self.probe.kernel_pass_limit
+                        };
                         pass.set_push_constants(
                             0,
-                            bytemuck::cast_slice(&[
-                                tick_cursor as u32,
-                                self.probe.kernel_pass_limit,
-                            ]),
+                            bytemuck::cast_slice(&[tick_cursor as u32, kernel_pass_limit]),
                         );
                         pass.dispatch_workgroups(self.agent_count, 1, 1);
 
@@ -2162,9 +2273,23 @@ impl GpuKernel {
                             pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                             pass.dispatch_workgroups(1, 1, 1);
                         }
-                        // Vision pass: raycasting, VISION_GROUPS_PER_AGENT
-                        // workgroups per agent.
-                        if !skip_vision {
+                        if brain_beside_vision {
+                            // Brain and vision in one dispatch, then publish
+                            // vision's senses for the next cycle's brain.
+                            pass.set_pipeline(&self.brain_vision_pipeline);
+                            pass.set_push_constants(
+                                0,
+                                bytemuck::cast_slice(&[
+                                    tick_cursor as u32,
+                                    self.probe.kernel_pass_limit,
+                                ]),
+                            );
+                            pass.dispatch_workgroups(self.brain_vision_workgroups, 1, 1);
+                            pass.set_pipeline(&self.sensory_publish_pipeline);
+                            pass.dispatch_workgroups(self.agent_count, 1, 1);
+                        } else if !skip_vision {
+                            // Vision pass: raycasting, VISION_GROUPS_PER_AGENT
+                            // workgroups per agent.
                             pass.set_pipeline(&self.vision_pipeline);
                             pass.dispatch_workgroups(self.vision_workgroups, 1, 1);
                         }
@@ -3725,6 +3850,8 @@ mod tests {
     const BRAIN_PASSES_SRC: &str = include_str!("shaders/kernel/brain_passes.wgsl");
     const BRAIN_TICK_SRC: &str = include_str!("shaders/kernel/brain_tick.wgsl");
     const KERNEL_TICK_SRC: &str = include_str!("shaders/kernel/kernel_tick.wgsl");
+    const BRAIN_INNER_SRC: &str = include_str!("shaders/kernel/brain_inner.wgsl");
+    const BRAIN_VISION_TICK_SRC: &str = include_str!("shaders/kernel/brain_vision_tick.wgsl");
     const COMMON_SRC: &str = include_str!("shaders/kernel/common.wgsl");
     const BITONIC_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sort_subgroup.wgsl");
 
@@ -3828,16 +3955,40 @@ mod tests {
 
     #[test]
     fn kernel_tick_has_expected_subgroup_markers() {
-        for marker in [
-            "// KERNEL_SUBGROUP_ENTRY_PARAMS",
-            "/* KERNEL_SUBGROUP_TOPK_PARAMS */",
-            "/* KERNEL_SUBGROUP_TOPK_ARGS */",
-            "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
+        // The entry markers live in each entry file; brain_tick_inner's own
+        // markers in the shared brain_inner.wgsl.
+        for (file, source, markers) in [
+            (
+                "kernel_tick.wgsl",
+                KERNEL_TICK_SRC,
+                &[
+                    "// KERNEL_SUBGROUP_ENTRY_PARAMS",
+                    "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
+                ][..],
+            ),
+            (
+                "brain_vision_tick.wgsl",
+                BRAIN_VISION_TICK_SRC,
+                &[
+                    "// KERNEL_SUBGROUP_ENTRY_PARAMS",
+                    "/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */",
+                ][..],
+            ),
+            (
+                "brain_inner.wgsl",
+                BRAIN_INNER_SRC,
+                &[
+                    "/* KERNEL_SUBGROUP_TOPK_PARAMS */",
+                    "/* KERNEL_SUBGROUP_TOPK_ARGS */",
+                ][..],
+            ),
         ] {
-            assert!(
-                KERNEL_TICK_SRC.contains(marker),
-                "kernel_tick.wgsl must declare the `{marker}` marker"
-            );
+            for marker in markers {
+                assert!(
+                    source.contains(marker),
+                    "{file} must declare the `{marker}` marker"
+                );
+            }
         }
     }
 
@@ -3857,7 +4008,16 @@ mod tests {
 
     #[test]
     fn top_k_param_and_arg_counts_match_for_composed_kernel_shader() {
-        let composed = [COMMON_SRC, BRAIN_PASSES_SRC, KERNEL_TICK_SRC].join("\n");
+        for entry in [KERNEL_TICK_SRC, BRAIN_VISION_TICK_SRC] {
+            assert_kernel_top_k_markers_balanced(
+                &[COMMON_SRC, BRAIN_PASSES_SRC, BRAIN_INNER_SRC, entry].join("\n"),
+            );
+        }
+    }
+
+    /// The kernel top-K markers of a composed module holding
+    /// `brain_tick_inner` and one entry that calls it are balanced.
+    fn assert_kernel_top_k_markers_balanced(composed: &str) {
         let k_params = composed
             .matches("/* KERNEL_SUBGROUP_TOPK_PARAMS */")
             .count();
@@ -3884,7 +4044,13 @@ mod tests {
     }
 
     fn composed_kernel_shader() -> String {
-        [COMMON_SRC, BRAIN_PASSES_SRC, KERNEL_TICK_SRC].join("\n")
+        [
+            COMMON_SRC,
+            BRAIN_PASSES_SRC,
+            BRAIN_INNER_SRC,
+            KERNEL_TICK_SRC,
+        ]
+        .join("\n")
     }
 
     fn assert_no_markers_remain(src: &str) {

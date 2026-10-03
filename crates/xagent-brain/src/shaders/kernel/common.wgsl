@@ -421,7 +421,7 @@ const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 50u;
+const PHYS_STRIDE: u32 = 52u;
 // Trail ring: TRAIL_RING_SLOTS slots, each (agent_count + 1) records of
 // TRAIL_RECORD_STRIDE floats. Records 0..agent_count are (x, y, z, death count);
 // the final record is the slot header whose first float is the sample number
@@ -497,6 +497,10 @@ const P_HOMEO_PREDICTED_GRADIENT_OUT: u32 = 47u;
 const P_AVOIDANCE_TURN_AWAY: u32 = 48u;
 /// Cumulative count of steps onto hazard ground. Mirrors buffers.rs.
 const P_HAZARD_ENTRIES: u32 = 49u;
+/// Position (x, z) the brain's staleness ring reads this cycle: saved after
+/// death/respawn, before the global pass's collisions. Mirrors buffers.rs.
+const P_BRAIN_POS_X: u32 = 50u;
+const P_BRAIN_POS_Z: u32 = 51u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 
@@ -1005,9 +1009,10 @@ fn settle_recent_moments_at_death(brain_base: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Buffer bindings — 14 storage + 2 uniform, single bind group
-// (binding 13 is now brain_scratch; the numbering of the remaining
-// bindings is stable so the bind-group layout in gpu_kernel.rs stays aligned)
+// Buffer bindings — 16 storage + 2 uniform, single bind group
+// (binding 13 is brain_scratch, binding 16 is the trail ring, binding 17 is
+// sensory_next; the numbering of the remaining bindings is stable so the
+// bind-group layout in gpu_kernel.rs stays aligned)
 // ═══════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)  var<storage, read_write> physics_state:        array<f32>;
@@ -1027,6 +1032,7 @@ fn settle_recent_moments_at_death(brain_base: u32) {
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 4>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 @group(0) @binding(16) var<storage, read_write> trail_ring:        array<f32>;
+@group(0) @binding(17) var<storage, read_write> sensory_next:      array<f32>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper functions

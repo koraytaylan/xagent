@@ -1752,8 +1752,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // accumulated forward output, then compare displacement against
         // expected travel to detect agents that aren't making progress.
         let phys_base_fat = agent_id * PHYS_STRIDE;
-        let cur_x = physics_state[phys_base_fat + P_POS_X];
-        let cur_z = physics_state[phys_base_fat + P_POS_Z];
+        // The position saved before this cycle's collisions (see
+        // P_BRAIN_POS_X), whichever dispatch the brain runs in.
+        let cur_x = physics_state[phys_base_fat + P_BRAIN_POS_X];
+        let cur_z = physics_state[phys_base_fat + P_BRAIN_POS_Z];
         let pos_cursor = u32(brain_state[brain_base + O_POS_RING_CURSOR]);
         brain_state[brain_base + O_POS_RING_X + pos_cursor] = cur_x;
         brain_state[brain_base + O_POS_RING_Z + pos_cursor] = cur_z;

@@ -389,6 +389,13 @@ pub const P_AVOIDANCE_TURN_AWAY: usize = 48;
 /// on hazard ground after a tick off it. Generation-cumulative (preserved
 /// across respawn).
 pub const P_HAZARD_ENTRIES: usize = 49;
+/// Position (x, z) the brain's staleness ring reads in a cycle: copied from
+/// `P_POS_X` / `P_POS_Z` after death/respawn, before the global pass's
+/// collisions, so the brain reads the same position whether it runs inside
+/// the fused kernel or after the global pass beside vision. Per-agent live
+/// state, never serialized.
+pub const P_BRAIN_POS_X: usize = 50;
+pub const P_BRAIN_POS_Z: usize = 51;
 
 /// Value written to `O_PREV_HOMEO_PREDICTION` at birth and on death.
 ///
@@ -399,7 +406,7 @@ pub const P_HAZARD_ENTRIES: usize = 49;
 /// actually predict, so clearing the slot to zero would be a false sample.
 /// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
 pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
-pub const PHYS_STRIDE: usize = 50;
+pub const PHYS_STRIDE: usize = 52;
 /// Number of sample slots in the GPU trail ring. Each slot holds one position
 /// record per agent plus a header record, written by the global pass at every
 /// trail-sample boundary; the CPU reads the ring with each state snapshot.
@@ -1793,6 +1800,8 @@ mod tests {
         );
         assert_eq!(wgsl["P_AVOIDANCE_TURN_AWAY"], P_AVOIDANCE_TURN_AWAY as u32);
         assert_eq!(wgsl["P_HAZARD_ENTRIES"], P_HAZARD_ENTRIES as u32);
+        assert_eq!(wgsl["P_BRAIN_POS_X"], P_BRAIN_POS_X as u32);
+        assert_eq!(wgsl["P_BRAIN_POS_Z"], P_BRAIN_POS_Z as u32);
     }
 
     #[test]
@@ -2050,6 +2059,8 @@ mod tests {
             P_HOMEO_PREDICTED_GRADIENT_OUT,
             P_AVOIDANCE_TURN_AWAY,
             P_HAZARD_ENTRIES,
+            P_BRAIN_POS_X,
+            P_BRAIN_POS_Z,
         ]
         .iter()
         .max()
@@ -2064,18 +2075,19 @@ mod tests {
     }
 
     #[test]
-    fn shader_has_17_bindings() {
+    fn shader_has_18_bindings() {
         let src = include_str!("shaders/kernel/common.wgsl");
         let binding_count = src
             .lines()
             .filter(|l| l.trim().starts_with("@group(0) @binding("))
             .count();
-        // Bindings 0-16: binding 13 is brain_scratch and binding 16 is the
-        // trail ring; the numbering of the remaining bindings is stable so the
-        // bind-group layout in gpu_kernel.rs stays aligned.
+        // Bindings 0-17: binding 13 is brain_scratch, binding 16 is the trail
+        // ring, and binding 17 is sensory_next (brain beside vision). The
+        // numbering of the remaining bindings is stable so the bind-group
+        // layout in gpu_kernel.rs stays aligned.
         assert_eq!(
-            binding_count, 17,
-            "Expected 17 bindings (0-16: binding 16 is trail_ring), found {binding_count}"
+            binding_count, 18,
+            "Expected 18 bindings (0-17: binding 16 is trail_ring, binding 17 is sensory_next), found {binding_count}"
         );
     }
 

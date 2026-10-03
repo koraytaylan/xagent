@@ -798,7 +798,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 //     `storageBarrier(); workgroupBarrier();` pair that follows each
 //     thread-0-only phase.
 //
-// With XAGENT_BRAIN_BESIDE_VISION=1 and vision_stride 1 the host runs this
+// With vision_stride 1 (unless XAGENT_BRAIN_BESIDE_VISION=0) the host runs this
 // entry with a pass limit of 0 (no brain passes) and runs the brain after the
 // global pass, beside the vision workgroups (brain_vision_tick.wgsl). The
 // brain then reads the same inputs: the global pass changes only positions,

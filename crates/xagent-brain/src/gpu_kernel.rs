@@ -309,12 +309,15 @@ impl BrainExecutionMode {
     }
 }
 
-/// Default-off per-batch timing / A-B knobs for the throughput-ceiling probe.
+/// Per-batch timing / A-B knobs for the throughput-ceiling probe, and the
+/// cycle-shape switch.
 ///
-/// Both flags are read once from the environment at construction so the
-/// steady-state dispatch path stays branch-light, and both default off — with
-/// them off the dispatch path is byte-for-byte unchanged. They exist purely to
-/// measure where the high-speed-multiplier ticks/sec ceiling actually lives.
+/// All are read once from the environment at construction so the
+/// steady-state dispatch path stays branch-light. The measurement knobs
+/// default off — with them off the dispatch path is byte-for-byte unchanged —
+/// and exist purely to measure where the ticks/sec ceiling lives. The cycle
+/// shape (`brain_beside_vision`) defaults on and gives the same results
+/// either way.
 struct DispatchProbe {
     /// `XAGENT_PROBE_GPU_WAIT=1`: add one `Maintain::Wait` after the final
     /// submit of each `dispatch_ticks` call to measure GPU-complete wall time
@@ -338,14 +341,14 @@ struct DispatchProbe {
     /// any smaller value deliberately produces wrong results and is for timing
     /// only — never on in tests or release.
     kernel_pass_limit: u32,
-    /// `XAGENT_BRAIN_BESIDE_VISION=1`: with one brain cycle per kernel batch,
-    /// run the brain beside the vision pass after the global pass instead of
-    /// inside the kernel before it (brain_vision_tick.wgsl). The results are
-    /// bit-identical either way; which is faster depends on the GPU. The
-    /// overlap pays where a small population leaves most cores idle, but the
-    /// vision workgroups then carry the brain's shared memory, and on a GPU
-    /// with few cores (an AMD Raphael iGPU: 25% slower at 10 agents) the
-    /// separate vision pass wins. Off by default.
+    /// With one brain cycle per kernel batch, run the brain beside the vision
+    /// pass after the global pass instead of inside the kernel before it
+    /// (brain_vision_tick.wgsl). On by default; `XAGENT_BRAIN_BESIDE_VISION=0`
+    /// opts out. The results are bit-identical either way; which is faster
+    /// depends on the GPU. The overlap pays where a small population leaves
+    /// most cores idle, but the vision workgroups then carry the brain's
+    /// shared memory, and on a GPU with few cores (an AMD Raphael iGPU: 25%
+    /// slower at 10 agents) the separate vision pass wins.
     brain_beside_vision: bool,
 }
 
@@ -371,7 +374,7 @@ impl DispatchProbe {
             skip_global: skip_both || flag("XAGENT_SKIP_GLOBAL"),
             skip_vision: skip_both || flag("XAGENT_SKIP_VISION"),
             kernel_pass_limit,
-            brain_beside_vision: flag("XAGENT_BRAIN_BESIDE_VISION"),
+            brain_beside_vision: std::env::var("XAGENT_BRAIN_BESIDE_VISION").as_deref() != Ok("0"),
         }
     }
 }
@@ -1926,7 +1929,7 @@ impl GpuKernel {
     }
 
     /// Override whether the fused path runs the brain beside the vision pass
-    /// (tests + benches). Default is read from XAGENT_BRAIN_BESIDE_VISION at
+    /// (tests + benches). Default is on unless XAGENT_BRAIN_BESIDE_VISION=0 at
     /// construction; see `DispatchProbe::brain_beside_vision`.
     pub fn set_brain_beside_vision(&mut self, beside: bool) {
         self.probe.brain_beside_vision = beside;
@@ -2250,11 +2253,12 @@ impl GpuKernel {
         // The global pass samples every agent's position into the trail ring on
         // each kernel-batch boundary of the simulated tick count.
         let trail_interval = self.kernel_batch_size();
-        // Opt-in (`XAGENT_BRAIN_BESIDE_VISION=1`, see `DispatchProbe`): with one
-        // brain cycle per kernel batch, run the brain beside the vision pass
-        // after the global pass instead of inside the kernel before it, so the
-        // two overlap. The results are the same. With the vision pass skipped
-        // (measurement only) the cycle keeps its serial shape.
+        // Unless opted out (`XAGENT_BRAIN_BESIDE_VISION=0`, see `DispatchProbe`):
+        // with one brain cycle per kernel batch, run the brain beside the
+        // vision pass after the global pass instead of inside the kernel
+        // before it, so the two overlap. The results are the same. With the
+        // vision pass skipped (measurement only) the cycle keeps its serial
+        // shape.
         let brain_beside_vision =
             self.probe.brain_beside_vision && self.vision_stride == 1 && !skip_vision;
         // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to

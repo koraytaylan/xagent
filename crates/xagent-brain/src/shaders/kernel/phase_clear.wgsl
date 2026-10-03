@@ -1,20 +1,17 @@
 // Phase: clear grids and collision scratch.
-// All 256 threads cooperate to zero food_grid, agent_grid, collision_scratch.
+// All 256 threads cooperate to empty food_grid and agent_grid and zero
+// collision_scratch.
 
 fn phase_clear(tid: u32) {
     let grid_w = wc_u32(WC_GRID_WIDTH);
     let total_cells = grid_w * grid_w;
 
-    // Zero food_grid: total_cells * FOOD_GRID_CELL_STRIDE elements
-    let food_grid_size = total_cells * FOOD_GRID_CELL_STRIDE;
-    for (var i = tid; i < food_grid_size; i += 256u) {
-        atomicStore(&food_grid[i], 0u);
-    }
-
-    // Zero agent_grid: total_cells * AGENT_GRID_CELL_STRIDE elements
-    let agent_grid_size = total_cells * AGENT_GRID_CELL_STRIDE;
-    for (var i = tid; i < agent_grid_size; i += 256u) {
-        atomicStore(&agent_grid[i], 0u);
+    // Empty every grid cell by zeroing its count (slot 0). Every reader stops
+    // at the clamped count and every insert writes the slot it claims, so the
+    // stale entries left past the count are never read.
+    for (var cell = tid; cell < total_cells; cell += 256u) {
+        atomicStore(&food_grid[cell * FOOD_GRID_CELL_STRIDE], 0u);
+        atomicStore(&agent_grid[cell * AGENT_GRID_CELL_STRIDE], 0u);
     }
 
     // Zero collision_scratch: agent_count * 3 elements

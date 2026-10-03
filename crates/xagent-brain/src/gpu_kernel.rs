@@ -378,6 +378,40 @@ const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
 const BIOME_GRID_RES: usize = 256;
 
+/// Storage declarations in `common.wgsl` of the food flags and the two grids,
+/// as every pass but vision sees them (atomics: the grid and food passes
+/// insert concurrently), with the plain `u32` form the vision module uses.
+const GRID_BINDING_DECLARATIONS: [(&str, &str); 3] = [
+    (
+        "var<storage, read_write> food_flags:        array<atomic<u32>>;",
+        "var<storage, read_write> food_flags:        array<u32>;",
+    ),
+    (
+        "var<storage, read_write> food_grid:         array<atomic<u32>>;",
+        "var<storage, read_write> food_grid:         array<u32>;",
+    ),
+    (
+        "var<storage, read_write> agent_grid:        array<atomic<u32>>;",
+        "var<storage, read_write> agent_grid:        array<u32>;",
+    ),
+];
+
+/// `common.wgsl` with the food flags and the two grids declared as plain
+/// `u32` arrays. The vision pass only reads them, and a storage barrier
+/// separates it from every pass that writes them, so plain loads read exactly
+/// what atomic loads would, without their cost.
+fn with_plain_grid_bindings(common: &str) -> String {
+    let mut source = common.to_string();
+    for (atomic, plain) in GRID_BINDING_DECLARATIONS {
+        assert!(
+            source.contains(atomic),
+            "common.wgsl no longer declares `{atomic}`"
+        );
+        source = source.replace(atomic, plain);
+    }
+    source
+}
+
 #[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
 pub struct GpuKernel {
     device: wgpu::Device,
@@ -1077,9 +1111,12 @@ impl GpuKernel {
         ]
         .join("\n");
 
-        // Vision pipeline: common + vision fragments + vision entry
+        // Vision pipeline: common + vision fragments + vision entry. Vision
+        // only reads the food flags and the two grids, so its module
+        // declares them as plain u32 (see `with_plain_grid_bindings`).
+        let vision_common = with_plain_grid_bindings(common_src);
         let vision_source = [
-            common_src,
+            vision_common.as_str(),
             include_str!("shaders/kernel/phase_vision.wgsl"),
             include_str!("shaders/kernel/vision_tick.wgsl"),
         ]

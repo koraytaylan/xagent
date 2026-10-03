@@ -75,11 +75,11 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
 
                 let cell_idx = uncx * grid_width + uncz;
                 let cell_base = cell_idx * FOOD_GRID_CELL_STRIDE;
-                let count = min(u32(atomicLoad(&food_grid[cell_base])), FOOD_GRID_MAX_PER_CELL);
+                let count = min(u32(food_grid[cell_base]), FOOD_GRID_MAX_PER_CELL);
 
                 for (var s: u32 = 0u; s < count; s++) {
-                    let fidx = u32(atomicLoad(&food_grid[cell_base + 1u + s]));
-                    if atomicLoad(&food_flags[fidx]) != 0u { continue; }
+                    let fidx = u32(food_grid[cell_base + 1u + s]);
+                    if food_flags[fidx] != 0u { continue; }
 
                     let fbase = fidx * FOOD_STATE_STRIDE;
                     let fx = food_state[fbase + FOOD_POSITION_X];
@@ -119,10 +119,10 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
 
                 let cell_idx = uncx * grid_width + uncz;
                 let cell_base = cell_idx * AGENT_GRID_CELL_STRIDE;
-                let count = min(u32(atomicLoad(&agent_grid[cell_base])), AGENT_GRID_MAX_PER_CELL);
+                let count = min(u32(agent_grid[cell_base]), AGENT_GRID_MAX_PER_CELL);
 
                 for (var s: u32 = 0u; s < count; s++) {
-                    let other = u32(atomicLoad(&agent_grid[cell_base + 1u + s]));
+                    let other = u32(agent_grid[cell_base + 1u + s]);
                     if other == agent_id { continue; }
 
                     let ob = other * PHYS_STRIDE;
@@ -267,12 +267,12 @@ fn phase_vision_senses(tid: u32) {
 
             let cell_idx = uncx * grid_width + uncz;
             let cell_base = cell_idx * FOOD_GRID_CELL_STRIDE;
-            let count = min(u32(atomicLoad(&food_grid[cell_base])), FOOD_GRID_MAX_PER_CELL);
+            let count = min(u32(food_grid[cell_base]), FOOD_GRID_MAX_PER_CELL);
 
             for (var s: u32 = 0u; s < count; s++) {
                 if touch_count >= MAX_TOUCH_CONTACTS { break; }
-                let fidx = u32(atomicLoad(&food_grid[cell_base + 1u + s]));
-                if atomicLoad(&food_flags[fidx]) != 0u { continue; }
+                let fidx = u32(food_grid[cell_base + 1u + s]);
+                if food_flags[fidx] != 0u { continue; }
 
                 let fbase = fidx * FOOD_STATE_STRIDE;
                 let fdx = food_state[fbase + FOOD_POSITION_X] - pos.x;
@@ -305,11 +305,11 @@ fn phase_vision_senses(tid: u32) {
 
             let cell_idx = uncx * grid_width + uncz;
             let cell_base = cell_idx * AGENT_GRID_CELL_STRIDE;
-            let count = min(u32(atomicLoad(&agent_grid[cell_base])), AGENT_GRID_MAX_PER_CELL);
+            let count = min(u32(agent_grid[cell_base]), AGENT_GRID_MAX_PER_CELL);
 
             for (var s: u32 = 0u; s < count; s++) {
                 if touch_count >= MAX_TOUCH_CONTACTS { break; }
-                let other = u32(atomicLoad(&agent_grid[cell_base + 1u + s]));
+                let other = u32(agent_grid[cell_base + 1u + s]);
                 if other == tid { continue; }
 
                 let ob = other * PHYS_STRIDE;
@@ -390,7 +390,7 @@ fn sense_scent(pos: vec3<f32>, facing: vec3<f32>, strength: f32) -> vec2<f32> {
     var concentration = vec2<f32>(0.0, 0.0);
     let food_count = wc_u32(WC_FOOD_COUNT);
     for (var f: u32 = 0u; f < food_count; f++) {
-        if (atomicLoad(&food_flags[f]) != 0u) { continue; }
+        if (food_flags[f] != 0u) { continue; }
         let fbase = f * FOOD_STATE_STRIDE;
         let fx = food_state[fbase + FOOD_POSITION_X];
         let fz = food_state[fbase + FOOD_POSITION_Z];

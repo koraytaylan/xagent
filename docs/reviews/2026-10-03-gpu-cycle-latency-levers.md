@@ -171,3 +171,26 @@ The profile on that machine differs from the M3 Max's. Skipping the vision pass 
 | All eight changes | **5,752** (5,583–6,059) |
 
 That is +37% there. R2 and R3 remain open.
+
+## Implementation of R2 (2026-10-03)
+
+R2 is on `develop` as an opt-in shape of the fused cycle: `XAGENT_BRAIN_BESIDE_VISION=1`, with `vision_stride = 1`. A cycle then runs four steps:
+
+1. The kernel with a pass limit of 0: physics, food and danger detection, death/respawn, and no brain passes.
+2. The global pass.
+3. One dispatch holding the brain workgroups and the vision workgroups (`brain_vision_tick.wgsl`, vision workgroups 256 wide).
+4. `sensory_publish`.
+
+R2 needed two pieces for exactness. They differ slightly from the sketch above:
+
+- **Positions.** The kernel saves each agent's position after death/respawn in two new physics slots, `P_BRAIN_POS_X/Z` (`PHYS_STRIDE` 50 → 52). The brain's staleness ring reads them on every path, so the code is the same in both shapes.
+- **Sensory buffer.** It is not swapped every cycle. Vision writes a second buffer (`sensory_next`, binding 16), and `sensory_publish` copies it into `sensory_buffer` after the combined dispatch. So the sensory buffer holds what the serial cycle left there at every cycle boundary, and telemetry and the other execution paths need no change.
+
+**Verification:**
+
+- The seeded hash (over the first 50 physics slots, for comparison with builds before the two new slots) is the same in both shapes: at 10 agents over 20,000 ticks, and at 40 agents over 5,000 ticks.
+- A new GPU test (`brain_beside_vision.rs`) runs both shapes for 3,000 ticks: six agents close enough to collide, food and hazard ground. It requires every physics and brain-state value to match.
+- Reading the post-collision position instead of the saved one makes the test fail.
+- The full integration suite passes.
+
+**It is off by default.** On the AMD Raphael iGPU (2 compute units) it was slower than the serial cycle: at 10 agents over 100,000 ticks, 4,455 against 5,908 ticks/sec. Each vision workgroup in the combined dispatch reserves the brain's workgroup memory, and on two compute units that costs more than the overlap gains. Whether it pays on the M3 Max, as the F5 proxy suggests, has not been measured with this implementation; turning it on there is one environment variable.

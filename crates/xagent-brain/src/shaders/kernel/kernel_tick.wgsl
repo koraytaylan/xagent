@@ -44,6 +44,16 @@ var<workgroup> s_food_dist_sq: array<f32, MEMORY_CAP>;
 // Cell index meaning "no danger cell found" in `agent_danger_detect`.
 const NO_DANGER_CELL: u32 = 0xFFFFFFFFu;
 
+// Food index meaning "no food item found" in `agent_food_detect`.
+const NO_FOOD: u32 = 0xFFFFFFFFu;
+
+// Whether a food candidate (squared distance, index) comes before another:
+// nearer first, then the lower index, as a scan in index order with a strict
+// `<` would choose.
+fn food_precedes(dist_sq: f32, idx: u32, other_dist_sq: f32, other_idx: u32) -> bool {
+    return dist_sq < other_dist_sq || (dist_sq == other_dist_sq && idx < other_idx);
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Per-agent physics (extracted from phase_physics.wgsl, single-agent)
 // ══════════════════════════════════════════════════════════════════════════
@@ -426,6 +436,13 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
     // Nearest food within FOOD_SENSE_RADIUS, independent of the eat gate, for the
     // food-sense navigation feature. Same sentinel so the reduction runs safely when dead.
     var local_best_food_dist_sq = 1e12;
+    // The food the bearing points at: nearest by full 3-D distance within the
+    // sense radius, ties to the lower index (each thread scans its indices in
+    // increasing order with a strict `<`, and the merges below compare
+    // (distance, index)). This is the item thread 0 used to find by
+    // rescanning every food item in order.
+    var local_bearing_dist_sq = FOOD_SENSE_RADIUS * FOOD_SENSE_RADIUS;
+    var local_bearing_idx = NO_FOOD;
 
     if (alive) {
         let pos = vec3f(
@@ -453,16 +470,30 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             if (d_sq < food_sense_radius_sq && d_sq < local_best_food_dist_sq) {
                 local_best_food_dist_sq = d_sq;
             }
+            let food_pos = vec3f(
+                food_state[fbase + FOOD_POSITION_X],
+                food_state[fbase + FOOD_POSITION_Y],
+                food_state[fbase + FOOD_POSITION_Z]);
+            let to_food = food_pos - pos;
+            let bearing_d_sq = dot(to_food, to_food);
+            if (bearing_d_sq < local_bearing_dist_sq) {
+                local_bearing_dist_sq = bearing_d_sq;
+                local_bearing_idx = f;
+            }
         }
     }
 
     // Two-phase shared-memory reduction (s_similarities/shared_sort_indices are 128 elements).
     // Runs unconditionally so both barriers are reached by every thread.
     // Phase 1: first 128 threads write directly
+    // The bearing pair reuses the brain's argmin scratch, which the brain
+    // passes only write later in the cycle.
     if (tid < 128u) {
         s_similarities[tid] = local_best_dist_sq;
         shared_sort_indices[tid] = local_best_idx;
         s_food_dist_sq[tid] = local_best_food_dist_sq;
+        s_argmin_val[tid] = local_bearing_dist_sq;
+        s_argmin_idx[tid] = local_bearing_idx;
     }
     workgroupBarrier();
 
@@ -474,6 +505,11 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             shared_sort_indices[slot] = local_best_idx;
         }
         s_food_dist_sq[slot] = min(s_food_dist_sq[slot], local_best_food_dist_sq);
+        if (food_precedes(local_bearing_dist_sq, local_bearing_idx,
+                          s_argmin_val[slot], s_argmin_idx[slot])) {
+            s_argmin_val[slot] = local_bearing_dist_sq;
+            s_argmin_idx[slot] = local_bearing_idx;
+        }
     }
     workgroupBarrier();
 
@@ -481,12 +517,18 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
         var best_idx = 0xFFFFFFFFu;
         var best_dist_sq = 1e12;
         var best_food_dist_sq = 1e12;
+        var bearing_dist_sq = FOOD_SENSE_RADIUS * FOOD_SENSE_RADIUS;
+        var best_food_idx = NO_FOOD;
         for (var i = 0u; i < 128u; i++) {
             if (s_similarities[i] < best_dist_sq) {
                 best_dist_sq = s_similarities[i];
                 best_idx = shared_sort_indices[i];
             }
             best_food_dist_sq = min(best_food_dist_sq, s_food_dist_sq[i]);
+            if (food_precedes(s_argmin_val[i], s_argmin_idx[i], bearing_dist_sq, best_food_idx)) {
+                bearing_dist_sq = s_argmin_val[i];
+                best_food_idx = s_argmin_idx[i];
+            }
         }
         // Publish the nearest in-range food distance (food-sense navigation feature);
         // FOOD_SENSE_RADIUS sentinel when none is within range.
@@ -505,28 +547,9 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
                 physics_state[b + P_POS_X],
                 physics_state[b + P_POS_Y],
                 physics_state[b + P_POS_Z]);
-            let food_count = wc_u32(WC_FOOD_COUNT);
-            let food_sense_radius = FOOD_SENSE_RADIUS;
-
-            // Find the food item with the minimum distance in food-sense range
-            var min_dist_sq = food_sense_radius_sq;
-            var best_food_idx = 0xFFFFFFFFu;
-            for (var f = 0u; f < food_count; f++) {
-                if (atomicLoad(&food_flags[f]) != 0u) { continue; } // already consumed
-                let fbase = f * FOOD_STATE_STRIDE;
-                let food_pos = vec3f(
-                    food_state[fbase + FOOD_POSITION_X],
-                    food_state[fbase + FOOD_POSITION_Y],
-                    food_state[fbase + FOOD_POSITION_Z]);
-                let to_food = food_pos - agent_pos;
-                let d_sq = dot(to_food, to_food);
-                if (d_sq < min_dist_sq) {
-                    min_dist_sq = d_sq;
-                    best_food_idx = f;
-                }
-            }
-
-            if (best_food_idx != 0xFFFFFFFFu) {
+            // The nearest food by 3-D distance within the sense radius,
+            // from the reduction above.
+            if (best_food_idx != NO_FOOD) {
                 let food_base = best_food_idx * FOOD_STATE_STRIDE;
                 let food_pos = vec3f(
                     food_state[food_base + FOOD_POSITION_X],

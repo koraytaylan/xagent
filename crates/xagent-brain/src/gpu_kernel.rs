@@ -1218,6 +1218,7 @@ impl GpuKernel {
             include_str!("shaders/kernel/phase_food_detect.wgsl"),
             include_str!("shaders/kernel/phase_food_respawn.wgsl"),
             include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+            include_str!("shaders/kernel/phase_grid_order.wgsl"),
             include_str!("shaders/kernel/phase_collision.wgsl"),
             include_str!("shaders/kernel/physics_tick.wgsl"),
         ]
@@ -1287,6 +1288,7 @@ impl GpuKernel {
             include_str!("shaders/kernel/phase_food_grid.wgsl"),
             include_str!("shaders/kernel/phase_food_respawn.wgsl"),
             include_str!("shaders/kernel/phase_agent_grid.wgsl"),
+            include_str!("shaders/kernel/phase_grid_order.wgsl"),
             include_str!("shaders/kernel/phase_collision.wgsl"),
             include_str!("shaders/kernel/phase_trail_sample.wgsl"),
             include_str!("shaders/kernel/global_tick.wgsl"),

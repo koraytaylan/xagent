@@ -2,7 +2,8 @@
 // dispatch(1, 1, 1) — single workgroup of 256 threads.
 // Runs once per vision_stride kernel cycles.
 // Requires: common.wgsl + phase_clear + phase_food_grid + phase_food_respawn
-//           + phase_agent_grid + phase_collision + phase_trail_sample
+//           + phase_agent_grid + phase_grid_order + phase_collision
+//           + phase_trail_sample
 //           (concatenated by Rust).
 
 struct GlobalPushConstants {
@@ -28,6 +29,10 @@ fn global_tick(@builtin(local_invocation_id) lid: vec3u) {
     storageBarrier(); workgroupBarrier();
 
     if (tid < agent_count) { phase_agent_grid(tid); }
+    storageBarrier(); workgroupBarrier();
+
+    // Entries in index order, whatever order the inserting threads ran in.
+    phase_sort_grid_cells(tid);
     storageBarrier(); workgroupBarrier();
 
     for (var c = 0u; c < 3u; c++) {

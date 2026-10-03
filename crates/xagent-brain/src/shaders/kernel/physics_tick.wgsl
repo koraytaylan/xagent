@@ -16,6 +16,10 @@ fn run_physics_tick(tid: u32, tick: u32, agent_count: u32) {
     phase_food_grid(tid);
     storageBarrier(); workgroupBarrier();
 
+    // Entries in index order, whatever order the inserting threads ran in.
+    phase_sort_grid_cells(tid);
+    storageBarrier(); workgroupBarrier();
+
     if (tid < agent_count) { phase_physics(tid, tick); }
     storageBarrier(); workgroupBarrier();
 
@@ -31,6 +35,9 @@ fn run_physics_tick(tid: u32, tick: u32, agent_count: u32) {
     if (tid < agent_count) { phase_agent_grid(tid); }
     storageBarrier(); workgroupBarrier();
 
+    phase_sort_grid_cells(tid);
+    storageBarrier(); workgroupBarrier();
+
     for (var c = 0u; c < 3u; c++) {
         if (tid < agent_count) { phase_collision_accumulate(tid); }
         storageBarrier(); workgroupBarrier();
@@ -40,6 +47,8 @@ fn run_physics_tick(tid: u32, tick: u32, agent_count: u32) {
 }
 
 fn run_empty_tick(tid: u32) {
+    storageBarrier(); workgroupBarrier();
+    storageBarrier(); workgroupBarrier();
     storageBarrier(); workgroupBarrier();
     storageBarrier(); workgroupBarrier();
     storageBarrier(); workgroupBarrier();

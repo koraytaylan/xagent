@@ -1596,3 +1596,23 @@ Generations 60–78, per seed (5, 6, 7, 8):
 - **Recombination slows this down.** Over the first twenty generations the two lineages are indistinguishable, and the +25% seen earlier over 20 generations was early-phase variation. From generation 30 on, the champion-only lineage pulls ahead in all four seeds, on fitness, deaths and time on hazard ground. A recombined brain is stored without ever having been evaluated, and averaging pulls in the unperturbed group and weaker perturbations, so each accepted step is smaller and less sure than the best group's own.
 - **More groups help recombination, but not enough.** With ten groups the recombined lineage dies and wanders onto hazard ground less than with five (0.93 against 1.32 deaths). It still trails the champion-only lineage, and it has less food per agent to work with.
 - **What a lineage needed was time, not a better search.** Twenty generations were too few to see avoidance evolve. Eighty are enough for the original champion-only search, while recombination costs it ground.
+
+## Avoidance intent restricted to hazard ahead
+
+The avoidance-intent counters now count only ticks where the nearest hazard cell is within 30 units and inside the agent's own horizontal field of view, with the agent off hazard ground. Hazard behind or beside the agent, and ticks spent standing on it, no longer count.
+
+To check the corrected metric, the champion-only lineage's stored champions were replayed. Each run starts every agent from the champion the lineage held at a given generation, or from a fresh brain, and lives one generation (40k ticks) under the evolution config: 20 agents, seeds 5–8, one repeat. "Hazard deaths" are deaths while on hazard ground.
+
+| Champion at generation | Avoidance intent (seeds 5, 6, 7, 8) | Approach intent | Deaths | Hazard deaths | Meals | Fitness |
+|---|---|---|---|---|---|---|
+| Fresh brain | 0.518 (0.528, 0.511, 0.515, 0.518) | 0.506 | 6.90 | 6.45 | 19.7 | 0.056 |
+| 0 | 0.535 (0.543, 0.522, 0.542, 0.532) | 0.576 | 4.97 | 4.33 | 29.6 | 0.081 |
+| 10 | 0.535 | 0.568 | 2.34 | 1.88 | 38.6 | 0.134 |
+| 20 | 0.535 | 0.556 | 1.99 | 1.49 | 39.5 | 0.141 |
+| 40 | 0.533 | 0.566 | 1.85 | 1.52 | 42.1 | 0.152 |
+| 60 | 0.533 | 0.565 | 0.97 | 0.75 | 46.0 | 0.185 |
+| 78 | 0.535 (0.549, 0.527, 0.516, 0.540) | 0.563 | 0.64 | 0.53 | 47.6 | 0.201 |
+
+- **The replay confirms the lineage evolves avoidance.** From generation 0 to 78, deaths on hazard ground fall by 88% (4.33 → 0.53) while meals rise by 60%.
+- **Even restricted to hazard ahead, avoidance intent does not show it.** It stays at about 0.535 from generation 0 on. A per-tick count of which way the motor turn points cannot see this avoidance: whatever the evolved agents do differently, it is not a consistent turn away on the ticks when hazard is ahead. What they do instead was not measured here.
+- **Deaths on hazard ground and time spent on it are the measures to watch** for avoidance. The `behavior_metric` table already records the latter as `danger_dwell_fraction`.

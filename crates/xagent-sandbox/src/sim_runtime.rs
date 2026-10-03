@@ -19,7 +19,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendE
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use xagent_brain::buffers::{BrainLayout, PATTERN_STRIDE};
+use xagent_brain::buffers::{BrainLayout, TrailSample, PATTERN_STRIDE};
 use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
 use xagent_shared::{BrainConfig, WorldConfig};
@@ -89,6 +89,35 @@ fn clamp_ticks_to_generation_budget(
     }
 }
 
+/// Shape a dispatch so every trail-sample boundary falls on a dispatch end or
+/// inside a run of whole kernel batches that started on a boundary.
+///
+/// The GPU samples agent positions at each multiple of `interval` ticks (one
+/// kernel batch), and only at the end of a kernel batch, so the sampled path
+/// is the same at every speed multiplier only if each dispatch (a) covers
+/// whole brain cycles and (b) never straddles a boundary it does not end on.
+/// A dispatch that starts on a boundary may run several whole batches; one
+/// that starts inside a batch stops at the next boundary. Returns the number
+/// of ticks to dispatch, at least `brain_tick_stride` for any `ticks` at
+/// least that large.
+fn align_dispatch_to_trail_boundary(
+    ticks: u32,
+    tick: u64,
+    interval: u32,
+    brain_tick_stride: u32,
+) -> u32 {
+    let whole_cycles = ticks - ticks % brain_tick_stride;
+    let into_interval = u32::try_from(tick % u64::from(interval)).unwrap_or(0);
+    if into_interval != 0 {
+        return whole_cycles.min(interval - into_interval);
+    }
+    if whole_cycles >= interval {
+        whole_cycles - whole_cycles % interval
+    } else {
+        whole_cycles
+    }
+}
+
 /// An owned, CPU-visible snapshot of GPU simulation state.
 ///
 /// Owns its vectors so it can cross the worker → main channel without borrowing
@@ -97,6 +126,10 @@ fn clamp_ticks_to_generation_budget(
 pub struct StateSnapshot {
     pub physics: Vec<f32>,
     pub food: Vec<f32>,
+    /// Every trail sample still held in the GPU ring, oldest first. A snapshot
+    /// repeats samples the previous one carried, so applying only the newest
+    /// snapshot (latest-wins) still sees every sample the ring retains.
+    pub trail_samples: Vec<TrailSample>,
     pub tick: u64,
     pub generation_tick: u64,
     /// Generation epoch of the population this state belongs to (the epoch the
@@ -679,7 +712,12 @@ impl Worker {
 
         let raw_ticks = ((self.sim_accumulator / sim_delta_time) as u32).min(dispatch_cap);
         let mut ticks_to_run = if raw_ticks >= min_dispatch {
-            raw_ticks
+            align_dispatch_to_trail_boundary(
+                raw_ticks,
+                self.tick,
+                self.kernel.kernel_batch_size(),
+                min_dispatch,
+            )
         } else {
             0
         };
@@ -755,6 +793,7 @@ impl Worker {
         StateSnapshot {
             physics,
             food,
+            trail_samples: self.kernel.collected_trail_samples(),
             tick: self.tick,
             generation_tick: self.gen_tick,
             generation_epoch: self.generation_epoch,
@@ -771,6 +810,7 @@ impl Worker {
         StateSnapshot {
             physics: self.kernel.cached_state().to_vec(),
             food,
+            trail_samples: self.kernel.collected_trail_samples(),
             tick: self.tick,
             generation_tick: self.gen_tick,
             generation_epoch: self.generation_epoch,
@@ -922,6 +962,55 @@ mod tests {
     // ── generation-budget clamp ──────────────────────────────────────
 
     #[test]
+    fn align_keeps_whole_batches_from_a_boundary() {
+        // Batch of 100 ticks, brain stride 10, starting on a boundary.
+        assert_eq!(align_dispatch_to_trail_boundary(350, 0, 100, 10), 300);
+        assert_eq!(align_dispatch_to_trail_boundary(100, 500, 100, 10), 100);
+    }
+
+    #[test]
+    fn align_runs_sub_batch_dispatches_from_a_boundary_whole() {
+        // Fewer ticks than a batch cannot straddle a boundary; round to cycles.
+        assert_eq!(align_dispatch_to_trail_boundary(37, 200, 100, 10), 30);
+        assert_eq!(align_dispatch_to_trail_boundary(10, 200, 100, 10), 10);
+    }
+
+    #[test]
+    fn align_stops_at_the_next_boundary_from_inside_a_batch() {
+        assert_eq!(align_dispatch_to_trail_boundary(350, 30, 100, 10), 70);
+        assert_eq!(align_dispatch_to_trail_boundary(40, 30, 100, 10), 40);
+        assert_eq!(align_dispatch_to_trail_boundary(70, 30, 100, 10), 70);
+    }
+
+    #[test]
+    fn align_reaches_every_boundary_from_any_dispatch_size() {
+        // Whatever dispatch sizes the wall clock produces, stepping with the
+        // aligned size must land on every multiple of the interval.
+        for sizes in [[10_u32, 10], [37, 250], [999, 13]] {
+            let mut tick = 0_u64;
+            let mut boundaries_seen = 0_u64;
+            for step in 0..400 {
+                let raw = sizes[step % 2];
+                let run = align_dispatch_to_trail_boundary(raw, tick, 100, 10);
+                assert!(run >= 10, "dispatch must stay at least one brain cycle");
+                let next = tick + u64::from(run);
+                // No boundary is jumped over: crossing one means ending on it
+                // or starting on one and covering whole batches.
+                let crossed = next / 100 - tick / 100;
+                if crossed > 0 {
+                    assert!(
+                        next % 100 == 0,
+                        "dispatch {tick}->{next} straddles a boundary"
+                    );
+                    boundaries_seen += crossed;
+                }
+                tick = next;
+            }
+            assert_eq!(boundaries_seen, tick / 100);
+        }
+    }
+
+    #[test]
     fn clamp_leaves_batch_untouched_with_budget_to_spare() {
         let (clamped, did_clamp) = clamp_ticks_to_generation_budget(64, 1000, 800);
         assert_eq!(clamped, 64);
@@ -981,6 +1070,7 @@ mod tests {
         StateSnapshot {
             physics: Vec::new(),
             food: Vec::new(),
+            trail_samples: Vec::new(),
             tick,
             generation_tick: tick,
             generation_epoch,

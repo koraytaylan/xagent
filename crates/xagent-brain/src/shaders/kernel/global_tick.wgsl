@@ -2,11 +2,14 @@
 // dispatch(1, 1, 1) — single workgroup of 256 threads.
 // Runs once per vision_stride kernel cycles.
 // Requires: common.wgsl + phase_clear + phase_food_grid + phase_food_respawn
-//           + phase_agent_grid + phase_collision (concatenated by Rust).
+//           + phase_agent_grid + phase_collision + phase_trail_sample
+//           (concatenated by Rust).
 
 struct GlobalPushConstants {
     tick: u32,
-    _pad: u32,
+    // Ticks between trail samples; zero disables trail sampling. The pass
+    // records a sample when `tick` is a multiple of it.
+    trail_interval: u32,
 }
 var<push_constant> gpc: GlobalPushConstants;
 
@@ -32,5 +35,9 @@ fn global_tick(@builtin(local_invocation_id) lid: vec3u) {
         storageBarrier(); workgroupBarrier();
         if (tid < agent_count) { phase_collision_apply(tid); }
         storageBarrier(); workgroupBarrier();
+    }
+
+    if gpc.trail_interval != 0u && gpc.tick % gpc.trail_interval == 0u {
+        phase_trail_sample(tid, gpc.tick / gpc.trail_interval);
     }
 }

@@ -53,7 +53,8 @@ impl App {
             for agent in &mut self.agents {
                 if agent.body.body.alive {
                     agent.record_heatmap(world.config.world_size);
-                    agent.record_trail();
+                    // The trail's live end follows the agent each snapshot.
+                    agent.trail_dirty = true;
                 }
             }
         }

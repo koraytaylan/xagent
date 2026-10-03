@@ -400,6 +400,53 @@ pub const P_HAZARD_ENTRIES: usize = 49;
 /// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
 pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
 pub const PHYS_STRIDE: usize = 50;
+/// Number of sample slots in the GPU trail ring. Each slot holds one position
+/// record per agent plus a header record, written by the global pass at every
+/// trail-sample boundary; the CPU reads the ring with each state snapshot.
+/// Mirrored by `TRAIL_RING_SLOTS` in `common.wgsl`.
+pub const TRAIL_RING_SLOTS: usize = 128;
+/// Floats per trail record: position x, y, z and the agent's death count (a
+/// new life starts a new trail). The header record of a slot instead holds the
+/// slot's sample number plus one in its first float (zero = never written),
+/// as a `u32` bit pattern. Mirrored by `TRAIL_RECORD_STRIDE` in `common.wgsl`.
+pub const TRAIL_RECORD_STRIDE: usize = 4;
+
+/// One trail sample read back from the GPU ring: every agent's position at a
+/// tick-aligned boundary of the simulation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrailSample {
+    /// Sample number: the simulated tick of the boundary divided by the trail
+    /// interval. Strictly increasing within one generation.
+    pub sample_number: u64,
+    /// `TRAIL_RECORD_STRIDE` floats per agent: position x, y, z and death count.
+    pub records: Vec<f32>,
+}
+
+/// Decode a GPU trail ring (`TRAIL_RING_SLOTS` slots of `agent_count + 1`
+/// records) into its written samples, oldest first. Slots never written, or
+/// whose header does not belong to the slot, are skipped.
+#[must_use]
+pub fn read_trail_ring(ring: &[f32], agent_count: usize) -> Vec<TrailSample> {
+    let slot_floats = (agent_count + 1) * TRAIL_RECORD_STRIDE;
+    let mut samples: Vec<TrailSample> = ring
+        .chunks_exact(slot_floats)
+        .take(TRAIL_RING_SLOTS)
+        .enumerate()
+        .filter_map(|(slot, slot_data)| {
+            let header = slot_data[agent_count * TRAIL_RECORD_STRIDE].to_bits();
+            let sample_number = u64::from(header.checked_sub(1)?);
+            if usize::try_from(sample_number).ok()? % TRAIL_RING_SLOTS != slot {
+                return None;
+            }
+            Some(TrailSample {
+                sample_number,
+                records: slot_data[..agent_count * TRAIL_RECORD_STRIDE].to_vec(),
+            })
+        })
+        .collect();
+    samples.sort_by_key(|sample| sample.sample_number);
+    samples
+}
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -1622,12 +1669,61 @@ mod tests {
         );
     }
 
+    /// Build a ring with one written slot per `(sample_number, x)` pair; every
+    /// agent's record in a slot holds `x` as its position and death count 0.
+    fn ring_with_samples(agent_count: usize, written: &[(u32, f32)]) -> Vec<f32> {
+        let slot_floats = (agent_count + 1) * TRAIL_RECORD_STRIDE;
+        let mut ring = vec![0.0_f32; TRAIL_RING_SLOTS * slot_floats];
+        for &(sample_number, x) in written {
+            let slot = sample_number as usize % TRAIL_RING_SLOTS;
+            let base = slot * slot_floats;
+            for agent in 0..agent_count {
+                ring[base + agent * TRAIL_RECORD_STRIDE] = x;
+            }
+            ring[base + agent_count * TRAIL_RECORD_STRIDE] = f32::from_bits(sample_number + 1);
+        }
+        ring
+    }
+
+    #[test]
+    fn trail_ring_decodes_written_slots_oldest_first() {
+        // Slot order differs from sample order once the ring has wrapped.
+        let written = [
+            (TRAIL_RING_SLOTS as u32 + 1, 3.0),
+            (2, 2.0),
+            (TRAIL_RING_SLOTS as u32 + 3, 5.0),
+        ];
+        let ring = ring_with_samples(2, &written);
+        let samples = read_trail_ring(&ring, 2);
+        let numbers: Vec<u64> = samples.iter().map(|s| s.sample_number).collect();
+        assert_eq!(
+            numbers,
+            vec![2, TRAIL_RING_SLOTS as u64 + 1, TRAIL_RING_SLOTS as u64 + 3]
+        );
+        assert_eq!(samples[0].records.len(), 2 * TRAIL_RECORD_STRIDE);
+        assert_eq!(samples[0].records[0], 2.0);
+        assert_eq!(samples[1].records[TRAIL_RECORD_STRIDE], 3.0);
+    }
+
+    #[test]
+    fn trail_ring_skips_unwritten_and_misplaced_slots() {
+        assert!(read_trail_ring(&ring_with_samples(2, &[]), 2).is_empty());
+
+        // A header whose sample number does not map to its slot is corrupt.
+        let mut ring = ring_with_samples(2, &[(5, 1.0)]);
+        let slot_floats = 3 * TRAIL_RECORD_STRIDE;
+        ring[5 * slot_floats + 2 * TRAIL_RECORD_STRIDE] = f32::from_bits(8);
+        assert!(read_trail_ring(&ring, 2).is_empty());
+    }
+
     #[test]
     fn shader_phys_constants_match_rust() {
         let src = include_str!("shaders/kernel/common.wgsl");
         let wgsl = parse_wgsl_u32_constants(src);
 
         assert_eq!(wgsl["PHYS_STRIDE"], PHYS_STRIDE as u32);
+        assert_eq!(wgsl["TRAIL_RING_SLOTS"], TRAIL_RING_SLOTS as u32);
+        assert_eq!(wgsl["TRAIL_RECORD_STRIDE"], TRAIL_RECORD_STRIDE as u32);
         assert_eq!(wgsl["P_POS_X"], P_POS_X as u32);
         assert_eq!(wgsl["P_POS_Y"], P_POS_Y as u32);
         assert_eq!(wgsl["P_POS_Z"], P_POS_Z as u32);
@@ -1968,18 +2064,18 @@ mod tests {
     }
 
     #[test]
-    fn shader_has_16_bindings() {
+    fn shader_has_17_bindings() {
         let src = include_str!("shaders/kernel/common.wgsl");
         let binding_count = src
             .lines()
             .filter(|l| l.trim().starts_with("@group(0) @binding("))
             .count();
-        // Bindings 0-15: binding 13 is now brain_scratch; the numbering of
-        // the remaining bindings is stable so the bind-group layout in
-        // gpu_kernel.rs stays aligned.
+        // Bindings 0-16: binding 13 is brain_scratch and binding 16 is the
+        // trail ring; the numbering of the remaining bindings is stable so the
+        // bind-group layout in gpu_kernel.rs stays aligned.
         assert_eq!(
-            binding_count, 16,
-            "Expected 16 bindings (0-15: binding 13 is now brain_scratch), found {binding_count}"
+            binding_count, 17,
+            "Expected 17 bindings (0-16: binding 16 is trail_ring), found {binding_count}"
         );
     }
 

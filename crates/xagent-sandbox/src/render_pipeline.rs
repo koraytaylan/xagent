@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use winit::event_loop::ActiveEventLoop;
 
-use xagent_sandbox::agent::srgb_to_linear;
+use xagent_sandbox::agent::{srgb_to_linear, Agent};
 use xagent_sandbox::overlay;
 use xagent_sandbox::renderer::font::TextItem;
 use xagent_sandbox::renderer::hud::HudBar;
@@ -191,10 +191,15 @@ impl App {
             if let (Some(renderer), Some(trail_gpu)) = (&self.renderer, &mut self.trail_gpu) {
                 let any_dirty = self.agents.iter().any(|a| a.trail_dirty);
                 if any_dirty {
+                    let trails: Vec<Vec<[f32; 3]>> =
+                        self.agents.iter().map(Agent::trail_with_live_end).collect();
                     let agent_data: Vec<(&[[f32; 3]], &[f32; 3], bool)> = self
                         .agents
                         .iter()
-                        .map(|a| (a.trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive))
+                        .zip(&trails)
+                        .map(|(a, trail)| {
+                            (trail.as_slice(), &a.color as &[f32; 3], a.body.body.alive)
+                        })
                         .collect();
                     let mesh = overlay::build_all_trails_mesh(&agent_data);
                     if mesh.indices.is_empty() {

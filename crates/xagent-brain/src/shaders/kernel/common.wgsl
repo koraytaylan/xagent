@@ -422,6 +422,12 @@ const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
 const PHYS_STRIDE: u32 = 50u;
+// Trail ring: TRAIL_RING_SLOTS slots, each (agent_count + 1) records of
+// TRAIL_RECORD_STRIDE floats. Records 0..agent_count are (x, y, z, death count);
+// the final record is the slot header whose first float is the sample number
+// plus one, as a u32 bit pattern (zero = never written).
+const TRAIL_RING_SLOTS: u32 = 128u;
+const TRAIL_RECORD_STRIDE: u32 = 4u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -1020,6 +1026,7 @@ fn settle_recent_moments_at_death(brain_base: u32) {
 @group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
 @group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 4>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
+@group(0) @binding(16) var<storage, read_write> trail_ring:        array<f32>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper functions

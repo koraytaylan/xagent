@@ -20,6 +20,7 @@ use xagent_brain::buffers::{
     P_GRADIENT_OUT, P_HAZARD_ENTRIES, P_INTEGRITY, P_LAST_DEATH_TICK, P_MAX_ENERGY,
     P_MAX_INTEGRITY, P_MOTOR_FWD_OUT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Y, P_POS_Z,
     P_PREDICTION_ERROR, P_TICKS_ALIVE, P_URGENCY_OUT, P_VEL_X, P_VEL_Y, P_VEL_Z, P_YAW,
+    TRAIL_RECORD_STRIDE,
 };
 use xagent_brain::AgentTelemetry;
 
@@ -281,6 +282,21 @@ impl App {
             a.cached_motor.turn = state[base + P_MOTOR_TURN_OUT];
             a.cached_gradient = state[base + P_GRADIENT_OUT];
             a.cached_urgency = state[base + P_URGENCY_OUT];
+        }
+
+        // GPU trail samples, oldest first. Each agent skips the ones it already
+        // applied, so the repeated ring contents of a snapshot cost nothing.
+        for sample in &snapshot.trail_samples {
+            for (agent, record) in self
+                .agents
+                .iter_mut()
+                .zip(sample.records.chunks_exact(TRAIL_RECORD_STRIDE))
+            {
+                agent.apply_trail_record(
+                    sample.sample_number,
+                    [record[0], record[1], record[2], record[3]],
+                );
+            }
         }
 
         // Feed the population's cumulative foraging totals to the governor's

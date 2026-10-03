@@ -1047,11 +1047,9 @@ fn reset_trail_clears_trail_and_marks_dirty() {
     let pos = world.safe_spawn_position();
     let mut agent = Agent::new(0, pos, 0, BrainConfig::default(), 0);
 
-    // Record a few trail points by moving the agent far enough apart
-    agent.body.body.position = Vec3::new(0.0, 0.0, 0.0);
-    agent.record_trail();
-    agent.body.body.position = Vec3::new(10.0, 0.0, 10.0);
-    agent.record_trail();
+    // Apply a few GPU trail samples
+    agent.apply_trail_record(1, [0.0, 0.0, 0.0, 0.0]);
+    agent.apply_trail_record(2, [10.0, 0.0, 10.0, 0.0]);
     assert!(agent.trail.len() >= 2, "trail should have points");
 
     // Clear dirty from initial recording

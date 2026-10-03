@@ -485,6 +485,9 @@ pub struct GpuKernel {
     // ── Indirect dispatch ──
     dispatch_args_buffer: wgpu::Buffer,
 
+    // ── Trail ring (written by the global pass at tick-aligned boundaries) ──
+    trail_ring_buffer: wgpu::Buffer,
+
     // ── Pipelines ──
     prepare_pipeline: wgpu::ComputePipeline,
     physics_pipeline: wgpu::ComputePipeline,
@@ -508,12 +511,14 @@ pub struct GpuKernel {
     // completion/error across the slot's `map_async` callbacks.
     state_staging: [wgpu::Buffer; STAGING_SLOTS],
     food_staging: [wgpu::Buffer; STAGING_SLOTS],
+    trail_staging: [wgpu::Buffer; STAGING_SLOTS],
     staging_index: usize,                     // which buffer to write NEXT
     staging_in_flight: [bool; STAGING_SLOTS], // submitted, not yet collected
     staging_trackers: [ReadbackTracker; STAGING_SLOTS],
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
     food_cache_valid: bool,
+    trail_cache: Vec<f32>,
 
     // ── Async telemetry readback ──
     telemetry_staging: TelemetryStagingBuffers,
@@ -796,6 +801,14 @@ impl GpuKernel {
         }
         self.staging_index = 0;
         self.food_cache_valid = false;
+        // A new generation restarts the tick count, so samples numbered by the
+        // previous generation's ticks must not survive in the ring.
+        self.trail_cache.fill(0.0);
+        self.queue.write_buffer(
+            &self.trail_ring_buffer,
+            0,
+            bytemuck::cast_slice(&self.trail_cache),
+        );
 
         // Clear async telemetry state so stale readbacks from the
         // previous generation don't leak into the new one.
@@ -1085,6 +1098,16 @@ impl GpuKernel {
             mapped_at_creation: false,
         });
 
+        let trail_ring_size = (TRAIL_RING_SLOTS * (n + 1) * TRAIL_RECORD_STRIDE * 4) as u64;
+        let trail_ring_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kernel_trail_ring"),
+            size: trail_ring_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // ── Async state readback staging (STAGING_SLOTS ring buffer) ──
         let state_size = (n * PHYS_STRIDE * 4) as u64;
         let food_state_size = ((f * FOOD_STATE_STRIDE * 4) as u64).max(4);
@@ -1101,6 +1124,15 @@ impl GpuKernel {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("kernel_food_staging_{i}")),
                 size: food_state_size,
+                usage: staging_usage,
+                mapped_at_creation: false,
+            })
+        });
+
+        let trail_staging = std::array::from_fn(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("kernel_trail_staging_{i}")),
+                size: trail_ring_size,
                 usage: staging_usage,
                 mapped_at_creation: false,
             })
@@ -1201,6 +1233,7 @@ impl GpuKernel {
             include_str!("shaders/kernel/phase_food_respawn.wgsl"),
             include_str!("shaders/kernel/phase_agent_grid.wgsl"),
             include_str!("shaders/kernel/phase_collision.wgsl"),
+            include_str!("shaders/kernel/phase_trail_sample.wgsl"),
             include_str!("shaders/kernel/global_tick.wgsl"),
         ]
         .join("\n");
@@ -1221,7 +1254,7 @@ impl GpuKernel {
             zero_initialize_workgroup_memory: true,
         };
 
-        // ── Explicit bind group layout (all 15 bindings) ──
+        // ── Explicit bind group layout (all 17 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
         // need a single shared layout so one bind group works for all 3 pipelines.
         use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages};
@@ -1280,6 +1313,7 @@ impl GpuKernel {
                 storage_rw_entry(13), // brain_scratch
                 uniform_entry(14),    // brain_config
                 storage_rw_entry(15), // dispatch_args
+                storage_rw_entry(16), // trail_ring
             ],
         });
         // ── Physics pipeline layout (has push constants) ──
@@ -1585,6 +1619,10 @@ impl GpuKernel {
                         binding: 15,
                         resource: dispatch_args_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 16,
+                        resource: trail_ring_buffer.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -1614,6 +1652,7 @@ impl GpuKernel {
             pattern_buffer,
             brain_config_buffer,
             dispatch_args_buffer,
+            trail_ring_buffer,
             prepare_pipeline,
             physics_pipeline,
             vision_pipeline,
@@ -1630,15 +1669,18 @@ impl GpuKernel {
             active_config_index: 0,
             state_staging,
             food_staging,
+            trail_staging,
             staging_index: 0,
             staging_in_flight: [false; STAGING_SLOTS],
-            // One `map_async` for agent phys plus one for food state when food_count > 0.
+            // One `map_async` for agent phys, one for the trail ring, plus one for
+            // food state when food_count > 0.
             staging_trackers: std::array::from_fn(|_| {
-                ReadbackTracker::new(if f > 0 { 2 } else { 1 })
+                ReadbackTracker::new(if f > 0 { 3 } else { 2 })
             }),
             state_cache: vec![0.0; n * PHYS_STRIDE],
             food_cache: vec![0.0; f * FOOD_STATE_STRIDE],
             food_cache_valid: false,
+            trail_cache: vec![0.0; TRAIL_RING_SLOTS * (n + 1) * TRAIL_RECORD_STRIDE],
             telemetry_staging,
             pending_telemetry: None,
             cached_telemetry: None,
@@ -1910,6 +1952,7 @@ impl GpuKernel {
     fn unmap_staging_slot(&self, slot: usize) {
         let _vulkan = vulkan_gate::enter();
         self.state_staging[slot].unmap();
+        self.trail_staging[slot].unmap();
         if self.food_count > 0 {
             self.food_staging[slot].unmap();
         }
@@ -1943,6 +1986,14 @@ impl GpuKernel {
             self.state_cache.clear();
             self.state_cache.extend_from_slice(floats);
             drop(data);
+
+            // Collect the trail ring
+            let trail_slice = self.trail_staging[i].slice(..self.trail_ring_bytes());
+            let trail_data = trail_slice.get_mapped_range();
+            let trail_floats: &[f32] = bytemuck::cast_slice(&trail_data);
+            self.trail_cache.clear();
+            self.trail_cache.extend_from_slice(trail_floats);
+            drop(trail_data);
 
             // Collect food state (only when food exists)
             if self.food_count > 0 {
@@ -2021,6 +2072,9 @@ impl GpuKernel {
         // and/or vision passes, independently, to isolate each pass's GPU cost.
         let skip_global = self.probe.skip_global;
         let skip_vision = self.probe.skip_vision;
+        // The global pass samples every agent's position into the trail ring on
+        // each kernel-batch boundary of the simulated tick count.
+        let trail_interval = self.kernel_batch_size();
         // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to
         // the optional GPU-complete time below distinguishes CPU submit/recording
         // cost from queue back-pressure / GPU execution.
@@ -2092,7 +2146,7 @@ impl GpuKernel {
                         // Global pass: grid rebuild + collisions.
                         if !skip_global {
                             let tick_for_global = tick_cursor + full_ticks as u64;
-                            let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                            let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                             pass.set_pipeline(&self.global_pipeline);
                             pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                             pass.dispatch_workgroups(1, 1, 1);
@@ -2139,7 +2193,7 @@ impl GpuKernel {
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
                 if !skip_global {
                     let tick_for_global = tick_cursor + rem_ticks as u64;
-                    let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                    let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                     pass.set_pipeline(&self.global_pipeline);
                     pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                     pass.dispatch_workgroups(1, 1, 1);
@@ -2200,6 +2254,9 @@ impl GpuKernel {
 
         let skip_global = self.probe.skip_global;
         let skip_vision = self.probe.skip_vision;
+        // The global pass samples every agent's position into the trail ring on
+        // each kernel-batch boundary of the simulated tick count.
+        let trail_interval = self.kernel_batch_size();
         let probe_start = std::time::Instant::now();
         let mut tick_cursor = start_tick;
 
@@ -2259,7 +2316,7 @@ impl GpuKernel {
                     // Global pass once after all vision_stride cycles.
                     if !skip_global {
                         let tick_for_global = batch_start + u64::from(full_ticks);
-                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                        let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                         let mut pass = encoder.begin_compute_pass(&Default::default());
                         pass.set_pipeline(&self.global_pipeline);
                         pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
@@ -2319,7 +2376,7 @@ impl GpuKernel {
 
             if !skip_global {
                 let tick_for_global = tick_cursor + rem_ticks as u64;
-                let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.global_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
@@ -2449,6 +2506,9 @@ impl GpuKernel {
 
         let skip_global = self.probe.skip_global;
         let skip_vision = self.probe.skip_vision;
+        // The global pass samples every agent's position into the trail ring on
+        // each kernel-batch boundary of the simulated tick count.
+        let trail_interval = self.kernel_batch_size();
         let probe_start = std::time::Instant::now();
         let mut tick_cursor = start_tick;
         let enc_tiles = (ENCODED_DIMENSION as u32) / 16;
@@ -2490,7 +2550,7 @@ impl GpuKernel {
 
                     if !skip_global {
                         let tick_for_global = batch_start + u64::from(full_ticks);
-                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                        let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                         let mut pass = encoder.begin_compute_pass(&Default::default());
                         pass.set_pipeline(&self.global_pipeline);
                         pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
@@ -2534,7 +2594,7 @@ impl GpuKernel {
             }
             if !skip_global {
                 let tick_for_global = tick_cursor + rem_ticks as u64;
-                let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.global_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
@@ -2667,10 +2727,20 @@ impl GpuKernel {
                 food_size,
             );
         }
+        let trail_size = self.trail_ring_bytes();
+        encoder.copy_buffer_to_buffer(
+            &self.trail_ring_buffer,
+            0,
+            &self.trail_staging[slot_index],
+            0,
+            trail_size,
+        );
         self.queue.submit(std::iter::once(encoder.finish()));
 
         self.staging_trackers[slot_index].reset();
         self.staging_trackers[slot_index].install(self.state_staging[slot_index].slice(..buf_size));
+        self.staging_trackers[slot_index]
+            .install(self.trail_staging[slot_index].slice(..trail_size));
         if self.food_count > 0 {
             let food_size = (self.food_count * FOOD_STATE_STRIDE * 4) as u64;
             self.staging_trackers[slot_index]
@@ -2727,6 +2797,21 @@ impl GpuKernel {
     /// Last collected agent physics state.
     pub fn cached_state(&self) -> &[f32] {
         &self.state_cache
+    }
+
+    /// Bytes in the trail ring (and in each trail staging buffer).
+    fn trail_ring_bytes(&self) -> u64 {
+        (self.trail_cache.len() * std::mem::size_of::<f32>()) as u64
+    }
+
+    /// Trail samples in the last collected ring, oldest first.
+    ///
+    /// The ring is written by the global pass at every kernel-batch boundary of
+    /// the simulated tick count, so the samples depend only on simulated ticks:
+    /// never on how many ticks one dispatch covers or how often state is read
+    /// back. Samples older than the ring's capacity are gone.
+    pub fn collected_trail_samples(&self) -> Vec<TrailSample> {
+        read_trail_ring(&self.trail_cache, self.agent_count as usize)
     }
 
     /// Last collected food state (pos_x, pos_y, pos_z, respawn_timer per food).

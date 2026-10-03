@@ -34,12 +34,12 @@ use xagent_shared::{
 /// an agent spent in that region.
 pub const HEATMAP_RES: usize = 64;
 
-/// Maximum trail control points per agent. With distance-based sampling
-/// (MIN_TRAIL_DIST ≈ 3 units) this covers extremely long lives.
+/// Maximum trail control points per agent. The GPU samples one point per
+/// kernel batch of simulated ticks, so this covers extremely long lives.
 pub const MAX_TRAIL_POINTS: usize = 4000;
 
-/// Minimum distance (squared) between consecutive trail samples.
-/// Only record a new point when the agent has moved at least this far.
+/// Spacing (squared) between the points the overlay interpolates between two
+/// trail control points; the smoothed ribbon gets one vertex per this distance.
 pub(crate) const MIN_TRAIL_DIST_SQ: f32 = 9.0; // 3.0²
 
 /// Runtime agent body extending shared [`BodyState`] with simulation bookkeeping.
@@ -175,10 +175,18 @@ pub struct Agent {
     pub approach_turns_toward: f32,
     /// Position visit counts for heatmap visualization.
     pub heatmap: Vec<u32>,
-    /// Distance-sampled control points for trail visualization (current life only).
+    /// Control points for trail visualization (current life only), sampled by
+    /// the GPU at tick-aligned boundaries so the path is independent of the
+    /// speed multiplier.
     pub trail: Vec<[f32; 3]>,
-    /// Set when a new trail point is added; cleared after the mesh is rebuilt.
+    /// Set when the trail or its live end changes; cleared after the mesh is rebuilt.
     pub trail_dirty: bool,
+    /// Death count of the life the trail belongs to; samples from an earlier
+    /// life are dropped and samples from a later life start a fresh trail.
+    trail_death_count: u32,
+    /// Newest GPU trail sample already applied, so a sample repeated by a later
+    /// snapshot is not added twice.
+    last_trail_sample: Option<u64>,
     /// Cached motor command for ticks where the brain is decimated.
     pub cached_motor: xagent_shared::MotorCommand,
     /// Brain telemetry from GPU physics readback.
@@ -233,6 +241,8 @@ impl Agent {
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],
             trail: Vec::with_capacity(256),
             trail_dirty: false,
+            trail_death_count: 0,
+            last_trail_sample: None,
             cached_motor: xagent_shared::MotorCommand::default(),
             cached_prediction_error: 0.0,
             cached_exploration_rate: 0.0,
@@ -272,25 +282,57 @@ impl Agent {
         self.heatmap[cz * HEATMAP_RES + cx] = self.heatmap[cz * HEATMAP_RES + cx].saturating_add(1);
     }
 
-    /// Record current position if the agent has moved far enough from the
-    /// last sample. Distance-based sampling keeps the trail compact for long lives.
-    pub fn record_trail(&mut self) {
-        let p = self.body.body.position;
-        let pos = [p.x, p.y, p.z];
-
-        if let Some(last) = self.trail.last() {
-            let dx = pos[0] - last[0];
-            let dy = pos[1] - last[1];
-            let dz = pos[2] - last[2];
-            if dx * dx + dy * dy + dz * dz < MIN_TRAIL_DIST_SQ {
-                return;
-            }
+    /// Append one GPU trail sample (`x, y, z, death count`) to the trail.
+    ///
+    /// Samples are ignored when already applied (snapshots repeat the ring's
+    /// contents) or when they belong to a life earlier than the one the trail
+    /// follows; a sample from a later life starts a fresh trail.
+    pub fn apply_trail_record(&mut self, sample_number: u64, record: [f32; 4]) {
+        if self
+            .last_trail_sample
+            .is_some_and(|applied| sample_number <= applied)
+        {
+            return;
         }
+        self.last_trail_sample = Some(sample_number);
 
+        // The GPU stores the death count as an exact small integer in an f32.
+        let death_count = record[3] as u32;
+        if death_count < self.trail_death_count {
+            return;
+        }
+        if death_count > self.trail_death_count {
+            self.trail_death_count = death_count;
+            self.trail.clear();
+        }
         if self.trail.len() < MAX_TRAIL_POINTS {
-            self.trail.push(pos);
+            self.trail.push([record[0], record[1], record[2]]);
             self.trail_dirty = true;
         }
+    }
+
+    /// The trail control points followed by the agent's current position, so
+    /// the drawn path reaches the agent between GPU samples. Only the final
+    /// segment depends on when the snapshot was taken; every earlier point is
+    /// a tick-aligned GPU sample.
+    #[must_use]
+    pub fn trail_with_live_end(&self) -> Vec<[f32; 3]> {
+        let mut points = Vec::with_capacity(self.trail.len() + 1);
+        points.extend_from_slice(&self.trail);
+        let position = self.body.body.position;
+        let live_end = [position.x, position.y, position.z];
+        if points.last() != Some(&live_end) {
+            points.push(live_end);
+        }
+        points
+    }
+
+    /// Forget every applied trail sample (new generation: the GPU restarts its
+    /// tick count, so earlier sample numbers no longer order anything).
+    pub fn restart_trail_samples(&mut self) {
+        self.trail_death_count = 0;
+        self.last_trail_sample = None;
+        self.reset_trail();
     }
 
     /// Clear trail data (called on death/respawn for a fresh life).
@@ -351,6 +393,9 @@ impl Agent {
             }
         }
         self.death_count = new_deaths;
+        // Samples recorded before this death carry an older count and are
+        // dropped; the live trail restarts with the first sample of the new life.
+        self.trail_death_count = self.trail_death_count.max(new_deaths);
     }
 
     /// Number of unique heatmap cells visited (non-zero entries).
@@ -372,8 +417,7 @@ impl Agent {
         self.food_consumed = 0;
         self.total_ticks_alive = 0;
         self.heatmap.fill(0);
-        self.trail.clear();
-        self.trail_dirty = true;
+        self.restart_trail_samples();
         self.prediction_error_history.clear();
         self.exploration_rate_history.clear();
         self.energy_history.clear();
@@ -1400,6 +1444,70 @@ mod tests {
             assert_bounds(&mutate_config_with_strength(&high, 0.3, &momentum));
             assert_bounds(&mutate_config_with_strength(&low, 0.3, &momentum));
         }
+    }
+
+    #[test]
+    fn trail_records_extend_the_trail_once_each() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent.apply_trail_record(1, [1.0, 0.0, 1.0, 0.0]);
+        agent.apply_trail_record(2, [2.0, 0.0, 2.0, 0.0]);
+        // A later snapshot repeats the ring's contents.
+        agent.apply_trail_record(1, [1.0, 0.0, 1.0, 0.0]);
+        agent.apply_trail_record(2, [2.0, 0.0, 2.0, 0.0]);
+        agent.apply_trail_record(3, [3.0, 0.0, 3.0, 0.0]);
+        assert_eq!(
+            agent.trail,
+            vec![[1.0, 0.0, 1.0], [2.0, 0.0, 2.0], [3.0, 0.0, 3.0]]
+        );
+        assert!(agent.trail_dirty);
+    }
+
+    #[test]
+    fn trail_restarts_with_the_first_sample_of_a_new_life() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent.apply_trail_record(1, [1.0, 0.0, 1.0, 0.0]);
+        agent.apply_trail_record(2, [2.0, 0.0, 2.0, 0.0]);
+        // Sample 3 was taken after the agent died once and respawned.
+        agent.apply_trail_record(3, [9.0, 0.0, 9.0, 1.0]);
+        agent.apply_trail_record(4, [9.5, 0.0, 9.5, 1.0]);
+        assert_eq!(agent.trail, vec![[9.0, 0.0, 9.0], [9.5, 0.0, 9.5]]);
+    }
+
+    #[test]
+    fn death_readback_drops_samples_from_the_previous_life() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent.apply_trail_record(1, [1.0, 0.0, 1.0, 0.0]);
+
+        // The snapshot reports the death before its older ring samples are applied.
+        agent.apply_death_count_readback(1, 50, 60);
+        assert!(agent.trail.is_empty());
+        agent.apply_trail_record(2, [2.0, 0.0, 2.0, 0.0]);
+        agent.apply_trail_record(3, [9.0, 0.0, 9.0, 1.0]);
+        assert_eq!(agent.trail, vec![[9.0, 0.0, 9.0]]);
+    }
+
+    #[test]
+    fn restarting_trail_samples_accepts_a_fresh_tick_count() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent.apply_trail_record(40, [1.0, 0.0, 1.0, 2.0]);
+        agent.restart_trail_samples();
+        assert!(agent.trail.is_empty());
+        agent.apply_trail_record(1, [5.0, 0.0, 5.0, 0.0]);
+        assert_eq!(agent.trail, vec![[5.0, 0.0, 5.0]]);
+    }
+
+    #[test]
+    fn live_end_extends_the_trail_to_the_agent() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        agent.body.body.position = Vec3::new(4.0, 0.0, 4.0);
+        agent.apply_trail_record(1, [1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(
+            agent.trail_with_live_end(),
+            vec![[1.0, 0.0, 1.0], [4.0, 0.0, 4.0]]
+        );
+        // Standing exactly on the newest sample adds no duplicate point.
+        agent.body.body.position = Vec3::new(1.0, 0.0, 1.0);
+        assert_eq!(agent.trail_with_live_end(), vec![[1.0, 0.0, 1.0]]);
     }
 
     #[test]

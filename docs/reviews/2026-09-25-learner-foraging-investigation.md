@@ -1616,3 +1616,35 @@ To check the corrected metric, the champion-only lineage's stored champions were
 - **The replay confirms the lineage evolves avoidance.** From generation 0 to 78, deaths on hazard ground fall by 88% (4.33 → 0.53) while meals rise by 60%.
 - **Even restricted to hazard ahead, avoidance intent does not show it.** It stays at about 0.535 from generation 0 on. A per-tick count of which way the motor turn points cannot see this avoidance: whatever the evolved agents do differently, it is not a consistent turn away on the ticks when hazard is ahead. What they do instead was not measured here.
 - **Deaths on hazard ground and time spent on it are the measures to watch** for avoidance. The `behavior_metric` table already records the latter as `danger_dwell_fraction`.
+
+## How evolved agents avoid hazard ground
+
+The champion-only lineage's champions were replayed for one generation (40k ticks, evolution config, 20 agents, seeds 5–8), with every brain tick logged. Columns are a fresh brain and the champions held at generations 0, 40 and 78. Values are means ± standard error over 80 agents. "Hazard ahead" means a hazard cell within 10 units inside the agent's view, with the agent off hazard ground; distances are in world units and visit lengths in brain ticks (10 physics ticks each).
+
+| | Fresh brain | Generation 0 | Generation 40 | Generation 78 |
+|---|---|---|---|---|
+| Deaths on hazard ground per life | 6.56 ± 0.16 | 4.21 ± 0.18 | 1.40 ± 0.13 | **0.41 ± 0.06** |
+| Steps onto hazard ground per life | 55.6 | 47.7 | 29.8 | **22.4** |
+| Length of a visit on hazard ground | 18.7 | 16.0 | 13.1 | **11.5** |
+| Integrity on stepping onto it | 60.5 | 60.3 | 67.2 | 72.6 |
+| Time on hazard ground | 25.8% | 18.9% | 10.0% | 6.3% |
+| Time on food-rich ground | 38.3% | 47.6% | 58.6% | **61.8%** |
+| Speed | 3.02 | 2.98 | 2.58 | 2.49 |
+| Turn size | 0.074 | 0.088 | 0.136 | **0.165** |
+| Hazard ahead: turn away, signed and weighted by size | +0.004 | +0.013 | +0.030 | **+0.041** |
+| Hazard ahead: distance change over the next 5 brain ticks | −3.10 | −3.12 | −2.65 | −2.45 |
+| Hazard ahead: onto hazard ground within 5 brain ticks | 38.1% | 34.6% | 23.0% | **18.6%** |
+| Meals per life | 20.4 | 29.9 | 41.0 | 47.2 |
+
+- **Evolved agents avoid hazards in four ways at once.**
+  - They stay on food-rich ground, 62% of their time against 48% at generation 0, which lies at the far end of the biome noise from hazard.
+  - They move more slowly and turn about twice as much, a winding search within food patches.
+  - With hazard ahead, they step onto it half as often (18.6% against 34.6% within five brain ticks), approaching more slowly and turning away.
+  - When they do step on, they leave sooner (11.5 against 16.0 brain ticks) and arrive with more integrity.
+  Together they step onto hazard ground half as often and die there 90% less.
+- **The turn away is real but small next to their turning overall.** Weighted by size, the turn with hazard ahead leans away from it ten times more than a fresh brain's (+0.041 against +0.004). That lean is a quarter of the turn's typical size (0.17), so the sign of a single tick's turn points away only slightly more than half the time. That is why the sign-count avoidance intent stays at about 0.535.
+- **Measures that show the avoidance:**
+  - the size-weighted turn away with hazard ahead;
+  - how often hazard ahead is followed by stepping onto it;
+  - steps onto hazard ground per life, and the length of each visit;
+  - time on hazard ground and on food-rich ground.

@@ -145,6 +145,9 @@ pub(crate) struct App {
     // Selection marker above focused agent
     pub(crate) marker_gpu: Option<GpuMesh>,
 
+    // Facing-direction lines for every alive agent
+    pub(crate) bearing_gpu: Option<GpuMesh>,
+
     // egui integration (IDE-style UI overlay)
     pub(crate) egui: Option<EguiIntegration>,
 
@@ -300,6 +303,7 @@ impl App {
             cached_agent_snaps: Vec::new(),
             last_snap_chart_window: 120,
             marker_gpu: None,
+            bearing_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
             governor: None,

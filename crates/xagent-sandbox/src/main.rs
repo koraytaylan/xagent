@@ -297,6 +297,14 @@ impl ApplicationHandler for App {
         // Selection marker: diamond (24 verts, 24 indices)
         self.marker_gpu = Some(GpuMesh::new_dynamic(&renderer.device, 24, 24));
 
+        // Bearing lines: one quad (4 verts, 6 indices) per agent.
+        let max_bearing_quads = MAX_AGENTS as u64;
+        self.bearing_gpu = Some(GpuMesh::new_dynamic(
+            &renderer.device,
+            max_bearing_quads * 4,
+            max_bearing_quads * 6,
+        ));
+
         // Pre-allocate agent instance buffer
         let instance_buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("agent_instance_buffer"),

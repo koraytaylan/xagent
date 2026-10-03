@@ -1,4 +1,4 @@
-//! Visual overlay meshes: heatmap, trail ribbon, selection marker.
+//! Visual overlay meshes: heatmap, trail ribbon, bearing lines, selection marker.
 //!
 //! These are diagnostic visualizations rendered on top of the 3D world.
 //! Extracted from main.rs to keep the core application logic focused.
@@ -275,6 +275,64 @@ pub fn build_all_trails_mesh(
     Mesh { vertices, indices }
 }
 
+/// Distance from the agent centre where its bearing line starts, clear of the
+/// agent's instanced cube (half-extent 1.0) so the line is not hidden inside it.
+const BEARING_LINE_START: f32 = 1.2;
+
+/// Distance from the agent centre where its bearing line ends.
+const BEARING_LINE_END: f32 = 5.0;
+
+/// Half the bearing line's width, wide enough to stay visible at orbit distance.
+const BEARING_LINE_HALF_WIDTH: f32 = 0.15;
+
+/// Height of the bearing line above the agent position, matching the trail ribbons.
+const BEARING_LINE_HEIGHT: f32 = 0.3;
+
+/// Bearing line colour; white, matching the facing line on the agent-details minimap.
+const BEARING_LINE_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+
+/// Build a combined flat line mesh showing the facing direction of every alive
+/// agent, the 3D counterpart of the facing line on the agent-details minimap.
+/// `agents` holds `(position, yaw, alive)`; the heading is `(sin(yaw), cos(yaw))`
+/// in the XZ plane.
+pub fn build_bearing_mesh(agents: &[([f32; 3], f32, bool)]) -> Mesh {
+    let alive_count = agents.iter().filter(|(_, _, alive)| *alive).count();
+    let mut vertices = Vec::with_capacity(alive_count.saturating_mul(4));
+    let mut indices: Vec<u32> = Vec::with_capacity(alive_count.saturating_mul(6));
+
+    for &(position, yaw, alive) in agents {
+        if !alive {
+            continue;
+        }
+        let (dir_x, dir_z) = (yaw.sin(), yaw.cos());
+        // Perpendicular in the XZ plane gives the line its width.
+        let (perp_x, perp_z) = (
+            -dir_z * BEARING_LINE_HALF_WIDTH,
+            dir_x * BEARING_LINE_HALF_WIDTH,
+        );
+        let y = position[1] + BEARING_LINE_HEIGHT;
+        let start = [
+            position[0] + dir_x * BEARING_LINE_START,
+            position[2] + dir_z * BEARING_LINE_START,
+        ];
+        let end = [
+            position[0] + dir_x * BEARING_LINE_END,
+            position[2] + dir_z * BEARING_LINE_END,
+        ];
+
+        let base = vertices.len() as u32;
+        for (point, side) in [(start, 1.0), (start, -1.0), (end, -1.0), (end, 1.0)] {
+            vertices.push(Vertex {
+                position: [point[0] + perp_x * side, y, point[1] + perp_z * side],
+                color: BEARING_LINE_COLOR,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    }
+
+    Mesh { vertices, indices }
+}
+
 /// Build a small diamond marker hovering above the given position.
 pub fn build_marker_mesh(position: glam::Vec3) -> Mesh {
     let cx = position.x;
@@ -478,6 +536,55 @@ mod tests {
         let m = build_all_trails_mesh(&agents);
         assert_eq!(m.vertices.len(), 4); // only agent 1
         assert_eq!(m.indices.len(), 6);
+    }
+
+    // ── build_bearing_mesh ───────────────────────────────────────────
+
+    #[test]
+    fn bearing_mesh_empty_when_no_agents() {
+        let m = build_bearing_mesh(&[]);
+        assert!(m.vertices.is_empty());
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn bearing_mesh_skips_dead_agents() {
+        let m = build_bearing_mesh(&[([0.0, 0.0, 0.0], 0.0, false)]);
+        assert!(m.indices.is_empty());
+    }
+
+    #[test]
+    fn bearing_mesh_one_quad_per_alive_agent() {
+        let m = build_bearing_mesh(&[
+            ([0.0, 0.0, 0.0], 0.0, true),
+            ([10.0, 0.0, 0.0], 1.0, false),
+            ([20.0, 0.0, 0.0], 2.0, true),
+        ]);
+        assert_eq!(m.vertices.len(), 8);
+        assert_eq!(m.indices.len(), 12);
+    }
+
+    #[test]
+    fn bearing_mesh_points_along_yaw() {
+        // Yaw 0 faces +Z; yaw pi/2 faces +X — the same convention as the minimap.
+        let forward = build_bearing_mesh(&[([0.0, 0.0, 0.0], 0.0, true)]);
+        assert!((forward.vertices[2].position[2] - BEARING_LINE_END).abs() < 1e-4);
+        assert!(forward.vertices[2].position[0].abs() <= BEARING_LINE_HALF_WIDTH + 1e-4);
+
+        let sideways = build_bearing_mesh(&[([0.0, 0.0, 0.0], std::f32::consts::FRAC_PI_2, true)]);
+        assert!((sideways.vertices[2].position[0] - BEARING_LINE_END).abs() < 1e-4);
+        assert!(sideways.vertices[2].position[2].abs() <= BEARING_LINE_HALF_WIDTH + 1e-4);
+    }
+
+    #[test]
+    fn bearing_mesh_is_offset_from_agent_position() {
+        let m = build_bearing_mesh(&[([4.0, 2.0, -3.0], 0.0, true)]);
+        for vertex in &m.vertices {
+            assert!((vertex.position[1] - (2.0 + BEARING_LINE_HEIGHT)).abs() < 1e-4);
+        }
+        // Starts clear of the agent cube, ends at the full line length.
+        assert!((m.vertices[0].position[2] - (-3.0 + BEARING_LINE_START)).abs() < 1e-4);
+        assert!((m.vertices[2].position[2] - (-3.0 + BEARING_LINE_END)).abs() < 1e-4);
     }
 
     #[test]

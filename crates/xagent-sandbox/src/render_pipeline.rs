@@ -227,6 +227,17 @@ impl App {
                 marker_gpu.num_indices = 0;
             }
         }
+
+        // ── rebuild facing-direction lines for ALL agents ─────
+        if let (Some(renderer), Some(bearing_gpu)) = (&self.renderer, &mut self.bearing_gpu) {
+            let agent_data: Vec<([f32; 3], f32, bool)> = self
+                .agents
+                .iter()
+                .map(|a| (a.body.body.position.into(), a.body.yaw, a.body.body.alive))
+                .collect();
+            let mesh = overlay::build_bearing_mesh(&agent_data);
+            bearing_gpu.update_from_mesh(&renderer.queue, &mesh);
+        }
     }
 
     /// Upload the agent instance buffer (positions + palette colors) when the
@@ -398,7 +409,8 @@ impl App {
             let h = self.heatmap_gpu.as_ref().filter(|g| g.num_indices > 0);
             let tr = self.trail_gpu.as_ref().filter(|g| g.num_indices > 0);
             let mk = self.marker_gpu.as_ref().filter(|g| g.num_indices > 0);
-            let mut mesh_vec: Vec<&GpuMesh> = Vec::with_capacity(5);
+            let bearing = self.bearing_gpu.as_ref().filter(|g| g.num_indices > 0);
+            let mut mesh_vec: Vec<&GpuMesh> = Vec::with_capacity(6);
             if let Some(t) = t {
                 mesh_vec.push(t);
             }
@@ -410,6 +422,9 @@ impl App {
             }
             if let Some(tr) = tr {
                 mesh_vec.push(tr);
+            }
+            if let Some(bearing) = bearing {
+                mesh_vec.push(bearing);
             }
             if let Some(mk) = mk {
                 mesh_vec.push(mk);

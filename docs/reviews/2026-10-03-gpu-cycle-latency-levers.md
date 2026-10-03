@@ -194,3 +194,21 @@ R2 needed two pieces for exactness. They differ slightly from the sketch above:
 - The full integration suite passes.
 
 **It is on by default; `XAGENT_BRAIN_BESIDE_VISION=0` opts out.** It first landed off by default, because on the AMD Raphael iGPU (2 compute units) it was slower than the serial cycle: at 10 agents over 100,000 ticks, 4,455 against 5,908 ticks/sec. Each vision workgroup in the combined dispatch reserves the brain's workgroup memory, and on two compute units that costs more than the overlap gains. Whether it pays on the M3 Max, as the F5 proxy suggests, has not been measured with this implementation. On a GPU like that iGPU, `XAGENT_BRAIN_BESIDE_VISION=0` restores the faster serial cycle.
+
+## Implementation of R4 (2026-10-03)
+
+R4 is on `develop` in two parts, and with both a seeded run reproduces exactly.
+
+- **Grid order.** After the agent grid is built, each cell's food and agent entries are put in index order (`phase_grid_order.wgsl`, an insertion sort per cell on the global pass and the physics-only path). Touch, collisions and the food scan then see the same order whichever thread inserted first.
+- **Food claims.** F6's eat race was real: each agent's workgroup took a food item with a compare-and-swap on its flag and ate at once, while other workgroups in the same dispatch were still scanning those flags. A brain cycle is now two kernel dispatches. `kernel_claim_tick` runs the physics and the food scan without writing any food flag, and each agent in reach records itself on the item's claim slot with `atomicMin`. `kernel_tick` settles the claims first, so the lowest-index claimant eats in the same cycle as before and the others go without. The claim slots are the second half of the `food_flags` buffer, because the trail ring already holds the last of the sixteen storage bindings the device is asked for; each agent keeps its claim in a new physics slot, `P_FOOD_CLAIM` (`PHYS_STRIDE` 52 → 53).
+
+**Verification** (state hash over every physics and brain-state value; seeds fixed):
+
+| Runs | Base | Grid order | Grid order + claims |
+|---|---|---|---|
+| 10 agents, 100,000 ticks | 4 of 4 differ (meals 529–575) | 2 of 3 agree | 3 of 3 agree (meals 538) |
+| 40 agents, 20,000 ticks | 4 of 4 differ (meals 311–331) | 3 of 3 agree | 3 of 3 agree |
+
+Two runs each at 10 agents over 500,000 ticks and at 40 agents over 100,000 ticks also agree, and the brain-beside-vision cycle lands on the same hash as the serial one. A new GPU test (`food_claims.rs`) puts two agents equally close to one food item and requires the lower index to eat it, in either order and when neither is agent 0.
+
+On the AMD Raphael iGPU the extra dispatch did not slow the serial cycle: 10 agents over 100,000 ticks ran at about 8,250 ticks/sec with the claims, against 7,640 with grid order alone and 7,600 before either. The brain-beside-vision cycle, now on by default, ran at about 6,800 there; `XAGENT_BRAIN_BESIDE_VISION=0` keeps the faster serial cycle on such a GPU.

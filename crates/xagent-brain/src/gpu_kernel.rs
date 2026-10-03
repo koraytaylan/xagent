@@ -514,6 +514,11 @@ pub struct GpuKernel {
     trail_staging: [wgpu::Buffer; STAGING_SLOTS],
     staging_index: usize,                     // which buffer to write NEXT
     staging_in_flight: [bool; STAGING_SLOTS], // submitted, not yet collected
+    /// Request order of each slot's readback (0 = none yet). Slots complete in
+    /// any order; the caches must only ever move forward in simulated time.
+    staging_sequence: [u64; STAGING_SLOTS],
+    next_staging_sequence: u64,
+    collected_staging_sequence: u64,
     staging_trackers: [ReadbackTracker; STAGING_SLOTS],
     state_cache: Vec<f32>,
     food_cache: Vec<f32>,
@@ -1672,6 +1677,9 @@ impl GpuKernel {
             trail_staging,
             staging_index: 0,
             staging_in_flight: [false; STAGING_SLOTS],
+            staging_sequence: [0; STAGING_SLOTS],
+            next_staging_sequence: 1,
+            collected_staging_sequence: 0,
             // One `map_async` for agent phys, one for the trail ring, plus one for
             // food state when food_count > 0.
             staging_trackers: std::array::from_fn(|_| {
@@ -1978,6 +1986,16 @@ impl GpuKernel {
                 }
                 ReadbackStatus::Ready => {}
             }
+
+            // Readbacks finish in any order. A slot older than what the caches
+            // already hold would move agents (and their trails) back in time,
+            // so it is released without being read.
+            if self.staging_sequence[i] < self.collected_staging_sequence {
+                self.unmap_staging_slot(i);
+                self.staging_in_flight[i] = false;
+                continue;
+            }
+            self.collected_staging_sequence = self.staging_sequence[i];
 
             // Collect agent phys state
             let slice = self.state_staging[i].slice(..buf_size);
@@ -2747,6 +2765,8 @@ impl GpuKernel {
                 .install(self.food_staging[slot_index].slice(..food_size));
         }
         self.staging_in_flight[slot_index] = true;
+        self.staging_sequence[slot_index] = self.next_staging_sequence;
+        self.next_staging_sequence += 1;
         self.staging_index = (slot_index + 1) % STAGING_SLOTS;
         true
     }
@@ -2850,6 +2870,8 @@ impl GpuKernel {
         self.state_cache.extend_from_slice(floats);
         drop(data);
         staging.unmap();
+        // This read is newer than every readback still in flight.
+        self.collected_staging_sequence = self.next_staging_sequence - 1;
         &self.state_cache
     }
 

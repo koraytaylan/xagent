@@ -83,6 +83,8 @@
 //! rename or move markers without updating both the helper and the tests.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use wgpu;
 use xagent_shared::{BrainConfig, FoodKind, WorldConfig};
@@ -578,6 +580,15 @@ const STAGING_SLOTS: usize = 6;
 /// cap is sized to this value so a high-speed backlog actually fuses.
 pub const MAX_FUSED_BATCHES: u32 = 24;
 
+/// Most [`GpuKernel::dispatch_ticks`] calls that may be submitted but not yet
+/// finished by the GPU. `queue.submit` never blocks, so without this bound a
+/// worker that dispatches faster than the GPU executes queues unbounded work;
+/// teardown then waits on that backlog and `wgpu` panics once the wait exceeds
+/// its fixed ~6 s limit. Two keeps the GPU fed (one executing, one queued) while
+/// bounding the backlog to two dispatches of at most [`MAX_FUSED_BATCHES`]
+/// kernel-batches each.
+pub const MAX_DISPATCHES_IN_FLIGHT: u32 = 2;
+
 /// GPU brain execution strategy. FusedSerial is the shipping path; the split
 /// modes exist to measure and then unlock per-agent multi-workgroup brain math.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -994,6 +1005,10 @@ pub struct GpuKernel {
     vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
     active_config_index: usize,
+    /// Dispatches submitted whose GPU work has not completed. Incremented on
+    /// submit, decremented by the `on_submitted_work_done` callback that runs
+    /// when the device is polled.
+    dispatches_in_flight: Arc<AtomicU32>,
 
     // ── Async state readback (STAGING_SLOTS ring, non-blocking) ──
     // Staging is decoupled from dispatch: in-flight readbacks do not
@@ -2510,6 +2525,7 @@ impl GpuKernel {
             vision_stride: brain_config.vision_stride,
             bind_groups,
             active_config_index: 0,
+            dispatches_in_flight: Arc::new(AtomicU32::new(0)),
             state_staging,
             food_staging,
             trail_staging,
@@ -2962,7 +2978,7 @@ impl GpuKernel {
         if !self.global_credit_active() {
             self.invalidate_packed_encoder();
         }
-        match self.execution_mode {
+        let dispatched = match self.execution_mode {
             BrainExecutionMode::SplitSerial => {
                 self.dispatch_ticks_split_serial(start_tick, ticks_to_run)
             }
@@ -2972,7 +2988,26 @@ impl GpuKernel {
             BrainExecutionMode::FusedSerial => {
                 self.dispatch_ticks_fused_serial(start_tick, ticks_to_run)
             }
+        };
+        if dispatched {
+            self.dispatches_in_flight.fetch_add(1, Ordering::AcqRel);
+            let in_flight = Arc::clone(&self.dispatches_in_flight);
+            self.queue.on_submitted_work_done(move || {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+            });
         }
+        dispatched
+    }
+
+    /// True while [`MAX_DISPATCHES_IN_FLIGHT`] dispatches are still executing.
+    ///
+    /// Polls the device without blocking so completed work is counted before the
+    /// check. A caller that sees `true` should skip dispatching this iteration
+    /// rather than queue more work behind the backlog.
+    pub fn dispatch_backlog_full(&self) -> bool {
+        let _vulkan = vulkan_gate::enter();
+        self.device.poll(wgpu::Maintain::Poll);
+        self.dispatches_in_flight.load(Ordering::Acquire) >= MAX_DISPATCHES_IN_FLIGHT
     }
 
     /// Fused serial execution: the original dispatch_ticks body.
@@ -4748,6 +4783,12 @@ impl GpuKernel {
 
 impl Drop for GpuKernel {
     fn drop(&mut self) {
+        {
+            // Finish queued work before the queue drops: `wgpu` panics if the
+            // last submission is still running after its fixed wait.
+            let _vulkan = vulkan_gate::enter();
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+        }
         vulkan_gate::stash_for_struct_drop();
     }
 }

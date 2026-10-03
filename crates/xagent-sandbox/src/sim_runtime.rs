@@ -842,7 +842,7 @@ impl Worker {
                 clamp_ticks_to_supervisor_sample(ticks_to_run, self.tick, SUPERVISOR_SAMPLE_TICKS);
         }
 
-        if ticks_to_run == 0 {
+        if ticks_to_run == 0 || self.kernel.dispatch_backlog_full() {
             return false;
         }
 
@@ -1108,9 +1108,9 @@ fn run_worker(init: SimInit, command_rx: &Receiver<SimCommand>, event_tx: &SyncS
         }
 
         // Only sleep when caught up (or paused). While a dispatch backlog
-        // remains, loop immediately so it drains at GPU speed — `queue.submit`
-        // back-pressure paces the worker without a fixed throttle, and snapshots
-        // publish as fast as the GPU completes batches.
+        // remains, loop immediately so it drains at GPU speed — the kernel's
+        // in-flight dispatch bound paces the worker, and snapshots publish as
+        // fast as the GPU completes batches.
         let busy = worker.step(event_tx);
         if !busy {
             std::thread::sleep(worker.idle_sleep());

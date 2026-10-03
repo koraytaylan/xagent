@@ -1648,3 +1648,22 @@ The champion-only lineage's champions were replayed for one generation (40k tick
   - how often hazard ahead is followed by stepping onto it;
   - steps onto hazard ground per life, and the length of each visit;
   - time on hazard ground and on food-rich ground.
+
+## Hazard avoidance in the evolution panel
+
+Two generation-cumulative physics counters, preserved across respawn, now record what the mechanism study found to move with an evolved lineage:
+
+- **Size-weighted turn away** (`P_AVOIDANCE_TURN_AWAY`): `motor_turn · sign(danger_bearing)` summed over the avoidance-counted ticks. Per generation it is stored as `behavior_metric.avoidance_turn_away`, the mean turn away, with 0 at chance.
+- **Steps onto hazard ground** (`P_HAZARD_ENTRIES`): stored per generation as `behavior_metric.hazard_entries_per_agent`.
+
+The evolution panel charts steps onto hazard ground per agent and the share of the path on it, below the fitness chart, with the latest turn away in the legend.
+
+A three-generation headless check (seed 5) recorded, for generations 0 and 1:
+
+| | Generation 0 | Generation 1 |
+|---|---|---|
+| Steps onto hazard ground per agent | 61.0 | 46.6 |
+| Share of the path on hazard ground | 23.9% | 17.4% |
+| Mean turn away from hazard ahead | +0.004 | +0.011 |
+
+These are in line with the replayed lineage at the same stage.

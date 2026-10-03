@@ -140,25 +140,6 @@ fn wg_reduce_dense(tid: u32) {
     }
 }
 
-// Cosine similarity between this tick's centered memory key and stored
-// pattern `idx` (keys are pre-habituation, so attenuation cannot silence
-// recall).
-fn cosine_sim_pat_s(agent_id: u32, idx: u32) -> f32 {
-    let pattern_base = agent_id * PATTERN_STRIDE;
-    var dot_val: f32 = 0.0;
-    var e_norm_sq: f32 = 0.0;
-    for (var d: u32 = 0u; d < ENCODED_DIMENSION; d = d + 1u) {
-        let e = s_memory_key[d];
-        let p = pattern_buffer[pattern_base + d * MEMORY_CAP + idx];
-        dot_val += e * p;
-        e_norm_sq += e * e;
-    }
-    let e_norm = sqrt(e_norm_sq);
-    let p_norm = pattern_buffer[pattern_base + O_PAT_NORMS + idx];
-    if (e_norm < 1e-8 || p_norm < 1e-8) { return 0.0; }
-    return clamp(dot_val / (e_norm * p_norm), -1.0, 1.0);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Pass 1: Feature extract — all threads cooperatively load vision data,
 // thread 0 handles the 25 non-visual features (velocity, facing, touch).
@@ -1242,13 +1223,15 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         }
     }
 
-    // ── Precompute recalled cosine similarities: threads 0..(RECALL_K-1) ──
-    // Each thread computes one recall entry's cosine sim in parallel,
-    // eliminating the serial 16×128 bottleneck in thread 0's memory
-    // blend and context blend loops.
+    // ── Recalled cosine similarities: threads 0..(RECALL_K-1) ──
+    // coop_recall_score computed every pattern's cosine with the memory key
+    // and coop_recall_topk sorted them with their indices, so the k-th
+    // recalled pattern's similarity is s_similarities[k], the same value a
+    // recomputation would give. Nothing writes s_similarities between the
+    // sort and here.
     if (tid < RECALL_K) {
         if (tid < recall_count) {
-            s_recall_similarity[tid] = cosine_sim_pat_s(agent_id, u32(s_recall[tid]));
+            s_recall_similarity[tid] = s_similarities[tid];
         } else {
             s_recall_similarity[tid] = 0.0;
         }

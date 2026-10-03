@@ -158,6 +158,10 @@ fn phase_physics(tid: u32, tick: u32) {
         let reference_step = DEFAULT_MOVE_SPEED * wc_f32(WC_DT);
         physics_state[b + P_INTEGRITY] = physics_state[b + P_INTEGRITY]
             - wc_f32(WC_HAZARD_DAMAGE) * integrity_scale * (step_len / max(reference_step, EPSILON));
+        // A step onto hazard ground: on it now, off it the tick before.
+        if physics_state[b + P_IN_DANGER_BIOME] < 0.5 {
+            physics_state[b + P_HAZARD_ENTRIES] += 1.0;
+        }
         physics_state[b + P_IN_DANGER_BIOME] = 1.0;
         physics_state[b + P_DANGER_PATH_LENGTH] += step_len;
     } else {
@@ -271,5 +275,8 @@ fn phase_physics(tid: u32, tick: u32) {
         if turn_away {
             physics_state[b + P_AVOIDANCE_TURNS_OPPOSING] += 1.0;
         }
+        // The same alignment weighted by the turn's size: a small lean away
+        // under larger turning still adds up.
+        physics_state[b + P_AVOIDANCE_TURN_AWAY] += motor_turn * sign(danger_bearing);
     }
 }

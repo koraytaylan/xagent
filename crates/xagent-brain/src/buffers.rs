@@ -377,6 +377,18 @@ pub const P_APPROACH_TURNS_TOWARD: usize = 46;
 /// Per-agent live state, never serialized. Provides the anticipatory credit
 /// signal used in the TD reward blend.
 pub const P_HOMEO_PREDICTED_GRADIENT_OUT: usize = 47;
+/// Cumulative size-weighted turn away from the nearest hazard over the ticks
+/// the avoidance counters count (hazard ahead in view, agent off it):
+/// Σ motor_turn · sign(danger_bearing), positive = away. Divided by
+/// `P_AVOIDANCE_SENSE_RANGE_TICKS` it is the mean turn away, in [-1, 1] and 0
+/// at chance. Unlike the sign count in `P_AVOIDANCE_TURNS_OPPOSING` it sees a
+/// small lean away under larger turning. Generation-cumulative (preserved
+/// across respawn).
+pub const P_AVOIDANCE_TURN_AWAY: usize = 48;
+/// Cumulative count of steps onto hazard ground: ticks on which the agent is
+/// on hazard ground after a tick off it. Generation-cumulative (preserved
+/// across respawn).
+pub const P_HAZARD_ENTRIES: usize = 49;
 
 /// Value written to `O_PREV_HOMEO_PREDICTION` at birth and on death.
 ///
@@ -387,7 +399,7 @@ pub const P_HOMEO_PREDICTED_GRADIENT_OUT: usize = 47;
 /// actually predict, so clearing the slot to zero would be a false sample.
 /// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
 pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
-pub const PHYS_STRIDE: usize = 48;
+pub const PHYS_STRIDE: usize = 50;
 /// Brain runs once every N physics ticks. Must match the cycle logic in dispatch_batch.
 pub const BRAIN_TICK_STRIDE: u32 = 4;
 
@@ -1683,6 +1695,8 @@ mod tests {
             wgsl["P_APPROACH_TURNS_TOWARD"],
             P_APPROACH_TURNS_TOWARD as u32
         );
+        assert_eq!(wgsl["P_AVOIDANCE_TURN_AWAY"], P_AVOIDANCE_TURN_AWAY as u32);
+        assert_eq!(wgsl["P_HAZARD_ENTRIES"], P_HAZARD_ENTRIES as u32);
     }
 
     #[test]
@@ -1938,6 +1952,8 @@ mod tests {
             P_APPROACH_SENSE_RANGE_TICKS,
             P_APPROACH_TURNS_TOWARD,
             P_HOMEO_PREDICTED_GRADIENT_OUT,
+            P_AVOIDANCE_TURN_AWAY,
+            P_HAZARD_ENTRIES,
         ]
         .iter()
         .max()

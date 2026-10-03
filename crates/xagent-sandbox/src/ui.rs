@@ -176,6 +176,8 @@ pub struct EvolutionSnapshot {
     pub current_node_id: Option<i64>,
     pub current_config: Option<xagent_shared::BrainConfig>,
     pub fitness_history: std::collections::HashMap<i64, Vec<(u32, f32, f32)>>, // island_id → (generation, best, avg)
+    /// Per-generation hazard-avoidance measures, oldest first.
+    pub hazard_history: Vec<crate::governor::HazardPoint>,
     pub selected_node_id: Option<i64>,
     /// Fraction of available width for the tree pane (0.0–1.0). Persisted across frames.
     pub tree_pane_fraction: f32,
@@ -212,6 +214,7 @@ impl Default for EvolutionSnapshot {
             current_node_id: None,
             current_config: None,
             fitness_history: std::collections::HashMap::new(),
+            hazard_history: Vec::new(),
             selected_node_id: None,
             tree_pane_fraction: 0.25,
             edit_brain: xagent_shared::BrainConfig::default(),
@@ -1828,6 +1831,9 @@ impl<'a> TabContext<'a> {
         if !evo.fitness_history.is_empty() {
             Self::render_fitness_chart(ui, &evo.fitness_history);
         }
+        if !evo.hazard_history.is_empty() {
+            Self::render_hazard_chart(ui, &evo.hazard_history);
+        }
 
         if !evo.tree_nodes.is_empty() {
             ui.collapsing("Evolution Tree", |ui| {
@@ -1845,6 +1851,9 @@ impl<'a> TabContext<'a> {
         // ── Fitness chart at top of tab (always visible) ────────
         if !evo.fitness_history.is_empty() {
             Self::render_fitness_chart(ui, &evo.fitness_history);
+        }
+        if !evo.hazard_history.is_empty() {
+            Self::render_hazard_chart(ui, &evo.hazard_history);
         }
 
         let tree_has_nodes = !evo.tree_nodes.is_empty();
@@ -2088,6 +2097,81 @@ impl<'a> TabContext<'a> {
                 ui.label(format!("Max: {:.4}", global_max_fit));
             });
         }
+        ui.add_space(4.0);
+    }
+
+    /// Per-generation hazard avoidance: steps onto hazard ground per agent
+    /// and the share of distance travelled on it, each scaled to its own
+    /// maximum, with the latest values (and the size-weighted turn away from
+    /// hazard ahead) in the legend. Both lines falling is the lineage learning
+    /// to keep off hazard ground.
+    fn render_hazard_chart(ui: &mut egui::Ui, history: &[crate::governor::HazardPoint]) {
+        const CHART_HEIGHT: f32 = 90.0;
+        const MIN_WIDTH: f32 = 200.0;
+        const STROKE: f32 = 2.0;
+        const PERCENT: f32 = 100.0;
+        let entries_color = egui::Color32::from_rgb(255, 80, 80);
+        let dwell_color = egui::Color32::from_rgb(255, 160, 60);
+
+        let avail = ui.available_width().max(MIN_WIDTH);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail, CHART_HEIGHT), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
+        let (Some(first), Some(last)) = (history.first(), history.last()) else {
+            return;
+        };
+        let gen_range = (last.generation.saturating_sub(first.generation)).max(1) as f32;
+        let max_entries = history
+            .iter()
+            .map(|p| p.hazard_entries_per_agent)
+            .fold(f32::EPSILON, f32::max);
+        let max_dwell = history
+            .iter()
+            .map(|p| p.danger_dwell_fraction)
+            .fold(f32::EPSILON, f32::max);
+        let point = |p: &crate::governor::HazardPoint, value: f32, max: f32| {
+            egui::pos2(
+                rect.left() + (p.generation - first.generation) as f32 / gen_range * rect.width(),
+                rect.bottom() - (value / max) * rect.height(),
+            )
+        };
+        for pair in history.windows(2) {
+            painter.line_segment(
+                [
+                    point(&pair[0], pair[0].hazard_entries_per_agent, max_entries),
+                    point(&pair[1], pair[1].hazard_entries_per_agent, max_entries),
+                ],
+                egui::Stroke::new(STROKE, entries_color),
+            );
+            painter.line_segment(
+                [
+                    point(&pair[0], pair[0].danger_dwell_fraction, max_dwell),
+                    point(&pair[1], pair[1].danger_dwell_fraction, max_dwell),
+                ],
+                egui::Stroke::new(STROKE, dwell_color),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                entries_color,
+                format!(
+                    "Steps onto hazard / agent: {:.1}",
+                    last.hazard_entries_per_agent
+                ),
+            );
+            ui.colored_label(
+                dwell_color,
+                format!(
+                    "Path on hazard: {:.1}%",
+                    last.danger_dwell_fraction * PERCENT
+                ),
+            );
+            ui.label(format!(
+                "Turn away from hazard ahead: {:+.3}",
+                last.avoidance_turn_away
+            ));
+        });
         ui.add_space(4.0);
     }
 

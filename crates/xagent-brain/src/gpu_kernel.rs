@@ -347,6 +347,12 @@ pub struct AgentTelemetry {
     pub approach_turns_toward: f32,
     pub avoidance_sense_range_ticks: f32,
     pub avoidance_turns_opposing: f32,
+    /// Size-weighted turn away from hazard ahead, cumulative
+    /// (`P_AVOIDANCE_TURN_AWAY`); divided by `avoidance_sense_range_ticks`
+    /// it is the mean turn away.
+    pub avoidance_turn_away: f32,
+    /// Steps onto hazard ground this generation (`P_HAZARD_ENTRIES`).
+    pub hazard_entries: f32,
     pub prediction_error: f32,
     pub exploration_rate: f32,
     /// Critic estimate of the discounted homeostatic return from the
@@ -3204,6 +3210,8 @@ impl GpuKernel {
         let approach_turns_toward = phys[P_APPROACH_TURNS_TOWARD];
         let avoidance_sense_range_ticks = phys[P_AVOIDANCE_SENSE_RANGE_TICKS];
         let avoidance_turns_opposing = phys[P_AVOIDANCE_TURNS_OPPOSING];
+        let avoidance_turn_away = phys[P_AVOIDANCE_TURN_AWAY];
+        let hazard_entries = phys[P_HAZARD_ENTRIES];
 
         AgentTelemetry {
             vision_color,
@@ -3221,6 +3229,8 @@ impl GpuKernel {
             approach_turns_toward,
             avoidance_sense_range_ticks,
             avoidance_turns_opposing,
+            avoidance_turn_away,
+            hazard_entries,
             prediction_error,
             exploration_rate,
             value,
@@ -3426,6 +3436,8 @@ impl GpuKernel {
         let approach_turns_toward = phys[P_APPROACH_TURNS_TOWARD];
         let avoidance_sense_range_ticks = phys[P_AVOIDANCE_SENSE_RANGE_TICKS];
         let avoidance_turns_opposing = phys[P_AVOIDANCE_TURNS_OPPOSING];
+        let avoidance_turn_away = phys[P_AVOIDANCE_TURN_AWAY];
+        let hazard_entries = phys[P_HAZARD_ENTRIES];
         drop(phys_data);
         self.telemetry_staging.phys.unmap();
 
@@ -3445,6 +3457,8 @@ impl GpuKernel {
             approach_turns_toward,
             avoidance_sense_range_ticks,
             avoidance_turns_opposing,
+            avoidance_turn_away,
+            hazard_entries,
             prediction_error,
             exploration_rate,
             value,

@@ -164,6 +164,11 @@ pub struct Agent {
     pub avoidance_sense_range_ticks: f32,
     /// Count of ticks where danger was in sense range AND motor turn opposed bearing (for avoidance-intent metric).
     pub avoidance_turns_opposing: f32,
+    /// Size-weighted turn away from hazard ahead, summed over the same ticks
+    /// (positive = away; divided by the sense-range ticks, the mean turn away).
+    pub avoidance_turn_away: f32,
+    /// Steps onto hazard ground this generation.
+    pub hazard_entries: f32,
     /// Count of ticks where food was in sense range (for approach-intent metric).
     pub approach_sense_range_ticks: f32,
     /// Count of ticks where food was in sense range AND motor turn rotated toward bearing (for approach-intent metric).
@@ -221,6 +226,8 @@ impl Agent {
             danger_path_length: 0.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            avoidance_turn_away: 0.0,
+            hazard_entries: 0.0,
             approach_sense_range_ticks: 0.0,
             approach_turns_toward: 0.0,
             heatmap: vec![0u32; HEATMAP_RES * HEATMAP_RES],

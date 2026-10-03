@@ -578,6 +578,8 @@ xagent provides two **count-based intent metrics** for answering this empiricall
 
 - **Approach-Intent Fraction** = (brain cycles the agent turned *toward* sensed food) / (brain cycles food was in sensory range). Measures food-seeking alignment.
 - **Avoidance-Intent Fraction** = (brain cycles the agent turned *away* from hazard ahead) / (brain cycles a hazard cell was within sensory range inside the agent's horizontal field of view, with the agent off hazard ground). Measures danger-avoidance alignment.
+- **Avoidance turn away** = Σ (motor turn · side of the hazard, positive = away) / the same brain cycles: the mean turn away, weighted by size, 0 at chance. Unlike the sign count it registers a small lean away under larger turning.
+- **Steps onto hazard ground** per agent per generation, alongside the share of distance travelled on it (`danger_dwell_fraction`). The evolution panel charts these per generation.
 
 ### Telemetry & Aggregation
 

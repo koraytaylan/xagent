@@ -241,6 +241,7 @@ impl App {
                     evo_snapshot
                         .fitness_history
                         .clone_from(gov.fitness_history_by_island());
+                    evo_snapshot.hazard_history = gov.hazard_history().to_vec();
                     evo_snapshot.best_fitness = gov.best_score();
                 }
                 println!(

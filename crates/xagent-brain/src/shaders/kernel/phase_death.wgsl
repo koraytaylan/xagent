@@ -53,6 +53,8 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Preserve cumulative avoidance intent counters (generation-cumulative)
     let saved_avoidance_sense_range = physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
     let saved_avoidance_turns_opposing = physics_state[base + P_AVOIDANCE_TURNS_OPPOSING];
+    let saved_avoidance_turn_away = physics_state[base + P_AVOIDANCE_TURN_AWAY];
+    let saved_hazard_entries = physics_state[base + P_HAZARD_ENTRIES];
     // Preserve cumulative approach intent counters (generation-cumulative)
     let saved_approach_sense_range = physics_state[base + P_APPROACH_SENSE_RANGE_TICKS];
     let saved_approach_turns_toward = physics_state[base + P_APPROACH_TURNS_TOWARD];
@@ -91,6 +93,8 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     // Restore cumulative avoidance intent (generation-cumulative, never reset)
     physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS] = saved_avoidance_sense_range;
     physics_state[base + P_AVOIDANCE_TURNS_OPPOSING] = saved_avoidance_turns_opposing;
+    physics_state[base + P_AVOIDANCE_TURN_AWAY] = saved_avoidance_turn_away;
+    physics_state[base + P_HAZARD_ENTRIES] = saved_hazard_entries;
     // Restore cumulative approach intent (generation-cumulative, never reset)
     physics_state[base + P_APPROACH_SENSE_RANGE_TICKS] = saved_approach_sense_range;
     physics_state[base + P_APPROACH_TURNS_TOWARD] = saved_approach_turns_toward;

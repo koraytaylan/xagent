@@ -152,6 +152,10 @@ impl App {
             self.evo_snapshot
                 .fitness_history
                 .clone_from(gov.fitness_history_by_island());
+            let hazard_history = gov.hazard_history();
+            if self.evo_snapshot.hazard_history.len() != hazard_history.len() {
+                self.evo_snapshot.hazard_history = hazard_history.to_vec();
+            }
             self.evo_snapshot.best_fitness = gov.best_score();
         }
         let wall = self.evo_wall_accumulated

@@ -200,6 +200,10 @@ fn agent_physics(agent_id: u32, tick: u32) {
     // otherwise — the flag must match the agent's actual current biome.
     let in_danger = (biome_type == BIOME_DANGER);
     if in_danger {
+        // A step onto hazard ground: on it now, off it the tick before.
+        if physics_state[b + P_IN_DANGER_BIOME] < 0.5 {
+            physics_state[b + P_HAZARD_ENTRIES] += 1.0;
+        }
         // Path-length hazard dose (Layer B): integrity loss is proportional
         // to the distance traveled through danger this tick, not to the number of ticks
         // spent in it. reference_step is a default-speed agent's per-tick displacement
@@ -272,6 +276,9 @@ fn agent_avoidance_accumulate(agent_id: u32, motor_turn: f32) {
         if turn_away {
             physics_state[b + P_AVOIDANCE_TURNS_OPPOSING] += 1.0;
         }
+        // The same alignment weighted by the turn's size: a small lean away
+        // under larger turning still adds up.
+        physics_state[b + P_AVOIDANCE_TURN_AWAY] += motor_turn * sign(danger_bearing);
     }
 }
 
@@ -611,6 +618,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // Preserve cumulative avoidance intent counters (generation-cumulative)
     let saved_avoidance_sense_range = physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS];
     let saved_avoidance_turns_opposing = physics_state[base + P_AVOIDANCE_TURNS_OPPOSING];
+    let saved_avoidance_turn_away = physics_state[base + P_AVOIDANCE_TURN_AWAY];
+    let saved_hazard_entries = physics_state[base + P_HAZARD_ENTRIES];
     // Preserve cumulative approach intent counters (generation-cumulative)
     let saved_approach_sense_range = physics_state[base + P_APPROACH_SENSE_RANGE_TICKS];
     let saved_approach_turns_toward = physics_state[base + P_APPROACH_TURNS_TOWARD];
@@ -643,6 +652,8 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // Restore cumulative avoidance intent (generation-cumulative, never reset)
     physics_state[base + P_AVOIDANCE_SENSE_RANGE_TICKS] = saved_avoidance_sense_range;
     physics_state[base + P_AVOIDANCE_TURNS_OPPOSING] = saved_avoidance_turns_opposing;
+    physics_state[base + P_AVOIDANCE_TURN_AWAY] = saved_avoidance_turn_away;
+    physics_state[base + P_HAZARD_ENTRIES] = saved_hazard_entries;
     // Restore cumulative approach intent (generation-cumulative, never reset)
     physics_state[base + P_APPROACH_SENSE_RANGE_TICKS] = saved_approach_sense_range;
     physics_state[base + P_APPROACH_TURNS_TOWARD] = saved_approach_turns_toward;

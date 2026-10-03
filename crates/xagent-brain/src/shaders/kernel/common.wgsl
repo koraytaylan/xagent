@@ -413,7 +413,7 @@ const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 48u;
+const PHYS_STRIDE: u32 = 50u;
 const P_POS_X: u32 = 0u;
 const P_POS_Y: u32 = 1u;
 const P_POS_Z: u32 = 2u;
@@ -478,6 +478,11 @@ const P_APPROACH_TURNS_TOWARD: u32 = 46u;
 /// Homeostatic gradient predicted by the forward model's predictor head
 /// (homeostatic gradient predictor head). Written by coop_predict_and_act when enabled; zero otherwise.
 const P_HOMEO_PREDICTED_GRADIENT_OUT: u32 = 47u;
+/// Cumulative size-weighted turn away from hazard on avoidance-counted ticks:
+/// Σ motor_turn · sign(danger_bearing), positive = away. Mirrors buffers.rs.
+const P_AVOIDANCE_TURN_AWAY: u32 = 48u;
+/// Cumulative count of steps onto hazard ground. Mirrors buffers.rs.
+const P_HAZARD_ENTRIES: u32 = 49u;
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 

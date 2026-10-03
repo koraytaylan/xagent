@@ -9,7 +9,7 @@
 
 use xagent_brain::buffers::{
     DANGER_SENSE_RADIUS, PHYS_STRIDE, P_AVOIDANCE_SENSE_RANGE_TICKS, P_FACING_X, P_FACING_Z,
-    P_NEAREST_DANGER_BEARING, P_NEAREST_DANGER_DISTANCE, P_POS_X, P_POS_Z,
+    P_HAZARD_ENTRIES, P_NEAREST_DANGER_BEARING, P_NEAREST_DANGER_DISTANCE, P_POS_X, P_POS_Z,
 };
 use xagent_brain::GpuKernel;
 use xagent_shared::{BrainConfig, WorldConfig};
@@ -173,4 +173,21 @@ fn only_hazard_ahead_and_off_it_counts_for_avoidance() {
         on[P_AVOIDANCE_SENSE_RANGE_TICKS], 0.0,
         "standing on hazard ground should not count"
     );
+}
+
+#[test]
+fn a_step_onto_hazard_ground_is_counted_once() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let biomes = hazard_where(|row, _| row >= HAZARD_FIRST_ROW);
+
+    // Placed on hazard ground: one step onto it (off it before the first
+    // tick), however long it then stays.
+    let (on, _) = probe(&biomes, glam::Vec3::new(0.0, 1.0, AGENT_Z_ON_HAZARD));
+    assert_eq!(on[P_HAZARD_ENTRIES], 1.0, "one step onto hazard ground");
+
+    let (off, _) = probe(&biomes, glam::Vec3::new(0.0, 1.0, AGENT_Z_BEFORE_HAZARD));
+    assert_eq!(off[P_HAZARD_ENTRIES], 0.0, "never on hazard ground");
 }

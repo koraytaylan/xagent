@@ -27,6 +27,17 @@ struct RecordingPayload {
 
 use crate::agent::{mutate_sensory_genes, Agent, HEATMAP_RES};
 
+/// One generation's hazard-avoidance measures, as the evolution panel charts
+/// them: steps onto hazard ground per agent, the share of distance travelled
+/// on it, and the mean size-weighted turn away from hazard ahead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HazardPoint {
+    pub generation: u32,
+    pub hazard_entries_per_agent: f32,
+    pub danger_dwell_fraction: f32,
+    pub avoidance_turn_away: f32,
+}
+
 /// Per-agent fitness evaluation result.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentFitness {
@@ -42,6 +53,11 @@ pub struct AgentFitness {
     pub danger_path_length: f32,
     pub avoidance_sense_range_ticks: f32,
     pub avoidance_turns_opposing: f32,
+    /// Size-weighted turn away from hazard ahead, summed over the
+    /// avoidance-counted ticks (positive = away).
+    pub avoidance_turn_away: f32,
+    /// Steps onto hazard ground this generation.
+    pub hazard_entries: f32,
     pub approach_sense_range_ticks: f32,
     pub approach_turns_toward: f32,
 }
@@ -285,6 +301,23 @@ pub(crate) fn compute_avoidance_intent_fraction(fitness: &[AgentFitness]) -> f32
     total_turns_opposing / total_sense_range_ticks.max(EPSILON)
 }
 
+/// Population mean turn away from hazard ahead, weighted by the turn's size:
+/// the summed size-weighted turn away divided by the summed avoidance-counted
+/// ticks (sum/sum, as for the intent fractions). In [-1, 1], 0 at chance.
+pub(crate) fn compute_avoidance_turn_away(fitness: &[AgentFitness]) -> f32 {
+    let total_sense_range_ticks: f32 = fitness.iter().map(|f| f.avoidance_sense_range_ticks).sum();
+    let total_turn_away: f32 = fitness.iter().map(|f| f.avoidance_turn_away).sum();
+    total_turn_away / total_sense_range_ticks.max(EPSILON)
+}
+
+/// Mean steps onto hazard ground per agent over the generation.
+pub(crate) fn compute_hazard_entries_per_agent(fitness: &[AgentFitness]) -> f32 {
+    if fitness.is_empty() {
+        return 0.0;
+    }
+    fitness.iter().map(|f| f.hazard_entries).sum::<f32>() / fitness.len() as f32
+}
+
 /// Population fraction of in-sense-range ticks the agents steered toward food.
 /// Sum of approach_turns_toward across the population divided by the sum of
 /// approach_sense_range_ticks. This is the defensible population statistic (sum/sum,
@@ -404,6 +437,8 @@ pub struct Governor {
     cached_tree_nodes: Option<Vec<TreeNode>>,
     /// Cached fitness history by island (invalidated on advance).
     cached_fitness_history: Option<std::collections::HashMap<i64, Vec<(u32, f32, f32)>>>,
+    /// Cached hazard-avoidance history (invalidated on advance).
+    cached_hazard_history: Option<Vec<HazardPoint>>,
     /// Per-island mutation momentum vectors.
     pub momentums: Vec<MutationMomentum>,
     /// Channel sender for offloading recording writes to a background thread.
@@ -621,6 +656,7 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             cached_fitness_history: None,
+            cached_hazard_history: None,
             momentums,
             recording_sender,
             writer_thread,
@@ -716,6 +752,7 @@ impl Governor {
             cached_best_score: -1.0,
             cached_tree_nodes: None,
             cached_fitness_history: None,
+            cached_hazard_history: None,
             momentums,
             recording_sender,
             writer_thread,
@@ -789,6 +826,8 @@ impl Governor {
                     danger_path_length: a.danger_path_length,
                     avoidance_sense_range_ticks: a.avoidance_sense_range_ticks,
                     avoidance_turns_opposing: a.avoidance_turns_opposing,
+                    avoidance_turn_away: a.avoidance_turn_away,
+                    hazard_entries: a.hazard_entries,
                     approach_sense_range_ticks: a.approach_sense_range_ticks,
                     approach_turns_toward: a.approach_turns_toward,
                 }
@@ -821,8 +860,9 @@ impl Governor {
                  (node_id, agent_index, config_json, total_ticks_alive,
                   death_count, food_consumed, cells_explored, composite_fitness,
                   distance_traveled, energy_spent, danger_path_length,
-                  avoidance_sense_range_ticks, avoidance_turns_opposing)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  avoidance_sense_range_ticks, avoidance_turns_opposing,
+                  avoidance_turn_away, hazard_entries)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     node_id,
                     r.agent_index as i64,
@@ -837,6 +877,8 @@ impl Governor {
                     r.danger_path_length,
                     r.avoidance_sense_range_ticks,
                     r.avoidance_turns_opposing,
+                    r.avoidance_turn_away,
+                    r.hazard_entries,
                 ],
             );
         }
@@ -979,12 +1021,14 @@ impl Governor {
             let danger_dwell_fraction = compute_danger_dwell_fraction(fitness);
             let avoidance_intent_fraction = compute_avoidance_intent_fraction(fitness);
             let approach_intent_fraction = compute_approach_intent_fraction(fitness);
+            let avoidance_turn_away = compute_avoidance_turn_away(fitness);
+            let hazard_entries_per_agent = compute_hazard_entries_per_agent(fitness);
 
             // Insert into behavior_metric table with placeholder values for fields not yet computed
             let _ = self.db.execute(
                 "INSERT INTO behavior_metric \
-                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, danger_dwell_fraction, avoidance_intent_fraction, approach_intent_fraction) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (node_id, sample_count, mean_abs_turn, turn_sign_persistence, straightness, danger_dwell_fraction, avoidance_intent_fraction, approach_intent_fraction, avoidance_turn_away, hazard_entries_per_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     node_id,
                     fitness.len() as i64,
@@ -994,6 +1038,8 @@ impl Governor {
                     danger_dwell_fraction,
                     avoidance_intent_fraction,
                     approach_intent_fraction,
+                    avoidance_turn_away,
+                    hazard_entries_per_agent,
                 ],
             );
         }
@@ -1160,6 +1206,7 @@ impl Governor {
             self.refresh_best_score();
             self.cached_tree_nodes = None;
             self.cached_fitness_history = None;
+            self.cached_hazard_history = None;
             self.persist_state();
             messages.push(format!(
                 "[EVOLUTION] Finished after {} generations",
@@ -1229,6 +1276,7 @@ impl Governor {
         self.refresh_best_score();
         self.cached_tree_nodes = None;
         self.cached_fitness_history = None;
+        self.cached_hazard_history = None;
 
         self.persist_state();
 
@@ -1745,6 +1793,41 @@ impl Governor {
         self.cached_fitness_history.as_ref().unwrap()
     }
 
+    /// Per-generation hazard-avoidance measures of this run, oldest first
+    /// (see [`HazardPoint`]). Returns a cached reference; the cache is
+    /// invalidated on `advance()`.
+    pub fn hazard_history(&mut self) -> &[HazardPoint] {
+        if self.cached_hazard_history.is_none() {
+            self.cached_hazard_history = Some(self.hazard_history_from_db());
+        }
+        self.cached_hazard_history.as_deref().unwrap_or(&[])
+    }
+
+    /// Fetch the hazard-avoidance history directly from the database. Rows
+    /// written before these measures existed are skipped.
+    fn hazard_history_from_db(&self) -> Vec<HazardPoint> {
+        let mut stmt = match self.db.prepare(
+            "SELECT n.generation, b.hazard_entries_per_agent, b.danger_dwell_fraction,
+                    b.avoidance_turn_away
+             FROM behavior_metric b JOIN node n ON n.id = b.node_id
+             WHERE n.run_id = ?1 AND b.hazard_entries_per_agent IS NOT NULL
+             ORDER BY n.generation ASC, n.id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![self.run_id], |row| {
+            Ok(HazardPoint {
+                generation: row.get(0)?,
+                hazard_entries_per_agent: row.get(1)?,
+                danger_dwell_fraction: row.get::<_, Option<f32>>(2)?.unwrap_or(0.0),
+                avoidance_turn_away: row.get::<_, Option<f32>>(3)?.unwrap_or(0.0),
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
     /// Fetch fitness history directly from the database.
     fn fitness_history_from_db(&self) -> std::collections::HashMap<i64, Vec<(u32, f32, f32)>> {
         let mut stmt = match self.db.prepare(
@@ -1907,7 +1990,9 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             cells_explored INTEGER,
             composite_fitness REAL,
             avoidance_sense_range_ticks REAL,
-            avoidance_turns_opposing REAL
+            avoidance_turns_opposing REAL,
+            avoidance_turn_away REAL,
+            hazard_entries REAL
         );
 
         CREATE TABLE IF NOT EXISTS mutation (
@@ -1960,6 +2045,11 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
         db.execute_batch("ALTER TABLE agent_result ADD COLUMN avoidance_sense_range_ticks REAL;");
     let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN avoidance_turns_opposing REAL;");
 
+    // Backwards-compatible migration: size-weighted turn away and steps onto
+    // hazard ground.
+    let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN avoidance_turn_away REAL;");
+    let _ = db.execute_batch("ALTER TABLE agent_result ADD COLUMN hazard_entries REAL;");
+
     // Per-generation behavior summary derived from recording and physics state
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS behavior_metric (
@@ -1973,7 +2063,9 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
             danger_dwell_fraction REAL,
             danger_exit_latency_ticks REAL,
             avoidance_intent_fraction REAL,
-            approach_intent_fraction REAL
+            approach_intent_fraction REAL,
+            avoidance_turn_away REAL,
+            hazard_entries_per_agent REAL
         );",
     )?;
 
@@ -1984,6 +2076,12 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
     // Backwards-compatible migration: add approach_intent_fraction to behavior_metric
     let _ =
         db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN approach_intent_fraction REAL;");
+
+    // Backwards-compatible migration: the hazard-avoidance measures the
+    // evolution panel shows.
+    let _ = db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN avoidance_turn_away REAL;");
+    let _ =
+        db.execute_batch("ALTER TABLE behavior_metric ADD COLUMN hazard_entries_per_agent REAL;");
 
     db.execute_batch(NODE_BRAIN_SCHEMA)?;
 
@@ -2180,6 +2278,8 @@ mod tests {
             danger_path_length: 10.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            avoidance_turn_away: 0.0,
+            hazard_entries: 0.0,
             approach_sense_range_ticks: 0.0,
             approach_turns_toward: 0.0,
         }]
@@ -2224,6 +2324,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             })
@@ -3698,6 +3800,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3714,6 +3818,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3730,6 +3836,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3840,6 +3948,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3859,6 +3969,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3878,6 +3990,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3897,6 +4011,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3952,6 +4068,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3971,6 +4089,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -3990,6 +4110,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -4009,6 +4131,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             },
@@ -4166,6 +4290,8 @@ mod tests {
                 danger_path_length: 10.0,
                 avoidance_sense_range_ticks: 0.0,
                 avoidance_turns_opposing: 0.0,
+                avoidance_turn_away: 0.0,
+                hazard_entries: 0.0,
                 approach_sense_range_ticks: 0.0,
                 approach_turns_toward: 0.0,
             })
@@ -4228,6 +4354,8 @@ mod tests {
             danger_path_length: 10.0,
             avoidance_sense_range_ticks: 0.0,
             avoidance_turns_opposing: 0.0,
+            avoidance_turn_away: 0.0,
+            hazard_entries: 0.0,
             approach_sense_range_ticks: 0.0,
             approach_turns_toward: 0.0,
         }];
@@ -4941,6 +5069,42 @@ mod tests {
     ///
     /// Straight-through scenario: agents sensed danger on many ticks but never
     /// turned to oppose it — `avoidance_turns_opposing == 0`.
+    #[test]
+    fn hazard_measures_persist_and_feed_the_hazard_history() {
+        use glam::Vec3;
+
+        let mut gov = test_governor(3);
+        let mut first = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        first.distance_traveled = 100.0;
+        first.danger_path_length = 10.0;
+        // 80 hazard-ahead ticks, turning away by 0.2 on average.
+        first.avoidance_sense_range_ticks = 80.0;
+        first.avoidance_turn_away = 16.0;
+        first.hazard_entries = 6.0;
+        let mut second = Agent::new(1, Vec3::ZERO, 1, BrainConfig::default(), 0);
+        second.distance_traveled = 100.0;
+        second.danger_path_length = 30.0;
+        // 20 hazard-ahead ticks, turning toward it by 0.2 on average.
+        second.avoidance_sense_range_ticks = 20.0;
+        second.avoidance_turn_away = -4.0;
+        second.hazard_entries = 2.0;
+
+        let fitness = gov.evaluate(&[first, second]);
+        let generation = gov.generation;
+        let _ = gov.advance(&fitness);
+
+        let history = gov.hazard_history().to_vec();
+        assert_eq!(history.len(), 1);
+        let point = history[0];
+        assert_eq!(point.generation, generation);
+        // (6 + 2) / 2 agents.
+        assert!((point.hazard_entries_per_agent - 4.0).abs() < 1e-6);
+        // (10 + 30) / (100 + 100).
+        assert!((point.danger_dwell_fraction - 0.2).abs() < 1e-6);
+        // (16 - 4) / (80 + 20).
+        assert!((point.avoidance_turn_away - 0.12).abs() < 1e-6);
+    }
+
     #[test]
     fn avoidance_intent_fraction_discriminates_turn_away() {
         use glam::Vec3;

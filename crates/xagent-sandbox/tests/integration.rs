@@ -7738,7 +7738,7 @@ fn nearest_danger_bearing_points_at_danger() {
 /// and split paths must agree.
 #[test]
 fn avoidance_counter_increments_only_on_turn_away() {
-    use xagent_brain::buffers::{PHYS_STRIDE, P_AVOIDANCE_TURNS_OPPOSING};
+    use xagent_brain::buffers::{PHYS_STRIDE, P_AVOIDANCE_TURNS_OPPOSING, P_AVOIDANCE_TURN_AWAY};
     use xagent_brain::GpuKernel;
 
     if !GpuKernel::is_available() {
@@ -7776,8 +7776,8 @@ fn avoidance_counter_increments_only_on_turn_away() {
     )];
 
     // Test helper: run an agent with a fixed motor_turn for one tick in both modes,
-    // and return the counter increments in (fused, split).
-    let run_with_motor_turn = |motor_turn: f32| -> (f32, f32) {
+    // and return the (sign count, size-weighted turn away) in (fused, split).
+    let run_with_motor_turn = |motor_turn: f32| -> ((f32, f32), (f32, f32)) {
         // Fused mode
         let counter_fused = {
             let mut kernel = GpuKernel::new(1, 0, &brain, &world_config);
@@ -7791,13 +7791,14 @@ fn avoidance_counter_increments_only_on_turn_away() {
             kernel.dispatch_batch(0, 1);
             let state = kernel.read_full_state_blocking();
             let counter = state[0 * PHYS_STRIDE + P_AVOIDANCE_TURNS_OPPOSING];
+            let turn_away = state[0 * PHYS_STRIDE + P_AVOIDANCE_TURN_AWAY];
 
             eprintln!(
-                "Fused mode: motor_turn={:.3}, counter={}",
-                motor_turn, counter as u32
+                "Fused mode: motor_turn={:.3}, counter={}, turn_away={:.3}",
+                motor_turn, counter as u32, turn_away
             );
 
-            counter
+            (counter, turn_away)
         };
 
         // Split mode
@@ -7814,13 +7815,14 @@ fn avoidance_counter_increments_only_on_turn_away() {
             kernel_split.dispatch_batch(0, 1);
             let state_split = kernel_split.read_full_state_blocking();
             let counter = state_split[0 * PHYS_STRIDE + P_AVOIDANCE_TURNS_OPPOSING];
+            let turn_away = state_split[0 * PHYS_STRIDE + P_AVOIDANCE_TURN_AWAY];
 
             eprintln!(
-                "Split mode:  motor_turn={:.3}, counter={}",
-                motor_turn, counter as u32
+                "Split mode:  motor_turn={:.3}, counter={}, turn_away={:.3}",
+                motor_turn, counter as u32, turn_away
             );
 
-            counter
+            (counter, turn_away)
         };
 
         (counter_fused, counter_split)
@@ -7829,7 +7831,13 @@ fn avoidance_counter_increments_only_on_turn_away() {
     // Test 1: left turn (motor_turn < 0)
     // Danger is to the right (bearing < 0), so (negative * negative) > 0 → turn away → should increment
     eprintln!("\n--- Test 1: Left turn (motor_turn = -0.5, danger to the right) ---");
-    let (counter_fused_left, counter_split_left) = run_with_motor_turn(-0.5);
+    let ((counter_fused_left, away_fused_left), (counter_split_left, away_split_left)) =
+        run_with_motor_turn(-0.5);
+    // The size-weighted sum carries the turn's size, signed away from danger.
+    assert!(
+        (away_fused_left - 0.5).abs() < 1e-6 && (away_split_left - 0.5).abs() < 1e-6,
+        "a 0.5 turn away should add +0.5: fused={away_fused_left}, split={away_split_left}"
+    );
     assert!(
         counter_fused_left > 0.0,
         "Fused: left turn away from right danger must increment counter, got {}",
@@ -7849,7 +7857,12 @@ fn avoidance_counter_increments_only_on_turn_away() {
     // Test 2: right turn (motor_turn > 0)
     // Danger is to the right (bearing < 0), so (positive * negative) < 0 → turn into danger → should NOT increment
     eprintln!("\n--- Test 2: Right turn (motor_turn = 0.5, danger to the right) ---");
-    let (counter_fused_right, counter_split_right) = run_with_motor_turn(0.5);
+    let ((counter_fused_right, away_fused_right), (counter_split_right, away_split_right)) =
+        run_with_motor_turn(0.5);
+    assert!(
+        (away_fused_right + 0.5).abs() < 1e-6 && (away_split_right + 0.5).abs() < 1e-6,
+        "a 0.5 turn toward danger should add -0.5: fused={away_fused_right}, split={away_split_right}"
+    );
     assert!(
         counter_fused_right == 0.0,
         "Fused: right turn into right danger must NOT increment counter, got {}",

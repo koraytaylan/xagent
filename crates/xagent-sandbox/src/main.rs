@@ -116,11 +116,6 @@ struct Cli {
     #[arg(long)]
     bench_visual_cortex: bool,
 
-    /// Run speed-decoupling validation (plan 0009): A/B test with all 0009 flags
-    /// off (baseline) vs on, measuring speed↔fitness correlation and other metrics.
-    #[arg(long)]
-    validate_speed_decoupling: bool,
-
     /// Run innate-instinct validation: A/B test with innate_instincts_enabled
     /// OFF (baseline) vs ON, measuring survival, alignment, and food-per-death.
     #[arg(long)]
@@ -692,21 +687,6 @@ fn main() {
 
     if cli.dump_tree {
         headless::dump_tree(&cli.db);
-        return;
-    }
-
-    if cli.validate_speed_decoupling {
-        // Apply seed-start offset so parallel shards use non-overlapping seed ranges.
-        if cli.validation_seed_start > 0 {
-            config.world.seed = config.world.seed.wrapping_add(cli.validation_seed_start);
-        }
-        headless::validate_speed_decoupling(
-            config,
-            cli.validation_generations,
-            cli.validation_population,
-            cli.validation_replicates,
-            cli.validation_tick_budget,
-        );
         return;
     }
 

@@ -468,166 +468,6 @@ pub fn dump_tree(db_path: &str) {
     }
 }
 
-/// Run the paired baseline-vs-ON speed-decoupling A/B at a fixed envelope.
-///
-/// Wraps `num_replicates` bootstrap replicates (baseline: all flags OFF; ON: effort-rebased
-/// fitness + super-linear locomotor drag at `speed_cost_exponent=2.0`, danger percept OFF) and
-/// computes 95% CI for four metrics: `mean_ticks_alive`, `speed_fitness_correlation`,
-/// `mean_fitness`, `danger_dwell_fraction`. Outputs JSON with point/CI/effect and a
-/// machine-readable decision rule.
-///
-/// Production default: 100 replicates, population 100, 50 generations. Pass smaller values via
-/// `--validation-replicates` / `--validation-population` / `--validation-generations` for quick
-/// hardware-limited checks.
-///
-/// `tick_budget_override`: if non-zero, replaces the governor's default 1 M-tick budget per
-/// generation. Use a smaller value (e.g. 10_000) to make N=100 production-scale bootstrap
-/// feasible on hardware where 1 M ticks × 50 gen × 100 pop × 200 arm-calls is prohibitive;
-/// 0 means keep the governor's configured value.
-pub fn validate_speed_decoupling(
-    config: FullConfig,
-    num_generations: u64,
-    population: u32,
-    num_replicates: usize,
-    tick_budget_override: u64,
-) {
-    let effective_tick_budget = if tick_budget_override > 0 {
-        tick_budget_override
-    } else {
-        config.governor.tick_budget
-    };
-
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("SPEED-DECOUPLING PRODUCTION A/B VALIDATION");
-    println!(
-        "Running N={} bootstrap replicates at population {} × {} generations × {} ticks/gen",
-        num_replicates, population, num_generations, effective_tick_budget
-    );
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    // Collect baseline and ON metrics across N replicates.
-    let mut baseline_ticks_alive: Vec<f32> = Vec::new();
-    let mut baseline_speed_correlation: Vec<f32> = Vec::new();
-    let mut baseline_fitness: Vec<f32> = Vec::new();
-    let mut baseline_danger_dwell: Vec<f32> = Vec::new();
-
-    let mut on_ticks_alive: Vec<f32> = Vec::new();
-    let mut on_speed_correlation: Vec<f32> = Vec::new();
-    let mut on_fitness: Vec<f32> = Vec::new();
-    let mut on_danger_dwell: Vec<f32> = Vec::new();
-
-    for replicate in 0..num_replicates {
-        println!(
-            "\n[Replicate {}/{}] Running baseline and ON arms...",
-            replicate + 1,
-            num_replicates
-        );
-
-        // Generate a seeded but independent world for this replicate.
-        let mut replicate_config = config.clone();
-        replicate_config.governor.population_size = population as usize;
-        replicate_config.world.seed = config.world.seed.wrapping_add(replicate as u64);
-        // Apply tick_budget_override when set: both arms use the same budget for a fair A/B.
-        if tick_budget_override > 0 {
-            replicate_config.governor.tick_budget = tick_budget_override;
-        }
-
-        // Baseline run (all flags off)
-        let baseline_stats = run_headless_with_flags(
-            replicate_config.clone(),
-            num_generations,
-            false,
-            false,
-            false,
-        );
-
-        // ON run: effort-rebased fitness, super-linear drag at k=2.0, danger percept OFF.
-        // danger_percept_enabled=false isolates the effort-fitness + speed-cost axis from the
-        // danger-percept signal, so the two mechanisms are measured independently.
-        let on_stats =
-            run_headless_with_flags(replicate_config, num_generations, true, false, false);
-
-        // Record metrics for this replicate.
-        baseline_ticks_alive.push(baseline_stats.mean_ticks_alive as f32);
-        baseline_speed_correlation.push(baseline_stats.speed_fitness_correlation);
-        baseline_fitness.push(baseline_stats.mean_fitness);
-        baseline_danger_dwell.push(baseline_stats.mean_danger_dwell_fraction);
-
-        on_ticks_alive.push(on_stats.mean_ticks_alive as f32);
-        on_speed_correlation.push(on_stats.speed_fitness_correlation);
-        on_fitness.push(on_stats.mean_fitness);
-        on_danger_dwell.push(on_stats.mean_danger_dwell_fraction);
-    }
-
-    // Compute bootstrap metrics: point estimate (mean), lower/upper 95% CI, effect.
-    let ticks_alive_baseline = compute_bootstrap_metric(&baseline_ticks_alive, None);
-    let ticks_alive_on =
-        compute_bootstrap_metric(&on_ticks_alive, Some(ticks_alive_baseline.point));
-
-    let speed_correlation_baseline = compute_bootstrap_metric(&baseline_speed_correlation, None);
-    let speed_correlation_on = compute_bootstrap_metric(
-        &on_speed_correlation,
-        Some(speed_correlation_baseline.point),
-    );
-
-    let fitness_baseline = compute_bootstrap_metric(&baseline_fitness, None);
-    let fitness_on = compute_bootstrap_metric(&on_fitness, Some(fitness_baseline.point));
-
-    let danger_dwell_baseline = compute_bootstrap_metric(&baseline_danger_dwell, None);
-    let danger_dwell_on =
-        compute_bootstrap_metric(&on_danger_dwell, Some(danger_dwell_baseline.point));
-
-    // Output JSON — include run parameters alongside metrics so the artifact is self-describing.
-    let json_output = serde_json::json!({
-        "run_parameters": {
-            "num_replicates": num_replicates,
-            "population": population,
-            "num_generations": num_generations,
-            "tick_budget_per_generation": effective_tick_budget,
-        },
-        "mean_ticks_alive_baseline": ticks_alive_baseline,
-        "mean_ticks_alive_on": ticks_alive_on,
-        "speed_correlation_baseline": speed_correlation_baseline,
-        "speed_correlation_on": speed_correlation_on,
-        "mean_fitness_baseline": fitness_baseline,
-        "mean_fitness_on": fitness_on,
-        "danger_dwell_fraction_baseline": danger_dwell_baseline,
-        "danger_dwell_fraction_on": danger_dwell_on,
-    });
-
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("BOOTSTRAP RESULTS (JSON)");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_output).unwrap_or_default()
-    );
-
-    // Save JSON output.
-    let json_path = "speed_decoupling_bootstrap.json";
-    match std::fs::write(
-        json_path,
-        serde_json::to_string_pretty(&json_output).unwrap_or_default(),
-    ) {
-        Ok(()) => println!("\nJSON output saved to ./{}", json_path),
-        Err(e) => eprintln!("Failed to write {}: {}", json_path, e),
-    }
-
-    // Print decision rule.
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("DECISION RULE");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    print_speed_decoupling_decision_rule(
-        &ticks_alive_baseline,
-        &ticks_alive_on,
-        &speed_correlation_baseline,
-        &speed_correlation_on,
-        &danger_dwell_baseline,
-        &danger_dwell_on,
-    );
-}
-
 /// Run danger-percept production A/B validation with bootstrap 95% confidence intervals.
 /// Baseline: danger_percept_enabled=false (all other flags off).
 /// ON: danger_percept_enabled=true (all other flags off).
@@ -687,17 +527,11 @@ pub fn validate_danger_percept(
         }
 
         // Baseline run: all flags off, danger_percept_enabled=false
-        let baseline_stats = run_headless_with_flags(
-            replicate_config.clone(),
-            num_generations,
-            false,
-            false,
-            false,
-        );
+        let baseline_stats =
+            run_headless_with_flags(replicate_config.clone(), num_generations, false, false);
 
         // ON run: danger_percept_enabled=true, all other flags off
-        let on_stats =
-            run_headless_with_flags(replicate_config, num_generations, false, true, false);
+        let on_stats = run_headless_with_flags(replicate_config, num_generations, true, false);
 
         // Record metrics for this replicate.
         baseline_avoidance_intent.push(baseline_stats.mean_avoidance_intent_fraction);
@@ -817,15 +651,14 @@ pub fn run_innate_instinct_ab(
     num_generations: u64,
 ) -> (ValidationStats, ValidationStats, bool) {
     // Baseline: innate_instincts_enabled=false (blank slate, learning from scratch).
-    // All speed-decoupling flags off — isolates the innate-instinct flag as the only variable.
+    // All other flags off — isolates the innate-instinct flag as the only variable.
     println!("\n=== Baseline (innate_instincts_enabled=false) ===");
-    let baseline_stats =
-        run_headless_with_flags(config.clone(), num_generations, false, false, false);
+    let baseline_stats = run_headless_with_flags(config.clone(), num_generations, false, false);
 
     // ON: innate_instincts_enabled=true (seeded instincts).
-    // All speed-decoupling flags remain off — same single-variable isolation.
+    // All other flags remain off — same single-variable isolation.
     println!("\n=== ON (innate_instincts_enabled=true) ===");
-    let on_stats = run_headless_with_flags(config.clone(), num_generations, false, false, true);
+    let on_stats = run_headless_with_flags(config.clone(), num_generations, false, true);
 
     // Apply gates.
     println!("\n=== Gate Evaluation ===");
@@ -922,18 +755,6 @@ pub struct ValidationStats {
     pub speed_trajectory_per_gen: Vec<f32>,
 }
 
-/// Super-linear locomotor-drag exponent used in the ON run.
-/// k=2.0: energy cost scales as (speed/20)^2 above the baseline speed, so the
-/// energy-drain axis becomes speed-dependent and faster movement costs
-/// disproportionately more.
-const ON_SPEED_COST_EXPONENT: f32 = 2.0;
-
-/// Locomotor-drag exponent used in the baseline (legacy-regime) run: linear
-/// drag, a bit-exact no-op per the WGSL guard. Set explicitly because the
-/// constructed `BrainConfig` default is super-linear; leaving it would give
-/// the baseline arm the ON arm's drag.
-const BASELINE_SPEED_COST_EXPONENT: f32 = 1.0;
-
 /// Guard value for the food-per-death denominator.
 /// Treats mean_death_count values below this threshold as effectively zero, returning
 /// f32::INFINITY instead of dividing. Chosen at 1e-4 to absorb floating-point imprecision
@@ -954,46 +775,28 @@ const INSTINCT_FOOD_PER_DEATH_MIN: f32 = 2.0;
 
 /// Run headless evolution and collect statistics with specified flags.
 ///
-/// `effort_rebased_fitness = true` activates effort-rebased fitness + super-linear drag:
-///   - `effort_rebased_fitness`: food-per-energy + cells-per-distance
-///   - `speed_cost_exponent = 2.0`: super-linear locomotor drag above baseline
-///   - `danger_percept_enabled`: dedicated danger bearing/distance senses
-///   - `innate_instincts_enabled`: seeded instinct patterns for the innate-instinct A/B harness.
-///     Pass `false` for the speed-decoupling harness (baseline and ON arms both use `false`).
+/// `danger_percept_enabled` adds the dedicated danger bearing/distance senses;
+/// `innate_instincts_enabled` seeds the instinct patterns for the innate-instinct
+/// A/B harness. Everything else runs at the config's own values, so a baseline
+/// arm and an ON arm differ only in the flag under test.
 fn run_headless_with_flags(
     mut config: FullConfig,
     num_generations: u64,
-    effort_rebased_fitness: bool,
     danger_percept_enabled: bool,
     innate_instincts_enabled: bool,
 ) -> ValidationStats {
-    // Set the validation flags.
-    // When enabling effort-rebased fitness, also engage the super-linear drag at k=2.0 — the
-    // keystone mechanism that makes the energy-drain axis speed-dependent.
-    // Sharing one exponent across the ON and baseline runs would make them
-    // byte-identical on the energy-drain axis, defeating the measurement, so the
-    // baseline pins linear drag.
-    config.brain.effort_rebased_fitness = effort_rebased_fitness;
     config.brain.danger_percept_enabled = danger_percept_enabled;
     config.brain.innate_instincts_enabled = innate_instincts_enabled;
-    config.brain.speed_cost_exponent = if effort_rebased_fitness {
-        ON_SPEED_COST_EXPONENT
-    } else {
-        BASELINE_SPEED_COST_EXPONENT
-    };
 
     println!(
-        "  Flags: effort_rebased={}, danger_percept={}, speed_cost_exponent={}, innate_instincts={}",
-        effort_rebased_fitness,
-        danger_percept_enabled,
-        config.brain.speed_cost_exponent,
-        innate_instincts_enabled
+        "  Flags: danger_percept={}, speed_cost_exponent={}, innate_instincts={}",
+        danger_percept_enabled, config.brain.speed_cost_exponent, innate_instincts_enabled
     );
 
     // Create a temporary database for this run
     let temp_db = format!(
         "xagent-validation-{}-{}.db",
-        if effort_rebased_fitness {
+        if danger_percept_enabled || innate_instincts_enabled {
             "ON"
         } else {
             "BASELINE"
@@ -1374,104 +1177,6 @@ fn compute_bootstrap_metric(values: &[f32], baseline_point: Option<f32>) -> Boot
         upper_ci,
         effect,
     }
-}
-
-/// Print speed-decoupling decision rule and verdict.
-/// Upper ticks-alive multiplier defining the +5% stability band above baseline.
-/// ON arm may not exceed this without indicating unexpected survival inflation.
-const TICKS_ALIVE_UPPER_BAND: f32 = 1.05;
-/// Minimum fraction of baseline danger-dwell the ON arm must retain.
-/// Agents must still enter hazard zones at ≥80% of the baseline rate.
-const DANGER_DWELL_RETENTION: f32 = 0.8;
-
-fn print_speed_decoupling_decision_rule(
-    ticks_alive_baseline: &BootstrapMetric,
-    ticks_alive_on: &BootstrapMetric,
-    speed_correlation_baseline: &BootstrapMetric,
-    speed_correlation_on: &BootstrapMetric,
-    danger_dwell_baseline: &BootstrapMetric,
-    danger_dwell_on: &BootstrapMetric,
-) {
-    // Thresholds (locked decision).
-    const SPEED_CORR_EXPLOITABLE: f32 = 0.5;
-    const SPEED_CORR_DECOUPLED: f32 = 0.2;
-    const TICKS_ALIVE_BAND: f32 = 0.1; // ±10% of baseline.
-
-    println!("\nThresholds:");
-    println!(
-        "  (a) speed_correlation BASELINE strongly positive (>= {:.1})",
-        SPEED_CORR_EXPLOITABLE
-    );
-    println!(
-        "  (b) speed_correlation ON near zero (in [-{:.1}, {:.1}])",
-        SPEED_CORR_DECOUPLED, SPEED_CORR_DECOUPLED
-    );
-    println!(
-        "  (c) ticks_alive ON within [-10%, +{:.0}%] of baseline",
-        (TICKS_ALIVE_UPPER_BAND - 1.0) * 100.0
-    );
-    println!(
-        "  (d) danger_dwell_fraction ON >= baseline * {:.1}",
-        DANGER_DWELL_RETENTION
-    );
-
-    // Check gates.
-    let gate_a = speed_correlation_baseline.point >= SPEED_CORR_EXPLOITABLE;
-    let gate_b = speed_correlation_on.point.abs() <= SPEED_CORR_DECOUPLED;
-    let lower_band = ticks_alive_baseline.point * (1.0 - TICKS_ALIVE_BAND);
-    let upper_band = ticks_alive_baseline.point * TICKS_ALIVE_UPPER_BAND;
-    let gate_c = ticks_alive_on.point >= lower_band && ticks_alive_on.point <= upper_band;
-    let gate_d = danger_dwell_on.point >= danger_dwell_baseline.point * DANGER_DWELL_RETENTION;
-
-    println!("\nGate Evaluation:");
-    println!(
-        "  (a) baseline speed_correlation {:.4} >= {:.1}? → {}",
-        speed_correlation_baseline.point,
-        SPEED_CORR_EXPLOITABLE,
-        if gate_a { "✓" } else { "✗" }
-    );
-    println!(
-        "  (b) ON speed_correlation {:.4} in [-{:.1}, {:.1}]? → {}",
-        speed_correlation_on.point,
-        SPEED_CORR_DECOUPLED,
-        SPEED_CORR_DECOUPLED,
-        if gate_b { "✓" } else { "✗" }
-    );
-    println!(
-        "  (c) ON ticks_alive {:.0} in [{:.0}, {:.0}]? → {}",
-        ticks_alive_on.point,
-        lower_band,
-        upper_band,
-        if gate_c { "✓" } else { "✗" }
-    );
-    println!(
-        "  (d) ON danger_dwell {:.4} >= {:.4}? → {}",
-        danger_dwell_on.point,
-        danger_dwell_baseline.point * DANGER_DWELL_RETENTION,
-        if gate_d { "✓" } else { "✗" }
-    );
-
-    // FLIP: all gates pass.
-    // RETIRE: ON is clearly negative on any axis (mechanism failure):
-    //   - speed_correlation_on <= -SPEED_CORR_DECOUPLED: correlation inverted beyond the
-    //     "near zero" band (< -0.2), meaning ON arm actively drives a negative speed-fitness
-    //     link — the mechanism is working in the wrong direction.
-    //   - ticks_alive_on < lower_band: survival drops >10% below baseline (harmful).
-    // DEFER: thresholds do not align — gate (a) baseline not exploitable at this scale,
-    //        gate (b) or gate (d) borderline, or gate (c) within band. Gate (a) failure
-    //        is a scale artifact (speed-ratchet requires sufficient generations to emerge),
-    //        not a mechanism failure, so it routes to DEFER rather than RETIRE.
-    let verdict = if gate_a && gate_b && gate_c && gate_d {
-        "FLIP: All gates pass. Effort-fitness is ready to ship."
-    } else if speed_correlation_on.point < -SPEED_CORR_DECOUPLED
-        || ticks_alive_on.point < lower_band
-    {
-        "RETIRE: ON speed_correlation is inverted beyond the near-zero band (<-0.2, mechanism working backwards) OR ticks_alive ON drops >10% below baseline."
-    } else {
-        "DEFER: Thresholds do not align; more data or refinement needed (see gate evaluation above)."
-    };
-
-    println!("\n>>> VERDICT: {}", verdict);
 }
 
 /// Lower bound of the "steering at chance" band. A value below this is considered regressed.

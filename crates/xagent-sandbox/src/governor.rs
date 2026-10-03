@@ -62,14 +62,10 @@ pub struct AgentFitness {
     pub approach_turns_toward: f32,
 }
 
-/// Foraging rate (food consumed per 1000 alive ticks) that earns a full
-/// foraging score. Around the per-capita break-even rate where an agent
-/// sustains its own energy, so a competent forager maxes this axis.
-const FORAGING_RATE_TARGET: f32 = 1.5;
 /// Food per unit energy for a competent forager earning full foraging credit.
 /// Calibrated from real production-scale telemetry: a competent forager
 /// (food=4200, energy=15,000) achieves food/energy ≈ 0.28, so TARGET = 0.28/0.95 ≈ 0.294
-/// ensures foraging ≥ 0.95 for that profile. Used only when effort_rebased_fitness = true.
+/// ensures foraging ≥ 0.95 for that profile.
 const FORAGING_ENERGY_TARGET: f32 = 0.294;
 /// Minimum energy before the foraging rate counts; anti-division-by-zero
 /// and prevents camping (a stationary agent still burns metabolic + brain energy).
@@ -80,8 +76,6 @@ const DISTANCE_FLOOR: f32 = 0.1;
 /// Cells explored per unit distance for a competent forager earning full
 /// exploration credit. Calibrated from real telemetry: cells=256,
 /// distance=520,000, raw_ratio=256/520,000≈0.000492, TARGET = 0.000492/0.95 ≈ 0.000518.
-/// Used only when effort_rebased_fitness = true in the duration-independent
-/// exploration formula.
 const EXPLORATION_RATE_TARGET: f32 = 0.0005;
 /// Lower bound on the survival multiplier. Deaths still penalize, but the
 /// multiplier never drives the foraging signal below this fraction the way an
@@ -194,66 +188,36 @@ fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
 
 /// Composite fitness: foraging-primary with a bounded survival multiplier.
 ///
-/// Two modes, selected by `effort_rebased_fitness`:
-///
-/// **Legacy mode** (`false`): The primary axis is `food_per_1k_alive_ticks`
-/// (food consumed normalized by the agent's actual lived time), so a
-/// generation's real foraging variance drives selection. Exploration is the
-/// fraction of reachable grid visited. Survival is a multiplier bounded below by
-/// [`SURVIVAL_FLOOR`]: dying still costs score — a careful forager outscores a
-/// kamikaze one with the same food — but a high death count can no longer
-/// collapse the composite into the noise floor where foraging variance is
-/// invisible.
-///
-/// **Effort-rebased mode** (`true`): Duration-independent cumulative ratios.
-/// Foraging = food / energy (food found per unit energy burned, independent of
-/// survival length), exploration = min(coverage, cells_explored / distance / TARGET)
-/// (pure coverage preferred; spatial efficiency measured by cells per distance).
-/// Survival multiplier unchanged. `total_grid_cells` is the per-generation
-/// exploration denominator. Both axes are true duration-independent ratios of
-/// cumulative totals, with no ticks factor.
+/// Both axes are duration-independent ratios of cumulative totals, with no
+/// ticks factor, so a long-lived idle agent cannot out-score an efficient one.
+/// Foraging = food / energy (food found per unit energy burned), exploration =
+/// min(coverage, cells_explored / distance / TARGET) (pure coverage preferred;
+/// spatial efficiency measured by cells per distance). Survival is a multiplier
+/// bounded below by [`SURVIVAL_FLOOR`]: dying still costs score — a careful
+/// forager outscores a kamikaze one with the same food — but a high death count
+/// can no longer collapse the composite into the noise floor where foraging
+/// variance is invisible. `total_grid_cells` is the per-generation exploration
+/// denominator.
 fn composite_fitness(
     death_count: u32,
     food_consumed: u32,
     cells_explored: u32,
-    ticks_alive: u64,
     total_grid_cells: f32,
     distance_traveled: f32,
     energy_spent: f32,
-    effort_rebased_fitness: bool,
 ) -> f32 {
     // Bounded survival multiplier: 1.0 at zero deaths, asymptotes to the floor.
     let survival =
         SURVIVAL_FLOOR + (1.0 - SURVIVAL_FLOOR) / (1.0 + death_count as f32 * DEATH_PENALTY);
 
-    let (foraging, exploration) = if effort_rebased_fitness {
-        // Effort-rebased mode: duration-independent cumulative ratios.
-        // Both axes measure efficiency (food per energy, cells per distance)
-        // independent of how long the agent lived. See docs/plans/0014-Post-0010-Review-Hardening/
-        // for re-derived targets.
-        let foraging = ((food_consumed as f32 / energy_spent.max(ENERGY_FLOOR))
-            / FORAGING_ENERGY_TARGET)
-            .min(1.0);
+    let foraging =
+        ((food_consumed as f32 / energy_spent.max(ENERGY_FLOOR)) / FORAGING_ENERGY_TARGET).min(1.0);
 
-        let coverage = (cells_explored as f32 / total_grid_cells).min(1.0);
-        let cells_per_distance = (cells_explored as f32
-            / distance_traveled.max(DISTANCE_FLOOR)
-            / EXPLORATION_RATE_TARGET)
+    let coverage = (cells_explored as f32 / total_grid_cells).min(1.0);
+    let cells_per_distance =
+        (cells_explored as f32 / distance_traveled.max(DISTANCE_FLOOR) / EXPLORATION_RATE_TARGET)
             .min(1.0);
-        let exploration = coverage.min(cells_per_distance);
-
-        (foraging, exploration)
-    } else {
-        // Legacy mode: food per 1000 ticks, exploration as coverage.
-        // Guard the divisor: a generation always advances at least a few ticks.
-        let alive_thousands = (ticks_alive as f32 / 1000.0).max(1e-3);
-        // Foraging rate, normalized to the target rate and capped at a full score.
-        let food_per_1k = food_consumed as f32 / alive_thousands;
-        let foraging = (food_per_1k / FORAGING_RATE_TARGET).min(1.0);
-        // Exploration: fraction of reachable grid visited (25% of total = perfect).
-        let exploration = (cells_explored as f32 / total_grid_cells).min(1.0);
-        (foraging, exploration)
-    };
+    let exploration = coverage.min(cells_per_distance);
 
     survival * (foraging * FORAGING_WEIGHT + exploration * EXPLORATION_WEIGHT)
 }
@@ -837,7 +801,7 @@ impl Governor {
 
         // Absolute fitness scoring — no intra-generational normalization.
         // The exploration denominator is the reachable quarter of the heatmap
-        // grid; foraging is a rate normalized by each agent's own lived time.
+        // grid; foraging is food per unit energy burned.
         let total_grid_cells = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
 
         for r in &mut results {
@@ -845,11 +809,9 @@ impl Governor {
                 r.death_count,
                 r.food_consumed,
                 r.cells_explored,
-                r.total_ticks_alive,
                 total_grid_cells,
                 r.distance_traveled,
                 r.energy_spent,
-                r.config.effort_rebased_fitness,
             );
         }
 
@@ -2514,24 +2476,22 @@ mod tests {
     fn composite_fitness_is_foraging_primary_with_bounded_survival() {
         let cells = 250;
         let grid = 1000.0_f32;
-        // ~budget-scale lived time so food_per_1k reflects the rate, not a tiny
-        // alive window.
-        let ticks = 100_000_u64;
-        // Dummy distance and energy for legacy mode (unused).
         let distance = 1000.0_f32;
-        let energy = 100.0_f32;
+        // Energy at which `FORAGING_ENERGY_TARGET` is reached at ~118 food, so
+        // the food counts below straddle the saturation point.
+        let energy = 400.0_f32;
 
-        // (a) More food at equal deaths scores strictly higher (legacy mode).
-        let low_food = composite_fitness(2, 100, cells, ticks, grid, distance, energy, false);
-        let high_food = composite_fitness(2, 300, cells, ticks, grid, distance, energy, false);
+        // (a) More food at equal deaths scores strictly higher.
+        let low_food = composite_fitness(2, 50, cells, grid, distance, energy);
+        let high_food = composite_fitness(2, 100, cells, grid, distance, energy);
         assert!(
             high_food > low_food,
             "more food must score higher: {high_food} !> {low_food}"
         );
 
         // (b) More deaths at equal food scores strictly lower (anti-kamikaze).
-        let few_deaths = composite_fitness(1, 200, cells, ticks, grid, distance, energy, false);
-        let many_deaths = composite_fitness(50, 200, cells, ticks, grid, distance, energy, false);
+        let few_deaths = composite_fitness(1, 200, cells, grid, distance, energy);
+        let many_deaths = composite_fitness(50, 200, cells, grid, distance, energy);
         assert!(
             few_deaths > many_deaths,
             "more deaths must score lower: {few_deaths} !> {many_deaths}"
@@ -2541,8 +2501,8 @@ mod tests {
         // gate drove a 200-death generation to ~0.003 (below eval noise); the
         // bounded multiplier keeps it well above, and two foragers differing
         // only in food rate stay clearly separable.
-        let forager_lean = composite_fitness(200, 30, cells, ticks, grid, distance, energy, false);
-        let forager_rich = composite_fitness(200, 60, cells, ticks, grid, distance, energy, false);
+        let forager_lean = composite_fitness(200, 30, cells, grid, distance, energy);
+        let forager_rich = composite_fitness(200, 60, cells, grid, distance, energy);
         assert!(
             forager_lean > 0.04,
             "high-death forager collapsed into the noise floor: {forager_lean}"
@@ -2554,24 +2514,20 @@ mod tests {
 
         // Survival is bounded below: even an extreme death count keeps at least
         // the floor fraction of the foraging score, never zero-by-gate.
-        let extreme =
-            composite_fitness(1_000_000, 200, cells, ticks, grid, distance, energy, false);
-        let alive = composite_fitness(0, 200, cells, ticks, grid, distance, energy, false);
+        let extreme = composite_fitness(1_000_000, 200, cells, grid, distance, energy);
+        let alive = composite_fitness(0, 200, cells, grid, distance, energy);
         assert!(
             extreme > alive * (SURVIVAL_FLOOR - 0.01),
             "survival multiplier fell through its floor: {extreme} vs alive {alive}"
         );
 
         // Idle agent: no foraging, no exploration → zero regardless of survival.
-        assert_eq!(
-            composite_fitness(0, 0, 0, ticks, grid, distance, energy, false),
-            0.0
-        );
+        assert_eq!(composite_fitness(0, 0, 0, grid, distance, energy), 0.0);
 
-        // Foraging rate is capped: 2× the target rate still scores a full
+        // Foraging is capped: 2× the saturation food count still scores a full
         // foraging term, not double.
-        let capped = composite_fitness(0, 300, 0, ticks, grid, distance, energy, false);
-        let at_target = composite_fitness(0, 150, 0, ticks, grid, distance, energy, false);
+        let capped = composite_fitness(0, 240, 0, grid, distance, energy);
+        let at_target = composite_fitness(0, 120, 0, grid, distance, energy);
         assert!(
             (capped - at_target).abs() < 1e-6,
             "foraging above target must cap: {capped} vs {at_target}"
@@ -2585,7 +2541,6 @@ mod tests {
     fn composite_fitness_rewards_efficiency() {
         let cells = 250;
         let grid = 1000.0_f32;
-        let ticks = 100_000_u64;
 
         // (a) Fast-aimless agent (high food, high distance, high energy)
         // scores lower than slow-deliberate agent (same food, low distance/energy).
@@ -2595,17 +2550,15 @@ mod tests {
             0,     // deaths
             100,   // food
             cells, // cells
-            ticks, grid, 5000.0, // high distance (aimless travel)
+            grid, 5000.0, // high distance (aimless travel)
             500.0,  // high energy (spent on movement)
-            true,   // effort_rebased_fitness enabled
         );
         let slow_deliberate = composite_fitness(
             0,     // deaths
             100,   // same food
             cells, // same cells (good coverage despite less distance)
-            ticks, grid, 100.0, // low distance (focused movement)
+            grid, 100.0, // low distance (focused movement)
             100.0, // low energy (efficient foraging)
-            true,
         );
         assert!(
             slow_deliberate > fast_aimless,
@@ -2618,9 +2571,8 @@ mod tests {
             0,     // deaths
             300,   // high food (respawning on one spot)
             cells, // good coverage from that spot
-            ticks, grid, 1.0,  // negligible distance
+            grid, 1.0,  // negligible distance
             50.0, // still burns energy (metabolic + brain)
-            true,
         );
         // The foraging axis actually maxes out here (food/energy far exceeds the
         // target), so what holds the composite below 1.0 is coverage-bounded
@@ -2630,21 +2582,10 @@ mod tests {
             camper < 1.0,
             "camper should not achieve perfect fitness; got {camper}"
         );
-
-        // (c) Flag-off path reproduces legacy scores (within tolerance).
-        // The legacy formula is unchanged when effort_rebased_fitness = false.
-        let legacy = composite_fitness(1, 150, cells, ticks, grid, 1000.0, 100.0, false);
-        // Using the same synthetic data but in legacy mode: food/time, coverage.
-        // This score should not depend on distance/energy.
-        let legacy_alt = composite_fitness(1, 150, cells, ticks, grid, 9999.0, 9999.0, false);
-        assert!(
-            (legacy - legacy_alt).abs() < 1e-6,
-            "legacy mode should ignore distance/energy: {legacy} vs {legacy_alt}"
-        );
     }
 
-    /// Replay production-scale telemetry through both legacy and effort-rebased fitness
-    /// formulas. Records min/mean/max distributions of per-generation accumulated telemetry
+    /// Replay production-scale telemetry through the composite fitness formula.
+    /// Records min/mean/max distributions of per-generation accumulated telemetry
     /// (`energy_spent`, `distance_traveled`, `food_consumed`, `cells_explored`, `ticks_alive`)
     /// and per-axis values under current constants, confirming the axis collapse reported
     /// in the design doc.
@@ -3202,20 +3143,19 @@ mod tests {
         );
     }
 
-    /// Fitness calibration: replays synthetic generation profiles through both
-    /// legacy and effort-rebased formulas to calibrate FORAGING_ENERGY_TARGET
+    /// Fitness calibration: replays synthetic generation profiles through the
+    /// composite formula to calibrate FORAGING_ENERGY_TARGET
     /// and EXPLORATION_RATE_TARGET. Pins the documented composite scores and
     /// deltas to tolerance using the production grid denominator (1024), so a
     /// math regression that preserves ordering but shifts magnitudes fails.
     #[test]
     fn fitness_calibration_replay_profiles() {
         let grid = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
-        let ticks = 100_000_u64; // ~1.67 minutes of simulated time at 1 tick/frame
 
         // Representative profile 1: Competent forager (skill-focused, exploring broadly)
         // - Travels moderate distance, finds abundant food via deliberate search
         // - Covers significant grid diversity through skillful foraging
-        // - Both foraging and exploration axes should approach 1.0 in effort mode
+        // - Both foraging and exploration axes should approach 1.0
         let competent_forager_deaths = 1;
         let competent_forager_food = 180; // high absolute food from good skill
         let competent_forager_cells = 600; // 60% coverage through deliberate exploration
@@ -3248,128 +3188,47 @@ mod tests {
         let camper_distance = 2.0; // barely moves
         let camper_energy = 100.0; // metabolic + brain cost over a long idle life
 
-        // Print calibration table header
+        let competent = composite_fitness(
+            competent_forager_deaths,
+            competent_forager_food,
+            competent_forager_cells,
+            grid,
+            competent_forager_distance,
+            competent_forager_energy,
+        );
+        let aimless = composite_fitness(
+            fast_aimless_deaths,
+            fast_aimless_food,
+            fast_aimless_cells,
+            grid,
+            fast_aimless_distance,
+            fast_aimless_energy,
+        );
+        let camper = composite_fitness(
+            camper_deaths,
+            camper_food,
+            camper_cells,
+            grid,
+            camper_distance,
+            camper_energy,
+        );
+
         eprintln!("\n=== FITNESS CALIBRATION REPLAY ===");
-        eprintln!(
-            "{:<30} {:>12} {:>12} {:>12}",
-            "Profile", "Legacy", "Effort-based", "Delta"
-        );
-        eprintln!("{}", "=".repeat(70));
+        eprintln!("{:<30} {:>12}", "Profile", "Composite");
+        eprintln!("{}", "=".repeat(44));
+        eprintln!("{:<30} {:>12.4}", "Competent Forager", competent);
+        eprintln!("{:<30} {:>12.4}", "Fast-Aimless", aimless);
+        eprintln!("{:<30} {:>12.4}", "Camper", camper);
+        eprintln!("{}", "=".repeat(44));
 
-        // Competent forager
-        let legacy_competent = composite_fitness(
-            competent_forager_deaths,
-            competent_forager_food,
-            competent_forager_cells,
-            ticks,
-            grid,
-            competent_forager_distance,
-            competent_forager_energy,
-            false,
-        );
-        let effort_competent = composite_fitness(
-            competent_forager_deaths,
-            competent_forager_food,
-            competent_forager_cells,
-            ticks,
-            grid,
-            competent_forager_distance,
-            competent_forager_energy,
-            true,
-        );
-        eprintln!(
-            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
-            "Competent Forager",
-            legacy_competent,
-            effort_competent,
-            effort_competent - legacy_competent
-        );
-
-        // Fast-aimless
-        let legacy_aimless = composite_fitness(
-            fast_aimless_deaths,
-            fast_aimless_food,
-            fast_aimless_cells,
-            ticks,
-            grid,
-            fast_aimless_distance,
-            fast_aimless_energy,
-            false,
-        );
-        let effort_aimless = composite_fitness(
-            fast_aimless_deaths,
-            fast_aimless_food,
-            fast_aimless_cells,
-            ticks,
-            grid,
-            fast_aimless_distance,
-            fast_aimless_energy,
-            true,
-        );
-        eprintln!(
-            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
-            "Fast-Aimless",
-            legacy_aimless,
-            effort_aimless,
-            effort_aimless - legacy_aimless
-        );
-
-        // Camper
-        let legacy_camper = composite_fitness(
-            camper_deaths,
-            camper_food,
-            camper_cells,
-            ticks,
-            grid,
-            camper_distance,
-            camper_energy,
-            false,
-        );
-        let effort_camper = composite_fitness(
-            camper_deaths,
-            camper_food,
-            camper_cells,
-            ticks,
-            grid,
-            camper_distance,
-            camper_energy,
-            true,
-        );
-        eprintln!(
-            "{:<30} {:>12.4} {:>12.4} {:>+12.4}",
-            "Camper",
-            legacy_camper,
-            effort_camper,
-            effort_camper - legacy_camper
-        );
-
-        eprintln!("{}", "=".repeat(70));
-
-        // Verify calibration intent: competent forager should score high in
-        // effort-rebased mode, fast-aimless should drop significantly.
-        eprintln!("\n=== CALIBRATION INTENT VERIFICATION ===");
-        eprintln!(
-            "Competent forager composite: {:.4} (foraging = 1.0 capped, exploration = 0.586 coverage-limited, \
-             survival = 0.75 from 1 death)",
-            effort_competent
-        );
-        eprintln!(
-            "Fast-aimless drops by: {:.4} (target: significant negative)",
-            effort_aimless - legacy_aimless
-        );
-        eprintln!(
-            "Competent beats fast-aimless by: {:.4} (target: decisively)",
-            effort_competent - effort_aimless
-        );
-
-        // Assert that the effort-rebased formula penalizes aimless speed:
-        // a competent forager should score higher in effort mode than a
+        // Assert that the formula penalizes aimless speed:
+        // a competent forager should score higher than a
         // fast-aimless agent, even if the aimless agent has slightly more food.
         assert!(
-            effort_competent > effort_aimless,
-            "Effort-rebased should prefer competent foraging ({}) over aimless speed ({})",
-            effort_competent,
-            effort_aimless
+            competent > aimless,
+            "Composite fitness should prefer competent foraging ({}) over aimless speed ({})",
+            competent,
+            aimless
         );
 
         // Negative control: the idle camper barely forages, so its foraging axis
@@ -3388,8 +3247,8 @@ mod tests {
         // counts. Reintroducing the per-tick `ticks_alive` rebasing would let the
         // do-nothing camper win again and fail this assertion.
         assert!(
-            effort_competent > effort_camper,
-            "Competent forager ({effort_competent}) must outscore the idle camper ({effort_camper})"
+            competent > camper,
+            "Competent forager ({competent}) must outscore the idle camper ({camper})"
         );
 
         // Pin the magnitudes from the re-derived duration-independent cumulative-ratio
@@ -3404,57 +3263,29 @@ mod tests {
         const MAGNITUDE_TOLERANCE: f32 = 1e-3;
 
         assert!(
-            (effort_competent - 0.7034).abs() < MAGNITUDE_TOLERANCE,
+            (competent - 0.7034).abs() < MAGNITUDE_TOLERANCE,
             "Competent forager effort score should be ~0.7034, got {}",
-            effort_competent
+            competent
         );
 
         assert!(
-            (effort_aimless - 0.5648).abs() < MAGNITUDE_TOLERANCE,
+            (aimless - 0.5648).abs() < MAGNITUDE_TOLERANCE,
             "Fast-aimless effort score should be ~0.5648, got {}",
-            effort_aimless
+            aimless
         );
 
         assert!(
-            (effort_camper - 0.1504).abs() < MAGNITUDE_TOLERANCE,
+            (camper - 0.1504).abs() < MAGNITUDE_TOLERANCE,
             "Idle camper effort score should be ~0.1504, got {}",
-            effort_camper
+            camper
         );
 
         // Pin the delta: competent forager beats fast-aimless by ~0.1386.
-        let competent_aimless_delta = effort_competent - effort_aimless;
+        let competent_aimless_delta = competent - aimless;
         assert!(
             (competent_aimless_delta - 0.1386).abs() < MAGNITUDE_TOLERANCE,
             "Competent-aimless delta should be ~0.1386, got {}",
             competent_aimless_delta
-        );
-    }
-
-    /// Effort-rebased fitness must be duration-independent: two agents with
-    /// identical efficiency ratios (food/energy and cells/distance) but very
-    /// different lifetimes must score identically. This is the guard that the
-    /// `ticks_alive` leak — which let a long-lived camper saturate both axes — is
-    /// gone. The legacy-mode pair is a control: it *does* depend on lifetime, so
-    /// the test would catch a regression that reintroduced the per-tick rebasing.
-    #[test]
-    fn effort_fitness_is_duration_invariant() {
-        let grid = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
-        // Identical totals and ratios; only ticks_alive differs (short vs long life).
-        let short = composite_fitness(1, 90, 300, 50_000, grid, 300.0, 90.0, true);
-        let long = composite_fitness(1, 90, 300, 950_000, grid, 300.0, 90.0, true);
-        assert!(
-            (short - long).abs() < 1e-6,
-            "effort fitness must be duration-independent: short-lived={short}, long-lived={long}"
-        );
-
-        // Control: legacy mode (food per 1000 ticks) is intentionally
-        // duration-dependent, so the same two profiles must score differently —
-        // proving the equality above is a real property, not a degenerate constant.
-        let legacy_short = composite_fitness(1, 90, 300, 50_000, grid, 300.0, 90.0, false);
-        let legacy_long = composite_fitness(1, 90, 300, 950_000, grid, 300.0, 90.0, false);
-        assert!(
-            (legacy_short - legacy_long).abs() > 1e-3,
-            "legacy mode should depend on lifetime (control): {legacy_short} vs {legacy_long}"
         );
     }
 
@@ -5442,7 +5273,6 @@ mod tests {
         const COMPETENT_FOOD: u32 = 4_200;
         const COMPETENT_ENERGY: f32 = 15_000.0;
         const COMPETENT_DISTANCE: f32 = 520_000.0;
-        const COMPETENT_TICKS: u64 = 850_000;
         const COMPETENT_CELLS: u32 = 256;
         const COMPETENT_DEATHS: u32 = 2;
         const GRID: f32 = 1024.0; // (HEATMAP_RES * HEATMAP_RES / 4)
@@ -5452,11 +5282,9 @@ mod tests {
             COMPETENT_DEATHS,
             COMPETENT_FOOD,
             COMPETENT_CELLS,
-            COMPETENT_TICKS,
             GRID,
             COMPETENT_DISTANCE,
             COMPETENT_ENERGY,
-            true, // effort_rebased_fitness enabled
         );
 
         // Compute the foraging axis directly using the new cumulative ratio formula

@@ -11,5 +11,4 @@
 
 # Generated bootstrap JSON artifacts written by the --validate-* harnesses to the cwd.
 # The canonical, dated copies live in docs/plans/0021-Effort-Danger-Lever-Graduation/.
-/speed_decoupling_bootstrap.json
 /danger_percept_bootstrap.json

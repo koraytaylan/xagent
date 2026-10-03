@@ -1957,33 +1957,32 @@ impl GpuKernel {
                             label: Some("dispatch_kernel_fused"),
                         });
 
-                // Prepare indirect dispatch args once per chunk: `dispatch_args`
-                // depends only on `agent_count` and is written by no other pass,
-                // so it stays valid for every vision dispatch in the chunk.
+                // One compute pass for the whole chunk. wgpu-core still places
+                // a storage barrier between dependent dispatches inside a pass
+                // (each dispatch is its own usage scope), so every unit sees
+                // the previous one's writes exactly as across passes; only the
+                // per-pass begin/end cost goes. Vision is dispatched directly:
+                // it is one workgroup per agent, which is all the indirect
+                // arguments ever said.
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.prepare_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                    pass.dispatch_workgroups(1, 1, 1);
-                }
-
-                for _ in batch..chunk_end {
-                    // Fused kernel: 1 dispatch, vision_stride brain cycles.
-                    // SAFETY: dispatch(agent_count, 1, 1) — one workgroup per
-                    // agent. Multi-thread passes may conditionally call
-                    // cooperative helpers that contain internal workgroup/storage
-                    // barriers, so barrier uniformity relies on the `alive` guard
-                    // being workgroup-uniform. The kernel makes this uniform by
-                    // construction: thread 0 (the sole writer of `P_ALIVE`)
-                    // broadcasts the post-write value into a `var<workgroup>
-                    // s_alive` before each workgroupBarrier(), and all other
-                    // threads read `s_alive` rather than `physics_state[P_ALIVE]`.
-                    // See the top-of-file SAFETY INVARIANT in kernel_tick.wgsl
-                    // before changing the dispatch shape or the alive contract.
-                    {
-                        let mut pass = encoder.begin_compute_pass(&Default::default());
+                    for _ in batch..chunk_end {
+                        // Fused kernel: 1 dispatch, vision_stride brain cycles.
+                        // SAFETY: dispatch(agent_count, 1, 1) — one workgroup
+                        // per agent. Multi-thread passes may conditionally call
+                        // cooperative helpers that contain internal
+                        // workgroup/storage barriers, so barrier uniformity
+                        // relies on the `alive` guard being workgroup-uniform.
+                        // The kernel makes this uniform by construction: thread
+                        // 0 (the sole writer of `P_ALIVE`) broadcasts the
+                        // post-write value into a `var<workgroup> s_alive`
+                        // before each workgroupBarrier(), and all other threads
+                        // read `s_alive` rather than `physics_state[P_ALIVE]`.
+                        // See the top-of-file SAFETY INVARIANT in
+                        // kernel_tick.wgsl before changing the dispatch shape
+                        // or the alive contract.
                         pass.set_pipeline(&self.kernel_pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                         // Per-batch start_tick + measurement-only pass_limit via
                         // push constant (both exact u32; pass_limit defaults to 7
                         // = all passes ⇒ byte-identical).
@@ -1995,27 +1994,23 @@ impl GpuKernel {
                             ]),
                         );
                         pass.dispatch_workgroups(self.agent_count, 1, 1);
-                    }
 
-                    // Global pass: grid rebuild + collisions.
-                    if !skip_global {
-                        let tick_for_global = tick_cursor + full_ticks as u64;
-                        let gpc: [u32; 2] = [tick_for_global as u32, 0];
-                        let mut pass = encoder.begin_compute_pass(&Default::default());
-                        pass.set_pipeline(&self.global_pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                        pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                        pass.dispatch_workgroups(1, 1, 1);
-                    }
-                    // Vision pass: raycasting.
-                    if !skip_vision {
-                        let mut pass = encoder.begin_compute_pass(&Default::default());
-                        pass.set_pipeline(&self.vision_pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                        pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
-                    }
+                        // Global pass: grid rebuild + collisions.
+                        if !skip_global {
+                            let tick_for_global = tick_cursor + full_ticks as u64;
+                            let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                            pass.set_pipeline(&self.global_pipeline);
+                            pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        // Vision pass: raycasting, one workgroup per agent.
+                        if !skip_vision {
+                            pass.set_pipeline(&self.vision_pipeline);
+                            pass.dispatch_workgroups(self.agent_count, 1, 1);
+                        }
 
-                    tick_cursor += full_ticks as u64;
+                        tick_cursor += full_ticks as u64;
+                    }
                 }
 
                 self.queue.submit(std::iter::once(encoder.finish()));
@@ -2040,34 +2035,24 @@ impl GpuKernel {
                 });
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.prepare_pipeline);
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.kernel_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.set_push_constants(
                     0,
                     bytemuck::cast_slice(&[tick_cursor as u32, self.probe.kernel_pass_limit]),
                 );
                 pass.dispatch_workgroups(self.agent_count, 1, 1);
-            }
-            if !skip_global {
-                let tick_for_global = tick_cursor + rem_ticks as u64;
-                let gpc: [u32; 2] = [tick_for_global as u32, 0];
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.global_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-            if !skip_vision {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.vision_pipeline);
-                pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
+                if !skip_global {
+                    let tick_for_global = tick_cursor + rem_ticks as u64;
+                    let gpc: [u32; 2] = [tick_for_global as u32, 0];
+                    pass.set_pipeline(&self.global_pipeline);
+                    pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                if !skip_vision {
+                    pass.set_pipeline(&self.vision_pipeline);
+                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
             self.probe_submits += 1;

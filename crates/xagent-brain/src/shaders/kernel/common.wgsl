@@ -150,6 +150,14 @@ const VISUAL_FEATURE_COUNT: u32 =
 // they are evaluated at pipeline creation time, not shader-module creation.
 
 override VISION_RAYS: u32 = VISION_W * VISION_H;
+// Rays one vision workgroup casts (its workgroup size), chosen by the host
+// from the population (`vision_rays_per_workgroup` in gpu_kernel.rs). An
+// agent's rays are independent, so spreading them over more, smaller
+// workgroups lets them run side by side while the GPU has idle cores.
+// VISION_GROUPS_PER_AGENT workgroups cover one agent's rays.
+override VISION_RAYS_PER_WORKGROUP: u32 = 256u;
+override VISION_GROUPS_PER_AGENT: u32 =
+    (VISION_RAYS + VISION_RAYS_PER_WORKGROUP - 1u) / VISION_RAYS_PER_WORKGROUP;
 override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
 override VISION_DEPTH_COUNT: u32 = VISION_RAYS;
 const MAX_TOUCH_CONTACTS: u32 = 4u;

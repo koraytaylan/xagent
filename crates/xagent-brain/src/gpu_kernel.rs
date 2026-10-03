@@ -91,6 +91,52 @@ fn subgroup_bitonic_supported(has_feature: bool, min_subgroup_size: u32) -> bool
 /// `RETINA_PIXEL_COUNT` into the WGSL override cascade. The returned map is the
 /// single source of truth for the vision-grid and retina dimensions at pipeline
 /// creation time.
+/// Rays per vision workgroup at or below `SMALL_POPULATION` agents: one, so
+/// every ray of a small population runs in its own workgroup, in parallel.
+const SMALL_POPULATION_RAYS_PER_WORKGROUP: u32 = 1;
+/// Largest population that still gets one ray per workgroup.
+const SMALL_POPULATION: u32 = 16;
+/// Rays per vision workgroup up to `MEDIUM_POPULATION` agents, where one
+/// workgroup per ray would already fill the GPU.
+const MEDIUM_POPULATION_RAYS_PER_WORKGROUP: u32 = 4;
+/// Largest population that gets `MEDIUM_POPULATION_RAYS_PER_WORKGROUP`.
+const MEDIUM_POPULATION: u32 = 128;
+/// Rays per vision workgroup for larger populations.
+const LARGE_POPULATION_RAYS_PER_WORKGROUP: u32 = 16;
+/// The largest ray count one vision workgroup may take (the old fixed size).
+const MAX_RAYS_PER_WORKGROUP: u32 = 256;
+/// The most workgroups one dispatch dimension may hold.
+const MAX_DISPATCH_WORKGROUPS: u32 = 65_535;
+
+/// Rays one vision workgroup casts for `agent_count` agents with `rays` rays
+/// each. A cycle costs what its longest per-thread chain costs while the GPU
+/// has idle cores, so small populations get one ray per workgroup; larger ones
+/// pack more rays per workgroup once that would fill the GPU, and the count
+/// doubles as needed to keep the dispatch within its dimension limit.
+/// `XAGENT_VISION_RAYS_PER_WORKGROUP` overrides the choice (measurement
+/// only). Every choice gives the same results: each ray is cast by one
+/// thread, whatever workgroup it lands in.
+fn vision_rays_per_workgroup(agent_count: u32, rays: u32) -> u32 {
+    let chosen = std::env::var("XAGENT_VISION_RAYS_PER_WORKGROUP")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(if agent_count <= SMALL_POPULATION {
+            SMALL_POPULATION_RAYS_PER_WORKGROUP
+        } else if agent_count <= MEDIUM_POPULATION {
+            MEDIUM_POPULATION_RAYS_PER_WORKGROUP
+        } else {
+            LARGE_POPULATION_RAYS_PER_WORKGROUP
+        });
+    let mut per_workgroup = chosen.clamp(1, MAX_RAYS_PER_WORKGROUP);
+    while per_workgroup < MAX_RAYS_PER_WORKGROUP
+        && u64::from(agent_count) * u64::from(rays.div_ceil(per_workgroup))
+            > u64::from(MAX_DISPATCH_WORKGROUPS)
+    {
+        per_workgroup *= 2;
+    }
+    per_workgroup.min(MAX_RAYS_PER_WORKGROUP)
+}
+
 fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
     let mut map = HashMap::new();
     map.insert("VISION_W".to_string(), f64::from(layout.vision_width));
@@ -495,6 +541,9 @@ pub struct GpuKernel {
 
     // ── Per-batch throughput probe (default-off knobs + wall-time counters) ──
     probe: DispatchProbe,
+    /// Workgroups in one vision dispatch: `VISION_GROUPS_PER_AGENT` per agent
+    /// (see `vision_rays_per_workgroup`).
+    vision_workgroups: u32,
     /// Brain execution mode (FusedSerial, SplitSerial, or ParallelTiled).
     execution_mode: BrainExecutionMode,
     /// Accumulated wall nanoseconds from recording start to the last
@@ -1159,7 +1208,14 @@ impl GpuKernel {
         // Pipeline-overridable constants: VISION_W and VISION_H drive the
         // entire vision/feature/brain-offset cascade via override-expressions
         // in common.wgsl. All derived overrides evaluate at pipeline creation.
-        let vision_overrides = vision_override_constants(&layout);
+        let mut vision_overrides = vision_override_constants(&layout);
+        let vision_rays = layout.vision_width * layout.vision_height;
+        let rays_per_workgroup = vision_rays_per_workgroup(agent_count, vision_rays);
+        vision_overrides.insert(
+            "VISION_RAYS_PER_WORKGROUP".to_string(),
+            f64::from(rays_per_workgroup),
+        );
+        let vision_workgroups = agent_count * vision_rays.div_ceil(rays_per_workgroup);
         let override_options = wgpu::PipelineCompilationOptions {
             constants: &vision_overrides,
             zero_initialize_workgroup_memory: true,
@@ -1597,6 +1653,7 @@ impl GpuKernel {
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),
+            vision_workgroups,
             execution_mode: BrainExecutionMode::from_env(),
             probe_submit_nanos: 0,
             probe_complete_nanos: 0,
@@ -1998,9 +2055,9 @@ impl GpuKernel {
                 // a storage barrier between dependent dispatches inside a pass
                 // (each dispatch is its own usage scope), so every unit sees
                 // the previous one's writes exactly as across passes; only the
-                // per-pass begin/end cost goes. Vision is dispatched directly:
-                // it is one workgroup per agent, which is all the indirect
-                // arguments ever said.
+                // per-pass begin/end cost goes. Vision is dispatched directly
+                // with `vision_workgroups`, the count the indirect arguments
+                // would hold.
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
@@ -2040,10 +2097,11 @@ impl GpuKernel {
                             pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
                             pass.dispatch_workgroups(1, 1, 1);
                         }
-                        // Vision pass: raycasting, one workgroup per agent.
+                        // Vision pass: raycasting, VISION_GROUPS_PER_AGENT
+                        // workgroups per agent.
                         if !skip_vision {
                             pass.set_pipeline(&self.vision_pipeline);
-                            pass.dispatch_workgroups(self.agent_count, 1, 1);
+                            pass.dispatch_workgroups(self.vision_workgroups, 1, 1);
                         }
 
                         tick_cursor += full_ticks as u64;
@@ -2088,7 +2146,7 @@ impl GpuKernel {
                 }
                 if !skip_vision {
                     pass.set_pipeline(&self.vision_pipeline);
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    pass.dispatch_workgroups(self.vision_workgroups, 1, 1);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));

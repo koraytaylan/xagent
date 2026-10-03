@@ -1,29 +1,26 @@
-// ── Vision dispatch: multi-workgroup, one workgroup per agent ───────────────
-// dispatch(agent_count, 1, 1) — each workgroup's WORKGROUP_SIZE threads
-// cooperatively cast all VISION_RAYS rays (looping when VISION_RAYS >
-// WORKGROUP_SIZE), then thread 0 packs proprioception/interoception/touch
-// into sensory_buffer.
+// ── Vision dispatch: VISION_GROUPS_PER_AGENT workgroups per agent ───────────
+// dispatch(agent_count * VISION_GROUPS_PER_AGENT, 1, 1) — each workgroup of
+// VISION_RAYS_PER_WORKGROUP threads casts one ray per thread, and thread 0 of
+// an agent's first workgroup packs its proprioception / interoception / touch
+// / smell into sensory_buffer. The senses write only the non-visual slots and
+// read nothing the rays write, so they need no barrier after the rays.
 
-const WORKGROUP_SIZE: u32 = 256u;
-
-@compute @workgroup_size(256)
+@compute @workgroup_size(VISION_RAYS_PER_WORKGROUP)
 fn vision_tick(
     @builtin(local_invocation_id) lid: vec3u,
     @builtin(workgroup_id) wgid: vec3u,
 ) {
-    let agent_id = wgid.x;
-    let tid = lid.x;
+    let agent_id = wgid.x / VISION_GROUPS_PER_AGENT;
+    let group = wgid.x % VISION_GROUPS_PER_AGENT;
 
     if (physics_state[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
 
-    // Each thread casts rays in a strided loop (handles VISION_RAYS > WORKGROUP_SIZE)
-    for (var ray = tid; ray < VISION_RAYS; ray += WORKGROUP_SIZE) {
+    let ray = group * VISION_RAYS_PER_WORKGROUP + lid.x;
+    if (ray < VISION_RAYS) {
         vision_single_ray(agent_id, ray);
     }
-    storageBarrier(); workgroupBarrier();
 
-    // Thread 0 packs sensory data (proprioception, interoception, touch)
-    if (tid == 0u) {
+    if (group == 0u && lid.x == 0u) {
         phase_vision_senses(agent_id);
     }
 }

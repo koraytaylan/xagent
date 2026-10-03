@@ -35,7 +35,7 @@ use xagent_shared::{
 pub const HEATMAP_RES: usize = 64;
 
 /// Maximum trail control points per agent. The GPU samples one point per
-/// kernel batch of simulated ticks, so this covers extremely long lives.
+/// kernel batch of simulated ticks; a longer life keeps its newest points.
 pub const MAX_TRAIL_POINTS: usize = 4000;
 
 /// Spacing (squared) between the points the overlay interpolates between two
@@ -305,10 +305,13 @@ impl Agent {
             self.trail_death_count = death_count;
             self.trail.clear();
         }
-        if self.trail.len() < MAX_TRAIL_POINTS {
-            self.trail.push([record[0], record[1], record[2]]);
-            self.trail_dirty = true;
+        // A full trail forgets its oldest point, so it keeps following the agent
+        // instead of freezing and leaving a straight line to the live end.
+        if self.trail.len() >= MAX_TRAIL_POINTS {
+            self.trail.remove(0);
         }
+        self.trail.push([record[0], record[1], record[2]]);
+        self.trail_dirty = true;
     }
 
     /// The trail control points followed by the agent's current position, so
@@ -1460,6 +1463,21 @@ mod tests {
             vec![[1.0, 0.0, 1.0], [2.0, 0.0, 2.0], [3.0, 0.0, 3.0]]
         );
         assert!(agent.trail_dirty);
+    }
+
+    #[test]
+    fn a_full_trail_drops_its_oldest_point_and_keeps_following_the_agent() {
+        let mut agent = Agent::new(0, Vec3::ZERO, 0, BrainConfig::default(), 0);
+        let extra = 5;
+        for number in 1..=(MAX_TRAIL_POINTS + extra) as u64 {
+            agent.apply_trail_record(number, [number as f32, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(agent.trail.len(), MAX_TRAIL_POINTS);
+        assert_eq!(agent.trail.first(), Some(&[(extra + 1) as f32, 0.0, 0.0]));
+        assert_eq!(
+            agent.trail.last(),
+            Some(&[(MAX_TRAIL_POINTS + extra) as f32, 0.0, 0.0])
+        );
     }
 
     #[test]

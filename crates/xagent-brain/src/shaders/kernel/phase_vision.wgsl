@@ -48,6 +48,14 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
     var hit_color = vec4<f32>(0.53, 0.81, 0.92, 1.0);
     var hit_depth = VISION_MAX_DIST;
     var hit = false;
+    // The agent-grid block the ray last checked, and whether it held another
+    // live agent. Consecutive samples (1.2 apart) stay in one 8-unit cell for
+    // several steps; while the block holds no other live agent no sample can
+    // hit one, so the block is only rescanned when the sample enters a new
+    // centre cell, and the hit tests run only while it is occupied.
+    var agent_block_cx = AGENT_BLOCK_NONE;
+    var agent_block_cz = AGENT_BLOCK_NONE;
+    var agent_block_occupied = false;
 
     for (var step: u32 = 0u; step < VISION_NUM_STEPS; step++) {
         if hit { break; }
@@ -105,8 +113,14 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
         // ── Check agent grid ──────────────────────────────────────
         let ag_cx = cell_coord(ray_pos.x) + grid_offset;
         let ag_cz = cell_coord(ray_pos.z) + grid_offset;
+        if (ag_cx != agent_block_cx || ag_cz != agent_block_cz) {
+            agent_block_cx = ag_cx;
+            agent_block_cz = ag_cz;
+            agent_block_occupied = agent_block_has_other_live_agent(
+                agent_id, ag_cx, ag_cz, grid_width);
+        }
 
-        for (var di: i32 = -1; di <= 1; di++) {
+        for (var di: i32 = -1; di <= 1 && agent_block_occupied; di++) {
             if hit { break; }
             for (var dj: i32 = -1; dj <= 1; dj++) {
                 if hit { break; }
@@ -177,6 +191,31 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
     sensory_buffer[ci + 2u] = hit_color.z;
     sensory_buffer[ci + 3u] = hit_color.w;
     sensory_buffer[s_base + VISION_COLOR_COUNT + ray_idx] = hit_depth / VISION_MAX_DIST;
+}
+
+// Whether the 3x3 agent-grid block centred on cell (cx, cz) holds a live
+// agent other than `agent_id`: the only agents a ray sample in that centre
+// cell can hit.
+fn agent_block_has_other_live_agent(agent_id: u32, cx: i32, cz: i32, grid_width: u32) -> bool {
+    for (var di: i32 = -1; di <= 1; di++) {
+        for (var dj: i32 = -1; dj <= 1; dj++) {
+            let ncx = cx + di;
+            let ncz = cz + dj;
+            if ncx < 0 || ncz < 0 { continue; }
+            let uncx = u32(ncx);
+            let uncz = u32(ncz);
+            if uncx >= grid_width || uncz >= grid_width { continue; }
+            let cell_base = (uncx * grid_width + uncz) * AGENT_GRID_CELL_STRIDE;
+            let count = min(u32(agent_grid[cell_base]), AGENT_GRID_MAX_PER_CELL);
+            for (var s: u32 = 0u; s < count; s++) {
+                let other = u32(agent_grid[cell_base + 1u + s]);
+                if other != agent_id && physics_state[other * PHYS_STRIDE + P_ALIVE] >= 0.5 {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 // ── Per-agent non-visual senses ───────────────────────────────────────────

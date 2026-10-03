@@ -581,6 +581,9 @@ const FOOD_RAY_RADIUS_SQ: f32 = 1.0;
 // box edges from ever leaving such a cell out. Probing a superset of those
 // cells finds exactly the hits the full 3x3 block finds.
 const FOOD_PROBE_HALF_WIDTH: f32 = 1.01;
+// "No block checked yet" for a ray's cached agent-grid block: a cell index no
+// sample can have.
+const AGENT_BLOCK_NONE: i32 = -2147483647;
 const AGENT_RAY_RADIUS_SQ: f32 = 2.25;
 
 // ── Touch constants ─────────────────────────────────────────────────────────

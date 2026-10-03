@@ -139,3 +139,35 @@ Independent of speed. Without it a bit-comparison gate longer than about 20,000 
 
 - **CPU at small populations.** One agent's cycle is about 150,000 multiply-adds plus 48 short rays. Ten agents on the M3 Max's CPU cores would plausibly finish a cycle in 100–150 µs, which is 5–8× the GPU at this population. It contradicts "per-tick simulation logic belongs in WGSL", needs a second implementation kept in step with the shaders, and its floats would not match the GPU's bit for bit. Not measured.
 - **Several independent worlds per dispatch.** The GPU runs 80 agents at the speed of 10, so eight 10-agent worlds would evaluate about eight times as many agent-ticks per second with unchanged per-world dynamics. It does not make one world faster, and the baseline spec records that search breadth is not what limits evolution.
+
+## Implementation of R1 (2026-10-03)
+
+All eight exact changes of F4 are on `develop`, one commit each:
+
+| # | Commit subject |
+|---|---|
+| 4 | perf(kernel): record each fused chunk in one compute pass, vision direct |
+| 2 | perf(vision): probe only the food cells a ray sample can reach |
+| 8 | perf(vision): read the food flags and grids without atomic loads |
+| 1 | perf(vision): spread an agent's rays over workgroups sized to the population |
+| 7 | perf(vision): rescan a ray's agent block only when it enters a new cell |
+| 3 | perf(global): empty grid cells by zeroing only their counts |
+| 5 | perf(kernel): find the food bearing in the parallel food scan |
+| 6 | perf(brain): read recalled similarities from the sorted recall scores |
+
+Notes on how each was made exact:
+
+- **Change 2:** the food probe box is widened by 1% beyond the 1.0 hit radius, so float rounding at its edges can never leave a reachable cell out. Probing a superset of the reachable cells gives the same hits.
+- **Change 1:** rays per workgroup are 1 up to 16 agents, 4 up to 128 and 16 beyond. The count doubles as needed to stay within the dispatch dimension limit, and `XAGENT_VISION_RAYS_PER_WORKGROUP` overrides it.
+- **Change 5:** each thread tracks the bearing candidate by the rescan's own 3-D distance expression, and the (distance, index) pairs merge nearer-first, then lower-index. The merge goes through the brain's argmin scratch, which is idle at that point of the cycle.
+
+Each change was checked against the build before it on a second machine: AMD Raphael integrated GPU (2 compute units), Vulkan, release build. The check is the seeded state hash of this report's method (world and brain seed 42, FNV over `physics_state` and every agent's `brain_state`). It ran at 10 agents over 20,000 ticks and, to exercise agent sightings, at 40 agents over 5,000 ticks. At 40 agents the base commit does not repeat over 20,000 ticks (F6), but it does over 5,000. Every change matched both hashes, change 1 at 1, 4, 16 and 256 rays per workgroup. The batch-size, fused/split and parallel-tiled determinism tests pass.
+
+The profile on that machine differs from the M3 Max's. Skipping the vision pass doubled throughput, but removing its internal work did not move it: no scent −3%, no agent probe 0%, half-length rays +7%. Its cost there was mostly per-pass overhead. Change 4 alone raised throughput from about 4,100 to 5,300 ticks/sec. With an interactive xagent session sharing the GPU throughout, four interleaved runs of each read:
+
+| | ticks/sec, 10 agents |
+|---|---|
+| Base | 4,194 (4,074–4,279) |
+| All eight changes | **5,752** (5,583–6,059) |
+
+That is +37% there. R2 and R3 remain open.

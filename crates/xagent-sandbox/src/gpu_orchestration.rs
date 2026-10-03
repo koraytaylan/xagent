@@ -290,12 +290,9 @@ impl App {
             for (agent, record) in self
                 .agents
                 .iter_mut()
-                .zip(sample.records.chunks_exact(TRAIL_RECORD_STRIDE))
+                .zip(sample.records.as_chunks::<TRAIL_RECORD_STRIDE>().0)
             {
-                agent.apply_trail_record(
-                    sample.sample_number,
-                    [record[0], record[1], record[2], record[3]],
-                );
+                agent.apply_trail_record(sample.sample_number, *record);
             }
         }
 

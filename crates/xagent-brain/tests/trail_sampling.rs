@@ -13,13 +13,17 @@ const BIOME_SIDE: usize = 256;
 const AGENT_COUNT: u32 = 3;
 const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn kernel() -> GpuKernel {
-    // Several brain cycles per batch, so a dispatch can end inside a batch.
-    let brain = BrainConfig {
+/// Several brain cycles per batch, so a dispatch can end inside a batch.
+fn brain_config() -> BrainConfig {
+    BrainConfig {
         brain_tick_stride: 5,
         vision_stride: 4,
         ..BrainConfig::default()
-    };
+    }
+}
+
+fn kernel() -> GpuKernel {
+    let brain = brain_config();
     let world = WorldConfig::default();
     let kernel = GpuKernel::new(AGENT_COUNT, 1, &brain, &world);
     let heights = vec![0.0_f32; TERRAIN_SIDE * TERRAIN_SIDE];
@@ -132,4 +136,29 @@ fn the_ring_keeps_only_the_newest_samples() {
             .all(|pair| pair[1].sample_number == pair[0].sample_number + 1),
         "retained samples must be consecutive"
     );
+}
+
+#[test]
+fn resetting_agents_forgets_the_previous_generations_samples() {
+    if !GpuKernel::is_available() {
+        eprintln!("Skipping: no GPU/fallback adapter available");
+        return;
+    }
+    let brain = brain_config();
+    let mut kernel = kernel();
+    let batch = kernel.kernel_batch_size();
+
+    kernel.dispatch_ticks(0, 6 * batch);
+    assert_eq!(sample_numbers(&collect_snapshot(&mut kernel)).len(), 6);
+
+    // The worker reseeds a generation in place with the non-blocking reset.
+    assert!(kernel.try_reset_agents(&brain));
+    assert!(
+        kernel.collected_trail_samples().is_empty(),
+        "the CPU cache must not keep the old generation's samples"
+    );
+
+    // The new generation restarts its tick count; only its own sample exists.
+    kernel.dispatch_ticks(0, batch);
+    assert_eq!(sample_numbers(&collect_snapshot(&mut kernel)), vec![1]);
 }

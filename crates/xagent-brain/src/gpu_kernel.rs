@@ -806,14 +806,7 @@ impl GpuKernel {
         }
         self.staging_index = 0;
         self.food_cache_valid = false;
-        // A new generation restarts the tick count, so samples numbered by the
-        // previous generation's ticks must not survive in the ring.
-        self.trail_cache.fill(0.0);
-        self.queue.write_buffer(
-            &self.trail_ring_buffer,
-            0,
-            bytemuck::cast_slice(&self.trail_cache),
-        );
+        self.clear_trail_ring();
 
         // Clear async telemetry state so stale readbacks from the
         // previous generation don't leak into the new one.
@@ -2819,6 +2812,20 @@ impl GpuKernel {
         &self.state_cache
     }
 
+    /// Forget every recorded trail sample, on the GPU and in the CPU cache.
+    ///
+    /// A new generation restarts the tick count, so samples numbered by the
+    /// previous generation's ticks must not survive in the ring: they would be
+    /// read as the new generation's earliest samples and hold back its real ones.
+    fn clear_trail_ring(&mut self) {
+        self.trail_cache.fill(0.0);
+        self.queue.write_buffer(
+            &self.trail_ring_buffer,
+            0,
+            bytemuck::cast_slice(&self.trail_cache),
+        );
+    }
+
     /// Bytes in the trail ring (and in each trail staging buffer).
     fn trail_ring_bytes(&self) -> u64 {
         (self.trail_cache.len() * std::mem::size_of::<f32>()) as u64
@@ -3250,6 +3257,7 @@ impl GpuKernel {
             self.staging_trackers[i].reset();
         }
         self.staging_index = 0;
+        self.clear_trail_ring();
 
         let n = self.agent_count as usize;
 

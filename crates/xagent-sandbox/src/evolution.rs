@@ -48,11 +48,12 @@ impl App {
                 let brain_config = self.evo_snapshot.edit_brain.clone();
                 let gov_config = self.evo_snapshot.edit_governor.clone();
                 let world_json = serde_json::to_string(&self.world_config).unwrap_or_default();
-                match Governor::new(
+                match Governor::new_seeded(
                     &self.db_path,
                     gov_config.clone(),
                     &brain_config,
                     &world_json,
+                    self.world_config.seed,
                 ) {
                     Ok(gov) => {
                         self.governor = Some(gov);

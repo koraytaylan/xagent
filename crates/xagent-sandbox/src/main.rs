@@ -46,7 +46,9 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
-    /// Random seed for world generation
+    /// Random seed for world generation. A new headless evolution run also
+    /// draws every random choice from it, so the same seed and config
+    /// reproduce the run.
     #[arg(long)]
     seed: Option<u64>,
 

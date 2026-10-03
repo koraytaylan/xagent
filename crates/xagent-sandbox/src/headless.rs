@@ -70,8 +70,14 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         println!("Resuming from {}", db_path);
         Governor::resume(db_path).expect("Failed to resume from database")
     } else {
-        Governor::new(db_path, config.governor.clone(), &config.brain, &world_json)
-            .expect("Failed to initialize governor database")
+        Governor::new_seeded(
+            db_path,
+            config.governor.clone(),
+            &config.brain,
+            &world_json,
+            config.world.seed,
+        )
+        .expect("Failed to initialize governor database")
     };
 
     let seed_config = governor.current_config().unwrap_or(config.brain.clone());
@@ -151,7 +157,11 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             .collect();
         kernel.upload_agents(&agent_data);
 
-        // `reset_agents()` does two things:
+        // Every random choice below comes from the run's stream, so a seeded
+        // run reproduces.
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(governor.draw_generation_seed());
+
+        // `reset_agents_seeded()` does two things:
         // 1. Writes the shader config uniform — population-wide brain
         //    tuning values (learning_rate, decay_rate, distress_exponent,
         //    metabolic_rate, integrity_scale) plus layout constants
@@ -164,9 +174,8 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         // come from `upload_agents()` above. Any inherited or mutated
         // AgentBrainState written via `write_agent_state()` below
         // overrides the reset-seeded brain_state values.
-        kernel.reset_agents(&current_configs[0]);
+        kernel.reset_agents_seeded(&current_configs[0], rng.random());
 
-        let mut rng = rand::rng();
         let template = match &inherited_state {
             Some(state) => state.clone(),
             None => fresh_brain_state(&current_configs[0], &mut rng),

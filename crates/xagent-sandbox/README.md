@@ -689,7 +689,8 @@ OPTIONS:
     --brain-preset <PRESET>   Brain preset: tiny, default, large [default: default]
     --world-preset <PRESET>   World preset: easy, normal, hard   [default: normal]
     --config <PATH>           Load full config from a JSON file
-    --seed <SEED>             Override random seed for world generation
+    --seed <SEED>             Override random seed for world generation (a new
+                              headless evolution run reproduces from it)
     --tick-rate <RATE>        Override simulation ticks per second
     --no-render               Run headless (no window, just simulation + logging)
     --dump-config             Print the resolved config as JSON and exit

@@ -10,6 +10,8 @@
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
 
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use xagent_brain::buffers::AgentBrainState;
@@ -26,6 +28,22 @@ struct RecordingPayload {
 }
 
 use crate::agent::{mutate_sensory_genes, Agent, HEATMAP_RES};
+
+/// Seed of a run created without one (`Governor::new`). It is the value the
+/// run table recorded for every run before runs carried their own seed.
+pub const DEFAULT_RUN_SEED: u64 = 42;
+
+/// Bits the current node id is rotated by before it is mixed into the run
+/// seed when a run resumes, so that a resumed run with a seed below 2^32
+/// cannot draw the stream of another seed's run.
+const RESUME_NODE_ROTATION: u32 = 32;
+
+/// Seed of the random stream a resumed run continues with: its run seed mixed
+/// with the node it resumes at. Resuming the same database state draws the
+/// same stream, though not the draws the uninterrupted run would have made.
+fn resumed_stream_seed(run_seed: u64, node_id: u64) -> u64 {
+    run_seed ^ node_id.rotate_left(RESUME_NODE_ROTATION)
+}
 
 /// One generation's hazard-avoidance measures, as the evolution panel charts
 /// them: steps onto hazard ground per agent, the share of distance travelled
@@ -411,6 +429,11 @@ pub struct Governor {
     writer_thread: Option<JoinHandle<()>>,
     /// Within-life foraging quarter samples for the current generation.
     within_life: WithinLifeTracker,
+    /// The run's random stream, seeded from the run seed: gene mutations of
+    /// each new generation, and the seeds of its evaluations
+    /// (`draw_generation_seed`). Nothing else draws from it, so a run is
+    /// reproducible from its seed.
+    rng: SmallRng,
 }
 
 /// Spawn a background thread that owns a dedicated SQLite connection and
@@ -548,12 +571,32 @@ impl Governor {
     }
 
     /// Create a new governor, initializing the database schema and inserting
-    /// a new run record. `db_path` is the SQLite file path.
+    /// a new run record with `DEFAULT_RUN_SEED`. `db_path` is the SQLite file
+    /// path.
     pub fn new(
         db_path: &str,
         config: GovernorConfig,
         seed_brain: &BrainConfig,
         world_config_json: &str,
+    ) -> SqlResult<Self> {
+        Self::new_seeded(
+            db_path,
+            config,
+            seed_brain,
+            world_config_json,
+            DEFAULT_RUN_SEED,
+        )
+    }
+
+    /// Create a new governor whose run draws every random choice from `seed`
+    /// (recorded in the run table), initializing the database schema and
+    /// inserting a new run record. `db_path` is the SQLite file path.
+    pub fn new_seeded(
+        db_path: &str,
+        config: GovernorConfig,
+        seed_brain: &BrainConfig,
+        world_config_json: &str,
+        seed: u64,
     ) -> SqlResult<Self> {
         let db = Connection::open(db_path)?;
         db.execute_batch(
@@ -567,7 +610,12 @@ impl Governor {
         db.execute(
             "INSERT INTO run (seed, governor_config, brain_config, world_config)
              VALUES (?1, ?2, ?3, ?4)",
-            params![42i64, governor_json, brain_json, world_config_json],
+            params![
+                seed.cast_signed(),
+                governor_json,
+                brain_json,
+                world_config_json
+            ],
         )?;
         let run_id = db.last_insert_rowid();
 
@@ -625,6 +673,7 @@ impl Governor {
             recording_sender,
             writer_thread,
             within_life: WithinLifeTracker::default(),
+            rng: SmallRng::seed_from_u64(seed),
         })
     }
 
@@ -643,17 +692,26 @@ impl Governor {
         let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
         db.execute_batch(NODE_BRAIN_SCHEMA)?;
 
-        let (run_id, governor_json, spawn_parent_id, momentum_json): (
+        let (run_id, run_seed, governor_json, spawn_parent_id, momentum_json): (
+            i64,
             i64,
             String,
             Option<i64>,
             String,
         ) = db.query_row(
-            "SELECT id, governor_config, spawn_parent_id,
+            "SELECT id, seed, governor_config, spawn_parent_id,
                         COALESCE(momentum_json, '[]')
                  FROM run ORDER BY id DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
 
         let config: GovernorConfig = serde_json::from_str(&governor_json).unwrap_or_default();
@@ -722,9 +780,21 @@ impl Governor {
             recording_sender,
             writer_thread,
             within_life: WithinLifeTracker::default(),
+            rng: SmallRng::seed_from_u64(resumed_stream_seed(
+                run_seed.cast_unsigned(),
+                node_id.cast_unsigned(),
+            )),
         };
         gov.refresh_best_score();
         Ok(gov)
+    }
+
+    /// Draw the seed for the random choices of the next generation's
+    /// evaluation (agent reset, birth brain, steering perturbations) from
+    /// the run's stream, so a run is reproducible from its seed. Call it
+    /// once per generation, before the generation's agents are set up.
+    pub fn draw_generation_seed(&mut self) -> u64 {
+        self.rng.random()
     }
 
     /// Get the seed BrainConfig for the current node.
@@ -1404,7 +1474,6 @@ impl Governor {
         // one world and compete for finite food.
         let parent_fitness = self.spawn_parent_fitness();
         let group_size = self.config.eval_repeats.max(1);
-        let mut rng = rand::rng();
         let mut configs = Vec::with_capacity(self.config.population_size);
         let mut group_config = parent_config.clone();
         for slot in 0..self.config.population_size {
@@ -1413,7 +1482,7 @@ impl Governor {
                     &parent_config,
                     strength,
                     &self.momentums[self.active_island],
-                    &mut rng,
+                    &mut self.rng,
                 );
                 record_mutations(
                     &self.db,
@@ -5329,6 +5398,91 @@ mod tests {
             fitness_effort.is_finite() && fitness_effort > 0.0,
             "Composite fitness must be finite and positive, got {:.4}",
             fitness_effort
+        );
+    }
+
+    // ─── run seed ───────────────────────────────────────────────────
+
+    /// Seed of the reproducibility tests; any value but `DEFAULT_RUN_SEED`.
+    const TEST_RUN_SEED: u64 = 5;
+    /// Generations bred in each reproducibility comparison.
+    const SEEDED_GENERATIONS: usize = 3;
+
+    /// A governor of five repeat groups whose run draws from `seed`, so
+    /// every later group carries mutated genes.
+    fn seeded_governor(db_path: &str, seed: u64) -> Governor {
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 2,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        Governor::new_seeded(db_path, config, &BrainConfig::default(), "{}", seed)
+            .expect("Governor::new_seeded")
+    }
+
+    /// The evaluation seed and bred configs of each of the next
+    /// `SEEDED_GENERATIONS` generations.
+    fn seeded_generations(gov: &mut Governor) -> (Vec<u64>, Vec<Vec<BrainConfig>>) {
+        (0..SEEDED_GENERATIONS)
+            .map(|_| {
+                let seed = gov.draw_generation_seed();
+                match gov.advance(&mock_fitness(0.5)) {
+                    AdvanceResult::Continue { configs, .. } => (seed, configs),
+                    AdvanceResult::Finished { .. } => panic!("evolution must continue"),
+                }
+            })
+            .unzip()
+    }
+
+    #[test]
+    fn a_run_seed_reproduces_its_generations() {
+        let (seeds, configs) = seeded_generations(&mut seeded_governor(":memory:", TEST_RUN_SEED));
+        let (same_seeds, same_configs) =
+            seeded_generations(&mut seeded_governor(":memory:", TEST_RUN_SEED));
+        let (other_seeds, other_configs) =
+            seeded_generations(&mut seeded_governor(":memory:", TEST_RUN_SEED + 1));
+        assert_eq!(seeds, same_seeds);
+        assert_eq!(configs, same_configs);
+        assert_ne!(seeds, other_seeds);
+        assert_ne!(
+            configs, other_configs,
+            "gene mutations must follow the seed"
+        );
+    }
+
+    #[test]
+    fn the_run_seed_is_recorded_and_resumed() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let resumed_draw = |name: &str, seed: u64| {
+            let db_path_buf = temp_dir.path().join(name);
+            let db_path = db_path_buf
+                .to_str()
+                .expect("temp DB path must be valid UTF-8");
+            let recorded: i64 = seeded_governor(db_path, seed)
+                .db
+                .query_row("SELECT seed FROM run", [], |row| row.get(0))
+                .expect("run row");
+            assert_eq!(recorded.cast_unsigned(), seed);
+            let first = Governor::resume(db_path)
+                .expect("Governor::resume")
+                .draw_generation_seed();
+            let again = Governor::resume(db_path)
+                .expect("Governor::resume")
+                .draw_generation_seed();
+            assert_eq!(first, again, "resuming the same state must draw the same");
+            first
+        };
+        assert_ne!(
+            resumed_draw("seed_a.db", TEST_RUN_SEED),
+            resumed_draw("seed_b.db", TEST_RUN_SEED + 1),
+            "a resumed run must draw from its own seed"
         );
     }
 

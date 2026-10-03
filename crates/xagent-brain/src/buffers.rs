@@ -396,6 +396,11 @@ pub const P_HAZARD_ENTRIES: usize = 49;
 /// state, never serialized.
 pub const P_BRAIN_POS_X: usize = 50;
 pub const P_BRAIN_POS_Z: usize = 51;
+/// The food item the agent claimed this cycle, plus one (0 = no claim). Set
+/// in the claim step, read and cleared when the claims are settled, so the
+/// lowest-index claimant of an item eats it. Per-agent live state, never
+/// serialized.
+pub const P_FOOD_CLAIM: usize = 52;
 
 /// Value written to `O_PREV_HOMEO_PREDICTION` at birth and on death.
 ///
@@ -406,7 +411,7 @@ pub const P_BRAIN_POS_Z: usize = 51;
 /// actually predict, so clearing the slot to zero would be a false sample.
 /// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
 pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
-pub const PHYS_STRIDE: usize = 52;
+pub const PHYS_STRIDE: usize = 53;
 /// Number of sample slots in the GPU trail ring. Each slot holds one position
 /// record per agent plus a header record, written by the global pass at every
 /// trail-sample boundary; the CPU reads the ring with each state snapshot.
@@ -1802,6 +1807,7 @@ mod tests {
         assert_eq!(wgsl["P_HAZARD_ENTRIES"], P_HAZARD_ENTRIES as u32);
         assert_eq!(wgsl["P_BRAIN_POS_X"], P_BRAIN_POS_X as u32);
         assert_eq!(wgsl["P_BRAIN_POS_Z"], P_BRAIN_POS_Z as u32);
+        assert_eq!(wgsl["P_FOOD_CLAIM"], P_FOOD_CLAIM as u32);
     }
 
     #[test]
@@ -2061,6 +2067,7 @@ mod tests {
             P_HAZARD_ENTRIES,
             P_BRAIN_POS_X,
             P_BRAIN_POS_Z,
+            P_FOOD_CLAIM,
         ]
         .iter()
         .max()

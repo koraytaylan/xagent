@@ -1,6 +1,8 @@
 // ── Fused kernel: per-agent physics + food + death + brain ─────────────
 // dispatch(agent_count, 1, 1) — one workgroup per agent, 256 threads each.
-// Loops over vision_stride brain cycles internally.
+// One brain cycle per pair of dispatches: kernel_claim_tick (physics, food
+// scan, food claims), then kernel_tick (claims settled, danger, death, brain).
+// The host loops over vision_stride cycles.
 // Requires: common.wgsl, brain_tick.wgsl functions (concatenated by Rust).
 //
 // SAFETY INVARIANT — barrier uniformity:
@@ -572,13 +574,9 @@ fn agent_food_detect(agent_id: u32, tid: u32) {
             physics_state[b + P_NEAREST_FOOD_BEARING] = 0.0;
         }
         if (best_idx != 0xFFFFFFFFu) {
-            // Atomic: claim food (prevents double-eating across workgroups)
-            let result = atomicCompareExchangeWeak(&food_flags[best_idx], 0u, 1u);
-            if (result.exchanged) {
-                let food_energy = wc_f32(WC_FOOD_ENERGY);
-                physics_state[b + P_ENERGY] += food_energy;
-                physics_state[b + P_FOOD_COUNT] += 1.0;
-            }
+            // Claim the food in reach; kernel_tick settles the claims once
+            // every agent has made its own (resolve_food_claim).
+            claim_food(agent_id, best_idx);
         }
     }
 }
@@ -773,12 +771,14 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // ══════════════════════════════════════════════════════════════════════════
 // Entry point
 //
-// Ordering guarantee within each inner cycle:
-//   physics → food_detect → death_respawn → brain
+// Ordering guarantee within each cycle:
+//   physics → food_detect (claim) | claims settled → danger → death_respawn → brain
+// where `|` is the boundary between the claim dispatch and the main one.
+// Splitting there lets every agent claim food before any agent eats, so the
+// lowest-index claimant eats and runs repeat exactly (resolve_food_claim).
 //
-// This guarantees same-dispatch ordering/visibility for data written in the
-// earlier kernel phases, but it does NOT mean all brain inputs are from the
-// same cycle.
+// This guarantees ordering/visibility for data written in the earlier
+// phases, but it does NOT mean all brain inputs are from the same cycle.
 //
 // Brain inputs have two visibility regimes:
 //
@@ -812,6 +812,42 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 // `KernelPushConstants` / `kpc` (start_tick, pass_limit) are declared in
 // brain_inner.wgsl, shared with the brain-and-vision entry.
 
+// ── Claim step: physics and the food scan for one cycle ─────────────────
+// The food flags are not written during this dispatch, so every agent's scan
+// sees the same food; each agent in reach of a food item claims it
+// (claim_food), and kernel_tick settles the claims.
+@compute @workgroup_size(256)
+fn kernel_claim_tick(
+    @builtin(local_invocation_id) lid: vec3u,
+    @builtin(workgroup_id) wgid: vec3u,
+) {
+    let agent_id = wgid.x;
+    let tid = lid.x;
+    let stride = wc_u32(WC_BRAIN_TICK_STRIDE);
+    let base_tick = kpc.start_tick;
+
+    // Per-agent physics: thread 0 loops over brain_tick_stride sub-ticks.
+    // Thread 0 is the sole writer of `P_ALIVE`, so it broadcasts the
+    // post-physics value into `s_alive` for the workgroup to read after the
+    // barrier. `storageBarrier()` is required because thread 0's writes to
+    // `physics_state` (position, velocity, energy, integrity, P_ALIVE) are read
+    // by other threads in `agent_food_detect` — `workgroupBarrier()` alone
+    // would not publish storage writes.
+    if (tid == 0u) {
+        for (var t = 0u; t < stride; t++) {
+            agent_physics(agent_id, base_tick + t);
+        }
+        s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
+    }
+    storageBarrier(); workgroupBarrier();
+
+    // Brute-force food detection: all 256 threads cooperate; thread 0 claims.
+    agent_food_detect(agent_id, tid);
+}
+
+// ── Main step: the rest of the cycle ─────────────────────────────────────
+// Dispatched after kernel_claim_tick for the same cycle (one cycle per
+// dispatch; the host loops over vision_stride cycles).
 @compute @workgroup_size(256)
 fn kernel_tick(
     @builtin(local_invocation_id) lid: vec3u,
@@ -820,84 +856,64 @@ fn kernel_tick(
 ) {
     let agent_id = wgid.x;
     let tid = lid.x;
-    let vision_stride = wc_u32(WC_VISION_STRIDE);
-    let stride = wc_u32(WC_BRAIN_TICK_STRIDE);
-    let start_tick = kpc.start_tick;
+    let base_tick = kpc.start_tick;
 
-    for (var cycle = 0u; cycle < vision_stride; cycle++) {
-        let base_tick = start_tick + cycle * stride;
-
-        // Per-agent physics: thread 0 loops over brain_tick_stride sub-ticks.
-        // Physics always precedes brain within the same cycle (barrier below).
-        // Thread 0 is the sole writer of `P_ALIVE`, so it broadcasts the
-        // post-physics value into `s_alive` for the workgroup to read after
-        // the barrier. `storageBarrier()` is required because thread 0's
-        // writes to `physics_state` (position, velocity, energy, integrity,
-        // P_ALIVE) are read by other threads in `agent_food_detect` and by the
-        // cooperative brain passes that read `physics_state` directly —
-        // `workgroupBarrier()` alone would not publish storage writes.
-        if (tid == 0u) {
-            for (var t = 0u; t < stride; t++) {
-                agent_physics(agent_id, base_tick + t);
-            }
-            s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
-        }
-        storageBarrier(); workgroupBarrier();
-
-        // Brute-force food detection: all 256 threads cooperate
-        agent_food_detect(agent_id, tid);
-        workgroupBarrier();
-
-        // Danger measurement: all 256 threads scan the biome grid for the
-        // nearest danger. Always on, because the avoidance-intent counters
-        // need it; the brain sees it only with the danger percept enabled.
-        agent_danger_detect(agent_id, tid);
-        workgroupBarrier();
-
-        // Avoidance and approach accumulation: thread 0 increments the counters based on
-        // motor turn and the danger/food bearings just computed. This runs after
-        // danger_detect and food_detect so the counters read same-cycle sensory values.
-        if (tid == 0u) {
-            let decision_base = agent_id * DECISION_STRIDE;
-            let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
-            agent_avoidance_accumulate(agent_id, motor_turn);
-            agent_approach_accumulate(agent_id, motor_turn);
-        }
-        workgroupBarrier();
-
-        // Death/respawn: thread 0. Re-broadcasts `s_alive` because respawn may
-        // flip `P_ALIVE` back to 1. `storageBarrier()` is required because
-        // respawn rewrites `physics_state`, `brain_state`, and
-        // `pattern_buffer`, all of which are read by the cooperative
-        // passes in `brain_tick_inner` below.
-        if (tid == 0u) {
-            agent_death_respawn(agent_id, base_tick);
-            s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
-            // The position the brain's staleness ring reads this cycle: the
-            // one before the global pass's collisions, which the brain may run
-            // after (see brain_vision_tick.wgsl).
-            let phys = agent_id * PHYS_STRIDE;
-            physics_state[phys + P_BRAIN_POS_X] = physics_state[phys + P_POS_X];
-            physics_state[phys + P_BRAIN_POS_Z] = physics_state[phys + P_POS_Z];
-        }
-        storageBarrier(); workgroupBarrier();
-
-        // Brain: all 256 threads, 7 cooperative passes.
-        // Reads sensory_buffer (vision + proprioception) from the previous batch's
-        // vision pass.  Physics state updated in this cycle is NOT yet in
-        // sensory_buffer — that update happens in the vision pass at the end of
-        // this batch, making it available for the following batch.
-        //
-        // SENSORY-LAG RISK (issue #115): this read is stale by exactly one batch =
-        // vision_stride * brain_tick_stride physics ticks. The lag is intentional
-        // and constant, but credit assignment pairs a motor command with the
-        // gradient it produced — the larger the lag, the more the visual evidence
-        // at decision time desynchronizes from the action's outcome, the failure
-        // mode behind the circling investigation. The product is bounded on the
-        // Rust side by `BrainConfig::MAX_SENSORY_LAG_TICKS` (asserted in
-        // `GpuKernel::new`); do NOT grow the strides or make them dynamic past that
-        // bound without revalidating credit assignment.
-        brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
-        workgroupBarrier();
+    // Settle the food claims of the claim step: the lowest-index claimant of
+    // each item eats it. Thread 0 broadcasts `P_ALIVE` for the passes below.
+    if (tid == 0u) {
+        resolve_food_claim(agent_id);
+        s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
     }
+    storageBarrier(); workgroupBarrier();
+
+    // Danger measurement: all 256 threads scan the biome grid for the
+    // nearest danger. Always on, because the avoidance-intent counters
+    // need it; the brain sees it only with the danger percept enabled.
+    agent_danger_detect(agent_id, tid);
+    workgroupBarrier();
+
+    // Avoidance and approach accumulation: thread 0 increments the counters based on
+    // motor turn and the danger/food bearings just computed. This runs after
+    // danger_detect and food_detect so the counters read same-cycle sensory values.
+    if (tid == 0u) {
+        let decision_base = agent_id * DECISION_STRIDE;
+        let motor_turn = decision_buffer[decision_base + DECISION_MOTOR + 1u];
+        agent_avoidance_accumulate(agent_id, motor_turn);
+        agent_approach_accumulate(agent_id, motor_turn);
+    }
+    workgroupBarrier();
+
+    // Death/respawn: thread 0. Re-broadcasts `s_alive` because respawn may
+    // flip `P_ALIVE` back to 1. `storageBarrier()` is required because
+    // respawn rewrites `physics_state`, `brain_state`, and
+    // `pattern_buffer`, all of which are read by the cooperative
+    // passes in `brain_tick_inner` below.
+    if (tid == 0u) {
+        agent_death_respawn(agent_id, base_tick);
+        s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
+        // The position the brain's staleness ring reads this cycle: the
+        // one before the global pass's collisions, which the brain may run
+        // after (see brain_vision_tick.wgsl).
+        let phys = agent_id * PHYS_STRIDE;
+        physics_state[phys + P_BRAIN_POS_X] = physics_state[phys + P_POS_X];
+        physics_state[phys + P_BRAIN_POS_Z] = physics_state[phys + P_POS_Z];
+    }
+    storageBarrier(); workgroupBarrier();
+
+    // Brain: all 256 threads, 7 cooperative passes.
+    // Reads sensory_buffer (vision + proprioception) from the previous batch's
+    // vision pass.  Physics state updated in this cycle is NOT yet in
+    // sensory_buffer — that update happens in the vision pass at the end of
+    // this batch, making it available for the following batch.
+    //
+    // SENSORY-LAG RISK (issue #115): this read is stale by exactly one batch =
+    // vision_stride * brain_tick_stride physics ticks. The lag is intentional
+    // and constant, but credit assignment pairs a motor command with the
+    // gradient it produced — the larger the lag, the more the visual evidence
+    // at decision time desynchronizes from the action's outcome, the failure
+    // mode behind the circling investigation. The product is bounded on the
+    // Rust side by `BrainConfig::MAX_SENSORY_LAG_TICKS` (asserted in
+    // `GpuKernel::new`); do NOT grow the strides or make them dynamic past that
+    // bound without revalidating credit assignment.
+    brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
 }

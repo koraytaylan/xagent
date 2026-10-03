@@ -11,13 +11,16 @@
 //! | Pipeline | Fragments after `common.wgsl`                                         |
 //! |----------|-----------------------------------------------------------------------|
 //! | physics  | phase_clear, phase_food_grid, phase_physics, phase_death,             |
-//! |          | phase_food_detect, phase_food_respawn, phase_agent_grid,              |
-//! |          | phase_collision, physics_tick                                         |
-//! | vision   | phase_vision, vision_tick                                             |
+//! |          | phase_food_claim, phase_food_detect, phase_food_respawn,              |
+//! |          | phase_agent_grid,                                                     |
+//! |          | phase_grid_order, phase_collision, physics_tick                       |
+//! | vision   | phase_vision, vision_tick (grids read as plain u32)                   |
 //! | brain    | brain_passes, brain_tick                                              |
-//! | kernel   | brain_passes, kernel_tick                                             |
+//! | kernel   | brain_passes, brain_inner, phase_food_claim, kernel_tick (entries     |
+//! |          | `kernel_claim_tick` and `kernel_tick`)                                |
+//! | brain+vision | brain_passes, brain_inner, phase_vision, brain_vision_tick        |
 //! | global   | phase_clear, phase_food_grid, phase_food_respawn, phase_agent_grid,   |
-//! |          | phase_collision, global_tick                                          |
+//! |          | phase_grid_order, phase_collision, global_tick                        |
 //! | prepare  | phase_prepare_dispatch                                                |
 //!
 //! ## Pipeline-overridable constants
@@ -41,7 +44,7 @@
 //! | `// KERNEL_SUBGROUP_ENTRY_PARAMS`         | kernel_tick.wgsl entry params               |
 //! | `/* SUBGROUP_TOPK_PARAMS */`              | brain_passes.wgsl `coop_recall_topk`        |
 //! | `/* SUBGROUP_TOPK_ARGS */`                | call sites of `coop_recall_topk`            |
-//! | `/* KERNEL_SUBGROUP_TOPK_PARAMS */`       | kernel_tick.wgsl `brain_tick_inner`         |
+//! | `/* KERNEL_SUBGROUP_TOPK_PARAMS */`       | brain_inner.wgsl `brain_tick_inner`         |
 //! | `/* KERNEL_SUBGROUP_TOPK_ARGS */`         | `brain_tick_inner` -> `coop_recall_topk`    |
 //! | `/* KERNEL_SUBGROUP_TOPK_INNER_ARGS */`   | `kernel_tick` -> `brain_tick_inner`         |
 //! | `// BEGIN_BITONIC_SORT`                   | fallback bitonic sort start (brain_passes)  |
@@ -91,6 +94,9 @@ fn subgroup_bitonic_supported(has_feature: bool, min_subgroup_size: u32) -> bool
 /// `RETINA_PIXEL_COUNT` into the WGSL override cascade. The returned map is the
 /// single source of truth for the vision-grid and retina dimensions at pipeline
 /// creation time.
+/// A food item nobody has claimed this cycle (`FOOD_UNCLAIMED` in common.wgsl).
+const FOOD_UNCLAIMED: u32 = u32::MAX;
+
 /// Threads in a brain workgroup (`BRAIN_WORKGROUP_SIZE` in the shaders), also
 /// the width of the vision workgroups in the brain-beside-vision dispatch.
 const BRAIN_WORKGROUP_THREADS: u32 = 256;
@@ -513,6 +519,9 @@ pub struct GpuKernel {
     encoder_credit_tiled_pipeline: wgpu::ComputePipeline,
     tail_pipeline: wgpu::ComputePipeline,
     kernel_pipeline: wgpu::ComputePipeline,
+    /// The kernel's claim step, dispatched before `kernel_pipeline` each
+    /// cycle (see `record_kernel_cycle`).
+    kernel_claim_pipeline: wgpu::ComputePipeline,
     global_pipeline: wgpu::ComputePipeline,
     vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
@@ -1058,12 +1067,23 @@ impl GpuKernel {
             usage: storage_rw,
             mapped_at_creation: false,
         });
+        // One consumed flag per food item, then one claim slot per item
+        // (`food_claim_slot` in phase_food_claim.wgsl): the lowest index of
+        // the agents claiming it this cycle, reset by the grid clear. Every
+        // item is unclaimed until the first claim step.
         let food_flags_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_food_flags"),
-            size: ((f * 4) as u64).max(4),
+            size: ((2 * f * 4) as u64).max(4),
             usage: storage_rw,
             mapped_at_creation: false,
         });
+        if f > 0 {
+            queue.write_buffer(
+                &food_flags_buffer,
+                (f * 4) as u64,
+                bytemuck::cast_slice(&vec![FOOD_UNCLAIMED; f]),
+            );
+        }
         let food_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_food_grid"),
             size: ((grid_cells * FOOD_GRID_CELL_STRIDE * 4) as u64).max(4),
@@ -1215,6 +1235,7 @@ impl GpuKernel {
             include_str!("shaders/kernel/phase_food_grid.wgsl"),
             include_str!("shaders/kernel/phase_physics.wgsl"),
             include_str!("shaders/kernel/phase_death.wgsl"),
+            include_str!("shaders/kernel/phase_food_claim.wgsl"),
             include_str!("shaders/kernel/phase_food_detect.wgsl"),
             include_str!("shaders/kernel/phase_food_respawn.wgsl"),
             include_str!("shaders/kernel/phase_agent_grid.wgsl"),
@@ -1252,6 +1273,7 @@ impl GpuKernel {
                 common_src,
                 include_str!("shaders/kernel/brain_passes.wgsl"),
                 include_str!("shaders/kernel/brain_inner.wgsl"),
+                include_str!("shaders/kernel/phase_food_claim.wgsl"),
                 include_str!("shaders/kernel/kernel_tick.wgsl"),
             ]
             .join("\n"),
@@ -1593,6 +1615,17 @@ impl GpuKernel {
             cache: None,
         });
 
+        // ── Claim step of the kernel (physics, food scan, food claims) ──
+        let kernel_claim_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("kernel_claim_tick"),
+                layout: Some(&kernel_layout),
+                module: &kernel_module,
+                entry_point: Some("kernel_claim_tick"),
+                compilation_options: override_options.clone(),
+                cache: None,
+            });
+
         // ── Brain-beside-vision and sensory-publish pipelines ──
         let brain_vision_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brain_vision_tick"),
@@ -1751,6 +1784,7 @@ impl GpuKernel {
             encoder_credit_tiled_pipeline,
             tail_pipeline,
             kernel_pipeline,
+            kernel_claim_pipeline,
             global_pipeline,
             vision_stride: brain_config.vision_stride,
             bind_groups,
@@ -1834,6 +1868,15 @@ impl GpuKernel {
             .collect();
         self.queue
             .write_buffer(&self.food_flags_buffer, 0, bytemuck::cast_slice(&flags));
+        // A fresh world has no food claimed (the claim slots follow the
+        // consumed flags).
+        if self.food_count > 0 {
+            self.queue.write_buffer(
+                &self.food_flags_buffer,
+                (self.food_count * 4) as u64,
+                bytemuck::cast_slice(&vec![FOOD_UNCLAIMED; self.food_count]),
+            );
+        }
     }
 
     /// Upload initial agent physics state.
@@ -2174,6 +2217,26 @@ impl GpuKernel {
     }
 
     /// Fused serial execution: the original dispatch_ticks body.
+    /// Record one brain cycle's kernel dispatches at `cycle_tick` into `pass`
+    /// (whose bind group is set): the claim step (physics, food scan, food
+    /// claims), then the main kernel (claims settled, danger, death/respawn,
+    /// and the first `pass_limit` brain passes). Splitting there lets every
+    /// agent claim food before any agent eats (`resolve_food_claim`).
+    fn record_kernel_cycle(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        cycle_tick: u64,
+        pass_limit: u32,
+    ) {
+        let push = [cycle_tick as u32, pass_limit];
+        pass.set_pipeline(&self.kernel_claim_pipeline);
+        pass.set_push_constants(0, bytemuck::cast_slice(&push));
+        pass.dispatch_workgroups(self.agent_count, 1, 1);
+        pass.set_pipeline(&self.kernel_pipeline);
+        pass.set_push_constants(0, bytemuck::cast_slice(&push));
+        pass.dispatch_workgroups(self.agent_count, 1, 1);
+    }
+
     fn dispatch_ticks_fused_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let _vulkan = vulkan_gate::enter();
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
@@ -2235,7 +2298,7 @@ impl GpuKernel {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                     for _ in batch..chunk_end {
-                        // Fused kernel: 1 dispatch, vision_stride brain cycles.
+                        // Kernel: a claim and a main dispatch per brain cycle.
                         // SAFETY: dispatch(agent_count, 1, 1) — one workgroup
                         // per agent. Multi-thread passes may conditionally call
                         // cooperative helpers that contain internal
@@ -2249,8 +2312,7 @@ impl GpuKernel {
                         // See the top-of-file SAFETY INVARIANT in
                         // kernel_tick.wgsl before changing the dispatch shape
                         // or the alive contract.
-                        pass.set_pipeline(&self.kernel_pipeline);
-                        // Per-batch start_tick + measurement-only pass_limit via
+                        // Per-cycle start_tick + measurement-only pass_limit via
                         // push constant (both exact u32; pass_limit defaults to 7
                         // = all passes ⇒ byte-identical). With the brain beside
                         // vision, the kernel runs only its prefix (physics,
@@ -2261,11 +2323,11 @@ impl GpuKernel {
                         } else {
                             self.probe.kernel_pass_limit
                         };
-                        pass.set_push_constants(
-                            0,
-                            bytemuck::cast_slice(&[tick_cursor as u32, kernel_pass_limit]),
-                        );
-                        pass.dispatch_workgroups(self.agent_count, 1, 1);
+                        for cycle in 0..self.vision_stride {
+                            let cycle_tick =
+                                tick_cursor + u64::from(cycle) * u64::from(self.brain_tick_stride);
+                            self.record_kernel_cycle(&mut pass, cycle_tick, kernel_pass_limit);
+                        }
 
                         // Global pass: grid rebuild + collisions.
                         if !skip_global {
@@ -2323,12 +2385,11 @@ impl GpuKernel {
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                pass.set_pipeline(&self.kernel_pipeline);
-                pass.set_push_constants(
-                    0,
-                    bytemuck::cast_slice(&[tick_cursor as u32, self.probe.kernel_pass_limit]),
-                );
-                pass.dispatch_workgroups(self.agent_count, 1, 1);
+                for cycle in 0..remainder_cycles {
+                    let cycle_tick =
+                        tick_cursor + u64::from(cycle) * u64::from(self.brain_tick_stride);
+                    self.record_kernel_cycle(&mut pass, cycle_tick, self.probe.kernel_pass_limit);
+                }
                 if !skip_global {
                     let tick_for_global = tick_cursor + rem_ticks as u64;
                     let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
@@ -2434,20 +2495,16 @@ impl GpuKernel {
                             batch_start + u64::from(c) * u64::from(self.brain_tick_stride);
                         {
                             let mut pass = encoder.begin_compute_pass(&Default::default());
-                            pass.set_pipeline(&self.kernel_pipeline);
                             pass.set_bind_group(
                                 0,
                                 &self.bind_groups[self.active_config_index],
                                 &[],
                             );
-                            pass.set_push_constants(
-                                0,
-                                bytemuck::cast_slice(&[
-                                    cycle_tick as u32,
-                                    self.probe.kernel_pass_limit,
-                                ]),
+                            self.record_kernel_cycle(
+                                &mut pass,
+                                cycle_tick,
+                                self.probe.kernel_pass_limit,
                             );
-                            pass.dispatch_workgroups(self.agent_count, 1, 1);
                         }
                     }
 
@@ -2502,13 +2559,8 @@ impl GpuKernel {
                 let cycle_tick = tick_cursor + u64::from(c) * u64::from(self.brain_tick_stride);
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&self.kernel_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
-                    pass.set_push_constants(
-                        0,
-                        bytemuck::cast_slice(&[cycle_tick as u32, self.probe.kernel_pass_limit]),
-                    );
-                    pass.dispatch_workgroups(self.agent_count, 1, 1);
+                    self.record_kernel_cycle(&mut pass, cycle_tick, self.probe.kernel_pass_limit);
                 }
             }
 
@@ -2583,10 +2635,8 @@ impl GpuKernel {
         // 1. Prefix: physics + food + death/respawn, no brain (pass_limit = 0).
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.kernel_pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.set_push_constants(0, bytemuck::cast_slice(&[cycle_tick as u32, 0u32]));
-            pass.dispatch_workgroups(self.agent_count, 1, 1);
+            self.record_kernel_cycle(&mut pass, cycle_tick, 0);
         }
         // 2. Features → SCRATCH_FEATURES (one workgroup per agent).
         {

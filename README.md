@@ -66,15 +66,16 @@ Sandbox                                                GpuKernel (GPU)
   │       `brain_cycles % vision_stride != 0`, plus an       │
   │       optional physics-only remainder for the trailing   │
   │       `ticks_to_run % brain_tick_stride` ticks. Each     │
-  │       kernel-batch is its own queue.submit() (uniform    │
-  │       write + four passes per batch):                    │
-  │         a. prepare  — indirect-dispatch args             │
-  │         b. kernel   — fused physics → food detect →      │
-  │                       death/respawn → brain, looped      │
-  │                       `cycles_this_batch` times          │
-  │         c. global   — grid rebuild + food respawn        │
-  │                       + agent collisions                 │
-  │         d. vision   — raycasting writes `sensory_buf`    │
+  │       chunk of kernel-batches is one compute pass and    │
+  │       one queue.submit(); per batch:                     │
+  │         a. per brain cycle, two kernel dispatches:       │
+  │            claim  — physics → food scan → food claims    │
+  │            kernel — claims settled (lowest agent index   │
+  │                     eats) → danger → death/respawn →     │
+  │                     brain                                │
+  │         b. global   — grid rebuild (cells in index       │
+  │                       order) + food respawn + collisions │
+  │         c. vision   — raycasting writes `sensory_buf`    │
   │     – the brain reads `sensory_buf` from the *previous*  │
   │       batch's vision pass (one-batch sensory lag)        │
   │ ────────────────────────────────────────────────────────►│

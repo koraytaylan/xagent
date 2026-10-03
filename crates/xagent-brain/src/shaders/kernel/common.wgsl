@@ -421,7 +421,7 @@ const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 52u;
+const PHYS_STRIDE: u32 = 53u;
 // Trail ring: TRAIL_RING_SLOTS slots, each (agent_count + 1) records of
 // TRAIL_RECORD_STRIDE floats. Records 0..agent_count are (x, y, z, death count);
 // the final record is the slot header whose first float is the sample number
@@ -501,6 +501,19 @@ const P_HAZARD_ENTRIES: u32 = 49u;
 /// death/respawn, before the global pass's collisions. Mirrors buffers.rs.
 const P_BRAIN_POS_X: u32 = 50u;
 const P_BRAIN_POS_Z: u32 = 51u;
+/// The food item the agent claimed this cycle, plus one (0 = no claim), kept
+/// from the claim dispatch to the resolve. Mirrors buffers.rs.
+const P_FOOD_CLAIM: u32 = 52u;
+/// A food item nobody has claimed this cycle (see `food_claim_slot`).
+const FOOD_UNCLAIMED: u32 = 0xFFFFFFFFu;
+
+/// Where the claims on food item `item` meet: the second half of food_flags,
+/// after the WC_FOOD_COUNT consumed flags, so the claims need no binding of
+/// their own. Holds the lowest index of the agents claiming the item this
+/// cycle, FOOD_UNCLAIMED when none has (see `resolve_food_claim`).
+fn food_claim_slot(item: u32) -> u32 {
+    return wc_u32(WC_FOOD_COUNT) + item;
+}
 
 // ── Food buffer layout ─────────────────────────────────────────────────────
 

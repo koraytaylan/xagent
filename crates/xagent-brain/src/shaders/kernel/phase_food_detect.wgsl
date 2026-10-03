@@ -65,14 +65,9 @@ fn phase_food_detect(tid: u32) {
         }
     }
 
-    // Try to claim the nearest food
+    // Claim the nearest food; physics_tick settles the claims after a
+    // barrier (resolve_food_claim), so the lowest-index claimant eats.
     if best_idx != 0xFFFFFFFFu {
-        let result = atomicCompareExchangeWeak(&food_flags[best_idx], 0u, 1u);
-        if result.exchanged {
-            // Winner: award energy and increment food count
-            let food_energy = wc_f32(WC_FOOD_ENERGY);
-            physics_state[b + P_ENERGY] = physics_state[b + P_ENERGY] + food_energy;
-            physics_state[b + P_FOOD_COUNT] = physics_state[b + P_FOOD_COUNT] + 1.0;
-        }
+        claim_food(agent, best_idx);
     }
 }

@@ -1667,3 +1667,47 @@ A three-generation headless check (seed 5) recorded, for generations 0 and 1:
 | Mean turn away from hazard ahead | +0.004 | +0.011 |
 
 These are in line with the replayed lineage at the same stage.
+
+## A reproducible eighty-generation baseline
+
+Seeded headless runs now reproduce exactly: the kernel settles contested food by agent index and keeps grid cells in index order, and the governor draws every random choice of a run from its seed. Two runs of seed 5 match in every node, agent result and stored brain. Seed 6 rerun alone for ten generations matches the baseline below in every config, fitness and agent result; only node statuses differ, where the baseline later abandoned a champion. A later learner change can therefore be compared with this baseline run for run, on the same seeds, instead of through averages over noisy lineages.
+
+The baseline is `develop` at `3d505b3`, headless, seeds 5–8, `--generations 80` (generations 0–78). The config is the `--dump-config` default with `governor.tick_budget` set to 40,000: 10 agents in 5 repeat groups, `vision_stride` 1. To reproduce a seed:
+
+```bash
+xagent --dump-config > base.json   # then set governor.tick_budget to 40000
+xagent --config base.json --seed 5 --no-render --db base_s5.db --generations 80
+```
+
+`XAGENT_BRAIN_BESIDE_VISION=0` gives the same results and ran faster on the iGPU (four runs side by side, about 23 s per generation, 30 minutes per run). The table pools the four seeds per block of ten generations.
+
+| Generations | Fitness | Meals per agent | Deaths per agent | Share of distance on hazard ground | Steps onto hazard ground per agent | Turn away from hazard ahead |
+|---|---|---|---|---|---|---|
+| 0–9 | 0.137 | 41.6 | 3.31 | 16.0% | 45.8 | +0.006 |
+| 10–19 | 0.169 | 48.5 | 2.01 | 11.9% | 39.4 | +0.008 |
+| 20–29 | 0.155 | 45.1 | 2.25 | 12.8% | 41.6 | +0.008 |
+| 30–39 | 0.188 | 48.8 | 1.54 | 9.7% | 33.8 | +0.008 |
+| 40–49 | 0.183 | 48.2 | 1.55 | 9.5% | 33.8 | +0.009 |
+| 50–59 | 0.187 | 52.0 | 1.80 | 10.8% | 36.2 | +0.008 |
+| 60–69 | 0.201 | 52.8 | 1.60 | 10.6% | 34.7 | +0.009 |
+| 70–78 | 0.196 | 52.0 | 1.49 | 9.9% | 34.3 | +0.009 |
+
+Per seed (5, 6, 7, 8):
+
+| | Generations 0–9 | Generations 60–78 |
+|---|---|---|
+| Deaths per agent | 3.31, 3.07, 3.91, 2.95 | 0.74, 2.90, 1.92, 0.65 |
+| Fitness | 0.125, 0.162, 0.096, 0.166 | 0.245, 0.157, 0.158, 0.234 |
+| Meals per agent | 36.7, 50.8, 29.5, 49.3 | 58.8, 53.1, 43.5, 54.4 |
+| Best score at the end | | 0.281, 0.244, 0.226, 0.292 |
+
+Each seed accepted 15–19 generations, but most were later abandoned: after five failed children in a row, a champion is marked exhausted and the search backtracks to its parent. The final champion's line (seeds 5, 6, 7, 8):
+
+- Seed 5: generations 0–3, 24, 43, 62, 76 (11 more accepted and abandoned)
+- Seed 6: generations 0, 2, 3, 35 (11 more abandoned)
+- Seed 7: generations 0–3, 16, 43, 75, 77 (11 more abandoned)
+- Seed 8: generations 0–3, 28, 29, 73, 74 (11 more abandoned)
+
+- **After generation 3, a lasting champion arrives only every 15–40 generations.** Most generations fail against their parent (60–64 of 79 per seed), and most accepted ones lead nowhere: their children all fail, so the step was probably a lucky evaluation.
+- **Seeds 5 and 8 evolve avoidance as the champion-only lineage did before:** deaths fall by about 75% and the share of the path on hazard ground halves. Seed 7 gets there more slowly. Seed 6's line gained one lasting champion after generation 3 (at 35), and its deaths barely fall.
+- **The pooled numbers trail the earlier champion-only lineage** (0.57 deaths per agent and 0.246 fitness by generations 70–79). That run used other random streams and an earlier kernel, and its seed 6 did well where this one stalls. Single lineages differ this much, so changes should be judged against this baseline seed by seed, not against earlier pooled numbers.

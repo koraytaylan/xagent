@@ -596,6 +596,14 @@ pub(super) struct DotMetrics {
     pub absolute_product_sum: f64,
 }
 
+/// Reference and error budget without claiming an observed GPU dot value.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DotReference {
+    pub reference_f64: f64,
+    pub forward_bound: f64,
+    pub absolute_product_sum: f64,
+}
+
 /// Assert the conservative gamma_(2n) dot bound, including f64-reference error
 /// and a worst-case binary32 flush-to-zero allowance per operation. Products
 /// of two f32 inputs are exact in f64; only the reference summation rounds.
@@ -620,6 +628,25 @@ pub(super) fn check_fp32_dot(
 ) -> DotMetrics {
     assert_eq!(left.len(), right.len());
     assert!(observed.is_finite(), "{label}: nonfinite observed dot");
+    let DotReference {
+        reference_f64,
+        forward_bound,
+        absolute_product_sum,
+    } = fp32_dot_reference(left, right, label);
+    let absolute_error = (f64::from(observed) - reference_f64).abs();
+    assert!(absolute_error <= forward_bound, "{label}: dot error {absolute_error:.9e} exceeds derived bound {forward_bound:.9e}; f64={reference_f64:.9e}, observed={observed:.9e}");
+    DotMetrics {
+        reference_f64,
+        absolute_error,
+        forward_bound,
+        absolute_product_sum,
+    }
+}
+
+/// Compute the existing nearest-rounding/FTZ forward budget and f64 reference.
+/// This does not assert that any GPU result or proposed recurrence meets it.
+pub(super) fn fp32_dot_reference(left: &[f32], right: &[f32], label: &str) -> DotReference {
+    assert_eq!(left.len(), right.len());
     let terms = u32::try_from(left.len()).unwrap();
     let operations = f64::from(terms.checked_mul(DOT_OPERATIONS_PER_TERM).unwrap());
     let scaled_roundoff = operations * FP32_UNIT_ROUNDOFF;
@@ -656,11 +683,8 @@ pub(super) fn check_fp32_dot(
     let forward_bound = (gamma + reference_gamma) * upper_product_sum
         + underflow_allowance
         + input_flush_allowance / (1.0 - double_roundoff);
-    let absolute_error = (f64::from(observed) - reference_f64).abs();
-    assert!(absolute_error <= forward_bound, "{label}: dot error {absolute_error:.9e} exceeds derived bound {forward_bound:.9e}; f64={reference_f64:.9e}, observed={observed:.9e}");
-    DotMetrics {
+    DotReference {
         reference_f64,
-        absolute_error,
         forward_bound,
         absolute_product_sum,
     }

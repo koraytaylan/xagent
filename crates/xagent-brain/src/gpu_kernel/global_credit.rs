@@ -109,7 +109,7 @@ pub(super) fn global_source(packed: Option<&packed_encoder::Cache>) -> String {
     global_source_with_store_suppression(packed, false)
 }
 
-fn global_source_with_store_suppression(
+pub(super) fn global_source_with_store_suppression(
     packed: Option<&packed_encoder::Cache>,
     skip_unchanged_stores: bool,
 ) -> String {
@@ -146,7 +146,7 @@ fn global_source_with_store_suppression(
     .join("\n")
 }
 
-fn private_bind_group(
+pub(super) fn private_bind_group(
     kernel: &GpuKernel,
     layout: &wgpu::BindGroupLayout,
     features: &wgpu::Buffer,

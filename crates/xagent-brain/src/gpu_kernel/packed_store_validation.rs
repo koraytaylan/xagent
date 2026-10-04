@@ -49,7 +49,7 @@ fn bytes(words: usize) -> u64 {
     u64::try_from(words.checked_mul(WORD_BYTES).unwrap()).unwrap()
 }
 
-fn optimized_brain() -> String {
+pub(super) fn optimized_brain() -> String {
     let fused = predictor_fusion::fuse_inline_predictor(&compose_brain_passes(true));
     let prefetched = dense_prefetch::prefetch_passes(&fused, PREFETCH_FACTOR);
     let widened = predictor_width::wider_predictor(&prefetched, PREDICTOR_LANES);
@@ -65,14 +65,29 @@ fn constants(kernel: &GpuKernel) -> HashMap<String, f64> {
 /// Explicit production baseline, shared with snapshot-only opportunity probes.
 /// The fixture fixes its vision and brain pipelines independently of process flags.
 pub(super) fn prepare_kernel(width: u32, height: u32, boundary: bool) -> GpuKernel {
+    prepare_kernel_with_store_suppression(width, height, boundary, false)
+}
+
+/// Select the canonical store option explicitly for independent experiments.
+pub(super) fn prepare_kernel_with_store_suppression(
+    width: u32,
+    height: u32,
+    boundary: bool,
+    suppress: bool,
+) -> GpuKernel {
     let mut kernel = super::cached_combined_validation::prepare(width, height, boundary);
-    kernel.global_credit = Pipelines::new_packed(&kernel, &optimized_brain(), &constants(&kernel));
+    kernel.global_credit = Pipelines::new_packed_with_store_suppression(
+        &kernel,
+        &optimized_brain(),
+        &constants(&kernel),
+        suppress,
+    );
     assert!(kernel.global_credit_active());
     assert!(!cache(&kernel).is_valid());
     kernel
 }
 
-fn cache(kernel: &GpuKernel) -> &packed_encoder::Cache {
+pub(super) fn cache(kernel: &GpuKernel) -> &packed_encoder::Cache {
     kernel
         .global_credit
         .as_ref()
@@ -168,7 +183,7 @@ pub(super) fn advance(kernel: &mut GpuKernel, cycle: u32, cycles: u32) {
 
 /// Public state is compared without exporting private weights. Independently
 /// assert the cache/mirror invariant that permits skipping both destinations.
-fn assert_mirror(kernel: &GpuKernel, state: &State) -> TestResult {
+pub(super) fn assert_mirror(kernel: &GpuKernel, state: &State) -> TestResult {
     let packed = cache(kernel).buffer();
     let actual = read_buffer(kernel, packed, packed.size())?;
     let agents = usize::try_from(kernel.agent_count).unwrap();

@@ -155,6 +155,35 @@ pub(super) struct Cache {
 impl Cache {
     pub(super) fn new(kernel: &GpuKernel) -> Option<Self> {
         let shape = Shape::new(&kernel.layout, kernel.agent_count, &kernel.device.limits())?;
+        Self::from_shape(kernel, shape)
+    }
+
+    /// Append private diagnostic scratch while retaining the production import
+    /// and invalidation lifecycle; all scalar public scratch keeps its offsets.
+    #[cfg(test)]
+    pub(super) fn new_with_extra_scratch(kernel: &GpuKernel, extra_words: usize) -> Option<Self> {
+        let limits = kernel.device.limits();
+        let mut shape = Shape::new(&kernel.layout, kernel.agent_count, &limits)?;
+        let words = usize::try_from(shape.scratch_words)
+            .ok()?
+            .checked_add(extra_words)?
+            .checked_add(VECTOR_WIDTH - 1)?
+            .checked_div(VECTOR_WIDTH)?
+            .checked_mul(VECTOR_WIDTH)?;
+        shape.scratch_words = u32::try_from(words).ok()?;
+        shape.prefix_bytes = bytes(words)?;
+        shape.total_bytes = shape
+            .prefix_bytes
+            .checked_add(shape.matrix_bytes.checked_mul(u64::from(shape.agents))?)?;
+        if shape.total_bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || shape.total_bytes > limits.max_buffer_size
+        {
+            return None;
+        }
+        Self::from_shape(kernel, shape)
+    }
+
+    fn from_shape(kernel: &GpuKernel, shape: Shape) -> Option<Self> {
         if shape.brain_bytes != kernel.brain_state_buffer.size()
             || shape.scalar_scratch_bytes != kernel.brain_scratch_buffer.size()
         {

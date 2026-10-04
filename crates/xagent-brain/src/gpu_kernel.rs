@@ -111,6 +111,8 @@ mod context_gather_validation;
 #[cfg(test)]
 mod context_prefetch_validation;
 #[cfg(test)]
+mod cooperative_jacobi_validation;
+#[cfg(test)]
 mod cooperative_whitening_validation;
 #[cfg(test)]
 mod credit_prefetch_validation;
@@ -133,11 +135,19 @@ mod encoder_noop_cache_validation;
 mod encoder_width_validation;
 #[cfg(test)]
 mod exact_tiled_validation;
+#[cfg(test)]
+mod food_grid_cache_validation;
+#[cfg(test)]
+mod fresh_projection_dot_validation;
+#[cfg(test)]
+mod fresh_projection_validation;
 mod global_credit;
 #[cfg(test)]
 mod global_credit_production_validation;
 #[cfg(test)]
 mod global_credit_validation;
+#[cfg(test)]
+mod global_world_profile;
 mod packed_encoder;
 #[cfg(test)]
 mod packed_encoder_dot_validation;
@@ -170,6 +180,8 @@ mod predictor_width_behavior_validation;
 #[cfg(test)]
 mod predictor_width_validation;
 #[cfg(test)]
+mod raw_event_recurrence_validation;
+#[cfg(test)]
 mod recall_cosine_validation;
 #[cfg(test)]
 mod recall_norm_validation;
@@ -185,6 +197,8 @@ mod subgroup_sum_validation;
 mod vision_claim_validation;
 #[cfg(test)]
 mod vision_validation;
+#[cfg(test)]
+mod visual_event_diagnostics;
 #[cfg(test)]
 mod whitening_storage_validation;
 #[cfg(test)]

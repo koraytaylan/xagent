@@ -1420,7 +1420,89 @@ to every cycle. `brain-sections-packed-context.log` records five rotated
 measurements per prefix at both checkpoints. The earlier 24-cycle whole-stage
 profile averages over multiple cycles and remains a separate measurement.
 
-### Further structural opportunity and its limits
+### Global-world attribution beside packed credit
+
+`global-world-profile-final.log` isolates the original world workgroup within
+the production combined global shader. Seven alternating trials per arm each
+restore the same warmed checkpoint, import the private encoder cache, and run
+one claim/main/global/vision cycle. GPU timestamps surround only global.
+The full arm dispatches world plus packed-credit groups; the measurement-only
+arm dispatches workgroup zero of the same compiled shader.
+
+| Warmup cycles | Full global | World group only | Difference |
+|---|---:|---:|---:|
+| 256 | 108.200 µs | 33.680 µs | 74.520 µs |
+| 1,000 | 91.560 µs | 33.480 µs | 58.080 µs |
+
+The full recorder matches all thirteen production buffers. For the world-only
+arm, the expected state replaces only the deliberately omitted encoder
+matrices with their initial values; every other word remains subject to exact
+comparison, and the private/scalar mirror also matches. No omitted-credit
+state is fed into a subsequent cycle. The differences are **non-additive
+attribution**, not isolated credit costs or achievable speedups: removing
+credit changes how the remaining work is scheduled. They show that the
+ordinary world work alone still takes about 33.5 µs on this adapter.
+
+### Cooperative Jacobi rotation prototype
+
+The remaining serial whitening rotations now have a test-only cooperative
+implementation. Eight lanes update independent covariance rows, then columns,
+with barriers between dependent phases; the eigenvector column update shares
+the first phase. Sweep and rotation order, scalar angle calculation, early
+exits and ordered output reconstruction are retained. Uniform refresh and
+sweep decisions keep ordinary and cortical cycles out of the rotation-loop
+barriers. Existing scratch is reused without another binding or dispatch.
+
+`cooperative-jacobi-validation.log` records four passing GPU tests. The 8×6
+and 9×7 raw fields match all thirteen buffers and the private encoder mirror
+through 100 cycles, death/refresh boundaries and two replays. Ten covariance
+fixtures exercise scheduled and skipped refreshes, and four bounded cortical
+cycles verify that raw whitening remains skipped. A separate CPU composition
+test passes in `jacobi-composition.log`, checking that other helper functions
+and scratch declarations survive the source substitution.
+
+Five alternating pairs after 256 warmup cycles measure:
+
+| Case | Current production source | Cooperative rotations | Ratio |
+|---|---:|---:|---:|
+| 100 evolving cycles | 0.046495265 s | 0.045858546 s | 1.013884× |
+| One forced refresh cycle | 0.000887237 s | 0.000742767 s | 1.194502× |
+| One ordinary cycle | 0.000612313 s | 0.000608566 s | 1.006157× |
+
+These are complete-cycle wall times, including the restored checkpoint's cold
+import and submission overhead; the single-cycle rows do not measure the
+whitening function alone. Every timed result matches all thirteen buffers.
+The intermittent refresh improvement yields only a small evolving-cycle gain,
+so this prototype remains unpromoted.
+
+### Food-grid reuse prototype
+
+The test-only food-grid cache records available, in-bounds cell membership for
+104 items in 108 words of unused private prediction scratch. It skips only
+food-count clearing, food insertion and food sorting when that membership is
+unchanged and the previous grid did not overflow. Agent grids, claim resets,
+collisions and the original respawn routine always execute. Timer expiry
+forces rebuilding both that cycle and the next, preserving the original
+pre-respawn build followed by respawn insertion. Overflow always retains the
+ordinary rebuild; its atomic winner selection remains an existing limitation
+on portable exactness claims.
+
+The three GPU tests in `food-grid-cache-validation.log` pass all-thirteen-buffer
+comparisons, including unused stale grid slots and the private matrix mirror.
+Both raw fields run 100 cycles with death/refresh and replay. Twelve explicit
+transition steps cover consumption, timer initialization/decrement/expiry,
+same-cell and cross-cell host moves, an actual food claim, seventeen-item
+overflow and recovery. The test asserts when reuse must and must not occur;
+checkpoint restoration and arm changes invalidate the private metadata.
+
+After 1,000 warmup cycles, five alternating 100-cycle pairs measure
+**0.043342417/0.042987244 s (1.008262×)** with all thirteen buffers equal.
+Both arms include cold imports. This small local gain is unpromoted, and the
+prototype does not establish a complete production invalidation lifecycle
+for arbitrary host world uploads or alternate dispatch routes. Its gain
+cannot be multiplied by the world-only attribution above.
+
+### Raw visual events and accumulated projection residuals
 
 Raw vision has a small color palette and constant alpha, but sensory
 adaptation subtracts an independent running mean from each visual feature.
@@ -1431,48 +1513,208 @@ after encoding and cannot factor the full dense encoder. Even aggregating
 encoder terms before accounting for weight maintenance; arbitrary host-written
 means also invalidate that shared-history assumption.
 
-A different candidate would cache the visual projection and update it only
-from changed raw inputs. In real arithmetic, if `v` is the adapted visual
-vector, `delta_r` is the change in raw vision, and `beta = 0.99`, then
-`v_next = beta*v + delta_r`. With unclamped rank-one encoder credit
-`W_next = W + v*c^T`, a cached visual projection obeys
-`a_next = beta*a + beta*c*dot(v,v) + transpose(W_next)*delta_r`.
-Combining sparse raw changes with deferred weight updates could avoid the
-dense base-matrix query retained by the earlier deferred encoder experiment.
+Two snapshot-only diagnostics now measure the proposed visual-projection
+recurrence on actual moving production trajectories. They use brain seeds
+42, 314 and 2026, ten agents, and sixteen consecutive transitions after 256
+and 1,000 warmup cycles. Raw sensory input is captured **before** each cycle;
+actual adapted features are read from private published storage **after** it.
+Matrices used by encoding come from the before-cycle state, prior to that
+cycle's global credit. Every sampled cycle passes exact thirteen-buffer replay
+and private/scalar matrix checks. Death/reset or inactive transitions are
+excluded explicitly; none occurs in these sampled windows. No stationary
+fixture, changed simulation arithmetic or timing counters are included.
 
-This identity is not yet an FP32 implementation: actual EMA rounding adds a
-generally dense residual, while per-weight rounding and clamping invalidate
-the ideal rank-one update. A useful rejection test would capture actual
-published features and weight matrices across early/mature, stationary/moving
-windows, then measure raw-change sparsity and projection residuals against the
-existing raw-dot error bounds over one, eight and sixteen cycles. It must also
-establish a viable rebase frequency and snapshot-only public materialization.
-No acceleration is claimed for this unimplemented candidate.
+`visual-event-diagnostics.log` reports:
 
-The measured encoder section is only about 35 µs, and even eliminating the
-entire earlier 294.10 µs main stage leaves 186.08 µs of claim/global/vision.
-Consequently an encoder-only redesign cannot establish 10× whole-simulation
-acceleration on this workload. Independent global work, such as food-grid
-rebuilds when food availability and positions are unchanged, needs its own
-opportunity and timing measurements. **The requested 10× target remains unmet.**
+| Warmup cycles | Raw RGBA/depth rays unchanged | Adapted RGBA/depth rays unchanged | Largest one-step absolute projection envelope / fresh-dot budget |
+|---|---:|---:|---:|
+| 256 | 22,918 / 23,040 (99.470%) | 0 / 23,040 | 1.068% |
+| 1,000 | 22,960 / 23,040 (99.653%) | 0 / 23,040 | 6.711% |
+
+Thus sparse raw events coexist with changing adapted rays. Neither signed
+one-step projection errors nor their absolute term envelopes exceed the
+existing fresh-dot forward budget across 122,880 output rows. This first
+screen uses the current matrix and excludes weight-update reuse.
+
+The second diagnostic, `raw-event-recurrence.log`, includes stored weight
+updates and resets its cached FP64 projection every one, eight or sixteen
+cycles. Its corrected clamp-classification rerun in
+`raw-event-recurrence-final.log` passes with the same measured results. With visual features `v`, raw change `delta_r`, actual adaptation rate
+`rho` and `beta = 1 - rho`, the ideal update is
+`a_next = beta*(a + c*dot(v,v)) + transpose(W_next)*delta_r`.
+Here the norm contains **visual rows only**; nonvisual terms and bias remain
+fresh. `W_next` is the actual matrix before the next cycle's credit. The
+learning rate is read from the actual GPU uniform, and `c` is the FP64 product
+of that rate, the previous cycle's stored credit and the source-derived credit
+scale, with the original credit threshold applied.
+
+The diagnostic measures adaptation residual
+`epsilon = v_next - (beta*v + delta_r)` and weight residual
+`R = W_next - W - v*c^T`, including coefficient rounding, per-weight rounding,
+discarded increments and ideal clamp residuals. The accumulated difference between fresh and cached projections decomposes as
+`e_next = beta*e + beta*transpose(R)*v + transpose(W_next)*epsilon`.
+This uses actual published features and stored matrices at each step; it is
+not an evolving simulation driven by the proposed cached result.
+
+For each window length, 122,880 output-row prefixes are checked across both
+warmup ages. No measured error or absolute residual envelope exceeds the
+existing full-feature-plus-bias fresh-dot budget. Maxima over all prefixes
+are:
+
+| Warmup cycles | Rebase window | FP64 cached error / budget | Absolute residual envelope / budget |
+|---|---:|---:|---:|
+| 256 | 1 cycle | 0.277% | 1.133% |
+| 256 | 8 cycles | 0.753% | 6.003% |
+| 256 | 16 cycles | 0.900% | 11.136% |
+| 1,000 | 1 cycle | 1.154% | 6.711% |
+| 1,000 | 8 cycles | 3.975% | 46.834% |
+| 1,000 | 16 cycles | 4.228% | 79.627% |
+
+The largest sixteen-cycle FP64 discrepancy is 1.548e-7. Per-weight residuals
+reach 1.863e-9. Of nonzero ideal visual-weight increments, 16.235% in the early
+window and 81.470% in the mature window leave the stored word unchanged.
+The diagnostic distinguishes these from below-threshold credit outputs
+(1,628 and 1,336 respectively). **No clamp events are observed:** both ideal
+clamp-crossing counts and observed stored-at-limit counts are zero. These
+trajectories therefore provide no empirical saturation-boundary coverage.
+
+This is a numerical opportunity screen, **not GPU accuracy acceptance**.
+It omits candidate FP32 recurrence, norm, coefficient and projection arithmetic,
+uses the existing conservative round-to-nearest/FTZ dot budget only as a
+comparison scale, and measures no altered decisions or long-run behavior.
+The mature sixteen-cycle envelope already consumes much more of that scale
+than the one-cycle envelope. A GPU candidate still needs raw arithmetic
+probes, adversarial saturation/reset cases, behavioral validation, a viable
+rebase policy and a measured complete-cycle benefit. No acceleration is
+claimed for this ideal multi-cycle recurrence.
+
+The encoder section remains only about 35 µs, so an encoder-only redesign
+cannot establish 10× whole-simulation acceleration on this workload. The
+cooperative Jacobi and food-grid experiments are test-only, and neither is
+included in the production headline. **The measured whole-simulation result
+remains 3.246×; the requested 10× target remains unmet.**
 
 
-The remaining serial Jacobi rotations in whitening are another bounded
-candidate: eight lanes could update independent rows in the column phase,
-then independent columns in the row phase, preserving the original rotation
-and sweep order. This differs from the current cooperative output
-reconstruction. It would require up to 1,008 rotation barriers per refresh,
-so the 343.6 µs refresh measurement does not establish a gain; even eliminating
-that surcharge completely would save only about 17.2 µs per cycle under
-steady once-per-twenty-cycle refreshes.
+### Fresh next-input projection: raw numerical validation
 
-Food-grid reuse has a stricter exactness condition than unchanged positions:
-availability and grid-cell membership must also be unchanged, and no cell
-may exceed its sixteen retained slots. Overflow must retain the ordinary
-rebuild because atomic insertion can choose different retained IDs even for
-identical inputs. An eligible cached path must preserve unused slot bytes,
-claim resets, respawn timer/RNG/insertion order, agent grids and collisions;
-host world uploads and alternate execution routes need invalidation. A
-snapshot-only opportunity measurement should verify full grid-byte equality
-before a conditional-rebuild prototype, whose savings could overlap work
-already hidden by concurrent encoder credit.
+A separate test-only candidate computes fresh visual projection partials beside
+packed encoder credit, using the actual updated, clamped weights. It predicts
+the next adapted visual input from current raw sensory data and the stored
+mean. The next encoder uses those partials only when every predicted visual
+word matches the actual input bit for bit and the cached death generation
+still matches. Otherwise it executes the original full packed encoder.
+Nonvisual features and bias remain fresh. This does not use the ideal
+multi-cycle EMA or rank-one recurrence described above.
+
+The independent hardware probe in `fresh-projection-raw-dots-final.log` invokes the
+candidate's actual credit and encoder helper bodies. Both encoder routes
+publish their pre-tanh value in the timing source itself; the probe uses that
+publication rather than duplicating the arithmetic or inverting tanh. The
+original scalar credit shader independently checks trained matrices, while
+the private packed matrix must equal its public scalar mirror. Each candidate
+raw output and its fresh-encoder reference are checked against the existing
+FP64 full-feature-plus-bias oracle and unchanged round-to-nearest/FTZ forward
+budget.
+
+Twelve fixtures across 8×6 and 9×7 raw fields cover 267 and 342 features,
+including partial eight-feature tiles, seeded values, cancellation, wide
+exponents, tiny normals, subnormals, sparse tails, bias-only and signed-zero
+inputs. Mixed credits exercise values below, at and above the update
+threshold, both clamp endpoints, and disabled components whose stored weights
+lie outside the clamp. A changed-input case drives a moderate predicted
+feature nearly to zero and must use the full fresh encoder.
+
+The passing test records the following candidate evaluations; the fresh
+reference is independently bounded for each of these same inputs:
+
+| Route | Raw outputs checked | Largest error / fresh-dot bound | Bit differences from fresh encoder |
+|---|---:|---:|---:|
+| Cached projection | 5,888 | 1.5574% | 3,085 |
+| Full-encoder fallback | 12,288 | 2.6387% | 0 |
+| **Total** | **18,176** | **2.6387%** | **3,085** |
+
+The cached count comprises 3,072 matching-input outputs and 2,816 live-agent
+outputs with an inactive agent present. The fallback count comprises 3,072
+outputs each for changed input, changed death generation, invalid cache and
+host reset followed by import. These are repeated evaluations of the fixture
+families, not 18,176 independently sampled trajectories. All trained matrices
+match the scalar-credit shader bitwise, including the inactive agent; its
+256 omitted encoder outputs across the two fields retain their sentinel bits
+and are excluded from numerical counts.
+
+The route checks are falsifiable. Deliberately corrupting a cached partial
+changes a matching-input result, proving that the fast path consumes it.
+Changed input, death generation and invalid-cache cases then reject the same
+corrupt partials and match the fresh encoder bitwise. A real seeded host reset
+starts with a freshly repopulated projection: every agent must report valid
+metadata and actual cached use before its partial is corrupted. The test then
+explicitly clears the detached cache's metadata header and invalidates/imports
+its matrices after reset; matching input must take the fresh fallback. This
+checks the prototype's manual reset protocol, not a production constructor
+API. The strengthened rerun retains exactly the original 18,176 numerical
+results and aggregate bounds. Deliberately corrupted results and the repeated
+warm-cache preparation are excluded from that table.
+
+These results establish bounded raw arithmetic for the observed helper
+compilation and fixtures. Cached reductions do change FP32 bits; the test does
+not establish complete-trajectory equivalence, cache hit frequency, a
+production host-mutation lifecycle, or a whole-simulation speedup. Timing and
+evolving-state validation are separate from this numerical gate.
+
+
+### Fresh next-input projection: cycle coverage and timing
+
+`fresh-projection-trajectory-final.log` passes 100-cycle checks for both raw
+fields, with death/refresh boundaries, an inactive agent, private/scalar
+matrix agreement and exact thirteen-buffer replay within each arm. Comparisons
+between the original and cached arms report FP32 differences and enforce
+finite/range/state invariants; they do not require bit equality. After 100
+cycles, maximum absolute differences across reported numeric fields are
+1.228e-5 for 8×6 and 3.254e-5 for 9×7, with zero reported discrete-field
+changes. These two fixtures use one seed and do not establish a behavioral
+distribution or a pipeline-wide error bound.
+
+To make cached-path coverage reliable, both arms receive the same held sky
+visual input before cycles 40 and 41. All world and vision dispatches still
+execute. The fixture records 11 hits/889 misses for 8×6 and 9 hits/891 misses
+for 9×7; it explicitly requires both routes. These deliberately held-input
+checks are distinct from the unmodified moving scene used for timing.
+
+In that mature scene, after 1,000 warmup cycles, five alternating 100-cycle
+pairs measure **0.045574866/0.044523232 s (1.023620×)**. The candidate records
+842 hits and 158 misses, an 84.2% hit rate over those 1,000 agent cycles.
+Each arm repeats all thirteen buffers exactly; cross-arm FP32 drift remains
+reported separately. The timing preflight observes zero discrete changes
+and a maximum numeric-field difference of 6.104e-5. State readbacks are outside
+timing, while cold cache import, raw-value publication and hit/miss counters
+are included. The prototype appends 159,040 bytes of private storage for this
+ten-agent field without adding a binding or dispatch. The log is
+`fresh-projection-timing.log`.
+
+This small local whole-cycle gain does not justify production promotion.
+Neither the held-input fixtures nor the single mature timing scene establishes
+long-run behavioral equivalence or a general cache-hit rate. The prototype
+remains test-only, and the production headline remains **3.246×**, with the
+**10× whole-simulation target unmet**.
+
+### Verification of the world and visual-reuse diagnostics
+
+The complete change passes 102 normal brain tests in debug mode, fifteen
+focused release GPU tests, all 284 sandbox tests run serially, formatting,
+and workspace Clippy with all targets and warnings denied. The existing
+packed encoder and predictor raw-dot probes also pass after extracting their
+unchanged FP64 reference/bound calculation for the snapshot diagnostics.
+Hardware-dependent experiments remain ignored in the normal test suite and
+are run explicitly. Logs include `brain-fresh-projection-debug.log`,
+`clippy-fresh-projection.log`, `sandbox-visual-events-serial-tests.log`,
+`packed-encoder-dot-bound-refactor.log` and
+`packed-predictor-dot-bound-refactor.log`.
+
+The initial parallel sandbox run failed two worker startup/event deadlines;
+the serial rerun passes the same assertions, including all 118 integration
+tests in 535.90 seconds. The initial fresh-projection trajectory test also
+found no cache hits in the moving 9×7 startup fixture and failed its route
+coverage assertion. The held-input case above makes that coverage deterministic
+without removing the assertion or weakening numerical checks. These changes
+add diagnostics and test-only candidates; no new runtime option or default
+is promoted by this verification.

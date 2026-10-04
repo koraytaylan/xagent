@@ -57,8 +57,8 @@ var<workgroup> s_pred_td: array<f32, 5>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 3>;
-// Reused cooperative dense-dot scratch, indexed by local invocation id; each
-// group of DENSE_INNER_LANES entries reduces one output row.
+// Reused cooperative dense-dot scratch, indexed by local invocation id.
+// Encoder partials are lane-major; predictor partials are output-major.
 var<workgroup> s_dense_partials: array<f32, BRAIN_WORKGROUP_SIZE>;
 
 // ── Scalars for parallel action-tail reductions ──
@@ -110,7 +110,11 @@ override VC_RETINA_BASE: u32 = 0u;
 override VC_CENTER_SURROUND_BASE: u32 = RETINA_PIXEL_COUNT;
 override VC_HORIZ_SCRATCH_BASE: u32 = 2u * RETINA_PIXEL_COUNT;
 override VC_COMPLEX_BASE: u32 = 3u * RETINA_PIXEL_COUNT;
-override VC_SCRATCH_LEN: u32 = 3u * RETINA_PIXEL_COUNT + VISUAL_FEATURE_COUNT;
+// A pipeline using raw vision never enters the cortex, so it needs only a
+// nonempty placeholder array. The same layout override sizes FEATURE_COUNT;
+// changing the cortex layout requires recreating the pipeline and its buffers.
+override VC_SCRATCH_LEN: u32 = (1u - VISUAL_CORTEX_FEATURES_ACTIVE)
+    + VISUAL_CORTEX_FEATURES_ACTIVE * (3u * RETINA_PIXEL_COUNT + VISUAL_FEATURE_COUNT);
 var<workgroup> s_visual: array<f32, VC_SCRATCH_LEN>;
 // Stage 1 needs NO additional workgroup binding for the DoG kernel: the 1D
 // Gaussian weights are recomputed analytically per tap (one call to
@@ -544,6 +548,11 @@ fn pool_bounds(cell: u32, cells: u32, extent: u32) -> vec2<u32> {
 }
 
 fn coop_visual_cortex(agent_id: u32, tid: u32) {
+    // Specialize away cortex code and its scratch accesses for raw-vision
+    // pipelines, independently of the runtime flag used by cortex pipelines.
+    if (VISUAL_CORTEX_FEATURES_ACTIVE == 0u) {
+        return;
+    }
     // Gate flag: 0.0 ⇒ no-op passthrough, encoder keeps the legacy raw-vision
     // slice. Read uniformly so every thread takes the same branch (barrier
     // uniformity). The stages live behind this gate.
@@ -925,8 +934,10 @@ fn vision_pathway_step(brain_base: u32, tick: f32, cortex_on: bool) -> f32 {
 
 fn coop_encode(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
-    let output_in_tile = tid / DENSE_INNER_LANES;   // 0..63
-    let lane = tid % DENSE_INNER_LANES;              // 0..3
+    // Adjacent invocations read adjacent output weights in the feature-major
+    // matrix. Each logical lane still visits its stride-four feature sequence.
+    let output_in_tile = tid % DENSE_OUTPUT_TILE;
+    let lane = tid / DENSE_OUTPUT_TILE;
 
     for (var tile = 0u; tile < ENCODED_DIMENSION; tile += DENSE_OUTPUT_TILE) {
         let dim = tile + output_in_tile;             // the output row this invocation serves
@@ -944,10 +955,15 @@ fn coop_encode(agent_id: u32, tid: u32) {
         s_dense_partials[tid] = partial;
         workgroupBarrier();
 
-        // Lane 0 reduces the 4 partials in ascending order and writes the result
+        // Lane-major scratch keeps stores contiguous. Logical lane zero adds
+        // the four partials in ascending, left-associated order.
         if (lane == 0u) {
-            let base = tid; // When lane==0, tid = output_in_tile*4, which is the base
-            let reduced = s_dense_partials[base] + s_dense_partials[base + 1u] + s_dense_partials[base + 2u] + s_dense_partials[base + 3u];
+            let base = output_in_tile;
+            let second_lane = base + DENSE_OUTPUT_TILE;
+            let third_lane = second_lane + DENSE_OUTPUT_TILE;
+            let fourth_lane = third_lane + DENSE_OUTPUT_TILE;
+            let reduced = s_dense_partials[base] + s_dense_partials[second_lane]
+                + s_dense_partials[third_lane] + s_dense_partials[fourth_lane];
             s_encoded[dim] = fast_tanh(reduced);
         }
         workgroupBarrier();   // REQUIRED before the next tile overwrites s_dense_partials
@@ -1979,8 +1995,10 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     // lives in this block, so gating it on the uniform `run_encoder_credit` flag
     // is barrier-uniformity-safe.
     if (run_encoder_credit) {
-        let output_in_tile_enc = tid / DENSE_INNER_LANES;
-        let lane_enc = tid % DENSE_INNER_LANES;
+        // Match the encoder's contiguous output mapping. Each weight has one
+        // writer, with a per-dimension credit threshold and a per-weight clamp.
+        let output_in_tile_enc = tid % DENSE_OUTPUT_TILE;
+        let lane_enc = tid / DENSE_OUTPUT_TILE;
 
         for (var tile = 0u; tile < ENCODED_DIMENSION; tile += DENSE_OUTPUT_TILE) {
             let dim = tile + output_in_tile_enc;

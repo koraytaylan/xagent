@@ -14,6 +14,11 @@ fn vision_tick(
     let agent_id = wgid.x / VISION_GROUPS_PER_AGENT;
     let group = wgid.x % VISION_GROUPS_PER_AGENT;
 
+    // BEGIN_VISION_OBJECT_QUERIES
+    if (VISION_OBJECT_QUERIES) {
+        vision_object_rays(agent_id, group * VISION_RAYS_PER_WORKGROUP, lid.x);
+    } else
+    // END_VISION_OBJECT_QUERIES
     if (VISION_PARALLEL_STEPS) {
         vision_parallel_rays(agent_id, group * VISION_RAYS_PER_WORKGROUP, lid.x);
     } else {
@@ -23,6 +28,11 @@ fn vision_tick(
         }
     }
 
+    // BEGIN_VISION_PARALLEL_SCENT
+    if (VISION_PARALLEL_SCENT && group == 0u) {
+        vision_prepare_scent(agent_id, lid.x, VISION_WORKGROUP_SIZE);
+    }
+    // END_VISION_PARALLEL_SCENT
     if (group == 0u && lid.x == 0u) {
         phase_vision_senses(agent_id);
     }

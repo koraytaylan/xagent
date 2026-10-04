@@ -14,7 +14,8 @@
 //! |          | phase_food_claim, phase_food_detect, phase_food_respawn,              |
 //! |          | phase_agent_grid,                                                     |
 //! |          | phase_grid_order, phase_collision, physics_tick                       |
-//! | vision   | phase_vision, phase_vision_parallel, vision_tick (plain u32 grids)    |
+//! | vision   | phase_vision, phase_vision_parallel, phase_vision_object_queries,    |
+//! |          | phase_vision_scent_parallel, vision_tick (plain u32 grids)           |
 //! | brain    | brain_passes, brain_tick                                              |
 //! | kernel   | brain_passes, brain_inner, phase_food_claim, kernel_tick (entries     |
 //! |          | `kernel_claim_tick` and `kernel_tick`)                                |
@@ -23,6 +24,10 @@
 //! | global   | phase_clear, phase_food_grid, phase_food_respawn, phase_agent_grid,   |
 //! |          | phase_grid_order, phase_collision, global_tick                        |
 //! | prepare  | phase_prepare_dispatch                                                |
+//!
+//! The standalone vision composer includes the object-query and parallel-scent
+//! fragments only when enabled, removing their entry-point branches otherwise.
+//! Disabled optional caches therefore declare no workgroup resources.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -63,6 +68,10 @@ use xagent_shared::{BrainConfig, WorldConfig};
 use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
+#[cfg(test)]
+mod cycle_profile;
+#[cfg(test)]
+mod persistent_validation;
 #[cfg(test)]
 mod vision_validation;
 
@@ -106,6 +115,8 @@ const FOOD_UNCLAIMED: u32 = u32::MAX;
 const BRAIN_WORKGROUP_THREADS: u32 = 256;
 /// Power-of-two lane group covering every one of the 25 discrete ray samples.
 const PARALLEL_VISION_LANES: u32 = 32;
+/// The cooperative object cache holds one item per thread in a 256-thread group.
+const VISION_OBJECT_FOOD_CAPACITY: usize = 256;
 
 /// Rays per vision workgroup at or below `SMALL_POPULATION` agents: one, so
 /// every ray of a small population runs in its own workgroup, in parallel.
@@ -453,6 +464,61 @@ const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
 const BIOME_GRID_RES: usize = 256;
 
+/// Redirect only the scent result after the cooperative helper has completed;
+/// the scalar reference and every other sense retain their original source.
+fn with_prepared_scent(source: &str) -> String {
+    let scalar_call = "let scent = sense_scent(pos, facing, smell_strength);";
+    assert_eq!(source.matches(scalar_call).count(), 1);
+    source.replace(scalar_call, "let scent = vision_prepared_scent;")
+}
+
+/// Compose standalone vision without allocating disabled optional caches.
+/// The parallel-sample fragment remains present for the serial/parallel override.
+fn compose_vision_source(common: &str, object_queries: bool, parallel_scent: bool) -> String {
+    let phase = include_str!("shaders/kernel/phase_vision.wgsl");
+    let phase = if parallel_scent {
+        with_prepared_scent(phase)
+    } else {
+        phase.to_owned()
+    };
+    let mut entry = include_str!("shaders/kernel/vision_tick.wgsl").to_owned();
+    for (enabled, begin, end) in [
+        (
+            object_queries,
+            "// BEGIN_VISION_OBJECT_QUERIES",
+            "// END_VISION_OBJECT_QUERIES",
+        ),
+        (
+            parallel_scent,
+            "// BEGIN_VISION_PARALLEL_SCENT",
+            "// END_VISION_PARALLEL_SCENT",
+        ),
+    ] {
+        assert_eq!(entry.matches(begin).count(), 1);
+        assert_eq!(entry.matches(end).count(), 1);
+        if !enabled {
+            entry = replace_fenced(&entry, begin, end, "");
+        }
+    }
+    let mut fragments = vec![
+        common,
+        phase.as_str(),
+        include_str!("shaders/kernel/phase_vision_parallel.wgsl"),
+    ];
+    if object_queries {
+        fragments.push(include_str!(
+            "shaders/kernel/phase_vision_object_queries.wgsl"
+        ));
+    }
+    if parallel_scent {
+        fragments.push(include_str!(
+            "shaders/kernel/phase_vision_scent_parallel.wgsl"
+        ));
+    }
+    fragments.push(entry.as_str());
+    fragments.join("\n")
+}
+
 /// Storage declarations in `common.wgsl` of the food flags and the two grids,
 /// as every pass but vision sees them (atomics: the grid and food passes
 /// insert concurrently), with the plain `u32` form the vision module uses.
@@ -521,6 +587,9 @@ pub struct GpuKernel {
     prepare_pipeline: wgpu::ComputePipeline,
     physics_pipeline: wgpu::ComputePipeline,
     vision_pipeline: wgpu::ComputePipeline,
+    /// Cached object queries and ordered scent use a standalone dispatch so
+    /// their workgroup memory does not reduce brain occupancy.
+    standalone_vision_required: bool,
     brain_pipeline: wgpu::ComputePipeline,
     feature_pipeline: wgpu::ComputePipeline,
     encode_tiled_pipeline: wgpu::ComputePipeline,
@@ -984,8 +1053,10 @@ impl GpuKernel {
             wgpu::Features::PUSH_CONSTANTS
         };
         #[cfg(test)]
-        let required_features =
-            required_features | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = required_features
+            | (adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES));
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -1245,6 +1316,88 @@ impl GpuKernel {
             bytemuck::cast_slice(&build_config_for(brain_config, &layout)),
         );
 
+        // Pipeline-overridable constants: VISION_W and VISION_H drive the
+        // entire vision/feature/brain-offset cascade via override-expressions
+        // in common.wgsl. All derived overrides evaluate at pipeline creation.
+        let mut vision_overrides = vision_override_constants(&layout);
+        let vision_rays = layout.vision_width * layout.vision_height;
+        let rays_per_workgroup = vision_rays_per_workgroup(agent_count, vision_rays);
+        let object_queries_requested =
+            std::env::var("XAGENT_VISION_OBJECT_QUERIES").as_deref() == Ok("1");
+        let parallel_scent_requested =
+            std::env::var("XAGENT_VISION_PARALLEL_SCENT").as_deref() == Ok("1");
+        let object_queries_supported =
+            agent_count <= u32::BITS && food_count <= VISION_OBJECT_FOOD_CAPACITY;
+        // Thirty-two lanes evaluate one ray's unchanged samples in parallel.
+        // Eight rays fit within the portable 256-thread workgroup limit.
+        let cooperative_rays_per_workgroup = if object_queries_requested && object_queries_supported
+        {
+            BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES
+        } else {
+            rays_per_workgroup.min(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES)
+        };
+        let cooperative_vision_workgroups = u64::from(agent_count)
+            * u64::from(vision_rays.div_ceil(cooperative_rays_per_workgroup));
+        let cooperative_combined_workgroups = u64::from(agent_count)
+            * (1 + u64::from(
+                vision_rays.div_ceil(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES),
+            ));
+        let parallel_vision_requested = std::env::var("XAGENT_VISION_PARALLEL_STEPS").as_deref()
+            == Ok("1")
+            || object_queries_requested
+            || parallel_scent_requested;
+        let parallel_vision = parallel_vision_requested
+            && cooperative_vision_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS)
+            && cooperative_combined_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS);
+        if parallel_vision_requested && !parallel_vision {
+            log::warn!(
+                "[GpuKernel] Parallel ray samples exceed the dispatch dimension limit; \
+                 using serial ray samples"
+            );
+        }
+        let object_queries =
+            parallel_vision && object_queries_requested && object_queries_supported;
+        let parallel_scent = parallel_vision && parallel_scent_requested;
+        let standalone_vision_required = object_queries || parallel_scent;
+        if standalone_vision_required {
+            log::info!("[GpuKernel] Cached vision uses a separate dispatch from the brain");
+        }
+        if object_queries_requested && !object_queries_supported {
+            log::warn!("[GpuKernel] Object cache capacity exceeded; using parallel ray samples");
+        }
+        let rays_per_workgroup = if parallel_vision {
+            cooperative_rays_per_workgroup
+        } else {
+            rays_per_workgroup
+        };
+        vision_overrides.insert(
+            "VISION_PARALLEL_STEPS".to_string(),
+            f64::from(u32::from(parallel_vision)),
+        );
+        if object_queries {
+            vision_overrides.insert("VISION_OBJECT_QUERIES".to_string(), 1.0);
+        }
+        if parallel_scent {
+            vision_overrides.insert("VISION_PARALLEL_SCENT".to_string(), 1.0);
+        }
+        vision_overrides.insert(
+            "VISION_AGENT_MASKS".to_string(),
+            f64::from(u32::from(
+                parallel_vision
+                    && agent_count <= u32::BITS
+                    && std::env::var("XAGENT_VISION_AGENT_MASKS").as_deref() == Ok("1"),
+            )),
+        );
+        vision_overrides.insert(
+            "VISION_RAYS_PER_WORKGROUP".to_string(),
+            f64::from(rays_per_workgroup),
+        );
+        let vision_workgroups = agent_count * vision_rays.div_ceil(rays_per_workgroup);
+        let override_options = wgpu::PipelineCompilationOptions {
+            constants: &vision_overrides,
+            zero_initialize_workgroup_memory: true,
+        };
+
         // ── Compose shader sources (see module-level composition contract) ──
         let common_src = include_str!("shaders/kernel/common.wgsl");
 
@@ -1269,13 +1422,7 @@ impl GpuKernel {
         // only reads the food flags and the two grids, so its module
         // declares them as plain u32 (see `with_plain_grid_bindings`).
         let vision_common = with_plain_grid_bindings(common_src);
-        let vision_source = [
-            vision_common.as_str(),
-            include_str!("shaders/kernel/phase_vision.wgsl"),
-            include_str!("shaders/kernel/phase_vision_parallel.wgsl"),
-            include_str!("shaders/kernel/vision_tick.wgsl"),
-        ]
-        .join("\n");
+        let vision_source = compose_vision_source(&vision_common, object_queries, parallel_scent);
 
         // Brain pipeline: common + brain_passes + brain entry
         let brain_source = apply_subgroup_markers(
@@ -1341,60 +1488,6 @@ impl GpuKernel {
             include_str!("shaders/kernel/global_tick.wgsl"),
         ]
         .join("\n");
-
-        // Pipeline-overridable constants: VISION_W and VISION_H drive the
-        // entire vision/feature/brain-offset cascade via override-expressions
-        // in common.wgsl. All derived overrides evaluate at pipeline creation.
-        let mut vision_overrides = vision_override_constants(&layout);
-        let vision_rays = layout.vision_width * layout.vision_height;
-        let rays_per_workgroup = vision_rays_per_workgroup(agent_count, vision_rays);
-        // Thirty-two lanes evaluate one ray's unchanged samples in parallel.
-        // Eight rays fit within the portable 256-thread workgroup limit.
-        let cooperative_rays_per_workgroup =
-            rays_per_workgroup.min(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES);
-        let cooperative_vision_workgroups = u64::from(agent_count)
-            * u64::from(vision_rays.div_ceil(cooperative_rays_per_workgroup));
-        let cooperative_combined_workgroups = u64::from(agent_count)
-            * (1 + u64::from(
-                vision_rays.div_ceil(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES),
-            ));
-        let parallel_vision_requested =
-            std::env::var("XAGENT_VISION_PARALLEL_STEPS").as_deref() == Ok("1");
-        let parallel_vision = parallel_vision_requested
-            && cooperative_vision_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS)
-            && cooperative_combined_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS);
-        if parallel_vision_requested && !parallel_vision {
-            log::warn!(
-                "[GpuKernel] Parallel ray samples exceed the dispatch dimension limit; \
-                 using serial ray samples"
-            );
-        }
-        let rays_per_workgroup = if parallel_vision {
-            cooperative_rays_per_workgroup
-        } else {
-            rays_per_workgroup
-        };
-        vision_overrides.insert(
-            "VISION_PARALLEL_STEPS".to_string(),
-            f64::from(u32::from(parallel_vision)),
-        );
-        vision_overrides.insert(
-            "VISION_AGENT_MASKS".to_string(),
-            f64::from(u32::from(
-                parallel_vision
-                    && agent_count <= u32::BITS
-                    && std::env::var("XAGENT_VISION_AGENT_MASKS").as_deref() == Ok("1"),
-            )),
-        );
-        vision_overrides.insert(
-            "VISION_RAYS_PER_WORKGROUP".to_string(),
-            f64::from(rays_per_workgroup),
-        );
-        let vision_workgroups = agent_count * vision_rays.div_ceil(rays_per_workgroup);
-        let override_options = wgpu::PipelineCompilationOptions {
-            constants: &vision_overrides,
-            zero_initialize_workgroup_memory: true,
-        };
 
         // ── Explicit bind group layout (all 18 bindings) ──
         // Each pipeline entry point only references a subset of bindings, but we
@@ -1845,6 +1938,7 @@ impl GpuKernel {
             prepare_pipeline,
             physics_pipeline,
             vision_pipeline,
+            standalone_vision_required,
             brain_pipeline,
             feature_pipeline,
             encode_tiled_pipeline,
@@ -2324,8 +2418,10 @@ impl GpuKernel {
         // before it, so the two overlap. The results are the same. With the
         // vision pass skipped (measurement only) the cycle keeps its serial
         // shape.
-        let brain_beside_vision =
-            self.probe.brain_beside_vision && self.vision_stride == 1 && !skip_vision;
+        let brain_beside_vision = self.probe.brain_beside_vision
+            && !self.standalone_vision_required
+            && self.vision_stride == 1
+            && !skip_vision;
         // Submit-return wall timer (always on, GPU-behavior-neutral): the gap to
         // the optional GPU-complete time below distinguishes CPU submit/recording
         // cost from queue back-pressure / GPU execution.
@@ -3975,6 +4071,38 @@ mod tests {
     const BRAIN_VISION_TICK_SRC: &str = include_str!("shaders/kernel/brain_vision_tick.wgsl");
     const COMMON_SRC: &str = include_str!("shaders/kernel/common.wgsl");
     const BITONIC_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sort_subgroup.wgsl");
+
+    #[test]
+    fn disabled_vision_caches_are_absent_from_composed_source() {
+        let common = with_plain_grid_bindings(COMMON_SRC);
+        for object_queries in [false, true] {
+            for parallel_scent in [false, true] {
+                let source = compose_vision_source(&common, object_queries, parallel_scent);
+                for symbol in [
+                    "VISION_OBJECT_QUERIES",
+                    "vision_object_cache",
+                    "vision_object_rays",
+                ] {
+                    assert_eq!(source.contains(symbol), object_queries, "{symbol}");
+                }
+                for symbol in [
+                    "VISION_PARALLEL_SCENT",
+                    "vision_scent_contributions",
+                    "vision_scent_valid",
+                    "vision_prepared_scent",
+                    "vision_prepare_scent",
+                ] {
+                    assert_eq!(source.contains(symbol), parallel_scent, "{symbol}");
+                }
+                assert!(source.contains("vision_parallel_rays"));
+                assert!(source.contains("vision_single_ray"));
+                assert_eq!(
+                    source.contains("let scent = sense_scent(pos, facing, smell_strength);"),
+                    !parallel_scent,
+                );
+            }
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────────────
     // Pipeline-overridable constants — verify the cascade is declared with

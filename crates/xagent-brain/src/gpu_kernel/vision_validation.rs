@@ -5,6 +5,7 @@ use std::error::Error;
 
 use glam::Vec3;
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use xagent_shared::{NOSTRIL_FORWARD_OFFSET, NOSTRIL_SIDE_OFFSET, SCENT_RANGE};
 
 use super::*;
 
@@ -48,37 +49,47 @@ const PARALLEL_GROUP_WIDTHS: [u32; 3] = [1, 4, 8];
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Clone, Copy, Default)]
+struct VisionOptions {
+    parallel_steps: bool,
+    agent_masks: bool,
+    object_queries: bool,
+    parallel_scent: bool,
+}
+
 struct VisionPipeline {
     pipeline: wgpu::ComputePipeline,
     workgroups: u32,
     rays_per_group: u32,
-    agent_masks: bool,
-    parallel_steps: bool,
+    options: VisionOptions,
 }
 
 fn make_pipeline(
     kernel: &GpuKernel,
-    parallel: bool,
     rays_per_group: u32,
     include_senses: bool,
-    agent_masks: bool,
+    mut options: VisionOptions,
 ) -> VisionPipeline {
+    options.parallel_scent &= include_senses;
     let common = with_plain_grid_bindings(include_str!("../shaders/kernel/common.wgsl"));
-    let entry = include_str!("../shaders/kernel/vision_tick.wgsl");
-    let entry = if include_senses {
-        entry.to_owned()
+    let source = if options.parallel_steps {
+        compose_vision_source(&common, options.object_queries, options.parallel_scent)
+    } else {
+        assert!(!options.agent_masks && !options.object_queries && !options.parallel_scent);
+        [
+            common.as_str(),
+            include_str!("../shaders/kernel/phase_vision.wgsl"),
+            include_str!("vision_serial_reference.wgsl"),
+        ]
+        .join("\n")
+    };
+    let source = if include_senses {
+        source
     } else {
         let senses_call = "phase_vision_senses(agent_id);";
-        assert_eq!(entry.matches(senses_call).count(), 1);
-        entry.replace(senses_call, "")
+        assert_eq!(source.matches(senses_call).count(), 1);
+        source.replace(senses_call, "")
     };
-    let source = [
-        common.as_str(),
-        include_str!("../shaders/kernel/phase_vision.wgsl"),
-        include_str!("../shaders/kernel/phase_vision_parallel.wgsl"),
-        entry.as_str(),
-    ]
-    .join("\n");
     let module = kernel
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -95,21 +106,26 @@ fn make_pipeline(
         });
     let mut constants = vision_override_constants(&kernel.layout);
     constants.insert(
-        "VISION_PARALLEL_STEPS".into(),
-        f64::from(u32::from(parallel)),
-    );
-    constants.insert(
         "VISION_RAYS_PER_WORKGROUP".into(),
         f64::from(rays_per_group),
     );
-    constants.insert(
-        "VISION_AGENT_MASKS".into(),
-        f64::from(u32::from(agent_masks)),
-    );
+    if options.parallel_steps {
+        constants.insert("VISION_PARALLEL_STEPS".into(), 1.0);
+        constants.insert(
+            "VISION_AGENT_MASKS".into(),
+            f64::from(u32::from(options.agent_masks)),
+        );
+        if options.object_queries {
+            constants.insert("VISION_OBJECT_QUERIES".into(), 1.0);
+        }
+        if options.parallel_scent {
+            constants.insert("VISION_PARALLEL_SCENT".into(), 1.0);
+        }
+    }
     let pipeline = kernel
         .device
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(if parallel {
+            label: Some(if options.parallel_steps {
                 "parallel_vision_probe"
             } else {
                 "serial_vision_reference"
@@ -128,12 +144,11 @@ fn make_pipeline(
         pipeline,
         workgroups: kernel.agent_count * rays.div_ceil(rays_per_group),
         rays_per_group,
-        agent_masks,
-        parallel_steps: parallel,
+        options,
     }
 }
 
-fn make_kernel(width: u32, height: u32, agents: u32, food_count: usize) -> GpuKernel {
+pub(super) fn make_kernel(width: u32, height: u32, agents: u32, food_count: usize) -> GpuKernel {
     let brain = BrainConfig {
         vision_width: width,
         vision_height: height,
@@ -341,7 +356,11 @@ fn upload_scene(kernel: &GpuKernel, agents: &[Vec3], food: &[Vec3], terrain_heig
     );
 }
 
-fn read_buffer(kernel: &GpuKernel, buffer: &wgpu::Buffer, size: u64) -> TestResult<Vec<u8>> {
+pub(super) fn read_buffer(
+    kernel: &GpuKernel,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> TestResult<Vec<u8>> {
     let staging = kernel.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vision_probe_readback"),
         size,
@@ -404,7 +423,9 @@ fn assert_parity(
     let expected = run_vision(kernel, serial)?;
     for pipeline in parallel {
         let group = pipeline.rays_per_group;
-        let masks = pipeline.agent_masks;
+        let masks = pipeline.options.agent_masks;
+        let objects = pipeline.options.object_queries;
+        let scent = pipeline.options.parallel_scent;
         let actual = run_vision(kernel, pipeline)?;
         assert_eq!(actual.len(), expected.len());
         if let Some((slot, (actual, expected))) = actual
@@ -413,7 +434,7 @@ fn assert_parity(
             .enumerate()
             .find(|(_, (actual, expected))| actual != expected)
         {
-            panic!("{label}, rays/group={group}, masks={masks}, agent={}, sensory slot={}: parallel={:#010x} ({}) serial={:#010x} ({})",
+            panic!("{label}, rays/group={group}, masks={masks}, objects={objects}, scent={scent}, agent={}, sensory slot={}: parallel={:#010x} ({}) serial={:#010x} ({})",
                 slot / kernel.layout.sensory_stride, slot % kernel.layout.sensory_stride,
                 actual, f32::from_bits(*actual), expected, f32::from_bits(*expected));
         }
@@ -435,26 +456,63 @@ fn pipeline_pair(
 ) -> (VisionPipeline, Vec<VisionPipeline>) {
     let serial = make_pipeline(
         kernel,
-        false,
         vision_rays_per_workgroup(
             kernel.agent_count,
             kernel.layout.vision_width * kernel.layout.vision_height,
         ),
         include_senses,
-        false,
+        VisionOptions::default(),
     );
-    let mut parallel: Vec<_> = PARALLEL_GROUP_WIDTHS
-        .iter()
-        .flat_map(|&width| {
-            [false, true].map(|masks| make_pipeline(kernel, true, width, include_senses, masks))
-        })
-        .collect();
+    let mut parallel = Vec::new();
+    for width in PARALLEL_GROUP_WIDTHS {
+        for masks in [false, true] {
+            for scent in [false, true]
+                .into_iter()
+                .filter(|&scent| !scent || include_senses)
+            {
+                parallel.push(make_pipeline(
+                    kernel,
+                    width,
+                    include_senses,
+                    VisionOptions {
+                        parallel_steps: true,
+                        agent_masks: masks,
+                        parallel_scent: scent,
+                        ..VisionOptions::default()
+                    },
+                ));
+            }
+        }
+    }
+    /// The object cache has a fixed capacity of 256 food positions.
+    const OBJECT_FOOD_CAPACITY: usize = 256;
+    if kernel.agent_count <= u32::BITS && kernel.food_count <= OBJECT_FOOD_CAPACITY {
+        let width = *PARALLEL_GROUP_WIDTHS.last().unwrap();
+        for masks in [false, true] {
+            for scent in [false, true]
+                .into_iter()
+                .filter(|&scent| !scent || include_senses)
+            {
+                parallel.push(make_pipeline(
+                    kernel,
+                    width,
+                    include_senses,
+                    VisionOptions {
+                        parallel_steps: true,
+                        agent_masks: masks,
+                        object_queries: true,
+                        parallel_scent: scent,
+                    },
+                ));
+            }
+        }
+    }
     // Packed serial waves distinguish useful step parallelism from simply
     // using more of the hardware lanes than the production small-world shape.
     const PACKED_SERIAL_WIDTHS: [u32; 2] = [32, 64];
     parallel.extend(
         PACKED_SERIAL_WIDTHS
-            .map(|width| make_pipeline(kernel, false, width, include_senses, false)),
+            .map(|width| make_pipeline(kernel, width, include_senses, VisionOptions::default())),
     );
     (serial, parallel)
 }
@@ -593,7 +651,12 @@ fn parallel_vision_preserves_hit_order_sky_exit_and_dead_agents() -> TestResult 
     Ok(())
 }
 
-fn upload_random_scene(kernel: &GpuKernel, scene_index: u64, terrain: bool, sparse: bool) {
+pub(super) fn upload_random_scene(
+    kernel: &GpuKernel,
+    scene_index: u64,
+    terrain: bool,
+    sparse: bool,
+) {
     const SCENE_HALF_WIDTH: f32 = 28.0;
     const FOOD_HEIGHT_LIMIT: f32 = 8.0;
     let half_width = if sparse {
@@ -737,6 +800,163 @@ fn parallel_vision_matches_at_agent_mask_population_boundary() -> TestResult {
             &format!("population={population}, final agent dead"),
         )?;
         assert_ray(&bits, &kernel.layout, CENTRE_RAY, SKY_COLOR, 1.0);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU; run explicitly with --ignored --nocapture"]
+fn object_queries_respect_retained_food_and_late_agent_eligibility() -> TestResult {
+    let _vulkan = vulkan_gate::enter();
+    let kernel = make_kernel(CENTRE_SIDE, CENTRE_SIDE, 2, FOOD_GRID_MAX_PER_CELL + 1);
+    let (serial, parallel) = pipeline_pair(&kernel, true);
+    let observer = Vec3::Y;
+    let sample = Vec3::new(0.0, 1.0, FIRST_SAMPLE);
+    let far_agent = Vec3::splat(MAX_DISTANCE);
+    /// All retained food shares the sample's grid cell but is outside the ray.
+    const MISSED_FOOD: Vec3 = Vec3::new(6.0, 6.0, 6.0);
+    let mut food = vec![MISSED_FOOD; FOOD_GRID_MAX_PER_CELL + 1];
+    food[FOOD_GRID_MAX_PER_CELL] = sample;
+    for retained in [false, true] {
+        if retained {
+            food.swap(0, FOOD_GRID_MAX_PER_CELL);
+        }
+        upload_scene(&kernel, &[observer, far_agent], &food, 0.0);
+        // Production insertion increments the count even when storage is full.
+        let width = grid_width(kernel.world_config.world_size);
+        let cell = width / 2 * width + width / 2;
+        let offset = u64::try_from(cell * FOOD_GRID_CELL_STRIDE * std::mem::size_of::<u32>())?;
+        kernel.queue.write_buffer(
+            &kernel.food_grid_buffer,
+            offset,
+            bytemuck::cast_slice(&[u32::try_from(food.len())?]),
+        );
+        let bits = assert_parity(
+            &kernel,
+            &serial,
+            &parallel,
+            &format!("food overflow target retained={retained}"),
+        )?;
+        assert_ray(
+            &bits,
+            &kernel.layout,
+            CENTRE_RAY,
+            if retained { FOOD_COLOR } else { SKY_COLOR },
+            if retained {
+                FIRST_SAMPLE / MAX_DISTANCE
+            } else {
+                1.0
+            },
+        );
+    }
+
+    let target = Vec3::new(0.0, 1.0, GRID_CELL_SIZE);
+    upload_scene(
+        &kernel,
+        &[observer, target],
+        &vec![far_agent; food.len()],
+        0.0,
+    );
+    upload_grid(
+        &kernel,
+        &[observer, Vec3::new(0.0, 1.0, GRID_CELL_SIZE * 2.0)],
+        AGENT_GRID_CELL_STRIDE,
+        &kernel.agent_grid_buffer,
+    );
+    let bits = assert_parity(
+        &kernel,
+        &serial,
+        &parallel,
+        "earlier geometric hit ineligible, later sample eligible",
+    )?;
+    /// Sample seven is the first centre in the neighboring eight-unit cell.
+    const FIRST_REGISTERED_SAMPLE: f32 = 7.0;
+    assert_ray(
+        &bits,
+        &kernel.layout,
+        CENTRE_RAY,
+        AGENT_COLOR,
+        (FIRST_REGISTERED_SAMPLE * FIRST_SAMPLE) / MAX_DISTANCE,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU; run explicitly with --ignored --nocapture"]
+fn parallel_scent_preserves_order_chunks_range_and_heritable_strength() -> TestResult {
+    let _vulkan = vulkan_gate::enter();
+    /// Counts cover empty worlds and one/two incomplete 256-item chunks.
+    const FOOD_COUNTS: [usize; 4] = [0, 1, 257, 513];
+    /// Small strengths expose accumulation changes without saturating the output.
+    const STRENGTHS: [f32; 6] = [0.0, 0.001, 0.05, 1.0, 5.0, 500.0];
+    let just_inside = f32::from_bits(SCENT_RANGE.to_bits() - 1);
+    let just_outside = f32::from_bits(SCENT_RANGE.to_bits() + 1);
+    for food_count in FOOD_COUNTS {
+        let kernel = make_kernel(
+            CENTRE_SIDE,
+            CENTRE_SIDE,
+            u32::try_from(STRENGTHS.len())?,
+            food_count,
+        );
+        let (serial, parallel) = pipeline_pair(&kernel, true);
+        for distance in [just_inside, SCENT_RANGE, just_outside] {
+            let food: Vec<_> = (0..food_count)
+                .map(|item| {
+                    if item == 0 {
+                        Vec3::new(-NOSTRIL_SIDE_OFFSET - distance, 0.0, NOSTRIL_FORWARD_OFFSET)
+                    } else {
+                        /// Vary contribution magnitude and separate the two nostrils.
+                        const POSITION_PERIOD: usize = 29;
+                        let horizontal = (item % POSITION_PERIOD) as f32 - SCENT_RANGE * 0.5;
+                        let depth =
+                            ((item / POSITION_PERIOD) % POSITION_PERIOD) as f32 - SCENT_RANGE * 0.5;
+                        Vec3::new(horizontal, 0.0, depth)
+                    }
+                })
+                .collect();
+            upload_scene(&kernel, &vec![Vec3::Y; STRENGTHS.len()], &food, 0.0);
+            for (agent, &strength) in STRENGTHS.iter().enumerate() {
+                kernel.write_agent_heritable_config(
+                    u32::try_from(agent)?,
+                    &BrainConfig {
+                        smell_strength: strength,
+                        ..BrainConfig::default()
+                    },
+                );
+            }
+            /// Mix live and consumed items across every chunk, keeping item zero.
+            const CONSUMED_PERIOD: usize = 3;
+            let flags: Vec<u32> = (0..food_count)
+                .map(|item| u32::from(item % CONSUMED_PERIOD == 1))
+                .collect();
+            kernel
+                .queue
+                .write_buffer(&kernel.food_flags_buffer, 0, bytemuck::cast_slice(&flags));
+            let bits = assert_parity(
+                &kernel,
+                &serial,
+                &parallel,
+                &format!("food={food_count}, first distance={distance:?}"),
+            )?;
+            let scent_start = kernel.layout.sensory_stride - SCENT_CHANNELS;
+            for (agent, values) in bits.chunks_exact(kernel.layout.sensory_stride).enumerate() {
+                let scent = &values[scent_start..];
+                if food_count == 0
+                    || (food_count == 1 && distance >= SCENT_RANGE)
+                    || STRENGTHS[agent] == 0.0
+                {
+                    assert!(
+                        scent.iter().all(|&value| f32::from_bits(value) == 0.0),
+                        "empty, out-of-range, or disabled scent must be zero"
+                    );
+                } else {
+                    assert!(
+                        f32::from_bits(scent[0]) > 0.0,
+                        "live in-range food must produce scent"
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -892,7 +1112,7 @@ fn benchmark_pipelines(
     let best_serial = parallel
         .iter()
         .zip(&timings[1..])
-        .filter(|(pipeline, _)| !pipeline.parallel_steps)
+        .filter(|(pipeline, _)| !pipeline.options.parallel_steps)
         .map(|(_, samples)| samples[TIMING_ROUNDS / 2])
         .fold(baseline, f64::min);
     let population = kernel.agent_count;
@@ -900,9 +1120,11 @@ fn benchmark_pipelines(
     for (pipeline, samples) in parallel.iter().zip(&timings[1..]) {
         let median = samples[TIMING_ROUNDS / 2];
         let group = pipeline.rays_per_group;
-        let masks = pipeline.agent_masks;
-        let parallel_steps = pipeline.parallel_steps;
-        println!("VISION_GPU_NS agents={population} scene={scene} scope={scope} parallel_steps={parallel_steps} rays_per_group={group} masks={masks} median={median:.1} min={:.1} speedup={:.3} best_serial_speedup={:.3}", samples[0], baseline / median, best_serial / median);
+        let masks = pipeline.options.agent_masks;
+        let parallel_steps = pipeline.options.parallel_steps;
+        let objects = pipeline.options.object_queries;
+        let scent = pipeline.options.parallel_scent;
+        println!("VISION_GPU_NS agents={population} scene={scene} scope={scope} parallel_steps={parallel_steps} rays_per_group={group} masks={masks} objects={objects} scent={scent} median={median:.1} min={:.1} speedup={:.3} best_serial_speedup={:.3}", samples[0], baseline / median, best_serial / median);
     }
     Ok(())
 }

@@ -337,6 +337,10 @@ fn print_state_hashes(kernel: &mut GpuKernel) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_arm(options: &Options, arm: &str) -> Result<(), Box<dyn Error>> {
+    if arm == "serial" {
+        std::env::set_var("XAGENT_VISION_OBJECT_QUERIES", "0");
+        std::env::set_var("XAGENT_VISION_PARALLEL_SCENT", "0");
+    }
     // Set before creating any GPU device or worker thread.
     std::env::set_var(
         "XAGENT_VISION_PARALLEL_STEPS",

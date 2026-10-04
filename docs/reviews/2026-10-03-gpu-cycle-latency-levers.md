@@ -216,8 +216,9 @@ On the AMD Raphael iGPU the extra dispatch did not slow the serial cycle: 10 age
 ## Exact parallel samples and registered-agent masks (2026-10-04)
 
 The follow-up starts from `e8b07c7`, which already contains R1, R2 and R4.
-The requested target is at least 10× acceleration with precision intact; the
-representative workloads measured so far do **not** establish that target.
+The requested target is at least **10× for the entire simulation** with
+precision intact; the representative workloads measured so far do **not**
+establish that target.
 Comparisons against the original 13,050 ticks/sec M3 Max measurement would mix
 hardware and revisions and are not used here.
 
@@ -307,9 +308,149 @@ the brain and other phases remain unchanged. The original profile's 40% ray
 share would cap even free rays at 1.67× whole-cycle speed. Further experiments
 must remove other work or its serial dependencies as well.
 
-Two exact candidates remain unmeasured: transpose object tests into discrete
-sample intervals using monotone coordinate bounds, while retaining grid
-membership and all terrain/sky samples; and compute scent contributions in
-parallel while adding them in the original food-index order. Approximate
-sphere depths, reordered floating-point sums, lower resolution and reduced
-vision frequency do not satisfy the precision requirement.
+Approximate sphere depths, reordered floating-point sums, lower resolution
+and reduced vision frequency do not satisfy the precision requirement.
+
+### Cached object queries and ordered scent
+
+Two additional opt-in implementations retain the discrete reference results:
+
+- `XAGENT_VISION_OBJECT_QUERIES=1` caches retained food and agent positions
+  cooperatively, rejects impossible objects using sample endpoint bounds,
+  and finds the first candidate sample with a monotone dominant-coordinate
+  search. It evaluates the original squared-distance expression at candidate
+  samples; agent membership is checked at every geometric hit, using the
+  registered grid rather than a post-collision spatial reconstruction.
+  Capacity is 32 agents and 256 foods; larger scenes use parallel samples.
+- `XAGENT_VISION_PARALLEL_SCENT=1` computes independent food contributions in
+  parallel, then accumulates them in the original ascending food-index order,
+  preserving both conditional nostril additions and the final expression.
+  Chunks of 256 support arbitrary food counts without unbounded shared memory.
+
+Both flags imply parallel vision and use a separate vision dispatch to avoid
+reserving their shared caches alongside every brain workgroup. Defaults are
+unchanged. This schedule change contributes to the overall measured gain and
+must not be attributed solely to the object-query algorithm.
+
+The full seven-test GPU matrix passes against a pure serial pipeline composed
+only from the unchanged ray/senses source and a serial entry point, excluding
+all cooperative fragments and their shared storage from the baseline.
+Coverage includes capped food-grid overflow, delayed agent-grid eligibility,
+31/32/33-agent mask boundaries, sky ordering, dead observers, dynamic fields
+of view and vision sizes, scent range boundaries, and 257/513-food chunks.
+
+For ten agents, the fastest full-vision variant in each measured scene uses
+four rays per group, candidate masks and ordered parallel scent; object
+queries are exact but did not beat that variant on this adapter:
+
+| Frozen scene | Pure serial vision + senses | Best measured vision + senses | Speedup |
+|---|---:|---:|---:|
+| Dense flat | 188.376 µs | 44.543 µs | 4.229× |
+| Dense terrain | 124.290 µs | 45.075 µs | 2.757× |
+| Sparse flat | 107.470 µs | 33.606 µs | 3.198× |
+| Synthetic 25-sample open rays | 242.733 µs | 32.098 µs | 7.562× |
+
+Packing the serial baseline into 32/64-ray groups improves some scenes;
+relative to the fastest measured serial grouping, those gains are 3.896×,
+2.757×, 3.198× and 3.736× respectively. The synthetic ray-only case reaches
+12.220× against the default grouping but 5.447× against packed serial; neither
+is a whole-simulation result.
+
+With object queries, masks and ordered scent, three alternating pairs of
+10,000 advancing ticks give **1.492636 s serial / 1.131062 s optimized
+(1.320×)**, with all six public-state hashes matching across arms and runs.
+A longer 100,000-tick pair gives **14.885979 s / 11.387694 s (1.307×)** with
+matching hashes. The whole-simulation 10× target remains unmet.
+
+```sh
+XAGENT_VISION_OBJECT_QUERIES=1 XAGENT_VISION_PARALLEL_SCENT=1 \
+  XAGENT_VISION_AGENT_MASKS=1 cargo run --release -p xagent-brain \
+  --example vision_performance -- --ticks 100000 --repeats 1
+```
+
+The next measurements target real cycle dispatch boundaries, brain resource
+use and the feasibility of a single-workgroup persistent cycle; those
+experiments must preserve the same evolving state before their timing is
+accepted.
+
+
+### Whole-cycle bottleneck after exact vision changes
+
+An in-pass timestamp harness replays the actual production dispatch sequence
+and compares all 13 mutable buffers byte-for-byte against normal execution,
+including full sensory depth, food flags/claims, decisions, grids, brain scratch
+and trails. Each trial restores the same state after 256 warmup brain cycles;
+five alternating timing pairs each advance one normal 24-cycle command chunk.
+The test requests in-pass timestamps only on supporting adapters.
+
+With cached objects, candidate masks and ordered scent, the measured stage
+medians on Raphael are:
+
+| Production dispatch | GPU time per cycle | Share |
+|---|---:|---:|
+| Physics and food claim | 34.30 µs | 3.04% |
+| Main kernel including brain | 1,014.51 µs | 89.87% |
+| Global grid/collision work | 38.15 µs | 3.38% |
+| Vision and senses | 41.94 µs | 3.71% |
+| Sum | 1,128.90 µs | 100% |
+
+Uninstrumented wall time is 1,123.29 µs per cycle; timestamped wall time is
+1,152.39 µs, so instrumentation overhead is reported rather than silently
+included in the simulation speed claim. The default combined schedule takes
+1,458.68 µs uninstrumented in this scene, while separate serial vision takes
+1,184.14 µs. These are a seeded flat-world diagnostic, distinct from the
+rolling-terrain advancing example above.
+
+A separate diagnostic restores the identical warmed state before every
+single-cycle partial-brain trial, rotates limits 0–7 over seven rounds, and
+never feeds partial results into another cycle. Cumulative differences suggest
+approximately 166 µs for encoding, 306 µs for prediction/action, and 319 µs for
+learning/storage, compared with 17 µs for recall scoring and 38 µs for recall
+sorting. These deltas locate work; they are not valid reduced-simulation
+throughput measurements.
+
+Two exact brain resource changes were also measured independently against
+saved binaries. Disabled visual cortex now uses a one-float shared placeholder
+and a creation-time guard; the enabled path is unchanged. This releases about
+6.8 KiB per workgroup but produces no measurable whole-simulation gain
+(1.0008× in three alternating pairs). Encoder and encoder-credit threads now
+visit contiguous output weights while preserving every original four-lane
+sum, bias placement and update expression; three paired runs give 1.017× with
+matching public-state hashes. The two enabled/disabled cortex integration
+tests also pass. A direct comparison against the original brain shader's
+output-major thread mapping and full cortex scratch allocation matches all
+13 mutable buffers for 8×6 and 13×9 fields with cortex both disabled and
+enabled; encoder weights change in every case, so credit-update coverage is
+active. Raw cases use ten agents and 48 comparison cycles, while cortex cases
+use one agent and eight cycles, each submitted separately after an earlier
+large cortex job lost its GPU context. Neither optimization approaches the
+10× whole-simulation target.
+
+```sh
+cargo test --release -p xagent-brain --lib profile_production_cycle_dispatches -- \
+  --ignored --nocapture --test-threads=1
+cargo test --release -p xagent-brain --lib profile_brain_pass_cumulative_costs -- \
+  --ignored --nocapture --test-threads=1
+```
+
+
+### Persistent-world feasibility result
+
+A test-only single-workgroup implementation reuses the production helpers and
+serially reuses one brain scratch allocation across agents, with storage and
+workgroup barriers at every world-wide dependency. It preserves food-claim
+arbitration, sorted grid registration, collision iteration order, sensory lag
+and exact sample arithmetic. All 13 mutable buffers match through initial
+death/respawn and multiple continuation chunks; warmed timing pairs also
+require byte identity before reporting a result.
+
+On Raphael, 1,000 measured ticks after 150 warmup brain cycles take median
+**0.121440 s for production serial / 0.230003 s persistent (0.528×)** over
+three alternating pairs. Serializing the agents outweighs removal of dispatch
+boundaries; the prototype therefore remains test-only. This result provides
+no evidence for a 10× whole-simulation improvement.
+
+```sh
+cargo test --release -p xagent-brain --lib persistent_validation -- \
+  --ignored --nocapture --test-threads=1
+```

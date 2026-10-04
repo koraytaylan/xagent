@@ -160,6 +160,18 @@ pub(super) fn make_kernel(width: u32, height: u32, agents: u32, food_count: usiz
     kernel
 }
 
+/// Build the original ray and senses entry without any cooperative fragments.
+/// Return its own dispatch count so callers cannot reuse an optimized count.
+pub(super) fn pure_serial_pipeline(kernel: &GpuKernel) -> (wgpu::ComputePipeline, u32) {
+    let reference = make_pipeline(
+        kernel,
+        SMALL_POPULATION_RAYS_PER_WORKGROUP,
+        true,
+        VisionOptions::default(),
+    );
+    (reference.pipeline, reference.workgroups)
+}
+
 fn dispatch_mask_builder(kernel: &GpuKernel, entry: &str) {
     let source = [
         include_str!("../shaders/kernel/common.wgsl"),

@@ -28,6 +28,11 @@
 //! The standalone vision composer includes the object-query and parallel-scent
 //! fragments only when enabled, removing their entry-point branches otherwise.
 //! Disabled optional caches therefore declare no workgroup resources.
+//! `XAGENT_BRAIN_COOPERATIVE_WHITENING=1` substitutes ordered interleaved
+//! recall and cooperative whitening in each cooperative brain pipeline.
+//! Whitening borrows existing learning scratch and adds no workgroup resource.
+//! `XAGENT_BRAIN_FUSED_PREDICTOR=1` fuses the inline predictor's update/read
+//! loops; the separately dispatched tiled predictor retains its own source.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -69,11 +74,32 @@ use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
 #[cfg(test)]
+mod brain_allocation;
+#[cfg(test)]
+mod combined_validation;
+#[cfg(test)]
+mod cooperative_whitening_validation;
+#[cfg(test)]
 mod cycle_profile;
 #[cfg(test)]
+mod dispatch_brain_validation;
+#[cfg(test)]
+mod exact_tiled_validation;
+#[cfg(test)]
 mod persistent_validation;
+mod predictor_fusion;
+#[cfg(test)]
+mod predictor_fusion_validation;
+#[cfg(test)]
+mod recall_norm_validation;
+#[cfg(test)]
+mod recall_validation;
 #[cfg(test)]
 mod vision_validation;
+#[cfg(test)]
+mod whitening_storage_validation;
+#[cfg(test)]
+mod whitening_validation;
 
 /// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
 /// dedicated WGSL file so the fragment stays validator-friendly.
@@ -463,6 +489,47 @@ struct AgentStateReadback {
 const TERRAIN_VPS: usize = 129;
 /// Biome grid resolution (cells per side).
 const BIOME_GRID_RES: usize = 256;
+
+/// Compose optional cooperative brain helpers while keeping the disabled
+/// source byte-for-byte identical to the scalar reference. All brain entry
+/// points use 256 invocations and workgroup-uniform agent/alive guards.
+fn compose_brain_passes(cooperative_whitening: bool) -> String {
+    let source = include_str!("shaders/kernel/brain_passes.wgsl");
+    if !cooperative_whitening {
+        return source.to_owned();
+    }
+    const RECALL_DEFINITION: &str = "fn coop_recall_score(agent_id: u32, tid: u32) {";
+    const REFRESH_BLOCK: &str = "    if (u32(tick) % VISION_WHITENING_REFRESH == 0u) {\n        refresh_vision_whitening(brain_base);\n    }\n";
+    const EXPLORATION_BOUNDARY: &str =
+        "    // ── Thread 0: exploration, noise, motor, telemetry ─────────────────────────────────────\n";
+    for marker in [RECALL_DEFINITION, REFRESH_BLOCK, EXPLORATION_BOUNDARY] {
+        assert_eq!(source.matches(marker).count(), 1);
+    }
+    // Predict/act does not otherwise use this scratch. Learning writes all
+    // 256 entries before its first read, so neither death nor a skipped
+    // learning phase can expose the whitening temporaries to another phase.
+    assert!(source.contains("var<workgroup> s_reinf_dot: array<f32, 256>;"));
+    assert!(source.contains("        s_reinf_dot[tid] = dot;\n    }\n    workgroupBarrier();"));
+    let passes = source
+        .replacen(
+            RECALL_DEFINITION,
+            "fn scalar_recall_score_reference(agent_id: u32, tid: u32) {",
+            1,
+        )
+        .replacen(REFRESH_BLOCK, "", 1)
+        .replacen(
+            EXPLORATION_BOUNDARY,
+            &format!(
+                "    cooperative_refresh_vision_whitening(brain_base, tid);\n\n{EXPLORATION_BOUNDARY}"
+            ),
+            1,
+        );
+    [
+        passes.as_str(),
+        include_str!("shaders/kernel/brain_cooperative_whitening.wgsl"),
+    ]
+    .join("\n")
+}
 
 /// Redirect only the scent result after the cooperative helper has completed;
 /// the scalar reference and every other sense retain their original source.
@@ -1400,6 +1467,21 @@ impl GpuKernel {
 
         // ── Compose shader sources (see module-level composition contract) ──
         let common_src = include_str!("shaders/kernel/common.wgsl");
+        let cooperative_whitening =
+            std::env::var("XAGENT_BRAIN_COOPERATIVE_WHITENING").as_deref() == Ok("1");
+        let fused_predictor = std::env::var("XAGENT_BRAIN_FUSED_PREDICTOR").as_deref() == Ok("1");
+        let brain_passes_src = compose_brain_passes(cooperative_whitening);
+        let brain_passes_src = if fused_predictor {
+            predictor_fusion::fuse_inline_predictor(&brain_passes_src)
+        } else {
+            brain_passes_src
+        };
+        if cooperative_whitening || fused_predictor {
+            log::info!(
+                "[GpuKernel] cooperative whitening and interleaved recall={cooperative_whitening}, \
+                 fused inline predictor={fused_predictor}"
+            );
+        }
 
         // Physics pipeline: common + phase fragments + physics entry
         let physics_source = [
@@ -1428,7 +1510,7 @@ impl GpuKernel {
         let brain_source = apply_subgroup_markers(
             &[
                 common_src,
-                include_str!("shaders/kernel/brain_passes.wgsl"),
+                brain_passes_src.as_str(),
                 include_str!("shaders/kernel/brain_tick.wgsl"),
             ]
             .join("\n"),
@@ -1439,7 +1521,7 @@ impl GpuKernel {
         let kernel_source = apply_subgroup_markers(
             &[
                 common_src,
-                include_str!("shaders/kernel/brain_passes.wgsl"),
+                brain_passes_src.as_str(),
                 include_str!("shaders/kernel/brain_inner.wgsl"),
                 include_str!("shaders/kernel/phase_food_claim.wgsl"),
                 include_str!("shaders/kernel/kernel_tick.wgsl"),
@@ -1466,7 +1548,7 @@ impl GpuKernel {
         let brain_vision_source = apply_subgroup_markers(
             &[
                 vision_common.as_str(),
-                include_str!("shaders/kernel/brain_passes.wgsl"),
+                brain_passes_src.as_str(),
                 include_str!("shaders/kernel/brain_inner.wgsl"),
                 vision_into_next.as_str(),
                 include_str!("shaders/kernel/brain_vision_tick.wgsl"),
@@ -1695,7 +1777,7 @@ impl GpuKernel {
         let tail_source = apply_subgroup_markers(
             &[
                 common_src,
-                include_str!("shaders/kernel/brain_passes.wgsl"),
+                brain_passes_src.as_str(),
                 include_str!("shaders/kernel/phase_brain_tail_from_scratch.wgsl"),
             ]
             .join("\n"),

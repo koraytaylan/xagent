@@ -454,3 +454,174 @@ no evidence for a 10× whole-simulation improvement.
 cargo test --release -p xagent-brain --lib persistent_validation -- \
   --ignored --nocapture --test-threads=1
 ```
+
+
+### Whitening and predictor feasibility measurements
+
+RADV shader diagnostics report 248 vector registers per thread, 8 KiB shared
+memory, four subgroups per SIMD and no spills for the main brain pipelines.
+Those allocations motivate experiments but do not by themselves prove which
+source operation causes the cost. Diagnostics use
+[`RADV_DEBUG=shaderstats,nocache`](https://docs.mesa3d.org/envvars.html#radv-driver-environment-variables);
+debug runs are excluded from timing comparisons.
+
+Three further test-only variants preserve every mutable buffer in the tested
+boundary fixtures and every paired timing trial:
+
+| Variant | Production serial | Variant | Whole-simulation ratio |
+|---|---:|---:|---:|
+| Whitening in a separate dispatch, 960 ticks | 0.113836 s | 0.104879 s | 1.085× |
+| Whitening matrices in 512 B shared memory, 960 ticks | 0.113778 s | 0.107371 s | 1.060× |
+| Predictor train/predict fusion, 1,000 ticks | 0.118543 s | 0.114858 s | 1.032× |
+
+Each median uses five alternating pairs from the same 256-cycle warmed
+checkpoint. Whitening tests cover scheduled refreshes, non-diagonal
+covariance, forced deaths and inactive agents; predictor fusion extends
+full-state comparison through 100 cycles. The predictor variant retains each
+clamped weight for its same-lane prediction, preserving the original
+stride-four accumulation and final reduction while removing a reread and a
+barrier per tile.
+
+Both whitening variants still compile the hot brain to 248 vector registers
+per thread. Whitening therefore is not the only cause of that allocation;
+the measured gains cannot support a 10× claim or be multiplied as independent
+speedups. These variants remain test-only while per-phase allocation and
+combined register-pressure experiments identify the remaining cause.
+
+
+### Two independent register-allocation peaks
+
+Compile-only stage diagnostics retain runtime inputs and observable outputs,
+then label each pipeline creation around RADV's allocation report. Encoding,
+features, homeostasis, sorting and learning individually need 16–32 vector
+registers; recall scoring and prediction/action each need 256. Splitting
+whitening alone leaves the recall peak in the combined shader.
+
+Recall reads the same 128 shared key values first for its norm, then again for
+its dot product. Interleaving those two ascending loops preserves each sum's
+order and shortens the time those inputs need to remain live. This is an exact
+source transformation; its compiler effect is measured separately.
+
+Across five rotated three-arm rounds from the same warmed checkpoint:
+
+| Variant, 960 ticks | Median time | Ratio to same serial schedule |
+|---|---:|---:|
+| Production serial | 0.114851 s | 1.000× |
+| Interleaved recall only | 0.114702 s | 1.001× |
+| Interleaved recall + shared whitening | 0.088539 s | 1.297× |
+
+Every arm matches all 13 mutable buffers. Driver diagnostics show the combined
+change reduces the main kernel from 248 to 120 vector registers, increasing
+the reported subgroups per SIMD from four to eight, with no spills. Either
+change alone leaves the other allocation peak. This is evidence for a joint
+compiler-resource effect, not for multiplying isolated benchmark ratios;
+it still does not establish 10× whole-simulation acceleration.
+
+### Cooperative whitening and exact dense tiles
+
+The Jacobi rotations retain their original serial operation order while
+64 invocations independently reconstruct the 64 whitening cells, preserving
+each cell's ascending eight-term sum. With interleaved recall, the test-only
+prototype compiles to 56 vector registers, 18 reported subgroups per SIMD and
+no spills; all 13 mutable buffers match through the same death, inactive-agent
+and refresh boundaries. Five paired 960-tick runs give **0.119816 s serial /
+0.083537 s cooperative (1.434×)**. Isolating whitening into another dispatch
+while interleaving recall gives a similar **1.429×**, at the cost of two extra
+dispatches per cycle.
+
+A separate exact tiled experiment retains the canonical feature, cortex,
+adaptation and alive-agent handling, the original four partial sums and bias
+placement, and both feature and encoded scratch inputs for the tail. It uses
+a separate transient buffer, allowing all 13 production buffers to remain
+byte-identical. This differs from the existing `ParallelTiled` mode, whose
+16-partial arithmetic and feature handling do not match the serial oracle.
+
+Both exact tile widths match through 100 cycles, including forced deaths and
+refresh boundaries, and every timing pair compares all mutable state:
+
+| Outputs per tile, 1,000 ticks | Serial median | Tiled median | Ratio |
+|---|---:|---:|---:|
+| 16 (64 invocations) | 0.118764 s | 0.110002 s | 1.080× |
+| 32 (128 invocations) | 0.120334 s | 0.106947 s | 1.125× |
+
+These five-pair measurements favor cooperative whitening over the nine-dispatch
+exact tiled schedule on this adapter. They compare the same separate-vision
+schedule within each trial, and must not be multiplied by the earlier vision
+ratios to infer a combined speedup. The whole-simulation 10× target remains
+unmet.
+
+### Combined production opt-ins
+
+The production cooperative path borrows 128 entries of existing learning
+scratch for whitening; learning overwrites all 256 entries before reading
+them. This avoids adding a shared-memory allocation or Metal resource slot.
+The untouched serial shader remains the disabled path and the independent
+test oracle. Cortex-enabled and odd 13×9 layouts match all 13 mutable buffers;
+raw death/refresh/inactive fixtures match through 41 cycles. Combined with
+the fused predictor, the brain path matches through 100 cycles and gives
+1.500× against the same separate-vision schedule in five paired trials.
+
+The full production configuration combines cooperative whitening/interleaved
+recall, fused inline prediction, cached vision objects, registered candidate
+masks and ordered parallel scent. In the rolling-terrain seeded example,
+three alternating 10,000-tick pairs give **1.519204 s default / 0.756920 s
+optimized (2.007×)**, with all six public-state hashes matching. A 100,000-tick
+pair gives **14.922522 s / 7.337975 s (2.034×)** with matching hashes. The default
+arm uses combined brain/vision; the optimized arm uses separate vision as
+required by its caches. These are measured whole-configuration ratios, not
+products of separate speedups. Public hashes retain their documented coverage
+limits; construction and readback remain outside the timed interval.
+
+```sh
+XAGENT_BRAIN_COOPERATIVE_WHITENING=1 XAGENT_BRAIN_FUSED_PREDICTOR=1 \
+XAGENT_VISION_OBJECT_QUERIES=1 XAGENT_VISION_PARALLEL_SCENT=1 \
+XAGENT_VISION_AGENT_MASKS=1 cargo run --release -p xagent-brain \
+  --example vision_performance -- --ticks 100000 --repeats 1
+```
+
+A fresh in-pass profile of the optimized flat-world fixture measures 34.25 µs
+claim, 624.67 µs main/brain, 37.68 µs global and 40.93 µs vision per cycle;
+uninstrumented wall time is 728.05 µs, instrumented 758.69 µs. The brain remains
+84.70% of GPU stage time. Adding cooperative whitening to the exact 32-output
+tiled experiment improves it to 1.329× against its separate serial reference,
+but is slower than the production cooperative/fused-predictor combination.
+
+**The requested 10× entire-simulation target has not been achieved.** Results
+above are local to the two-compute-unit Raphael integrated GPU and do not
+establish speedups on the original review's M3 Max. All production additions
+are opt-in; their applicability is preserved without changing the defaults.
+The objective is GPU-independent efficiency: these transformations retain
+portable WGSL arithmetic, workgroup synchronization and workload-based
+fallbacks, with no device-name or vendor-specific selection. Local register
+counts explain an observed effect rather than define the intended hardware.
+
+The complete combination also passes direct 13-buffer comparison against
+independently compiled serial brain and pure serial vision for 8×6 and 9×7
+fields over 100 cycles, including death and whitening-refresh boundaries.
+Both arms use the separate-vision schedule and identical grid/mask generation
+so the auxiliary buffer contents remain directly comparable. Another test
+compares original and optimized brain sources through combined brain/vision,
+split serial and standalone masked dispatches, each with native subgroups
+and the workgroup fallback: all six cases match all 13 buffers over 41 cycles.
+
+The required sandbox suite passes all 284 tests when serialized. An initial
+parallel run timed out waiting for a generation-budget worker event; that
+test passed in isolation and in the full serialized rerun.
+Formatting, workspace-wide Clippy with all targets and warnings denied, and
+the 79 normal brain-library unit tests also pass; the hardware-only checks
+above were run explicitly in addition to that ordinary unit-test command.
+
+### Sharing the ordered recall norm
+
+A further portable experiment assigns an otherwise unused invocation to
+compute the identical ascending query norm once while the pattern invocations
+compute their unchanged dots. A barrier publishes the norm through existing
+scratch before similarities are calculated. At 128 active patterns this
+removes 127 repeated 128-term norm calculations and square roots per agent,
+while retaining the distinct tree-reduction norm used later by learning.
+
+All 13 buffers match through 100 cycles and every paired timing trial.
+Five warmed 1,000-tick pairs give **0.077538 s current optimized brain /
+0.076794 s shared norm (1.010×)**. This small observed difference is not
+enough to establish a broadly useful timing gain, so the variant remains
+test-only and is excluded from the reported 2.034× production configuration.

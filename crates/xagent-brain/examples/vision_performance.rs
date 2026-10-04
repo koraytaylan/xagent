@@ -1,4 +1,4 @@
-//! Paired, seeded full-simulation timing of serial and parallel ray steps.
+//! Paired, seeded full-simulation timing of exact opt-in GPU optimizations.
 //!
 //! Run with `cargo run --release -p xagent-brain --example vision_performance --
 //! --ticks 10000 --agents 10 --seed 42 --width 8 --height 6`. Each arm runs in
@@ -8,6 +8,8 @@
 //! The scene is synthetic: rolling terrain, hazard bands, food and colliding
 //! agents. Both arms advance the same warmup before timing subsequent ticks.
 //! Readbacks and pipeline construction are outside the measured interval.
+//! The serial arm disables optional vision and brain transforms; the parallel
+//! arm inherits selected transforms from the environment and enables ray steps.
 //!
 //! Matching hashes cover public readback state, not every private GPU buffer.
 //! In particular, final vision depth, food flags and the full decision buffer
@@ -340,6 +342,8 @@ fn run_arm(options: &Options, arm: &str) -> Result<(), Box<dyn Error>> {
     if arm == "serial" {
         std::env::set_var("XAGENT_VISION_OBJECT_QUERIES", "0");
         std::env::set_var("XAGENT_VISION_PARALLEL_SCENT", "0");
+        std::env::set_var("XAGENT_BRAIN_COOPERATIVE_WHITENING", "0");
+        std::env::set_var("XAGENT_BRAIN_FUSED_PREDICTOR", "0");
     }
     // Set before creating any GPU device or worker thread.
     std::env::set_var(
@@ -366,7 +370,7 @@ fn run_arm(options: &Options, arm: &str) -> Result<(), Box<dyn Error>> {
         .checked_mul(WARMUP_BATCHES)
         .ok_or("Warmup overflow")?;
     advance_and_drain(&mut kernel, 0, warmup);
-    println!("SCENE synthetic agents={} seed={} vision={}x{} warmup_ticks={warmup} timed_ticks={} execution={} vision_stride={} brain_beside_vision={}",
+    println!("SCENE synthetic agents={} seed={} vision={}x{} warmup_ticks={warmup} timed_ticks={} execution={} vision_stride={} brain_beside_vision_requested={}",
         options.agents, options.seed, options.width, options.height, options.ticks,
         options.execution_name(), options.vision_stride,
         std::env::var("XAGENT_BRAIN_BESIDE_VISION").unwrap_or_else(|_| "default".into()));

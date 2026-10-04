@@ -2226,11 +2226,10 @@ which remains test-only. Logs are `agent-projection-raw.log`,
 
 ### Remaining architectural limits and verification
 
-A possible smaller follow-up is a 128-thread version of the new global
-projection dispatch: all arithmetic owners already fit in 128 lanes, but
-both predicted-input copy strides and all six world-loop strides must also
-change, with an agent-count guard and grid-capacity checks. Longer world
-loops could offset any occupancy gain; it has not been implemented or timed.
+The 128-thread global projection follow-up is now implemented and tested,
+including both predicted-input copy strides and all six world-loop strides,
+an agent-count guard and grid-capacity checks. Its measured results are
+recorded below with the binding-layout and workgroup-initialization checks.
 
 An algebraic recurrence could avoid more visual-matrix work, but FP32
 weight rounding, clamping and adaptation rounding leave dense residuals
@@ -2262,3 +2261,207 @@ documentation, with no production behavior or dependencies changed. The
 the unchanged production code and was not repeated. None of the three
 candidates changes the 3.887× committed production headline, and the 10×
 whole-simulation goal remains unmet.
+
+### Minimal bindings for each dispatch entry
+
+The production layout binds eighteen resources throughout the cycle. A
+test-only candidate uses Naga's transitive entry-point usage to omit unused
+bindings, retaining the original WGSL text, declared storage access modes,
+buffer allocations and arithmetic. Resources used only by a reachable
+helper, an array-length query or an atomic operation remain bound. A CPU
+fixture checks those distinctions, including an unused resource referenced
+only by another entry point.
+
+| Entry | Original bindings | Retained bindings |
+|---|---:|---:|
+| Claim | 18 | 9 |
+| Main128 | 18 | 11 |
+| Global world and packed credit | 18 | 14 |
+| Vision | 18 | 10 |
+
+The custom full-layout control retains production pipeline handles and
+first matches the production recorder. It and the minimal-layout candidate
+then pass exact thirteen-buffer, private-mirror and inactive-agent checks
+for both raw fields through 100 cycles, death/refresh and two replays on
+both tested backends. Both custom arms issue the same binding calls and use
+the same tick, trail, chunk, import and completion schedule.
+
+Five alternating 100-cycle pairs after 1,000 warmup cycles measure:
+
+| Backend | Reference / candidate median | Whole-simulation speedup |
+|---|---:|---:|
+| GPU | 0.036347383 / 0.036429736 s | 0.997739× |
+| CPU Vulkan | 0.079794923 / 0.080174472 s | 0.995266× |
+
+Cold import and completion are timed; state comparisons are not. The two
+focused checks pass on each backend, but the narrower layout gives no
+measured acceleration and remains test-only. Logs are
+`minimal-bindings-gpu.log` and `minimal-bindings-lavapipe.log`.
+
+The source audit explains why omitted bindings do not remove the cycle's
+true dependencies. In the pinned wgpu-core 24.0.5, each compute dispatch
+merges every active bind group's tracked resources; buffer tracking has one
+state per allocation, without subrange tracking. The Vulkan HAL emits
+whole-buffer memory barriers with shader-stage execution dependencies.
+Claim/main physics and claim data, main/global features and credit,
+global/vision positions and grids, and vision/next-main sensory data still
+require synchronization. Splitting one allocation into binding ranges
+would not change that tracker granularity. This experiment neither changes
+read/write declarations nor separates physical buffers, and it does not
+measure actual cache-flush traffic. Metal's corresponding explicit buffer
+transition hook is empty, so these Vulkan implementation details do not
+establish a portable barrier-cost claim.
+
+### Compiler-generated workgroup initialization
+
+A separate raw-only candidate disables
+`zero_initialize_workgroup_memory` for claim, main128 and vision while
+retaining storage bounds checks, storage initialization, arithmetic and all
+source barriers. The production global/world/packed-credit pipeline stays
+unchanged; it declares no workgroup storage. The written-before-read audit
+covers only the complete raw-vision route. Partial cortex paths can return
+before publishing their visual feature head and depend on implicit zeros,
+so this is not a general permission to disable initialization.
+
+The pinned Naga SPIR-V initialization polyfill and MSL writer initialize
+workgroup globals used by the selected entry point, rather than every
+declaration in its module. The polyfill adds initialization stores and a
+barrier; Vulkan can instead express zero initialization through a native
+initializer. These are source-level implementation facts, not measurements
+of initialization cost on every backend.
+
+Three controls make the bounded audit observable: explicitly initialized
+source, initialization disabled with every declared workgroup object filled
+with varying finite nonzero poison before entry execution, and initialization
+disabled without poison. All pass exact thirteen-buffer, private-mirror and
+inactive-agent comparisons for 8×6 and 9×7 raw fields, 100 cycles,
+death/refresh and two replays on both backends. Poison covers the 31 declared
+objects in the main/claim module and five in vision, including atomic and
+vector arrays; this declaration inventory is not a count of reachable
+initialization stores. The poison arm is excluded from timing.
+
+Five alternating 100-cycle pairs after 1,000 warmup cycles give:
+
+| Backend | Production / no-initialization median | Whole-simulation speedup |
+|---|---:|---:|
+| GPU | 0.039923661 / 0.039212362 s | 1.018140× |
+| CPU Vulkan | 0.080327218 / 0.079459337 s | 1.010922× |
+
+Both focused checks pass on each backend. Completion and cold import are
+timed, with the same production recorder and unchanged global pipeline.
+The small measured gain and deliberately limited audit leave this option
+test-only; production initialization remains enabled. Logs are
+`workgroup-init-gpu.log` and `workgroup-init-lavapipe.log`.
+
+### Projection workgroups with 128 global invocations
+
+The per-agent projection experiment now compares the production reference
+with both 256- and 128-invocation global dispatches. Both candidates retain
+the original 128 arithmetic owners. The smaller variant also changes both
+predicted-input copy strides and the six world clear, registration, respawn
+and sorting loop strides. Direct agent phases require the population to fit
+the selected width; every-cycle untimed checks exclude grid overflow, whose
+retained insertion winners are not guaranteed across schedules. Neither
+variant adds a dispatch or changes the private-cache layout.
+
+The actual-source raw probe checks **42,496 output rows per backend** across
+the two widths: 21,248 per width, comprising 8,960 cached and 12,288 fallback
+rows. All match fresh-dot bits and satisfy the unchanged FP64-derived
+round-to-nearest/FTZ comparison bound; the largest observed error-to-bound
+ratio is 0.026388. Canonical scalar-credit and private/public matrix checks
+remain exact. These results describe the observed compiled shaders, not a
+universal floating-point contraction guarantee.
+
+All four focused checks pass on each backend. Both widths preserve all
+thirteen public buffers, private mirrors and inactive state through the
+two raw fields, 100 cycles, death/refresh and replay. Held raw inputs at
+cycles 40 and 41 guarantee reuse alongside fallback. Each width records
+11/889 hits/misses for 8×6 on both backends; for 9×7 the GPU records 9/891
+and the CPU backend 11/889. Predicted-input publication also matches the
+actual raw-minus-stored-mean bits for 2,160/2,835 live visual words in the
+two layouts. These are within-backend comparisons, not cross-backend
+trajectory equality or production cache-lifecycle integration.
+
+Five rotated three-arm trials of 100 cycles after 1,000 warmup cycles give:
+
+| Backend | Global invocations | Reference / candidate median | Whole-simulation speedup | Reuse hits / misses |
+|---|---:|---:|---:|---:|
+| GPU | 256 | 0.035464074 / 0.035765056 s | 0.991584× | 842 / 158 |
+| GPU | 128 | 0.035464074 / 0.035784781 s | 0.991038× | 842 / 158 |
+| CPU Vulkan | 256 | 0.079647709 / 0.089425257 s | 0.890662× | 921 / 79 |
+| CPU Vulkan | 128 | 0.079647709 / 0.089239470 s | 0.892517× | 921 / 79 |
+
+Both candidates use eleven global workgroups for ten agents, 25,920 bytes
+of additional private storage and 960/1,264 bytes of workgroup storage for
+the two fields. Completion, cold import and raw-value publication remain
+inside the timing; readbacks and per-cycle overflow inspection are outside.
+The smaller global group does not yield a useful whole-cycle gain, and
+neither projection variant is promoted. Logs are
+`agent-projection-width-gpu.log` and `agent-projection-width-lavapipe.log`.
+These independent test-only measurements leave the committed **3.887×**
+production result unchanged; no combined gain is inferred from their ratios.
+
+### Clearing and sorting only registered grid cells
+
+The sparse-grid candidate retains the production main128 and packed-credit
+schedule, but records each food or agent's insertion cell in private
+metadata before collisions can move it. The next warm global pass clears
+counts only in those previously registered cells and clears the associated
+agent visibility masks. After canonical registration and respawn, only
+currently occupied cells are sorted. Each cell's first retained item selects
+one sorting owner; an unconditional barrier fixes all ownership decisions
+before sorting can change that first item. Original insertion-sort bodies,
+claims, collision scratch clearing, collisions, trails and credit arithmetic
+are retained.
+
+Skipped, consumed, dead and out-of-bounds registrations explicitly receive
+zero metadata; successful food respawn records its new cell. Cold or
+invalid metadata takes the original full clear and sort. The ten-agent,
+104-food fixture adds **120 words (480 bytes)**, including its six-word
+header, to the aligned private prefix. It adds no workgroup storage or
+dispatch. Cache import, restored/parked arm activation, seeded reset and
+host brain writes explicitly invalidate the test's metadata. This lifecycle
+is managed by the harness and has not been integrated into production APIs.
+
+All three focused checks pass on the GPU and CPU Vulkan backend. For both
+raw fields, 100-cycle trajectories and two replays compare all thirteen
+buffers, inactive state and private/public matrices through death and
+refresh; full grid comparisons include stale tails and visibility masks.
+Fourteen additional transition steps cover consumed/respawned/out-of-bounds
+food, inactive agents and reactivation, a mismatched geometry header, seeded
+reset and a host weight write. The collision fixture explicitly crosses a
+cell boundary and checks that metadata still contains the pre-collision
+registration. Successful respawn must publish an available food and a
+nonzero registration code. Both item populations are bounded by 256, and
+each compared or timing-preflight cycle checks grid capacity. Overflowing
+cells, whose retained atomic-insertion winners can change, are outside the
+claimed parity scope.
+
+Five alternating 100-cycle pairs after 1,000 warmup cycles measure:
+
+| Backend | Reference / candidate median | Whole-simulation speedup |
+|---|---:|---:|
+| GPU | 0.035554072 / 0.034444029 s | 1.032227× |
+| CPU Vulkan | 0.080017259 / 0.079678316 s | 1.004254× |
+
+The same production recorder is used in both arms. Completion, the first
+cold full clear/sort and private-cache import are timed; state and metadata
+readbacks are not. This small, backend-dependent gain remains test-only,
+with no change to the committed production result. Logs are
+`sparse-grid-gpu.log` and `sparse-grid-lavapipe.log`.
+
+### Verification of dispatch overhead and sparse maintenance
+
+All **123 normal debug brain tests**, **eleven focused GPU checks**, their
+**eleven CPU Vulkan counterparts**, formatting and workspace Clippy across
+all targets with warnings denied pass. The normal check logs are
+`dispatch-grid-brain-debug.log` and `dispatch-grid-clippy.log`. The release
+source checks also pass after correcting a reserved WGSL identifier in the
+minimal-binding toy fixture; that run deliberately excludes the existing
+debug-assertion-only test, which passes in the complete debug suite.
+
+These changes affect test modules, test shaders and this review only, with
+no production behavior or dependency changes. The previously recorded
+284-test serial sandbox result covers the unchanged production tree and
+was not repeated. The four experiments do not change the committed
+**3.887×** whole-simulation result; the requested **10×** remains unmet.

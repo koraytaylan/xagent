@@ -1,5 +1,5 @@
 //! Test-only encoder projection computed beside actual packed credit updates.
-//! One 256-thread global workgroup per agent updates all packed weights and
+//! One 128- or 256-thread global workgroup per agent updates all packed weights and
 //! forms four original visual-prefix sums, seeded with the lane-zero bias.
 //! Predicted inputs come from current raw vision and the stored adapted mean.
 //! The next encoder reuses those partials only if all visual input bits match;
@@ -28,8 +28,11 @@ const AGENTS: u32 = 10;
 const FIXTURE_SEED: u64 = 0x194f_c3a7;
 /// Typed storage vectors own four adjacent outputs.
 const VECTOR_WORDS: usize = 4;
-/// World remains 256-thread; only 128 owners perform encoder arithmetic.
-const CREDIT_THREADS: usize = 256;
+/// Both choices retain the same 128 encoder owners; world follows that width.
+pub(super) const GLOBAL_THREADS: [u32; 2] = [256, 128];
+const ARM_COUNT: usize = GLOBAL_THREADS.len() + 1;
+/// Clear, food registration/respawn, and grid ordering cover six strided loops.
+const WORLD_STRIDED_LOOPS: usize = 6;
 /// Preserve the canonical four ascending feature recurrences.
 const PARTIAL_LANES: usize = 4;
 /// Each equality-gate invocation checks eight consecutive visual features.
@@ -95,15 +98,21 @@ pub(super) struct ProjectionLayout {
     features_per_group: usize,
     gate_groups: usize,
     pub(super) shared_bytes: usize,
+    pub(super) global_threads: u32,
 }
 
 impl ProjectionLayout {
     pub(super) fn new(kernel: &GpuKernel) -> Self {
+        Self::with_threads(kernel, GLOBAL_THREADS[0])
+    }
+
+    pub(super) fn with_threads(kernel: &GpuKernel, global_threads: u32) -> Self {
         assert!(!kernel.layout.visual_cortex_enabled);
-        assert!(kernel.agent_count > 0);
+        assert!(GLOBAL_THREADS.contains(&global_threads));
+        assert!(kernel.agent_count > 0 && kernel.agent_count <= global_threads);
         assert!(ENCODED_DIMENSION.is_multiple_of(VECTOR_WORDS));
         let output_vectors = ENCODED_DIMENSION / VECTOR_WORDS;
-        assert!(CREDIT_THREADS.is_multiple_of(output_vectors));
+        assert!(usize::try_from(global_threads).unwrap() >= PARTIAL_LANES * output_vectors);
         let features_per_group = GATE_FEATURES;
         let visual_count = kernel.layout.vision_color_count + kernel.layout.vision_depth_count;
         let gate_groups = visual_count.div_ceil(features_per_group);
@@ -152,16 +161,25 @@ impl ProjectionLayout {
             features_per_group,
             gate_groups,
             shared_bytes,
+            global_threads,
         }
     }
 
     fn header(&self) -> String {
-        format!(
+        let mut header = format!(
             "\nconst PROJECTION_STORAGE_BASE: u32 = {}u;\nconst PROJECTION_AGENT_STRIDE: u32 = {}u;\nconst PROJECTION_VISUAL_COUNT: u32 = {}u;\nconst PROJECTION_GATE_GROUP_COUNT: u32 = {}u;\nconst PROJECTION_FEATURES_PER_GROUP: u32 = {}u;\nconst PROJECTION_VALID_OFFSET: u32 = {}u;\nconst PROJECTION_USED_OFFSET: u32 = {}u;\nconst PROJECTION_HITS_OFFSET: u32 = {HITS_OFFSET}u;\nconst PROJECTION_MISSES_OFFSET: u32 = {MISSES_OFFSET}u;\nconst PROJECTION_DEATH_OFFSET: u32 = {}u;\nconst PROJECTION_RAW_OFFSET: u32 = {}u;\nconst PROJECTION_PARTIAL_OFFSET: u32 = {}u;\n",
             self.base_words, self.agent_stride, self.visual_count, self.gate_groups,
             self.features_per_group, self.valid_offset, self.used_offset,
             self.death_offset, self.raw_offset, self.partial_offset,
+        );
+        use std::fmt::Write;
+        writeln!(
+            header,
+            "const PROJECTION_GLOBAL_THREADS: u32 = {}u;",
+            self.global_threads
         )
+        .unwrap();
+        header
     }
 }
 
@@ -239,6 +257,7 @@ pub(super) fn global_source(
         "        phase_encoder_credit(agent_id, tile * ENCODER_CREDIT_THREADS + lid.x);",
         "        projection_credit_agent(agent_id, lid.x);",
     );
+    let source = global_thread_source(&source);
     let source = format!("{source}{}", layout.header());
     let shared: Vec<_> = source
         .lines()
@@ -248,6 +267,37 @@ pub(super) fn global_source(
         shared,
         ["var<workgroup> agent_projection_inputs: array<f32, PROJECTION_VISUAL_COUNT>;"]
     );
+    source
+}
+
+/// Restrict the width change to the entry and canonical world coverage loops.
+/// Agent-owned grid/collision/trail phases require agent_count <= this width.
+fn global_thread_source(source: &str) -> String {
+    let mut source = replace_once(
+        source,
+        "@compute @workgroup_size(ENCODER_CREDIT_THREADS)",
+        "@compute @workgroup_size(PROJECTION_GLOBAL_THREADS)",
+    );
+    let phases = [
+        include_str!("../shaders/kernel/phase_clear.wgsl"),
+        include_str!("../shaders/kernel/phase_food_grid.wgsl"),
+        include_str!("../shaders/kernel/phase_food_respawn.wgsl"),
+        include_str!("../shaders/kernel/phase_grid_order.wgsl"),
+    ];
+    assert_eq!(
+        phases
+            .iter()
+            .map(|phase| phase.matches("+= 256u").count())
+            .sum::<usize>(),
+        WORLD_STRIDED_LOOPS
+    );
+    for phase in phases {
+        source = replace_once(
+            &source,
+            phase,
+            &phase.replace("+= 256u", "+= PROJECTION_GLOBAL_THREADS"),
+        );
+    }
     source
 }
 
@@ -292,8 +342,8 @@ fn pipeline(kernel: &GpuKernel, source: String, entry: &str) -> wgpu::ComputePip
 }
 
 struct Arms {
-    parked: Option<global_credit::Pipelines>,
-    candidate: bool,
+    parked: [Option<global_credit::Pipelines>; ARM_COUNT],
+    arm: usize,
     layout: ProjectionLayout,
 }
 
@@ -312,69 +362,78 @@ impl Arms {
         );
         assert_eq!(kernel.agent_count, AGENTS);
         let layout = ProjectionLayout::new(&kernel);
-        let packed =
-            packed_encoder::Cache::new_with_extra_scratch(&kernel, layout.extra_words).unwrap();
-        let mut candidate = global_credit::Pipelines::new_packed_with_main128(
-            &kernel,
-            &optimized_brain(),
-            &constants(&kernel),
-            true,
-        )
-        .unwrap();
-        eprintln!(
-            "AGENT_PROJECTION_COMPILE_MAIN_BEGIN width={width} height={height} main_threads={}",
+        let mut parked = std::array::from_fn(|_| None);
+        for (index, global_threads) in GLOBAL_THREADS.into_iter().enumerate() {
+            let candidate_layout = ProjectionLayout::with_threads(&kernel, global_threads);
+            assert_eq!(layout.prefix_words, candidate_layout.prefix_words);
+            let packed =
+                packed_encoder::Cache::new_with_extra_scratch(&kernel, layout.extra_words).unwrap();
+            let mut candidate = global_credit::Pipelines::new_packed_with_main128(
+                &kernel,
+                &optimized_brain(),
+                &constants(&kernel),
+                true,
+            )
+            .unwrap();
+            eprintln!(
+            "AGENT_PROJECTION_COMPILE_MAIN_BEGIN width={width} height={height} global_threads={global_threads} main_threads={}",
             main_width::MAIN_THREADS
         );
-        candidate.main = pipeline(
-            &kernel,
-            main_source(&kernel, &packed, &layout),
-            "kernel_tick",
-        );
-        eprintln!("AGENT_PROJECTION_COMPILE_MAIN_END");
-        eprintln!(
-            "AGENT_PROJECTION_COMPILE_GLOBAL_BEGIN shared_bytes={}",
+            candidate.main = pipeline(
+                &kernel,
+                main_source(&kernel, &packed, &candidate_layout),
+                "kernel_tick",
+            );
+            eprintln!("AGENT_PROJECTION_COMPILE_MAIN_END");
+            eprintln!(
+            "AGENT_PROJECTION_COMPILE_GLOBAL_BEGIN global_threads={global_threads} shared_bytes={}",
             layout.shared_bytes
         );
-        candidate.global = pipeline(
-            &kernel,
-            global_source(&kernel, &packed, &layout),
-            "global_credit_tick",
-        );
-        eprintln!("AGENT_PROJECTION_COMPILE_GLOBAL_END");
-        let binding = kernel.kernel_pipeline.get_bind_group_layout(0);
-        candidate.bind_groups = std::array::from_fn(|index| {
-            global_credit::private_bind_group(&kernel, &binding, packed.buffer(), index)
-        });
-        candidate.global_workgroups = kernel.agent_count.checked_add(1).unwrap();
-        assert!(
-            candidate.global_workgroups
-                <= kernel.device.limits().max_compute_workgroups_per_dimension
-        );
-        assert_eq!(candidate.main_threads, main_width::MAIN_THREADS);
-        candidate.packed_encoder = Some(packed);
+            candidate.global = pipeline(
+                &kernel,
+                global_source(&kernel, &packed, &candidate_layout),
+                "global_credit_tick",
+            );
+            eprintln!("AGENT_PROJECTION_COMPILE_GLOBAL_END");
+            let binding = kernel.kernel_pipeline.get_bind_group_layout(0);
+            candidate.bind_groups = std::array::from_fn(|index| {
+                global_credit::private_bind_group(&kernel, &binding, packed.buffer(), index)
+            });
+            candidate.global_workgroups = kernel.agent_count.checked_add(1).unwrap();
+            assert!(
+                candidate.global_workgroups
+                    <= kernel.device.limits().max_compute_workgroups_per_dimension
+            );
+            assert_eq!(candidate.main_threads, main_width::MAIN_THREADS);
+            candidate.packed_encoder = Some(packed);
+            parked[index + 1] = Some(candidate);
+        }
         (
             kernel,
             Self {
-                parked: Some(candidate),
-                candidate: false,
+                parked,
+                arm: 0,
                 layout,
             },
         )
     }
 
-    fn activate(&mut self, kernel: &mut GpuKernel, candidate: bool) {
-        if self.candidate != candidate {
-            self.parked
+    fn activate(&mut self, kernel: &mut GpuKernel, arm: usize) {
+        assert!(arm < ARM_COUNT);
+        if self.arm != arm {
+            assert!(self.parked[self.arm].is_none());
+            self.parked[arm]
                 .as_ref()
                 .unwrap()
                 .packed_encoder
                 .as_ref()
                 .unwrap()
                 .invalidate();
-            std::mem::swap(&mut kernel.global_credit, &mut self.parked);
-            self.candidate = candidate;
+            self.parked[self.arm] = kernel.global_credit.take();
+            kernel.global_credit = self.parked[arm].take();
+            self.arm = arm;
         }
-        if candidate && !cache(kernel).is_valid() {
+        if arm != 0 && !cache(kernel).is_valid() {
             self.invalidate(kernel);
         }
         assert!(kernel.global_credit_active());
@@ -385,7 +444,7 @@ impl Arms {
     }
 
     fn invalidate(&self, kernel: &GpuKernel) {
-        if self.candidate {
+        if self.arm != 0 {
             for agent in 0..usize::try_from(kernel.agent_count).unwrap() {
                 kernel.queue.write_buffer(
                     cache(kernel).buffer(),
@@ -403,6 +462,16 @@ impl Arms {
         production_advance(kernel, cycle, count);
     }
 
+    /// Untimed preflight checks every grid generation. A later clear must not
+    /// conceal overflow whose nondeterministic retained subset could differ.
+    fn advance_checked(&self, kernel: &mut GpuKernel, cycle: u32, count: u32) -> TestResult {
+        for offset in 0..count {
+            self.advance(kernel, cycle.checked_add(offset).unwrap(), 1);
+            assert_no_overflow(kernel)?;
+        }
+        Ok(())
+    }
+
     fn restore(&self, kernel: &mut GpuKernel, saved: &Checkpoint) {
         restore(kernel, saved);
         self.invalidate(kernel);
@@ -410,7 +479,7 @@ impl Arms {
 
     fn state(&self, kernel: &GpuKernel) -> TestResult<State> {
         let state = capture_state(kernel)?;
-        if self.candidate {
+        if self.arm != 0 {
             let storage = cache(kernel).buffer();
             let actual = read_buffer(kernel, storage, storage.size())?;
             let matrix_words = kernel
@@ -437,7 +506,7 @@ impl Arms {
     }
 
     fn counts(&self, kernel: &GpuKernel) -> TestResult<(f32, f32)> {
-        assert!(self.candidate);
+        assert_ne!(self.arm, 0);
         let raw = read_buffer(
             kernel,
             cache(kernel).buffer(),
@@ -453,6 +522,36 @@ impl Arms {
         }
         Ok((hits, misses))
     }
+}
+
+fn assert_no_overflow(kernel: &GpuKernel) -> TestResult {
+    let food = read_buffer(
+        kernel,
+        &kernel.food_grid_buffer,
+        kernel.food_grid_buffer.size(),
+    )?;
+    let agents = read_buffer(
+        kernel,
+        &kernel.agent_grid_buffer,
+        kernel.agent_grid_buffer.size(),
+    )?;
+    let food: &[u32] = bytemuck::cast_slice(&food);
+    let agents: &[u32] = bytemuck::cast_slice(&agents);
+    assert!(food.len().is_multiple_of(FOOD_GRID_CELL_STRIDE));
+    let cells = food.len() / FOOD_GRID_CELL_STRIDE;
+    assert!(agents.len() >= cells.checked_mul(AGENT_GRID_CELL_STRIDE).unwrap());
+    for cell in 0..cells {
+        assert!(
+            food[cell * FOOD_GRID_CELL_STRIDE] <= u32::try_from(FOOD_GRID_MAX_PER_CELL).unwrap(),
+            "food grid overflow cell={cell}"
+        );
+        assert!(
+            agents[cell * AGENT_GRID_CELL_STRIDE]
+                <= u32::try_from(AGENT_GRID_MAX_PER_CELL).unwrap(),
+            "agent grid overflow cell={cell}"
+        );
+    }
+    Ok(())
 }
 
 /// Fixture-only input injection; all world, vision and brain dispatches still
@@ -496,7 +595,7 @@ fn trajectory(kernel: &mut GpuKernel, arms: &Arms, initial: &State) -> TestResul
         if HELD_RAW_CYCLES.contains(&cycle) {
             hold_raw_visual(kernel, snapshots.last().unwrap());
         }
-        arms.advance(kernel, cycle, count);
+        arms.advance_checked(kernel, cycle, count)?;
         let state = arms.state(kernel)?;
         assert_inactive_agent_unchanged(
             kernel,
@@ -526,44 +625,46 @@ fn agent_projection_preserves_complete_state_and_repeatability() -> TestResult {
         for (expected, actual) in reference.iter().zip(&reference_replay) {
             assert_state_equal(&kernel, expected, actual);
         }
-        arms.restore(&mut kernel, &saved);
-        arms.activate(&mut kernel, true);
-        let candidate = trajectory(&mut kernel, &arms, &initial)?;
-        let (hits, misses) = arms.counts(&kernel)?;
-        assert!(
-            hits > 0.0 && misses > 0.0,
-            "exercise cached and fresh routes"
-        );
-        arms.restore(&mut kernel, &saved);
-        let repeated = trajectory(&mut kernel, &arms, &initial)?;
-        let mut cycle = 0;
-        for (((expected, actual), repeated), count) in reference
-            .iter()
-            .zip(&candidate)
-            .zip(&repeated)
-            .zip(PARITY_CHUNKS)
-        {
-            cycle += count;
-            assert_state_equal(&kernel, actual, repeated);
-            if expected != actual {
-                compare_rounding_state(
+        for (index, global_threads) in GLOBAL_THREADS.into_iter().enumerate() {
+            arms.restore(&mut kernel, &saved);
+            arms.activate(&mut kernel, index + 1);
+            let candidate = trajectory(&mut kernel, &arms, &initial)?;
+            let (hits, misses) = arms.counts(&kernel)?;
+            assert!(
+                hits > 0.0 && misses > 0.0,
+                "exercise cached and fresh routes"
+            );
+            arms.restore(&mut kernel, &saved);
+            let repeated = trajectory(&mut kernel, &arms, &initial)?;
+            let mut cycle = 0;
+            for (((expected, actual), repeated), count) in reference
+                .iter()
+                .zip(&candidate)
+                .zip(&repeated)
+                .zip(PARITY_CHUNKS)
+            {
+                cycle += count;
+                assert_state_equal(&kernel, actual, repeated);
+                if expected != actual {
+                    compare_rounding_state(
                     &kernel,
                     expected,
                     actual,
-                    &format!("agent_projection {width}x{height} cycles={cycle}"),
+                    &format!("agent_projection {width}x{height} global_threads={global_threads} cycles={cycle}"),
                 );
+                }
+                assert_state_equal(&kernel, expected, actual);
             }
-            assert_state_equal(&kernel, expected, actual);
-        }
-        report_seeded_behavior(
+            report_seeded_behavior(
             &[(
                 FIXTURE_SEED,
                 extract_behavior(&kernel, reference.last().unwrap()),
                 extract_behavior(&kernel, candidate.last().unwrap()),
             )],
-            &format!("agent_projection {width}x{height} cycles={TIMED_CYCLES}"),
+            &format!("agent_projection {width}x{height} global_threads={global_threads} cycles={TIMED_CYCLES}"),
         );
-        println!("AGENT_PROJECTION_PARITY width={width} height={height} cycles={TIMED_CYCLES} held_raw_cycles={HELD_RAW_CYCLES:?} world_vision_dispatches_unchanged=true same_arm_exact_buffers={MUTABLE_BUFFERS} cross_arm=all13_exact inactive_exact=true private_mirror_exact=true hits={hits} misses={misses} cache_error_accumulation=false");
+            println!("AGENT_PROJECTION_PARITY width={width} height={height} global_threads={global_threads} cycles={TIMED_CYCLES} held_raw_cycles={HELD_RAW_CYCLES:?} world_vision_dispatches_unchanged=true same_arm_exact_buffers={MUTABLE_BUFFERS} cross_arm=all13_exact inactive_exact=true private_mirror_exact=true hits={hits} misses={misses} cache_error_accumulation=false every_cycle_no_grid_overflow=true");
+        }
     }
     Ok(())
 }
@@ -598,6 +699,12 @@ fn agent_projection_source_preserves_credit_math_and_fallback() {
     assert!(encode.contains("workgroupUniformLoad(&s_reinf_dot[PROJECTION_GATE_GROUP_COUNT])"));
     assert_eq!(credit.matches("var<workgroup>").count(), 1);
     assert!(credit.contains("storageBarrier();\n    workgroupBarrier();"));
+    assert_eq!(
+        credit
+            .matches("feature += PROJECTION_GLOBAL_THREADS")
+            .count(),
+        2
+    );
     assert!(encode.contains("PROJECTION_VISUAL_COUNT % PACKED_ENCODER_INNER_LANES"));
     assert!(encode.contains(
         "PROJECTION_DEATH_OFFSET] == physics_state[agent_id * PHYS_STRIDE + P_DEATH_COUNT]"
@@ -631,13 +738,46 @@ fn agent_projection_owners_preserve_visual_prefix_and_nonvisual_continuation() {
             );
         }
         assert!(writes.iter().all(|count| *count == 1));
-        let mut q_writes = vec![0_u32; visual_count];
-        for thread in 0..CREDIT_THREADS {
-            for feature in (thread..visual_count).step_by(CREDIT_THREADS) {
-                q_writes[feature] += 1;
+        for global_threads in GLOBAL_THREADS {
+            let threads = usize::try_from(global_threads).unwrap();
+            let mut q_writes = vec![0_u32; visual_count];
+            for thread in 0..threads {
+                for feature in (thread..visual_count).step_by(threads) {
+                    q_writes[feature] += 1;
+                }
             }
+            assert!(q_writes.iter().all(|count| *count == 1));
         }
-        assert!(q_writes.iter().all(|count| *count == 1));
+    }
+}
+
+#[test]
+fn agent_projection_global_width_covers_only_canonical_world_strides() {
+    let phases = [
+        include_str!("../shaders/kernel/phase_clear.wgsl"),
+        include_str!("../shaders/kernel/phase_food_grid.wgsl"),
+        include_str!("../shaders/kernel/phase_food_respawn.wgsl"),
+        include_str!("../shaders/kernel/phase_grid_order.wgsl"),
+        include_str!("../shaders/kernel/global_credit_tick.wgsl"),
+    ]
+    .join("\n");
+    let candidate = global_thread_source(&phases);
+    assert_eq!(
+        candidate.matches("+= PROJECTION_GLOBAL_THREADS").count(),
+        WORLD_STRIDED_LOOPS
+    );
+    assert!(!candidate.contains("+= 256u"));
+    assert!(candidate.contains("@compute @workgroup_size(PROJECTION_GLOBAL_THREADS)"));
+    for threads in GLOBAL_THREADS {
+        for count in [0, 104, 128, 129, 256, 257, 315, 1_024] {
+            let mut owners = vec![0_u32; count];
+            for tid in 0..usize::try_from(threads).unwrap() {
+                for item in (tid..count).step_by(usize::try_from(threads).unwrap()) {
+                    owners[item] += 1;
+                }
+            }
+            assert!(owners.iter().all(|owners| *owners == 1));
+        }
     }
 }
 
@@ -655,57 +795,60 @@ fn agent_projection_publishes_current_raw_minus_stored_mean() -> TestResult {
         let (mut kernel, mut arms) = Arms::prepare(width, height, true);
         let before = capture_state(&kernel)?;
         let saved = checkpoint(&kernel);
-        arms.advance(&mut kernel, 0, 1);
+        arms.advance_checked(&mut kernel, 0, 1)?;
         let reference = arms.state(&kernel)?;
-        arms.restore(&mut kernel, &saved);
-        arms.activate(&mut kernel, true);
-        arms.advance(&mut kernel, 0, 1);
-        let actual = arms.state(&kernel)?;
-        assert_state_equal(&kernel, &reference, &actual);
-        let prefix = read_buffer(
-            &kernel,
-            cache(&kernel).buffer(),
-            bytes(arms.layout.prefix_words),
-        )?;
-        let mean_offset = kernel.layout.brain_stride - kernel.layout.feature_count;
-        let mut checked = 0;
-        for agent in 0..usize::try_from(kernel.agent_count).unwrap() {
-            let alive = state_float(&actual[PHYSICS_BUFFER], agent * PHYS_STRIDE + P_ALIVE)
-                >= ALIVE_THRESHOLD;
-            let header = arms.layout.base_words + agent * arms.layout.agent_stride;
-            assert_eq!(
-                state_float(&prefix, header + VALID_OFFSET),
-                if alive { 1.0 } else { 0.0 }
-            );
-            assert_eq!(
-                state_float(&prefix, header + DEATH_OFFSET).to_bits(),
-                state_float(&actual[PHYSICS_BUFFER], agent * PHYS_STRIDE + P_DEATH_COUNT).to_bits()
-            );
-            if !alive {
-                continue;
-            }
-            for feature in 0..arms.layout.visual_count {
-                let raw = state_float(
-                    &before[SENSORY_BUFFER],
-                    agent * kernel.layout.sensory_stride + feature,
-                );
-                let mean = state_float(
-                    &actual[BRAIN_BUFFER],
-                    agent * kernel.layout.brain_stride + mean_offset + feature,
-                );
-                let predicted = state_float(
-                    &prefix,
-                    agent * kernel.layout.brain_scratch_stride + feature,
+        for (index, global_threads) in GLOBAL_THREADS.into_iter().enumerate() {
+            arms.restore(&mut kernel, &saved);
+            arms.activate(&mut kernel, index + 1);
+            arms.advance_checked(&mut kernel, 0, 1)?;
+            let actual = arms.state(&kernel)?;
+            assert_state_equal(&kernel, &reference, &actual);
+            let prefix = read_buffer(
+                &kernel,
+                cache(&kernel).buffer(),
+                bytes(arms.layout.prefix_words),
+            )?;
+            let mean_offset = kernel.layout.brain_stride - kernel.layout.feature_count;
+            let mut checked = 0;
+            for agent in 0..usize::try_from(kernel.agent_count).unwrap() {
+                let alive = state_float(&actual[PHYSICS_BUFFER], agent * PHYS_STRIDE + P_ALIVE)
+                    >= ALIVE_THRESHOLD;
+                let header = arms.layout.base_words + agent * arms.layout.agent_stride;
+                assert_eq!(
+                    state_float(&prefix, header + VALID_OFFSET),
+                    if alive { 1.0 } else { 0.0 }
                 );
                 assert_eq!(
-                    predicted.to_bits(),
-                    (raw - mean).to_bits(),
-                    "q publication agent={agent} feature={feature}"
+                    state_float(&prefix, header + DEATH_OFFSET).to_bits(),
+                    state_float(&actual[PHYSICS_BUFFER], agent * PHYS_STRIDE + P_DEATH_COUNT)
+                        .to_bits()
                 );
-                checked += 1;
+                if !alive {
+                    continue;
+                }
+                for feature in 0..arms.layout.visual_count {
+                    let raw = state_float(
+                        &before[SENSORY_BUFFER],
+                        agent * kernel.layout.sensory_stride + feature,
+                    );
+                    let mean = state_float(
+                        &actual[BRAIN_BUFFER],
+                        agent * kernel.layout.brain_stride + mean_offset + feature,
+                    );
+                    let predicted = state_float(
+                        &prefix,
+                        agent * kernel.layout.brain_scratch_stride + feature,
+                    );
+                    assert_eq!(
+                        predicted.to_bits(),
+                        (raw - mean).to_bits(),
+                        "q publication agent={agent} feature={feature}"
+                    );
+                    checked += 1;
+                }
             }
+            println!("AGENT_PROJECTION_PUBLICATION width={width} height={height} global_threads={global_threads} checked_visual_words={checked} q_bits_exact=true death_header_exact=true exact_buffers={MUTABLE_BUFFERS} private_mirror_exact=true every_cycle_no_grid_overflow=true");
         }
-        println!("AGENT_PROJECTION_PUBLICATION width={width} height={height} checked_visual_words={checked} q_bits_exact=true death_header_exact=true exact_buffers={MUTABLE_BUFFERS} private_mirror_exact=true");
     }
     Ok(())
 }
@@ -715,31 +858,39 @@ fn agent_projection_publishes_current_raw_minus_stored_mean() -> TestResult {
 fn benchmark_agent_projection() -> TestResult {
     let _vulkan = vulkan_gate::enter();
     let (mut kernel, mut arms) = Arms::prepare(FIELDS[0].0, FIELDS[0].1, false);
-    arms.advance(&mut kernel, 0, WARMUP_CYCLES);
+    arms.advance_checked(&mut kernel, 0, WARMUP_CYCLES)?;
     let saved = checkpoint(&kernel);
     let mut expected = Vec::new();
-    for candidate in [false, true] {
+    let mut route_counts = Vec::new();
+    for arm in 0..ARM_COUNT {
         arms.restore(&mut kernel, &saved);
-        arms.activate(&mut kernel, candidate);
-        arms.advance(&mut kernel, WARMUP_CYCLES, TIMED_CYCLES);
+        arms.activate(&mut kernel, arm);
+        arms.advance_checked(&mut kernel, WARMUP_CYCLES, TIMED_CYCLES)?;
         expected.push(arms.state(&kernel)?);
+        if arm != 0 {
+            if expected[0] != expected[arm] {
+                compare_rounding_state(
+                    &kernel,
+                    &expected[0],
+                    &expected[arm],
+                    &format!(
+                        "agent_projection timing preflight global_threads={}",
+                        GLOBAL_THREADS[arm - 1]
+                    ),
+                );
+            }
+            assert_state_equal(&kernel, &expected[0], &expected[arm]);
+            let counts = arms.counts(&kernel)?;
+            assert!(counts.0 > 0.0 && counts.1 > 0.0);
+            route_counts.push(counts);
+        }
     }
-    if expected[0] != expected[1] {
-        compare_rounding_state(
-            &kernel,
-            &expected[0],
-            &expected[1],
-            "agent_projection timing preflight",
-        );
-    }
-    assert_state_equal(&kernel, &expected[0], &expected[1]);
-    let (hits, misses) = arms.counts(&kernel)?;
-    assert!(hits > 0.0 && misses > 0.0);
-    let mut times: [Vec<f64>; 2] = std::array::from_fn(|_| Vec::new());
+    let mut times: [Vec<f64>; ARM_COUNT] = std::array::from_fn(|_| Vec::new());
     for pair in 0..TIMING_PAIRS {
-        for arm in [pair % 2, 1 - pair % 2] {
+        for offset in 0..ARM_COUNT {
+            let arm = (pair + offset) % ARM_COUNT;
             arms.restore(&mut kernel, &saved);
-            arms.activate(&mut kernel, arm != 0);
+            arms.activate(&mut kernel, arm);
             let start = Instant::now();
             arms.advance(&mut kernel, WARMUP_CYCLES, TIMED_CYCLES);
             times[arm].push(start.elapsed().as_secs_f64());
@@ -750,7 +901,10 @@ fn benchmark_agent_projection() -> TestResult {
         values.sort_by(f64::total_cmp);
     }
     let reference = times[0][TIMING_PAIRS / 2];
-    let candidate = times[1][TIMING_PAIRS / 2];
-    println!("AGENT_PROJECTION_TIMING warmup={WARMUP_CYCLES} cycles={TIMED_CYCLES} pairs={TIMING_PAIRS} baseline_seconds={reference:.9} candidate_seconds={candidate:.9} speedup={:.6} hits={hits} misses={misses} same_arm_exact_buffers={MUTABLE_BUFFERS} cross_arm_all13_exact=true private_mirror_exact=true extra_storage_bytes={} shared_bytes={} global_groups={} added_dispatch=false raw_publication_timed=true full_simulation=true", reference / candidate, bytes(arms.layout.extra_words), arms.layout.shared_bytes, kernel.agent_count + 1);
+    for (index, global_threads) in GLOBAL_THREADS.into_iter().enumerate() {
+        let candidate = times[index + 1][TIMING_PAIRS / 2];
+        let (hits, misses) = route_counts[index];
+        println!("AGENT_PROJECTION_TIMING global_threads={global_threads} warmup={WARMUP_CYCLES} cycles={TIMED_CYCLES} pairs={TIMING_PAIRS} rotated_arms={ARM_COUNT} baseline_seconds={reference:.9} candidate_seconds={candidate:.9} speedup={:.6} hits={hits} misses={misses} same_arm_exact_buffers={MUTABLE_BUFFERS} cross_arm_all13_exact=true private_mirror_exact=true extra_storage_bytes={} shared_bytes={} global_groups={} added_dispatch=false raw_publication_timed=true every_cycle_no_grid_overflow_preflight=true full_simulation=true", reference / candidate, bytes(arms.layout.extra_words), arms.layout.shared_bytes, kernel.agent_count + 1);
+    }
     Ok(())
 }

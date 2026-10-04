@@ -8,7 +8,7 @@ use std::error::Error;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use super::agent_projection_validation::{
-    common_source, credit_source, encode_source, main_source, ProjectionLayout,
+    common_source, credit_source, encode_source, main_source, ProjectionLayout, GLOBAL_THREADS,
 };
 use super::rounding_validation::{check_fp32_dot, DotMetrics};
 use super::vision_validation::{make_kernel, read_buffer};
@@ -307,8 +307,8 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(kernel: &GpuKernel) -> Self {
-        let layout = ProjectionLayout::new(kernel);
+    fn new(kernel: &GpuKernel, global_threads: u32) -> Self {
+        let layout = ProjectionLayout::with_threads(kernel, global_threads);
         let cache =
             packed_encoder::Cache::new_with_extra_scratch(kernel, layout.extra_words).unwrap();
         let binding = global_credit::private_bind_group(
@@ -328,10 +328,15 @@ impl Probe {
             .join("\n"),
             "credit_probe",
         );
-        let candidate_entry = CREDIT_ENTRY.replace(
-            "phase_encoder_credit(group.y, group.x * ENCODER_CREDIT_THREADS + tid);",
-            "projection_credit_agent(group.y, tid);",
-        );
+        let candidate_entry = CREDIT_ENTRY
+            .replace(
+                "phase_encoder_credit(group.y, group.x * ENCODER_CREDIT_THREADS + tid);",
+                "projection_credit_agent(group.y, tid);",
+            )
+            .replace(
+                "@workgroup_size(ENCODER_CREDIT_THREADS)",
+                "@workgroup_size(PROJECTION_GLOBAL_THREADS)",
+            );
         assert_ne!(candidate_entry, CREDIT_ENTRY);
         let candidate_credit = pipeline(
             kernel,
@@ -709,7 +714,7 @@ fn check_outputs(
             summary.add(metrics, actual, original);
         }
         let rms = (summary.squared_error / summary.rows as f64).sqrt();
-        println!("AGENT_PROJECTION_RAW label={label} case={case:?} features={} rows={} cached={} max_abs={:.9e} rms={rms:.9e} max_error_to_fresh_bound={:.9e} raw_bit_differences={} cached_and_fallback_bits_exact=true actual_credit_matrix_exact=true private_mirror_exact=true bound=unchanged_nearest_gamma_2n_f64_ftz timing_source_raw_publication=true observed_compilation=true", kernel.layout.feature_count, summary.rows, expected_reuse[agent], summary.max_abs, summary.max_over_bound, summary.reference_bit_differences);
+        println!("AGENT_PROJECTION_RAW global_threads={} label={label} case={case:?} features={} rows={} cached={} max_abs={:.9e} rms={rms:.9e} max_error_to_fresh_bound={:.9e} raw_bit_differences={} cached_and_fallback_bits_exact=true actual_credit_matrix_exact=true private_mirror_exact=true bound=unchanged_nearest_gamma_2n_f64_ftz timing_source_raw_publication=true observed_compilation=true", probe.layout.global_threads, kernel.layout.feature_count, summary.rows, expected_reuse[agent], summary.max_abs, summary.max_over_bound, summary.reference_bit_differences);
     }
 }
 
@@ -743,211 +748,217 @@ fn compare_encode(
 fn agent_projection_raw_dots_match_fresh_and_satisfy_bounds() -> TestResult {
     let _vulkan = vulkan_gate::enter();
     for (width, height) in FIELDS {
-        let mut kernel = make_kernel(width, height, u32::try_from(CASE_COUNT).unwrap(), 1);
-        let probe = Probe::new(&kernel);
-        let fixture = fixtures(kernel.layout.feature_count, probe.layout.visual_count);
-        let brain = prepare_credit(&kernel, &probe, &fixture, None)?;
-        let predicted = predicted_inputs(&kernel, &probe, &fixture)?;
-        let fast = compare_encode(
-            &kernel,
-            &probe,
-            &brain,
-            &predicted,
-            &[true; CASE_COUNT],
-            None,
-            "matching_prediction",
-        )?;
+        for global_threads in GLOBAL_THREADS {
+            let mut kernel = make_kernel(width, height, u32::try_from(CASE_COUNT).unwrap(), 1);
+            let probe = Probe::new(&kernel, global_threads);
+            let fixture = fixtures(kernel.layout.feature_count, probe.layout.visual_count);
+            let brain = prepare_credit(&kernel, &probe, &fixture, None)?;
+            let predicted = predicted_inputs(&kernel, &probe, &fixture)?;
+            let fast = compare_encode(
+                &kernel,
+                &probe,
+                &brain,
+                &predicted,
+                &[true; CASE_COUNT],
+                None,
+                "matching_prediction",
+            )?;
 
-        // Visual prefixes remain valid while the original four lane chains
-        // continue through fresh nonvisual inputs, including the odd boundary.
-        let mut nonvisual_changed = predicted.clone();
-        for (agent, inputs) in nonvisual_changed.iter_mut().enumerate() {
-            for (feature, input) in inputs
-                .iter_mut()
-                .enumerate()
-                .skip(probe.layout.visual_count)
-            {
-                let replacement: f32 = if (feature + agent).is_multiple_of(PAIR) {
-                    0.375
-                } else {
-                    -0.625
-                };
-                *input = if input.to_bits() == replacement.to_bits() {
-                    -replacement
-                } else {
-                    replacement
-                };
+            // Visual prefixes remain valid while the original four lane chains
+            // continue through fresh nonvisual inputs, including the odd boundary.
+            let mut nonvisual_changed = predicted.clone();
+            for (agent, inputs) in nonvisual_changed.iter_mut().enumerate() {
+                for (feature, input) in inputs
+                    .iter_mut()
+                    .enumerate()
+                    .skip(probe.layout.visual_count)
+                {
+                    let replacement: f32 = if (feature + agent).is_multiple_of(PAIR) {
+                        0.375
+                    } else {
+                        -0.625
+                    };
+                    *input = if input.to_bits() == replacement.to_bits() {
+                        -replacement
+                    } else {
+                        replacement
+                    };
+                }
             }
-        }
-        let nonvisual_fast = compare_encode(
-            &kernel,
-            &probe,
-            &brain,
-            &nonvisual_changed,
-            &[true; CASE_COUNT],
-            None,
-            "nonvisual_only_changed_cached_continuation",
-        )?;
-        assert!(
-            (0..CASE_COUNT).any(|agent| {
-                (0..ENCODED_DIMENSION).any(|dimension| {
-                    let raw = probe.private_word(agent, probe.layout.raw_offset + dimension);
-                    word(&nonvisual_fast, raw).to_bits() != word(&fast, raw).to_bits()
-                })
-            }),
-            "nonvisual continuation must affect a raw output"
-        );
-
-        // Deliberately invalid cache data proves the fast route reads cached
-        // partials. These poisoned results are excluded from numerical checks.
-        for agent in 0..CASE_COUNT {
-            probe.set_private(&kernel, agent, probe.layout.partial_offset, SENTINEL);
-        }
-        let poisoned = encode(&kernel, &probe, true, &predicted)?;
-        for agent in 0..CASE_COUNT {
-            assert_ne!(
-                word(
-                    &poisoned,
-                    probe.private_word(agent, probe.layout.raw_offset)
-                )
-                .to_bits(),
-                word(&fast, probe.private_word(agent, probe.layout.raw_offset)).to_bits(),
-                "cached path must consume its partials"
+            let nonvisual_fast = compare_encode(
+                &kernel,
+                &probe,
+                &brain,
+                &nonvisual_changed,
+                &[true; CASE_COUNT],
+                None,
+                "nonvisual_only_changed_cached_continuation",
+            )?;
+            assert!(
+                (0..CASE_COUNT).any(|agent| {
+                    (0..ENCODED_DIMENSION).any(|dimension| {
+                        let raw = probe.private_word(agent, probe.layout.raw_offset + dimension);
+                        word(&nonvisual_fast, raw).to_bits() != word(&fast, raw).to_bits()
+                    })
+                }),
+                "nonvisual continuation must affect a raw output"
             );
-        }
-        let mut changed = predicted.clone();
-        for (agent, inputs) in changed.iter_mut().enumerate() {
-            let last = probe.layout.visual_count - 1;
-            inputs[last] = f32::from_bits(inputs[last].to_bits() ^ 1);
-            if agent == NEAR_ZERO_AGENT {
-                inputs[..probe.layout.visual_count].fill(2.0_f32.powi(RESIDUAL_EXPONENT));
+
+            // Deliberately invalid cache data proves the fast route reads cached
+            // partials. These poisoned results are excluded from numerical checks.
+            for agent in 0..CASE_COUNT {
+                probe.set_private(&kernel, agent, probe.layout.partial_offset, SENTINEL);
             }
-        }
-        compare_encode(
-            &kernel,
-            &probe,
-            &brain,
-            &changed,
-            &[false; CASE_COUNT],
-            None,
-            "changed_input_poisoned_cache",
-        )?;
+            let poisoned = encode(&kernel, &probe, true, &predicted)?;
+            for agent in 0..CASE_COUNT {
+                assert_ne!(
+                    word(
+                        &poisoned,
+                        probe.private_word(agent, probe.layout.raw_offset)
+                    )
+                    .to_bits(),
+                    word(&fast, probe.private_word(agent, probe.layout.raw_offset)).to_bits(),
+                    "cached path must consume its partials"
+                );
+            }
+            let mut changed = predicted.clone();
+            for (agent, inputs) in changed.iter_mut().enumerate() {
+                let last = probe.layout.visual_count - 1;
+                inputs[last] = f32::from_bits(inputs[last].to_bits() ^ 1);
+                if agent == NEAR_ZERO_AGENT {
+                    inputs[..probe.layout.visual_count].fill(2.0_f32.powi(RESIDUAL_EXPONENT));
+                }
+            }
+            compare_encode(
+                &kernel,
+                &probe,
+                &brain,
+                &changed,
+                &[false; CASE_COUNT],
+                None,
+                "changed_input_poisoned_cache",
+            )?;
 
-        // A changed death generation must reject otherwise matching q and
-        // deliberately corrupt cached partials without reading them.
-        for agent in 0..CASE_COUNT {
-            kernel
-                .write_agent_physics_fields(u32::try_from(agent).unwrap(), &[(P_DEATH_COUNT, 1.0)]);
-        }
-        compare_encode(
-            &kernel,
-            &probe,
-            &brain,
-            &predicted,
-            &[false; CASE_COUNT],
-            None,
-            "death_generation_poisoned_cache",
-        )?;
-        for agent in 0..CASE_COUNT {
-            kernel
-                .write_agent_physics_fields(u32::try_from(agent).unwrap(), &[(P_DEATH_COUNT, 0.0)]);
-            probe.set_private(&kernel, agent, probe.layout.valid_offset, 0.0);
-        }
-        compare_encode(
-            &kernel,
-            &probe,
-            &brain,
-            &predicted,
-            &[false; CASE_COUNT],
-            None,
-            "invalid_poisoned_cache",
-        )?;
+            // A changed death generation must reject otherwise matching q and
+            // deliberately corrupt cached partials without reading them.
+            for agent in 0..CASE_COUNT {
+                kernel.write_agent_physics_fields(
+                    u32::try_from(agent).unwrap(),
+                    &[(P_DEATH_COUNT, 1.0)],
+                );
+            }
+            compare_encode(
+                &kernel,
+                &probe,
+                &brain,
+                &predicted,
+                &[false; CASE_COUNT],
+                None,
+                "death_generation_poisoned_cache",
+            )?;
+            for agent in 0..CASE_COUNT {
+                kernel.write_agent_physics_fields(
+                    u32::try_from(agent).unwrap(),
+                    &[(P_DEATH_COUNT, 0.0)],
+                );
+                probe.set_private(&kernel, agent, probe.layout.valid_offset, 0.0);
+            }
+            compare_encode(
+                &kernel,
+                &probe,
+                &brain,
+                &predicted,
+                &[false; CASE_COUNT],
+                None,
+                "invalid_poisoned_cache",
+            )?;
 
-        // Rebuild a valid projection after the invalid-cache case. Verify that
-        // matching input actually reuses it, then poison its first partial.
-        // Thus reset cannot pass merely because metadata was already invalid.
-        assert_eq!(prepare_credit(&kernel, &probe, &fixture, None)?, brain);
-        let warm = encode(&kernel, &probe, true, &predicted)?;
-        for agent in 0..CASE_COUNT {
-            assert_eq!(
-                word(&warm, probe.private_word(agent, probe.layout.valid_offset)),
-                1.0
-            );
-            assert_eq!(
-                word(&warm, probe.private_word(agent, probe.layout.used_offset)),
-                1.0
-            );
-            probe.set_private(&kernel, agent, probe.layout.partial_offset, SENTINEL);
-        }
-        let before_reset = probe.read(&kernel)?;
-        for agent in 0..CASE_COUNT {
-            assert_eq!(
-                word(
-                    &before_reset,
-                    probe.private_word(agent, probe.layout.valid_offset)
-                ),
-                1.0,
-                "host reset must start with a warm valid projection"
-            );
-            assert_eq!(
-                word(
-                    &before_reset,
-                    probe.private_word(agent, probe.layout.partial_offset)
-                ),
-                SENTINEL
-            );
-        }
+            // Rebuild a valid projection after the invalid-cache case. Verify that
+            // matching input actually reuses it, then poison its first partial.
+            // Thus reset cannot pass merely because metadata was already invalid.
+            assert_eq!(prepare_credit(&kernel, &probe, &fixture, None)?, brain);
+            let warm = encode(&kernel, &probe, true, &predicted)?;
+            for agent in 0..CASE_COUNT {
+                assert_eq!(
+                    word(&warm, probe.private_word(agent, probe.layout.valid_offset)),
+                    1.0
+                );
+                assert_eq!(
+                    word(&warm, probe.private_word(agent, probe.layout.used_offset)),
+                    1.0
+                );
+                probe.set_private(&kernel, agent, probe.layout.partial_offset, SENTINEL);
+            }
+            let before_reset = probe.read(&kernel)?;
+            for agent in 0..CASE_COUNT {
+                assert_eq!(
+                    word(
+                        &before_reset,
+                        probe.private_word(agent, probe.layout.valid_offset)
+                    ),
+                    1.0,
+                    "host reset must start with a warm valid projection"
+                );
+                assert_eq!(
+                    word(
+                        &before_reset,
+                        probe.private_word(agent, probe.layout.partial_offset)
+                    ),
+                    SENTINEL
+                );
+            }
 
-        // Use the real host reset, then explicitly clear the private header
-        // and reimport scalar matrices, as the prototype recorder does. This
-        // detached test cache is not part of the production constructor API.
-        kernel.reset_agents_seeded(
-            &BrainConfig {
-                vision_width: width,
-                vision_height: height,
-                vision_stride: 1,
-                ..BrainConfig::default()
-            },
-            RESET_SEED,
-        );
-        probe.cache.invalidate();
-        assert!(!probe.cache.is_valid());
-        for agent in 0..CASE_COUNT {
-            kernel.queue.write_buffer(
-                probe.cache.buffer(),
-                bytes(probe.private_word(agent, 0)),
-                bytemuck::cast_slice(&vec![0.0_f32; probe.layout.raw_offset]),
+            // Use the real host reset, then explicitly clear the private header
+            // and reimport scalar matrices, as the prototype recorder does. This
+            // detached test cache is not part of the production constructor API.
+            kernel.reset_agents_seeded(
+                &BrainConfig {
+                    vision_width: width,
+                    vision_height: height,
+                    vision_stride: 1,
+                    ..BrainConfig::default()
+                },
+                RESET_SEED,
             );
-        }
-        probe.import(&kernel);
-        let reset_brain = read_buffer(
-            &kernel,
-            &kernel.brain_state_buffer,
-            kernel.brain_state_buffer.size(),
-        )?;
-        assert_matrices(&kernel, &probe, &reset_brain, &probe.read(&kernel)?);
-        compare_encode(
-            &kernel,
-            &probe,
-            &reset_brain,
-            &predicted,
-            &[false; CASE_COUNT],
-            None,
-            "host_reset_import_fallback",
-        )?;
+            probe.cache.invalidate();
+            assert!(!probe.cache.is_valid());
+            for agent in 0..CASE_COUNT {
+                kernel.queue.write_buffer(
+                    probe.cache.buffer(),
+                    bytes(probe.private_word(agent, 0)),
+                    bytemuck::cast_slice(&vec![0.0_f32; probe.layout.raw_offset]),
+                );
+            }
+            probe.import(&kernel);
+            let reset_brain = read_buffer(
+                &kernel,
+                &kernel.brain_state_buffer,
+                kernel.brain_state_buffer.size(),
+            )?;
+            assert_matrices(&kernel, &probe, &reset_brain, &probe.read(&kernel)?);
+            compare_encode(
+                &kernel,
+                &probe,
+                &reset_brain,
+                &predicted,
+                &[false; CASE_COUNT],
+                None,
+                "host_reset_import_fallback",
+            )?;
 
-        let dead_brain = prepare_credit(&kernel, &probe, &fixture, Some(MIXED_CREDIT_AGENT))?;
-        let predicted = predicted_inputs(&kernel, &probe, &fixture)?;
-        compare_encode(
-            &kernel,
-            &probe,
-            &dead_brain,
-            &predicted,
-            &[true; CASE_COUNT],
-            Some(MIXED_CREDIT_AGENT),
-            "inactive_credit_and_brain",
-        )?;
-        println!("AGENT_PROJECTION_GATES width={width} height={height} fixtures={CASE_COUNT} scalar_credit_exact=true clamp_threshold_disabled_outside_limit=true partial_poison_falsifiable=true changed_input_fallback=true death_generation_fallback=true host_reset_import_fallback=true reset_started_with_valid_poisoned_projection=true detached_header_reset_explicit=true inactive_agent_preserved=true");
+            let dead_brain = prepare_credit(&kernel, &probe, &fixture, Some(MIXED_CREDIT_AGENT))?;
+            let predicted = predicted_inputs(&kernel, &probe, &fixture)?;
+            compare_encode(
+                &kernel,
+                &probe,
+                &dead_brain,
+                &predicted,
+                &[true; CASE_COUNT],
+                Some(MIXED_CREDIT_AGENT),
+                "inactive_credit_and_brain",
+            )?;
+            println!("AGENT_PROJECTION_GATES width={width} height={height} global_threads={global_threads} fixtures={CASE_COUNT} scalar_credit_exact=true clamp_threshold_disabled_outside_limit=true partial_poison_falsifiable=true changed_input_fallback=true death_generation_fallback=true host_reset_import_fallback=true reset_started_with_valid_poisoned_projection=true detached_header_reset_explicit=true inactive_agent_preserved=true");
+        }
     }
     Ok(())
 }

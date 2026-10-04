@@ -169,6 +169,8 @@ mod main_width_validation;
 #[cfg(test)]
 mod memory_offload_validation;
 #[cfg(test)]
+mod minimal_binding_validation;
+#[cfg(test)]
 mod packed_credit_batch_validation;
 mod packed_encoder;
 #[cfg(test)]
@@ -218,6 +220,8 @@ mod recall_validation;
 #[cfg(test)]
 mod rounding_validation;
 #[cfg(test)]
+mod sparse_grid_validation;
+#[cfg(test)]
 mod subgroup_sum_validation;
 #[cfg(test)]
 mod vision_claim_validation;
@@ -231,6 +235,8 @@ mod visual_pathway_validation;
 mod whitening_storage_validation;
 #[cfg(test)]
 mod whitening_validation;
+#[cfg(test)]
+mod workgroup_initialization_validation;
 
 /// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
 /// dedicated WGSL file so the fragment stays validator-friendly.

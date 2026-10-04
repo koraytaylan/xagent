@@ -6,7 +6,7 @@ fn projection_credit_agent(agent_id: u32, tid: u32) {
     let alive = physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5;
     let private_base = PROJECTION_STORAGE_BASE + agent_id * PROJECTION_AGENT_STRIDE;
     let brain_base = agent_id * BRAIN_STRIDE;
-    for (var feature = tid; feature < PROJECTION_VISUAL_COUNT; feature += ENCODER_CREDIT_THREADS) {
+    for (var feature = tid; feature < PROJECTION_VISUAL_COUNT; feature += PROJECTION_GLOBAL_THREADS) {
         var predicted = 0.0;
         if (alive) {
             predicted = sensory_buffer[agent_id * SENSORY_STRIDE + feature]
@@ -47,7 +47,7 @@ fn projection_credit_agent(agent_id: u32, tid: u32) {
     storageBarrier();
     workgroupBarrier();
     if (alive) {
-        for (var feature = tid; feature < PROJECTION_VISUAL_COUNT; feature += ENCODER_CREDIT_THREADS) {
+        for (var feature = tid; feature < PROJECTION_VISUAL_COUNT; feature += PROJECTION_GLOBAL_THREADS) {
             packed_encoder.scratch[agent_id * BRAIN_SCRATCH_STRIDE + SCRATCH_FEATURES + feature]
                 = agent_projection_inputs[feature];
         }

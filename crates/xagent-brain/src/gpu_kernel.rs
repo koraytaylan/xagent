@@ -96,11 +96,17 @@ mod combined_validation;
 #[cfg(test)]
 mod context_cache_validation;
 #[cfg(test)]
+mod context_prefetch_validation;
+#[cfg(test)]
 mod cooperative_whitening_validation;
 #[cfg(test)]
 mod credit_prefetch_validation;
 #[cfg(test)]
 mod cycle_profile;
+#[cfg(test)]
+mod deferred_encoder_oracle;
+#[cfg(test)]
+mod deferred_encoder_validation;
 mod dense_prefetch;
 #[cfg(test)]
 mod dense_prefetch_validation;
@@ -108,6 +114,10 @@ mod dense_prefetch_validation;
 mod detection_reduction_validation;
 #[cfg(test)]
 mod dispatch_brain_validation;
+#[cfg(test)]
+mod encoder_noop_cache_validation;
+#[cfg(test)]
+mod encoder_width_validation;
 #[cfg(test)]
 mod exact_tiled_validation;
 mod global_credit;
@@ -124,6 +134,8 @@ mod predictor_dot_validation;
 mod predictor_fusion;
 #[cfg(test)]
 mod predictor_fusion_validation;
+#[cfg(test)]
+mod predictor_transpose_validation;
 mod predictor_width;
 #[cfg(test)]
 mod predictor_width_behavior_validation;
@@ -141,6 +153,8 @@ mod recall_validation;
 mod rounding_validation;
 #[cfg(test)]
 mod subgroup_sum_validation;
+#[cfg(test)]
+mod vision_claim_validation;
 #[cfg(test)]
 mod vision_validation;
 #[cfg(test)]

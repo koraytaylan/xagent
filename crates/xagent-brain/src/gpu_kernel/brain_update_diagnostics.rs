@@ -24,6 +24,8 @@ const ENVELOPE_WINDOWS: [usize; 3] = [1, 8, 16];
 /// Current optional production predictor configuration.
 const PREFETCH_FACTOR: u32 = 8;
 const PREDICTOR_LANES: u32 = 16;
+/// Compare contiguous dimension blocks with the complete feature row.
+const CERTIFICATE_BLOCK_WIDTHS: [usize; 3] = [32, 64, ENCODED_DIMENSION];
 /// Indices are the capture_state buffer order.
 const PHYSICS: usize = 0;
 const DECISIONS: usize = 1;
@@ -210,7 +212,7 @@ struct Observation {
     predictor_counts: Vec<Counts>,
     encoder: Vec<RowBound>,
     predictor: Vec<RowBound>,
-    feature_certificates: Vec<FeatureCertificates>,
+    feature_certificates: Vec<[FeatureCertificates; CERTIFICATE_BLOCK_WIDTHS.len()]>,
     respawns: u64,
 }
 
@@ -422,50 +424,57 @@ fn observe_feature_certificates(
     decision: &[f32],
     features: &[Interval],
     learning_rate: f32,
+    block_width: usize,
 ) -> FeatureCertificates {
-    let mut active_dimensions = 0_u64;
-    let mut maximum_scale = 0.0_f64;
+    assert!(block_width != 0 && ENCODED_DIMENSION % block_width == 0);
     let epsilon = shader_constant("CREDIT_EPSILON");
     let credit_scale = Interval::exact(shader_constant("ENCODER_CREDIT_SCALE"));
-    for &credit in &decision[DECISION_CREDIT..DECISION_CREDIT + ENCODED_DIMENSION] {
-        if credit.abs() >= epsilon {
-            active_dimensions += 1;
-            let scale = Interval::exact(learning_rate)
-                .multiply(Interval::exact(credit))
-                .multiply(credit_scale);
-            maximum_scale = maximum_scale.max(scale.magnitude());
-        }
-    }
-    let scale_bound = Interval {
-        low: 0.0,
-        high: maximum_scale,
-    };
     let mut counts = FeatureCertificates::default();
-    for (feature, &input) in features.iter().enumerate() {
-        let first = feature * ENCODED_DIMENSION;
-        let old = &before[first..first + ENCODED_DIMENSION];
-        let new = &after[first..first + ENCODED_DIMENSION];
-        let unchanged = old
-            .iter()
-            .zip(new)
-            .all(|(old, new)| old.to_bits() == new.to_bits());
-        counts.total += 1;
-        counts.all_unchanged += u64::from(unchanged);
-        counts.no_active_credit += u64::from(active_dimensions == 0);
-        counts.all_unchanged_attempted_weights += u64::from(unchanged) * active_dimensions;
-        let Some(minimum_gap) = minimum_neighbor_gap(old) else {
-            continue;
+    for (block, credits) in decision[DECISION_CREDIT..DECISION_CREDIT + ENCODED_DIMENSION]
+        .chunks_exact(block_width)
+        .enumerate()
+    {
+        let mut active_dimensions = 0_u64;
+        let mut maximum_scale = 0.0_f64;
+        for &credit in credits {
+            if credit.abs() >= epsilon {
+                active_dimensions += 1;
+                let scale = Interval::exact(learning_rate)
+                    .multiply(Interval::exact(credit))
+                    .multiply(credit_scale);
+                maximum_scale = maximum_scale.max(scale.magnitude());
+            }
+        }
+        let scale_bound = Interval {
+            low: 0.0,
+            high: maximum_scale,
         };
-        counts.eligible += 1;
-        let update_bound = scale_bound.multiply(input).magnitude();
-        if update_bound < minimum_gap / 2.0 {
-            assert!(
-                unchanged,
-                "feature {feature}: certified no-op changed a weight, update bound {update_bound:e}, minimum neighbor gap {minimum_gap:e}"
-            );
-            counts.certified += 1;
-            counts.certified_active += u64::from(active_dimensions != 0);
-            counts.certified_attempted_weights += active_dimensions;
+        for (feature, &input) in features.iter().enumerate() {
+            let first = feature * ENCODED_DIMENSION + block * block_width;
+            let old = &before[first..first + block_width];
+            let new = &after[first..first + block_width];
+            let unchanged = old
+                .iter()
+                .zip(new)
+                .all(|(old, new)| old.to_bits() == new.to_bits());
+            counts.total += 1;
+            counts.all_unchanged += u64::from(unchanged);
+            counts.no_active_credit += u64::from(active_dimensions == 0);
+            counts.all_unchanged_attempted_weights += u64::from(unchanged) * active_dimensions;
+            let Some(minimum_gap) = minimum_neighbor_gap(old) else {
+                continue;
+            };
+            counts.eligible += 1;
+            let update_bound = scale_bound.multiply(input).magnitude();
+            if update_bound < minimum_gap / 2.0 {
+                assert!(
+                    unchanged,
+                    "feature {feature} block {block} width {block_width}: certified no-op changed a weight, update bound {update_bound:e}, minimum neighbor gap {minimum_gap:e}"
+                );
+                counts.certified += 1;
+                counts.certified_active += u64::from(active_dimensions != 0);
+                counts.certified_attempted_weights += active_dimensions;
+            }
         }
     }
     counts
@@ -529,13 +538,16 @@ fn observe(
         let decision = &decisions[agent * DECISION_STRIDE..(agent + 1) * DECISION_STRIDE];
         observation
             .feature_certificates
-            .push(observe_feature_certificates(
-                old,
-                new,
-                decision,
-                &features,
-                learning_rate,
-            ));
+            .push(CERTIFICATE_BLOCK_WIDTHS.map(|block_width| {
+                observe_feature_certificates(
+                    old,
+                    new,
+                    decision,
+                    &features,
+                    learning_rate,
+                    block_width,
+                )
+            }));
         let (counts, rows) = observe_encoder(kernel, old, new, decision, &features, learning_rate);
         observation.encoder_counts.push(counts);
         observation.encoder.extend(rows);
@@ -696,12 +708,16 @@ fn report_window(label: &str, observations: &[Observation]) {
     report_feature_certificates(label, observations);
 }
 
-fn report_feature_certificates(label: &str, observations: &[Observation]) {
+fn feature_certificate_totals(
+    observations: &[Observation],
+    width_index: usize,
+) -> FeatureCertificates {
     let mut total = FeatureCertificates::default();
-    for counts in observations
+    for widths in observations
         .iter()
         .flat_map(|sample| &sample.feature_certificates)
     {
+        let counts = widths[width_index];
         total.total += counts.total;
         total.all_unchanged += counts.all_unchanged;
         total.no_active_credit += counts.no_active_credit;
@@ -711,11 +727,37 @@ fn report_feature_certificates(label: &str, observations: &[Observation]) {
         total.certified_attempted_weights += counts.certified_attempted_weights;
         total.all_unchanged_attempted_weights += counts.all_unchanged_attempted_weights;
     }
+    total
+}
+
+fn report_feature_certificates(label: &str, observations: &[Observation]) {
     let attempted_weights: u64 = observations
         .iter()
         .flat_map(|sample| &sample.encoder_counts)
         .map(|counts| counts.attempted)
         .sum();
+    for (width_index, block_width) in CERTIFICATE_BLOCK_WIDTHS.into_iter().enumerate() {
+        let total = feature_certificate_totals(observations, width_index);
+        println!(
+            "DENSE_ENCODER_BLOCK_CERTIFICATE label={label} block_width={block_width} total_blocks={} all_block_weights_unchanged={} no_active_credit_blocks={} eligible_blocks={} invalid_blocks={} certificate_hits={} certificate_hits_with_active_credit={} attempted_weights={} certified_attempted_weights={} all_unchanged_block_attempted_weights={} false_positives=0 proof_scope=observed_compilation future_gpu_cache_unimplemented=true",
+            total.total,
+            total.all_unchanged,
+            total.no_active_credit,
+            total.eligible,
+            total.total - total.eligible,
+            total.certified,
+            total.certified_active,
+            attempted_weights,
+            total.certified_attempted_weights,
+            total.all_unchanged_attempted_weights
+        );
+    }
+    // The full-row report expresses the same coverage in complete features.
+    let full_row_index = CERTIFICATE_BLOCK_WIDTHS
+        .iter()
+        .position(|&width| width == ENCODED_DIMENSION)
+        .unwrap();
+    let total = feature_certificate_totals(observations, full_row_index);
     println!(
         "DENSE_ENCODER_FEATURE_CERTIFICATE label={label} total_features={} all_128_unchanged={} no_active_credit_features={} eligible_features={} invalid_features={} certificate_hits={} certificate_hits_with_active_credit={} attempted_weights={} certified_attempted_weights={} all_128_unchanged_attempted_weights={} false_positives=0 proof_scope=observed_compilation future_gpu_cache_unimplemented=true",
         total.total,

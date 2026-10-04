@@ -960,3 +960,111 @@ overall—far less than the individual no-op rate. No GPU certificate cache is
 implemented or timed. Maintaining gap metadata, reducing the scale bounds,
 and invalidating cached bounds after host writes and alternate schedules would
 all cost work; these observations alone do not establish a speedup.
+
+### Further layout and update-representation experiments
+
+The same snapshot analysis now evaluates contiguous blocks of 32, 64 and 128
+output weights separately, using each block's own maximum update and minimum
+adjacent-float gap; every certificate hit still asserts unchanged weight bits.
+The 32-weight blocks certify 40.15%, 66.44% and 47.00% of attempted updates in
+the three mature seed windows, compared with 23.01%, 45.19% and 28.02% for
+whole 128-weight feature rows; early-window coverage remains near 6.5%.
+There are no observed false positives. The half-gap argument assumes
+round-to-nearest, which [WGSL's floating-point rules](https://www.w3.org/TR/WGSL/#floating-point-accuracy) do not universally require,
+so observed exactness is a compilation-specific validation result, not a
+portable guarantee of bitwise equivalence.
+
+An implemented 32-weight GPU gap cache then passes all-thirteen-buffer
+comparisons through 100 cycles in both field sizes, including cold metadata,
+death, refresh and replay. Eight explicit harness invalidations cover host
+agent/batch writes, zero/subnormal/clamp-edge weights, reset, split/tiled
+transitions, partial brain execution and skipped global work. Cache lower
+bounds are checked against the actual matrix, and nonzero skip counts are
+required. Its finite-input guards reject unsafe factor magnitudes before
+multiplication; rejected cases execute the original update.
+
+This cache is slower: five alternating 100-cycle pairs after a 1,000-cycle
+warmup measure 0.052254/0.060551 s (**0.863×**) against production global
+credit. It adds 85,440 private metadata bytes, including diagnostic skip
+counts, plus update-bound checks and block reductions. The measured cost
+outweighs skipped weight accesses on this GPU. Production APIs do not maintain
+its metadata or invalidation, and the experiment is not promoted.
+
+Three further experiments use the complete optimized global-credit cycle,
+including cached vision, cooperative whitening, prefetch8 and predictor16:
+
+* Context gathers prefetched in groups of 4/8/16 preserve all thirteen buffers
+  across 8×6 and 9×7 fields with death and refresh boundaries. Five rotated
+  100-cycle trials measure 0.997×/1.001×/0.998× against the scalar context loop;
+  this does not establish a speedup.
+* Encoder layouts with 2/8/16 lanes per output measure
+  1.044×/0.962×/0.878× against four lanes after the same 256-cycle checkpoint.
+  All arms pass state invariants and repeat all thirteen buffers over five
+  trials. These layouts change dot-product association; reported trajectory
+  differences are not a numerical error bound or evidence of long-run
+  behavioral equivalence, and none is enabled in production.
+* Transposed predictor storage preserves all thirteen buffers after decoding
+  the matrix layout for comparison. Matching 4/8/16/32-lane pairs measure
+  1.089×/0.968×/0.892×/0.807× respectively, but the best transposed arm takes
+  0.053804 s versus 0.052334 s for the current row-major sixteen-lane arm.
+  Initial upload and final readback conversions are outside these timings;
+  no host API or alternative dispatch integration is implemented.
+
+These are test-only measurements on the local GPU and do not improve the
+reported 2.692× long whole-simulation result or establish the 10× target.
+
+The deferred encoder primitive stores a base matrix plus 8 or 16 FP32
+feature/scale factors, with the original per-output update gate. Its raw
+queries add low-rank corrections to the base matvec. Materialization replays
+every per-weight update and clamp chronologically in registers, loading and
+storing each weight once per window; it reduces matrix traffic, not update
+arithmetic. A GPU maximum-magnitude certificate bounds every intermediate
+weight, and failure materializes the accepted prefix before applying the
+uncertified update densely. This is an isolated primitive, with no simulation
+or host-lifecycle integration.
+
+Seven adversarial fixtures across both windows and 33 prefixes pass exact
+materialized-matrix comparisons against sequential GPU updates, independent
+raw-dot error bounds, clamp-fallback checks and repetition. Tiny updates that
+sequential FP32 arithmetic discards still affect deferred queries: the largest
+observed raw-dot difference is 3.242493e-5 for the sixteen-step tiny-update
+fixture. The numerical oracle explicitly includes that discrepancy rather
+than comparing only with ideal real-valued rank-one algebra; its seven CPU
+tests also reject omitted factors and one-shot materialization. The shader
+with snapshot capture disabled additionally matches the bounded shader's raw
+dots, certificate metadata and final matrix for every numerical fixture.
+
+Five rotated primitive timing trials with ten matrices and eight 33-step GPU
+dispatches measure **1.126×** for the eight-step window and **1.044×** for
+sixteen. Snapshot capture is disabled while timing, and the measured path
+includes certification and chronological flushing. Reported logical matrix
+traffic excludes cache effects and is not a bandwidth measurement. The result
+does not demonstrate a gain over production global-credit scheduling or
+behavioral equivalence of an evolving simulation. Export would need to
+materialize a copy without changing the pending representation, so readback
+frequency cannot alter subsequent query rounding.
+
+### Vision beside the following claim step
+
+A further test-only schedule snapshots all 53 physics words per agent after
+the global collision barrier, then runs vision beside the following cycle's
+physics and food-claim workgroups. Vision reads the private snapshot; claim
+writes live physics and separate atomic food-claim slots. Food positions,
+consumed flags, grids and the brain genes read by vision remain unchanged
+until the following dispatch. Every submission still starts with its first
+claim and ends with vision alone, so public API boundaries retain their
+original state and no claim is left pending. No extra shader binding is added;
+the snapshot privately replaces the unused sensory-next binding in these
+experimental groups without modifying that public buffer.
+
+Both 8×6 and 9×7 fixtures pass all-thirteen-buffer comparisons and repetition
+through 100 cycles including death, refresh and singleton submissions. Five
+alternating 100-cycle trials use 305 dispatches instead of 400, with the same
+five submissions, but measure 0.052329/0.052947 s (**0.988×**). These timings
+include the 2,120-byte physics snapshot and changed shader composition;
+fewer dispatches do not produce a measured benefit on this GPU, and the
+schedule is not promoted.
+
+The completed experiments pass 90 normal brain-library tests, their focused
+GPU checks, formatting and workspace Clippy with all targets and warnings
+denied; none changes production simulation behavior or establishes 10×.

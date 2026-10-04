@@ -102,6 +102,7 @@ pub(super) fn checkpoint(kernel: &GpuKernel) -> Checkpoint {
 }
 
 pub(super) fn restore(kernel: &mut GpuKernel, checkpoint: &Checkpoint) {
+    kernel.invalidate_packed_encoder();
     let mut encoder = kernel.device.create_command_encoder(&Default::default());
     for ((_, target), source) in state_buffers(kernel).iter().zip(&checkpoint.buffers) {
         encoder.copy_buffer_to_buffer(source, 0, target, 0, source.size());
@@ -299,6 +300,14 @@ fn profile_cycles(
     let batch_ticks = kernel.kernel_batch_size();
     kernel.upload_world_config_with_cycles(start_tick, batch_ticks, COMPLETE_PHASE_MASK, 1);
     let mut encoder = kernel.device.create_command_encoder(&Default::default());
+    if let Some(cache) = kernel
+        .global_credit
+        .as_ref()
+        .filter(|_| kernel.global_credit_active())
+        .and_then(|credit| credit.packed_encoder.as_ref())
+    {
+        cache.record_import(kernel, &mut encoder);
+    }
     {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_bind_group(0, &kernel.bind_groups[kernel.active_config_index], &[]);

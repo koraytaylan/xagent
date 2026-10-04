@@ -2,10 +2,12 @@
 //! The main kernel publishes its actual adapted features into private storage
 //! at binding 13. Pointwise credit retains the original weight arithmetic and
 //! clamps; the world branch does not access encoder weights or modify alive
-//! flags. No extra dispatch or workgroup-memory allocation is introduced.
+//! flags. Optional packed encoder weights mirror every update into ordinary
+//! brain storage, keeping public readbacks authoritative without extra dispatches.
 
 use std::collections::HashMap;
 
+use super::packed_encoder;
 use super::{apply_subgroup_markers, GpuKernel, BRAIN_WORKGROUP_THREADS, MAX_DISPATCH_WORKGROUPS};
 use crate::buffers::ENCODED_DIMENSION;
 
@@ -21,7 +23,8 @@ pub(super) struct Pipelines {
     pub(super) global_workgroups: u32,
     // Binding 13 differs from the ordinary group. Its lifetime follows both
     // groups, and every live agent rewrites its features before any read.
-    _features: wgpu::Buffer,
+    _features: Option<wgpu::Buffer>,
+    pub(super) packed_encoder: Option<packed_encoder::Cache>,
 }
 
 /// Checked shape calculation also bounds WGSL's per-agent u32 weight offset.
@@ -72,11 +75,26 @@ fn publish_features(brain_passes: &str) -> String {
     )
 }
 
-fn main_source(brain_passes: &str, has_subgroup: bool) -> String {
+fn main_source(
+    brain_passes: &str,
+    has_subgroup: bool,
+    packed: Option<&packed_encoder::Cache>,
+) -> String {
     let passes = publish_features(brain_passes);
+    let (common, passes) = if let Some(cache) = packed {
+        (
+            cache.common_source(),
+            packed_encoder::packed_passes(&passes),
+        )
+    } else {
+        (
+            include_str!("../shaders/kernel/common.wgsl").to_owned(),
+            passes,
+        )
+    };
     apply_subgroup_markers(
         &[
-            include_str!("../shaders/kernel/common.wgsl"),
+            &common,
             passes.as_str(),
             include_str!("../shaders/kernel/brain_inner.wgsl"),
             include_str!("../shaders/kernel/phase_food_claim.wgsl"),
@@ -87,7 +105,7 @@ fn main_source(brain_passes: &str, has_subgroup: bool) -> String {
     )
 }
 
-fn global_source() -> String {
+fn global_source(packed: Option<&packed_encoder::Cache>) -> String {
     let global = replace_once(include_str!("../shaders/kernel/global_tick.wgsl"),
         "@compute @workgroup_size(256)\nfn global_tick(@builtin(local_invocation_id) lid: vec3u) {\n    let tid = lid.x;",
         "fn global_world_inner(tid: u32) {");
@@ -102,11 +120,20 @@ fn global_source() -> String {
     ]
     .join("\n");
     assert!(!phases.contains("brain_state"));
+    let common = packed.map_or_else(
+        || include_str!("../shaders/kernel/common.wgsl").to_owned(),
+        packed_encoder::Cache::common_source,
+    );
+    let credit = if packed.is_some() {
+        packed_encoder::CREDIT_SOURCE
+    } else {
+        include_str!("../shaders/kernel/phase_encoder_credit.wgsl")
+    };
     [
-        include_str!("../shaders/kernel/common.wgsl"),
+        &common,
         phases.as_str(),
         global.as_str(),
-        include_str!("../shaders/kernel/phase_encoder_credit.wgsl"),
+        credit,
         include_str!("../shaders/kernel/global_credit_tick.wgsl"),
     ]
     .join("\n")
@@ -159,16 +186,50 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
     ) -> Option<Self> {
+        Self::new_variant(kernel, brain_passes, constants, false)
+    }
+
+    pub(super) fn new_packed(
+        kernel: &GpuKernel,
+        brain_passes: &str,
+        constants: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        Self::new_variant(kernel, brain_passes, constants, true)
+    }
+
+    fn new_variant(
+        kernel: &GpuKernel,
+        brain_passes: &str,
+        constants: &HashMap<String, f64>,
+        packed_requested: bool,
+    ) -> Option<Self> {
         if kernel.vision_stride != 1 {
             log::warn!("[GpuKernel] Global encoder credit requires vision stride 1; retaining the original schedule");
             return None;
         }
-        let Some(global_workgroups) =
-            workgroup_count(kernel.layout.feature_count, kernel.agent_count)
-        else {
+        let packed = if packed_requested {
+            let cache = packed_encoder::Cache::new(kernel);
+            if cache.is_none() {
+                log::warn!("[GpuKernel] Packed encoder exceeds buffer, workgroup storage or dispatch limits; retaining scalar global credit");
+            }
+            cache
+        } else {
+            None
+        };
+        let Some(global_workgroups) = packed.as_ref().map_or_else(
+            || workgroup_count(kernel.layout.feature_count, kernel.agent_count),
+            |cache| Some(cache.global_workgroups()),
+        ) else {
             log::warn!("[GpuKernel] Global encoder credit exceeds the dispatch dimension limit; retaining the original schedule");
             return None;
         };
+        let mut constants = constants.clone();
+        if let Some(cache) = &packed {
+            constants.insert(
+                "GLOBAL_CREDIT_GROUPS_PER_AGENT".into(),
+                f64::from(cache.groups_per_agent()),
+            );
+        }
         let bind_layout = kernel.kernel_pipeline.get_bind_group_layout(0);
         let layout = kernel
             .device
@@ -195,32 +256,38 @@ impl Pipelines {
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: wgpu::PipelineCompilationOptions {
-                        constants,
+                        constants: &constants,
                         ..Default::default()
                     },
                     cache: None,
                 })
         };
         let main = create(
-            main_source(brain_passes, kernel.has_subgroup),
+            main_source(brain_passes, kernel.has_subgroup, packed.as_ref()),
             "kernel_tick",
         );
-        let global = create(global_source(), "global_credit_tick");
-        let features = kernel.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("global_credit_features"),
-            size: kernel.brain_scratch_buffer.size(),
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
+        let global = create(global_source(packed.as_ref()), "global_credit_tick");
+        let features = packed.is_none().then(|| {
+            kernel.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global_credit_features"),
+                size: kernel.brain_scratch_buffer.size(),
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
         });
+        let buffer = packed
+            .as_ref()
+            .map_or_else(|| features.as_ref().unwrap(), packed_encoder::Cache::buffer);
         let bind_groups =
-            std::array::from_fn(|index| private_bind_group(kernel, &bind_layout, &features, index));
-        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, private features; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule");
+            std::array::from_fn(|index| private_bind_group(kernel, &bind_layout, buffer, index));
+        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, packed encoder={}; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule", packed.is_some());
         Some(Self {
             main,
             global,
             bind_groups,
             global_workgroups,
             _features: features,
+            packed_encoder: packed,
         })
     }
 }

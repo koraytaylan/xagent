@@ -1,6 +1,6 @@
 // Optional cooperative brain helpers, composed with common + brain_passes.
 // One workgroup owns one agent. Whitening borrows the first two matrix-sized
-// regions of s_reinf_dot, which predict/act otherwise does not access. The
+// regions of s_reinf_dot after context blending releases its scratch. The
 // learning pass overwrites every s_reinf_dot[tid], then barriers, before its
 // first read. If an agent is dead or learning is skipped, no later pass reads
 // these temporary values. No additional workgroup resource is allocated.

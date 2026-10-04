@@ -31,6 +31,8 @@
 //! `XAGENT_BRAIN_COOPERATIVE_WHITENING=1` substitutes ordered interleaved
 //! recall and cooperative whitening in each cooperative brain pipeline.
 //! Whitening borrows existing learning scratch and adds no workgroup resource.
+//! `XAGENT_BRAIN_CONTEXT_GATHER=1` stages recalled patterns cooperatively,
+//! preserving each output's scalar accumulation order in existing scratch.
 //! `XAGENT_BRAIN_FUSED_PREDICTOR=1` fuses the inline predictor's update/read
 //! loops; the separately dispatched tiled predictor retains its own source.
 //! `XAGENT_BRAIN_GLOBAL_CREDIT=1` moves encoder-weight credit into independent
@@ -39,6 +41,9 @@
 //! complete brain/global cycle. Other modes, longer vision strides, partial
 //! brain probes, skipped global work and oversized dispatches retain the
 //! original schedule. Private feature storage preserves ordinary brain scratch.
+//! `XAGENT_BRAIN_PACKED_ENCODER=1` enables global credit with four-output
+//! encoder vectors. Updated weights are mirrored into ordinary brain storage;
+//! host writes and scalar fallback routes invalidate the private vector cache.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -95,6 +100,11 @@ mod cached_combined_validation;
 mod combined_validation;
 #[cfg(test)]
 mod context_cache_validation;
+mod context_gather;
+#[cfg(test)]
+mod context_gather_production_validation;
+#[cfg(test)]
+mod context_gather_validation;
 #[cfg(test)]
 mod context_prefetch_validation;
 #[cfg(test)]
@@ -125,6 +135,17 @@ mod global_credit;
 mod global_credit_production_validation;
 #[cfg(test)]
 mod global_credit_validation;
+mod packed_encoder;
+#[cfg(test)]
+mod packed_encoder_dot_validation;
+#[cfg(test)]
+mod packed_encoder_production_validation;
+#[cfg(test)]
+mod packed_encoder_validation;
+#[cfg(test)]
+mod packed_predictor_dot_validation;
+#[cfg(test)]
+mod packed_predictor_validation;
 #[cfg(test)]
 mod persistent_validation;
 #[cfg(test)]
@@ -1034,6 +1055,7 @@ impl GpuKernel {
 
     fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
         let _vulkan = vulkan_gate::enter();
+        self.invalidate_packed_encoder();
         // Drain any pending async readback so staging buffers are clean.
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {
@@ -1534,6 +1556,7 @@ impl GpuKernel {
         let cooperative_whitening =
             std::env::var("XAGENT_BRAIN_COOPERATIVE_WHITENING").as_deref() == Ok("1");
         let dense_prefetch = std::env::var("XAGENT_BRAIN_DENSE_PREFETCH").as_deref() == Ok("1");
+        let context_gather = std::env::var("XAGENT_BRAIN_CONTEXT_GATHER").as_deref() == Ok("1");
         let predictor_lanes = std::env::var("XAGENT_BRAIN_PREDICTOR_LANES")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -1555,14 +1578,21 @@ impl GpuKernel {
         } else {
             brain_passes_src
         };
-        if cooperative_whitening || fused_predictor || dense_prefetch {
+        if cooperative_whitening || fused_predictor || dense_prefetch || context_gather {
             log::info!(
                 "[GpuKernel] cooperative whitening and interleaved recall={cooperative_whitening}, \
                  fused inline predictor={fused_predictor}, dense prefetch={dense_prefetch}, \
-                 predictor lanes={predictor_lanes}"
+                 predictor lanes={predictor_lanes}, gathered context={context_gather}"
             );
         }
         let brain_passes_src = predictor_width::wider_predictor(&brain_passes_src, predictor_lanes);
+        let brain_passes_src = if context_gather {
+            // Eight lanes stage sixteen recalled patterns in two scratch arrays.
+            const CONTEXT_GATHER_LANES: u32 = 8;
+            context_gather::gather_context(&brain_passes_src, CONTEXT_GATHER_LANES)
+        } else {
+            brain_passes_src
+        };
 
         // Physics pipeline: common + phase fragments + physics entry
         let physics_source = [
@@ -2158,7 +2188,10 @@ impl GpuKernel {
             probe_submits: 0,
             vulkan_lock_tail: vulkan_gate::LockTail,
         };
-        if std::env::var("XAGENT_BRAIN_GLOBAL_CREDIT").as_deref() == Ok("1") {
+        if std::env::var("XAGENT_BRAIN_PACKED_ENCODER").as_deref() == Ok("1") {
+            kernel.global_credit =
+                global_credit::Pipelines::new_packed(&kernel, &brain_passes_src, &vision_overrides);
+        } else if std::env::var("XAGENT_BRAIN_GLOBAL_CREDIT").as_deref() == Ok("1") {
             kernel.global_credit =
                 global_credit::Pipelines::new(&kernel, &brain_passes_src, &vision_overrides);
         }
@@ -2336,6 +2369,7 @@ impl GpuKernel {
     /// Bit 0 = physics, bit 1 = vision, bit 2 = brain.
     pub fn dispatch_batch_masked(&mut self, start_tick: u64, ticks_to_run: u32, phase_mask: u32) {
         let _vulkan = vulkan_gate::enter();
+        self.invalidate_packed_encoder();
         let n = self.agent_count as usize;
         let buf_size = (n * PHYS_STRIDE * 4) as u64;
 
@@ -2538,6 +2572,9 @@ impl GpuKernel {
     /// `vision_stride * brain_tick_stride` physics ticks and the sensory lag
     /// is one batch = `vision_stride * brain_tick_stride` physics ticks.
     pub fn dispatch_ticks(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
+        if !self.global_credit_active() {
+            self.invalidate_packed_encoder();
+        }
         match self.execution_mode {
             BrainExecutionMode::SplitSerial => {
                 self.dispatch_ticks_split_serial(start_tick, ticks_to_run)
@@ -2594,6 +2631,18 @@ impl GpuKernel {
             && self.probe.kernel_pass_limit == COMPLETE_BRAIN_PASSES
     }
 
+    /// Scalar brain writes make the private vector copy stale; public storage
+    /// stays authoritative and is copied only before packed execution resumes.
+    fn invalidate_packed_encoder(&self) {
+        if let Some(cache) = self
+            .global_credit
+            .as_ref()
+            .and_then(|credit| credit.packed_encoder.as_ref())
+        {
+            cache.invalidate();
+        }
+    }
+
     fn dispatch_ticks_fused_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
         let _vulkan = vulkan_gate::enter();
         let brain_cycles = ticks_to_run / self.brain_tick_stride;
@@ -2648,6 +2697,14 @@ impl GpuKernel {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("dispatch_kernel_fused"),
                         });
+                if let Some(cache) = self
+                    .global_credit
+                    .as_ref()
+                    .filter(|_| global_credit_active)
+                    .and_then(|credit| credit.packed_encoder.as_ref())
+                {
+                    cache.record_import(self, &mut encoder);
+                }
 
                 // One compute pass for the whole chunk. wgpu-core still places
                 // a storage barrier between dependent dispatches inside a pass
@@ -3464,6 +3521,7 @@ impl GpuKernel {
     /// Write full brain state for one agent (blocking GPU upload).
     pub fn write_agent_state(&self, index: u32, state: &AgentBrainState) {
         let _vulkan = vulkan_gate::enter();
+        self.invalidate_packed_encoder();
         let i = index as usize;
         let bs = self.layout.brain_stride;
 
@@ -3747,6 +3805,7 @@ impl GpuKernel {
         F: Fn(usize) -> AgentBrainState,
     {
         let _vulkan = vulkan_gate::enter();
+        self.invalidate_packed_encoder();
         debug_assert_eq!(
             count, self.agent_count as usize,
             "batch_write_agent_states: count ({}) != agent_count ({})",
@@ -3794,6 +3853,7 @@ impl GpuKernel {
     /// buffers are still in flight (caller should retry next frame).
     pub fn try_reset_agents(&mut self, brain_config: &BrainConfig) -> bool {
         let _vulkan = vulkan_gate::enter();
+        self.invalidate_packed_encoder();
         // Check if any staging buffer is still in flight.
         for i in 0..STAGING_SLOTS {
             if self.staging_in_flight[i] {

@@ -5,9 +5,9 @@
 **Base:** `33a7afaa` on `develop`
 **Trigger:** find ways to make the GPU computation several times faster without damaging accuracy.
 
-**Follow-up, 2026-10-04:** the [latest production experiments](#production-encoder-credit-beside-the-world-update)
-measure 2.692× whole-simulation acceleration with optional FP32 reassociation,
-or 2.437× with matching public hashes, for 10 agents on a Raphael integrated
+**Follow-up, 2026-10-04:** the [latest production experiments](#production-packed-encoder-cache)
+measure 3.110× whole-simulation acceleration with optional FP32 reassociation,
+or 2.743× with matching public hashes, for 10 agents on a Raphael integrated
 GPU; these are separate from the original M3 Max measurements below, and the
 requested 10× whole-simulation target remains unmet.
 
@@ -1068,3 +1068,248 @@ schedule is not promoted.
 The completed experiments pass 90 normal brain-library tests, their focused
 GPU checks, formatting and workspace Clippy with all targets and warnings
 denied; none changes production simulation behavior or establishes 10×.
+
+### Production ordered context gathering
+
+The original context blend assigns one invocation to each output dimension.
+Each invocation reads sixteen recalled pattern values from dimension-major
+storage. The new gather assigns eight invocations to an output: each loads
+two raw values into existing `s_dense_partials` and `s_reinf_dot` storage, and
+invocation zero performs the original ascending normalization and weighted
+accumulation before tanh. Four output tiles require eight unconditional
+barriers. No shared allocation, shader binding or dispatch is added. The
+scratch is released before cooperative whitening initializes its matrix
+cells, and reinforcement later overwrites all entries before reading them.
+
+Both eight- and sixteen-invocation variants match all thirteen mutable buffers
+through 100 cycles in 8×6 and 9×7 fixtures, including forced death, whitening
+refresh and two candidate replays. Five rotated 100-cycle measurements after
+256 warmup cycles, with ten agents and the existing optimized global-credit
+configuration, give 0.053548 s for scalar context, 0.051299 s for sixteen lanes
+(**1.044×**) and 0.050529 s for eight lanes (**1.060×**). These are complete
+cycle timings from `context-gather-widths-validation.log` on the local GPU.
+
+`XAGENT_BRAIN_CONTEXT_GATHER=1` enables eight lanes; the default remains off.
+Constructor-created pipelines also pass independent comparisons against an
+ungathered control across fused, overlap-requested, split, tiled, vision-stride
+two, full masked and brain-only masked dispatches. Each route compares its
+own schedule. Raw 9×7 fixtures run 41 cycles and cortex 8×6 fixtures run four
+cycles with short submissions; this does not extend the earlier driver's
+long-cortex-submission validation. The checks run both with the other brain
+options disabled and with the optimized global-credit configuration.
+
+With the sixteen-lane predictor and the other production optimizations below,
+three alternating 100,000-tick pairs measure median **14.598242/5.033922 s
+(2.900×)**. Pair ratios are 2.879×, 2.900× and 2.908×. All six public hashes
+repeat within each arm, while the candidate differs from the original serial
+arm because this configuration permits FP32 reassociation. Context gathering
+itself matches the ungathered optimized state in the focused comparisons;
+these checks do not establish long-run behavioral equivalence of the wider
+predictor. The long public benchmark still omits final depth, consumed-food
+and claim flags, the complete decision buffer, and private scratch.
+
+Keeping the original four-lane predictor, one 100,000-tick pair measures
+**14.587345/5.648706 s (2.582×)** and matches all six public hashes. That single
+pair does not independently establish repetition. Both results use the
+ten-agent synthetic rolling-terrain scene on RADV Raphael with Mesa 26.0.8;
+performance on other GPUs or populations is unmeasured. **10× remains unmet.**
+
+```sh
+XAGENT_BRAIN_GLOBAL_CREDIT=1 XAGENT_BRAIN_COOPERATIVE_WHITENING=1 \
+XAGENT_BRAIN_DENSE_PREFETCH=1 XAGENT_BRAIN_PREDICTOR_LANES=16 \
+XAGENT_BRAIN_CONTEXT_GATHER=1 XAGENT_VISION_OBJECT_QUERIES=1 \
+XAGENT_VISION_PARALLEL_SCENT=1 XAGENT_VISION_AGENT_MASKS=1 \
+cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 100000 --repeats 3 --precision fp32
+```
+
+Omit the predictor-lane option and `--precision fp32` for the hash-matching
+configuration. The serial child explicitly clears context gathering and the
+other optional optimizations. The long FP32 result is recorded in
+`context-gather-production-long-benchmark.log`.
+
+### Packed encoder prototype measurements
+
+The initial packed encoder experiment keeps four adjacent output weights in each
+`vec4<f32>` without transposing their feature-major byte order. One invocation
+accumulates four outputs; 128 invocations cover the four original feature
+lanes and all 128 outputs in one tile. Every invocation reaches the barriers.
+The existing dense scratch grows from 256 to 512 scalars, and vector credit
+assigns each complete vector to one invocation, reducing credit workgroups
+from 134 to 34 per agent. Each component retains its original credit threshold,
+multiply/add and clamp. Different invocations never write components of the
+same vector.
+
+The private binding-13 allocation contains scalar scratch followed by packed
+weights and occupies 1,400,000 bytes for the default ten-agent fixture. The
+unmirrored variant imports and exports matrices explicitly at test boundaries;
+these copies are outside timing. Both 8×6 and 9×7 raw vision grids pass
+all-thirteen-buffer comparisons after decoding, including death, refresh, inactive agents and
+replay. Separate credit fixtures check mixed threshold decisions, clamp edges,
+signed zero and inactive values outside the clamp range. Across ten raw-dot
+fixtures, both raw vision grids and both implementations, 5,120 GPU output
+values pass independent FP32 forward-error bounds against the FP64 oracle. The bounds
+use round-to-nearest unit roundoff plus an allowance for subnormal flushing;
+passing characterizes this compilation, not every WGSL-permitted rounding
+choice. Matching scalar and packed outputs are bit-identical, including
+the cancellation, subnormal and bias-only cases.
+
+An initial five-pair whole-cycle comparison measures 0.052265/0.046414 s
+(**1.126×**) against scalar global credit. A subsequent four-arm experiment
+also tests writing every updated vector back to the ordinary scalar brain
+buffer, so public state remains current without a decoded export. Five
+rotated 100-cycle trials after the same 256-cycle warmup report:
+
+| Arm | Seconds | Ratio to scalar reference |
+|---|---:|---:|
+| Scalar global credit, context gather off | 0.053989 | 1.000× |
+| Packed encoder, boundary exports | 0.047386 | 1.139× |
+| Packed encoder, scalar mirror each cycle | 0.050248 | 1.074× |
+| Packed encoder, scalar mirror and context gather8 | 0.047847 | 1.128× |
+
+All timed arms match the thirteen-buffer reference at the final checkpoint;
+the mirrored arms require no decoded export for that comparison. Initial
+imports remain outside timing. These numbers are from
+`packed-encoder-mirror-timing.log` and use the existing production dispatch
+recorder. They do not isolate an incremental packed gain over context gathering
+alone, which is absent from this four-arm comparison. These prototype timings
+exclude the public reset, host-write and fallback-schedule lifecycle. The
+production integration below retains scalar mirroring and adds that lifecycle;
+packed storage was absent from the preceding 2.900× context-gathering result.
+
+### Production packed encoder cache
+
+`XAGENT_BRAIN_PACKED_ENCODER=1` enables the packed encoder and global-credit
+schedule; the default remains off. Each vector-credit invocation writes its
+updated components into both the private vector allocation and the ordinary
+scalar brain matrix. The scalar matrix therefore remains authoritative for
+serialization, blocking and queued agent-state reads, and fallback pipelines.
+No export or readback-layout change is needed.
+
+The private cache starts invalid. Before the first packed compute pass, the
+command encoder records a GPU copy of each scalar encoder matrix into its
+packed range. Full resets, single-agent and batch brain-state writes invalidate
+the cache. Dispatch through split, tiled, masked, longer-vision-stride or
+incomplete brain/global routes also invalidates it; returning to the packed
+route imports the current scalar matrix before use. Death preserves learned
+weights and needs no separate import. The validity flag is atomic, retaining
+shared-reference write APIs without adding per-tick CPU simulation logic.
+
+Checked layout arithmetic rejects buffer, shader-index, dispatch and workgroup
+storage overflows. Existing scratch grows by 1 KiB without another workgroup
+resource slot. Conservatively rounding every shared allocation to sixteen
+bytes gives 9,200 bytes for raw 8×6 vision and 15,296 bytes for the 24×24 cortex
+retina, below the requested 16,384-byte limit. Larger unsupported layouts
+retain scalar global credit. A CPU source-declaration audit guards the shared
+storage estimate against shader changes.
+The constructor fallback also passes a 20×21 raw-vision fixture with 2,127
+features: its packed bound is 16,640 bytes versus 15,616 for scalar storage.
+On the 16,384-byte device limit, the cache is absent, scalar global credit
+remains active, and three cycles match all thirteen captured buffers.
+
+The raw encoder probe now extracts the production `packed_passes` result and
+removes only its final tanh; the credit probe uses the production credit
+fragment. The unmirrored timing variant derives from that same fragment by
+removing only the scalar-store tail. Thus the numerical fixtures exercise
+the canonical arithmetic rather than a duplicated encoder or credit shader.
+All 5,120 raw encoder outputs pass the FP32 bounds and match the scalar dots
+bitwise. Constructor lifecycle checks also pass all thirteen captured
+simulation buffers at five checkpoints per scenario: thirteen raw-vision
+scenarios and five cortical scenarios, repeated with optimized and otherwise
+bare brain options. They assert cache validity and that a warm cache records
+no import, and cover cold cache states, host writes,
+resets, fallback execution and resumed packed execution, plus request-time
+queued reads and current blocking reads. These comparisons never export the
+private cache into the scalar matrix to make the check pass. Warmup includes
+death, whitening refresh and an inactive agent; cortical submissions remain
+limited to one brain cycle.
+
+With gathered context, the sixteen-lane predictor and the other production
+options below, three alternating 100,000-tick pairs measure median
+**14.549147/4.678881 s (3.110×)**. Individual pair ratios are 3.103×, 3.107× and
+3.115×. Each arm repeats all six public hashes, and the candidate hashes match
+the earlier context-only optimized candidate at the same tick count. They
+differ from the original serial arm, as expected from the permitted predictor
+reassociation. This is a complete production-cycle measurement with scalar
+mirroring enabled. Initial cache import occurs during the shared 100-tick
+warmup, so these timings do not measure frequent host mutation or fallback
+transitions.
+
+Keeping the original four-lane predictor, one 100,000-tick pair measures
+**14.511148/5.289362 s (2.743×)** and matches all six public hashes. This single
+pair does not establish repetition; its log is
+`packed-encoder-exact-long-benchmark.log`. Separately, all six candidate hashes
+are identical across the three context-only and three packed sixteen-lane
+long runs. That agreement checks the readback coverage of packed storage,
+not equivalence between the sixteen- and four-lane predictor trajectories.
+
+The result is recorded in `packed-encoder-production-long-benchmark.log` and
+uses ten agents in the synthetic rolling-terrain scene on RADV Raphael with
+Mesa 26.0.8. The six-hash readback coverage and FP32 behavioral limitations
+described above still apply. **The 10× whole-simulation target remains unmet.**
+
+```sh
+XAGENT_BRAIN_PACKED_ENCODER=1 XAGENT_BRAIN_COOPERATIVE_WHITENING=1 \
+XAGENT_BRAIN_DENSE_PREFETCH=1 XAGENT_BRAIN_PREDICTOR_LANES=16 \
+XAGENT_BRAIN_CONTEXT_GATHER=1 XAGENT_VISION_OBJECT_QUERIES=1 \
+XAGENT_VISION_PARALLEL_SCENT=1 XAGENT_VISION_AGENT_MASKS=1 \
+cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 100000 --repeats 3 --precision fp32
+```
+
+The serial child explicitly clears the packed flag along with the other
+optional optimizations. Omit `XAGENT_BRAIN_PREDICTOR_LANES=16` and
+`--precision fp32` to reproduce the hash-matching configuration.
+
+### Packed row-major predictor
+
+A separate test-only predictor groups four adjacent input weights in each
+`vec4<f32>`, retaining row-major storage and the current sixteen-lane FP32
+reduction tree. Each invocation owns a complete vector, applies the original
+gradient and weight clamps, and accumulates four original lane sequences.
+With 256 active invocations, 64 outputs share each tile and predictor barriers
+fall from 48 to four. The 128-active variant covers 32 outputs per tile and
+uses eight barriers; all 256 workgroup invocations still reach every barrier.
+
+Both variants match all thirteen decoded buffers through 100 cycles across
+8×6 and 9×7 fields, including death, whitening refresh, inactive agents and
+replay. An independent probe uses the actual scalar and packed shader bodies:
+all 7,680 raw outputs satisfy FP32 forward-error bounds, all corresponding raw
+outputs match bitwise, and both packed trained matrices match scalar GPU
+updates bitwise. This checks the current sixteen-lane reference, whose
+association already differs from the original four-lane predictor.
+
+Five rotated three-arm, 100-cycle trials after 256 warmup cycles measure
+0.052307147 s for scalar global credit, 0.051685686 s for packed256
+(**1.012×**) and 0.051968795 s for packed128 (**1.007×**). Matrix import and
+decoded export are outside timing; no public host-lifecycle integration or
+scalar mirroring is included. The small gains do not justify promotion, so
+both variants remain test-only.
+
+The variants enlarge existing dense scratch from 256 scalars to 1,024 or 512;
+they add no workgroup resource slot. At the default 24×24 cortex retina, total
+declared main-kernel workgroup storage is 17,140 bytes for packed256 and
+15,092 bytes for packed128. The former exceeds the device's currently
+requested 16,384-byte limit; even conservative per-variable alignment keeps
+packed128 below that limit. The measured fixtures use raw vision, not cortex.
+
+### Latest production profile and verification
+
+After 256 warmup cycles, the 24-cycle production profile measures 474.658 µs
+per cycle in the ordinary dispatch recorder and 501.044 µs with timestamps.
+Timestamp stage measurements total 480.178 µs: claim 34.282 µs (7.14%), main
+kernel and brain 294.100 µs (61.25%), global update with encoder credit
+108.868 µs (22.67%), and vision 42.928 µs (8.94%). These are separately
+measured wall and GPU timings, not interchangeable totals. Checkpoint restore
+invalidates the cache, so wall timing includes the cold import; stage queries
+start after the copy. The instrumented replay matches all thirteen captured
+buffers. `cycle-profile-packed-context.log` records this ten-agent local-GPU
+profile; main brain work and global encoder credit remain the largest costs.
+
+Final verification passes 99 normal brain tests, 284 sandbox tests, the focused
+GPU checks described above, `cargo fmt --all -- --check`, and workspace Clippy
+with all targets and warnings denied. The sandbox total includes 141 library,
+21 binary, two guard, 118 integration and two sensory tests. The resource-limit
+fallback is additionally checked through the actual constructor. These checks
+support the stated local results; they establish neither universal GPU
+performance nor long-run behavioral equivalence of FP32 reassociation.

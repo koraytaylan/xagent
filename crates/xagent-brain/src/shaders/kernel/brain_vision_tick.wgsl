@@ -15,8 +15,11 @@
 //     `sensory_publish` copies it over once both are done, as the serial
 //     vision pass would have left it.
 
+override COMBINED_VISION_RAYS_PER_WORKGROUP: u32 =
+    BRAIN_WORKGROUP_SIZE /
+    (1u + (VISION_PARALLEL_LANES_PER_RAY - 1u) * u32(VISION_PARALLEL_STEPS));
 override COMBINED_VISION_GROUPS_PER_AGENT: u32 =
-    (VISION_RAYS + BRAIN_WORKGROUP_SIZE - 1u) / BRAIN_WORKGROUP_SIZE;
+    (VISION_RAYS + COMBINED_VISION_RAYS_PER_WORKGROUP - 1u) / COMBINED_VISION_RAYS_PER_WORKGROUP;
 
 @compute @workgroup_size(256)
 fn brain_vision_tick(
@@ -37,14 +40,17 @@ fn brain_vision_tick(
         workgroupBarrier();
         brain_tick_inner(agent_id, tid /* KERNEL_SUBGROUP_TOPK_INNER_ARGS */);
     } else {
-        // Vision workgroup: one thread per ray, as the vision pass casts them.
+        // Vision workgroup: either serial rays or eight cooperative ray groups.
         let vision_group = wgid.x - agent_count;
         let agent_id = vision_group / COMBINED_VISION_GROUPS_PER_AGENT;
         let group = vision_group % COMBINED_VISION_GROUPS_PER_AGENT;
-        if (physics_state[agent_id * PHYS_STRIDE + P_ALIVE] < 0.5) { return; }
-        let ray = group * BRAIN_WORKGROUP_SIZE + tid;
-        if (ray < VISION_RAYS) {
-            vision_single_ray(agent_id, ray);
+        if (VISION_PARALLEL_STEPS) {
+            vision_parallel_rays(agent_id, group * COMBINED_VISION_RAYS_PER_WORKGROUP, tid);
+        } else {
+            let ray = group * COMBINED_VISION_RAYS_PER_WORKGROUP + tid;
+            if (ray < VISION_RAYS) {
+                vision_single_ray(agent_id, ray);
+            }
         }
         if (group == 0u && tid == 0u) {
             phase_vision_senses(agent_id);

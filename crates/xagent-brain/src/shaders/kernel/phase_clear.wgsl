@@ -12,6 +12,9 @@ fn phase_clear(tid: u32) {
     for (var cell = tid; cell < total_cells; cell += 256u) {
         atomicStore(&food_grid[cell * FOOD_GRID_CELL_STRIDE], 0u);
         atomicStore(&agent_grid[cell * AGENT_GRID_CELL_STRIDE], 0u);
+        if VISION_AGENT_MASKS && wc_u32(WC_AGENT_COUNT) <= AGENT_VISIBILITY_MASK_BITS {
+            atomicStore(&agent_grid[agent_visibility_mask_offset(grid_w) + cell], 0u);
+        }
     }
 
     // No food is claimed until the next claim step (see resolve_food_claim).

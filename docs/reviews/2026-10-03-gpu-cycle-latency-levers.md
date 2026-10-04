@@ -212,3 +212,104 @@ R4 is on `develop` in two parts, and with both a seeded run reproduces exactly.
 Two runs each at 10 agents over 500,000 ticks and at 40 agents over 100,000 ticks also agree, and the brain-beside-vision cycle lands on the same hash as the serial one. A new GPU test (`food_claims.rs`) puts two agents equally close to one food item and requires the lower index to eat it, in either order and when neither is agent 0.
 
 On the AMD Raphael iGPU the extra dispatch did not slow the serial cycle: 10 agents over 100,000 ticks ran at about 8,250 ticks/sec with the claims, against 7,640 with grid order alone and 7,600 before either. The brain-beside-vision cycle, now on by default, ran at about 6,800 there; `XAGENT_BRAIN_BESIDE_VISION=0` keeps the faster serial cycle on such a GPU.
+
+## Exact parallel samples and registered-agent masks (2026-10-04)
+
+The follow-up starts from `e8b07c7`, which already contains R1, R2 and R4.
+The requested target is at least 10× acceleration with precision intact; the
+representative workloads measured so far do **not** establish that target.
+Comparisons against the original 13,050 ticks/sec M3 Max measurement would mix
+hardware and revisions and are not used here.
+
+Two opt-in mechanisms are implemented:
+
+- `XAGENT_VISION_PARALLEL_STEPS=1` assigns 32 invocations to each ray's 25
+  existing sample points. Each invocation returns the terminating event at
+  its sample, and an integer minimum selects the first event. The sample
+  position, field-of-view calculation, squared-distance expressions, terrain
+  interpolation, colors and depth expression are unchanged. A sky early exit
+  is an event too: it suppresses later hits while retaining sky depth 1.0.
+  The event ordering is food, agent, terrain, sky within each sample, then the
+  next sample. There is no floating-point reduction or analytic intersection.
+- `XAGENT_VISION_AGENT_MASKS=1`, together with parallel samples and at most
+  32 agents, replaces each repeated 3×3 agent-grid search with one candidate
+  mask. An agent is added to neighboring center-cell masks only after its
+  registration obtains a retained grid slot. Masks are cleared with grid
+  counts, so they represent the current registered grid before collisions.
+  Hit tests still use current post-collision positions. Outside-grid sample
+  centers retain the full search because they can see an in-range edge cell.
+
+For a center cell, the mask is exactly the union of retained IDs in the
+original nine cells. Changing their iteration order cannot change a ray's
+result because all agent hits at the same sample have the same color and
+depth. The unchanged serial marcher remains the comparison implementation.
+Both standalone vision and brain-beside-vision use the new path when enabled;
+the latter still publishes through `sensory_next`. Dispatches that cannot fit
+the cooperative workgroup count retain serial samples. Defaults remain serial
+samples with candidate masks disabled.
+
+### Measurement scope
+
+Hardware: AMD Ryzen 9 7950X3D integrated GPU, RADV RAPHAEL_MENDOCINO, Vulkan,
+Mesa 26.0.8-1ubuntu0.3; optimized Rust builds. These are measurements on this
+adapter, not estimates for the review's M3 Max.
+
+`gpu_kernel::vision_validation` compares complete sensory-buffer bits,
+including depth and the nonvisual tail. Its GPU timestamps cover 128 repeated
+dispatches per sample, seven rounds with variant order rotated, reporting
+medians. Scenes distinguish dense flat ground, dense irregular terrain, sparse
+flat ground and explicitly synthetic unobstructed long rays. Ray-only timings
+exclude the nonvisual senses; full-vision timings include them. Static mask
+construction is outside these frozen-scene timings; the advancing simulation
+benchmark includes mask maintenance every cycle. Packed serial groups of 32
+and 64 rays are also measured to expose gains obtainable without the new
+algorithm.
+
+The advancing `vision_performance` example uses a seeded synthetic world,
+100 warmup ticks, 10,000 measured ticks and three pairs in alternating arm
+order. With ten agents and default 8×6 vision, the default combined schedule
+has median elapsed times **1.554348 s serial / 1.315549 s parallel + masks
+(1.182×)**. With `XAGENT_BRAIN_BESIDE_VISION=0`, the medians are **1.250385 s /
+1.169957 s (1.069×)**. The separate schedule remains faster on this GPU.
+These whole-simulation timings use the existing default rays-per-workgroup
+choice, whereas microbenchmarks explicitly sweep that choice.
+
+All six public-state hash components match within every pair and across
+repetitions: physics, complete brain state, patterns, available sensory data,
+the exposed decision subset, and food positions/timers. The example explicitly
+reports its coverage gaps: final depth, food flags/claims, complete decisions,
+and private scratch. Complete depth is checked separately by the direct GPU
+vision tests. No claim of cross-adapter bit identity is made.
+
+### Reproduction
+
+Run the GPU tests explicitly, on an available hardware adapter:
+
+```sh
+cargo test --release -p xagent-brain --lib vision_validation -- \
+  --ignored --nocapture --test-threads=1
+XAGENT_VISION_AGENT_MASKS=1 cargo run --release -p xagent-brain \
+  --example vision_performance -- --ticks 10000 --repeats 3
+XAGENT_BRAIN_BESIDE_VISION=0 XAGENT_VISION_AGENT_MASKS=1 \
+  cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 10000 --repeats 3
+```
+
+The example launches separate serial/parallel processes, fixes the brain and
+world seeds, waits for GPU completion, and fails on mismatching public-state
+hashes. `--execution split|parallel-tiled`, `--vision-stride`, `--seed`,
+`--agents`, `--width`, and `--height` expose additional equivalence cases.
+
+### Remaining route to 10×
+
+Reducing the old ray cost by ten cannot reduce the entire cycle by ten when
+the brain and other phases remain unchanged. The original profile's 40% ray
+share would cap even free rays at 1.67× whole-cycle speed. Further experiments
+must remove other work or its serial dependencies as well.
+
+Two exact candidates remain unmeasured: transpose object tests into discrete
+sample intervals using monotone coordinate bounds, while retaining grid
+membership and all terrain/sky samples; and compute scent contributions in
+parallel while adding them in the original food-index order. Approximate
+sphere depths, reordered floating-point sums, lower resolution and reduced
+vision frequency do not satisfy the precision requirement.

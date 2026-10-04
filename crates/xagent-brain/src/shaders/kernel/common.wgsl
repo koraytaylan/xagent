@@ -156,6 +156,8 @@ override VISION_RAYS: u32 = VISION_W * VISION_H;
 // workgroups lets them run side by side while the GPU has idle cores.
 // VISION_GROUPS_PER_AGENT workgroups cover one agent's rays.
 override VISION_RAYS_PER_WORKGROUP: u32 = 256u;
+// A population fitting one u32 can cache each registered 3x3 agent block.
+override VISION_AGENT_MASKS: bool = false;
 override VISION_GROUPS_PER_AGENT: u32 =
     (VISION_RAYS + VISION_RAYS_PER_WORKGROUP - 1u) / VISION_RAYS_PER_WORKGROUP;
 override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
@@ -563,6 +565,8 @@ const FOOD_GRID_MAX_PER_CELL: u32 = 16u;
 const FOOD_GRID_CELL_STRIDE: u32 = 17u;   // 1 + 16
 const AGENT_GRID_MAX_PER_CELL: u32 = 32u;
 const AGENT_GRID_CELL_STRIDE: u32 = 33u;  // 1 + 32
+// Each candidate agent occupies one bit in a u32 visibility mask.
+const AGENT_VISIBILITY_MASK_BITS: u32 = 32u;
 
 // ── Terrain constants ───────────────────────────────────────────────────────
 // Static terrain grid properties (129 vertices per side).
@@ -1104,6 +1108,11 @@ fn cell_coord(v: f32) -> i32 {
 
 fn cell_index(cx: u32, cz: u32) -> u32 {
     return cx * wc_u32(WC_GRID_WIDTH) + cz;
+}
+
+// Visibility masks follow the retained registration cells in agent_grid.
+fn agent_visibility_mask_offset(grid_width: u32) -> u32 {
+    return grid_width * grid_width * AGENT_GRID_CELL_STRIDE;
 }
 
 // ── Terrain height sampling (bilinear) ──────────────────────────────────────

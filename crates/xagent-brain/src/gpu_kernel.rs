@@ -14,11 +14,12 @@
 //! |          | phase_food_claim, phase_food_detect, phase_food_respawn,              |
 //! |          | phase_agent_grid,                                                     |
 //! |          | phase_grid_order, phase_collision, physics_tick                       |
-//! | vision   | phase_vision, vision_tick (grids read as plain u32)                   |
+//! | vision   | phase_vision, phase_vision_parallel, vision_tick (plain u32 grids)    |
 //! | brain    | brain_passes, brain_tick                                              |
 //! | kernel   | brain_passes, brain_inner, phase_food_claim, kernel_tick (entries     |
 //! |          | `kernel_claim_tick` and `kernel_tick`)                                |
-//! | brain+vision | brain_passes, brain_inner, phase_vision, brain_vision_tick        |
+//! | brain+vision | brain_passes, brain_inner, phase_vision, phase_vision_parallel,  |
+//! |              | brain_vision_tick                                               |
 //! | global   | phase_clear, phase_food_grid, phase_food_respawn, phase_agent_grid,   |
 //! |          | phase_grid_order, phase_collision, global_tick                        |
 //! | prepare  | phase_prepare_dispatch                                                |
@@ -62,6 +63,9 @@ use xagent_shared::{BrainConfig, WorldConfig};
 use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
+#[cfg(test)]
+mod vision_validation;
+
 /// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
 /// dedicated WGSL file so the fragment stays validator-friendly.
 const BITONIC_SORT_SUBGROUP_SRC: &str = include_str!("shaders/kernel/bitonic_sort_subgroup.wgsl");
@@ -100,6 +104,8 @@ const FOOD_UNCLAIMED: u32 = u32::MAX;
 /// Threads in a brain workgroup (`BRAIN_WORKGROUP_SIZE` in the shaders), also
 /// the width of the vision workgroups in the brain-beside-vision dispatch.
 const BRAIN_WORKGROUP_THREADS: u32 = 256;
+/// Power-of-two lane group covering every one of the 25 discrete ray samples.
+const PARALLEL_VISION_LANES: u32 = 32;
 
 /// Rays per vision workgroup at or below `SMALL_POPULATION` agents: one, so
 /// every ray of a small population runs in its own workgroup, in parallel.
@@ -977,6 +983,9 @@ impl GpuKernel {
         } else {
             wgpu::Features::PUSH_CONSTANTS
         };
+        #[cfg(test)]
+        let required_features =
+            required_features | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY);
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -1095,7 +1104,15 @@ impl GpuKernel {
         });
         let agent_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_agent_grid"),
-            size: (grid_cells * AGENT_GRID_CELL_STRIDE * 4) as u64,
+            // A mask array follows the entire retained-entry region, with one
+            // mask per cell; the grid's original cell stride is unchanged.
+            size: u64::try_from(
+                grid_cells
+                    .checked_mul(AGENT_GRID_CELL_STRIDE + 1)
+                    .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+                    .expect("agent grid and visibility masks exceed addressable memory"),
+            )
+            .expect("agent grid byte length exceeds u64"),
             usage: storage_rw,
             mapped_at_creation: false,
         });
@@ -1255,6 +1272,7 @@ impl GpuKernel {
         let vision_source = [
             vision_common.as_str(),
             include_str!("shaders/kernel/phase_vision.wgsl"),
+            include_str!("shaders/kernel/phase_vision_parallel.wgsl"),
             include_str!("shaders/kernel/vision_tick.wgsl"),
         ]
         .join("\n");
@@ -1288,8 +1306,12 @@ impl GpuKernel {
         // `sensory_next` instead of the buffer the brain reads (see
         // brain_vision_tick.wgsl). Vision only reads the grids, as in the
         // vision pipeline.
-        let vision_into_next = include_str!("shaders/kernel/phase_vision.wgsl")
-            .replace("sensory_buffer[", "sensory_next[");
+        let vision_into_next = [
+            include_str!("shaders/kernel/phase_vision.wgsl"),
+            include_str!("shaders/kernel/phase_vision_parallel.wgsl"),
+        ]
+        .join("\n")
+        .replace("sensory_buffer[", "sensory_next[");
         assert!(
             !vision_into_next.contains("sensory_buffer"),
             "phase_vision.wgsl uses sensory_buffer in a form the redirect misses"
@@ -1326,6 +1348,44 @@ impl GpuKernel {
         let mut vision_overrides = vision_override_constants(&layout);
         let vision_rays = layout.vision_width * layout.vision_height;
         let rays_per_workgroup = vision_rays_per_workgroup(agent_count, vision_rays);
+        // Thirty-two lanes evaluate one ray's unchanged samples in parallel.
+        // Eight rays fit within the portable 256-thread workgroup limit.
+        let cooperative_rays_per_workgroup =
+            rays_per_workgroup.min(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES);
+        let cooperative_vision_workgroups = u64::from(agent_count)
+            * u64::from(vision_rays.div_ceil(cooperative_rays_per_workgroup));
+        let cooperative_combined_workgroups = u64::from(agent_count)
+            * (1 + u64::from(
+                vision_rays.div_ceil(BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES),
+            ));
+        let parallel_vision_requested =
+            std::env::var("XAGENT_VISION_PARALLEL_STEPS").as_deref() == Ok("1");
+        let parallel_vision = parallel_vision_requested
+            && cooperative_vision_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS)
+            && cooperative_combined_workgroups <= u64::from(MAX_DISPATCH_WORKGROUPS);
+        if parallel_vision_requested && !parallel_vision {
+            log::warn!(
+                "[GpuKernel] Parallel ray samples exceed the dispatch dimension limit; \
+                 using serial ray samples"
+            );
+        }
+        let rays_per_workgroup = if parallel_vision {
+            cooperative_rays_per_workgroup
+        } else {
+            rays_per_workgroup
+        };
+        vision_overrides.insert(
+            "VISION_PARALLEL_STEPS".to_string(),
+            f64::from(u32::from(parallel_vision)),
+        );
+        vision_overrides.insert(
+            "VISION_AGENT_MASKS".to_string(),
+            f64::from(u32::from(
+                parallel_vision
+                    && agent_count <= u32::BITS
+                    && std::env::var("XAGENT_VISION_AGENT_MASKS").as_deref() == Ok("1"),
+            )),
+        );
         vision_overrides.insert(
             "VISION_RAYS_PER_WORKGROUP".to_string(),
             f64::from(rays_per_workgroup),
@@ -1652,8 +1712,13 @@ impl GpuKernel {
                 compilation_options: override_options.clone(),
                 cache: None,
             });
+        let combined_rays_per_workgroup = if parallel_vision {
+            BRAIN_WORKGROUP_THREADS / PARALLEL_VISION_LANES
+        } else {
+            BRAIN_WORKGROUP_THREADS
+        };
         let brain_vision_workgroups =
-            agent_count + agent_count * vision_rays.div_ceil(BRAIN_WORKGROUP_THREADS);
+            agent_count + agent_count * vision_rays.div_ceil(combined_rays_per_workgroup);
 
         // ── Create global pipeline ──
         let global_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

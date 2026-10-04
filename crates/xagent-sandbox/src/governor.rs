@@ -120,12 +120,12 @@ const RECORDING_STRIDE_V1: usize = 15;
 /// Stride (floats per agent per tick) for recording format v2.
 const RECORDING_STRIDE_V2: usize = 15;
 
-/// Significance threshold (in pooled standard errors) a generation's mean must
-/// clear over its parent to count as a real improvement. One stderr keeps the
-/// spawn bar from ratcheting on eval noise — the dominant cause of the
-/// near-zero success rate and high cross-repeat winner disagreement — while
-/// still accepting genuine one-σ gains. Only applied when there are enough
-/// repeats to estimate the noise.
+/// Significance threshold, in standard errors, an improvement must clear to
+/// count as real: the best mutated group's mean over the champion group's
+/// mean in the same generation, or (with no mutated group) the generation's
+/// mean over its parent's. One stderr keeps selection from ratcheting on
+/// eval noise while still accepting genuine one-σ gains. Only applied when
+/// there are enough repeats to estimate the noise.
 const K_SIGNIF: f32 = 1.0;
 
 /// Epsilon guard against division-by-zero in metrics that aggregate distance
@@ -978,6 +978,25 @@ impl Governor {
     /// there are too few repeats (or samples) to estimate the noise, in which
     /// case the caller falls back to the bare mean comparison.
     fn pooled_stderr(&self, fitness: &[AgentFitness]) -> Option<f32> {
+        let (pooled_variance, total_samples) = self.pooled_variance(fitness)?;
+        Some((pooled_variance / total_samples as f32).sqrt())
+    }
+
+    /// Standard error of the difference between two group means of this
+    /// generation, from the pooled within-config variance: each group mean
+    /// averages `eval_repeats` agents. `None` when the noise cannot be
+    /// estimated (see [`Governor::pooled_stderr`]).
+    fn group_difference_stderr(&self, fitness: &[AgentFitness]) -> Option<f32> {
+        let (pooled_variance, _) = self.pooled_variance(fitness)?;
+        let repeats = self.config.eval_repeats.max(1) as f32;
+        Some((2.0 * pooled_variance / repeats).sqrt())
+    }
+
+    /// Pooled within-config variance of the per-agent fitness and the number
+    /// of agents it pools, grouping agents by config as [`reduce_fitness`]
+    /// does. `None` with fewer than two repeats or no residual degree of
+    /// freedom.
+    fn pooled_variance(&self, fitness: &[AgentFitness]) -> Option<(f32, usize)> {
         let repeats = self.config.eval_repeats.max(1);
         if repeats < 2 {
             return None;
@@ -1004,7 +1023,61 @@ impl Governor {
             return None;
         }
         let pooled_variance = pooled_sum_sq / (total_samples - group_count) as f32;
-        Some((pooled_variance / total_samples as f32).sqrt())
+        Some((pooled_variance, total_samples))
+    }
+
+    /// Mean fitness of each config group in spawn order: group 0 is the
+    /// champion (the spawn parent's config and brain, unmutated), every later
+    /// group a mutation of it.
+    fn group_means_in_spawn_order(&self, fitness: &[AgentFitness]) -> Vec<f32> {
+        let repeats = self.config.eval_repeats.max(1);
+        let mut ordered = fitness.to_vec();
+        ordered.sort_by_key(|f| f.agent_index);
+        ordered
+            .chunks(repeats)
+            .map(|chunk| {
+                chunk.iter().map(|f| f.composite_fitness).sum::<f32>() / chunk.len() as f32
+            })
+            .collect()
+    }
+
+    /// Whether this generation improves on its spawn parent, and the fitness
+    /// it had to beat.
+    ///
+    /// With mutated groups, the bar is the champion group scored in the same
+    /// generation and world, so a parent's lucky score cannot set a bar its
+    /// own children cannot reach: the best mutated group must beat the
+    /// champion group by `K_SIGNIF` standard errors of a group difference.
+    /// A root not yet evaluated (`parent_fitness < 0`) always passes, and a
+    /// generation of the champion group alone falls back to comparing its
+    /// mean with the parent's stored fitness.
+    fn selection_verdict(
+        &self,
+        fitness: &[AgentFitness],
+        gen_avg: f32,
+        parent_fitness: f32,
+    ) -> (bool, f32) {
+        if parent_fitness < 0.0 {
+            return (true, parent_fitness);
+        }
+        let groups = self.group_means_in_spawn_order(fitness);
+        let best_mutant = groups.iter().skip(1).copied().reduce(f32::max);
+        match (groups.first().copied(), best_mutant) {
+            (Some(champion), Some(best_mutant)) => {
+                let accepted = match self.group_difference_stderr(fitness) {
+                    Some(stderr) if stderr > 0.0 => best_mutant - champion > K_SIGNIF * stderr,
+                    _ => best_mutant > champion,
+                };
+                (accepted, champion)
+            }
+            _ => {
+                let accepted = match self.pooled_stderr(fitness) {
+                    Some(stderr) if stderr > 0.0 => gen_avg - parent_fitness > K_SIGNIF * stderr,
+                    _ => gen_avg >= parent_fitness,
+                };
+                (accepted, parent_fitness)
+            }
+        }
     }
 
     /// Record a within-life foraging sample for the current generation.
@@ -1092,40 +1165,33 @@ impl Governor {
         let gen_fit = reduced.first().map(|f| f.composite_fitness).unwrap_or(0.0);
         let mut messages = Vec::new();
 
-        // Use the population average (mean of all reduced group fitnesses) for both
-        // the success comparison and the stored bar.  The original approach used the
-        // best group's average, which suffers from "winner's curse": the max of N
-        // noisy estimates is systematically inflated, so the next generation almost
-        // never reproduces it.  The mean is unbiased and has much lower variance
-        // (σ/√N vs order-statistic inflation), giving a fair cross-generation bar.
+        // The population average (mean of all reduced group fitnesses) is the
+        // node's stored fitness, and the bar when a generation holds only the
+        // champion group. A stored best group's average would suffer from the
+        // "winner's curse": the max of N noisy estimates is systematically
+        // inflated, so a later generation almost never reproduces it.
         let gen_avg = if reduced.is_empty() {
             0.0
         } else {
             reduced.iter().map(|f| f.composite_fitness).sum::<f32>() / reduced.len() as f32
         };
 
-        // Look up the spawn parent's fitness and config — this is the bar to beat.
-        // Capture both before the success/failure branch so they refer to the same node
+        // Look up the spawn parent's fitness and config. Capture both before the success/failure branch so they refer to the same node
         // (backtracking changes spawn_parent_id, which would cause a mismatch).
         let parent_fitness = self.spawn_parent_fitness();
         let parent_config_for_momentum = self.spawn_parent_config();
 
-        // Score this generation against its parent (not the all-time best).
-        // Require the generation mean to beat the parent by at least K_SIGNIF
-        // pooled standard errors, so the spawn bar advances on real signal
-        // rather than eval noise. With too few repeats to estimate the noise,
-        // fall back to the bare mean comparison. Computed before the island
+        // Score this generation against its spawn parent's champion, scored
+        // alongside it (see `selection_verdict`). Computed before the island
         // mutable borrow below.
-        let accepted = match self.pooled_stderr(fitness) {
-            Some(stderr) if stderr > 0.0 => gen_avg - parent_fitness > K_SIGNIF * stderr,
-            _ => gen_avg >= parent_fitness,
-        };
+        let (accepted, bar) = self.selection_verdict(fitness, gen_avg, parent_fitness);
 
         let island = &mut self.islands[self.active_island];
         let mut champion_capture = None;
 
         if accepted {
-            // ★ Success — this generation's average meets or exceeds its parent's
+            // ★ Success — a mutated group beat the champion (or the root's
+            // first evaluation)
             let _ = self.db.execute(
                 "UPDATE node SET status = 'successful', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_avg as f64],
@@ -1162,19 +1228,19 @@ impl Governor {
                 ));
             } else {
                 messages.push(format!(
-                    "[EVOLUTION] ✓ Beat parent ({:.4} → {:.4}, peak: {:.4})",
-                    parent_fitness, gen_avg, gen_fit
+                    "[EVOLUTION] ✓ Beat champion ({:.4} → {:.4}, mean: {:.4})",
+                    bar, gen_fit, gen_avg
                 ));
             }
         } else {
-            // ✗ Failure — didn't beat the parent
+            // ✗ Failure — didn't beat the champion
             let _ = self.db.execute(
                 "UPDATE node SET status = 'failed', best_fitness = ?2 WHERE id = ?1",
                 params![self.current_node_id, gen_avg as f64],
             );
             messages.push(format!(
-                "[EVOLUTION] ✗ Failed ({:.4} < parent {:.4})",
-                gen_avg, parent_fitness
+                "[EVOLUTION] ✗ Failed (best {:.4}, mean {:.4}; champion {:.4})",
+                gen_fit, gen_avg, bar
             ));
 
             // Check if this island has exhausted its patience at current spawn parent
@@ -1185,13 +1251,14 @@ impl Governor {
         }
 
         // ── Momentum update: learn from individual winners ──────────────
-        // An individual "winner" is an offspring whose fitness >= spawn parent.
-        // Even in a failed generation, strong individuals contribute directional data.
+        // An individual "winner" is an offspring whose fitness >= the bar
+        // (the champion group's score this generation). Even in a failed
+        // generation, strong individuals contribute directional data.
         let had_winners;
         if let Some(ref pc) = parent_config_for_momentum {
             let winner_configs: Vec<BrainConfig> = reduced
                 .iter()
-                .filter(|f| f.composite_fitness >= parent_fitness)
+                .filter(|f| f.composite_fitness >= bar)
                 .map(|f| f.config.clone())
                 .collect();
             had_winners = !winner_configs.is_empty();
@@ -2458,6 +2525,79 @@ mod tests {
             "successful",
             "a 1.2·stderr gain clears the one-stderr bar and must advance it"
         );
+    }
+
+    /// Spread of each group's two repeats around its mean in the concurrent
+    /// selection tests.
+    const GROUP_DEVIATION: f32 = 0.01;
+
+    /// Per-agent results of a champion group and one mutated group, two
+    /// repeats each, with every group's repeats `GROUP_DEVIATION` either side
+    /// of its mean.
+    fn champion_and_mutant(champion: f32, mutant: f32) -> Vec<AgentFitness> {
+        mock_fitness_repeats(&[
+            champion + GROUP_DEVIATION,
+            champion - GROUP_DEVIATION,
+            mutant + GROUP_DEVIATION,
+            mutant - GROUP_DEVIATION,
+        ])
+    }
+
+    /// Standard error of a group difference for `champion_and_mutant`: the
+    /// pooled variance is 2·DEV² (four agents, two groups), and a difference
+    /// of two two-agent means has variance 2·(2·DEV²)/2.
+    fn champion_and_mutant_stderr() -> f32 {
+        (2.0 * GROUP_DEVIATION * GROUP_DEVIATION).sqrt()
+    }
+
+    /// A generation is accepted when its best mutated group beats the
+    /// champion group scored alongside it by more than `K_SIGNIF` standard
+    /// errors of a group difference: 0.8 of one is rejected, 1.2 accepted.
+    #[test]
+    fn a_mutant_must_beat_the_champion_scored_alongside_it() {
+        let stderr = champion_and_mutant_stderr();
+        let champion = 0.30_f32;
+        for (gain, expected) in [(0.8, "failed"), (1.2, "successful")] {
+            let mut gov = test_governor_repeats(2);
+            gov.advance(&champion_and_mutant(champion, champion));
+            let generation = gov.current_node_id.unwrap();
+            gov.advance(&champion_and_mutant(champion, champion + gain * stderr));
+            assert_eq!(
+                node_status(&gov, generation),
+                expected,
+                "a mutant {gain}·stderr above the champion"
+            );
+        }
+    }
+
+    /// A parent's lucky score is no bar: once the champion scores lower in a
+    /// later generation, a mutant that beats it there is accepted although
+    /// the generation's mean is far below the parent's stored fitness.
+    #[test]
+    fn a_lucky_parent_score_does_not_block_its_children() {
+        let lucky = 0.90_f32;
+        let champion = 0.30_f32;
+        let mut gov = test_governor_repeats(2);
+        gov.advance(&champion_and_mutant(lucky, lucky));
+        let generation = gov.current_node_id.unwrap();
+        gov.advance(&champion_and_mutant(
+            champion,
+            champion + 2.0 * champion_and_mutant_stderr(),
+        ));
+        assert_eq!(node_status(&gov, generation), "successful");
+    }
+
+    /// A generation whose mean beats the parent's stored fitness is still
+    /// rejected when no mutated group beats the champion scored alongside it.
+    #[test]
+    fn a_mutant_below_the_champion_is_rejected_whatever_the_mean() {
+        let parent = 0.10_f32;
+        let champion = 0.50_f32;
+        let mut gov = test_governor_repeats(2);
+        gov.advance(&champion_and_mutant(parent, parent));
+        let generation = gov.current_node_id.unwrap();
+        gov.advance(&champion_and_mutant(champion, champion - 0.1));
+        assert_eq!(node_status(&gov, generation), "failed");
     }
 
     /// The shared quarter-rate helper computes the first-quarter food rate from

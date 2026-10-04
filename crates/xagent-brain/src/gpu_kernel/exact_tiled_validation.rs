@@ -37,16 +37,17 @@ const EXPECTED_FORCED_DEATHS: f32 = 2.0;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-struct TiledPipelines {
+pub(super) struct TiledPipelines {
     features: wgpu::ComputePipeline,
-    encode: wgpu::ComputePipeline,
-    predictor: wgpu::ComputePipeline,
+    pub(super) encode: wgpu::ComputePipeline,
+    pub(super) predictor: wgpu::ComputePipeline,
     tail: wgpu::ComputePipeline,
-    credit: wgpu::ComputePipeline,
+    pub(super) credit: wgpu::ComputePipeline,
     bind_groups: [wgpu::BindGroup; 2],
     _transient: wgpu::Buffer,
     outputs_per_tile: u32,
     tiles_per_agent: u32,
+    pub(super) credit_workgroups_per_agent: u32,
     cooperative: bool,
 }
 
@@ -102,9 +103,12 @@ fn make_transient_bind_group(
     })
 }
 
-fn make_pipelines(kernel: &GpuKernel, outputs: u32) -> TiledPipelines {
+pub(super) fn make_pipelines(
+    kernel: &GpuKernel,
+    outputs: u32,
+    cooperative: bool,
+) -> TiledPipelines {
     let common = include_str!("../shaders/kernel/common.wgsl");
-    let cooperative = std::env::var("XAGENT_EXACT_TILE_COOPERATIVE").as_deref() == Ok("1");
     let passes = compose_brain_passes(cooperative);
     assert!(passes.contains("const DENSE_INNER_LANES: u32 = 4u;"));
     let brain_source = apply_subgroup_markers(
@@ -190,6 +194,7 @@ fn make_pipelines(kernel: &GpuKernel, outputs: u32) -> TiledPipelines {
         _transient: transient,
         outputs_per_tile: outputs,
         tiles_per_agent: dimensions / outputs,
+        credit_workgroups_per_agent: dimensions / outputs,
         cooperative,
     }
 }
@@ -216,7 +221,7 @@ fn record_tiled_cycle(
     // Encoder weights are next consumed by the next cycle's encoder. Credit
     // and the current feature vector are unchanged by the intervening tail.
     pass.set_pipeline(&pipelines.credit);
-    pass.dispatch_workgroups(kernel.agent_count, pipelines.tiles_per_agent, 1);
+    pass.dispatch_workgroups(kernel.agent_count, pipelines.credit_workgroups_per_agent, 1);
     let stride = kernel.brain_tick_stride;
     pass.set_pipeline(&kernel.global_pipeline);
     pass.set_push_constants(0, bytemuck::cast_slice(&[tick + stride, stride]));
@@ -251,7 +256,12 @@ fn dispatch_tiled(
     kernel.active_config_index = 1 - kernel.active_config_index;
 }
 
-fn advance(kernel: &mut GpuKernel, tiled: Option<&TiledPipelines>, start_tick: u32, cycles: u32) {
+pub(super) fn advance(
+    kernel: &mut GpuKernel,
+    tiled: Option<&TiledPipelines>,
+    start_tick: u32,
+    cycles: u32,
+) {
     if let Some(pipelines) = tiled {
         dispatch_tiled(kernel, pipelines, start_tick, cycles);
     } else {
@@ -268,7 +278,8 @@ fn exact_tiled_matches_complete_serial_state() -> TestResult {
     // Explicitly compile the original brain even if production optimization
     // environment flags were inherited by GpuKernel construction.
     kernel.kernel_pipeline = make_reference_pipeline(&kernel, false);
-    let pipelines = make_pipelines(&kernel, requested_tile_outputs()?);
+    let cooperative = std::env::var("XAGENT_EXACT_TILE_COOPERATIVE").as_deref() == Ok("1");
+    let pipelines = make_pipelines(&kernel, requested_tile_outputs()?, cooperative);
     prepare_boundary_scene(&kernel);
     let initial = checkpoint(&kernel);
     let inactive_before = kernel.read_agent_state(INACTIVE_AGENT);
@@ -316,7 +327,8 @@ fn benchmark_exact_tiled_against_serial() -> TestResult {
     let _vulkan = vulkan_gate::enter();
     let mut kernel = prepare_kernel();
     kernel.kernel_pipeline = make_reference_pipeline(&kernel, false);
-    let pipelines = make_pipelines(&kernel, requested_tile_outputs()?);
+    let cooperative = std::env::var("XAGENT_EXACT_TILE_COOPERATIVE").as_deref() == Ok("1");
+    let pipelines = make_pipelines(&kernel, requested_tile_outputs()?, cooperative);
     advance(&mut kernel, None, 0, WARMUP_CYCLES);
     let warm = checkpoint(&kernel);
     let tick = WARMUP_CYCLES * kernel.brain_tick_stride;

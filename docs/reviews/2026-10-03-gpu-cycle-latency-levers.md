@@ -625,3 +625,51 @@ Five warmed 1,000-tick pairs give **0.077538 s current optimized brain /
 0.076794 s shared norm (1.010×)**. This small observed difference is not
 enough to establish a broadly useful timing gain, so the variant remains
 test-only and is excluded from the reported 2.034× production configuration.
+
+### Locating the remaining cost
+
+A single compiled optimized main shader now supports runtime section stops,
+with all partial executions restored from the same checkpoint and never used
+as input to another cycle. The complete guarded shader matches all 13 buffers;
+its control timing is within 0.2% of the uninstrumented shader. Five rotated
+trials after 256 warmup cycles attribute approximately 145 µs to predictor
+weight training and its dot products, 59 µs to recalled-context blending,
+149 µs to encoder credit and context adaptation, and 36 µs to reinforcement.
+These cumulative differences are diagnostic estimates and include timing
+noise. A whitening refresh adds about 352 µs every 20 cycles, approximately
+18 µs amortized; it is no longer the largest recurring cost.
+
+The next exact experiments use the cooperative/fused-predictor baseline,
+256 warmup cycles and five rotated 1,000-tick trials. Every timing arm also
+compares all 13 buffers, and separate 100-cycle fixtures cover inactive agents,
+death and whitening refreshes:
+
+| Test-only variant | Baseline seconds | Candidate seconds | Ratio |
+|---|---:|---:|---:|
+| Four-item dense prefetch | 0.077376 | 0.072104 | 1.073× |
+| Eight-item dense prefetch | 0.077376 | 0.071366 | 1.084× |
+| Stable detection reduction trees | 0.077519 | 0.075638 | 1.025× |
+| Shared context normalization | 0.077316 | 0.077611 | 0.996× |
+| Shared previous predictor inputs | 0.077316 | 0.077026 | 1.004× |
+| Both shared prediction caches | 0.077316 | 0.077051 | 1.003× |
+| Trusted main shader without software bounds checks | 0.077618 | 0.076933 | 1.009× |
+
+Prefetch retains the same stride-four accumulation and weight clamps, loading
+independent inputs before consuming them. Missing tail terms execute no
+addition. Detection trees retain original tie ordering; a dedicated fixture
+with 320 foods proves that merged scratch-slot priority chooses food 288 over
+the smaller food index 64. Bounds-check removal is a controlled, test-only
+diagnostic; production checks remain enabled, and Vulkan hardware robustness
+is unchanged. Cache and bounds-check timings show no compelling benefit.
+
+Pointwise encoder credit, one weight per invocation, gives **0.089579 s /
+0.084801 s (1.056×)** against the separate exact tiled schedule, with all 13
+buffers identical. That baseline is slower than the optimized monolithic
+brain, so this ratio is not an additional production improvement.
+
+These experiments have not yet been incorporated into the reported 2.034×
+whole production configuration, and their ratios must not be multiplied to
+infer a combined result. The user subsequently authorized reordered FP32
+sums with validated rounding differences; subsequent experiments may use
+that allowance, but must report numerical error and behavioral changes
+explicitly rather than treating divergent long trajectories as bitwise parity.

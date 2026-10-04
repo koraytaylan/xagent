@@ -74,19 +74,31 @@ use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
 #[cfg(test)]
+mod bounds_validation;
+#[cfg(test)]
 mod brain_allocation;
 #[cfg(test)]
+mod brain_sections;
+#[cfg(test)]
 mod combined_validation;
+#[cfg(test)]
+mod context_cache_validation;
 #[cfg(test)]
 mod cooperative_whitening_validation;
 #[cfg(test)]
 mod cycle_profile;
+#[cfg(test)]
+mod dense_prefetch_validation;
+#[cfg(test)]
+mod detection_reduction_validation;
 #[cfg(test)]
 mod dispatch_brain_validation;
 #[cfg(test)]
 mod exact_tiled_validation;
 #[cfg(test)]
 mod persistent_validation;
+#[cfg(test)]
+mod pointwise_credit_validation;
 mod predictor_fusion;
 #[cfg(test)]
 mod predictor_fusion_validation;

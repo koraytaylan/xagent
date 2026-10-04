@@ -73,7 +73,7 @@ fn control_passes() -> String {
     passes
 }
 
-fn control_constants(kernel: &GpuKernel) -> HashMap<String, f64> {
+pub(super) fn control_constants(kernel: &GpuKernel) -> HashMap<String, f64> {
     let mut constants = vision_override_constants(&kernel.layout);
     let rays = kernel.layout.vision_width * kernel.layout.vision_height;
     // These retinas distinguish the constructor's serial and parallel combined

@@ -361,6 +361,7 @@ fn run_arm(options: &Options, arm: &str) -> Result<(), Box<dyn Error>> {
         std::env::set_var("XAGENT_BRAIN_GLOBAL_CREDIT", "0");
         std::env::set_var("XAGENT_BRAIN_CONTEXT_GATHER", "0");
         std::env::set_var("XAGENT_BRAIN_PACKED_ENCODER", "0");
+        std::env::set_var("XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES", "0");
         std::env::set_var("XAGENT_BRAIN_PREDICTOR_LANES", "4");
     }
     // Set before creating any GPU device or worker thread.

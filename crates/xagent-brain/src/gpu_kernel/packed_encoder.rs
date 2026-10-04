@@ -239,6 +239,32 @@ fn replace_once(source: &str, old: &str, new: &str) -> String {
     source.replacen(old, new, 1)
 }
 
+/// Optionally suppress both destinations only after the original arithmetic
+/// produced four bit-identical words. Cache import and mirrored changed writes
+/// maintain scalar == packed, so this needs no extra validity state. Comparing
+/// integer bits preserves signed-zero changes that floating equality would hide.
+pub(super) fn credit_source(skip_unchanged_stores: bool) -> String {
+    if !skip_unchanged_stores {
+        return CREDIT_SOURCE.to_owned();
+    }
+    assert!(!CREDIT_SOURCE.contains("Barrier"));
+    let source = replace_once(
+        CREDIT_SOURCE,
+        "    var weight = packed_encoder.weights[address];",
+        "    let original_weight = packed_encoder.weights[address];\n    var weight = original_weight;",
+    );
+    let source = replace_once(
+        &source,
+        "    packed_encoder.weights[address] = weight;",
+        "    if all(bitcast<vec4<u32>>(weight) == bitcast<vec4<u32>>(original_weight)) { return; }\n    packed_encoder.weights[address] = weight;",
+    );
+    assert_eq!(
+        source.matches("brain_state[scalar_address").count(),
+        VECTOR_WIDTH
+    );
+    source
+}
+
 /// Replace only encoder arithmetic and redirect scalar scratch accesses.
 /// Apply context gathering and feature publication first, so their scratch
 /// references are redirected too. Predictor width and fusion are independent.

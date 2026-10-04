@@ -541,7 +541,7 @@ fn benchmark_packed_encoder_against_current_global_credit() -> TestResult {
     Ok(())
 }
 
-fn credit_fixture(kernel: &GpuKernel, packed: &wgpu::Buffer) {
+pub(super) fn credit_fixture(kernel: &GpuKernel, packed: &wgpu::Buffer) {
     assert!(
         include_str!("../shaders/kernel/common.wgsl").contains("const CREDIT_EPSILON: f32 = 1e-6;")
     );
@@ -672,7 +672,7 @@ fn run_credit(
     kernel.poll_wait();
 }
 
-fn assert_credit_cases(kernel: &GpuKernel, initial: &State, actual: &State) {
+pub(super) fn assert_credit_cases(kernel: &GpuKernel, initial: &State, actual: &State) {
     let initial: &[u32] = bytemuck::cast_slice(&initial[BRAIN_BUFFER_INDEX]);
     let actual: &[u32] = bytemuck::cast_slice(&actual[BRAIN_BUFFER_INDEX]);
     for agent in 0..usize::try_from(kernel.agent_count).unwrap() {

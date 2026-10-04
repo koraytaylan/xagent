@@ -44,6 +44,9 @@
 //! `XAGENT_BRAIN_PACKED_ENCODER=1` enables global credit with four-output
 //! encoder vectors. Updated weights are mirrored into ordinary brain storage;
 //! host writes and scalar fallback routes invalidate the private vector cache.
+//! With that packed path active, `XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES=1`
+//! skips both weight stores when all four updated words retain their exact bits.
+//! This option defaults off and does not enable packing by itself.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -146,6 +149,10 @@ mod packed_encoder_validation;
 mod packed_predictor_dot_validation;
 #[cfg(test)]
 mod packed_predictor_validation;
+#[cfg(test)]
+mod packed_store_diagnostics;
+#[cfg(test)]
+mod packed_store_validation;
 #[cfg(test)]
 mod persistent_validation;
 #[cfg(test)]
@@ -2189,8 +2196,14 @@ impl GpuKernel {
             vulkan_lock_tail: vulkan_gate::LockTail,
         };
         if std::env::var("XAGENT_BRAIN_PACKED_ENCODER").as_deref() == Ok("1") {
-            kernel.global_credit =
-                global_credit::Pipelines::new_packed(&kernel, &brain_passes_src, &vision_overrides);
+            let skip_unchanged_stores =
+                std::env::var("XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES").as_deref() == Ok("1");
+            kernel.global_credit = global_credit::Pipelines::new_packed_with_store_suppression(
+                &kernel,
+                &brain_passes_src,
+                &vision_overrides,
+                skip_unchanged_stores,
+            );
         } else if std::env::var("XAGENT_BRAIN_GLOBAL_CREDIT").as_deref() == Ok("1") {
             kernel.global_credit =
                 global_credit::Pipelines::new(&kernel, &brain_passes_src, &vision_overrides);

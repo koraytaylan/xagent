@@ -75,7 +75,7 @@ fn publish_features(brain_passes: &str) -> String {
     )
 }
 
-fn main_source(
+pub(super) fn main_source(
     brain_passes: &str,
     has_subgroup: bool,
     packed: Option<&packed_encoder::Cache>,
@@ -105,7 +105,14 @@ fn main_source(
     )
 }
 
-fn global_source(packed: Option<&packed_encoder::Cache>) -> String {
+pub(super) fn global_source(packed: Option<&packed_encoder::Cache>) -> String {
+    global_source_with_store_suppression(packed, false)
+}
+
+fn global_source_with_store_suppression(
+    packed: Option<&packed_encoder::Cache>,
+    skip_unchanged_stores: bool,
+) -> String {
     let global = replace_once(include_str!("../shaders/kernel/global_tick.wgsl"),
         "@compute @workgroup_size(256)\nfn global_tick(@builtin(local_invocation_id) lid: vec3u) {\n    let tid = lid.x;",
         "fn global_world_inner(tid: u32) {");
@@ -125,15 +132,15 @@ fn global_source(packed: Option<&packed_encoder::Cache>) -> String {
         packed_encoder::Cache::common_source,
     );
     let credit = if packed.is_some() {
-        packed_encoder::CREDIT_SOURCE
+        packed_encoder::credit_source(skip_unchanged_stores)
     } else {
-        include_str!("../shaders/kernel/phase_encoder_credit.wgsl")
+        include_str!("../shaders/kernel/phase_encoder_credit.wgsl").to_owned()
     };
     [
         &common,
         phases.as_str(),
         global.as_str(),
-        credit,
+        credit.as_str(),
         include_str!("../shaders/kernel/global_credit_tick.wgsl"),
     ]
     .join("\n")
@@ -186,7 +193,7 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
     ) -> Option<Self> {
-        Self::new_variant(kernel, brain_passes, constants, false)
+        Self::new_variant(kernel, brain_passes, constants, false, false)
     }
 
     pub(super) fn new_packed(
@@ -194,7 +201,20 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
     ) -> Option<Self> {
-        Self::new_variant(kernel, brain_passes, constants, true)
+        Self::new_variant(kernel, brain_passes, constants, true, false)
+    }
+
+    /// Explicit selection keeps reference pipelines independent of process flags.
+    pub(super) fn new_packed_with_store_suppression(
+        kernel: &GpuKernel,
+        brain_passes: &str,
+        constants: &HashMap<String, f64>,
+        skip_unchanged_stores: bool,
+    ) -> Option<Self> {
+        if !skip_unchanged_stores {
+            return Self::new_packed(kernel, brain_passes, constants);
+        }
+        Self::new_variant(kernel, brain_passes, constants, true, true)
     }
 
     fn new_variant(
@@ -202,6 +222,7 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
         packed_requested: bool,
+        skip_unchanged_stores: bool,
     ) -> Option<Self> {
         if kernel.vision_stride != 1 {
             log::warn!("[GpuKernel] Global encoder credit requires vision stride 1; retaining the original schedule");
@@ -266,7 +287,12 @@ impl Pipelines {
             main_source(brain_passes, kernel.has_subgroup, packed.as_ref()),
             "kernel_tick",
         );
-        let global = create(global_source(packed.as_ref()), "global_credit_tick");
+        let global_src = if skip_unchanged_stores {
+            global_source_with_store_suppression(packed.as_ref(), true)
+        } else {
+            global_source(packed.as_ref())
+        };
+        let global = create(global_src, "global_credit_tick");
         let features = packed.is_none().then(|| {
             kernel.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global_credit_features"),
@@ -280,7 +306,7 @@ impl Pipelines {
             .map_or_else(|| features.as_ref().unwrap(), packed_encoder::Cache::buffer);
         let bind_groups =
             std::array::from_fn(|index| private_bind_group(kernel, &bind_layout, buffer, index));
-        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, packed encoder={}; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule", packed.is_some());
+        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, packed encoder={}, unchanged vector stores skipped={}; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule", packed.is_some(), packed.is_some() && skip_unchanged_stores);
         Some(Self {
             main,
             global,

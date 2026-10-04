@@ -5,9 +5,9 @@
 **Base:** `33a7afaa` on `develop`
 **Trigger:** find ways to make the GPU computation several times faster without damaging accuracy.
 
-**Follow-up, 2026-10-04:** the [latest production experiments](#production-packed-encoder-cache)
-measure 3.110× whole-simulation acceleration with optional FP32 reassociation,
-or 2.743× with matching public hashes, for 10 agents on a Raphael integrated
+**Follow-up, 2026-10-04:** the [latest production experiments](#suppressing-unchanged-packed-encoder-stores)
+measure 3.246× whole-simulation acceleration with optional FP32 reassociation,
+or 2.840× with matching public hashes, for 10 agents on a Raphael integrated
 GPU; these are separate from the original M3 Max measurements below, and the
 requested 10× whole-simulation target remains unmet.
 
@@ -1313,3 +1313,166 @@ with all targets and warnings denied. The sandbox total includes 141 library,
 fallback is additionally checked through the actual constructor. These checks
 support the stated local results; they establish neither universal GPU
 performance nor long-run behavioral equivalence of FP32 reassociation.
+
+
+### Suppressing unchanged packed encoder stores
+
+`XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES=1` optionally checks the four
+updated words after the original credit gates, FP32 arithmetic and clamps.
+When their `u32` bit representations all equal the loaded vector, the shader
+omits both the private vector store and the four public scalar stores.
+Integer comparison distinguishes signed zeros; there is no rounding-gap
+estimate or metadata cache. The existing import and mirrored-write lifecycle
+maintains equality of both destinations before each update. This option is
+default-off, only affects an already-active packed encoder, and does not
+select hardware or enable packing by itself. Scalar fallback remains available.
+
+Snapshot diagnostics observe three independently seeded brain trajectories
+at cycles 256 and 1,000, with sixteen consecutive cycles per window. They read
+the actual GPU matrices and the after-cycle decision credits used by global
+credit, exclude inactive/death transitions, and check private/public matrix
+agreement plus exact thirteen-buffer replay. No shader counters enter timing.
+Of attempted vectors, **10.803%** retain all four words in the earlier window
+and **70.748%** in the later window; individual later seeds range from 65.980%
+to 75.665%. Credit-disabled vectors are counted separately. These are measured
+opportunities, not a prediction of bandwidth or speedup.
+
+The canonical production helper passes the mixed threshold/clamp fixture,
+signed zeros, subnormal operands, tiny active updates, inactive agents and
+odd-sized raw grids with partial credit workgroup tiles. Complete evolving
+runs across 8×6 and 9×7 fields match all
+thirteen captured buffers and the private matrix mirror through 100 cycles,
+including death and whitening refresh, in two replays. Five alternating
+100-cycle timing pairs with the same production recorder measure:
+
+| Warmup cycles | Ordinary stores | Unchanged stores skipped | Whole-cycle ratio |
+|---|---:|---:|---:|
+| 256 | 0.046634604 s | 0.046738188 s | 0.997784× |
+| 1,000 | 0.046165098 s | 0.043390527 s | 1.063944× |
+
+Both arms include their checkpoint-triggered cold import in timing; state
+readbacks are outside it. The logs are `packed-store-canonical-validation.log`
+and `packed-store-production-lifecycle.log`. The actual constructor also
+passes the existing eighteen raw/cortical lifecycle scenarios and resource
+fallback test with suppression enabled, against an independent scalar-credit
+control; cortical checks use one-cycle submissions.
+
+Three alternating 100,000-tick pairs against the original serial configuration
+measure **14.893836464/4.588355608 s (3.246×)**, with all six hashes repeatable
+within each arm. All six candidate hashes also match all three earlier packed
+long runs with suppression disabled. The log is
+`packed-store-production-long-benchmark.log`; add the store-suppression flag
+to the packed benchmark command above to reproduce it. These whole-simulation
+measurements retain the earlier synthetic-scene and readback-coverage limits.
+The ratio to the original serial arm is not an isolated estimate of the new
+store optimization, because timings can vary between measurement sessions.
+
+A separate three-pair, alternating on/off comparison keeps every other option
+identical and uses the example's `--arm parallel --ticks 100000` mode. It
+measures **4.709516207/4.495535372 s (1.047599×)**, with all six hashes equal
+across all six runs (`packed-store-toggle-long-benchmark.log`). This directly
+measures the store optimization within the existing optimized simulation.
+The option is off for the baseline and on for the candidate; both retain
+packed weights, context gathering, cooperative whitening, prefetch eight,
+sixteen predictor lanes, cached object queries, agent masks and parallel scent.
+
+Keeping the original four-lane predictor, one 100,000-tick pair measures
+**14.698164957/5.175427695 s (2.840×)** and matches all six original public
+hashes (`packed-store-exact-long-benchmark.log`). This is one pair and does not
+establish repetition. No isolated ratio is multiplied into a whole-simulation
+claim.
+
+Verification with suppression enabled passes 99 normal brain tests in debug
+mode, all 284 sandbox tests, the seven focused release GPU tests described
+above, formatting checks and workspace Clippy with all targets and warnings
+denied. The ordinary brain suite uses debug mode because its existing
+`zero_expected_panics_in_debug` test requires debug assertions; an initial
+release run of that suite failed only that expected-panic test before the
+debug rerun passed. No test assertion was weakened. Sandbox verification is
+recorded in `sandbox-packed-store-tests.log`, including all 118 integration
+tests and both sensory tests.
+
+### Packed main-kernel section profile
+
+`XAGENT_SECTIONS_PACKED_CONTEXT=1` makes the section diagnostic compose the
+actual packed encoder, gathered context and global-credit main, including the
+same vision-mask overrides in its global pipeline. Checkpoint restoration
+invalidates the private cache; imports precede timestamps. Claim and main use
+the production private bind group. Runtime-uniform prefix guards allow all
+stops to use one compiled shader, and every prefix starts from a restored
+checkpoint without feeding an incomplete state into a later cycle.
+
+With prefetch eight and sixteen predictor lanes, after 256 cycles the
+unguarded main takes **276.080 µs**, versus **279.480 µs** with all guards
+inactive (1.0123× overhead); their complete cycles match all thirteen buffers.
+The larger consecutive prefix differences are encoder 34.60 µs, predictor
+training/dot 40.68 µs, recalled context 30.36 µs, motor/sensory/telemetry
+32.20 µs, and memory reinforcement 32.76 µs. Recall scoring and selection add
+15.12 and 14.16 µs. These are single-checkpoint medians, not independently
+additive steady-state measurements: small negative differences reveal timing
+noise. Encoder credit itself runs in global and is excluded from these main
+sections.
+
+At cycle 260, scheduled whitening refresh contributes approximately 343.60 µs;
+unguarded/guarded full main times are 623.760/623.320 µs and again match all
+thirteen buffers. That refresh cost is intermittent and must not be charged
+to every cycle. `brain-sections-packed-context.log` records five rotated
+measurements per prefix at both checkpoints. The earlier 24-cycle whole-stage
+profile averages over multiple cycles and remains a separate measurement.
+
+### Further structural opportunity and its limits
+
+Raw vision has a small color palette and constant alpha, but sensory
+adaptation subtracts an independent running mean from each visual feature.
+Identical current colors therefore do not imply identical adapted inputs.
+The eight-channel whitening calculation belongs to a separate action pathway
+after encoding and cannot factor the full dense encoder. Even aggregating
+48 identical alpha histories could remove at most 47 of the 267 default
+encoder terms before accounting for weight maintenance; arbitrary host-written
+means also invalidate that shared-history assumption.
+
+A different candidate would cache the visual projection and update it only
+from changed raw inputs. In real arithmetic, if `v` is the adapted visual
+vector, `delta_r` is the change in raw vision, and `beta = 0.99`, then
+`v_next = beta*v + delta_r`. With unclamped rank-one encoder credit
+`W_next = W + v*c^T`, a cached visual projection obeys
+`a_next = beta*a + beta*c*dot(v,v) + transpose(W_next)*delta_r`.
+Combining sparse raw changes with deferred weight updates could avoid the
+dense base-matrix query retained by the earlier deferred encoder experiment.
+
+This identity is not yet an FP32 implementation: actual EMA rounding adds a
+generally dense residual, while per-weight rounding and clamping invalidate
+the ideal rank-one update. A useful rejection test would capture actual
+published features and weight matrices across early/mature, stationary/moving
+windows, then measure raw-change sparsity and projection residuals against the
+existing raw-dot error bounds over one, eight and sixteen cycles. It must also
+establish a viable rebase frequency and snapshot-only public materialization.
+No acceleration is claimed for this unimplemented candidate.
+
+The measured encoder section is only about 35 µs, and even eliminating the
+entire earlier 294.10 µs main stage leaves 186.08 µs of claim/global/vision.
+Consequently an encoder-only redesign cannot establish 10× whole-simulation
+acceleration on this workload. Independent global work, such as food-grid
+rebuilds when food availability and positions are unchanged, needs its own
+opportunity and timing measurements. **The requested 10× target remains unmet.**
+
+
+The remaining serial Jacobi rotations in whitening are another bounded
+candidate: eight lanes could update independent rows in the column phase,
+then independent columns in the row phase, preserving the original rotation
+and sweep order. This differs from the current cooperative output
+reconstruction. It would require up to 1,008 rotation barriers per refresh,
+so the 343.6 µs refresh measurement does not establish a gain; even eliminating
+that surcharge completely would save only about 17.2 µs per cycle under
+steady once-per-twenty-cycle refreshes.
+
+Food-grid reuse has a stricter exactness condition than unchanged positions:
+availability and grid-cell membership must also be unchanged, and no cell
+may exceed its sixteen retained slots. Overflow must retain the ordinary
+rebuild because atomic insertion can choose different retained IDs even for
+identical inputs. An eligible cached path must preserve unused slot bytes,
+claim resets, respawn timer/RNG/insertion order, agent grids and collisions;
+host world uploads and alternate execution routes need invalidation. A
+snapshot-only opportunity measurement should verify full grid-byte equality
+before a conditional-rebuild prototype, whose savings could overlap work
+already hidden by concurrent encoder credit.

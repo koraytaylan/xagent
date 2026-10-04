@@ -1,6 +1,6 @@
 // Four adjacent output weights share one typed storage load. Each component
 // retains its original ascending stride-four accumulation and reduction.
-// Only the first 128 threads perform arithmetic; all 256 reach both barriers.
+// Only the first 128 threads perform arithmetic; every thread reaches both barriers.
 fn coop_encode(agent_id: u32, tid: u32) {
     let brain_base = agent_id * BRAIN_STRIDE;
     let output_vector = tid % PACKED_ENCODER_OUTPUT_VECTORS;

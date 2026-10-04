@@ -47,6 +47,9 @@
 //! With that packed path active, `XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES=1`
 //! skips both weight stores when all four updated words retain their exact bits.
 //! This option defaults off and does not enable packing by itself.
+//! `XAGENT_BRAIN_MAIN_THREADS=128` reduces only the packed main workgroup when
+//! predictor16 and context8 are also enabled; unsupported compositions keep
+//! 256 threads. Claim, global and vision dispatch shapes remain unchanged.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -148,6 +151,11 @@ mod global_credit_production_validation;
 mod global_credit_validation;
 #[cfg(test)]
 mod global_world_profile;
+mod main_width;
+#[cfg(test)]
+mod main_width_validation;
+#[cfg(test)]
+mod memory_offload_validation;
 mod packed_encoder;
 #[cfg(test)]
 mod packed_encoder_dot_validation;
@@ -155,6 +163,8 @@ mod packed_encoder_dot_validation;
 mod packed_encoder_production_validation;
 #[cfg(test)]
 mod packed_encoder_validation;
+#[cfg(test)]
+mod packed_physics_validation;
 #[cfg(test)]
 mod packed_predictor_dot_validation;
 #[cfg(test)]
@@ -199,6 +209,8 @@ mod vision_claim_validation;
 mod vision_validation;
 #[cfg(test)]
 mod visual_event_diagnostics;
+#[cfg(test)]
+mod visual_pathway_validation;
 #[cfg(test)]
 mod whitening_storage_validation;
 #[cfg(test)]
@@ -2212,12 +2224,22 @@ impl GpuKernel {
         if std::env::var("XAGENT_BRAIN_PACKED_ENCODER").as_deref() == Ok("1") {
             let skip_unchanged_stores =
                 std::env::var("XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES").as_deref() == Ok("1");
-            kernel.global_credit = global_credit::Pipelines::new_packed_with_store_suppression(
-                &kernel,
-                &brain_passes_src,
-                &vision_overrides,
-                skip_unchanged_stores,
-            );
+            kernel.global_credit =
+                if std::env::var("XAGENT_BRAIN_MAIN_THREADS").as_deref() == Ok("128") {
+                    global_credit::Pipelines::new_packed_with_main128(
+                        &kernel,
+                        &brain_passes_src,
+                        &vision_overrides,
+                        skip_unchanged_stores,
+                    )
+                } else {
+                    global_credit::Pipelines::new_packed_with_store_suppression(
+                        &kernel,
+                        &brain_passes_src,
+                        &vision_overrides,
+                        skip_unchanged_stores,
+                    )
+                };
         } else if std::env::var("XAGENT_BRAIN_GLOBAL_CREDIT").as_deref() == Ok("1") {
             kernel.global_credit =
                 global_credit::Pipelines::new(&kernel, &brain_passes_src, &vision_overrides);

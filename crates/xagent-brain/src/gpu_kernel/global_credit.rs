@@ -21,6 +21,8 @@ pub(super) struct Pipelines {
     pub(super) global: wgpu::ComputePipeline,
     pub(super) bind_groups: [wgpu::BindGroup; 2],
     pub(super) global_workgroups: u32,
+    #[cfg(test)]
+    pub(super) main_threads: u32,
     // Binding 13 differs from the ordinary group. Its lifetime follows both
     // groups, and every live agent rewrites its features before any read.
     _features: Option<wgpu::Buffer>,
@@ -193,7 +195,7 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
     ) -> Option<Self> {
-        Self::new_variant(kernel, brain_passes, constants, false, false)
+        Self::new_variant(kernel, brain_passes, constants, false, false, false)
     }
 
     pub(super) fn new_packed(
@@ -201,7 +203,7 @@ impl Pipelines {
         brain_passes: &str,
         constants: &HashMap<String, f64>,
     ) -> Option<Self> {
-        Self::new_variant(kernel, brain_passes, constants, true, false)
+        Self::new_variant(kernel, brain_passes, constants, true, false, false)
     }
 
     /// Explicit selection keeps reference pipelines independent of process flags.
@@ -214,7 +216,25 @@ impl Pipelines {
         if !skip_unchanged_stores {
             return Self::new_packed(kernel, brain_passes, constants);
         }
-        Self::new_variant(kernel, brain_passes, constants, true, true)
+        Self::new_variant(kernel, brain_passes, constants, true, true, false)
+    }
+
+    /// Use 128 main invocations only for the supported packed/predictor/context
+    /// composition; unsupported source or resource shapes keep the 256 entry.
+    pub(super) fn new_packed_with_main128(
+        kernel: &GpuKernel,
+        brain_passes: &str,
+        constants: &HashMap<String, f64>,
+        skip_unchanged_stores: bool,
+    ) -> Option<Self> {
+        Self::new_variant(
+            kernel,
+            brain_passes,
+            constants,
+            true,
+            skip_unchanged_stores,
+            true,
+        )
     }
 
     fn new_variant(
@@ -223,6 +243,7 @@ impl Pipelines {
         constants: &HashMap<String, f64>,
         packed_requested: bool,
         skip_unchanged_stores: bool,
+        main128_requested: bool,
     ) -> Option<Self> {
         if kernel.vision_stride != 1 {
             log::warn!("[GpuKernel] Global encoder credit requires vision stride 1; retaining the original schedule");
@@ -283,10 +304,17 @@ impl Pipelines {
                     cache: None,
                 })
         };
-        let main = create(
-            main_source(brain_passes, kernel.has_subgroup, packed.as_ref()),
-            "kernel_tick",
-        );
+        let mut main_src = main_source(brain_passes, kernel.has_subgroup, packed.as_ref());
+        let mut main_threads = BRAIN_WORKGROUP_THREADS;
+        if main128_requested {
+            if let Some(candidate) = super::main_width::try_transform(&main_src) {
+                main_src = candidate;
+                main_threads = super::main_width::MAIN_THREADS;
+            } else {
+                log::warn!("[GpuKernel] 128-thread main requires packed encoder, predictor16 and context8; retaining 256 threads");
+            }
+        }
+        let main = create(main_src, "kernel_tick");
         let global_src = if skip_unchanged_stores {
             global_source_with_store_suppression(packed.as_ref(), true)
         } else {
@@ -306,12 +334,14 @@ impl Pipelines {
             .map_or_else(|| features.as_ref().unwrap(), packed_encoder::Cache::buffer);
         let bind_groups =
             std::array::from_fn(|index| private_bind_group(kernel, &bind_layout, buffer, index));
-        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, packed encoder={}, unchanged vector stores skipped={}; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule", packed.is_some(), packed.is_some() && skip_unchanged_stores);
+        log::info!("[GpuKernel] Global encoder credit enabled: {global_workgroups} groups, packed encoder={}, unchanged vector stores skipped={}, main threads={main_threads}; fused serial uses a separate brain, other modes and partial/global-skipping probes retain the original schedule", packed.is_some(), packed.is_some() && skip_unchanged_stores);
         Some(Self {
             main,
             global,
             bind_groups,
             global_workgroups,
+            #[cfg(test)]
+            main_threads,
             _features: features,
             packed_encoder: packed,
         })

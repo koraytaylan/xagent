@@ -5,9 +5,9 @@
 **Base:** `33a7afaa` on `develop`
 **Trigger:** find ways to make the GPU computation several times faster without damaging accuracy.
 
-**Follow-up, 2026-10-04:** the [latest production experiments](#suppressing-unchanged-packed-encoder-stores)
-measure 3.246× whole-simulation acceleration with optional FP32 reassociation,
-or 2.840× with matching public hashes, for 10 agents on a Raphael integrated
+**Follow-up, 2026-10-04:** the [latest production experiments](#reducing-the-main-workgroup-to-128-threads)
+measure 3.887× whole-simulation acceleration with optional FP32 reassociation,
+or an earlier 2.840× with matching original public hashes, for 10 agents on a Raphael integrated
 GPU; these are separate from the original M3 Max measurements below, and the
 requested 10× whole-simulation target remains unmet.
 
@@ -1592,7 +1592,7 @@ The encoder section remains only about 35 µs, so an encoder-only redesign
 cannot establish 10× whole-simulation acceleration on this workload. The
 cooperative Jacobi and food-grid experiments are test-only, and neither is
 included in the production headline. **The measured whole-simulation result
-remains 3.246×; the requested 10× target remains unmet.**
+at this stage was 3.246×; the requested 10× target remains unmet.**
 
 
 ### Fresh next-input projection: raw numerical validation
@@ -1694,7 +1694,7 @@ ten-agent field without adding a binding or dispatch. The log is
 This small local whole-cycle gain does not justify production promotion.
 Neither the held-input fixtures nor the single mature timing scene establishes
 long-run behavioral equivalence or a general cache-hit rate. The prototype
-remains test-only, and the production headline remains **3.246×**, with the
+remains test-only, and the production headline at this stage was **3.246×**, with the
 **10× whole-simulation target unmet**.
 
 ### Verification of the world and visual-reuse diagnostics
@@ -1718,3 +1718,182 @@ coverage assertion. The held-input case above makes that coverage deterministic
 without removing the assertion or weakening numerical checks. These changes
 add diagnostics and test-only candidates; no new runtime option or default
 is promoted by this verification.
+
+### Reducing the main workgroup to 128 threads
+
+`XAGENT_BRAIN_MAIN_THREADS=128` now selects a smaller main workgroup when
+packed encoding, the sixteen-lane predictor and eight-lane context gather
+are present. It defaults off, enables no other option, and does not inspect
+GPU vendor or device names. Unsupported source compositions and packed-cache
+resource fallbacks retain the 256-thread main. Existing execution-mode,
+vision-stride, partial-brain and skipped-global fallbacks are unchanged.
+
+The packed encoder already performs its arithmetic on 128 invocations, so
+its weight ownership and four-part reduction stay intact. The predictor
+processes eight outputs per tile instead of sixteen, keeping each output's
+sixteen-lane tree. Context tiles shrink similarly. Each reinforcement thread
+computes both original ascending even/odd chains before their existing sum.
+Cortex normalization initializes all 256 logical partials and keeps its
+original tree, including the leading positive-zero addition. A cortex output
+count above 128 components rejects the transformation. Claim, global and vision
+keep 256 threads, shared allocations are unchanged, and there is no additional
+dispatch, binding or per-cycle host work.
+
+The production constructor passes exact thirteen-buffer comparisons for raw
+8×6 and 9×7 fields through 100 cycles, death and refresh boundaries, an inactive
+agent, two candidate replays and the private/scalar encoder mirror. A bounded
+three-agent cortex case passes three individually submitted cycles with two
+deaths and two replays. A predictor4/no-context case explicitly verifies the
+256-thread fallback. CPU composition tests cover missing/duplicate source
+contracts, repeated application, predictor4/8/32, context absent/16, and
+supported sources with scalar or cooperative whitening.
+
+The existing production lifecycle suite also passes with the new option
+actually active: eighteen raw/cortex cases cover host writes, reset, queued
+readback snapshots and departures from/resumption of packed execution. Its
+workgroup-resource case explicitly verifies scalar credit and a 256-thread
+main when packing is unavailable. Logs are
+`main128-memory-production-validation.log` and
+`main128-production-lifecycle.log`.
+
+Five alternating complete 100-cycle pairs after 1,000 warmup cycles measure
+**0.045049295/0.036604195 s (1.230714×)** against the previous optimized stack,
+with all thirteen buffers and the private mirror equal. Cold cache import
+is included; state readbacks are outside timing.
+
+Three alternating **100,000-tick** production pairs against the original
+default configuration (serial vision and default brain/vision scheduling)
+measure **15.035975847/3.868469985 s (3.887×)**. Each arm's six
+public hashes repeat exactly; cross-arm hashes differ because the candidate
+includes the already validated predictor16 reassociation. A separate direct
+256/128 toggle comparison, also three alternating 100,000-tick pairs, measures
+**4.672434687/3.859867571 s (1.210517×)**, with all six public hashes identical
+across all six runs. These are measured combined results, not products of
+isolated speedups. Logs are `main128-production-long-benchmark.log` and
+`main128-toggle-long-benchmark.log`.
+
+Both long experiments use the unchanged synthetic seed42, ten-agent, 8×6
+scene with terrain, hazards, food and collisions. Pipeline construction and
+final readback are excluded; all simulation dispatches and GPU completion are
+timed. These public hashes do not include every internal buffer, which is why
+the separate thirteen-buffer gates remain necessary. The implementation uses
+portable WGSL, but performance on other GPUs and populations is unmeasured.
+**The requested 10× whole-simulation target remains unmet.**
+
+Reproduce the combined long comparison with:
+
+```sh
+XAGENT_BRAIN_PACKED_ENCODER=1 \
+XAGENT_BRAIN_SKIP_UNCHANGED_ENCODER_STORES=1 \
+XAGENT_BRAIN_CONTEXT_GATHER=1 \
+XAGENT_BRAIN_COOPERATIVE_WHITENING=1 \
+XAGENT_BRAIN_DENSE_PREFETCH=1 \
+XAGENT_BRAIN_PREDICTOR_LANES=16 \
+XAGENT_BRAIN_MAIN_THREADS=128 \
+XAGENT_VISION_AGENT_MASKS=1 \
+XAGENT_VISION_OBJECT_QUERIES=1 \
+XAGENT_VISION_PARALLEL_SCENT=1 \
+cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 100000 --agents 10 --seed 42 --width 8 --height 6 \
+  --vision-stride 1 --execution fused --repeats 3 --precision fp32
+```
+
+### Structural alternatives checked beside main128
+
+Three other candidates remain test-only and were measured independently
+against the preceding 256-thread optimized stack:
+
+| Candidate | Five-pair reference / candidate time | Complete-cycle speedup |
+|---|---:|---:|
+| Memory maintenance beside world and encoder credit | 0.044454795 / 0.044467549 s | 0.999713× |
+| Grouped per-agent physics followed by cooperative claims | 0.043383995 / 0.043275682 s | 1.002503× |
+| Parallel visual whitening rows and covariance cells | 0.048718767 / 0.047911550 s | 1.016848× |
+
+Each sample advances 100 complete cycles; memory and physics use 1,000 warmup
+cycles, while visual pathway uses 256. These small or absent gains do not
+establish a combined improvement with main128 and are excluded from its
+headline.
+
+Memory maintenance retains main's exact norm, slot store and critic replay,
+then executes reinforcement, decay, active count and eviction selection in
+one additional global workgroup per agent. It reads the exact newly stored
+key/norm and skips reinforcement of that fresh slot because main has already
+overwritten the old slot's reinforcement and valence. No dispatch is added,
+but every global group reserves 2,576 bytes of shared memory. Exact full-state
+and mirror checks pass for both raw layouts; direct fixtures verify overwrite,
+another reinforced slot, episodic credit, deactivation and first-index eviction
+ties. The initial host resource guard incorrectly matched a shared-memory
+token in a comment; the corrected guard checks declarations. The passing log
+is `main128-memory-production-validation.log`.
+
+Grouped physics gives one invocation to each agent in a 32-thread workgroup,
+preserving that agent's original sequence of sub-ticks. A separate dispatch
+then runs the original 256-thread food claim. Both timed arms share the same
+chunking and cache-import protocol, and the extra dispatch is timed. The
+custom recorder is independently compared with production across all thirteen
+buffers, two raw layouts, death/refresh, inactive state and two replays.
+This fixture has ten agents and one brain stride; it does not validate multiple
+physics workgroups or a general production lifecycle. The log is
+`packed-physics-validation.log`.
+
+The visual candidate retains scalar hemifield pooling, then computes eight
+ordered whitening rows and 64 independent covariance cells cooperatively in
+released scratch. An earlier redistribution of the hemifield divisions failed
+exact comparisons: the diagnostic located differences in the mean before
+whitening, with the whitening matrix itself unchanged. Restoring the original
+hemifield function makes all strict checks pass without relaxing assertions:
+both raw layouts, 100-cycle trajectories, death/refresh, two replays, direct
+old-mean/old-covariance probes at refresh/nonrefresh ticks, and bounded cortex
+execution. Logs are `visual-pathway-phase-diagnostic.log`,
+`visual-pathway-phase-repair.log` and `visual-pathway-final-validation.log`.
+
+### Remaining cost with the 128-thread production main
+
+The production dispatch profiler uses the actual constructor-selected pipeline
+and checks its instrumented recorder against all thirteen mutable buffers.
+After 256 warmup cycles, its 24-cycle sample measures 397.149 µs per cycle of
+uninstrumented wall time, 415.473 µs instrumented wall time and 393.710 µs
+summed GPU stage medians:
+
+| Stage | GPU time | Share |
+|---|---:|---:|
+| Physics and food claim | 34.173 µs | 8.68% |
+| Remaining kernel and brain | 210.357 µs | 53.43% |
+| World update and encoder credit | 106.282 µs | 26.99% |
+| Vision and other senses | 42.898 µs | 10.90% |
+
+The log is `main128-cycle-profile.log`. This short restored-state profile is
+distinct from the long throughput experiment. The older `brain_sections`
+helper still constructs a 256-thread pipeline explicitly, so its internal
+section timings above are not attribution of the new main.
+
+At unchanged costs for the other stages, their measured times sum to
+183.353 µs, above the roughly 150 µs cycle budget derived from the long-run
+original baseline. This is conditional attribution, not a lower bound after
+rescheduling. Further gains need investigation across dispatches as well as
+inside the brain.
+
+A source audit identifies a possible four-dispatch ordering: physics/claim;
+food settlement, danger and death prefix; brain alongside world; then vision
+alongside encoder credit. Brain reads the saved pre-collision position and
+physics fields disjoint from the world's position writes; vision reads FOV
+and smell genes disjoint from encoder weights. No candidate for this complete
+ordering is implemented or measured here. Keeping main128 would require a
+128-thread world implementation, with care around grid overflow ordering, and
+combining vision with credit would make every credit workgroup reserve about
+7.9 KB of vision scratch. That resource cost could erase overlap gains; this
+is a dependency-audited experiment direction, not a claimed speedup.
+
+### Verification of the 128-thread production option
+
+The final change passes all 108 normal brain tests, fifteen focused release
+GPU tests, the production dispatch-profile parity check, all 284 sandbox tests
+run serially, formatting and workspace Clippy across all targets with warnings
+denied. Long benchmarks additionally verify per-arm public-hash repeatability
+and exact equality across the direct 256/128 toggle. Hardware experiments remain
+ignored in the ordinary suite and were run explicitly. Final routine-check logs
+are `main128-final-brain-debug.log`, `main128-clippy.log` and
+`main128-sandbox-serial-tests.log`; the GPU and timing logs are identified above.
+Only the guarded 128-thread main gains a production option in this follow-up;
+memory offload, grouped physics and cooperative visual-pathway updates remain
+test-only.

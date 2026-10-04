@@ -158,6 +158,12 @@ fn prepare(brain: &BrainConfig) -> GpuKernel {
         cache(&kernel).is_some(),
         "run with XAGENT_BRAIN_PACKED_ENCODER=1 on a supported device"
     );
+    if std::env::var("XAGENT_BRAIN_MAIN_THREADS").as_deref() == Ok("128") {
+        assert_eq!(
+            kernel.global_credit.as_ref().unwrap().main_threads,
+            main_width::MAIN_THREADS,
+        );
+    }
     kernel.reset_agents_seeded(brain, INITIAL_SEED);
     active_route(&mut kernel);
     upload_random_scene(&kernel, 0, true, false);
@@ -565,6 +571,10 @@ fn production_packed_encoder_falls_back_at_workgroup_limit() -> TestResult {
     assert!(
         cache(&kernel).is_none(),
         "constructor must select scalar credit"
+    );
+    assert_eq!(
+        kernel.global_credit.as_ref().unwrap().main_threads,
+        BRAIN_WORKGROUP_THREADS,
     );
     assert!(packed_encoder::Cache::new(&kernel).is_none());
     active_route(&mut kernel);

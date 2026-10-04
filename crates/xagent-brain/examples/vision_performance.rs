@@ -1,4 +1,4 @@
-//! Paired, seeded full-simulation timing of exact opt-in GPU optimizations.
+//! Paired, seeded full-simulation timing of opt-in GPU optimizations.
 //!
 //! Run with `cargo run --release -p xagent-brain --example vision_performance --
 //! --ticks 10000 --agents 10 --seed 42 --width 8 --height 6`. Each arm runs in
@@ -14,6 +14,10 @@
 //! Matching hashes cover public readback state, not every private GPU buffer.
 //! In particular, final vision depth, food flags and the full decision buffer
 //! are not exposed by the public API. Use ray-level parity tests for depth.
+//! `--precision fp32` reports differing hashes and checks each arm's exact
+//! repeatability across multiple repetitions; numerical accuracy and behavior
+//! must be checked by the separate
+//! GPU validation tests, since hashes cannot measure rounding error.
 
 use std::error::Error;
 use std::process::{Command, ExitCode};
@@ -83,6 +87,7 @@ struct Options {
     repeats: usize,
     vision_stride: u32,
     execution: BrainExecutionMode,
+    allow_rounding: bool,
     arm: Option<String>,
 }
 
@@ -98,6 +103,7 @@ impl Options {
             repeats: 1,
             vision_stride: brain.vision_stride,
             execution: BrainExecutionMode::FusedSerial,
+            allow_rounding: false,
             arm: None,
         };
         let mut arguments = std::env::args().skip(1);
@@ -113,6 +119,13 @@ impl Options {
                 "--height" => options.height = value.parse()?,
                 "--repeats" => options.repeats = value.parse()?,
                 "--vision-stride" => options.vision_stride = value.parse()?,
+                "--precision" => {
+                    options.allow_rounding = match value.as_str() {
+                        "exact" => false,
+                        "fp32" => true,
+                        _ => return Err("Precision must be exact or fp32".into()),
+                    };
+                }
                 "--execution" => {
                     options.execution = match value.as_str() {
                         "fused" => BrainExecutionMode::FusedSerial,
@@ -344,6 +357,8 @@ fn run_arm(options: &Options, arm: &str) -> Result<(), Box<dyn Error>> {
         std::env::set_var("XAGENT_VISION_PARALLEL_SCENT", "0");
         std::env::set_var("XAGENT_BRAIN_COOPERATIVE_WHITENING", "0");
         std::env::set_var("XAGENT_BRAIN_FUSED_PREDICTOR", "0");
+        std::env::set_var("XAGENT_BRAIN_DENSE_PREFETCH", "0");
+        std::env::set_var("XAGENT_BRAIN_PREDICTOR_LANES", "4");
     }
     // Set before creating any GPU device or worker thread.
     std::env::set_var(
@@ -437,7 +452,11 @@ fn run_pair(
     println!("PAIR repetition={} first_arm={}", repetition + 1, arms[0]);
     let first = child_result(options, arms[0])?;
     let second = child_result(options, arms[1])?;
-    if first.hashes.len() != CHECKSUM_COMPONENTS || first.hashes != second.hashes {
+    if first.hashes.len() != CHECKSUM_COMPONENTS || second.hashes.len() != CHECKSUM_COMPONENTS {
+        return Err("Missing public-state checksum component".into());
+    }
+    let hashes_match = first.hashes == second.hashes;
+    if !hashes_match && !options.allow_rounding {
         return Err(format!(
             "Serial/parallel state hashes differ in pair {}; inspect CHECKSUM rows above",
             repetition + 1
@@ -450,8 +469,9 @@ fn run_pair(
         (second, first)
     };
     println!(
-        "PAIR_RESULT repetition={} public_state_hashes=match full_simulation_speedup={:.3}x",
+        "PAIR_RESULT repetition={} public_state_hashes={} full_simulation_speedup={:.3}x",
         repetition + 1,
+        if hashes_match { "match" } else { "differ" },
         serial.seconds / parallel.seconds
     );
     Ok((serial, parallel))
@@ -475,8 +495,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut serial_times = Vec::new();
     let mut parallel_times = Vec::new();
     let mut reference_hashes = None;
+    let mut candidate_hashes = None;
+    let mut all_hashes_match = true;
     for repetition in 0..options.repeats {
         let (serial, parallel) = run_pair(&options, repetition)?;
+        all_hashes_match &= serial.hashes == parallel.hashes;
         if let Some(reference) = &reference_hashes {
             if &serial.hashes != reference {
                 return Err("Seeded state hashes changed across repetitions".into());
@@ -484,15 +507,26 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             reference_hashes = Some(serial.hashes);
         }
+        if let Some(reference) = &candidate_hashes {
+            if &parallel.hashes != reference {
+                return Err("Candidate state hashes changed across repetitions".into());
+            }
+        } else {
+            candidate_hashes = Some(parallel.hashes);
+        }
         serial_times.push(serial.seconds);
         parallel_times.push(parallel.seconds);
     }
     let serial_median = median(&mut serial_times);
     let parallel_median = median(&mut parallel_times);
     println!(
-        "PAIRED repeats={} public_state_hashes=match serial_median_secs={serial_median:.9} \
+        "PAIRED repeats={} public_state_hashes={} precision={} repeatability={} serial_median_secs={serial_median:.9} \
          parallel_median_secs={parallel_median:.9} full_simulation_speedup={:.3}x synthetic_scene=true",
-        options.repeats, serial_median / parallel_median
+        options.repeats,
+        if all_hashes_match { "match" } else { "differ" },
+        if options.allow_rounding { "fp32_diagnostics_separate" } else { "exact_hashes" },
+        if options.repeats > 1 { "per_arm_hashes_match" } else { "not_checked" },
+        serial_median / parallel_median
     );
     Ok(())
 }

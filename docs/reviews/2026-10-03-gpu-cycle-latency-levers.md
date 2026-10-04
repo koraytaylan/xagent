@@ -5,6 +5,12 @@
 **Base:** `33a7afaa` on `develop`
 **Trigger:** find ways to make the GPU computation several times faster without damaging accuracy.
 
+**Follow-up, 2026-10-04:** the [latest production experiments](#production-dense-prefetch-and-optional-wider-fp32-prediction)
+measure 2.419× whole-simulation acceleration with optional FP32 reassociation,
+or 2.199× with matching public hashes, for 10 agents on a Raphael integrated
+GPU; these are separate from the original M3 Max measurements below, and the
+requested 10× whole-simulation target remains unmet.
+
 ## Summary
 
 - The default configuration runs at **13,050 ticks/sec** with 10 agents: **766 µs per brain cycle** (10 physics ticks).
@@ -673,3 +679,103 @@ infer a combined result. The user subsequently authorized reordered FP32
 sums with validated rounding differences; subsequent experiments may use
 that allowance, but must report numerical error and behavioral changes
 explicitly rather than treating divergent long trajectories as bitwise parity.
+
+### Production dense prefetch and optional wider FP32 prediction
+
+The following measurements use 10 agents on the same two-compute-unit
+Raphael integrated GPU with RADV Vulkan; other GPU performance is unmeasured.
+
+`XAGENT_BRAIN_DENSE_PREFETCH=1` enables the eight-item encoder/predictor
+prefetch and implies fused inline prediction. With the earlier production
+vision and cooperative-whitening options, three alternating 10,000-tick
+pairs give **1.473513 s default / 0.652942 s optimized (2.257×)**; a
+100,000-tick pair gives **14.530228 s / 6.606974 s (2.199×)**. All six public
+hashes match. Direct 13-buffer checks also pass for 8×6 and 9×7 fields through
+100 cycles, and for combined, split and masked brain dispatches with native
+subgroups and the workgroup fallback through death/refresh boundaries.
+
+With the user's authorization for reordered FP32 sums, the inline predictor
+can instead use 8, 16 or 32 lanes per output row, selected by
+`XAGENT_BRAIN_PREDICTOR_LANES`; the default remains four. The 256-thread
+workgroup, per-weight training, clamps and number of dispatches are unchanged.
+Wider rows read more adjacent weights and use a balanced final addition tree.
+The option implies fused prediction and uses no vendor/device-name selection.
+
+Five rotated 1,000-tick trials from the same warm checkpoint give:
+
+| Predictor lanes | With scalar dense inputs | With production prefetch8 |
+|---|---:|---:|
+| 4, each column's baseline | 0.077352 s | 0.071136 s |
+| 8 | 0.071831 s / 1.077× | 0.067097 s / 1.060× |
+| 16 | 0.069284 s / 1.116× | 0.065264 s / 1.090× |
+| 32 | 0.069684 s / 1.110× | 0.065867 s / 1.080× |
+
+The complete 16-lane/prefetch/vision configuration measures **1.475807 s /
+0.594244 s (2.484×)** in three alternating 10,000-tick pairs and
+**14.540775 s / 6.012051 s (2.419×)** in a 100,000-tick pair. Public hashes
+differ across variants; each arm repeats its own hashes exactly in the
+three-pair run. These are seeded, evolving-trajectory timings, with possible
+workload differences after rounding changes trajectories; the restored-state
+measurements above show a benefit when both arms start from the same warmed
+checkpoint, but also include 100 evolving cycles and do not fully isolate
+dispatch cost from subsequent workload differences.
+
+```sh
+XAGENT_BRAIN_COOPERATIVE_WHITENING=1 XAGENT_BRAIN_DENSE_PREFETCH=1 \
+XAGENT_BRAIN_PREDICTOR_LANES=16 XAGENT_VISION_OBJECT_QUERIES=1 \
+XAGENT_VISION_PARALLEL_SCENT=1 XAGENT_VISION_AGENT_MASKS=1 \
+cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 100000 --repeats 1 --precision fp32
+```
+
+Omit the predictor-lane option and use the default exact precision mode to
+reproduce the hash-matching prefetch configuration. The benchmark's explicit
+`--precision fp32` mode reports differing hashes and enforces repeatability
+within each arm across multiple repetitions; a one-pair run does not check
+repeatability, and a hash is not a numerical-error measurement.
+
+The numerical harness reports max absolute error, RMS and symmetric normalized
+L2 for named floating-point state regions, plus an aggregate count of discrete
+storage differences, while
+requiring valid layouts, finite values, actual clamp/cursor/grid invariants
+and unchanged inactive brain/pattern state. A mature single-cycle comparison
+of wider prediction changes only predictions, by at most 5.97e-8 in the
+measured fixture. A separate raw-dot probe executes the actual predictor
+prefix before context/tanh, compares with f64 sums under a conservative FP32
+forward-error bound including explicit subnormal allowances, and checks
+weight preservation and complete output writes. All **10,240 dots** pass:
+1,280 rows for each of four lane widths, with and without production prefetch,
+covering seeded inputs, positive sums, cancellation, exponent sweeps, tiny
+normal/subnormal values and sparse rows. The 16-lane composition also passes
+state-invariant checks through all three brain dispatch routes with native
+subgroups and their fallback; the inactive brain and pattern state remains
+byte-identical in every case.
+
+Long behavior checks use three brain seeds, one flat-world geometry,
+1,000 cycles, forced deaths and refreshes, with exact 13-buffer repeatability
+within both arms. The reported means average population totals across seeds:
+food eaten changes from 52.0 to 51.67, energy from 609.91 to 602.99, and summed
+prediction error from 0.381 to 0.616; alive and death counts match. Hazard
+entries and danger-path distance remain zero in this fixture, so these
+samples do not exercise hazard behavior. They demonstrate observable
+trajectory differences and **do not establish statistical behavioral
+equivalence**. A local dot error bound is not a bound on a nonlinear
+simulation's long-term state. Wider prediction therefore remains opt-in.
+
+Other reordered FP32 experiments remain test-only: 16×16 multi-workgroup
+dense tiles give 1.033× against cooperative/fused monolithic brain, while
+8×32 tiles regress to 0.866×. Replacing thirteen action/learning reductions
+with subgroup sums removes up to 65 workgroup barriers but measures only
+1.003×; its three-seed trajectories also diverge. Prefetching encoder-credit
+updates measures 1.019×/1.027× for four/eight items against dense-prefetch8,
+but fails cross-variant bitwise parity and is excluded from production.
+
+**For this 10-agent local benchmark, the best measured long whole-simulation
+result is now 2.419× with FP32 reassociation, or 2.199× with matching public
+hashes; 10× remains unachieved.**
+
+Final validation passes formatting and workspace Clippy with all targets and
+warnings denied, 82 normal brain-library tests, and all 284 sandbox tests with
+cooperative whitening, dense prefetch and the 16-lane predictor enabled; the
+118-test sandbox integration group completed in 549.72 seconds when serialized.
+The hardware diagnostics above were run explicitly in addition to these suites.

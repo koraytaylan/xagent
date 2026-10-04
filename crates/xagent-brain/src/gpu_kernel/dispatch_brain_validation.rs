@@ -1,11 +1,14 @@
-//! Hardware parity for combined-brain, split-serial and masked-dispatch paths.
-//! Each mode compares its own original-source schedule against both optional
-//! brain transforms, using the same restored state at death/refresh boundaries.
+//! Hardware checks for combined-brain, split-serial and masked-dispatch paths.
+//! Each mode compares its own original-source schedule against optional brain
+//! transforms at death/refresh boundaries. Four predictor lanes require exact
+//! state parity; sixteen lanes report FP32 drift without asserting equivalence.
 
 use std::error::Error;
 
 use super::cycle_profile::{assert_state_equal, capture_state, checkpoint, restore};
 use super::predictor_fusion::fuse_inline_predictor;
+use super::predictor_width::wider_predictor;
+use super::rounding_validation::{assert_inactive_agent_unchanged, compare_rounding_state};
 use super::whitening_validation::{
     force_death, prepare_boundary_scene, prepare_kernel, PARITY_CHUNKS, REFRESH_CYCLES,
 };
@@ -21,6 +24,10 @@ const EXPECTED_FORCED_DEATHS: f32 = 2.0;
 const STATE_BUFFERS: usize = 13;
 /// The masked public route runs physics, vision and standalone brain together.
 const COMPLETE_PHASE_MASK: u32 = 7;
+/// The production ordered predictor has four lanes per output row.
+const EXACT_PREDICTOR_LANES: u32 = 4;
+/// The rounding candidate uses sixteen lanes and a balanced final sum.
+const WIDE_PREDICTOR_LANES: u32 = 16;
 
 enum BrainEntry {
     Main,
@@ -83,9 +90,18 @@ fn shader_module(
         })
 }
 
-fn make_variants(kernel: &mut GpuKernel, has_subgroup: bool) -> (BrainPipelines, BrainPipelines) {
+fn make_variants(
+    kernel: &mut GpuKernel,
+    has_subgroup: bool,
+    predictor_lanes: u32,
+) -> (BrainPipelines, BrainPipelines) {
     let original_passes = include_str!("../shaders/kernel/brain_passes.wgsl");
     let candidate_passes = fuse_inline_predictor(&compose_brain_passes(true));
+    // Exercise the production prefetch factor through every brain entry point.
+    const PREFETCH_FACTOR: u32 = 8;
+    let candidate_passes =
+        super::dense_prefetch::prefetch_passes(&candidate_passes, PREFETCH_FACTOR);
+    let candidate_passes = wider_predictor(&candidate_passes, predictor_lanes);
     let original_main = shader_module(kernel, original_passes, BrainEntry::Main, has_subgroup);
     let original_combined =
         shader_module(kernel, original_passes, BrainEntry::Combined, has_subgroup);
@@ -189,6 +205,16 @@ fn advance(kernel: &mut GpuKernel, cycle: u32, cycles: u32, masked: bool) {
 #[test]
 #[ignore = "requires a GPU; run explicitly with --ignored --nocapture"]
 fn optional_brain_preserves_combined_and_split_dispatches() -> Result<(), Box<dyn Error>> {
+    check_dispatches(EXACT_PREDICTOR_LANES)
+}
+
+#[test]
+#[ignore = "requires a GPU; run explicitly with --ignored --nocapture"]
+fn wider_predictor_reports_rounding_across_dispatch_routes() -> Result<(), Box<dyn Error>> {
+    check_dispatches(WIDE_PREDICTOR_LANES)
+}
+
+fn check_dispatches(predictor_lanes: u32) -> Result<(), Box<dyn Error>> {
     let _vulkan = vulkan_gate::enter();
     let mut kernel = prepare_kernel();
     // Ensure the combined case actually dispatches brain_vision_tick even if
@@ -199,6 +225,7 @@ fn optional_brain_preserves_combined_and_split_dispatches() -> Result<(), Box<dy
         kernel.agent_count * (1 + rays.div_ceil(BRAIN_WORKGROUP_THREADS));
     prepare_boundary_scene(&kernel);
     let initial = checkpoint(&kernel);
+    let initial_state = capture_state(&kernel)?;
     let inactive_before = kernel.read_agent_state(INACTIVE_AGENT);
 
     let subgroup_modes = if kernel.has_subgroup {
@@ -207,7 +234,7 @@ fn optional_brain_preserves_combined_and_split_dispatches() -> Result<(), Box<dy
         vec![false]
     };
     for has_subgroup in subgroup_modes {
-        let (original, candidate) = make_variants(&mut kernel, has_subgroup);
+        let (original, candidate) = make_variants(&mut kernel, has_subgroup, predictor_lanes);
         for (label, mode, beside, masked) in [
             ("combined", BrainExecutionMode::FusedSerial, true, false),
             (
@@ -234,8 +261,18 @@ fn optional_brain_preserves_combined_and_split_dispatches() -> Result<(), Box<dy
             let mut cycle = 0;
             for cycles in PARITY_CHUNKS {
                 advance(&mut kernel, cycle, cycles, masked);
-                expected.push(capture_state(&kernel)?);
                 cycle += cycles;
+                let state = capture_state(&kernel)?;
+                assert_inactive_agent_unchanged(
+                    &kernel,
+                    &initial_state,
+                    &state,
+                    INACTIVE_AGENT,
+                    &format!(
+                        "dispatch_reference mode={label} subgroup={has_subgroup} cycles={cycle}"
+                    ),
+                );
+                expected.push(state);
             }
             assert!(kernel.read_full_state_blocking()[P_DEATH_COUNT] >= EXPECTED_FORCED_DEATHS);
 
@@ -244,15 +281,35 @@ fn optional_brain_preserves_combined_and_split_dispatches() -> Result<(), Box<dy
             cycle = 0;
             for (cycles, expected) in PARITY_CHUNKS.into_iter().zip(&expected) {
                 advance(&mut kernel, cycle, cycles, masked);
-                assert_state_equal(&kernel, expected, &capture_state(&kernel)?);
                 cycle += cycles;
+                let actual = capture_state(&kernel)?;
+                let checkpoint_label = format!(
+                    "dispatch_predictor_width mode={label} subgroup={has_subgroup} predictor_lanes={predictor_lanes} cycles={cycle}"
+                );
+                if predictor_lanes == EXACT_PREDICTOR_LANES {
+                    assert_state_equal(&kernel, expected, &actual);
+                } else {
+                    compare_rounding_state(&kernel, expected, &actual, &checkpoint_label);
+                }
+                assert_inactive_agent_unchanged(
+                    &kernel,
+                    &initial_state,
+                    &actual,
+                    INACTIVE_AGENT,
+                    &checkpoint_label,
+                );
             }
+            assert!(kernel.read_full_state_blocking()[P_DEATH_COUNT] >= EXPECTED_FORCED_DEATHS);
             let inactive_after = kernel.read_agent_state(INACTIVE_AGENT);
             assert_eq!(
                 bytemuck::cast_slice::<f32, u32>(&inactive_before.brain_state),
                 bytemuck::cast_slice::<f32, u32>(&inactive_after.brain_state),
             );
-            println!("BRAIN_DISPATCH_PARITY mode={label} subgroup={has_subgroup} cycles={cycle} exact_buffers={STATE_BUFFERS} original_source_oracle=true death_boundary=true");
+            if predictor_lanes == EXACT_PREDICTOR_LANES {
+                println!("BRAIN_DISPATCH_PARITY mode={label} subgroup={has_subgroup} cycles={cycle} exact_buffers={STATE_BUFFERS} original_source_oracle=true death_boundary=true");
+            } else {
+                println!("BRAIN_DISPATCH_ROUNDING mode={label} subgroup={has_subgroup} predictor_lanes={predictor_lanes} cycles={cycle} compared_buffers={STATE_BUFFERS} original_source_oracle=true inactive_brain_patterns_exact=true death_boundary=true equivalence=not_asserted");
+            }
         }
     }
     Ok(())

@@ -74,6 +74,8 @@ use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
 #[cfg(test)]
+mod balanced_dense_validation;
+#[cfg(test)]
 mod bounds_validation;
 #[cfg(test)]
 mod brain_allocation;
@@ -86,7 +88,10 @@ mod context_cache_validation;
 #[cfg(test)]
 mod cooperative_whitening_validation;
 #[cfg(test)]
+mod credit_prefetch_validation;
+#[cfg(test)]
 mod cycle_profile;
+mod dense_prefetch;
 #[cfg(test)]
 mod dense_prefetch_validation;
 #[cfg(test)]
@@ -99,13 +104,24 @@ mod exact_tiled_validation;
 mod persistent_validation;
 #[cfg(test)]
 mod pointwise_credit_validation;
+#[cfg(test)]
+mod predictor_dot_validation;
 mod predictor_fusion;
 #[cfg(test)]
 mod predictor_fusion_validation;
+mod predictor_width;
+#[cfg(test)]
+mod predictor_width_behavior_validation;
+#[cfg(test)]
+mod predictor_width_validation;
 #[cfg(test)]
 mod recall_norm_validation;
 #[cfg(test)]
 mod recall_validation;
+#[cfg(test)]
+mod rounding_validation;
+#[cfg(test)]
+mod subgroup_sum_validation;
 #[cfg(test)]
 mod vision_validation;
 #[cfg(test)]
@@ -1481,19 +1497,36 @@ impl GpuKernel {
         let common_src = include_str!("shaders/kernel/common.wgsl");
         let cooperative_whitening =
             std::env::var("XAGENT_BRAIN_COOPERATIVE_WHITENING").as_deref() == Ok("1");
-        let fused_predictor = std::env::var("XAGENT_BRAIN_FUSED_PREDICTOR").as_deref() == Ok("1");
+        let dense_prefetch = std::env::var("XAGENT_BRAIN_DENSE_PREFETCH").as_deref() == Ok("1");
+        let predictor_lanes = std::env::var("XAGENT_BRAIN_PREDICTOR_LANES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| predictor_width::LANE_WIDTHS.contains(value))
+            .unwrap_or(predictor_width::LANE_WIDTHS[0]);
+        let fused_predictor = dense_prefetch
+            || predictor_lanes != predictor_width::LANE_WIDTHS[0]
+            || std::env::var("XAGENT_BRAIN_FUSED_PREDICTOR").as_deref() == Ok("1");
         let brain_passes_src = compose_brain_passes(cooperative_whitening);
         let brain_passes_src = if fused_predictor {
             predictor_fusion::fuse_inline_predictor(&brain_passes_src)
         } else {
             brain_passes_src
         };
-        if cooperative_whitening || fused_predictor {
+        let brain_passes_src = if dense_prefetch {
+            // Eight independent items preserve each lane's ordered arithmetic.
+            const PREFETCH_FACTOR: u32 = 8;
+            dense_prefetch::prefetch_passes(&brain_passes_src, PREFETCH_FACTOR)
+        } else {
+            brain_passes_src
+        };
+        if cooperative_whitening || fused_predictor || dense_prefetch {
             log::info!(
                 "[GpuKernel] cooperative whitening and interleaved recall={cooperative_whitening}, \
-                 fused inline predictor={fused_predictor}"
+                 fused inline predictor={fused_predictor}, dense prefetch={dense_prefetch}, \
+                 predictor lanes={predictor_lanes}"
             );
         }
+        let brain_passes_src = predictor_width::wider_predictor(&brain_passes_src, predictor_lanes);
 
         // Physics pipeline: common + phase fragments + physics entry
         let physics_source = [

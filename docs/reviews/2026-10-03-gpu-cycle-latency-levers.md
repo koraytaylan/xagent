@@ -2069,3 +2069,196 @@ with warnings denied pass. Logs are `scheduling-accepted-brain-tests.log`,
 above. The rejected dual-sum prototype is excluded from these passing
 counts and from the committed source. The 10× whole-simulation goal remains
 unmet.
+
+### Same-WGSL CPU backend comparison
+
+The existing optimized example was also run through Mesa's CPU Vulkan
+implementation, preserving the complete WGSL simulation and its production
+128-thread main. `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json` and
+`LIBGL_ALWAYS_SOFTWARE=1` select this diagnostic; the logged adapter confirms
+`device_type: Cpu` and `backend: Vulkan`. Its minimum subgroup width is eight,
+so the existing portable shared-memory recall fallback is used. The normal
+GPU run uses its supported subgroup path; no production adapter selection or
+device-specific tuning was added.
+
+Three alternating pairs of the same optimized arm, ten agents, seed 42,
+8×6 raw vision, 100 warmup ticks and 10,000 timed ticks measure median
+**0.387712229 s on the GPU versus 0.834973237 s on the CPU**: the CPU backend
+is 2.154× slower on this host. Compilation and readback remain outside the
+interval, while simulation completion is included. Each backend repeats its
+own six public hashes exactly; cross-backend hashes differ and have not
+passed a numerical-accuracy gate. This is a local backend diagnostic, not
+evidence about other CPUs or GPUs or validation of interchangeable
+trajectories. The log is `lavapipe-main128-paired.log`.
+
+### Packed authority with timed publication boundaries
+
+A test-only candidate removes exactly the four scalar mirror stores from the
+canonical packed credit helper; private weight arithmetic and stores, the
+production main128 and dispatch recorder remain unchanged. The private
+matrix is compared with the reference before publication, then explicit
+buffer copies publish it and all thirteen public buffers must match.
+Checks pass for both raw layouts through death, refresh, inactive agents
+and two replays, on both the GPU and CPU Vulkan implementations.
+
+Five alternating pairs time 100 evolving cycles after 1,000 warmup cycles.
+Both arms use identical dispatch-call and completion boundaries; the
+candidate's extra export submissions and final completion are inside the
+timer. Cold import and state readback are outside both timers. Each export
+copies 1,367,040 bytes:
+
+| Export interval | GPU reference / candidate median | GPU speedup | CPU speedup |
+|---|---:|---:|---:|
+| Every cycle | 0.042525910 / 0.047459992 s | 0.896037× | 0.952956× |
+| Every 24 cycles | 0.036163839 / 0.035066540 s | 1.031292× | 1.013739× |
+| Final cycle only | 0.035368865 / 0.033975683 s | 1.041005× | 0.996829× |
+
+These small, boundary-dependent gains do not justify promoting this
+prototype without the public lifecycle work described above; frequent
+publication regresses on both tested backends. The test deliberately permits
+only restored/cold arm transitions, not host writes or scalar fallback while
+private authority is live. Logs are `authoritative-packed-gpu.log` and
+`authoritative_packed_validation-lavapipe.log`.
+
+### Cached coefficients for gathered context
+
+The production main128 gathers sixteen prediction dimensions per tile and
+recomputes the ordered similarity total and sixteen context coefficients for
+each output. Another test-only candidate calculates these once, retaining
+the original blend order, guard conditions and tanh. Seventeen released
+packed-encoder scratch words hold the values, with one additional barrier
+and no additional allocation or dispatch.
+
+Exact thirteen-buffer, private-mirror and two-replay checks pass for both
+raw layouts through death/refresh on both tested backends. An independent
+actual-helper probe compares all 128 outputs for ten fixtures, covering
+empty/partial/full recall, negative and zero totals, values immediately
+below/at/above the 1e-8 guard, zero coefficients and signed-zero inputs;
+all public buffers remain unchanged by the probe.
+
+Five alternating 100-cycle pairs after 1,000 warmup cycles measure
+**0.035623620/0.035024993 s, or 1.017091×**, on the GPU and **1.014766×**
+on the CPU backend, with completion and cold import included. It remains
+test-only because the measured whole-simulation gain is small. These
+separate backend comparisons establish within-backend candidate/reference
+parity, not cross-backend trajectory equality. Logs are
+`gathered-context-cache-gpu.log` and
+`gathered_context_cache_validation-lavapipe.log`.
+
+### Population and raw-field sensitivity
+
+The existing production configuration was compared with the example's
+unoptimized serial arm across additional workloads on the same GPU, using
+three alternating seeded pairs, 100 warmup ticks and 10,000 timed ticks:
+
+| Agents | Raw field | Serial median | Optimized median | Whole-simulation speedup |
+|---:|---|---:|---:|---:|
+| 1 | 8×6 | 0.249748728 s | 0.207184307 s | 1.205× |
+| 32 | 8×6 | 6.033873659 s | 2.176847922 s | 2.772× |
+| 33 | 8×6 | 6.231415203 s | 2.214188569 s | 2.814× |
+| 100 | 8×6 | 20.698095546 s | 7.526145591 s | 2.750× |
+| 10 | 12×8 | 1.898621979 s | 0.521320697 s | 3.642× |
+
+Each arm repeats its own six public hashes; cross-arm hashes differ under
+the FP32 option. These timings do not independently certify long-run
+trajectory equivalence or every private buffer. They show why the ten-agent
+3.887× result must not be extrapolated to every workload. Object-based
+vision and retained masks disable above 32 agents, while packed credit and
+main128 remain selected; there is no measured regression across that
+eligibility boundary. Logs are `main128-workload-<agents>-<width>x<height>.log`.
+
+The matrix deliberately stays below 256 agents: the current global
+agent-grid, collision and trail phases assign one agent per invocation in a
+single 256-thread group. The sandbox's existing 400/1,000-agent sweep rows
+therefore cannot establish complete-population simulation performance until
+that separate coverage limit is addressed. Default cortex dimensions fit
+the production shared-memory guard, but the available cortex checks remain
+short correctness fixtures rather than this seeded timing comparison.
+
+### One workgroup per agent for updated visual projections
+
+A third test-only candidate combines encoder credit and the next predicted
+visual projection in one 256-thread workgroup per agent, using 128 arithmetic
+owners. Each owner updates its original vec4 weight with the canonical
+thresholds, FP32 arithmetic, clamp, unchanged-store suppression and scalar
+mirror, then accumulates that actual updated weight into its original
+stride-four visual sum. Lane zero starts with the original bias. Four sums
+per output are cached separately; the next main continues each with fresh
+nonvisual inputs before the original left-associated final reduction.
+Bitwise equality of every visual input and the death generation gate reuse;
+all other cases execute the original packed encoder.
+
+This reduces global workgroups from 341/431 to eleven for the two raw
+layouts, without adding a dispatch. Staging each predicted visual input once
+uses 960/1,264 bytes of shared memory, and the private cache grows by
+25,920 bytes for ten agents. Unconditional storage and workgroup barriers
+finish all old-feature reads before those features are replaced with their
+predicted values. Main shared memory is unchanged.
+
+The actual shader helpers pass **21,120 raw output checks per backend**
+against fresh-dot bits and the unchanged FP64-derived error bound, whose
+largest observed error ratio is 0.026388. Independent scalar credit and
+private/public matrix comparisons pass. Fixtures include cancellation,
+wide exponents, subnormals, update thresholds, clamps, unchanged components,
+poisoned partials, changed visual inputs, nonvisual-only changes, death,
+inactive agents and explicitly invalidated detached-cache resets. The
+nonvisual-only case requires both reuse and an observable output change,
+including the 315-feature visual boundary of the odd-sized field.
+
+Both backends also pass exact thirteen-buffer comparisons and repeatability
+through 100 cycles of both raw layouts, forced death/refresh and held visual
+inputs, plus exact checks of the published predicted inputs. These are
+test-managed cache transitions; no production lifecycle integration is
+claimed. Five alternating 100-cycle pairs after 1,000 warmup cycles give:
+
+| Backend | Reference / candidate median | Whole-simulation speedup | Reuse hits / misses |
+|---|---:|---:|---:|
+| GPU | 0.036103516 / 0.035917099 s | 1.005190× | 842 / 158 |
+| CPU Vulkan | 0.079506603 / 0.088673932 s | 0.896618× | 921 / 79 |
+
+Completion, cold import and diagnostic raw-value publication are timed;
+readbacks are excluded. Reducing dispatch workgroups and a later matrix
+read therefore does not establish a useful overall gain for this candidate,
+which remains test-only. Logs are `agent-projection-raw.log`,
+`agent-projection-state.log`, `agent-projection-timing.log`,
+`agent-projection-raw-lavapipe.log` and
+`agent-projection-full-lavapipe.log`.
+
+### Remaining architectural limits and verification
+
+A possible smaller follow-up is a 128-thread version of the new global
+projection dispatch: all arithmetic owners already fit in 128 lanes, but
+both predicted-input copy strides and all six world-loop strides must also
+change, with an agent-count guard and grid-capacity checks. Longer world
+loops could offset any occupancy gain; it has not been implemented or timed.
+
+An algebraic recurrence could avoid more visual-matrix work, but FP32
+weight rounding, clamping and adaptation rounding leave dense residuals
+even when raw inputs are unchanged. Any delayed matrix representation must
+replay each original update and clamp chronologically when materialized;
+adding all pending increments and clamping once changes the result. A useful
+prototype needs a cheap conservative error bound and rebase condition that
+do not themselves traverse the dense matrix. The existing sixteen-cycle
+diagnostic envelope already consumes about 79.6% of its fresh-dot error
+budget before candidate GPU arithmetic, so observed cancellation is
+insufficient evidence. Predictor updates additionally contain a per-element
+gradient clamp, and their nonlinear next input lacks the visual recurrence.
+Even eliminating the approximate encoder and credit attribution entirely
+would suggest only about 1.33× additional whole-cycle gain on this profile;
+those separate attribution measurements are not additive exact costs.
+
+All **119 normal debug brain tests**, **nine focused GPU checks**, their
+**nine CPU Vulkan counterparts**, formatting and workspace Clippy across
+all targets with warnings denied pass. Logs for the normal checks are
+`projection-authority-brain-debug.log` and
+`projection-authority-clippy.log`; experiment logs are identified above.
+An earlier unfiltered release-unit run hit the pre-existing
+`zero_expected_panics_in_debug` test, which expects a debug assertion;
+the normal debug suite passes and the focused release checks all pass.
+
+This follow-up adds only test modules, test shader fragments and review
+documentation, with no production behavior or dependencies changed. The
+284-test serial sandbox result recorded in the preceding section covers
+the unchanged production code and was not repeated. None of the three
+candidates changes the 3.887× committed production headline, and the 10×
+whole-simulation goal remains unmet.

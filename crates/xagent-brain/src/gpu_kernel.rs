@@ -91,6 +91,12 @@ use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
 
 #[cfg(test)]
+mod agent_projection_dot_validation;
+#[cfg(test)]
+mod agent_projection_validation;
+#[cfg(test)]
+mod authoritative_packed_validation;
+#[cfg(test)]
 mod balanced_dense_validation;
 #[cfg(test)]
 mod bounds_validation;
@@ -146,6 +152,8 @@ mod four_dispatch_validation;
 mod fresh_projection_dot_validation;
 #[cfg(test)]
 mod fresh_projection_validation;
+#[cfg(test)]
+mod gathered_context_cache_validation;
 mod global_credit;
 #[cfg(test)]
 mod global_credit_production_validation;

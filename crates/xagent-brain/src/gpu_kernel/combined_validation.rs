@@ -116,6 +116,8 @@ fn make_serial_oracle(kernel: &GpuKernel) -> CyclePipelines {
 
 fn prepare_optimized_kernel(width: u32, height: u32) -> GpuKernel {
     let mut kernel = make_kernel(width, height, AGENTS, FOOD_ITEMS);
+    // This comparison swaps the retained main pipeline with an explicit oracle.
+    kernel.global_credit = None;
     kernel.set_execution_mode(BrainExecutionMode::FusedSerial);
     kernel.set_brain_beside_vision(false);
     kernel.probe.skip_global = false;

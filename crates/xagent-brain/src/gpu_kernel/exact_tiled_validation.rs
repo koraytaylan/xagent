@@ -60,7 +60,7 @@ fn requested_tile_outputs() -> TestResult<u32> {
     Ok(outputs)
 }
 
-fn make_transient_bind_group(
+pub(super) fn make_transient_bind_group(
     kernel: &GpuKernel,
     layout: &wgpu::BindGroupLayout,
     transient: &wgpu::Buffer,

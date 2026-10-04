@@ -187,6 +187,8 @@ fn make_pipelines(kernel: &GpuKernel, reduced: bool) -> KernelPipelines {
 }
 
 fn install_baseline(kernel: &mut GpuKernel) -> KernelPipelines {
+    // Both arms replace claim and main directly, including the tie fixture.
+    kernel.global_credit = None;
     let baseline = make_pipelines(kernel, false);
     let candidate = make_pipelines(kernel, true);
     kernel.kernel_claim_pipeline = baseline.claim;

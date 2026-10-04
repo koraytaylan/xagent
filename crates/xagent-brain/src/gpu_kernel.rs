@@ -33,6 +33,12 @@
 //! Whitening borrows existing learning scratch and adds no workgroup resource.
 //! `XAGENT_BRAIN_FUSED_PREDICTOR=1` fuses the inline predictor's update/read
 //! loops; the separately dispatched tiled predictor retains its own source.
+//! `XAGENT_BRAIN_GLOBAL_CREDIT=1` moves encoder-weight credit into independent
+//! workgroups beside the global update, using four dispatches per cycle.
+//! It uses a separate brain in fused serial mode with vision stride 1 and a
+//! complete brain/global cycle. Other modes, longer vision strides, partial
+//! brain probes, skipped global work and oversized dispatches retain the
+//! original schedule. Private feature storage preserves ordinary brain scratch.
 //!
 //! ## Pipeline-overridable constants
 //!
@@ -82,6 +88,10 @@ mod brain_allocation;
 #[cfg(test)]
 mod brain_sections;
 #[cfg(test)]
+mod brain_update_diagnostics;
+#[cfg(test)]
+mod cached_combined_validation;
+#[cfg(test)]
 mod combined_validation;
 #[cfg(test)]
 mod context_cache_validation;
@@ -100,6 +110,11 @@ mod detection_reduction_validation;
 mod dispatch_brain_validation;
 #[cfg(test)]
 mod exact_tiled_validation;
+mod global_credit;
+#[cfg(test)]
+mod global_credit_production_validation;
+#[cfg(test)]
+mod global_credit_validation;
 #[cfg(test)]
 mod persistent_validation;
 #[cfg(test)]
@@ -115,7 +130,11 @@ mod predictor_width_behavior_validation;
 #[cfg(test)]
 mod predictor_width_validation;
 #[cfg(test)]
+mod recall_cosine_validation;
+#[cfg(test)]
 mod recall_norm_validation;
+#[cfg(test)]
+mod recall_reuse_validation;
 #[cfg(test)]
 mod recall_validation;
 #[cfg(test)]
@@ -696,6 +715,9 @@ pub struct GpuKernel {
     /// cycle (see `record_kernel_cycle`).
     kernel_claim_pipeline: wgpu::ComputePipeline,
     global_pipeline: wgpu::ComputePipeline,
+    /// Optional fused-serial credit offload. Original pipelines and bind groups
+    /// remain available for every unsupported mode and diagnostic fallback.
+    global_credit: Option<global_credit::Pipelines>,
     vision_stride: u32,
     bind_groups: [wgpu::BindGroup; 2],
     active_config_index: usize,
@@ -2040,7 +2062,7 @@ impl GpuKernel {
             make_bind_group(&world_config_bufs[1], "kernel_tick_bg_1"),
         ];
 
-        Self {
+        let mut kernel = Self {
             device,
             queue,
             agent_count,
@@ -2075,6 +2097,7 @@ impl GpuKernel {
             kernel_pipeline,
             kernel_claim_pipeline,
             global_pipeline,
+            global_credit: None,
             vision_stride: brain_config.vision_stride,
             bind_groups,
             active_config_index: 0,
@@ -2120,7 +2143,12 @@ impl GpuKernel {
             probe_batches: 0,
             probe_submits: 0,
             vulkan_lock_tail: vulkan_gate::LockTail,
+        };
+        if std::env::var("XAGENT_BRAIN_GLOBAL_CREDIT").as_deref() == Ok("1") {
+            kernel.global_credit =
+                global_credit::Pipelines::new(&kernel, &brain_passes_src, &vision_overrides);
         }
+        kernel
     }
 
     /// Upload one-time world data: terrain, biomes, food positions.
@@ -2212,11 +2240,15 @@ impl GpuKernel {
     /// XAGENT_BRAIN_EXECUTION_MODE at construction.
     pub fn set_execution_mode(&mut self, mode: BrainExecutionMode) {
         self.execution_mode = mode;
+        if self.global_credit.is_some() && mode != BrainExecutionMode::FusedSerial {
+            log::info!("[GpuKernel] Global encoder credit is inactive outside fused serial mode; retaining the original schedule");
+        }
     }
 
     /// Override whether the fused path runs the brain beside the vision pass
     /// (tests + benches). Default is on unless XAGENT_BRAIN_BESIDE_VISION=0 at
-    /// construction; see `DispatchProbe::brain_beside_vision`.
+    /// construction; see `DispatchProbe::brain_beside_vision`. Active global
+    /// encoder credit uses a separate brain regardless of this preference.
     pub fn set_brain_beside_vision(&mut self, beside: bool) {
         self.probe.brain_beside_vision = beside;
     }
@@ -2517,13 +2549,35 @@ impl GpuKernel {
         cycle_tick: u64,
         pass_limit: u32,
     ) {
+        self.record_kernel_cycle_with_main(pass, cycle_tick, pass_limit, &self.kernel_pipeline);
+    }
+
+    fn record_kernel_cycle_with_main(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        cycle_tick: u64,
+        pass_limit: u32,
+        main: &wgpu::ComputePipeline,
+    ) {
         let push = [cycle_tick as u32, pass_limit];
         pass.set_pipeline(&self.kernel_claim_pipeline);
         pass.set_push_constants(0, bytemuck::cast_slice(&push));
         pass.dispatch_workgroups(self.agent_count, 1, 1);
-        pass.set_pipeline(&self.kernel_pipeline);
+        pass.set_pipeline(main);
         pass.set_push_constants(0, bytemuck::cast_slice(&push));
         pass.dispatch_workgroups(self.agent_count, 1, 1);
+    }
+
+    /// Credit consumes the features published by the complete main kernel in
+    /// the same cycle. Other schedules and deliberately incomplete probes keep
+    /// both the original main and global pipelines and their ordinary bindings.
+    fn global_credit_active(&self) -> bool {
+        const COMPLETE_BRAIN_PASSES: u32 = 7;
+        self.global_credit.is_some()
+            && self.execution_mode == BrainExecutionMode::FusedSerial
+            && self.vision_stride == 1
+            && !self.probe.skip_global
+            && self.probe.kernel_pass_limit == COMPLETE_BRAIN_PASSES
     }
 
     fn dispatch_ticks_fused_serial(&mut self, start_tick: u64, ticks_to_run: u32) -> bool {
@@ -2536,6 +2590,7 @@ impl GpuKernel {
         // and/or vision passes, independently, to isolate each pass's GPU cost.
         let skip_global = self.probe.skip_global;
         let skip_vision = self.probe.skip_vision;
+        let global_credit_active = self.global_credit_active();
         // The global pass samples every agent's position into the trail ring on
         // each kernel-batch boundary of the simulated tick count.
         let trail_interval = self.kernel_batch_size();
@@ -2546,6 +2601,7 @@ impl GpuKernel {
         // vision pass skipped (measurement only) the cycle keeps its serial
         // shape.
         let brain_beside_vision = self.probe.brain_beside_vision
+            && !global_credit_active
             && !self.standalone_vision_required
             && self.vision_stride == 1
             && !skip_vision;
@@ -2588,7 +2644,11 @@ impl GpuKernel {
                 // would hold.
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
-                    pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
+                    let credit = self.global_credit.as_ref().filter(|_| global_credit_active);
+                    let bind_groups =
+                        credit.map_or(&self.bind_groups, |pipelines| &pipelines.bind_groups);
+                    let main = credit.map_or(&self.kernel_pipeline, |pipelines| &pipelines.main);
+                    pass.set_bind_group(0, &bind_groups[self.active_config_index], &[]);
                     for _ in batch..chunk_end {
                         // Kernel: a claim and a main dispatch per brain cycle.
                         // SAFETY: dispatch(agent_count, 1, 1) — one workgroup
@@ -2618,16 +2678,25 @@ impl GpuKernel {
                         for cycle in 0..self.vision_stride {
                             let cycle_tick =
                                 tick_cursor + u64::from(cycle) * u64::from(self.brain_tick_stride);
-                            self.record_kernel_cycle(&mut pass, cycle_tick, kernel_pass_limit);
+                            self.record_kernel_cycle_with_main(
+                                &mut pass,
+                                cycle_tick,
+                                kernel_pass_limit,
+                                main,
+                            );
                         }
 
                         // Global pass: grid rebuild + collisions.
                         if !skip_global {
                             let tick_for_global = tick_cursor + full_ticks as u64;
                             let gpc: [u32; 2] = [tick_for_global as u32, trail_interval];
-                            pass.set_pipeline(&self.global_pipeline);
+                            let global =
+                                credit.map_or(&self.global_pipeline, |pipelines| &pipelines.global);
+                            let workgroups =
+                                credit.map_or(1, |pipelines| pipelines.global_workgroups);
+                            pass.set_pipeline(global);
                             pass.set_push_constants(0, bytemuck::cast_slice(&gpc));
-                            pass.dispatch_workgroups(1, 1, 1);
+                            pass.dispatch_workgroups(workgroups, 1, 1);
                         }
                         if brain_beside_vision {
                             // Brain and vision in one dispatch, then publish

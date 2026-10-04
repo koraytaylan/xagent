@@ -5,9 +5,9 @@
 **Base:** `33a7afaa` on `develop`
 **Trigger:** find ways to make the GPU computation several times faster without damaging accuracy.
 
-**Follow-up, 2026-10-04:** the [latest production experiments](#production-dense-prefetch-and-optional-wider-fp32-prediction)
-measure 2.419× whole-simulation acceleration with optional FP32 reassociation,
-or 2.199× with matching public hashes, for 10 agents on a Raphael integrated
+**Follow-up, 2026-10-04:** the [latest production experiments](#production-encoder-credit-beside-the-world-update)
+measure 2.692× whole-simulation acceleration with optional FP32 reassociation,
+or 2.437× with matching public hashes, for 10 agents on a Raphael integrated
 GPU; these are separate from the original M3 Max measurements below, and the
 requested 10× whole-simulation target remains unmet.
 
@@ -779,3 +779,184 @@ warnings denied, 82 normal brain-library tests, and all 284 sandbox tests with
 cooperative whitening, dense prefetch and the 16-lane predictor enabled; the
 118-test sandbox integration group completed in 549.72 seconds when serialized.
 The hardware diagnostics above were run explicitly in addition to these suites.
+
+### Profiling the composed candidate and reusing memory work
+
+The complete production configuration with prefetch8, predictor16, cooperative
+whitening, cached object queries, ordered parallel scent and registered agent
+masks measures 594.293 µs per cycle without timestamp instrumentation in the
+flat-world profiling fixture. Instrumented wall time is 618.430 µs, and the
+599.937 µs GPU timestamp sum divides into claim 34.190 µs (5.70%), main brain
+and physics 491.602 µs (81.94%), global update 33.523 µs (5.59%), and vision
+40.622 µs (6.77%). Timestamp replay matches all thirteen buffers.
+
+`brain_sections::benchmark_frozen_predictor_width_cycles` also isolates the
+earlier predictor-width benefit from evolving trajectories: each arm executes
+one cycle from identical restored state, with seven alternating timing pairs,
+prefetch8 in both arms, and serial vision in this fixture. After 256 warmup
+cycles, width4/width16 main time is 526.520/475.280 µs (1.108×), and the full
+cycle is 704.040/657.320 µs (1.071×); at the refresh checkpoint after cycle 260,
+main time is 862.000/800.880 µs (1.076×), and full-cycle time is
+1,044.520/982.920 µs (1.063×). Each arm's timestamp replay matches its own
+production dispatch state exactly; cross-arm rounding differences are
+reported separately. Serial vision here takes approximately 109 µs, so these
+full-cycle times are not the cached-vision profile above.
+
+With `XAGENT_SECTIONS_PREFETCH=1 XAGENT_SECTIONS_PREDICTOR_LANES=16`, cumulative
+section differences identify encoder credit plus context-weight adaptation
+at approximately 133–146 µs, recalled context plus tanh at 55–57 µs,
+predictor training plus dot products at 45–47 µs, and memory reinforcement
+at 34–36 µs. These are differences between guarded prefixes and include
+measurement noise; the full guarded path matches the unguarded thirteen
+buffers. The periodic whitening refresh adds approximately 349 µs in the
+measured refresh cycle.
+
+Two further architectures remain test-only:
+
+* `cached_combined_validation` overlaps cached object vision and ordered scent
+  with the optimized brain in one dispatch, aliasing scratch arrays whose
+  lifetimes do not overlap. The 8×6 and 9×7 cases use approximately 12.0–12.3 KiB
+  of workgroup memory without another workgroup resource slot. Through death
+  and refresh boundaries, all twelve persistent outputs match the standalone
+  reference; the combined path additionally publishes `sensory_next`, whose
+  standalone counterpart stays unchanged. Each candidate repetition matches
+  all thirteen buffers. Five alternating 100-cycle pairs yield
+  0.058544/0.057241 s, only **1.023×**.
+* `recall_reuse_validation` caches unsorted recall cosines in existing argmin
+  scratch for later reinforcement, since the query and pattern vectors remain
+  unchanged between these phases. Five rotated 100-cycle trials give
+  0.065467 s for the optimized reference, 0.062292 s for serial recall reuse
+  (**1.051×**), and 0.063523 s for a cooperative variant (**1.031×**). The latter
+  moves learning's original norm tree and two-lane dots into recall. Both
+  change FP32 association, pass state-invariant and inactive-agent checks
+  across 100 cycles including death/refresh, and repeat all thirteen buffers
+  exactly within each arm. These timings include evolving trajectories and
+  use the serial-vision fixture; they are not additional measured gains on
+  the long whole-simulation benchmark.
+
+None of these isolated ratios establishes a combined speedup or the 10× goal.
+
+The raw recall probe separately checks 2,560 pattern cases across both reuse
+variants against f64 dot/norm references and propagated FP32 error intervals.
+Cancellation, zero and inactive patterns, tiny norms, the 1e-8 norm guard, and
+the 0.3 reinforcement threshold are covered. Every case passes; no guard or
+reinforcement-threshold flips occurred in these fixtures. This validates local
+arithmetic, not statistical equivalence of long simulation trajectories.
+
+### Production encoder credit beside the world update
+
+Encoder credit only needs the adapted features and decision-credit vector
+already computed by the brain. Its weight writes have no consumer until the
+next brain cycle, while the global world update neither reads those weights
+nor changes alive flags. `XAGENT_BRAIN_GLOBAL_CREDIT=1` publishes the actual
+adapted features into a private buffer, replaces the inline credit loop with
+one-weight-per-invocation workgroups, and schedules them beside the existing
+global workgroup. No global spin barrier or additional dispatch is needed:
+the same dispatch boundary completes both branches before the next cycle.
+
+The default ten-agent, 267-feature case uses 1,341 workgroups for this combined
+dispatch, including the original world-update group. Feature publication is
+10,680 bytes per cycle. Each weight retains its original threshold, scale,
+multiply/add, and clamp. The option selects a separate brain in fused serial
+mode with vision stride 1; split/tiled/masked schedules, longer vision strides,
+partial-brain probes, skipped global work and excessive workgroup counts retain
+their original implementation. It selects no GPU vendor or device name and is
+disabled by default.
+
+The prototype's five alternating 100-cycle pairs measure
+0.058598/0.052343 s (**1.119×**) against the optimized cached-vision configuration,
+with all thirteen buffers identical. The production dispatch independently
+passes all-thirteen-buffer comparisons, repetition, death and refresh checks
+for 8×6, 9×7, 1×1, and cortex-enabled 8×6 fields through 100 cycles; six fallback
+routes also match their original schedules, including physics remainders.
+Warm lifecycle comparisons additionally cover split/tiled transitions and
+reactivation, full agent-state replacement, seeded reset with agent upload,
+and skipped vision. All thirteen buffers match after each stage, both with
+the option alone and with the full optimized configuration, while private
+feature storage is deliberately left unrestored.
+
+The option-alone cortex reference lost its RADV context twice during long
+multi-cycle submissions, before offloaded execution began. The driver marked
+the context innocent; kernel reset attribution was unavailable, so the cause
+is not established. Repeating all 100 cortex cycles with one cycle per
+submission passes exact state and repetition checks for both arms. The earlier
+optimized-brain cortex comparison also passed its larger submissions. The
+parity harness now uses bounded cortex submissions; this does **not** validate
+long bare-cortex submissions on this driver, and production scheduling has
+not been changed to work around that limitation.
+
+With prefetch8, predictor16, cooperative whitening and all the cached vision
+options, three alternating 10,000-tick whole-simulation pairs measure
+**1.472825/0.530179 s (2.778×)**, with exact per-arm hash repeatability. The
+100,000-tick pair measures **14.525987/5.396931 s (2.692×)**. All six candidate
+hashes in that long run match the earlier predictor16 configuration, so the
+new scheduling change adds no observed trajectory difference to that result.
+With the original four-lane predictor, a 100,000-tick pair measures
+**14.545071/5.969116 s (2.437×)** and matches all six original public hashes.
+Single-pair long runs do not independently establish repetition. These remain
+measurements of the ten-agent synthetic rolling-terrain scene on the local
+Raphael GPU; performance elsewhere is unmeasured, and **10× remains unmet**.
+
+```sh
+XAGENT_BRAIN_GLOBAL_CREDIT=1 XAGENT_BRAIN_COOPERATIVE_WHITENING=1 \
+XAGENT_BRAIN_DENSE_PREFETCH=1 XAGENT_BRAIN_PREDICTOR_LANES=16 \
+XAGENT_VISION_OBJECT_QUERIES=1 XAGENT_VISION_PARALLEL_SCENT=1 \
+XAGENT_VISION_AGENT_MASKS=1 \
+cargo run --release -p xagent-brain --example vision_performance -- \
+  --ticks 100000 --repeats 1 --precision fp32
+```
+
+Omit the predictor-lane option and `--precision fp32` for the hash-matching
+configuration. The benchmark's serial child explicitly disables global credit
+along with the other optional transforms.
+
+The updated flat-world profile measures 531.914 µs uninstrumented wall time
+and 538.240 µs summed GPU stages per cycle: claim 34.200 µs (6.35%), main brain
+and physics 341.485 µs (63.44%), global world update plus encoder credit
+119.378 µs (22.18%), and vision 43.177 µs (8.02%). Timestamp replay matches all
+thirteen buffers. Moving credit reduces main-stage latency but moves work into
+the global stage; the measured complete-cycle gain includes both effects.
+
+Validation passes formatting, workspace Clippy with all targets and warnings
+denied, 83 normal brain-library tests, and all 284 sandbox tests with global
+credit, cooperative whitening, prefetch8 and predictor16 enabled; the sandbox
+integration group completed in 590.03 seconds when serialized. Focused GPU
+checks above ran in addition to those suites.
+
+### Dense-update observations without changing the shader
+
+Inline counters changed a few rounding results, so that instrumentation was
+discarded. `brain_update_diagnostics` instead captures the unmodified
+production pipeline's before/after state and requires exact thirteen-buffer
+replay for every observed cycle. Host-side diagnostic arithmetic bounds each
+observed update and classifies clamps as absent, definite, or unresolved; this
+analysis is outside production simulation execution.
+
+Across three brain seeds and sixteen-cycle windows after cycles 256 and 1,000,
+the 864 active-agent observations contain 28,593,831 attempted encoder updates.
+15,608,383 (**54.59%**) leave the weight bits unchanged, including 13,658,025
+whose update is definitely nonzero. The unchanged fraction grows from 21.98%
+in the earlier windows to **87.31%** in the later windows. The average active
+encoder-credit dimension count is 123.95/128, so the existing credit threshold
+skips only about 3.16% of dimensions. By contrast, only 761 of 14,155,776
+predictor updates (**0.00538%**) leave their weight bits unchanged.
+
+No gradient or weight clamp, nor unresolved clamp classification, occurs in
+these sampled updates; all sampled 1/8/16-cycle absolute-sum envelopes fit the
+clamp bounds. This does not prove that deferred updates preserve the computation:
+batching tiny nonzero updates can accumulate changes that per-tick FP32 rounding
+currently discards. Nor do individual unchanged weights establish that entire
+groups can be skipped cheaply. The windows contain no respawns and do not
+establish behavior in every world; an alternative representation still needs
+its own rounding proof, lifecycle checks, and measured benefit.
+
+A stricter snapshot-only gate compares the largest possible update for a
+feature with half the smallest adjacent-float gap among its 128 weights,
+considering both neighbors and only finite, normal, in-range weights. It
+certifies 46,001 of 230,688 feature rows, with zero observed false positives
+against all 128 resulting weight words. Those rows cover 6.38% of attempted
+updates in the earlier windows and 32.01% in the mature windows, or 19.17%
+overall—far less than the individual no-op rate. No GPU certificate cache is
+implemented or timed. Maintaining gap metadata, reducing the scale bounds,
+and invalidating cached bounds after host writes and alternate schedules would
+all cost work; these observations alone do not establish a speedup.

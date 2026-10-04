@@ -210,6 +210,8 @@ fn make_persistent_pipeline(kernel: &GpuKernel) -> wgpu::ComputePipeline {
 
 fn prepare_kernel(scene: u64) -> GpuKernel {
     let mut kernel = make_kernel(VISION_WIDTH, VISION_HEIGHT, AGENTS, FOOD_ITEMS);
+    // The persistent shader is compared with the retained inline schedule.
+    kernel.global_credit = None;
     assert_eq!(kernel.vision_stride, 1);
     kernel.set_execution_mode(BrainExecutionMode::FusedSerial);
     kernel.set_brain_beside_vision(false);

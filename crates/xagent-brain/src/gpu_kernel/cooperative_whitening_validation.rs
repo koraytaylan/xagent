@@ -155,6 +155,8 @@ fn cooperative_brain_preserves_cortex_and_odd_vision_layouts() -> TestResult {
             ..BrainConfig::default()
         };
         let mut kernel = GpuKernel::new(1, FOOD_COUNT, &brain, &WorldConfig::default());
+        // Each arm installs its own main shader; no alternate main may bypass it.
+        kernel.global_credit = None;
         kernel.set_execution_mode(BrainExecutionMode::FusedSerial);
         kernel.set_brain_beside_vision(false);
         kernel.reset_agents_seeded(&brain, SEED);

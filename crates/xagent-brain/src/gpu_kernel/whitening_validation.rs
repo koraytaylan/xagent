@@ -115,9 +115,12 @@ fn make_pipelines(kernel: &GpuKernel, interleaved_recall: bool) -> WhiteningPipe
 
 pub(super) fn prepare_kernel() -> GpuKernel {
     let mut kernel = make_kernel();
+    // These fixtures replace the main pipeline directly. An alternate global
+    // credit main must not bypass the shader being measured or compared.
+    kernel.global_credit = None;
     kernel.set_brain_beside_vision(false);
-    // Historical experiment baselines must remain the original serial brain
-    // even when the surrounding process opts into production brain variants.
+    // The reference remains the original serial brain even when the process
+    // opts into production brain transformations.
     kernel.kernel_pipeline = super::cooperative_whitening_validation::make_pipeline(&kernel, false);
     assert_eq!(kernel.vision_stride, 1);
     assert!(!kernel.layout.visual_cortex_enabled);

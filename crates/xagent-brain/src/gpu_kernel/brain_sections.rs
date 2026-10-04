@@ -2,11 +2,17 @@
 //! Runtime push-constant guards retain one compiled pipeline for all prefixes.
 //! Full execution must match all thirteen persistent buffers; partial prefixes
 //! each run one restored cycle and never become a later cycle's input.
+//! XAGENT_SECTIONS_PREFETCH and XAGENT_SECTIONS_PREDICTOR_LANES select the
+//! same production composition for warmup, guarded prefixes, and their control.
+//! A separate frozen-cycle comparison isolates width changes from trajectories.
 
 use std::error::Error;
 
 use super::cycle_profile::{assert_state_equal, capture_state, checkpoint, make_kernel, restore};
+use super::dense_prefetch::prefetch_passes;
 use super::predictor_fusion::fuse_inline_predictor;
+use super::predictor_width::{wider_predictor, LANE_WIDTHS};
+use super::rounding_validation::compare_rounding_state;
 use super::vision_validation::read_buffer;
 use super::*;
 
@@ -30,6 +36,50 @@ const ROUNDS: usize = 5;
 const QUERY_COUNT: u32 = 3;
 /// The report uses microseconds rather than raw nanoseconds.
 const NANOS_PER_MICRO: f64 = 1_000.0;
+/// Production prefetch loads eight independent terms before arithmetic.
+const PREFETCH_FACTOR: u32 = 8;
+/// The frozen comparison isolates the selected wider production predictor.
+const FROZEN_PREDICTOR_LANES: u32 = 16;
+/// An odd count permits medians while alternating which arm runs first.
+const FROZEN_ROUNDS: usize = 7;
+/// The serial cycle preserves these production dispatch boundaries.
+const CYCLE_STAGES: [&str; 4] = ["claim", "main", "global", "vision"];
+/// One timestamp before the first dispatch and one after each stage.
+const CYCLE_QUERY_COUNT: u32 = 5;
+
+#[derive(Clone, Copy)]
+struct BrainVariant {
+    prefetch: bool,
+    predictor_lanes: u32,
+}
+
+impl BrainVariant {
+    fn from_env() -> TestResult<Self> {
+        let prefetch = std::env::var("XAGENT_SECTIONS_PREFETCH").as_deref() == Ok("1");
+        let predictor_lanes = match std::env::var("XAGENT_SECTIONS_PREDICTOR_LANES") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => LANE_WIDTHS[0],
+            Err(error) => return Err(error.into()),
+        };
+        if !LANE_WIDTHS.contains(&predictor_lanes) {
+            return Err(format!("unsupported section predictor width {predictor_lanes}").into());
+        }
+        Ok(Self {
+            prefetch,
+            predictor_lanes,
+        })
+    }
+
+    fn passes(self) -> String {
+        let passes = fuse_inline_predictor(&compose_brain_passes(true));
+        let passes = if self.prefetch {
+            prefetch_passes(&passes, PREFETCH_FACTOR)
+        } else {
+            passes
+        };
+        wider_predictor(&passes, self.predictor_lanes)
+    }
+}
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -195,8 +245,8 @@ const BOUNDARIES: &[Boundary] = &[
     },
 ];
 
-fn sources(instrumented: bool) -> String {
-    let mut passes = fuse_inline_predictor(&compose_brain_passes(true));
+fn sources(instrumented: bool, variant: BrainVariant) -> String {
+    let mut passes = variant.passes();
     let mut inner = include_str!("../shaders/kernel/brain_inner.wgsl").to_owned();
     if instrumented {
         let limit = "let limit = kpc.pass_limit;";
@@ -233,20 +283,28 @@ fn sources(instrumented: bool) -> String {
     .join("\n")
 }
 
-fn pipeline(kernel: &GpuKernel, instrumented: bool) -> wgpu::ComputePipeline {
+fn pipeline(
+    kernel: &GpuKernel,
+    instrumented: bool,
+    variant: BrainVariant,
+) -> wgpu::ComputePipeline {
+    let label = format!(
+        "brain_section_guarded_{instrumented}_prefetch_{}_lanes_{}",
+        variant.prefetch, variant.predictor_lanes,
+    );
     let module = kernel
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("brain_section_prefixes"),
+            label: Some(&label),
             source: wgpu::ShaderSource::Wgsl(
-                apply_subgroup_markers(&sources(instrumented), kernel.has_subgroup).into(),
+                apply_subgroup_markers(&sources(instrumented, variant), kernel.has_subgroup).into(),
             ),
         });
     let bind = kernel.kernel_pipeline.get_bind_group_layout(0);
     let layout = kernel
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("brain_section_prefixes"),
+            label: Some(&label),
             bind_group_layouts: &[&bind],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
@@ -257,11 +315,7 @@ fn pipeline(kernel: &GpuKernel, instrumented: bool) -> wgpu::ComputePipeline {
     kernel
         .device
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(if instrumented {
-                "brain_section_guarded"
-            } else {
-                "brain_section_reference"
-            }),
+            label: Some(&label),
             layout: Some(&layout),
             module: &module,
             entry_point: Some("kernel_tick"),
@@ -276,23 +330,45 @@ fn pipeline(kernel: &GpuKernel, instrumented: bool) -> wgpu::ComputePipeline {
 struct Timer {
     queries: wgpu::QuerySet,
     results: wgpu::Buffer,
+    query_count: u32,
 }
 
 impl Timer {
     fn new(kernel: &GpuKernel) -> Self {
+        Self::with_query_count(kernel, QUERY_COUNT)
+    }
+
+    fn with_query_count(kernel: &GpuKernel, query_count: u32) -> Self {
         Self {
             queries: kernel.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("brain_section_timestamps"),
                 ty: wgpu::QueryType::Timestamp,
-                count: QUERY_COUNT,
+                count: query_count,
             }),
             results: kernel.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brain_section_timestamp_results"),
-                size: u64::from(QUERY_COUNT) * u64::from(wgpu::QUERY_SIZE),
+                size: u64::from(query_count) * u64::from(wgpu::QUERY_SIZE),
                 usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::QUERY_RESOLVE,
                 mapped_at_creation: false,
             }),
+            query_count,
         }
+    }
+
+    fn finish(
+        &self,
+        kernel: &GpuKernel,
+        mut encoder: wgpu::CommandEncoder,
+    ) -> TestResult<Vec<f64>> {
+        encoder.resolve_query_set(&self.queries, 0..self.query_count, &self.results, 0);
+        kernel.queue.submit([encoder.finish()]);
+        let bytes = read_buffer(kernel, &self.results, self.results.size())?;
+        let timestamps: &[u64] = bytemuck::cast_slice(&bytes);
+        assert!(timestamps.windows(2).all(|pair| pair[1] >= pair[0]));
+        Ok(timestamps
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]) as f64 * f64::from(kernel.queue.get_timestamp_period()))
+            .collect())
     }
 
     fn measure(&self, kernel: &mut GpuKernel, tick: u32, limit: u32) -> TestResult<f64> {
@@ -316,12 +392,42 @@ impl Timer {
             pass.dispatch_workgroups(kernel.agent_count, 1, 1);
             pass.write_timestamp(&self.queries, QUERY_COUNT - 1);
         }
-        encoder.resolve_query_set(&self.queries, 0..QUERY_COUNT, &self.results, 0);
-        kernel.queue.submit([encoder.finish()]);
-        let bytes = read_buffer(kernel, &self.results, self.results.size())?;
-        let timestamps: &[u64] = bytemuck::cast_slice(&bytes);
-        assert!(timestamps.windows(2).all(|pair| pair[1] >= pair[0]));
-        Ok((timestamps[2] - timestamps[1]) as f64 * f64::from(kernel.queue.get_timestamp_period()))
+        Ok(self.finish(kernel, encoder)?[1])
+    }
+
+    fn measure_cycle(
+        &self,
+        kernel: &mut GpuKernel,
+        tick: u32,
+    ) -> TestResult<[f64; CYCLE_STAGES.len()]> {
+        assert_eq!(self.query_count, CYCLE_QUERY_COUNT);
+        assert_eq!(kernel.vision_stride, 1);
+        let batch_ticks = kernel.kernel_batch_size();
+        kernel.upload_world_config_with_cycles(u64::from(tick), batch_ticks, PHASE_MASK, 1);
+        let mut encoder = kernel.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_bind_group(0, &kernel.bind_groups[kernel.active_config_index], &[]);
+            pass.write_timestamp(&self.queries, 0);
+            pass.set_pipeline(&kernel.kernel_claim_pipeline);
+            pass.set_push_constants(0, bytemuck::cast_slice(&[tick, COMPLETE_BRAIN]));
+            pass.dispatch_workgroups(kernel.agent_count, 1, 1);
+            pass.write_timestamp(&self.queries, 1);
+            pass.set_pipeline(&kernel.kernel_pipeline);
+            pass.set_push_constants(0, bytemuck::cast_slice(&[tick, COMPLETE_BRAIN]));
+            pass.dispatch_workgroups(kernel.agent_count, 1, 1);
+            pass.write_timestamp(&self.queries, 2);
+            pass.set_pipeline(&kernel.global_pipeline);
+            pass.set_push_constants(0, bytemuck::cast_slice(&[tick + batch_ticks, batch_ticks]));
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.write_timestamp(&self.queries, 3);
+            pass.set_pipeline(&kernel.vision_pipeline);
+            pass.dispatch_workgroups(kernel.vision_workgroups, 1, 1);
+            pass.write_timestamp(&self.queries, CYCLE_QUERY_COUNT - 1);
+        }
+        let intervals = self.finish(kernel, encoder)?;
+        kernel.active_config_index = 1 - kernel.active_config_index;
+        Ok(intervals.try_into().unwrap())
     }
 }
 
@@ -341,6 +447,7 @@ fn profile_checkpoint(
     guarded: &wgpu::ComputePipeline,
     tick: u32,
     scene: &str,
+    variant: BrainVariant,
 ) -> TestResult {
     let initial = checkpoint(kernel);
     kernel.kernel_pipeline = reference.clone();
@@ -384,9 +491,9 @@ fn profile_checkpoint(
         let nanos = median(samples);
         let is_start = previous_pass != boundary.pass;
         let delta = if is_start { 0.0 } else { nanos - previous };
-        println!("BRAIN_SECTION scene={scene} pass={} completed={} stop={} main_prefix_us={:.3} consecutive_delta_us={:.3} start_boundary={is_start} restored_single_cycle=true measurement_only=true", boundary.pass, boundary.completed, boundary.stop, nanos / NANOS_PER_MICRO, delta / NANOS_PER_MICRO);
+        println!("BRAIN_SECTION scene={scene} prefetch={} predictor_lanes={} pass={} completed={} stop={} main_prefix_us={:.3} consecutive_delta_us={:.3} start_boundary={is_start} restored_single_cycle=true measurement_only=true", variant.prefetch, variant.predictor_lanes, boundary.pass, boundary.completed, boundary.stop, nanos / NANOS_PER_MICRO, delta / NANOS_PER_MICRO);
         if boundary.pass == COMPLETE_BRAIN && boundary.stop == 0 {
-            println!("BRAIN_SECTION_CONTROL scene={scene} reference_full_us={:.3} guarded_full_us={:.3} guarded_over_reference={:.4} full_all13_equal=true rounds={ROUNDS}", reference_nanos / NANOS_PER_MICRO, nanos / NANOS_PER_MICRO, nanos / reference_nanos);
+            println!("BRAIN_SECTION_CONTROL scene={scene} prefetch={} predictor_lanes={} reference_full_us={:.3} guarded_full_us={:.3} guarded_over_reference={:.4} full_all13_equal=true rounds={ROUNDS}", variant.prefetch, variant.predictor_lanes, reference_nanos / NANOS_PER_MICRO, nanos / NANOS_PER_MICRO, nanos / reference_nanos);
         }
         previous = nanos;
         previous_pass = boundary.pass;
@@ -399,19 +506,132 @@ fn profile_checkpoint(
 fn profile_optimized_brain_sections() -> TestResult {
     let _vulkan = vulkan_gate::enter();
     let mut kernel = make_kernel();
+    // Prefix and complete-cycle arms must execute their selected main shader.
+    kernel.global_credit = None;
     kernel.set_brain_beside_vision(false);
     assert!(kernel
         .device
         .features()
         .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES));
-    let reference = pipeline(&kernel, false);
-    let guarded = pipeline(&kernel, true);
+    let variant = BrainVariant::from_env()?;
+    let reference = pipeline(&kernel, false, variant);
+    let guarded = pipeline(&kernel, true, variant);
     kernel.kernel_pipeline = reference.clone();
     advance(&mut kernel, 0, WARMUP_CYCLES);
     let mut tick = WARMUP_CYCLES * kernel.brain_tick_stride;
-    profile_checkpoint(&mut kernel, &reference, &guarded, tick, "after_256_cycles")?;
+    profile_checkpoint(
+        &mut kernel,
+        &reference,
+        &guarded,
+        tick,
+        "after_256_cycles",
+        variant,
+    )?;
     advance(&mut kernel, tick, REFRESH_ADVANCE);
     tick += REFRESH_ADVANCE * kernel.brain_tick_stride;
-    profile_checkpoint(&mut kernel, &reference, &guarded, tick, "after_260_cycles")?;
+    profile_checkpoint(
+        &mut kernel,
+        &reference,
+        &guarded,
+        tick,
+        "after_260_cycles",
+        variant,
+    )?;
+    Ok(())
+}
+
+fn benchmark_frozen_checkpoint(
+    kernel: &mut GpuKernel,
+    pipelines: &[wgpu::ComputePipeline; 2],
+    tick: u32,
+    scene: &str,
+) -> TestResult {
+    let initial = checkpoint(kernel);
+    let mut expected = Vec::with_capacity(pipelines.len());
+    for pipeline in pipelines {
+        restore(kernel, &initial);
+        kernel.kernel_pipeline = pipeline.clone();
+        advance(kernel, tick, 1);
+        expected.push(capture_state(kernel)?);
+    }
+    compare_rounding_state(
+        kernel,
+        &expected[0],
+        &expected[1],
+        &format!("frozen_predictor/{scene}"),
+    );
+    let timer = Timer::with_query_count(kernel, CYCLE_QUERY_COUNT);
+    // Validate timestamp recording against each arm's real dispatch_ticks
+    // result, and warm both timed paths before collecting their measurements.
+    for (arm, pipeline) in pipelines.iter().enumerate() {
+        restore(kernel, &initial);
+        kernel.kernel_pipeline = pipeline.clone();
+        timer.measure_cycle(kernel, tick)?;
+        assert_state_equal(kernel, &expected[arm], &capture_state(kernel)?);
+    }
+    let mut samples: [Vec<[f64; CYCLE_STAGES.len()]>; 2] = std::array::from_fn(|_| Vec::new());
+    for round in 0..FROZEN_ROUNDS {
+        for offset in 0..pipelines.len() {
+            let arm = (round + offset) % pipelines.len();
+            restore(kernel, &initial);
+            kernel.kernel_pipeline = pipelines[arm].clone();
+            samples[arm].push(timer.measure_cycle(kernel, tick)?);
+        }
+    }
+    restore(kernel, &initial);
+    kernel.kernel_pipeline = pipelines[0].clone();
+    for (stage, name) in CYCLE_STAGES.iter().enumerate() {
+        let medians = samples.each_ref().map(|samples| {
+            median(
+                &mut samples
+                    .iter()
+                    .map(|sample| sample[stage])
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert!(medians.iter().all(|&nanos| nanos > 0.0));
+        println!("FROZEN_PREDICTOR_STAGE scene={scene} stage={name} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} identical_start=true", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1]);
+    }
+    let medians = samples.each_ref().map(|samples| {
+        median(
+            &mut samples
+                .iter()
+                .map(|sample| sample.iter().sum())
+                .collect::<Vec<f64>>(),
+        )
+    });
+    println!("FROZEN_PREDICTOR_CYCLE scene={scene} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} restore_and_readback_excluded=true each_arm_timestamp_all13_equal=true warmup_lanes={}", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1], LANE_WIDTHS[0]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "frozen-input GPU timestamps; run in release mode with --ignored --nocapture"]
+fn benchmark_frozen_predictor_width_cycles() -> TestResult {
+    let _vulkan = vulkan_gate::enter();
+    let mut kernel = make_kernel();
+    // Each frozen arm selects its own main, including the matching warmup.
+    kernel.global_credit = None;
+    kernel.set_brain_beside_vision(false);
+    assert!(kernel
+        .device
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES));
+    let pipelines = [LANE_WIDTHS[0], FROZEN_PREDICTOR_LANES].map(|predictor_lanes| {
+        pipeline(
+            &kernel,
+            false,
+            BrainVariant {
+                prefetch: true,
+                predictor_lanes,
+            },
+        )
+    });
+    kernel.kernel_pipeline = pipelines[0].clone();
+    advance(&mut kernel, 0, WARMUP_CYCLES);
+    let mut tick = WARMUP_CYCLES * kernel.brain_tick_stride;
+    benchmark_frozen_checkpoint(&mut kernel, &pipelines, tick, "after_256_cycles")?;
+    advance(&mut kernel, tick, REFRESH_ADVANCE);
+    tick += REFRESH_ADVANCE * kernel.brain_tick_stride;
+    benchmark_frozen_checkpoint(&mut kernel, &pipelines, tick, "after_260_cycles")?;
     Ok(())
 }

@@ -222,12 +222,23 @@ fn record_cycle(
     let mut query = first_query;
     pass.write_timestamp(queries, query);
     pass.set_pipeline(&kernel.kernel_claim_pipeline);
+    pass.set_bind_group(0, &kernel.bind_groups[kernel.active_config_index], &[]);
     pass.set_push_constants(0, bytemuck::cast_slice(&kernel_push));
     pass.dispatch_workgroups(kernel.agent_count, 1, 1);
     query += 1;
     pass.write_timestamp(queries, query);
 
-    pass.set_pipeline(&kernel.kernel_pipeline);
+    let credit = kernel
+        .global_credit
+        .as_ref()
+        .filter(|_| kernel.global_credit_active());
+    if let Some(credit) = credit {
+        assert!(!combined);
+        pass.set_pipeline(&credit.main);
+        pass.set_bind_group(0, &credit.bind_groups[kernel.active_config_index], &[]);
+    } else {
+        pass.set_pipeline(&kernel.kernel_pipeline);
+    }
     pass.set_push_constants(0, bytemuck::cast_slice(&kernel_push));
     pass.dispatch_workgroups(kernel.agent_count, 1, 1);
     query += 1;
@@ -235,11 +246,12 @@ fn record_cycle(
 
     let batch_ticks = kernel.kernel_batch_size();
     let global_push = [u32::try_from(tick + u64::from(batch_ticks))?, batch_ticks];
-    pass.set_pipeline(&kernel.global_pipeline);
+    pass.set_pipeline(credit.map_or(&kernel.global_pipeline, |credit| &credit.global));
     pass.set_push_constants(0, bytemuck::cast_slice(&global_push));
-    pass.dispatch_workgroups(1, 1, 1);
+    pass.dispatch_workgroups(credit.map_or(1, |credit| credit.global_workgroups), 1, 1);
     query += 1;
     pass.write_timestamp(queries, query);
+    pass.set_bind_group(0, &kernel.bind_groups[kernel.active_config_index], &[]);
 
     if combined {
         let brain_push = [u32::try_from(tick)?, COMPLETE_BRAIN];
@@ -339,7 +351,8 @@ fn median(values: &mut [f64]) -> f64 {
 
 fn profile_shape(mut kernel: GpuKernel, beside_requested: bool) -> ProfileResult {
     kernel.set_brain_beside_vision(beside_requested);
-    let combined = beside_requested && !kernel.standalone_vision_required;
+    let combined =
+        beside_requested && !kernel.standalone_vision_required && !kernel.global_credit_active();
     let stages = if combined {
         &COMBINED_STAGES[..]
     } else {
@@ -501,6 +514,9 @@ fn profile_brain_pass_cumulative_costs() -> ProfileResult {
         "learn_and_store",
     ];
     let mut kernel = make_kernel();
+    // This diagnostic measures prefixes of the retained inline main shader.
+    // The separate production-cycle profiler keeps the configured offload.
+    kernel.global_credit = None;
     kernel.set_brain_beside_vision(false);
     assert!(
         kernel
@@ -690,6 +706,8 @@ fn coalesced_brain_matches_output_major_reference_all_state() -> ProfileResult {
             };
             let agents = if cortex { 1 } else { PROFILE_AGENTS };
             let mut kernel = GpuKernel::new(agents, PROFILE_FOOD, &brain, &WorldConfig::default());
+            // This comparison swaps the inline main's encoder layout directly.
+            kernel.global_credit = None;
             kernel.set_execution_mode(BrainExecutionMode::FusedSerial);
             kernel.set_brain_beside_vision(false);
             kernel.probe.kernel_pass_limit = COMPLETE_BRAIN;

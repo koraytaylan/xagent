@@ -1711,3 +1711,40 @@ Each seed accepted 15–19 generations, but most were later abandoned: after fiv
 - **After generation 3, a lasting champion arrives only every 15–40 generations.** Most generations fail against their parent (60–64 of 79 per seed), and most accepted ones lead nowhere: their children all fail, so the step was probably a lucky evaluation.
 - **Seeds 5 and 8 evolve avoidance as the champion-only lineage did before:** deaths fall by about 75% and the share of the path on hazard ground halves. Seed 7 gets there more slowly. Seed 6's line gained one lasting champion after generation 3 (at 35), and its deaths barely fall.
 - **The pooled numbers trail the earlier champion-only lineage** (0.57 deaths per agent and 0.246 fitness by generations 70–79). That run used other random streams and an earlier kernel, and its seed 6 did well where this one stalls. Single lineages differ this much, so changes should be judged against this baseline seed by seed, not against earlier pooled numbers.
+
+## Judging a generation against its champion scored alongside it
+
+In the baseline, a generation was accepted when its mean fitness beat the spawn parent's stored mean by one pooled standard error. That stored mean was a single noisy score. After a lucky one, the parent's own children could not reach it: five failures in a row marked the parent exhausted, and the search backtracked to the grandparent and discarded the parent's champion. Of the 15–19 generations each seed accepted, 11 ended that way.
+
+Every generation already evaluates the champion unmutated in its first repeat group, in the same world as its mutants. The governor now accepts a generation when its best mutated group beats that champion group by one standard error of a group difference (from the pooled within-group variance). A root's first evaluation is still accepted, and a generation with no mutated group falls back to the parent's stored score.
+
+The variant measured alongside it also kept the champion when patience ran out, instead of backtracking. It made no difference by the end: pooled fitness over generations 60–78 was 0.252 against 0.254, two seeds each way. Only the comparison against the concurrent champion was landed.
+
+Same config and seeds as the baseline (80 generations, generations 0–78). Pooled per block of ten generations, fitness / deaths per agent / share of distance on hazard ground:
+
+| Generations | Baseline | Concurrent champion | Concurrent champion, keep on exhaustion |
+|---|---|---|---|
+| 0–9 | 0.137 / 3.31 / 16.0% | 0.137 / 3.29 / 16.5% | 0.137 / 3.29 / 16.5% |
+| 10–19 | 0.169 / 2.01 / 11.9% | 0.192 / 1.31 / 9.8% | 0.204 / 1.19 / 9.5% |
+| 20–29 | 0.155 / 2.25 / 12.8% | 0.179 / 1.44 / 10.0% | 0.225 / 0.81 / 8.0% |
+| 30–39 | 0.188 / 1.54 / 9.7% | 0.229 / 0.68 / 7.0% | 0.253 / 0.55 / 6.6% |
+| 40–49 | 0.183 / 1.55 / 9.5% | 0.232 / 0.51 / 6.0% | 0.255 / 0.48 / 6.3% |
+| 50–59 | 0.187 / 1.80 / 10.8% | 0.252 / 0.51 / 7.1% | 0.262 / 0.45 / 6.7% |
+| 60–69 | 0.201 / 1.60 / 10.6% | 0.262 / 0.42 / 6.7% | 0.250 / 0.60 / 7.3% |
+| 70–78 | 0.196 / 1.49 / 9.9% | 0.244 / 0.53 / 7.1% | 0.254 / 0.45 / 6.2% |
+
+Generations 60–78 per seed (5, 6, 7, 8):
+
+| | Baseline | Concurrent champion |
+|---|---|---|
+| Fitness | 0.245, 0.157, 0.158, 0.234 | 0.273, 0.249, 0.224, 0.269 |
+| Deaths per agent | 0.74, 2.90, 1.92, 0.65 | 0.45, 0.68, 0.56, 0.22 |
+| Meals per agent | 58.8, 53.1, 43.5, 54.4 | 64.1, 61.4, 51.2, 59.7 |
+| Share of distance on hazard ground | 7.2%, 15.6%, 11.2%, 7.1% | 7.6%, 8.3%, 6.0%, 5.6% |
+| Accepted generations (abandoned later) | 19 (11), 15 (11), 19 (11), 19 (11) | 29 (7), 40 (3), 25 (5), 27 (5) |
+| Best score | 0.281, 0.244, 0.226, 0.292 | 0.336, 0.301, 0.269, 0.307 |
+
+- **Every seed ends fitter and dies less.** Fitness over generations 60–78 rises by 11–59% and deaths fall by 39–77%. Seed 6, which stalled in the baseline, now does as well as the others.
+- **The gain comes early and holds.** By generations 10–19 the lineages are ahead (1.31 against 2.01 deaths per agent). They stay ahead in every later block.
+- **Accepted steps now stick.** Each seed accepts 25–40 generations and abandons 3–7 of them, against 11 of 15–19 before. The final champion's line is two and a half to nine times as long.
+- **Hazard avoidance keeps improving through evolution.** Deaths per agent reach about 0.5 by generation 40, which the baseline never reached in 80 generations.

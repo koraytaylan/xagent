@@ -1748,3 +1748,36 @@ Generations 60–78 per seed (5, 6, 7, 8):
 - **The gain comes early and holds.** By generations 10–19 the lineages are ahead (1.31 against 2.01 deaths per agent). They stay ahead in every later block.
 - **Accepted steps now stick.** Each seed accepts 25–40 generations and abandons 3–7 of them, against 11 of 15–19 before. The final champion's line is two and a half to nine times as long.
 - **Hazard avoidance keeps improving through evolution.** Deaths per agent reach about 0.5 by generation 40, which the baseline never reached in 80 generations.
+
+## How much of the evolved avoidance is learned within a life
+
+Each reference lineage's final champion (selection against the concurrent champion, generation 78) was replayed for one generation: 40,000 ticks, 10 agents all starting from the champion's birth brain and config, on its home world and on six worlds it never saw (seeds 101–106). Each replay ran in three arms. **Learning on** is the champion as evolved. **Steering frozen** holds the turn policy and the smell and visual pathways (the existing switch). **Policy frozen** also holds the forward weights, the forward bias and the encoder (a scratch switch, measurement only). In every arm the value head, predictor, memory and habituation keep adapting, but those reach the motor only through the frozen policy. A fresh birth brain, with learning on and with the policy frozen, ran on the same ten worlds for reference. Seeded runs repeat exactly, so the arms differ only in what learns.
+
+Champions, means per agent (home: 4 lineage-world pairs; unseen: 24):
+
+| | Learning on | Steering frozen | Policy frozen |
+|---|---|---|---|
+| Fitness, home / unseen | 0.244 / 0.257 | 0.239 / 0.256 | 0.250 / 0.253 |
+| Deaths, home / unseen | 0.57 / 0.50 | 0.53 / 0.48 | 0.48 / 0.47 |
+| Meals, home / unseen | 58.4 / 61.0 | 57.1 / 59.9 | 60.0 / 59.4 |
+| Share of distance on hazard ground, home / unseen | 7.4% / 7.1% | 7.2% / 6.7% | 6.8% / 6.9% |
+| Steps onto hazard ground, first → last quarter of the life | 5.7 → 6.3 | 5.6 → 5.8 | 5.7 → 5.5 |
+
+Paired over all 28 lineage-world pairs, learning on minus policy frozen: fitness +0.003 ± 0.005, deaths +0.04 ± 0.05, meals +1.1 ± 0.9, hazard share +0.24 ± 0.15 points.
+
+Fresh brain, 10 worlds:
+
+| | Learning on | Policy frozen |
+|---|---|---|
+| Fitness | 0.063 | 0.060 |
+| Deaths per agent | 6.68 | 7.86 |
+| Share of distance on hazard ground | 25.4% | 27.7% |
+| Steps onto hazard ground, first → last quarter | 17.6 → 15.3 | 17.3 → 17.6 |
+| Deaths, first → last quarter | 1.56 → 1.53 | 1.58 → 2.05 |
+
+Paired, learning on minus policy frozen: deaths −1.18 ± 0.15 (fewer in all 10 worlds), hazard share −2.3 ± 0.5 points (lower in all 10).
+
+- **The evolved avoidance is innate.** Freezing the whole policy for a life changes nothing measurable: deaths, meals, fitness and time on hazard ground stay within noise. If anything, learning lets a champion drift slightly onto hazard ground over its life (5.7 → 6.3 steps per quarter, against 5.7 → 5.5 frozen).
+- **It is not a memorised map.** The champions avoid hazard ground as well on six unseen worlds as at home (0.50 against 0.57 deaths per agent). Evolution always used one world per seed, yet what it found is general.
+- **The lifetime learner does learn avoidance from homeostatic decline, from a naive start.** A fresh brain with learning on dies 15% less than the same brain frozen, in every world. Its visits to hazard ground fall over the life (17.6 → 15.3 per quarter) while the frozen brain's stay flat and its deaths climb.
+- **But a life's lesson is small against what evolution stores.** Learning takes a fresh brain from 7.9 to 6.7 deaths per agent in one life; eighty generations reach 0.5. Once the inherited policy avoids hazards, the lifetime learner adds nothing more.

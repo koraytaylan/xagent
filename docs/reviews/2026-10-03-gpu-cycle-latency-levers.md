@@ -1863,9 +1863,9 @@ summed GPU stage medians:
 | Vision and other senses | 42.898 µs | 10.90% |
 
 The log is `main128-cycle-profile.log`. This short restored-state profile is
-distinct from the long throughput experiment. The older `brain_sections`
-helper still constructs a 256-thread pipeline explicitly, so its internal
-section timings above are not attribution of the new main.
+distinct from the long throughput experiment. The earlier internal section
+timings above used a 256-thread pipeline and are not attribution of the new
+main; the updated 128-thread section profile appears below.
 
 At unchanged costs for the other stages, their measured times sum to
 183.353 µs, above the roughly 150 µs cycle budget derived from the long-run
@@ -1877,12 +1877,9 @@ A source audit identifies a possible four-dispatch ordering: physics/claim;
 food settlement, danger and death prefix; brain alongside world; then vision
 alongside encoder credit. Brain reads the saved pre-collision position and
 physics fields disjoint from the world's position writes; vision reads FOV
-and smell genes disjoint from encoder weights. No candidate for this complete
-ordering is implemented or measured here. Keeping main128 would require a
-128-thread world implementation, with care around grid overflow ordering, and
-combining vision with credit would make every credit workgroup reserve about
-7.9 KB of vision scratch. That resource cost could erase overlap gains; this
-is a dependency-audited experiment direction, not a claimed speedup.
+and smell genes disjoint from encoder weights. The test-only implementation
+and measurements are recorded below; its combined vision/credit pipeline
+reserves about 7.9 KB of vision scratch in every credit workgroup.
 
 ### Verification of the 128-thread production option
 
@@ -1897,3 +1894,178 @@ are `main128-final-brain-debug.log`, `main128-clippy.log` and
 Only the guarded 128-thread main gains a production option in this follow-up;
 memory offload, grouped physics and cooperative visual-pathway updates remain
 test-only.
+
+### Physics-local state and packed-credit row batching
+
+Two further test-only candidates use the actual 128-thread production main
+as their reference, retaining its private encoder cache and production
+recorder. Five alternating pairs each time 100 complete cycles after 1,000
+warmup cycles, including cache import and GPU completion but excluding state
+readbacks:
+
+| Candidate | Reference / candidate median | Complete-cycle speedup |
+|---|---:|---:|
+| Function-local physics state across sub-ticks | 0.035875523 / 0.034510394 s | 1.039557× |
+| Two encoder-credit rows per invocation | 0.035574912 / 0.035798660 s | 0.993750× |
+| Four encoder-credit rows per invocation | 0.035598646 / 0.035957045 s | 0.990033× |
+| Eight encoder-credit rows per invocation | 0.035472460 / 0.036078502 s | 0.983202× |
+
+The physics candidate redirects the canonical per-tick field accesses into
+function storage, loads the referenced fields before the sub-tick loop, and
+publishes only fields the canonical function writes before the existing claim
+barriers. Initially inactive agents perform no writes; a death during the loop
+keeps the original alive gate and death tick. It adds no persistent cache,
+shared allocation or dispatch. Exact thirteen-buffer, inactive-agent and
+private-mirror checks pass for 8×6 and 9×7 raw fields, brain strides 1 and 10,
+100 cycles through death/refresh and two candidate replays. Keeping the
+expressions unchanged alone does not guarantee identical backend rounding;
+the strict comparisons establish parity on the tested GPU. The small timing
+gain is preliminary and has no long-run or other-device confirmation. Logs
+are `physics-cache-composition.log` and `physics-cache-validation.log`.
+
+Row batching retains each vec4 weight's update arithmetic, gates, clamps and
+private/public stores, but reuses its credit values across 2, 4 or 8 feature
+rows. The unchanged-store early return exits a single-row helper, so an
+unchanged first row cannot skip a later update. For ten agents with 267
+features, global workgroups fall from 341 to 171, 91 or 51 without changing
+shared storage or dispatch count. All three widths pass exact thirteen-buffer
+and private-mirror checks across both raw layouts, death/refresh and two
+replays; direct fixtures cover thresholds, clamps, inactive agents, partial
+tails, disabled vectors and an unchanged row followed by a changed row.
+Despite fewer workgroups, every measured width is slightly slower, so none
+is promoted. Logs are `packed-credit-batch-composition.log` and
+`packed-credit-batch-validation.log`.
+
+These independent comparisons are excluded from the 3.887× production
+headline and do not establish a combined speedup.
+
+### Smaller main and overlapped four-dispatch schedule
+
+The 64-thread main processes the original 128 logical owners in two halves,
+completing both halves of each independent block before its original
+barrier. Packed encoder and reinforcement scratch retain their complete
+logical ownership and arithmetic chains. Predictor and context tiles shrink,
+while reductions and recall tie breakers keep their original logical order.
+The candidate adds neither dispatches nor shared storage and explicitly
+rejects cortex layouts. CPU checks validate both subgroup and fallback
+compositions; GPU checks exercise the native subgroup path, not a forced
+fallback path.
+
+The four-dispatch candidate retains the original claim, then runs a separate
+food-settlement/danger/death prefix, brain alongside a 128-thread world
+update, and finally vision alongside packed encoder credit. Shared storage
+is 9,200 bytes for brain/world at 8×6 and 9,504 bytes at 9×7, and 7,872 bytes
+for vision/credit in both layouts. World loops retain their coverage and
+phase order with 128 threads. Untimed preflight checks both grid capacities
+after every cycle; parity is not claimed for overflowing grids. The custom
+reference recorder is independently compared with production, and both
+timed schedules use identical chunking and import behavior.
+
+Both candidates pass exact thirteen-buffer, private-mirror and inactive-agent
+comparisons for two raw layouts through 100 cycles, two forced deaths,
+refresh boundaries and two replays. Five alternating 100-cycle timing pairs
+after 1,000 warmup cycles, with GPU completion and cache import included,
+give:
+
+| Candidate | Reference / candidate median | Complete-cycle speedup |
+|---|---:|---:|
+| 64-thread main versus production128 | 0.035501955 / 0.042057227 s | 0.844134× |
+| Brain/world followed by vision/credit overlap | 0.035583398 / 0.034192100 s | 1.040691× |
+
+The smaller main is slower and remains test-only. The overlap gain is small
+and does not yet cover general populations, cortex, overflowing grids or
+production lifecycle transitions, so it also remains test-only. A second
+physics-cache comparison measures **0.035945073/0.034585835 s (1.039300×)**
+and passes stronger source-change and forced-death assertions. All six GPU
+checks in this batch pass; the log is
+`scheduling-candidates-gpu-validation.log`. No product of these ratios is
+reported as a measured combined result, and the production headline remains
+3.887×.
+
+### Section attribution of the actual 128-thread main
+
+`XAGENT_SECTIONS_MAIN_THREADS=128` now makes the section diagnostic use the
+production compact-main transformation for warmup, its unguarded control and
+its instrumented shader. It requires packed context and sixteen predictor
+lanes, rejects unsupported configurations before constructing a GPU kernel,
+and reports the actual width. The default and frozen predictor-width
+comparison retain 256 threads.
+
+Five restored single-cycle samples per prefix after 256 warmup cycles give
+the following consecutive prefix differences:
+
+| Section | Approximate GPU time |
+|---|---:|
+| Main before brain | 22.360 µs |
+| Encoder | 27.560 µs |
+| Recall scoring | 18.040 µs |
+| Predictor training and dot product | 34.400 µs |
+| Recall context and tanh | 28.520 µs |
+| Memory reinforcement | 20.960 µs |
+
+The complete unguarded main takes 198.080 µs and the guarded main 195.720 µs,
+with all thirteen buffers equal. At the scheduled-refresh checkpoint after
+260 cycles, they take 383.600 and 385.400 µs, again with all thirteen buffers
+equal. Prefix differences are diagnostic estimates rather than independent
+stage measurements; small negative differences at short sections expose
+their timing noise. Cache import happens before the timestamped main, and
+global store suppression remains off in this diagnostic, as before, without
+changing main arithmetic. The log is `main128-brain-sections.log`.
+
+### Rejected exact reuse of recall pattern loads
+
+A separate prototype computed recall's ascending dot and reinforcement's
+even/odd partial sums during one traversal, retaining those partials in
+released argmin scratch until reinforcement. It added no allocation or
+dispatch. The isolated probe passed bitwise cosine and active-partial
+comparisons plus 3,040 FP64 dot-error checks per raw layout, including active
+flags immediately below, at and above 0.5.
+
+The full-simulation gate nevertheless failed, including after restoring the
+canonical one-dimension-at-a-time recall loop. A diagnostic replayed each
+candidate cycle from the exact same baseline prefix and found the first
+difference at cycle three: nine prediction words for agent nine and their
+nine saved previous-prediction copies differed; the other eleven buffers
+matched. One reported prediction differed by about 2.98e-8. Source review
+found no intervening mutation of the cached inputs or omitted barrier, but
+compiler-dependent contraction remains a hypothesis, not an established
+cause. The isolated probe therefore does not certify the complete shader.
+
+No speedup or accepted precision result is reported for this candidate; it
+is excluded from the committed implementation. Its source and unchanged
+strict tests are preserved locally in the task cache for further numerical
+investigation. Logs are `recall-dual-sum-validation.log`,
+`recall-dual-sum-repair-validation.log` and
+`recall-dual-sum-first-difference.log`.
+
+### Audited next option: delayed publication of encoder weights
+
+The private packed encoder could become authoritative between public-state
+boundaries, removing the four scalar mirror stores from each updated vec4.
+This needs three explicit states: scalar-authoritative, synchronized and
+packed-dirty. Scalar fallback dispatches must export first; single-agent host
+writes must export all untouched dirty agents before submitting the incoming
+write and invalidating the cache. A successful full-population replacement
+may discard old packed state, while a failed `try_reset_agents` must preserve
+it. Full brain readbacks need an export before their staging copy in queue
+order, including request-time asynchronous snapshots; physics snapshots and
+telemetry fields outside the encoder matrix need no export.
+
+The old unmirrored experiment excluded boundary copies and used an older
+stack, so it establishes neither current end-to-end speed nor these lifecycle
+semantics. A new comparison must time final export completion and frequent
+snapshots as well as steady simulation. This remains a source-audited option,
+not an implemented production change or evidence of reaching 10×.
+
+### Verification of the scheduling experiments
+
+The accepted follow-up contains four test-only candidates and the updated
+main-width profiler, with no new production option. All 115 normal brain
+tests, nine focused release GPU checks, the section-profiler parity check,
+284 serial sandbox tests, formatting and workspace Clippy across all targets
+with warnings denied pass. Logs are `scheduling-accepted-brain-tests.log`,
+`scheduling-accepted-clippy.log` and
+`scheduling-candidates-sandbox-tests.log`, together with the GPU logs named
+above. The rejected dual-sum prototype is excluded from these passing
+counts and from the committed source. The 10× whole-simulation goal remains
+unmet.

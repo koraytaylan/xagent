@@ -6,6 +6,8 @@
 //! same production composition for warmup, guarded prefixes, and their control.
 //! XAGENT_SECTIONS_PACKED_CONTEXT selects packed encoder, gathered context and
 //! global credit; its private cache is imported before timestamped dispatches.
+//! XAGENT_SECTIONS_MAIN_THREADS=128 selects the production compact main and
+//! requires packed context with sixteen predictor lanes; the default is 256.
 //! A separate frozen-cycle comparison isolates width changes from trajectories.
 
 use std::error::Error;
@@ -51,12 +53,15 @@ const FROZEN_ROUNDS: usize = 7;
 const CYCLE_STAGES: [&str; 4] = ["claim", "main", "global", "vision"];
 /// One timestamp before the first dispatch and one after each stage.
 const CYCLE_QUERY_COUNT: u32 = 5;
+/// The default profile and frozen predictor comparison retain the full main.
+const DEFAULT_MAIN_THREADS: u32 = BRAIN_WORKGROUP_THREADS;
 
 #[derive(Clone, Copy)]
 struct BrainVariant {
     prefetch: bool,
     predictor_lanes: u32,
     packed_context: bool,
+    main_threads: u32,
 }
 
 impl BrainVariant {
@@ -67,14 +72,37 @@ impl BrainVariant {
             Err(std::env::VarError::NotPresent) => LANE_WIDTHS[0],
             Err(error) => return Err(error.into()),
         };
-        if !LANE_WIDTHS.contains(&predictor_lanes) {
-            return Err(format!("unsupported section predictor width {predictor_lanes}").into());
-        }
-        Ok(Self {
+        let main_threads = match std::env::var("XAGENT_SECTIONS_MAIN_THREADS") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => DEFAULT_MAIN_THREADS,
+            Err(error) => return Err(error.into()),
+        };
+        Self {
             prefetch,
             predictor_lanes,
             packed_context: std::env::var("XAGENT_SECTIONS_PACKED_CONTEXT").as_deref() == Ok("1"),
-        })
+            main_threads,
+        }
+        .validated()
+    }
+
+    fn validated(self) -> TestResult<Self> {
+        if !LANE_WIDTHS.contains(&self.predictor_lanes) {
+            return Err(format!(
+                "unsupported section predictor width {}",
+                self.predictor_lanes
+            )
+            .into());
+        }
+        if ![DEFAULT_MAIN_THREADS, main_width::MAIN_THREADS].contains(&self.main_threads) {
+            return Err(format!("unsupported section main width {}", self.main_threads).into());
+        }
+        if self.main_threads == main_width::MAIN_THREADS
+            && (!self.packed_context || self.predictor_lanes != FROZEN_PREDICTOR_LANES)
+        {
+            return Err("XAGENT_SECTIONS_MAIN_THREADS=128 requires XAGENT_SECTIONS_PACKED_CONTEXT=1 and XAGENT_SECTIONS_PREDICTOR_LANES=16".into());
+        }
+        Ok(self)
     }
 
     fn passes(self) -> String {
@@ -294,6 +322,7 @@ const BOUNDARIES: &[Boundary] = &[
 ];
 
 fn sources(kernel: &GpuKernel, instrumented: bool, variant: BrainVariant) -> String {
+    variant.validated().unwrap();
     let passes = variant.passes();
     let mut source = if variant.packed_context {
         let credit = kernel.global_credit.as_ref().unwrap();
@@ -311,6 +340,19 @@ fn sources(kernel: &GpuKernel, instrumented: bool, variant: BrainVariant) -> Str
             kernel.has_subgroup,
         )
     };
+    if variant.main_threads == main_width::MAIN_THREADS {
+        source = main_width::try_transform(&source)
+            .expect("validated section configuration must support the production 128-thread main");
+    }
+    assert_eq!(
+        source
+            .matches(&format!(
+                "@compute @workgroup_size({})\nfn kernel_tick(",
+                variant.main_threads
+            ))
+            .count(),
+        1
+    );
     if instrumented {
         let limit = "let limit = kpc.pass_limit;";
         assert_eq!(source.matches(limit).count(), 1);
@@ -353,8 +395,8 @@ fn pipeline(
     variant: BrainVariant,
 ) -> wgpu::ComputePipeline {
     let label = format!(
-        "brain_section_guarded_{instrumented}_prefetch_{}_lanes_{}",
-        variant.prefetch, variant.predictor_lanes,
+        "brain_section_guarded_{instrumented}_prefetch_{}_lanes_{}_main_{}",
+        variant.prefetch, variant.predictor_lanes, variant.main_threads,
     );
     let module = kernel
         .device
@@ -572,9 +614,9 @@ fn profile_checkpoint(
         };
         let is_start = index == 0;
         let delta = if is_start { 0.0 } else { nanos - previous };
-        println!("BRAIN_SECTION scene={scene} prefetch={} predictor_lanes={} packed_context={} pass={} completed={} stop={} main_prefix_us={:.3} consecutive_delta_us={:.3} start_boundary={is_start} restored_single_cycle=true measurement_only=true", variant.prefetch, variant.predictor_lanes, variant.packed_context, boundary.pass, completed, boundary.stop, nanos / NANOS_PER_MICRO, delta / NANOS_PER_MICRO);
+        println!("BRAIN_SECTION scene={scene} prefetch={} predictor_lanes={} packed_context={} main_threads={} pass={} completed={} stop={} main_prefix_us={:.3} consecutive_delta_us={:.3} start_boundary={is_start} restored_single_cycle=true measurement_only=true", variant.prefetch, variant.predictor_lanes, variant.packed_context, variant.main_threads, boundary.pass, completed, boundary.stop, nanos / NANOS_PER_MICRO, delta / NANOS_PER_MICRO);
         if boundary.pass == COMPLETE_BRAIN && boundary.stop == 0 {
-            println!("BRAIN_SECTION_CONTROL scene={scene} prefetch={} predictor_lanes={} packed_context={} reference_full_us={:.3} guarded_full_us={:.3} guarded_over_reference={:.4} full_all13_equal=true rounds={ROUNDS}", variant.prefetch, variant.predictor_lanes, variant.packed_context, reference_nanos / NANOS_PER_MICRO, nanos / NANOS_PER_MICRO, nanos / reference_nanos);
+            println!("BRAIN_SECTION_CONTROL scene={scene} prefetch={} predictor_lanes={} packed_context={} main_threads={} reference_full_us={:.3} guarded_full_us={:.3} guarded_over_reference={:.4} full_all13_equal=true rounds={ROUNDS}", variant.prefetch, variant.predictor_lanes, variant.packed_context, variant.main_threads, reference_nanos / NANOS_PER_MICRO, nanos / NANOS_PER_MICRO, nanos / reference_nanos);
         }
         previous = nanos;
     }
@@ -585,6 +627,7 @@ fn profile_checkpoint(
 #[ignore = "hardware section-prefix diagnostic; run in release mode with --ignored --nocapture"]
 fn profile_optimized_brain_sections() -> TestResult {
     let _vulkan = vulkan_gate::enter();
+    let variant = BrainVariant::from_env()?;
     let mut kernel = make_kernel();
     // Prefix and complete-cycle arms must execute their selected main shader.
     kernel.global_credit = None;
@@ -593,14 +636,26 @@ fn profile_optimized_brain_sections() -> TestResult {
         .device
         .features()
         .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES));
-    let variant = BrainVariant::from_env()?;
     if variant.packed_context {
-        kernel.global_credit = global_credit::Pipelines::new_packed(
-            &kernel,
-            &variant.passes(),
-            &control_constants(&kernel),
-        );
+        kernel.global_credit = if variant.main_threads == main_width::MAIN_THREADS {
+            global_credit::Pipelines::new_packed_with_main128(
+                &kernel,
+                &variant.passes(),
+                &control_constants(&kernel),
+                false,
+            )
+        } else {
+            global_credit::Pipelines::new_packed(
+                &kernel,
+                &variant.passes(),
+                &control_constants(&kernel),
+            )
+        };
         assert!(kernel.global_credit_active());
+        assert_eq!(
+            kernel.global_credit.as_ref().unwrap().main_threads,
+            variant.main_threads
+        );
         assert!(kernel
             .global_credit
             .as_ref()
@@ -684,7 +739,7 @@ fn benchmark_frozen_checkpoint(
             )
         });
         assert!(medians.iter().all(|&nanos| nanos > 0.0));
-        println!("FROZEN_PREDICTOR_STAGE scene={scene} stage={name} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} identical_start=true", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1]);
+        println!("FROZEN_PREDICTOR_STAGE scene={scene} stage={name} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} main_threads={DEFAULT_MAIN_THREADS} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} identical_start=true", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1]);
     }
     let medians = samples.each_ref().map(|samples| {
         median(
@@ -694,7 +749,7 @@ fn benchmark_frozen_checkpoint(
                 .collect::<Vec<f64>>(),
         )
     });
-    println!("FROZEN_PREDICTOR_CYCLE scene={scene} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} restore_and_readback_excluded=true each_arm_timestamp_all13_equal=true warmup_lanes={}", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1], LANE_WIDTHS[0]);
+    println!("FROZEN_PREDICTOR_CYCLE scene={scene} prefetch=true baseline_lanes={} candidate_lanes={FROZEN_PREDICTOR_LANES} main_threads={DEFAULT_MAIN_THREADS} baseline_us={:.3} candidate_us={:.3} speedup={:.4} rounds={FROZEN_ROUNDS} restore_and_readback_excluded=true each_arm_timestamp_all13_equal=true warmup_lanes={}", LANE_WIDTHS[0], medians[0] / NANOS_PER_MICRO, medians[1] / NANOS_PER_MICRO, medians[0] / medians[1], LANE_WIDTHS[0]);
     Ok(())
 }
 
@@ -718,6 +773,7 @@ fn benchmark_frozen_predictor_width_cycles() -> TestResult {
                 prefetch: true,
                 predictor_lanes,
                 packed_context: false,
+                main_threads: DEFAULT_MAIN_THREADS,
             },
         )
     });
@@ -729,4 +785,34 @@ fn benchmark_frozen_predictor_width_cycles() -> TestResult {
     tick += REFRESH_ADVANCE * kernel.brain_tick_stride;
     benchmark_frozen_checkpoint(&mut kernel, &pipelines, tick, "after_260_cycles")?;
     Ok(())
+}
+
+#[test]
+fn section_main_width_requires_supported_packed_shape() {
+    for prefetch in [false, true] {
+        for packed_context in [false, true] {
+            for predictor_lanes in LANE_WIDTHS {
+                let baseline = BrainVariant {
+                    prefetch,
+                    predictor_lanes,
+                    packed_context,
+                    main_threads: DEFAULT_MAIN_THREADS,
+                };
+                assert!(baseline.validated().is_ok());
+                let compact = BrainVariant {
+                    main_threads: main_width::MAIN_THREADS,
+                    ..baseline
+                };
+                assert_eq!(
+                    compact.validated().is_ok(),
+                    packed_context && predictor_lanes == FROZEN_PREDICTOR_LANES
+                );
+                let unsupported = BrainVariant {
+                    main_threads: main_width::MAIN_THREADS / 2,
+                    ..baseline
+                };
+                assert!(unsupported.validated().is_err());
+            }
+        }
+    }
 }

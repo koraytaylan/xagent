@@ -141,6 +141,8 @@ mod exact_tiled_validation;
 #[cfg(test)]
 mod food_grid_cache_validation;
 #[cfg(test)]
+mod four_dispatch_validation;
+#[cfg(test)]
 mod fresh_projection_dot_validation;
 #[cfg(test)]
 mod fresh_projection_validation;
@@ -151,11 +153,15 @@ mod global_credit_production_validation;
 mod global_credit_validation;
 #[cfg(test)]
 mod global_world_profile;
+#[cfg(test)]
+mod main64_validation;
 mod main_width;
 #[cfg(test)]
 mod main_width_validation;
 #[cfg(test)]
 mod memory_offload_validation;
+#[cfg(test)]
+mod packed_credit_batch_validation;
 mod packed_encoder;
 #[cfg(test)]
 mod packed_encoder_dot_validation;
@@ -175,6 +181,8 @@ mod packed_store_diagnostics;
 mod packed_store_validation;
 #[cfg(test)]
 mod persistent_validation;
+#[cfg(test)]
+mod physics_cache_validation;
 #[cfg(test)]
 mod pointwise_credit_validation;
 #[cfg(test)]

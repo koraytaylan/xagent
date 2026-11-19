@@ -223,7 +223,7 @@ execution_checks:
     timeout_ms: 7200000
     actions:
       - name: dump-default-config
-        command: "cargo run --release -p xagent-sandbox -- --dump-config"
+        command: "cargo run --release -p xagent-sandbox --bin xagent -- --dump-config"
         timeout_ms: 3600000
     constraints:
       - task: "default-fingerprint"

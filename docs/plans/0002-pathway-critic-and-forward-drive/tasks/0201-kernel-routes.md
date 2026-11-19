@@ -32,7 +32,7 @@ checks:
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration"
     timeout_ms: 7200000
   - name: crate-fmt
-    command: "cargo fmt -p xagent-brain -p xagent-sandbox -- --check"
+    command: "cargo fmt -p xagent-brain -p xagent-sandbox --bin xagent -- --check"
     fix: "cargo fmt -p xagent-brain -p xagent-sandbox"
   - name: crate-clippy
     command: "cargo clippy -p xagent-brain -p xagent-sandbox --all-targets -- -D warnings"

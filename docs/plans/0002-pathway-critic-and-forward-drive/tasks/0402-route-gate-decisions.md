@@ -39,7 +39,7 @@ checks:
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration"
     timeout_ms: 7200000
   - name: shared-fmt
-    command: "cargo fmt -p xagent-shared -p xagent-sandbox -- --check"
+    command: "cargo fmt -p xagent-shared -p xagent-sandbox --bin xagent -- --check"
     fix: "cargo fmt -p xagent-shared -p xagent-sandbox"
 ---
 
@@ -64,7 +64,7 @@ fixed by D9 and route-gate-tool; do not tune them.
 
 ## Scope
 
-- Binaries: `cargo run --release -p xagent-sandbox -- ...` (xagent) and
+- Binaries: `cargo run --release -p xagent-sandbox --bin xagent -- ...` (xagent) and
   `cargo run -p xagent-sandbox --bin pathway_route_gate -- ...` (gate tool).
 - Free-life flags are copied verbatim from `crates/xagent-sandbox/src/main.rs`;
   on mismatch, stop and report it.
@@ -90,7 +90,7 @@ fixed by D9 and route-gate-tool; do not tune them.
    `encoding` (winner, `false`). Confirm with `diff` that each arm differs from
    control in its own key only.
 2. Free lives. For seeds 5 to 8, run control and each arm as
-   `cargo run --release -p xagent-sandbox -- --config <arm> --seed S --free-life --free-life-agents 10 --free-life-ticks 300000 --free-life-out target/pathway-route/free-life/<arm>-s<S>.json`,
+   `cargo run --release -p xagent-sandbox --bin xagent -- --config <arm> --seed S --free-life --free-life-agents 10 --free-life-ticks 300000 --free-life-out target/pathway-route/free-life/<arm>-s<S>.json`,
    adding `--free-life-log target/pathway-route/free-life/<arm>-s<S>.log` for
    control and forward only. Each run must exit 0 and list 10 agents of 300,000
    ticks. Rerun a failed run once with the same seed; a second failure is a
@@ -104,7 +104,7 @@ fixed by D9 and route-gate-tool; do not tune them.
 3. Generations. For each route that passed G1 to G3 (G2 and G3 for critic),
    derive configs from the step 1 arms with `governor.tick_budget` 40000 in
    control and route alike. Run
-   `cargo run --release -p xagent-sandbox -- --config <gen> --seed S --no-render --db target/pathway-route/gen/<arm>-s<S>.db --generations 80`
+   `cargo run --release -p xagent-sandbox --bin xagent -- --config <gen> --seed S --no-render --db target/pathway-route/gen/<arm>-s<S>.db --generations 80`
    for seeds 5 to 8 at the step 1 commit; control runs are shared and the step 2
    rerun rule applies. Then run `pathway_route_gate generations --record <json>`
    with `--control-db` and `--route-db` for seeds 5 to 8. Routes that failed

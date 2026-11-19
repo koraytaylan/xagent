@@ -75,3 +75,24 @@ this plan's run (kernel-routes failed; route-gate-decisions blocked).
   exits 0; on the preserved kernel-routes branch the brain-lib check
   (`cargo test -p xagent-brain --lib`) and focused-proof
   (`env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test pathway_routes`) pass.
+
+## Repair: name the `xagent` binary in `cargo run` commands
+
+Cited authority: the plan owner's standing authorization for automatic repair of this run.
+
+- Superseded: the `$integration`-scope witness action `dump-default-config`
+  (`cargo run --release -p xagent-sandbox -- --dump-config`) and the task
+  procedures in 0101, 0401 and 0402 that run `cargo run -p xagent-sandbox -- ...`
+  without `--bin`.
+- Contradiction: route-gate-tool and critic-input-decision add the
+  `pathway_route_gate` and `pathway_return_fit` binaries to xagent-sandbox,
+  and the package has no `default-run`. After that, cargo refuses a bare
+  `cargo run -p xagent-sandbox` ("could not determine which binary to run",
+  exit 101), so the host continuation proof failed.
+- Correction: every such command now passes `--bin xagent`, the `[[bin]]`
+  declared in crates/xagent-sandbox/Cargo.toml. It runs the same program with
+  the same arguments, so no behavior, bound or proof changes.
+- Witness: `cargo run --release -p xagent-sandbox --bin xagent -- --dump-config`
+  exits 0 and prints the JSON config, and
+  `grep -rn 'p xagent-sandbox -- ' docs/plans/0002-pathway-critic-and-forward-drive`
+  finds nothing.

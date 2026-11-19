@@ -20,7 +20,7 @@ checks:
     command: "cargo check -p xagent-sandbox --all-targets"
     timeout_ms: 3600000
   - name: crate-fmt
-    command: "cargo fmt -p xagent-shared -p xagent-sandbox -- --check"
+    command: "cargo fmt -p xagent-shared -p xagent-sandbox --bin xagent -- --check"
     fix: "cargo fmt -p xagent-shared -p xagent-sandbox"
   - name: crate-clippy
     command: "cargo clippy -p xagent-shared -p xagent-sandbox --all-targets -- -D warnings"

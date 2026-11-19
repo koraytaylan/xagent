@@ -17,7 +17,7 @@ checks:
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test pathway_default_fingerprint"
     timeout_ms: 3600000
   - name: sandbox-fmt
-    command: "cargo fmt -p xagent-sandbox -- --check"
+    command: "cargo fmt -p xagent-sandbox --bin xagent -- --check"
     fix: "cargo fmt -p xagent-sandbox"
   - name: sandbox-clippy
     command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings"
@@ -80,7 +80,7 @@ Doc comments describe what is checked; no source text names any plan, task, work
 **Steps:**
 
 1. Read the integrated plan 0001 code per Prerequisites; record the flag names, `agents` layout, header terminator and stderr path as doc-commented consts. Stop and report any contradiction.
-2. Create the config fixture from `cargo run -p xagent-sandbox -- --dump-config` (stdout is JSON), adding the two `brain` keys and nothing else.
+2. Create the config fixture from `cargo run -p xagent-sandbox --bin xagent -- --dump-config` (stdout is JSON), adding the two `brain` keys and nothing else.
 3. Write the test file: doc-commented consts, the pure verdict function and the test set. The GPU test runs the free life with the fixture config, seed, agent and tick counts, log and report outputs into `CARGO_TARGET_TMPDIR`, asserts success (stderr in the message) and applies the adapter and digest rules. Use `serde_json` only for fixture and report reads.
 4. Create the fingerprint fixture: `digest_algorithm: "fnv1a-64"`, parameters (`seed`, `agent_count`, `ticks`, `brain_source: "fresh"`), `command` with placeholders `<config>`, `<scratch>/ticks.bin`, `<scratch>/metrics.json`, digest scopes (`metrics_scope: "agents"`, `log_scope: "payload_after_header_line"`), the `gpu_adapter` name only, and the two digests printed on this host. Never write scratch paths.
 5. Run the focused check twice; both runs print `fingerprint: match` and pass without a skip. Do not edit the fixture between runs.

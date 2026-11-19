@@ -53,7 +53,7 @@ changes in this task.
   have landed, that does not change the run; record the full commit SHA
   (`git rev-parse HEAD`) in the Markdown record.
 - Config. Dump the default config with
-  `cargo run --release -p xagent-sandbox -- --dump-config` into a scratch
+  `cargo run --release -p xagent-sandbox --bin xagent -- --dump-config` into a scratch
   directory outside the repository, and use that dump unchanged for every run
   (no hand edits). Record the dump's SHA-256 in the Markdown record.
 - Logged free lives. Fresh birth brains (no stored champion), 10 agents per

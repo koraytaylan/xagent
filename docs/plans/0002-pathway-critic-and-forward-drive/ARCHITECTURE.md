@@ -22,7 +22,7 @@
   `vision_pathway_learning_rate`), each sense in its own `MAX_WEIGHT_NORM` ball;
   at death `settle_turn_pathways_at_death` applies `TERMINAL_DEATH_TD_ERROR`
   through the traces, then zeroes them.
-- `CONFIG_SIZE` is 16 with every slot used at HEAD (preflight
+- `CONFIG_SIZE` was 16 before plan 0001; it is 24 with slots 16-20 used at HEAD (preflight
   `witness-config-size`); plan 0001 may add lesion slots before this plan runs.
 - The brain-state fixed tail ends with `O_TRACE_VISION`, then
   `O_SENSORY_MEAN` (layout-sized), in both `buffers.rs` and `common.wgsl`.
@@ -309,7 +309,7 @@ this plan's G1 rebuilds the trace per sense as D7 does, and reports plan
 |---|---|---|---|
 | default-fingerprint | Pinned config passes through `resolve_config` (`crates/xagent-sandbox/src/main.rs`); extra route keys are ignored until route-flags defines them because no config type denies unknown fields (`crates/xagent-shared/src/config.rs`); the adapter name comes from the `[GpuKernel] Adapter:` info log in `crates/xagent-brain/src/gpu_kernel.rs`; GPU available to host checks. | architect witness fails without an adapter (`gpu_adapter_present_when_required` under `XAGENT_REQUIRE_GPU=1`) and runs `--dump-config` | `preflight-default-fingerprint` |
 | route-flags | No config type denies unknown fields, so new serde-defaulted fields keep old JSON loading (`config.rs`); two full `BrainConfig` literals in `agent/mod.rs` (mutation and crossover) must carry the new fields. | developer witness compiles the sandbox test targets | `preflight-route-flags` |
-| brain-slot-layout | `CONFIG_SIZE` 16, fully used at HEAD (`buffers.rs`), grown to 24 with padding 21-23 by plan 0001; block inserted before `O_SENSORY_MEAN` in both `buffers.rs` and `common.wgsl`; 1321 mod 129 ≠ 0. | developer witness compiles the sandbox test targets | `preflight-brain-slot-layout` |
+| brain-slot-layout | `CONFIG_SIZE` 24 at HEAD (`buffers.rs`, grown from 16 by plan 0001), slots 16-20 used, padding 21-23; block inserted before `O_SENSORY_MEAN` in both `buffers.rs` and `common.wgsl`; 1321 mod 129 ≠ 0. | developer witness compiles the sandbox test targets | `preflight-brain-slot-layout` |
 | legacy-decode-and-birth-state | `decode_brain_state` is the single blob decode in `governor.rs`, used by `champion_brain` and plan 0001's read-only loader. | developer witness compiles the sandbox test targets | `witness-decode-brain-state` |
 | kernel-routes | Value computed before whitening (`brain_passes.wgsl`), so the critic reads the previous tick's stored inputs and nothing moves (D5); composition markers in `gpu_kernel.rs` and the validation tests (`gpu_kernel/visual_pathway_validation.rs`); forward noise is fresh per tick; existing pathway trace rule; death settle helper in `common.wgsl`; `XAGENT_REQUIRE_GPU` test convention (`tests/integration.rs`). | developer witness compiles the sandbox test targets; constraint check `brain-lib-baseline` runs `cargo test -p xagent-brain --lib` green at the baseline | `preflight-kernel-routes` |
 | return-fit-tool | `src/bin/*.rs` auto-discovered (no `autobins` in `crates/xagent-sandbox/Cargo.toml`); `TD_DISCOUNT = 0.97` (`common.wgsl`). | developer witness compiles the sandbox test targets | `preflight-return-fit-tool` |

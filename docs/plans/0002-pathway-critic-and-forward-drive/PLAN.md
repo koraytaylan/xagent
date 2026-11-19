@@ -60,7 +60,7 @@ preflight_checks:
   - name: witness-no-deny-unknown-fields
     command: "awk 'index($0, \"deny_unknown_fields\") { found = 1 } END { exit found }' crates/xagent-shared/src/config.rs"
   - name: witness-config-size
-    command: "grep -q -F 'pub const CONFIG_SIZE: usize = 16;' crates/xagent-brain/src/buffers.rs"
+    command: "grep -q -F 'pub const CONFIG_SIZE: usize = 24;' crates/xagent-brain/src/buffers.rs"
   - name: witness-sensory-mean-follows-vision-trace
     command: "grep -q -F 'pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;' crates/xagent-brain/src/buffers.rs"
   - name: witness-wgsl-sensory-mean
@@ -102,7 +102,7 @@ preflight_checks:
   - name: preflight-route-flags
     command: "awk 'FILENAME ~ /config.rs$/ && index($0, \"deny_unknown_fields\") { d = 1 } FILENAME ~ /mod.rs$/ && index($0, \"cortex_stage_limit: parent.cortex_stage_limit,\") { a = 1 } FILENAME ~ /mod.rs$/ && index($0, \"cortex_stage_limit: 0,\") { b = 1 } END { exit !(a && b && !d) }' crates/xagent-shared/src/config.rs crates/xagent-sandbox/src/agent/mod.rs"
   - name: preflight-brain-slot-layout
-    command: "awk 'FILENAME ~ /buffers.rs$/ && index($0, \"pub const CONFIG_SIZE: usize = 16;\") { c = 1 } FILENAME ~ /buffers.rs$/ && index($0, \"pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;\") { s = 1 } FILENAME ~ /common.wgsl$/ && index($0, \"override O_SENSORY_MEAN: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;\") { w = 1 } END { u = ((10 + 10 + 10 + 10 + 1 + 128 * 10) % (128 + 1) != 0); exit !(c && s && w && u) }' crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/kernel/common.wgsl"
+    command: "awk 'FILENAME ~ /buffers.rs$/ && index($0, \"pub const CONFIG_SIZE: usize = 24;\") { c = 1 } FILENAME ~ /buffers.rs$/ && index($0, \"pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;\") { s = 1 } FILENAME ~ /common.wgsl$/ && index($0, \"override O_SENSORY_MEAN: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;\") { w = 1 } END { u = ((10 + 10 + 10 + 10 + 1 + 128 * 10) % (128 + 1) != 0); exit !(c && s && w && u) }' crates/xagent-brain/src/buffers.rs crates/xagent-brain/src/shaders/kernel/common.wgsl"
   - name: preflight-kernel-routes
     command: "awk 'FILENAME ~ /brain_passes.wgsl$/ && index($0, \"if (tid == 0u) { s_value = s_dense_partials[0]; }\") && !v { v = FNR } FILENAME ~ /brain_passes.wgsl$/ && index($0, \"brain_state[brain_base + O_SCENT_WHITENED] = scent_whitened.x;\") { w = FNR } FILENAME ~ /brain_passes.wgsl$/ && index($0, \"s_explore[0u] = noise_forward * exploration_rate * fatigue_factor;\") { n = 1 } FILENAME ~ /brain_passes.wgsl$/ && index($0, \"+ s_explore[2u] * input / (1.0 + vision_sq);\") { t = 1 } FILENAME ~ /common.wgsl$/ && index($0, \"fn settle_turn_pathways_at_death(brain_base: u32)\") { d = 1 } FILENAME ~ /integration.rs$/ && index($0, \"XAGENT_REQUIRE_GPU\") { g = 1 } END { exit !(v && w && v < w && n && t && d && g) }' crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl crates/xagent-brain/src/shaders/kernel/common.wgsl crates/xagent-sandbox/tests/integration.rs"
   - name: preflight-return-fit-tool
@@ -152,7 +152,7 @@ execution_checks:
           - crates/xagent-brain/src/shaders/kernel/common.wgsl
         checks:
           - name: witness-config-size
-            command: "grep -q -F 'pub const CONFIG_SIZE: usize = 16;' crates/xagent-brain/src/buffers.rs"
+            command: "grep -q -F 'pub const CONFIG_SIZE: usize = 24;' crates/xagent-brain/src/buffers.rs"
           - name: witness-sensory-mean-follows-vision-trace
             command: "grep -q -F 'pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;' crates/xagent-brain/src/buffers.rs"
           - name: witness-wgsl-sensory-mean

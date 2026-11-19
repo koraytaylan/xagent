@@ -9,8 +9,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/tests/seeded_headless_digest.rs
   - crates/xagent-sandbox/tests/fixtures/seeded_headless_digest.json
-status: todo
-merged_as: ""
+status: done
+merged_as: "6615030e9b8b7b570baae8705cf68e73e003b94f"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --test seeded_headless_digest"

@@ -10,8 +10,8 @@ touches:
   - docs/measurements/trunk-lesions/lesion-matrix.json
   - docs/measurements/trunk-lesions/DECISION.md
   - crates/xagent-sandbox/tests/lesion_matrix_record.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "1d9eb64da69c9956c109b6ca74d7a0cb73264410"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --test lesion_matrix_record"

@@ -7,8 +7,8 @@ role: developer
 depends_on: []
 gated: false
 touches: [crates/xagent-sandbox/src/governor.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "951ced9e7adca52ddc55289365fb66fa0b730735"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib governor::tests::read_only_champion"

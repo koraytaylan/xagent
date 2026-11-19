@@ -732,7 +732,35 @@ pub const RECALL_IDX_STRIDE: usize = RECALL_K + 1; // 16 indices + 1 count
 pub const DECISION_PREDICTION: usize = 0;
 pub const DECISION_CREDIT: usize = ENCODED_DIMENSION;
 pub const DECISION_MOTOR: usize = ENCODED_DIMENSION + ENCODED_DIMENSION;
-pub const DECISION_STRIDE: usize = DECISION_MOTOR + 4;
+/// Start of the per-tick measurement block after the motor slots.
+pub const DECISION_PROBE: usize = DECISION_MOTOR + 4;
+/// Number of f32 slots in the measurement block.
+pub const BRAIN_TICK_PROBE_LEN: usize = 148;
+pub const DECISION_STRIDE: usize = DECISION_PROBE + BRAIN_TICK_PROBE_LEN;
+/// Probe offsets (relative to `DECISION_PROBE`): the 128-d centred encoding.
+pub const PROBE_ENCODING: usize = 0;
+/// Ten pathway inputs: scent (2) then vision (8).
+pub const PROBE_PATHWAY_INPUTS: usize = 128;
+/// TD reward.
+pub const PROBE_REWARD: usize = 138;
+/// This tick's value after any critic lesion.
+pub const PROBE_VALUE: usize = 139;
+/// TD error.
+pub const PROBE_TD_ERROR: usize = 140;
+/// Executed forward exploration noise.
+pub const PROBE_FORWARD_NOISE: usize = 141;
+/// Executed turn exploration noise.
+pub const PROBE_TURN_NOISE: usize = 142;
+/// Executed turn innovation.
+pub const PROBE_TURN_INNOVATION: usize = 143;
+/// Encoding turn dot as computed.
+pub const PROBE_ENCODING_TURN_OUTPUT: usize = 144;
+/// Scent turn dot as computed.
+pub const PROBE_SCENT_TURN_OUTPUT: usize = 145;
+/// Vision turn dot as computed.
+pub const PROBE_VISION_TURN_OUTPUT: usize = 146;
+/// Encoding forward dot as computed.
+pub const PROBE_ENCODING_FORWARD_OUTPUT: usize = 147;
 
 // ── Brain scratch buffer offsets (8×6 layout anchors) ──────────────────────────
 // Mirrors SCRATCH_* WGSL overrides for the default 8×6 layout; used for
@@ -792,7 +820,59 @@ pub const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: usize = 14;
 /// carries its lifetime learning into the next generation. Mirrored by
 /// `CFG_FREEZE_STEERING_WEIGHTS` in `common.wgsl`.
 pub const CFG_FREEZE_STEERING_WEIGHTS: usize = 15;
-pub const CONFIG_SIZE: usize = 16; // padded for uniform vec4 alignment (4 × vec4)
+/// `1.0` leaves the encoding turn dot out of `turn`. Mirrored in `common.wgsl`.
+pub const CFG_LESION_TURN_WEIGHTS: usize = 16;
+/// `1.0` leaves the encoding forward dot out of `forward`; the forward bias
+/// stays. Mirrored in `common.wgsl`.
+pub const CFG_LESION_FORWARD_WEIGHTS: usize = 17;
+/// `1.0` skips the recalled-memory motor blend. Mirrored in `common.wgsl`.
+pub const CFG_LESION_MEMORY_BLEND: usize = 18;
+/// `1.0` makes every value the critic forms (TD value and replay value) the
+/// value bias alone. Mirrored in `common.wgsl`.
+pub const CFG_LESION_CRITIC: usize = 19;
+/// `1.0` makes the brain pass write the probe block of the decision buffer.
+/// Mirrored in `common.wgsl`.
+pub const CFG_BRAIN_TICK_PROBE: usize = 20;
+pub const CONFIG_SIZE: usize = 24; // padded for uniform vec4 alignment (6 × vec4)
+
+/// Which trunk pathways are cut out of the decision; each `true` field
+/// enables the matching lesion switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrunkLesions {
+    /// Leave the encoding turn dot out of `turn`.
+    pub turn_weights: bool,
+    /// Leave the encoding forward dot out of `forward`.
+    pub forward_weights: bool,
+    /// Skip the recalled-memory motor blend.
+    pub memory_blend: bool,
+    /// Make every critic value the value bias alone.
+    pub critic: bool,
+}
+
+impl TrunkLesions {
+    /// No lesion active.
+    pub const NONE: Self = Self {
+        turn_weights: false,
+        forward_weights: false,
+        memory_blend: false,
+        critic: false,
+    };
+    /// Every lesion active.
+    pub const ALL: Self = Self {
+        turn_weights: true,
+        forward_weights: true,
+        memory_blend: true,
+        critic: true,
+    };
+
+    /// True when no lesion is active.
+    pub fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+}
+
+/// Per-step TD trace decay; mirrors `TD_DISCOUNT * TD_LAMBDA` in `common.wgsl`.
+pub const TD_TRACE_DECAY: f32 = 0.97 * 0.9;
 
 // ── AgentBrainState (CPU-side snapshot for evolution) ──────────────────
 
@@ -1237,6 +1317,79 @@ pub fn pack_freeze_steering_weights(cfg: &mut [f32], freeze: bool) {
     cfg[CFG_FREEZE_STEERING_WEIGHTS] = if freeze { 1.0 } else { 0.0 };
 }
 
+/// Writes the four trunk-lesion switches into slots 16-19 of `cfg` as
+/// `1.0` (lesioned) or `0.0`.
+pub fn pack_trunk_lesions(cfg: &mut [f32], lesions: TrunkLesions) {
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+    cfg[CFG_LESION_TURN_WEIGHTS] = flag(lesions.turn_weights);
+    cfg[CFG_LESION_FORWARD_WEIGHTS] = flag(lesions.forward_weights);
+    cfg[CFG_LESION_MEMORY_BLEND] = flag(lesions.memory_blend);
+    cfg[CFG_LESION_CRITIC] = flag(lesions.critic);
+}
+
+/// Writes the brain-tick probe switch into slot 20 of `cfg`.
+pub fn pack_brain_tick_probe(cfg: &mut [f32], enabled: bool) {
+    cfg[CFG_BRAIN_TICK_PROBE] = if enabled { 1.0 } else { 0.0 };
+}
+
+/// Per-tick measurement block decoded from a decision-buffer record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrainTickProbe {
+    /// Centred encoding the critic and turn channel read.
+    pub encoding: [f32; ENCODED_DIMENSION],
+    /// Scent (2) then vision (8) pathway inputs of this tick.
+    pub pathway_inputs: [f32; 10],
+    /// Reward used by the TD update.
+    pub reward: f32,
+    /// This tick's value after any critic lesion.
+    pub value: f32,
+    /// TD error of this tick.
+    pub td_error: f32,
+    /// Executed forward exploration noise.
+    pub forward_noise: f32,
+    /// Executed turn exploration noise.
+    pub turn_noise: f32,
+    /// Executed turn innovation.
+    pub turn_innovation: f32,
+    /// Encoding turn dot as computed, even when lesioned.
+    pub encoding_turn_output: f32,
+    /// Scent turn dot as computed.
+    pub scent_turn_output: f32,
+    /// Vision turn dot as computed.
+    pub vision_turn_output: f32,
+    /// Encoding forward dot as computed, even when lesioned.
+    pub encoding_forward_output: f32,
+}
+
+impl BrainTickProbe {
+    /// Decodes the probe block of one agent's decision record; `None` unless
+    /// the record holds at least `DECISION_STRIDE` values.
+    pub fn from_decision_record(record: &[f32]) -> Option<Self> {
+        if record.len() < DECISION_STRIDE {
+            return None;
+        }
+        let p = &record[DECISION_PROBE..DECISION_PROBE + BRAIN_TICK_PROBE_LEN];
+        let mut encoding = [0.0_f32; ENCODED_DIMENSION];
+        encoding.copy_from_slice(&p[PROBE_ENCODING..PROBE_ENCODING + ENCODED_DIMENSION]);
+        let mut pathway_inputs = [0.0_f32; 10];
+        pathway_inputs.copy_from_slice(&p[PROBE_PATHWAY_INPUTS..PROBE_PATHWAY_INPUTS + 10]);
+        Some(Self {
+            encoding,
+            pathway_inputs,
+            reward: p[PROBE_REWARD],
+            value: p[PROBE_VALUE],
+            td_error: p[PROBE_TD_ERROR],
+            forward_noise: p[PROBE_FORWARD_NOISE],
+            turn_noise: p[PROBE_TURN_NOISE],
+            turn_innovation: p[PROBE_TURN_INNOVATION],
+            encoding_turn_output: p[PROBE_ENCODING_TURN_OUTPUT],
+            scent_turn_output: p[PROBE_SCENT_TURN_OUTPUT],
+            vision_turn_output: p[PROBE_VISION_TURN_OUTPUT],
+            encoding_forward_output: p[PROBE_ENCODING_FORWARD_OUTPUT],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,6 +1669,158 @@ mod tests {
         assert!(CFG_HOMEO_PREDICTOR_LEARNING_RATE < CONFIG_SIZE);
         assert!(CFG_HOMEO_PREDICTIVE_CREDIT_BETA < CONFIG_SIZE);
         assert!(CFG_FREEZE_STEERING_WEIGHTS < CONFIG_SIZE);
+        assert!(CFG_LESION_TURN_WEIGHTS < CONFIG_SIZE);
+        assert!(CFG_LESION_FORWARD_WEIGHTS < CONFIG_SIZE);
+        assert!(CFG_LESION_MEMORY_BLEND < CONFIG_SIZE);
+        assert!(CFG_LESION_CRITIC < CONFIG_SIZE);
+        assert!(CFG_BRAIN_TICK_PROBE < CONFIG_SIZE);
+        assert_eq!(CONFIG_SIZE, 24);
+    }
+
+    #[test]
+    fn pack_trunk_lesions_places_each_switch_in_its_slot() {
+        let slots = [
+            CFG_LESION_TURN_WEIGHTS,
+            CFG_LESION_FORWARD_WEIGHTS,
+            CFG_LESION_MEMORY_BLEND,
+            CFG_LESION_CRITIC,
+        ];
+        let singles = [
+            TrunkLesions {
+                turn_weights: true,
+                ..TrunkLesions::NONE
+            },
+            TrunkLesions {
+                forward_weights: true,
+                ..TrunkLesions::NONE
+            },
+            TrunkLesions {
+                memory_blend: true,
+                ..TrunkLesions::NONE
+            },
+            TrunkLesions {
+                critic: true,
+                ..TrunkLesions::NONE
+            },
+        ];
+        for (i, l) in singles.iter().enumerate() {
+            let mut cfg = vec![0.0_f32; CONFIG_SIZE];
+            pack_trunk_lesions(&mut cfg, *l);
+            for (j, s) in slots.iter().enumerate() {
+                assert_eq!(cfg[*s], if i == j { 1.0 } else { 0.0 });
+            }
+            assert!(cfg[CFG_BRAIN_TICK_PROBE..].iter().all(|v| *v == 0.0));
+        }
+        let mut cfg = vec![0.0_f32; CONFIG_SIZE];
+        pack_trunk_lesions(&mut cfg, TrunkLesions::ALL);
+        assert!(slots.iter().all(|s| cfg[*s] == 1.0));
+        assert!(cfg[CFG_BRAIN_TICK_PROBE..].iter().all(|v| *v == 0.0));
+        pack_trunk_lesions(&mut cfg, TrunkLesions::NONE);
+        assert!(cfg.iter().all(|v| *v == 0.0));
+        assert!(TrunkLesions::NONE.is_none());
+        assert!(!TrunkLesions::ALL.is_none());
+    }
+
+    #[test]
+    fn pack_brain_tick_probe_writes_only_slot_20() {
+        let mut cfg = vec![0.0_f32; CONFIG_SIZE];
+        pack_brain_tick_probe(&mut cfg, true);
+        for (i, v) in cfg.iter().enumerate() {
+            assert_eq!(*v, if i == 20 { 1.0 } else { 0.0 });
+        }
+        pack_brain_tick_probe(&mut cfg, false);
+        assert!(cfg.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn brain_tick_probe_decoder_places_each_field() {
+        let record: Vec<f32> = (0..DECISION_STRIDE).map(|i| i as f32).collect();
+        let p = BrainTickProbe::from_decision_record(&record).expect("full record decodes");
+        let base = DECISION_PROBE as f32;
+        for (i, v) in p.encoding.iter().enumerate() {
+            assert_eq!(*v, base + (PROBE_ENCODING + i) as f32);
+        }
+        for (i, v) in p.pathway_inputs.iter().enumerate() {
+            assert_eq!(*v, base + (PROBE_PATHWAY_INPUTS + i) as f32);
+        }
+        assert_eq!(p.reward, base + PROBE_REWARD as f32);
+        assert_eq!(p.value, base + PROBE_VALUE as f32);
+        assert_eq!(p.td_error, base + PROBE_TD_ERROR as f32);
+        assert_eq!(p.forward_noise, base + PROBE_FORWARD_NOISE as f32);
+        assert_eq!(p.turn_noise, base + PROBE_TURN_NOISE as f32);
+        assert_eq!(p.turn_innovation, base + PROBE_TURN_INNOVATION as f32);
+        assert_eq!(
+            p.encoding_turn_output,
+            base + PROBE_ENCODING_TURN_OUTPUT as f32
+        );
+        assert_eq!(p.scent_turn_output, base + PROBE_SCENT_TURN_OUTPUT as f32);
+        assert_eq!(p.vision_turn_output, base + PROBE_VISION_TURN_OUTPUT as f32);
+        assert_eq!(
+            p.encoding_forward_output,
+            base + PROBE_ENCODING_FORWARD_OUTPUT as f32
+        );
+        assert_eq!(PROBE_ENCODING_FORWARD_OUTPUT + 1, BRAIN_TICK_PROBE_LEN);
+        assert!(BrainTickProbe::from_decision_record(&record[..DECISION_STRIDE - 1]).is_none());
+    }
+
+    #[test]
+    fn wgsl_probe_layout_matches_rust() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+        assert_eq!(wgsl["BRAIN_TICK_PROBE_LEN"], BRAIN_TICK_PROBE_LEN as u32);
+        assert_eq!(wgsl["PROBE_ENCODING"], PROBE_ENCODING as u32);
+        assert_eq!(wgsl["PROBE_PATHWAY_INPUTS"], PROBE_PATHWAY_INPUTS as u32);
+        assert_eq!(wgsl["PROBE_REWARD"], PROBE_REWARD as u32);
+        assert_eq!(wgsl["PROBE_VALUE"], PROBE_VALUE as u32);
+        assert_eq!(wgsl["PROBE_TD_ERROR"], PROBE_TD_ERROR as u32);
+        assert_eq!(wgsl["PROBE_FORWARD_NOISE"], PROBE_FORWARD_NOISE as u32);
+        assert_eq!(wgsl["PROBE_TURN_NOISE"], PROBE_TURN_NOISE as u32);
+        assert_eq!(wgsl["PROBE_TURN_INNOVATION"], PROBE_TURN_INNOVATION as u32);
+        assert_eq!(
+            wgsl["PROBE_ENCODING_TURN_OUTPUT"],
+            PROBE_ENCODING_TURN_OUTPUT as u32
+        );
+        assert_eq!(
+            wgsl["PROBE_SCENT_TURN_OUTPUT"],
+            PROBE_SCENT_TURN_OUTPUT as u32
+        );
+        assert_eq!(
+            wgsl["PROBE_VISION_TURN_OUTPUT"],
+            PROBE_VISION_TURN_OUTPUT as u32
+        );
+        assert_eq!(
+            wgsl["PROBE_ENCODING_FORWARD_OUTPUT"],
+            PROBE_ENCODING_FORWARD_OUTPUT as u32
+        );
+        assert!(src
+            .lines()
+            .any(|l| l.trim() == "const DECISION_PROBE: u32 = DECISION_MOTOR + 4u;"));
+        assert!(src
+            .lines()
+            .any(|l| l.trim()
+                == "const DECISION_STRIDE: u32 = DECISION_PROBE + BRAIN_TICK_PROBE_LEN;"));
+    }
+
+    #[test]
+    fn td_trace_decay_matches_wgsl_text() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let parse = |name: &str| -> f32 {
+            let prefix = format!("const {name}: f32 = ");
+            let line = src
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&prefix))
+                .expect("constant present");
+            line[prefix.len()..]
+                .split(';')
+                .next()
+                .unwrap()
+                .trim()
+                .parse::<f32>()
+                .expect("f32 literal")
+        };
+        let product = parse("TD_DISCOUNT") * parse("TD_LAMBDA");
+        assert!((TD_TRACE_DECAY - product).abs() < 1e-6);
     }
 
     #[test]
@@ -1836,6 +2141,20 @@ mod tests {
             wgsl["CFG_FREEZE_STEERING_WEIGHTS"],
             CFG_FREEZE_STEERING_WEIGHTS as u32
         );
+        assert_eq!(
+            wgsl["CFG_LESION_TURN_WEIGHTS"],
+            CFG_LESION_TURN_WEIGHTS as u32
+        );
+        assert_eq!(
+            wgsl["CFG_LESION_FORWARD_WEIGHTS"],
+            CFG_LESION_FORWARD_WEIGHTS as u32
+        );
+        assert_eq!(
+            wgsl["CFG_LESION_MEMORY_BLEND"],
+            CFG_LESION_MEMORY_BLEND as u32
+        );
+        assert_eq!(wgsl["CFG_LESION_CRITIC"], CFG_LESION_CRITIC as u32);
+        assert_eq!(wgsl["CFG_BRAIN_TICK_PROBE"], CFG_BRAIN_TICK_PROBE as u32);
     }
 
     #[test]

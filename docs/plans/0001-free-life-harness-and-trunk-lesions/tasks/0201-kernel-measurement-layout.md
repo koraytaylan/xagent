@@ -9,8 +9,8 @@ gated: false
 touches:
   - crates/xagent-brain/src/buffers.rs
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
-status: todo
-merged_as: ""
+status: done
+merged_as: "a0fb08a0695064bd12b8c131373d0599c805a886"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib buffers::tests"

@@ -7,12 +7,14 @@
 //! All state is persisted in a SQLite database (`xagent.db`), enabling resume
 //! and post-hoc analysis of the evolution tree.
 
+use std::fmt;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Result as SqlResult};
 use serde::Serialize;
 use xagent_brain::buffers::AgentBrainState;
 use xagent_shared::{BrainConfig, GovernorConfig};
@@ -201,6 +203,140 @@ fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
     Some(AgentBrainState {
         brain_state: brain_state.to_vec(),
         patterns: patterns.to_vec(),
+    })
+}
+
+/// Busy timeout of a read-only champion load; it matches the governor's own
+/// connection timeout.
+pub const CHAMPION_LOAD_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// A champion brain read back from a governor database, with the node it
+/// belongs to.
+#[derive(Clone, Debug)]
+pub struct StoredChampion {
+    /// Database id of the node that owns the brain.
+    pub node_id: i64,
+    /// Generation of that node.
+    pub generation: i64,
+    /// The node's brain configuration.
+    pub config: BrainConfig,
+    /// The decoded champion brain.
+    pub brain: AgentBrainState,
+}
+
+/// Why a champion could not be loaded read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChampionLoadError {
+    /// The database could not be opened read-only.
+    Open(String),
+    /// A query failed.
+    Query(String),
+    /// The database holds no stored champion brain for the selection.
+    NoStoredChampion,
+    /// The requested node exists but has no stored brain.
+    NodeWithoutBrain(i64),
+    /// The stored brain blob of this node could not be decoded.
+    MalformedBrain(i64),
+    /// The stored configuration of this node is not a valid brain config.
+    MalformedConfig(i64),
+}
+
+impl fmt::Display for ChampionLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(msg) => write!(f, "cannot open database read-only: {msg}"),
+            Self::Query(msg) => write!(f, "champion query failed: {msg}"),
+            Self::NoStoredChampion => write!(f, "database holds no stored champion"),
+            Self::NodeWithoutBrain(id) => write!(f, "node {id} has no stored brain"),
+            Self::MalformedBrain(id) => write!(f, "stored brain of node {id} is malformed"),
+            Self::MalformedConfig(id) => write!(f, "stored config of node {id} is malformed"),
+        }
+    }
+}
+
+impl std::error::Error for ChampionLoadError {}
+
+/// Open `db_path` read-only on the plain path and set the busy timeout.
+fn open_read_only(db_path: &str) -> Result<Connection, ChampionLoadError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let db = Connection::open_with_flags(db_path, flags)
+        .map_err(|err| ChampionLoadError::Open(err.to_string()))?;
+    db.busy_timeout(CHAMPION_LOAD_BUSY_TIMEOUT)
+        .map_err(|err| ChampionLoadError::Open(err.to_string()))?;
+    Ok(db)
+}
+
+/// Whether the `node_brain` table exists in the database.
+fn node_brain_table_exists(db: &Connection) -> SqlResult<bool> {
+    db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'node_brain'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+}
+
+/// One selected champion row: node id, generation, config JSON, brain blob
+/// (`None` when the node has no brain row).
+type ChampionRow = (i64, i64, String, Option<Vec<u8>>);
+
+/// Select the champion row: the given node, or the stored brain whose node has
+/// the greatest `(generation, id)`. `None` when no row matches.
+fn query_champion_row(db: &Connection, node_id: Option<i64>) -> SqlResult<Option<ChampionRow>> {
+    let map = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+    match node_id {
+        Some(id) => db
+            .query_row(
+                "SELECT n.id, n.generation, n.config_json, b.data FROM node n
+                 LEFT JOIN node_brain b ON b.node_id = n.id WHERE n.id = ?1",
+                params![id],
+                map,
+            )
+            .optional(),
+        None => db
+            .query_row(
+                "SELECT b.node_id, n.generation, n.config_json, b.data
+                 FROM node_brain b JOIN node n ON n.id = b.node_id
+                 ORDER BY n.generation DESC, b.node_id DESC LIMIT 1",
+                [],
+                map,
+            )
+            .optional(),
+    }
+}
+
+/// Load a stored champion from a governor database without writing to it.
+///
+/// `node_id` selects that node's brain; `None` selects the stored brain whose
+/// node has the greatest `(generation, id)`. The database is opened read-only
+/// and only `SELECT` statements run.
+///
+/// # Errors
+///
+/// Returns [`ChampionLoadError`] when the database cannot be opened or
+/// queried, holds no matching champion, the node has no brain, or the stored
+/// brain blob or config JSON is malformed.
+pub fn load_champion_read_only(
+    db_path: &str,
+    node_id: Option<i64>,
+) -> Result<StoredChampion, ChampionLoadError> {
+    let db = open_read_only(db_path)?;
+    let query_err = |err: rusqlite::Error| ChampionLoadError::Query(err.to_string());
+    if !node_brain_table_exists(&db).map_err(query_err)? {
+        return Err(ChampionLoadError::NoStoredChampion);
+    }
+    let (id, generation, config_json, blob) = query_champion_row(&db, node_id)
+        .map_err(query_err)?
+        .ok_or(ChampionLoadError::NoStoredChampion)?;
+    let blob = blob.ok_or(ChampionLoadError::NodeWithoutBrain(id))?;
+    let brain = decode_brain_state(&blob).ok_or(ChampionLoadError::MalformedBrain(id))?;
+    let config = serde_json::from_str::<BrainConfig>(&config_json)
+        .map_err(|_| ChampionLoadError::MalformedConfig(id))?;
+    Ok(StoredChampion {
+        node_id: id,
+        generation,
+        config,
+        brain,
     })
 }
 
@@ -5668,6 +5804,188 @@ mod tests {
             decode_brain_state(&padded).is_none(),
             "payload longer than the header declares"
         );
+    }
+
+    // ─── read-only champion loader ──────────────────────────────────
+
+    /// FNV-1a 64-bit offset basis.
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    /// FNV-1a 64-bit prime.
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// FNV-1a 64-bit hash of `bytes`.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+    }
+
+    /// Create `champion.db` in `dir` with nodes 50 (generation 7), 100
+    /// (generation 3) and 200 (generation 9); 50 and 100 have brains tagged
+    /// 2.0 and 1.0, 200 has none. Returns the database path.
+    fn read_only_champion_fixture(dir: &std::path::Path) -> String {
+        let path = dir.join("champion.db");
+        let db_path = path.to_str().expect("temp DB path must be valid UTF-8");
+        let config = GovernorConfig {
+            population_size: 10,
+            tick_budget: 100,
+            elitism_count: 3,
+            patience: 5,
+            max_generations: 0,
+            mutation_strength: 0.1,
+            eval_repeats: 1,
+            num_islands: 1,
+            migration_interval: 0,
+            momentum_decay: 0.9,
+        };
+        let gov = Governor::new(db_path, config, &BrainConfig::default(), "{}").unwrap();
+        let config_json = serde_json::to_string(&BrainConfig::default()).unwrap();
+        for (id, generation) in [(50_i64, 7_i64), (100, 3), (200, 9)] {
+            gov.db
+                .execute(
+                    "INSERT INTO node (id, run_id, parent_id, generation, config_json, status)
+                     VALUES (?1, (SELECT MIN(id) FROM run), NULL, ?2, ?3, 'active')",
+                    params![id, generation, config_json],
+                )
+                .unwrap();
+        }
+        assert!(gov.store_champion_brain(50, &tagged_brain(2.0)));
+        assert!(gov.store_champion_brain(100, &tagged_brain(1.0)));
+        drop(gov);
+        db_path.to_string()
+    }
+
+    /// Assert `champion` is the fixture node `node_id` carrying brain `tag`.
+    fn assert_fixture_champion(champion: &StoredChampion, node_id: i64, generation: i64, tag: f32) {
+        let expected = tagged_brain(tag);
+        assert_eq!(champion.node_id, node_id);
+        assert_eq!(champion.generation, generation);
+        assert_eq!(champion.brain.brain_state, expected.brain_state);
+        assert_eq!(champion.brain.patterns, expected.patterns);
+        assert_eq!(
+            serde_json::to_string(&champion.config).unwrap(),
+            serde_json::to_string(&BrainConfig::default()).unwrap()
+        );
+    }
+
+    /// The default selection takes the greatest generation among stored
+    /// brains, not the greatest node id.
+    #[test]
+    fn read_only_champion_default_selects_greatest_generation_then_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let champion = load_champion_read_only(&path, None).unwrap();
+        assert_fixture_champion(&champion, 50, 7, 2.0);
+    }
+
+    /// An explicit node id loads that node's brain and config.
+    #[test]
+    fn read_only_champion_explicit_node_loads_that_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let champion = load_champion_read_only(&path, Some(100)).unwrap();
+        assert_fixture_champion(&champion, 100, 3, 1.0);
+    }
+
+    /// A node without a brain row is reported by id.
+    #[test]
+    fn read_only_champion_node_without_brain_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let err = load_champion_read_only(&path, Some(200)).unwrap_err();
+        assert_eq!(err, ChampionLoadError::NodeWithoutBrain(200));
+    }
+
+    /// A blob the decoder rejects is a malformed brain.
+    #[test]
+    fn read_only_champion_corrupt_blob_is_malformed_brain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE node_brain SET data = ?1 WHERE node_id = 100",
+            params![vec![1_u8, 2]],
+        )
+        .unwrap();
+        drop(db);
+        let err = load_champion_read_only(&path, Some(100)).unwrap_err();
+        assert_eq!(err, ChampionLoadError::MalformedBrain(100));
+    }
+
+    /// Unparseable config JSON is rejected, with no default fallback.
+    #[test]
+    fn read_only_champion_malformed_config_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE node SET config_json = '{not json' WHERE id = 50",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let err = load_champion_read_only(&path, None).unwrap_err();
+        assert_eq!(err, ChampionLoadError::MalformedConfig(50));
+    }
+
+    /// A database without the brain table has no champion in either mode.
+    #[test]
+    fn read_only_champion_database_without_table_has_no_champion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE node_brain;").unwrap();
+        drop(db);
+        assert_eq!(
+            load_champion_read_only(&path, None).unwrap_err(),
+            ChampionLoadError::NoStoredChampion
+        );
+        assert_eq!(
+            load_champion_read_only(&path, Some(100)).unwrap_err(),
+            ChampionLoadError::NoStoredChampion
+        );
+    }
+
+    /// Loading leaves the main database file's bytes unchanged; sidecar files
+    /// are not compared.
+    #[test]
+    fn read_only_champion_load_leaves_file_bytes_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let file = dir.path().join("champion.db");
+        let before = std::fs::read(&file).unwrap();
+        let hash_before = fnv1a_64(&before);
+        let default = load_champion_read_only(&path, None).unwrap();
+        let explicit = load_champion_read_only(&path, Some(100)).unwrap();
+        let after = std::fs::read(&file).unwrap();
+        assert_eq!(default.node_id, 50);
+        assert_eq!(explicit.node_id, 100);
+        assert_eq!(before, after);
+        assert_eq!(hash_before, fnv1a_64(&after));
+    }
+
+    /// A handle from `open_read_only` rejects writes and a later load still
+    /// sees the original data.
+    #[test]
+    fn read_only_champion_write_through_read_only_handle_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = read_only_champion_fixture(dir.path());
+        let db = open_read_only(&path).unwrap();
+        assert!(db
+            .execute(
+                "UPDATE node_brain SET data = x'0102' WHERE node_id = 100",
+                []
+            )
+            .is_err());
+        assert!(db
+            .execute(
+                "INSERT INTO node_brain (node_id, data) VALUES (300, x'0102')",
+                []
+            )
+            .is_err());
+        drop(db);
+        let champion = load_champion_read_only(&path, None).unwrap();
+        assert_fixture_champion(&champion, 50, 7, 2.0);
     }
 
     #[test]

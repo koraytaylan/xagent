@@ -359,7 +359,24 @@ override FEATURES_STRIDE: u32 = FEATURE_COUNT;
 const DECISION_PREDICTION: u32 = 0u;
 const DECISION_CREDIT: u32 = ENCODED_DIMENSION;
 const DECISION_MOTOR: u32 = ENCODED_DIMENSION + ENCODED_DIMENSION;
-const DECISION_STRIDE: u32 = DECISION_MOTOR + 4u;
+// Start of the per-tick measurement block that follows the motor slots.
+const DECISION_PROBE: u32 = DECISION_MOTOR + 4u;
+// Number of f32 slots in the measurement block.
+const BRAIN_TICK_PROBE_LEN: u32 = 148u;
+const DECISION_STRIDE: u32 = DECISION_PROBE + BRAIN_TICK_PROBE_LEN;
+// Offsets inside the measurement block (relative to DECISION_PROBE).
+const PROBE_ENCODING: u32 = 0u;
+const PROBE_PATHWAY_INPUTS: u32 = 128u;
+const PROBE_REWARD: u32 = 138u;
+const PROBE_VALUE: u32 = 139u;
+const PROBE_TD_ERROR: u32 = 140u;
+const PROBE_FORWARD_NOISE: u32 = 141u;
+const PROBE_TURN_NOISE: u32 = 142u;
+const PROBE_TURN_INNOVATION: u32 = 143u;
+const PROBE_ENCODING_TURN_OUTPUT: u32 = 144u;
+const PROBE_SCENT_TURN_OUTPUT: u32 = 145u;
+const PROBE_VISION_TURN_OUTPUT: u32 = 146u;
+const PROBE_ENCODING_FORWARD_OUTPUT: u32 = 147u;
 const HOMEO_OUT_STRIDE: u32 = 6u;
 const RECALL_IDX_STRIDE: u32 = 17u;    // 16 indices + 1 count
 
@@ -420,6 +437,16 @@ const CFG_HOMEO_PREDICTIVE_CREDIT_BETA: u32 = 14u;
 // 1.0 holds the turn-policy weights and the turn bias fixed (evolution scores
 // the inherited map). 0.0 lets the actor's TD update change them.
 const CFG_FREEZE_STEERING_WEIGHTS: u32 = 15u;
+// 1.0 leaves the encoding turn dot out of `turn`.
+const CFG_LESION_TURN_WEIGHTS: u32 = 16u;
+// 1.0 leaves the encoding forward dot out of `forward`; the bias stays.
+const CFG_LESION_FORWARD_WEIGHTS: u32 = 17u;
+// 1.0 skips the recalled-memory motor blend.
+const CFG_LESION_MEMORY_BLEND: u32 = 18u;
+// 1.0 makes every critic value the value bias alone.
+const CFG_LESION_CRITIC: u32 = 19u;
+// 1.0 makes the brain pass write the measurement block.
+const CFG_BRAIN_TICK_PROBE: u32 = 20u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
@@ -1046,7 +1073,7 @@ fn settle_recent_moments_at_death(brain_base: u32) {
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
 @group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
-@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 4>;
+@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 6>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 @group(0) @binding(16) var<storage, read_write> trail_ring:        array<f32>;
 @group(0) @binding(17) var<storage, read_write> sensory_next:      array<f32>;
@@ -1071,6 +1098,26 @@ fn bc_f32(idx: u32) -> f32 {
 
 fn steering_weights_learn() -> bool {
     return bc_f32(CFG_FREEZE_STEERING_WEIGHTS) < 0.5;
+}
+
+fn lesion_turn_weights() -> bool {
+    return bc_f32(CFG_LESION_TURN_WEIGHTS) >= 0.5;
+}
+
+fn lesion_forward_weights() -> bool {
+    return bc_f32(CFG_LESION_FORWARD_WEIGHTS) >= 0.5;
+}
+
+fn lesion_memory_blend() -> bool {
+    return bc_f32(CFG_LESION_MEMORY_BLEND) >= 0.5;
+}
+
+fn lesion_critic() -> bool {
+    return bc_f32(CFG_LESION_CRITIC) >= 0.5;
+}
+
+fn brain_tick_probe_enabled() -> bool {
+    return bc_f32(CFG_BRAIN_TICK_PROBE) >= 0.5;
 }
 
 // Step normalizer 1 / ‖[1, x]‖² of the critic and the turn channel (see

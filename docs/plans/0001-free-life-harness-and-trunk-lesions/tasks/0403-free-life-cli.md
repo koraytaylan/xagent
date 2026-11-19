@@ -7,8 +7,8 @@ role: developer
 depends_on: [free-life-runner]
 gated: false
 touches: [crates/xagent-sandbox/src/main.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "49f29de69187bddb59488d0a962b67bb8791ca03"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --bin xagent tests::free_life"

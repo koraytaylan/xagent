@@ -12,8 +12,8 @@ touches:
   - crates/xagent-brain/src/gpu_kernel.rs
   - crates/xagent-brain/tests/trunk_lesions.rs
   - crates/xagent-brain/tests/brain_tick_probe.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "8b769a4b97ec5d693e4eaf7e1d2277b1aa83d37a"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test trunk_lesions --test brain_tick_probe"

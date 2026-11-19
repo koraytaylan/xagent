@@ -7,6 +7,7 @@ mod sim_runtime;
 mod snapshot;
 mod ui_chrome;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -156,6 +157,39 @@ struct Cli {
     /// parallel, then merge the per-shard JSON files (default: 0, no offset).
     #[arg(long, default_value_t = 0)]
     validation_seed_start: u64,
+
+    /// Run one seeded free life and print its JSON report; `--seed` seeds it
+    #[arg(long)]
+    free_life: bool,
+
+    /// Number of agents in a free life
+    #[arg(long, default_value_t = headless::DEFAULT_FREE_LIFE_AGENTS)]
+    free_life_agents: usize,
+
+    /// Simulation ticks in a free life
+    #[arg(long, default_value_t = headless::DEFAULT_FREE_LIFE_TICKS)]
+    free_life_ticks: u64,
+
+    /// Governor database to load the birth champion from (default: fresh brain)
+    #[arg(long)]
+    free_life_champion_db: Option<String>,
+
+    /// Champion node to load; requires --free-life-champion-db (default: newest)
+    #[arg(long)]
+    free_life_champion_node: Option<i64>,
+
+    /// Comma list of trunk lesions: turn-weights, forward-weights,
+    /// memory-blend, critic, all, none
+    #[arg(long, default_value = "none")]
+    free_life_lesion: String,
+
+    /// Per-tick log file for a free life
+    #[arg(long)]
+    free_life_log: Option<PathBuf>,
+
+    /// Write the free-life JSON report to this file instead of stdout
+    #[arg(long)]
+    free_life_out: Option<PathBuf>,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -712,6 +746,11 @@ fn main() {
         return;
     }
 
+    if cli.free_life {
+        run_free_life_cli(&cli, &config);
+        return;
+    }
+
     print_config(&config);
 
     if cli.no_render {
@@ -724,6 +763,67 @@ fn main() {
 }
 
 // ── Pure helpers (extracted for testability) ─────────────────────────────
+
+/// Build the free-life options from the parsed flags and the resolved config.
+fn free_life_options_from_cli(
+    cli: &Cli,
+    config: &FullConfig,
+) -> Result<headless::FreeLifeOptions, String> {
+    if cli.free_life_agents == 0 || cli.free_life_agents > MAX_AGENTS {
+        return Err(format!(
+            "--free-life-agents must be in 1..={}, got {}",
+            MAX_AGENTS, cli.free_life_agents
+        ));
+    }
+    if cli.free_life_ticks == 0 {
+        return Err("--free-life-ticks must be greater than 0".to_string());
+    }
+    if cli.free_life_champion_node.is_some() && cli.free_life_champion_db.is_none() {
+        return Err("--free-life-champion-node requires --free-life-champion-db".to_string());
+    }
+    let lesions = headless::parse_lesions(&cli.free_life_lesion).map_err(|e| e.to_string())?;
+    let brain_source = match &cli.free_life_champion_db {
+        Some(db_path) => headless::BrainSource::Champion {
+            db_path: db_path.clone(),
+            node_id: cli.free_life_champion_node,
+        },
+        None => headless::BrainSource::Fresh,
+    };
+    Ok(headless::FreeLifeOptions {
+        agent_count: cli.free_life_agents,
+        ticks: cli.free_life_ticks,
+        seed: config.world.seed,
+        brain_source,
+        lesions,
+        log_path: cli.free_life_log.clone(),
+    })
+}
+
+/// Run one free life and emit its JSON report; exits with status 1 on error.
+fn run_free_life_cli(cli: &Cli, config: &FullConfig) {
+    let fail = |msg: String| -> ! {
+        eprintln!("Error: {}", msg);
+        std::process::exit(1);
+    };
+    let options = free_life_options_from_cli(cli, config).unwrap_or_else(|e| fail(e));
+    let report = headless::run_free_life(config, &options)
+        .unwrap_or_else(|e| fail(format!("free life failed: {}", e)));
+    let json = serde_json::to_string_pretty(&report)
+        .unwrap_or_else(|e| fail(format!("cannot serialise report: {}", e)));
+    match &cli.free_life_out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, json) {
+                fail(format!("cannot write '{}': {}", path.display(), e));
+            }
+            eprintln!(
+                "Free life: {} agents, report written to {}",
+                report.agents.len(),
+                path.display()
+            );
+        }
+        None => println!("{}", json),
+    }
+}
 
 /// Map speed multiplier to a compact display label.
 fn speed_label(multiplier: u32) -> &'static str {
@@ -744,6 +844,106 @@ fn speed_label(multiplier: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xagent_brain::buffers::TrunkLesions;
+
+    fn parse_options(args: &[&str]) -> Result<headless::FreeLifeOptions, String> {
+        let mut argv = vec!["xagent", "--free-life"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).expect("flags parse");
+        free_life_options_from_cli(&cli, &FullConfig::default())
+    }
+
+    #[test]
+    fn free_life_defaults_are_ten_agents_300000_ticks_fresh_no_lesions() {
+        let o = parse_options(&[]).expect("defaults are valid");
+        assert_eq!(o.agent_count, 10);
+        assert_eq!(o.ticks, 300_000);
+        assert_eq!(o.lesions, TrunkLesions::NONE);
+        assert_eq!(o.brain_source, headless::BrainSource::Fresh);
+        assert!(o.log_path.is_none());
+    }
+
+    #[test]
+    fn free_life_seed_flows_from_seed_flag() {
+        let cli =
+            Cli::try_parse_from(["xagent", "--free-life", "--seed", "5"]).expect("flags parse");
+        let config = resolve_config(&cli);
+        let o = free_life_options_from_cli(&cli, &config).expect("valid");
+        assert_eq!(o.seed, 5);
+    }
+
+    #[test]
+    fn free_life_lesion_list_is_parsed() {
+        let o = parse_options(&["--free-life-lesion", "turn-weights,critic"]).expect("valid");
+        assert!(o.lesions.turn_weights && o.lesions.critic);
+        assert!(!o.lesions.forward_weights && !o.lesions.memory_blend);
+        let o = parse_options(&["--free-life-lesion", "all"]).expect("valid");
+        assert!(
+            o.lesions.turn_weights
+                && o.lesions.forward_weights
+                && o.lesions.memory_blend
+                && o.lesions.critic
+        );
+    }
+
+    #[test]
+    fn free_life_unknown_lesion_is_rejected() {
+        assert!(parse_options(&["--free-life-lesion", "Critic"]).is_err());
+        assert!(parse_options(&["--free-life-lesion", "turn-weights,,critic"]).is_err());
+    }
+
+    #[test]
+    fn free_life_champion_node_without_db_is_rejected() {
+        let err = parse_options(&["--free-life-champion-node", "3"]).expect_err("rejected");
+        assert_eq!(
+            err,
+            "--free-life-champion-node requires --free-life-champion-db"
+        );
+    }
+
+    #[test]
+    fn free_life_agent_count_outside_range_is_rejected() {
+        let err = parse_options(&["--free-life-agents", "0"]).expect_err("rejected");
+        assert_eq!(
+            err,
+            format!("--free-life-agents must be in 1..={}, got 0", MAX_AGENTS)
+        );
+        let over = (MAX_AGENTS + 1).to_string();
+        assert!(parse_options(&["--free-life-agents", &over]).is_err());
+        let max = MAX_AGENTS.to_string();
+        assert!(parse_options(&["--free-life-agents", &max]).is_ok());
+    }
+
+    #[test]
+    fn free_life_zero_ticks_is_rejected() {
+        assert!(parse_options(&["--free-life-ticks", "0"]).is_err());
+    }
+
+    #[test]
+    fn free_life_champion_db_and_node_map_to_champion_source() {
+        let o = parse_options(&[
+            "--free-life-champion-db",
+            "x.db",
+            "--free-life-champion-node",
+            "3",
+        ])
+        .expect("valid");
+        assert_eq!(
+            o.brain_source,
+            headless::BrainSource::Champion {
+                db_path: "x.db".to_string(),
+                node_id: Some(3),
+            }
+        );
+        let o = parse_options(&["--free-life-champion-db", "x.db"]).expect("valid");
+        assert_eq!(
+            o.brain_source,
+            headless::BrainSource::Champion {
+                db_path: "x.db".to_string(),
+                node_id: None,
+            }
+        );
+    }
 
     // ── speed_label ──────────────────────────────────────────────────
 

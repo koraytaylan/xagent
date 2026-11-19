@@ -11,8 +11,8 @@ touches:
   - crates/xagent-sandbox/src/free_life/mod.rs
   - crates/xagent-sandbox/src/free_life/metrics.rs
   - crates/xagent-sandbox/src/free_life/tick_log.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "329a1a2f33f8db0e095eb47fb42d8e283b503beb"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib free_life::"

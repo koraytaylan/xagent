@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: free-life harness and trunk lesions
@@ -17,3 +17,7 @@ Progress: 0/9 tasks complete.
 | tasks/0403-free-life-cli.md | free-life-cli | todo |
 | tasks/0404-free-life-cli-exit-test.md | free-life-cli-exit-test | todo |
 | tasks/0501-trunk-lesion-matrix.md | trunk-lesion-matrix | todo |
+
+## Factory runs
+
+- 2026-11-19 21:01:51Z — completed 9/9; final plan gates passed

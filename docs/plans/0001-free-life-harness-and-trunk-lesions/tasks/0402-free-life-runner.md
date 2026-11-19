@@ -7,8 +7,8 @@ role: developer
 depends_on: [kernel-lesions-and-probe, read-only-champion-loader, free-life-metrics-and-log]
 gated: false
 touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/free_life.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "5c563cdf4a25b87a5cf473cfcf6c69a8cdd331c0"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test free_life"

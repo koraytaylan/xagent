@@ -1450,6 +1450,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Thread 0: form δ (using s_value) and update the scalar biases.
         if (tid == 0u) {
             var value: f32 = brain_state[brain_base + O_VALUE_BIAS] + s_value;
+            if (lesion_critic()) {
+                value = brain_state[brain_base + O_VALUE_BIAS];
+            }
             // Reward is the immediate urgency-amplified homeostatic delta
             // accrued since the previous brain tick.
             // ── Homeostatic predictive credit blend (homeostatic gradient predictor head) ──────────
@@ -1650,7 +1653,15 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             }
             workgroupBarrier();
             wg_reduce_dense(tid);
-            if (tid == 0u) { s_turn_dot = s_dense_partials[0]; }
+            if (tid == 0u) {
+                // The probe keeps the computed dot; the turn lesion leaves it
+                // out of `turn` by zeroing the trunk term.
+                if (brain_tick_probe_enabled()) {
+                    decision_buffer[decision_base + DECISION_PROBE + PROBE_ENCODING_TURN_OUTPUT] =
+                        s_dense_partials[0];
+                }
+                s_turn_dot = select(s_dense_partials[0], 0.0, lesion_turn_weights());
+            }
             workgroupBarrier();
         }
     }
@@ -1718,11 +1729,14 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // has no bias, so it can only turn in response to what it senses.
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
         var turn: f32 = s_turn_dot + scent_dot + vision_dot;
+        if (lesion_forward_weights()) {
+            forward = brain_state[brain_base + O_ACT_BIASES];
+        }
 
         // Memory blend: recalled experiences influence motor output via valence.
         // Positive valence (food memory) + similar state → reproduce approach action.
         // Negative valence (danger memory) + similar state → negate approach → escape.
-        if (recall_count > 0u) {
+        if (recall_count > 0u && !lesion_memory_blend()) {
             var mem_forward: f32 = 0.0;
             var mem_turn: f32 = 0.0;
             var total_weight: f32 = 0.0;
@@ -1882,6 +1896,35 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Slot 3 is TD-error telemetry for CPU readback.
         decision_buffer[decision_base + DECISION_MOTOR + 3u] = s_pred_td[S_TD_ERROR];
 
+        // Measurement block: scalar fields and pathway inputs, written only
+        // while the probe is enabled.
+        if (brain_tick_probe_enabled()) {
+            let probe_base = decision_base + DECISION_PROBE;
+            decision_buffer[probe_base + PROBE_PATHWAY_INPUTS] =
+                brain_state[brain_base + O_SCENT_WHITENED];
+            decision_buffer[probe_base + PROBE_PATHWAY_INPUTS + 1u] =
+                brain_state[brain_base + O_SCENT_WHITENED + 1u];
+            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                decision_buffer[probe_base + PROBE_PATHWAY_INPUTS + 2u + k] =
+                    brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
+            }
+            decision_buffer[probe_base + PROBE_REWARD] = s_pred_td[S_REWARD];
+            decision_buffer[probe_base + PROBE_VALUE] = brain_state[brain_base + O_PREV_VALUE];
+            decision_buffer[probe_base + PROBE_TD_ERROR] = s_pred_td[S_TD_ERROR];
+            decision_buffer[probe_base + PROBE_FORWARD_NOISE] = s_explore[0u];
+            decision_buffer[probe_base + PROBE_TURN_NOISE] = s_explore[1u];
+            decision_buffer[probe_base + PROBE_TURN_INNOVATION] = s_explore[2u];
+            // Recomputed from the stored inputs: a second use of `scent_dot`
+            // would let the compiler contract the turn sum differently.
+            decision_buffer[probe_base + PROBE_SCENT_TURN_OUTPUT] =
+                brain_state[brain_base + O_SCENT_TURN_WEIGHTS]
+                    * brain_state[brain_base + O_SCENT_WHITENED]
+                + brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u]
+                    * brain_state[brain_base + O_SCENT_WHITENED + 1u];
+            decision_buffer[probe_base + PROBE_VISION_TURN_OUTPUT] = vision_dot;
+            decision_buffer[probe_base + PROBE_ENCODING_FORWARD_OUTPUT] = s_forward_dot;
+        }
+
         // Write telemetry to physics buffer for CPU readback
         let phys_base = agent_id * PHYS_STRIDE;
         physics_state[phys_base + P_PREDICTION_ERROR] = s_pred_td[S_PRED_ERROR];
@@ -1905,6 +1948,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     // ── Per-dimension credit copy: threads 0..ENCODED_DIMENSION ──
     if (tid < ENCODED_DIMENSION) {
         decision_buffer[decision_base + DECISION_CREDIT + tid] = s_credit[tid];
+        if (brain_tick_probe_enabled()) {
+            decision_buffer[decision_base + DECISION_PROBE + PROBE_ENCODING + tid] = s_memory_key[tid];
+        }
     }
     workgroupBarrier();
 
@@ -2261,7 +2307,11 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     if (tid == 0u) {
         let key_norm_sq = brain_state[brain_base + O_RECENT_NORMS + replay_slot];
         let replay_value = brain_state[brain_base + O_VALUE_BIAS] + s_dense_partials[0];
-        let replay_error = brain_state[brain_base + O_RECENT_RETURNS + replay_slot] - replay_value;
+        let replay_error = brain_state[brain_base + O_RECENT_RETURNS + replay_slot] - select(
+            replay_value,
+            brain_state[brain_base + O_VALUE_BIAS],
+            lesion_critic(),
+        );
         s_value = select(
             0.0,
             CRITIC_REPLAY_RATE * replay_error / (1.0 + key_norm_sq),

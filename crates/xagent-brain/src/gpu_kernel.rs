@@ -853,6 +853,11 @@ pub struct GpuKernel {
     /// [`CFG_FREEZE_STEERING_WEIGHTS`] so the turn policy stays at the
     /// uploaded weights. Unset by default, including during evolution.
     freeze_steering_weights: bool,
+    /// Trunk lesions packed into every brain-config upload. None by default.
+    trunk_lesions: TrunkLesions,
+    /// When set, the brain pass writes the measurement block of the decision
+    /// buffer every brain tick. Off by default.
+    brain_tick_probe: bool,
 
     // ── Reused world-config upload scratch (avoids a per-batch heap alloc) ──
     world_config_scratch: [f32; WORLD_CONFIG_SIZE],
@@ -1161,7 +1166,75 @@ impl GpuKernel {
     fn packed_brain_config(&self, brain_config: &BrainConfig) -> Vec<f32> {
         let mut cfg = build_config_for(brain_config, &self.layout);
         pack_freeze_steering_weights(&mut cfg, self.freeze_steering_weights);
+        pack_trunk_lesions(&mut cfg, self.trunk_lesions);
+        pack_brain_tick_probe(&mut cfg, self.brain_tick_probe);
         cfg
+    }
+
+    /// Write one brain-config slot immediately.
+    fn write_config_slot(&self, slot: usize, value: bool) {
+        let packed = [if value { 1.0_f32 } else { 0.0 }];
+        let byte_offset = u64::try_from(slot * std::mem::size_of::<f32>()).unwrap_or(0);
+        self.queue.write_buffer(
+            &self.brain_config_buffer,
+            byte_offset,
+            bytemuck::cast_slice(&packed),
+        );
+    }
+
+    /// Select the trunk lesions. Written into the brain-config uniform at once
+    /// and again on every later agent reset.
+    pub fn set_trunk_lesions(&mut self, lesions: TrunkLesions) {
+        self.trunk_lesions = lesions;
+        self.write_config_slot(CFG_LESION_TURN_WEIGHTS, lesions.turn_weights);
+        self.write_config_slot(CFG_LESION_FORWARD_WEIGHTS, lesions.forward_weights);
+        self.write_config_slot(CFG_LESION_MEMORY_BLEND, lesions.memory_blend);
+        self.write_config_slot(CFG_LESION_CRITIC, lesions.critic);
+    }
+
+    /// The trunk lesions currently applied.
+    pub fn trunk_lesions(&self) -> TrunkLesions {
+        self.trunk_lesions
+    }
+
+    /// Enable or disable the per-tick measurement block in the decision buffer.
+    pub fn set_brain_tick_probe(&mut self, enabled: bool) {
+        self.brain_tick_probe = enabled;
+        self.write_config_slot(CFG_BRAIN_TICK_PROBE, enabled);
+    }
+
+    /// Whether the measurement block is being written.
+    pub fn brain_tick_probe_enabled(&self) -> bool {
+        self.brain_tick_probe
+    }
+
+    /// Copy the whole decision buffer once and decode every agent's probe.
+    /// On any failure this logs and leaves `out` empty.
+    pub fn read_brain_tick_probes_blocking(&self, out: &mut Vec<BrainTickProbe>) {
+        out.clear();
+        let n = self.agent_count as usize;
+        let mut raw = Vec::with_capacity(n * DECISION_STRIDE);
+        self.read_buffer_range(
+            &self.decision_buffer,
+            0,
+            (n * DECISION_STRIDE * std::mem::size_of::<f32>()) as u64,
+            &mut raw,
+        );
+        let mut decoded = Vec::with_capacity(n);
+        for record in raw.chunks(DECISION_STRIDE).take(n) {
+            match BrainTickProbe::from_decision_record(record) {
+                Some(p) => decoded.push(p),
+                None => {
+                    log::error!("[GpuKernel] Brain-tick probe readback returned a short record");
+                    return;
+                }
+            }
+        }
+        if decoded.len() != n {
+            log::error!("[GpuKernel] Brain-tick probe readback returned too few records");
+            return;
+        }
+        *out = decoded;
     }
 
     /// Hold (`true`) or release (`false`) the turn-policy weights. The flag is
@@ -2228,6 +2301,8 @@ impl GpuKernel {
             danger_percept_enabled: brain_config.danger_percept_enabled,
             danger_percept_blinded: brain_config.danger_percept_blinded,
             freeze_steering_weights: false,
+            trunk_lesions: TrunkLesions::NONE,
+            brain_tick_probe: false,
             has_subgroup,
             world_config_scratch: [0.0; WORLD_CONFIG_SIZE],
             probe: DispatchProbe::from_env(),

@@ -3,6 +3,8 @@
 //! Uses GpuKernel for all simulation — physics, brain, food, and
 //! death/respawn run entirely on GPU via fused kernel dispatch.
 
+use std::fmt;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use log::info;
@@ -11,19 +13,23 @@ use serde::{Deserialize, Serialize};
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
-    BrainLayout, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS,
-    O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE,
+    BrainLayout, BrainTickProbe, TrunkLesions, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS,
+    O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE,
     P_APPROACH_SENSE_RANGE_TICKS, P_APPROACH_TURNS_TOWARD, P_AVOIDANCE_SENSE_RANGE_TICKS,
     P_AVOIDANCE_TURNS_OPPOSING, P_AVOIDANCE_TURN_AWAY, P_DANGER_PATH_LENGTH, P_DEATH_COUNT,
-    P_DISTANCE_TRAVELED, P_ENERGY_SPENT, P_FOOD_COUNT, P_HAZARD_ENTRIES, P_POS_X, P_POS_Y, P_POS_Z,
-    P_TICKS_ALIVE,
+    P_DISTANCE_TRAVELED, P_ENERGY_SPENT, P_FOOD_COUNT, P_HAZARD_ENTRIES, P_IN_DANGER_BIOME,
+    P_MOTOR_TURN_OUT, P_NEAREST_DANGER_BEARING, P_NEAREST_DANGER_DISTANCE, P_NEAREST_FOOD_BEARING,
+    P_NEAREST_FOOD_DISTANCE, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE, TD_TRACE_DECAY,
 };
 use xagent_brain::{AgentBrainState, GpuKernel};
 
-use crate::agent::{fresh_brain_state, steering_population, Agent};
+use crate::agent::{fresh_brain_state, steering_population, Agent, MAX_AGENTS};
+use crate::free_life::metrics::{AgentAccumulator, AgentMetrics, FreeLifeSample, MetricsConfig};
+use crate::free_life::tick_log::TickLogWriter;
 use crate::governor::{
     compute_approach_intent_fraction, compute_avoidance_intent_fraction,
-    compute_danger_dwell_fraction, AdvanceResult, ChampionCapture, Governor,
+    compute_danger_dwell_fraction, load_champion_read_only, AdvanceResult, ChampionCapture,
+    ChampionLoadError, Governor,
 };
 use crate::world::WorldState;
 
@@ -1429,6 +1435,477 @@ fn print_validation_metrics(baseline: &ValidationStats, on_stats: &ValidationSta
             .collect::<Vec<_>>()
             .join(", ")
     );
+}
+
+/// Where a free life's birth brain comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrainSource {
+    /// One freshly seeded birth brain shared by every agent.
+    Fresh,
+    /// The stored champion of a governor database, read only.
+    Champion {
+        /// Path of the governor database.
+        db_path: String,
+        /// Node to load; `None` selects the newest stored champion.
+        node_id: Option<i64>,
+    },
+}
+
+/// Default number of agents in a free life.
+pub const DEFAULT_FREE_LIFE_AGENTS: usize = 10;
+
+/// Default number of simulation ticks in a free life.
+pub const DEFAULT_FREE_LIFE_TICKS: u64 = 300_000;
+
+/// Name of the `turn-weights` lesion in a lesion list.
+const LESION_TURN_WEIGHTS: &str = "turn-weights";
+/// Name of the `forward-weights` lesion in a lesion list.
+const LESION_FORWARD_WEIGHTS: &str = "forward-weights";
+/// Name of the `memory-blend` lesion in a lesion list.
+const LESION_MEMORY_BLEND: &str = "memory-blend";
+/// Name of the `critic` lesion in a lesion list.
+const LESION_CRITIC: &str = "critic";
+/// List entry selecting every lesion.
+const LESION_ALL: &str = "all";
+/// List entry selecting no lesion.
+const LESION_NONE: &str = "none";
+
+/// Report label of a freshly seeded birth brain.
+const SOURCE_FRESH: &str = "fresh";
+/// Report label of a stored champion birth brain.
+const SOURCE_CHAMPION: &str = "champion";
+
+/// Options of one seeded free life.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreeLifeOptions {
+    /// Number of agents, in `1..=MAX_AGENTS`.
+    pub agent_count: usize,
+    /// Simulation ticks; a non-zero multiple of the kernel batch size.
+    pub ticks: u64,
+    /// Seed of the world and of every random choice.
+    pub seed: u64,
+    /// Birth brain source.
+    pub brain_source: BrainSource,
+    /// Trunk parts left out of the brain.
+    pub lesions: TrunkLesions,
+    /// Optional per-tick log file.
+    pub log_path: Option<PathBuf>,
+}
+
+/// Why a free life could not run.
+#[derive(Debug)]
+pub enum FreeLifeError {
+    /// No GPU adapter is available.
+    NoGpu,
+    /// The brain config's vision stride is not 1.
+    VisionStride(u32),
+    /// The agent count is outside `1..=MAX_AGENTS`.
+    AgentCount(usize),
+    /// The tick count is zero or not a multiple of the kernel batch size.
+    Ticks {
+        /// Requested ticks.
+        ticks: u64,
+        /// Kernel batch size.
+        batch: u32,
+    },
+    /// A lesion list names an unknown part.
+    UnknownLesion(String),
+    /// The champion could not be loaded.
+    ChampionLoad(ChampionLoadError),
+    /// The champion's brain does not fit its config's layout.
+    ChampionLayout {
+        /// Brain length the config's layout needs.
+        expected: usize,
+        /// Brain length stored.
+        found: usize,
+    },
+    /// A readback returned fewer values than the run needs.
+    ReadbackLength {
+        /// Which readback.
+        what: &'static str,
+        /// Values needed.
+        expected: usize,
+        /// Values returned.
+        found: usize,
+    },
+    /// The tick log could not be written.
+    LogIo(String),
+}
+
+impl fmt::Display for FreeLifeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoGpu => write!(f, "no GPU adapter available"),
+            Self::VisionStride(s) => write!(f, "vision stride must be 1, got {s}"),
+            Self::AgentCount(n) => write!(f, "agent count must be in 1..={MAX_AGENTS}, got {n}"),
+            Self::Ticks { ticks, batch } => write!(
+                f,
+                "ticks must be a non-zero multiple of the kernel batch size {batch}, got {ticks}"
+            ),
+            Self::UnknownLesion(name) => write!(f, "unknown lesion '{name}'"),
+            Self::ChampionLoad(err) => write!(f, "cannot load champion: {err}"),
+            Self::ChampionLayout { expected, found } => write!(
+                f,
+                "champion brain has {found} values, its config needs {expected}"
+            ),
+            Self::ReadbackLength {
+                what,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{what} readback returned {found} values, expected {expected}"
+            ),
+            Self::LogIo(msg) => write!(f, "tick log error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for FreeLifeError {}
+
+/// Result of one seeded free life.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FreeLifeReport {
+    pub agent_count: usize,
+    pub ticks: u64,
+    pub seed: u64,
+    /// `"fresh"` or `"champion"`.
+    pub brain_source: String,
+    pub champion_node_id: Option<i64>,
+    pub champion_generation: Option<i64>,
+    /// Names of the lesioned parts.
+    pub lesions: Vec<String>,
+    pub kernel_batch_size: u32,
+    /// Brain ticks run (one sample per agent each).
+    pub brain_ticks: u64,
+    pub agents: Vec<AgentMetrics>,
+}
+
+/// Parse a comma list of lesion names into a lesion set.
+pub fn parse_lesions(list: &str) -> Result<TrunkLesions, FreeLifeError> {
+    let mut lesions = TrunkLesions::NONE;
+    if list.trim().is_empty() {
+        return Ok(lesions);
+    }
+    for item in list.split(',') {
+        match item.trim() {
+            LESION_TURN_WEIGHTS => lesions.turn_weights = true,
+            LESION_FORWARD_WEIGHTS => lesions.forward_weights = true,
+            LESION_MEMORY_BLEND => lesions.memory_blend = true,
+            LESION_CRITIC => lesions.critic = true,
+            LESION_ALL => lesions = TrunkLesions::ALL,
+            LESION_NONE => {}
+            other => return Err(FreeLifeError::UnknownLesion(other.to_string())),
+        }
+    }
+    Ok(lesions)
+}
+
+/// Names of the lesioned parts, in a fixed order.
+pub fn lesion_names(lesions: TrunkLesions) -> Vec<&'static str> {
+    [
+        (lesions.turn_weights, LESION_TURN_WEIGHTS),
+        (lesions.forward_weights, LESION_FORWARD_WEIGHTS),
+        (lesions.memory_blend, LESION_MEMORY_BLEND),
+        (lesions.critic, LESION_CRITIC),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect()
+}
+
+/// Birth brain and config chosen by the options.
+struct Birth {
+    brain_config: BrainConfig,
+    champion_brain: Option<AgentBrainState>,
+    node_id: Option<i64>,
+    generation: Option<i64>,
+}
+
+/// Resolve the birth source, check its layout and the vision stride.
+fn resolve_birth(config: &FullConfig, source: &BrainSource) -> Result<Birth, FreeLifeError> {
+    let birth = match source {
+        BrainSource::Fresh => Birth {
+            brain_config: config.brain.clone(),
+            champion_brain: None,
+            node_id: None,
+            generation: None,
+        },
+        BrainSource::Champion { db_path, node_id } => {
+            let stored =
+                load_champion_read_only(db_path, *node_id).map_err(FreeLifeError::ChampionLoad)?;
+            let expected = BrainLayout::from_config(&stored.config).brain_stride;
+            let found = stored.brain.brain_state.len();
+            if expected != found {
+                return Err(FreeLifeError::ChampionLayout { expected, found });
+            }
+            Birth {
+                brain_config: stored.config,
+                champion_brain: Some(stored.brain),
+                node_id: Some(stored.node_id),
+                generation: Some(stored.generation),
+            }
+        }
+    };
+    if birth.brain_config.vision_stride != 1 {
+        return Err(FreeLifeError::VisionStride(
+            birth.brain_config.vision_stride,
+        ));
+    }
+    Ok(birth)
+}
+
+/// Build the world and create the kernel without uploading anything.
+fn create_kernel(
+    config: &FullConfig,
+    brain_config: &BrainConfig,
+    options: &FreeLifeOptions,
+) -> (GpuKernel, WorldState) {
+    let mut world_config = config.world.clone();
+    world_config.seed = options.seed;
+    let world = WorldState::new(world_config.clone());
+    let kernel = GpuKernel::new(
+        u32::try_from(options.agent_count).unwrap_or(u32::MAX),
+        world.food_items.len(),
+        brain_config,
+        &world_config,
+    );
+    (kernel, world)
+}
+
+/// Upload the world and the agents to the kernel.
+fn upload_kernel(
+    kernel: &GpuKernel,
+    world: &WorldState,
+    brain_config: &BrainConfig,
+    options: &FreeLifeOptions,
+) {
+    let biomes = world.biome_map.grid_as_u32();
+    let food_pos: Vec<(f32, f32, f32)> = world
+        .food_items
+        .iter()
+        .map(|f| (f.position.x, f.position.y, f.position.z))
+        .collect();
+    let food_consumed: Vec<bool> = world.food_items.iter().map(|f| f.consumed).collect();
+    let food_timers: Vec<f32> = world.food_items.iter().map(|f| f.respawn_timer).collect();
+    kernel.upload_world(
+        &world.terrain.heights,
+        &biomes,
+        &food_pos,
+        &food_consumed,
+        &food_timers,
+    );
+    let agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)> = (0..options.agent_count)
+        .map(|i| {
+            let id = u32::try_from(i).unwrap_or(u32::MAX);
+            let agent = Agent::new(id, world.safe_spawn_position(), id, brain_config.clone(), 0);
+            (
+                agent.body.body.position,
+                agent.body.body.internal.max_energy,
+                agent.body.body.internal.max_integrity,
+                brain_config.memory_capacity,
+                brain_config.processing_slots,
+            )
+        })
+        .collect();
+    kernel.upload_agents(&agent_data);
+}
+
+/// Convert a non-negative kernel counter held in an `f32` to a count.
+fn counter_value(v: f32) -> u64 {
+    if v.is_finite() && v > 0.0 {
+        v.round() as u64
+    } else {
+        0
+    }
+}
+
+/// Build one agent's sample from its physics row and the brain-tick probe.
+fn build_sample(brain_tick: u64, phys: &[f32], probe: &BrainTickProbe) -> FreeLifeSample {
+    FreeLifeSample {
+        brain_tick,
+        alive: phys[P_ALIVE] > 0.5,
+        meals_total: counter_value(phys[P_FOOD_COUNT]),
+        deaths_total: counter_value(phys[P_DEATH_COUNT]),
+        on_hazard: phys[P_IN_DANGER_BIOME] > 0.5,
+        motor_turn: phys[P_MOTOR_TURN_OUT],
+        food_distance: phys[P_NEAREST_FOOD_DISTANCE],
+        food_bearing: phys[P_NEAREST_FOOD_BEARING],
+        hazard_distance: phys[P_NEAREST_DANGER_DISTANCE],
+        hazard_bearing: phys[P_NEAREST_DANGER_BEARING],
+        encoding: probe.encoding.to_vec(),
+        pathway_inputs: probe.pathway_inputs,
+        reward: probe.reward,
+        value: probe.value,
+        td_error: probe.td_error,
+        forward_noise: probe.forward_noise,
+        turn_noise: probe.turn_noise,
+        turn_innovation: probe.turn_innovation,
+        encoding_turn_output: probe.encoding_turn_output,
+        scent_turn_output: probe.scent_turn_output,
+        vision_turn_output: probe.vision_turn_output,
+        encoding_forward_output: probe.encoding_forward_output,
+    }
+}
+
+/// Feed one brain tick's samples to the accumulators and the optional log.
+fn feed_tick(
+    brain_tick: u64,
+    probes: &[BrainTickProbe],
+    state: &[f32],
+    accumulators: &mut [AgentAccumulator],
+    writer: &mut Option<TickLogWriter>,
+) -> Result<(), FreeLifeError> {
+    let agents = accumulators.len();
+    if probes.len() != agents {
+        return Err(FreeLifeError::ReadbackLength {
+            what: "brain tick probe",
+            expected: agents,
+            found: probes.len(),
+        });
+    }
+    let needed = agents.saturating_mul(PHYS_STRIDE);
+    if state.len() < needed {
+        return Err(FreeLifeError::ReadbackLength {
+            what: "physics state",
+            expected: needed,
+            found: state.len(),
+        });
+    }
+    for (i, (acc, probe)) in accumulators.iter_mut().zip(probes).enumerate() {
+        let phys = &state[i * PHYS_STRIDE..(i + 1) * PHYS_STRIDE];
+        let sample = build_sample(brain_tick, phys, probe);
+        acc.push(&sample);
+        if let Some(w) = writer.as_mut() {
+            let agent = u32::try_from(i).unwrap_or(u32::MAX);
+            w.write_sample(agent, &sample)
+                .map_err(|e| FreeLifeError::LogIo(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the birth brain and heritable config to every agent.
+fn seed_birth_brains(
+    kernel: &GpuKernel,
+    birth: &Birth,
+    agent_count: usize,
+    rng: &mut rand::rngs::SmallRng,
+) {
+    let state = match &birth.champion_brain {
+        Some(brain) => brain.clone(),
+        None => fresh_brain_state(&birth.brain_config, rng),
+    };
+    for i in 0..agent_count {
+        let idx = u32::try_from(i).unwrap_or(u32::MAX);
+        kernel.write_agent_state(idx, &state);
+        kernel.write_agent_heritable_config(idx, &birth.brain_config);
+    }
+}
+
+/// Dispatch every batch and feed each brain tick's samples.
+fn run_batches(
+    kernel: &mut GpuKernel,
+    batches: u64,
+    batch_size: u32,
+    accumulators: &mut [AgentAccumulator],
+    writer: &mut Option<TickLogWriter>,
+) -> Result<(), FreeLifeError> {
+    let mut probes: Vec<BrainTickProbe> = Vec::new();
+    for batch in 0..batches {
+        // `dispatch_batch` always reports success.
+        let _dispatched = kernel.dispatch_batch(batch * u64::from(batch_size), batch_size);
+        // The probe read borrows the kernel shared and the physics read borrows
+        // it mutably, so the probe read goes first.
+        probes.clear();
+        kernel.read_brain_tick_probes_blocking(&mut probes);
+        let state = kernel.read_full_state_blocking();
+        feed_tick(batch, &probes, state, accumulators, writer)?;
+    }
+    Ok(())
+}
+
+/// Run one seeded free life and report per-agent metrics.
+pub fn run_free_life(
+    config: &FullConfig,
+    options: &FreeLifeOptions,
+) -> Result<FreeLifeReport, FreeLifeError> {
+    if !GpuKernel::is_available() {
+        return Err(FreeLifeError::NoGpu);
+    }
+    if options.agent_count == 0 || options.agent_count > MAX_AGENTS {
+        return Err(FreeLifeError::AgentCount(options.agent_count));
+    }
+    let birth = resolve_birth(config, &options.brain_source)?;
+    let (mut kernel, world) = create_kernel(config, &birth.brain_config, options);
+    let batch_size = kernel.kernel_batch_size();
+    if options.ticks == 0 || options.ticks % u64::from(batch_size) != 0 {
+        return Err(FreeLifeError::Ticks {
+            ticks: options.ticks,
+            batch: batch_size,
+        });
+    }
+    upload_kernel(&kernel, &world, &birth.brain_config, options);
+    let batches = options.ticks / u64::from(batch_size);
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(options.seed);
+    kernel.reset_agents_seeded(&birth.brain_config, rng.random());
+    seed_birth_brains(&kernel, &birth, options.agent_count, &mut rng);
+    kernel.set_trunk_lesions(options.lesions);
+    kernel.set_brain_tick_probe(true);
+
+    let expected_rows = u64::try_from(options.agent_count)
+        .ok()
+        .and_then(|n| n.checked_mul(batches))
+        .unwrap_or(u64::MAX);
+    let mut writer = match &options.log_path {
+        Some(path) => Some(
+            TickLogWriter::create(path, expected_rows)
+                .map_err(|e| FreeLifeError::LogIo(e.to_string()))?,
+        ),
+        None => None,
+    };
+    let metrics_config = MetricsConfig {
+        trace_decay: f64::from(TD_TRACE_DECAY),
+        total_brain_ticks: batches,
+    };
+    let mut accumulators: Vec<AgentAccumulator> = (0..options.agent_count)
+        .map(|_| AgentAccumulator::new(metrics_config))
+        .collect();
+    run_batches(
+        &mut kernel,
+        batches,
+        batch_size,
+        &mut accumulators,
+        &mut writer,
+    )?;
+    if let Some(w) = writer {
+        w.finish()
+            .map_err(|e| FreeLifeError::LogIo(e.to_string()))?;
+    }
+    let from_champion = birth.node_id.is_some();
+    Ok(FreeLifeReport {
+        agent_count: options.agent_count,
+        ticks: options.ticks,
+        seed: options.seed,
+        brain_source: if from_champion {
+            SOURCE_CHAMPION
+        } else {
+            SOURCE_FRESH
+        }
+        .to_string(),
+        champion_node_id: birth.node_id,
+        champion_generation: birth.generation,
+        lesions: lesion_names(options.lesions)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        kernel_batch_size: batch_size,
+        brain_ticks: batches,
+        agents: accumulators
+            .into_iter()
+            .map(AgentAccumulator::finish)
+            .collect(),
+    })
 }
 
 #[cfg(test)]

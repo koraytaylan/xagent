@@ -19,7 +19,7 @@ objective: >-
   and the within-life learning need. Default behaviour stays bit-identical,
   checked by a seeded headless run against a digest captured at the baseline.
 depends_on: []
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

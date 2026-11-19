@@ -94,5 +94,5 @@ Cited authority: the plan owner's standing authorization for automatic repair of
   the same arguments, so no behavior, bound or proof changes.
 - Witness: `cargo run --release -p xagent-sandbox --bin xagent -- --dump-config`
   exits 0 and prints the JSON config, and
-  `grep -rn 'p xagent-sandbox -- ' docs/plans/0002-pathway-critic-and-forward-drive`
+  `grep -rn --exclude=AUTHORIZATION.md 'cargo run.*-p xagent-sandbox -- ' docs/plans/0002-pathway-critic-and-forward-drive`
   finds nothing.

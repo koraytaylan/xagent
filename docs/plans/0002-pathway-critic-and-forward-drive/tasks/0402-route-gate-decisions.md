@@ -39,7 +39,7 @@ checks:
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration"
     timeout_ms: 7200000
   - name: shared-fmt
-    command: "cargo fmt -p xagent-shared -p xagent-sandbox --bin xagent -- --check"
+    command: "cargo fmt -p xagent-shared -p xagent-sandbox -- --check"
     fix: "cargo fmt -p xagent-shared -p xagent-sandbox"
 ---
 

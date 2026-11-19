@@ -15,7 +15,7 @@ checks:
     command: "cargo test -p xagent-sandbox --bin pathway_return_fit"
     timeout_ms: 3600000
   - name: sandbox-fmt
-    command: "cargo fmt -p xagent-sandbox --bin xagent -- --check"
+    command: "cargo fmt -p xagent-sandbox -- --check"
     fix: "cargo fmt -p xagent-sandbox"
   - name: sandbox-clippy
     command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings"

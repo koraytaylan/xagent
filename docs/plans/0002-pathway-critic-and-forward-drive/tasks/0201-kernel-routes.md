@@ -119,7 +119,7 @@ asserts values, and is not ignored. Nine tests:
 - `critic_pathway_mode_freezes_value_weights` (INV-7): value is bias plus pathway dot; `O_VALUE_WEIGHTS` unchanged.
 - `critic_encoding_and_pathway_matches_d6` (INV-7): value and normaliser equal D6.
 - `ring_pathway_keys_equal_stored_input` (INV-7): the store-slot key equals the stored `c`.
-- `critic_death_zeroes_both_traces` (INV-7): both critic traces are zero after death.
+- `critic_death_zeroes_both_traces` (INV-7): both critic traces are zero after death; observed after the respawn tick with the stored pathway inputs set to zero, so all ten pathway trace entries read zero and all 128 `O_TRACE_CRITIC` entries minus the new life's first term read zero.
 
 ## Steps
 

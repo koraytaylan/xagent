@@ -19,3 +19,59 @@ this plan's run.
   task, dependency or behavior changed.
 - Witness: `grep -q -F 'pub const CONFIG_SIZE: usize = 24;' crates/xagent-brain/src/buffers.rs`
   exits 0; all 58 preflight and constraint checks pass on the baseline.
+
+## Corrected requirement: `s_critic_pathway_input` storage class (2026-11-19)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run (task kernel-routes, plan contract blocker).
+
+- Superseded: ARCHITECTURE.md D5 ("a new workgroup array
+  `s_critic_pathway_input`") and the State table row
+  "`s_critic_pathway_input` (workgroup, `PATHWAY_INPUT_COUNT`)".
+- Contradiction: brain-lib, required by task 0201's Done when, pins total
+  workgroup memory: `packed_encoder_shared_estimate_tracks_shader_declarations`
+  asserts `FIXED_WORKGROUP_BYTES = 6_064` (gpu_kernel/packed_encoder.rs:25) and
+  `four_dispatch_shared_bounds_follow_composed_declarations` asserts
+  `RAW_MAIN_SHARED_BOUND = 9_200` (gpu_kernel/four_dispatch_validation.rs:44).
+  A 10-float workgroup array yields 6_112 and 9_248, and both files are outside
+  the task's touches; no in-budget workgroup array is free across the
+  value-to-store window.
+- Correction: the array is module-scope `var<private>` (literal length 10).
+  Every write and read (fill after the `s_value` line, pathway dot, normaliser,
+  trace update, store-pass `O_RECENT_PATHWAY_KEYS` write at `store_slot`) is in
+  a `tid == 0u` block of one invocation, so private storage is semantically
+  identical and adds no shared memory. The store-pass placement, same
+  `store_slot` key, formulas, touches and the shared-memory constants are
+  unchanged. Task 0201's `critic_death_zeroes_both_traces` line now states the
+  observable reachable at the host tick boundary (zero stored pathway inputs:
+  pathway trace reads zero; 128-d trace minus first term reads zero, all
+  entries); the zeroing requirement is not weakened.
+- Witness: the brain-lib check and the focused-proof check
+  (`env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test pathway_routes`)
+  pass on the preserved implementation.
+
+## Repair: publish the kernel-routes storage-class amendment to the base (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run (kernel-routes failed; route-gate-decisions blocked).
+
+- Superseded: the published base records still carried ARCHITECTURE.md D5's
+  "new workgroup array" and the State table "(workgroup, ...)" row, while the
+  amendment above lived only on the plan branch (commit 1bcb430).
+- Contradiction: the kernel-routes reviewer judged against the unamended base
+  wording (it cites D5 line 131 and State table line 292, the base line
+  numbers) and kept rejecting the `var<private>` declaration the amendment
+  requires; the architect could not satisfy both, so the run stopped.
+- Correction: the same amendment text (D5, State table, task 0201's
+  `critic_death_zeroes_both_traces` line and the entry above) is now on the
+  base, so every role reads one contract. No bound, proof, touch, dependency
+  or behavior changes. Source check: every `s_critic_pathway_input` access
+  (brain_passes.wgsl fill, dot/normaliser, trace, store-pass ring write) is in
+  a `tid == 0u` block, and `coop_predict_and_act` and `coop_learn_and_store`
+  run in the same entry point in every composed kernel (brain_tick.wgsl,
+  brain_inner.wgsl, exact_tiled_brain.wgsl,
+  phase_brain_tail_from_scratch.wgsl), so private storage persists across both.
+- Witness: `grep -q -F 'module-scope `var<private>` array' docs/plans/0002-pathway-critic-and-forward-drive/ARCHITECTURE.md`
+  exits 0; on the preserved kernel-routes branch the brain-lib check
+  (`cargo test -p xagent-brain --lib`) and focused-proof
+  (`env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test pathway_routes`) pass.

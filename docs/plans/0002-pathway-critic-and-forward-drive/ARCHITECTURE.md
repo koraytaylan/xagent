@@ -127,9 +127,12 @@ Consequences, fixed here:
 - The critic's pathway input at brain tick `t` is `c_t`: the ten values held
   in `O_SCENT_WHITENED[0..2]` and `O_VISION_PATHWAY_INPUT[0..8]` when the value
   is formed, which are the whitened inputs `x_{t−1}` stored by the previous
-  brain tick (zero at birth). Thread 0 copies `c_t` into a new workgroup array
-  `s_critic_pathway_input` (length `PATHWAY_INPUT_COUNT`) before whitening
-  overwrites the slots; the store pass reads that array.
+  brain tick (zero at birth). Thread 0 copies `c_t` into a new module-scope `var<private>` array
+  `s_critic_pathway_input` (length `PATHWAY_INPUT_COUNT`, literal `10` in the
+  declaration) before whitening overwrites the slots; thread 0 of the same
+  invocation reads it for the pathway dot, normaliser and trace, and its store
+  pass writes it to the ring. Every access is inside a `tid == 0u` block, so no
+  workgroup memory is added and the fixed shared-memory estimates hold.
 - The forward pathway reads this tick's `x_t`, which is in those slots after
   the existing `vision_pathway_step` call in the exploration block.
 - New code is inserted only inside uniform branches on the two config slots.
@@ -289,7 +292,7 @@ this plan's G1 rebuilds the trace per sense as D7 does, and reports plan
 | `O_TRACE_FORWARD_PATHWAY`, `O_TRACE_CRITIC_PATHWAY` | same | zero at birth; accumulate each brain tick; zeroed at death after the terminal step | same |
 | `O_PREV_PATHWAY_INPUT_NORM` | same | zero at birth; rewritten each brain tick at trace time | same |
 | `O_RECENT_PATHWAY_KEYS` | same, store pass | slot written with the ring slot it shadows; survives death | written by threads `< PATHWAY_INPUT_COUNT` before the existing `storageBarrier` |
-| `s_critic_pathway_input` (workgroup, `PATHWAY_INPUT_COUNT`) | `coop_predict_and_act` thread 0 | written at value time (critic modes other than encoding) from the stored whitened slots, read by the store pass of the same invocation; never persisted | written before a `workgroupBarrier`, read after the existing pass barrier |
+| `s_critic_pathway_input` (`var<private>`, `PATHWAY_INPUT_COUNT`) | `coop_predict_and_act` thread 0 | written at value time (critic modes other than encoding) from the stored whitened slots, read only by thread 0 of the same invocation (pathway dot, normaliser, trace, store-pass ring write); never persisted | single-invocation program order; no other thread reads it |
 | Fingerprint fixture | default-fingerprint | recorded once at the plan baseline, read-only afterwards | test reads only |
 | Decision JSON records | critic-input-decision, route-gate-decisions | written once by the measuring architect; read by `verify` | none |
 

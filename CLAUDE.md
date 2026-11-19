@@ -5,7 +5,7 @@ All rules in [CONTRIBUTING.md](CONTRIBUTING.md) must be strictly followed. That 
 
 Enforcement, strongest first:
 - **Machine gate** — `crates/xagent-sandbox/tests/contributing_guard.rs` fails `cargo test` on rules no clippy lint can express: TODO/FIXME markers (hard zero) and *new* planning references in source (ratcheted baseline — debt may only shrink). A violation blocks the merge like any failing test; do not raise the baseline to silence it.
-- **Reviewer pass** — [docs/REVIEW-CHECKLIST.md](docs/REVIEW-CHECKLIST.md) enumerates the judgment-only rules (magic numbers, doc/behavior match, numeric `as` safety, GPU/WGSL/async/concurrency invariants) that the gate cannot catch. Any review — human or the `implement-plan` reviewer agent — runs this before approving.
+- **Reviewer pass** — [docs/REVIEW-CHECKLIST.md](docs/REVIEW-CHECKLIST.md) enumerates the judgment-only rules (magic numbers, doc/behavior match, numeric `as` safety, GPU/WGSL/async/concurrency invariants) that the gate cannot catch. Any review — human or an automated reviewer agent — runs this before approving.
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate

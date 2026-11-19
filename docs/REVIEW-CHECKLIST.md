@@ -1,8 +1,8 @@
 # Reviewer Checklist
 
 A focused pass over the [CONTRIBUTING.md](../CONTRIBUTING.md) rules that **no
-automated gate can catch**. Run this on every change before approval — in the
-`implement-plan` workflow this is the reviewer agent's job; for a human PR it is
+automated gate can catch**. Run this on every change before approval — in an
+automated plan run this is the reviewer agent's job; for a human PR it is
 the reviewer's.
 
 ## What is already machine-enforced — do not spend review effort here

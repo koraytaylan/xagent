@@ -13,14 +13,14 @@ touches:
   - crates/xagent-sandbox/src/pooling_study.rs
   - crates/xagent-sandbox/src/lib.rs
   - crates/xagent-sandbox/examples/pooling_study.rs
-  - docs/decisions/pooling-study.md
+  - docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib pooling_study"
     timeout_ms: 3600000
   - name: verdict
     command: >-
-      sh -c 'grep -Eqx "Verdict: (PORTED|NOT PORTED)" docs/decisions/pooling-study.md'
+      sh -c 'grep -Eqx "Verdict: (PORTED|NOT PORTED)" docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md'
   - name: parity
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored"
     timeout_ms: 5400000
@@ -136,7 +136,7 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
    with output under `$MAKINA_SHELL_JOB/output` and an explicit timeout:
    `cargo run --release -p xagent-sandbox --example pooling_study -- --out-dir <job-dir>`.
    Re-run `--fit-only <job-dir>` and confirm the same table and verdict.
-4. Write `docs/decisions/pooling-study.md`: the
+4. Write `docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`: the
    method (fixed decisions above, in substance); the per-seed and pooled A–D table
    with excluded and above-zero counts; the gate applied line by line with numbers;
    the sanity lines; the winning arm by name; and, only if PORTED, the winning arm's
@@ -149,5 +149,5 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
 - **Done when:** INV-06 is proved: the `focused-proof` check passes with
   `planted_side_cue_is_learned_by_reference_arm`, `cue_free_log_scores_near_zero`,
   `malformed_records_are_rejected` and `gate_matches_fixed_rule` reported ok; the
-  `verdict` check passes against `docs/decisions/pooling-study.md`; and the `parity`
+  `verdict` check passes against `0301-POOLING-DECISION.md`; and the `parity`
   check stays green on the unchanged golden, so the default input is still the hemifields.

@@ -60,7 +60,7 @@ draws and results stay bit-identical to today. No other file changes.
 ## Decisions
 
 - Helper: `pub fn mutate_steering_weights_for(state: &AgentBrainState,
-  feature_count: usize, senses: &[SenseDescriptor], strength: f32, rng: &mut
+  feature_count: usize, senses: &'static [SenseDescriptor], strength: f32, rng: &mut
   impl Rng) -> AgentBrainState`, same visibility and style as its neighbours.
 - Per-sense turn offsets: from `BrainLayout::with_senses(&BrainConfig::default(),
   senses).sense_blocks()`, mapped by the `predictor_context` rule above.

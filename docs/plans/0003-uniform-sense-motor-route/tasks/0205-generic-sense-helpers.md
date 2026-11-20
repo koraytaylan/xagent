@@ -13,6 +13,7 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
   - crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
+  - crates/xagent-brain/src/gpu_kernel.rs
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test scent_pathway --test vision_pathway --test executed_action_credit"
@@ -74,7 +75,9 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
     `sense_forward_weights` (`_FORWARD_WEIGHTS`), `sense_forward_trace`
     (`_FORWARD_TRACE`), `sense_critic_weights` (`_CRITIC_WEIGHTS`),
     `sense_critic_trace` (`_CRITIC_TRACE`).
-  - Add `const SENSE_MAX_CHANNELS: u32 = 8u;` beside them.
+  - Add `const MAX_SENSE_CHANNELS: u32 = 8u;` beside them (the name of the
+    Rust `senses::MAX_SENSE_CHANNELS`; a `SENSE_` prefix would collide with the
+    `sense_override_wgsl_mirrors_rust_codes` code-mirror scan).
 - Helpers use these accessors only: no unindexed `SENSE_CHANNELS`, no smell or
   vision identifiers. Only the wrappers pass `0u` or `1u`.
 - **Closed form.** `sense_whiten_closed_form(sense, centred, covariance)` keeps
@@ -85,6 +88,25 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
   otherwise `ACTION_WEIGHT_LEARNING_RATE * clamp(brain_state[brain_base + gene],
   VISION_PLASTICITY_MIN, VISION_PLASTICITY_MAX)`. `vision_pathway_learning_rate`
   wraps it with `1u`.
+- **Layout-relative gene offset (Rust).** `insert_sense_overrides` in
+  `gpu_kernel.rs` emits `SENSE{k}_LEARNING_RATE_GENE` as the gene's offset in
+  the live `BrainLayout`, not the static `buffers.rs` constant: for a nonzero
+  `gene_offset_or_zero()`, `gene - O_PREDICTOR_CONTEXT_WEIGHT` plus the
+  layout's predictor-context-weight offset
+  (`feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION`);
+  `0` stays `0`. This matches the WGSL `O_VISION_PLASTICITY` override, which
+  moves with `FEATURE_COUNT` when the visual cortex is on. Add one new
+  `gpu_kernel.rs` unit test asserting that, under a visual-cortex-enabled
+  layout, `SENSE1_LEARNING_RATE_GENE` equals the layout-relative
+  `O_VISION_PLASTICITY` offset and differs from the static constant. The same
+  layout-relative shift applies to every nonzero `SENSE{k}_*` block slot offset
+  `insert_sense_overrides` emits (mean, covariance, whitening, input, turn,
+  forward and critic weights and traces), since `derive_sense_layout` places
+  them from the static `SENSE_BASE` while the WGSL `O_SCENT_*` and
+  `O_VISION_*` overrides move with `FEATURE_COUNT`; `0` stays `0`. The new test
+  also asserts `SENSE1_TURN_WEIGHTS` equals the layout-relative
+  `O_VISION_TURN_WEIGHTS` under the cortex layout. No other Rust change;
+  existing test bodies are unchanged.
 - **Route settle.** `sense_settle_routes_at_death(brain_base, sense)` steps only
   the Turn route, gated by `steering_weights_learn()` and
   `sense_route_mask(sense) & SENSE_ROUTE_TURN`, zeroing weights then trace per
@@ -105,7 +127,7 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
 
 **Steps:**
 
-1. **Accessors.** Add `SENSE_MAX_CHANNELS`, `sense_count()` and the 18
+1. **Accessors.** Add `MAX_SENSE_CHANNELS`, `sense_count()` and the 18
    `switch` accessors listed above, before `fn refresh_vision_whitening` in `common.wgsl`.
 2. **Closed form.** Add `sense_whiten_closed_form(sense, centred, covariance)`
    with the `whiten_scent` body unchanged; make `whiten_scent` a one-line wrapper calling it with `0u`.
@@ -130,7 +152,8 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
 
 ## Non-goals
 
-- No edit to `brain_passes.wgsl`, any cooperative fragment, or any Rust file.
+- No edit to `brain_passes.wgsl`, any cooperative fragment, or any Rust file
+  other than the `gpu_kernel.rs` layout-relative offset fix and its new test above.
 - No new override, no new sense or route, and no forward or critic settle code.
 - No change to a float expression's operand order, a constant's value, or the
   steering freeze.

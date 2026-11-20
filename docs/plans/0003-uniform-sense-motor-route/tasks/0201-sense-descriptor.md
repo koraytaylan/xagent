@@ -12,7 +12,7 @@ merged_as: ""
 touches:
   - crates/xagent-brain/src/senses.rs
   - crates/xagent-brain/src/lib.rs
-  - docs/plans/0003-uniform-sense-motor-route/0201-ROUTE-WIRING.md
+  - docs/decisions/sense-route-wiring.md
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib -- senses::"
@@ -35,7 +35,7 @@ checks:
 `crates/xagent-brain/src/senses.rs` holds the sense descriptor types and the
 declared table `DECLARED_SENSES = [SMELL, VISION]`, re-exported from
 `crates/xagent-brain/src/lib.rs`. The module is pure data: no caller, no GPU
-code, no behaviour change. `0201-ROUTE-WIRING.md` records the route verdicts the
+code, no behaviour change. `docs/decisions/sense-route-wiring.md` records the route verdicts the
 table was built from. Nothing in the crate reads the table yet.
 
 ## Baseline facts
@@ -90,7 +90,7 @@ table was built from. Nothing in the crate reads the table yet.
    `DEFAULT_FORWARD_PATHWAY_ENABLED` and `DEFAULT_CRITIC_INPUT` in
    `crates/xagent-shared/src/config.rs`. Apply the admission rules above; stop
    as BLOCKED if any gate fails. Otherwise write
-   `docs/plans/0003-uniform-sense-motor-route/0201-ROUTE-WIRING.md` with: each
+   `docs/decisions/sense-route-wiring.md` with: each
    record path and its verdict, each default value, and a table of the resulting
    routes per sense (smell, vision).
 2. **Types and constants.** Create `crates/xagent-brain/src/senses.rs` with a
@@ -128,7 +128,7 @@ table was built from. Nothing in the crate reads the table yet.
    Finally, check every `senses.rs` line for `TODO` and for plan, task or
    decision names, and remove any found.
 
-- **Done when:** INV-04 — the `focused-proof` check (`cargo test -p xagent-brain --lib -- senses::`) passes with the three named tests above, and `declared_routes_match_route_wiring` fails if any `Forward` or `Critic` route is added or removed without a matching verdict in `0201-ROUTE-WIRING.md`, proving INV-04.
+- **Done when:** INV-04 — the `focused-proof` check (`cargo test -p xagent-brain --lib -- senses::`) passes with the three named tests above, and `declared_routes_match_route_wiring` fails if any `Forward` or `Critic` route is added or removed without a matching verdict in `docs/decisions/sense-route-wiring.md`, proving INV-04.
 
 ## Non-goals
 

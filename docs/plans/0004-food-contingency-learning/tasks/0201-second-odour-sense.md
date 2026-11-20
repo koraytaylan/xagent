@@ -105,7 +105,8 @@ changes. See PLAN.md "Owner decisions on the 0003 interface" and ARCHITECTURE.md
    adaptation rate and whitening bit-equal to `SMELL`'s, learning rate `Actor`,
    routes exactly one entry, `Turn` with `LearnedOnly`);
    `senses_for_config_off_is_declared_table` (`BrainConfig::default()` gives
-   `std::ptr::eq` with `DECLARED_SENSES`, and `extra_sensory_channels` is 0);
+   a table equal by value to `DECLARED_SENSES` (`assert_eq!` on the slices; no
+   pointer-identity check, since a `const` has no single address), and `extra_sensory_channels` is 0);
    `senses_for_config_on_appends_second_odour_last` (flag on gives 3 entries, the
    first two equal `DECLARED_SENSES` in order, the last equals `SECOND_ODOUR`, and
    `extra_sensory_channels` is 2); `second_odour_routes_are_turn_only` (no

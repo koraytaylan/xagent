@@ -167,7 +167,7 @@ default behaviour (0402 landing) may re-record it, and must say so.
 
 ### Investigations
 
-- **Pooling (`pooling-study`, then `learned-pooling-port`)**: `crates/xagent-sandbox/src/pooling_study.rs` (fit
+- **Pooling (`pooling-fit`, `pooling-study`, then `learned-pooling-port`)**: `crates/xagent-sandbox/src/pooling_study.rs` (fit
   library, unit-tested on synthetic data) and
   `crates/xagent-sandbox/examples/pooling_study.rs` (runner: seeded fresh-brain
   free lives through plan 0001's harness API, seeds 5–8, 10 agents, 300,000
@@ -256,5 +256,6 @@ default behaviour (0402 landing) may re-record it, and must say so.
 | declared-sense-extension-test | `GpuKernel::new` sizes buffers from `BrainLayout::from_config`; integration tests in `crates/xagent-brain/tests` drive the kernel | a test-only layout with one extra feature sense goes through `GpuKernel::new_with_senses` | `pf-task-declared-sense-extension-test` |
 | modulator-flags | klinotaxis and fatigue factors in `brain_passes.wgsl`; `CONFIG_SIZE = 16` fully used at baseline (plans 0001/0002 extend it; take the next free slots); `BrainConfig` bool-flag pattern (`danger_percept_enabled`); the full `BrainConfig` literals in `agent/mod.rs` (mutation, crossover) must copy the new flags | flags take the next free `CFG_*` slots, growing `CONFIG_SIZE` by one vec4 if needed (existing alignment tests) | `pf-task-modulator-flags` |
 | modulator-study | headless evolution CLI (`--no-render --seed --generations --config --db` in `main.rs`), plan 0001 free-life harness, investigation reference numbers | architect shell runs the paired arms; only the decision record and the default flip/revert are committed | `pf-task-modulator-study` |
+| pooling-fit | log format, arms, score and gate fixed in Investigations: Pooling and INV-06; turn-rule constants in `brain_passes.wgsl`; reference scores in the investigation; `lib.rs` module list | CPU-only library unit-tested on synthetic logs; no GPU, no brain or shader edit | `pf-task-pooling-fit` |
 | pooling-study | `read_brain_scratch_blocking` exposes adapted features per brain tick; `vision_hemifields` defines the reference pooling; reference scores in the investigation | the runner reads features through the public kernel API; the fit is CPU-only | `pf-task-pooling-study` |
 | learned-pooling-port | the generic block's input kinds (`SenseInput`), layout rule and config-flag pattern | a new input kind plus flag-gated slots reuse the block; NOT PORTED needs no change | `pf-task-learned-pooling-port` |

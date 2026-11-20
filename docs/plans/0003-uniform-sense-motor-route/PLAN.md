@@ -110,6 +110,9 @@ preflight_checks:
   - name: pf-task-modulator-study
     command: "sh -c 'grep -q \"KLINOTAXIS_SENSITIVITY\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"turn \\*= klinotaxis_factor;\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"brain_state\\[brain_base + O_FATIGUE_FACTOR\\] = fatigue_factor;\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"pub const CONFIG_SIZE: usize\" crates/xagent-brain/src/buffers.rs && grep -q \"pub danger_percept_enabled: bool,\" crates/xagent-shared/src/config.rs && env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration -- --exact gpu_adapter_present_when_required'"
     timeout_ms: 3600000
+  - name: pf-task-pooling-fit
+    command: "sh -c 'grep -q \"pub mod free_life;\" crates/xagent-sandbox/src/lib.rs && grep -q \"columns, whitened, learned | +0.16\" docs/reviews/2026-09-25-learner-foraging-investigation.md && grep -q \"hemifields, whitened, learned\\*\\* | \\*\\*+0.33\" docs/reviews/2026-09-25-learner-foraging-investigation.md && grep -q \"ACTION_WEIGHT_LEARNING_RATE\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && cargo test -p xagent-sandbox --test contributing_guard'"
+    timeout_ms: 3600000
   - name: pf-task-pooling-study
     command: "sh -c 'grep -q \"pub fn read_brain_scratch_blocking\" crates/xagent-brain/src/gpu_kernel.rs && grep -q \"fn vision_hemifields() -> array<f32, 8>\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"columns, whitened, learned | +0.16\" docs/reviews/2026-09-25-learner-foraging-investigation.md && grep -q \"hemifields, whitened, learned\\*\\* | \\*\\*+0.33\" docs/reviews/2026-09-25-learner-foraging-investigation.md && env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration -- --exact gpu_adapter_present_when_required'"
     timeout_ms: 3600000
@@ -207,6 +210,7 @@ execution_checks:
       - remove-sense-specific-wgsl
       - declared-sense-extension-test
       - modulator-flags
+      - pooling-fit
       - learned-pooling-port
     role: developer
     operations:
@@ -310,6 +314,22 @@ execution_checks:
             command: >-
               sh -c 'grep -q "override O_VISION_PATHWAY_MEAN: u32" crates/xagent-brain/src/shaders/kernel/common.wgsl
               && grep -q "O_SCENT_MEAN" crates/xagent-brain/README.md'
+      - task: pooling-fit
+        name: fit-library-surfaces
+        sources:
+          - crates/xagent-sandbox/src/lib.rs
+          - crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl
+          - docs/reviews/2026-09-25-learner-foraging-investigation.md
+          - CONTRIBUTING.md
+        checks:
+          - name: fit-references
+            command: >-
+              sh -c 'grep -q "pub mod free_life;" crates/xagent-sandbox/src/lib.rs
+              && grep -q "ACTION_WEIGHT_LEARNING_RATE" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl
+              && grep -q "columns, whitened, learned | +0.16" docs/reviews/2026-09-25-learner-foraging-investigation.md'
+          - name: sandbox-lib-and-guard
+            command: cargo test -p xagent-sandbox --test contributing_guard
+            timeout_ms: 3600000
       - task: learned-pooling-port
         name: port-surfaces-known
         sources:
@@ -465,7 +485,7 @@ is staged so every step stays byte-identical within six files:
 `remove-sense-specific-wgsl` → `declared-sense-extension-test`.
 `modulator-flags` follows the chain and the mutation task (shared shader,
 layout, config and agent files); `modulator-study` lands or reverts each
-modulator; `pooling-study` then measures pooling on the final learner and
+modulator; `pooling-fit` builds the offline fit library and `pooling-study` then measures pooling on the final learner and
 `learned-pooling-port` applies its verdict.
 
 ## Decision records (authored by tasks)

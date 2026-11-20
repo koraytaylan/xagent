@@ -510,3 +510,36 @@ Authority: host-authorized plan amendment for task `pooling-study`.
 - Witness: the `focused-proof` check (`cargo test -p xagent-sandbox --lib
   pooling_study`) passes, and the `verdict` check reads `Verdict: NOT PORTED`
   from `docs/decisions/pooling-study.md`, produced by the runner under this design.
+
+## Corrected plan record: pooling-study split for the junior-task bounds (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run (stopped on the junior-task bounds refusal).
+
+- Superseded: task `pooling-study` (tasks/0301-pooling-study.md) as one packet
+  owning the fit library (`crates/xagent-sandbox/src/pooling_study.rs`,
+  `lib.rs`), the runner, the study run and the decision record.
+- Contradiction: its body was 8222 characters, over the host's 8000-character
+  bound for one task, so the run refused to resume; the task's last attempt
+  also exhausted its review budget on the 1317-line library alone.
+- Correction: the fit library moves, with every fixed decision it implements
+  (log format, arms A-D, adaptation and whitening, credit rule, score, INV-06
+  gate, sanity constants, the four named unit tests and their focused-proof),
+  into the new non-gated developer task `pooling-fit`
+  (tasks/0300-pooling-fit.md, depends on `modulator-study`). `pooling-study`
+  now depends on `pooling-fit`, touches only the runner example and the
+  decision record, and keeps every check (focused-proof, verdict, parity, fmt,
+  clippy, guard), its role, the harness-reuse and run decisions, and its Done
+  when. The whitening refresh constant is cited from `xagent_brain::senses`
+  (where `sense-descriptor` placed `VISION_WHITENING_REFRESH`) instead of
+  `buffers.rs`, which only names it in a comment. No bound, proof, gated flag
+  or existing dependency changed; `learned-pooling-port` still waits for
+  `pooling-study`.
+- Witness: bodies are now 5318 (`pooling-fit`) and 4895 (`pooling-study`)
+  characters with 2 touches each; the preflight `pf-task-pooling-fit` and the
+  `fit-library-surfaces` constraint exit 0 on the baseline.
+- Not changed: `remove-sense-specific-wgsl` (9 touches, 8225-character body)
+  is already done on the plan branch, landed as
+  a955d3705bdef571e7e333326b429457161b0ecb (an ancestor of
+  plan/0003-uniform-sense-motor-route), so it is not pending work and is not
+  split.

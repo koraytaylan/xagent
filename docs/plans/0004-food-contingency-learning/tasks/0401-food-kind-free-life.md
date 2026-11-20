@@ -10,6 +10,8 @@ depends_on:
   - second-odour-features
   - food-kind-metrics
   - kind-readout
+  - second-odour-inheritance
+  - flag-on-tail-base
 gated: false
 touches:
   - crates/xagent-sandbox/src/headless.rs
@@ -69,11 +71,12 @@ task food-kind-verdict.
   `td_error` and `turn_innovation`, `AgentMetrics`, and the tick log), and the
   `--free-life` CLI in `main.rs`. This task does not edit `free_life/` or `lib.rs`.
   Read the runner and `main.rs` before editing.
-- Via depends_on (directly or transitively): `GpuKernel::nourishing_food_kind()`
+- Via depends_on (or transitively): `GpuKernel::nourishing_food_kind()`
   and `brain_layout()` (kernel-food-kind-draw, second-odour-kernel);
   `P_HARMFUL_MEAL_COUNT` (food-kind-layout via kernel-food-kind-meals); both config
   flags (food-kind-config); the `second_odour` sense, its senses and features
-  (second-odour-features); `food_kind_metrics` items; `kind_readout::fit_kind_readout`.
+  (second-odour-features); flag-on stride fix (flag-on-tail-base);
+  `food_kind_metrics` items; `kind_readout::fit_kind_readout`.
 - Baseline APIs: `set_freeze_steering_weights(bool)`, `cached_food_state()`, physics
   snapshot readback; sense offsets come from `BrainLayout`, never hard-coded. TD error
   and turn innovation come from the 0001 probe sample, so no critic constant is

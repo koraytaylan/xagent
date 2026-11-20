@@ -134,6 +134,7 @@ execution_checks:
       - food-kind-senses
       - second-odour-features
       - second-odour-inheritance
+      - flag-on-tail-base
       - food-kind-metrics
       - food-kind-verdict
       - kind-readout
@@ -296,6 +297,15 @@ execution_checks:
           - name: pf-inheritance-apis
             command: |-
               sh -c 'grep -qF "pub fn fresh_brain_state(config: &BrainConfig, rng: &mut impl Rng) -> AgentBrainState {" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn mutate_steering_weights(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn steering_population(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn mutate_brain_state_seeded(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "rand = { workspace = true }" crates/xagent-sandbox/Cargo.toml && grep -qF "mutate_steering_weights_for" docs/plans/0003-uniform-sense-motor-route/tasks/0203-descriptor-driven-mutation.md'
+      - task: flag-on-tail-base
+        name: stride-inference-site
+        sources:
+          - crates/xagent-brain/src/buffers.rs
+        checks:
+          - name: pf-flag-on-tail-base
+            command: |-
+              sh -c 'grep -qF "pub fn feature_count_for_brain_stride(brain_stride: usize) -> Option<usize> {" crates/xagent-brain/src/buffers.rs && grep -qF "pub fn fixed_tail_base(brain_stride: usize) -> usize {" crates/xagent-brain/src/buffers.rs && grep -qF "pub fn from_config(config: &BrainConfig) -> Self {" crates/xagent-brain/src/buffers.rs && cargo test -p xagent-brain --lib buffers:: --no-run'
+            timeout_ms: 3600000
       - task: food-kind-metrics
         name: metrics-inputs
         sources:

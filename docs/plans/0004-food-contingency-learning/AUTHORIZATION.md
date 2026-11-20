@@ -81,3 +81,192 @@ each baseline proof still requires the exact baseline anchor at the baseline.
 - Witness: all 46 grep preflight/constraint commands of PLAN.md exit 0 at the baseline
   (f7b8d53), on the plan integration branch (1d450b3) and on the food-kind-layout task branch
   (c58fc83), where the superseded greps failed.
+
+## Amendment 2026-11-20: extra-sensory-layout flag-on brain_stride growth
+
+Authority: host-authorized plan amendment for task extra-sensory-layout. No task, dependency,
+touch, check, gated flag or other requirement changed; the brain_stride formula stays frozen.
+
+- Superseded: task 0202 test `second_odour_on_grows_sensory_and_feature_width_by_two`
+  requiring `brain_stride` to grow by exactly `2 * (ENCODED_DIMENSION + 1)`.
+- Contradiction: the same packet forbids changing the `brain_stride` formula and requires an
+  11-slot third block (mean 2 + covariance 3 + whitened 2 + turn 2 + trace 2) inside
+  `[end of the 0003 route block, sensory_mean_base)`. The landed formula in
+  `crates/xagent-brain/src/buffers.rs` (`build`) adds `extra_sense_slots =
+  sensory_mean_base - (route_base + PATHWAY_ROUTE_SLOT_COUNT)` to `brain_stride`, so that
+  block necessarily adds 11 more slots. The host measured 71348 against the stated 71337.
+- Correction: the required growth is `2 * (ENCODED_DIMENSION + 1) + 11`, the value the
+  unchanged source formula yields; the 11 may be expressed as
+  `on.sensory_mean_base() - off.sensory_mean_base()`.
+- Witness: the task's focused-proof (`buffers::tests`) passed on the host with the assertion
+  `off.brain_stride + 2 * (ENCODED_DIMENSION + 1) + (on.sensory_mean_base() -
+  off.sensory_mean_base())` (measured 71348); gradient-audit and parity also passed.
+
+## Amendment 2026-11-20: second-odour-inheritance steering feature-count inference
+
+Authority: host-authorized plan amendment for task second-odour-inheritance. Task id,
+dependency, gated flag, checks, Done when and frozen contracts (pf-inheritance-apis) are
+unchanged; the touches gain two product files.
+
+- Superseded: task 0205 "Why no product edit is expected", its Non-goal "No edit to
+  `agent/mod.rs`, the governor or any other product file", and touches limited to the new
+  test file.
+- Contradiction: the Done when requires `mutate_steering_weights` and `steering_population`
+  to run on a `second_odour_sense_enabled` brain. `mutate_steering_weights`
+  (`crates/xagent-sandbox/src/agent/mod.rs`) derives the feature count with
+  `feature_count_for_brain_stride(len).expect(..)` (`crates/xagent-brain/src/buffers.rs`),
+  which assumes the default `FIXED_TAIL_SIZE`; the flag-on stride is larger by the
+  11 extra-sense slots (previous amendment), so it panics ("brain_state length matches no
+  BrainLayout"). `steering_population` has no other path and `mutate_steering_weights_for`
+  builds offsets from `BrainConfig::default()`, so no test-only change can pass.
+- Correction: touches add `crates/xagent-sandbox/src/agent/mod.rs` and
+  `crates/xagent-brain/src/buffers.rs`; a new step 5 lets the task make the feature-count
+  inference accept the flag-on length (the source offsets of the action turn weights and the
+  0003 sense blocks relative to the predictor context are unchanged by the block, which lies
+  after the route block), keeping signatures frozen, default behaviour bit-identical, no
+  path writing the block, and every test assertion unweakened.
+- Witness: the task's focused-proof (`cargo test -p xagent-sandbox --test
+  second_odour_inheritance`) with all three tests ok, and agent-unit
+  (`cargo test -p xagent-sandbox --lib agent::`) green; the failing witness is the recorded
+  panic at agent/mod.rs:593 in both mutation tests.
+
+## Amendment 2026-11-20: food-kind-colour hit-index recovery at two colour sites
+
+Authority: host-authorized plan amendment for task food-kind-colour. Task id, dependencies,
+touches, checks, Done when, gated flag and frozen contracts are unchanged.
+
+- Superseded: task 0106 Scope "`phase_vision_parallel.wgsl` (line 191): ... using `fidx`
+  (in scope from line 73)" and "`phase_vision_object_queries.wgsl` (line 196): ... use the
+  food-index variable in scope there; invent no index", and Decision "Only the three literals
+  change"; and the review reading (round 3) that recovering the hit index by re-running the
+  existing food search is an unauthorized restructure.
+- Contradiction: in the baseline `fidx` is local to `vision_parallel_sample` (line 73),
+  which returns only `VISION_EVENT_FOOD`, while the colour site is in `vision_parallel_rays`;
+  in object-queries `vision_object_write_ray(agent_id, ray_idx, first_event)` sees only the
+  event word, the caller's `food_id` loop (line 268) folding into an `atomicMin`. So a
+  literal-only change leaves Second items in the base colour in two paths, failing the Done
+  when's INV-04 "in every vision path".
+- Correction: Scope now states the index is not in scope at those sites and requires it be
+  recovered at the colour site by re-running the existing food test (parallel: at the ray's
+  first hit step, optionally via a helper shared with the sample function; object-queries:
+  lowest `food_id` in `vision_object_cache` whose `vision_object_first_hit` step equals the
+  first step). The Decision keeps no new storage buffer, binding or workgroup variable and an
+  unchanged event word/encoding/`atomicMin` (so no food-index cap is introduced), and states
+  that byte-identical surrounding shader code is not required.
+- Witness: the task's focused-proof, vision-regression and parity checks, which passed with
+  all=true on the round-3 implementation of exactly this design.
+
+## Amendment 2026-11-20: food-kind-senses names the WGSL scent count by its 0003 name
+
+Authority: host-authorized plan amendment for task food-kind-senses. Task id, dependencies,
+touches, checks, Done when, gated flag and frozen contracts are unchanged; the guard and
+offsets keep the same value (2u) and meaning.
+
+- Superseded: task 0103 Outcome/Scope/WGSL-names/Non-goals text requiring the WGSL guard
+  `EXTRA_SENSORY_CHANNELS >= SCENT_CHANNELS` and writes at `scent_base + SCENT_CHANNELS`
+  and `scent_base + SCENT_CHANNELS + 1u`, the ARCHITECTURE.md food-kind-senses row's
+  `scent_base + SCENT_CHANNELS`, and the review reading (rounds 2 and 4) that the WGSL must
+  spell `SCENT_CHANNELS`.
+- Contradiction: no WGSL file defines `SCENT_CHANNELS`; 0003 renamed it to
+  `NON_VISUAL_FEATURE_CHANNELS` (`common.wgsl:168`, `const NON_VISUAL_FEATURE_CHANNELS: u32 = 2u;`;
+  this record's Repair item 2), and `SENSE_SPECIFIC_NAMES` in `gpu_kernel.rs` bans
+  `SCENT_CHANNELS` in WGSL. The packet forbids editing `common.wgsl`/`gpu_kernel.rs` and a
+  literal offset, so the literal text is unsatisfiable within the touches.
+- Correction: the same rename as Repair item 2: in WGSL the guard is
+  `EXTRA_SENSORY_CHANNELS >= NON_VISUAL_FEATURE_CHANNELS` and the writes are
+  `sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS]` and
+  `sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS + 1u]`; WGSL must not write or
+  define `SCENT_CHANNELS`; the Rust `buffers::SCENT_CHANNELS` stays usable in Rust tests.
+- Witness: the task's focused-proof, scent-regression, sandbox-sensory-regression and parity
+  checks, which passed with all=true on the round-4 implementation
+  (`phase_vision.wgsl:414-417`, which already uses `NON_VISUAL_FEATURE_CHANNELS`).
+
+## Amendment 2026-11-20: second-odour-features names the WGSL scent count by its 0003 name
+
+Authority: host-authorized plan amendment for task second-odour-features. Task id,
+dependencies, touches, checks, Done when, gated flag and frozen contracts are unchanged; the
+offset keeps the same value (2u) and meaning, and no literal scent width is permitted.
+
+- Superseded: task 0204 Scope loop `sensory_buffer[s_base + scent_offset + SCENT_CHANNELS + k]`
+  (with "use `u32(SCENT_CHANNELS)`") and Decision "The loop names `EXTRA_SENSORY_CHANNELS`
+  and `SCENT_CHANNELS`", and the review reading (rounds 1-3) that the WGSL must spell
+  `SCENT_CHANNELS`.
+- Contradiction: no WGSL file defines `SCENT_CHANNELS`; 0003 renamed it to
+  `NON_VISUAL_FEATURE_CHANNELS` (`common.wgsl:168`, `const NON_VISUAL_FEATURE_CHANNELS: u32 = 2u;`;
+  Repair item 2 and the food-kind-senses amendment above). The guard test
+  `sense_specific_wgsl_has_no_sense_names` (`gpu_kernel.rs:4988-5015`, list
+  `SENSE_SPECIFIC_NAMES`) fails if `SCENT_CHANNELS` appears in `brain_passes.wgsl` or
+  `common.wgsl`, and the packet's Non-goals forbid editing `common.wgsl`/`gpu_kernel.rs`.
+- Correction: both extractor loops read
+  `sensory_buffer[s_base + scent_offset + NON_VISUAL_FEATURE_CHANNELS + k]`; WGSL must not
+  write or define `SCENT_CHANNELS`; Rust tests may keep using `buffers::SCENT_CHANNELS`.
+- Witness: the task's focused-proof, scent-regression, gradient-audit and parity checks, which
+  passed with all=true on the round-3 implementation (`brain_passes.wgsl:248`,
+  `phase_brain_features.wgsl:82`).
+
+## Amendment 2026-11-20: food-kind-free-life depends on the flag-on stride inference
+
+Authority: host-authorized plan amendment for task food-kind-free-life. Task id, touches,
+gated flag, checks, Done when, Decisions, Non-goals and frozen contracts are unchanged;
+depends_on gains one existing task.
+
+- Superseded: task 0401 depends_on without second-odour-inheritance, and its Prerequisites
+  treating the flag-on brain stride as usable by the landed seeding.
+- Contradiction: the Decisions require `--food-kinds` to set
+  `brain.second_odour_sense_enabled = true` before kernel construction and the Done when
+  requires both GPU tests to pass under it, but the landed seeding calls
+  `GpuKernel::write_agent_heritable_config` (`gpu_kernel.rs:3896`), which calls
+  `buffers::fixed_tail_base`; `feature_count_for_brain_stride` (`buffers.rs:475`) assumes
+  the default `FIXED_TAIL_SIZE` and returns `None` for the flag-on stride, so
+  `fixed_tail_base` panics (`buffers.rs:520`). The Non-goals forbid this task editing
+  buffers.rs, and skipping the call would restructure the run loop (INV-07). The fix is
+  already authorized in task second-odour-inheritance (amendment "second-odour-inheritance
+  steering feature-count inference" above, which owns buffers.rs); adding buffers.rs here
+  instead would make two tasks claim the same path (validate_plan refuses it).
+- Correction: food-kind-free-life depends_on second-odour-inheritance, whose landed
+  flag-on-aware `feature_count_for_brain_stride` makes `fixed_tail_base` accept the
+  second-odour stride; the Prerequisites name it. To stay within the 8000-character body limit, the
+  Prerequisites phrase "(directly or transitively)" becomes "(or transitively)", which means the same. No cycle: second-odour-inheritance depends
+  only on extra-sensory-layout.
+- Witness: the task's focused-proof (`env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox
+  --test food_kind_free_life`) with all three tests ok once second-odour-inheritance lands;
+  the failing witness is the recorded panic at buffers.rs:520 in
+  food_kind_free_life_frozen_arm_keeps_turn_weights and food_kind_free_life_summary_is_complete.
+
+## Repair 2026-11-20: flag-on fixed-tail base (new task flag-on-tail-base)
+
+Authority: the plan owner's standing authorization for automatic repair of this run (add a
+non-gated implementation task for work an approved bound needs that no pending task delivers).
+
+- Superseded: the food-kind-free-life amendment's claim that second-odour-inheritance's
+  landed work makes `fixed_tail_base` accept the second-odour stride.
+- Contradiction: task 0205's packet requires only the steering feature-count inference;
+  its accepted-by-gates implementation is a private `steering_feature_count` in
+  `crates/xagent-sandbox/src/agent/mod.rs` and leaves `buffers.rs` unchanged, so
+  `buffers::fixed_tail_base` (`buffers.rs:518-520`) still panics for the flag-on stride
+  inside `GpuKernel::write_agent_heritable_config` (`gpu_kernel.rs:3896`). The
+  food-kind-free-life focused-proof cannot pass even after 0205 lands, and no pending task
+  delivers the fix.
+- Correction: new task `flag-on-tail-base` (tasks/0206, non-gated, touches only
+  `buffers.rs`, depends_on second-odour-inheritance so the two `buffers.rs` owners are
+  serialized) makes `feature_count_for_brain_stride` and `fixed_tail_base` accept the
+  flag-on stride with default results bit-identical; food-kind-free-life gains depends_on
+  flag-on-tail-base. Its Feasibility row, execution_checks entry (developer-route) and
+  constraint `pf-flag-on-tail-base` are added. Every existing bound, proof and dependency
+  stays.
+- Witness: tasks/0206 focused-proof (`cargo test -p xagent-brain --lib buffers::`) with
+  its three named tests ok; then food-kind-free-life's focused-proof with all three tests
+  ok. Failing witness: the recorded panic at `buffers.rs:520`.
+
+## Repair 2026-11-20: second-odour-inheritance review ledger record
+
+Authority: the same standing authorization (correct a plan record the review could not judge).
+
+- Superseded: nothing in the contract; the 0205 packet lacked a record of review ledger L2.
+- Contradiction: the last review's only open finding (minor) asked for L2's full text in the
+  0205 packet, which no approved check proves; the work itself (gates focused-proof and
+  agent-unit green, diff from `bcd26ac^` limited to `agent/mod.rs` and the new test) was
+  not found defective.
+- Correction: 0205 gains a "Review record" section restating L1/L2 and their resolution
+  (commit a9e1963). No requirement changes.
+- Witness: `git diff bcd26ac^ a9e1963 -- crates/xagent-brain crates/xagent-sandbox/src/bin crates/xagent-sandbox/src/food_kind_metrics.rs` is empty; task gates focused-proof and agent-unit.

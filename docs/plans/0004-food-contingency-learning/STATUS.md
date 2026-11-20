@@ -4,7 +4,7 @@ status: todo
 
 # Status: food contingency learning
 
-Progress: 0/16 tasks complete.
+Progress: 0/17 tasks complete.
 
 | task | title | status |
 |---|---|---|
@@ -19,6 +19,7 @@ Progress: 0/16 tasks complete.
 | food-kind-senses | Kind odour in the senses pass and the extra sensory channels | todo |
 | second-odour-features | Extra sensory channels copied into the brain features | todo |
 | second-odour-inheritance | Second-odour block weights stay zero through birth, mutation and inheritance | todo |
+| flag-on-tail-base | Fixed-tail base and feature count accept the second-odour brain stride | todo |
 | food-kind-metrics | Food-kind free-life metrics, link accumulators and run summaries | todo |
 | food-kind-verdict | Gate verdict binary over the eight run summaries | todo |
 | kind-readout | Supervised kind readout (measurement only) | todo |

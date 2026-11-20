@@ -125,7 +125,9 @@ asserts values, and is not ignored. Nine tests:
 
 **Steps:**
 1. Critic value (D5, D6), `brain_passes.wgsl`: declare mode constants and
-   `s_critic_pathway_input`; copy `c` and add the pathway dot in one uniform branch
+   `s_critic_pathway_input` as module-scope `var<private>` (never
+   `var<workgroup>`: brain-lib's shared-memory bounds forbid it; see
+   AUTHORIZATION.md); copy `c` and add the pathway dot in one uniform branch
    after the `s_value` line; gate the 128-d value dot by `[m != pathway]`.
 2. Critic normaliser, step, trace, replay (D6), `brain_passes.wgsl`: grow `s_pred_td`;
    gate the 128-d step and trace; add the pathway step, trace, ball and

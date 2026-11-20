@@ -45,8 +45,10 @@
 - The value pass (`coop_predict_and_act`) and the store pass
   (`coop_learn_and_store`) run in the same entry-point invocation in every
   brain entry (`brain_tick.wgsl`, `brain_inner.wgsl`, `exact_tiled_brain.wgsl`,
-  `phase_brain_tail_from_scratch.wgsl`), so a workgroup variable written by the
-  first is readable by the second.
+  `phase_brain_tail_from_scratch.wgsl`), so a module-scope `var<private>`
+  variable written by thread 0 in the first is readable by thread 0 in the
+  second (no workgroup storage is needed or allowed for
+  `s_critic_pathway_input`; see D5 and AUTHORIZATION.md).
 
 ## Decisions
 

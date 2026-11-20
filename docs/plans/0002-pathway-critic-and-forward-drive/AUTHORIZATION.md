@@ -96,3 +96,27 @@ Cited authority: the plan owner's standing authorization for automatic repair of
   exits 0 and prints the JSON config, and
   `grep -rn --exclude=AUTHORIZATION.md 'cargo run.*-p xagent-sandbox -- ' docs/plans/0002-pathway-critic-and-forward-drive`
   finds nothing.
+
+## Repair: remove the residual workgroup wording behind the kernel-routes review (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run (kernel-routes failed; route-gate-decisions blocked).
+
+- Superseded: ARCHITECTURE.md baseline fact "so a workgroup variable written
+  by the first is readable by the second", and task 0201 step 1's unqualified
+  "declare ... `s_critic_pathway_input`".
+- Contradiction: D5 and the State table already require module-scope
+  `var<private>` (entries above), but the baseline fact still justified a
+  workgroup variable and step 1 named no storage class; the kernel-routes
+  reviewer read them as requiring `var<workgroup>` and rejected the
+  conforming `var<private>` declaration (brain_passes.wgsl:71 on the preserved
+  branch), while a workgroup array fails brain-lib (6_112 against 6_064 and
+  9_248 against 9_200).
+- Correction: the baseline fact now states that a thread-0 `var<private>`
+  value persists from the value pass to the store pass of the same
+  invocation, and step 1 names `var<private>` explicitly. No bound, proof,
+  touch, dependency or behavior changes.
+- Witness: `grep -q -F 'never
+   `var<workgroup>`' docs/plans/0002-pathway-critic-and-forward-drive/tasks/0201-kernel-routes.md`
+  and `! grep -q -F 'so a workgroup variable written' docs/plans/0002-pathway-critic-and-forward-drive/ARCHITECTURE.md`
+  exit 0.

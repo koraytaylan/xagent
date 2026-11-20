@@ -99,7 +99,9 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
 - **Placement (accepted constraint).** The slice from `fn refresh_vision_whitening(brain_base: u32) {`
   to `fn settle_recent_moments_at_death` contains only the wrapper followed by
   `sense_refresh_jacobi_whitening`; the accessors sit above the wrapper. The
-  extracted slice must not contain `a[` or `v[` after its `a`/`v` rewrite.
+  extracted slice keeps the single private `var a`/`var v` matrix declaration
+  and its `a[`/`v[` indexing; it contains no `a[` or `v[` only after the `a`/`v`
+  rewrite to `whitening_scratch` that `whitening_storage_validation.rs` performs.
 
 **Steps:**
 

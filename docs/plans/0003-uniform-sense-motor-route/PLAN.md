@@ -250,8 +250,8 @@ execution_checks:
             command: >-
               sh -c 'grep -q "fn whiten_scent(" crates/xagent-brain/src/shaders/kernel/common.wgsl
               && grep -q "fn refresh_vision_whitening(" crates/xagent-brain/src/shaders/kernel/common.wgsl
-              && grep -q "settle_turn_pathways_at_death" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
-              && grep -q "settle_turn_pathways_at_death" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl'
+              && grep -Eq "settle_(turn_pathways|senses)_at_death\(brain_base\)" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
+              && grep -Eq "settle_(turn_pathways|senses)_at_death\(brain_base\)" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl'
       - task: generic-sense-block-sites
         name: site-anchors-and-validations
         sources:

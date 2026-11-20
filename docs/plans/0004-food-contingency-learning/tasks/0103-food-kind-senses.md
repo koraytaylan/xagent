@@ -33,12 +33,10 @@ checks:
 
 ## Outcome
 
-With food kinds on, nostril pair 1 smells
-only `First` items. The extra sensory channels that directly follow the scent
+With food kinds on, nostril pair 1 smells only `First` items. The extra sensory channels that directly follow the scent
 channels smell only `Second` items under the same odour law, and are written
 whenever `EXTRA_SENSORY_CHANNELS` is at least `NON_VISUAL_FEATURE_CHANNELS` (the
-WGSL scent channel count). Serial and
-parallel pair-1 scent agree bit for bit. With kinds off and the second sense off,
+WGSL scent channel count). Serial and parallel pair-1 scent agree bit for bit. With kinds off and the second sense off,
 scent and the sensory stride equal the baseline. Kind colour is task
 `food-kind-colour`, which edits `phase_vision.wgsl` first.
 
@@ -61,7 +59,7 @@ scent and the sensory stride equal the baseline. Kind colour is task
     `sensory_buffer[scent_base + 1u] = scent.y;`. Immediately after the second of
     these, add:
     `if (EXTRA_SENSORY_CHANNELS >= NON_VISUAL_FEATURE_CHANNELS) { let second = sense_second_odour(pos, facing, smell_strength); sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS] = second.x; sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS + 1u] = second.y; }`
-    Both sides are `u32`, so no cast is needed; use no literal offset. In WGSL the
+    Both sides are `u32` (no cast); no literal offset. In WGSL the
     scent channel count is `NON_VISUAL_FEATURE_CHANNELS` (`common.wgsl`, `2u`), 0003's
     rename of the WGSL `SCENT_CHANNELS`; do not write or define `SCENT_CHANNELS` in
     WGSL (0003's `SENSE_SPECIFIC_NAMES` bans it). The Rust `SCENT_CHANNELS`
@@ -84,7 +82,7 @@ WGSL names used: `food_kinds_enabled()`, `food_item_kind(i)`, `FOOD_KIND_FIRST`,
   `scent_base + NON_VISUAL_FEATURE_CHANNELS` via `EXTRA_SENSORY_CHANNELS` (PLAN.md "Owner
   decisions on the 0003 interface", item 2).
 - No read of `food_item_is_nourishing`; no channel encodes which kind nourishes.
-- No CPU mirror, GUI or reward change; no planning vocabulary or `TODO` in source.
+- No CPU mirror, GUI or reward change; no planning words or `TODO` in source.
 
 ## Prerequisites
 
@@ -94,14 +92,14 @@ flag-built kernel (second-odour-kernel), the 0003 parity test (plan dependency).
 
 ## Decisions
 
-- **Pair 1 filter sits inside the existing loops.** No new pass or buffer.
-- **Pair 2 is serial and separate.** It is written from `phase_vision_senses`, not from
-  the scalar-call redirect, so the redirect does not touch it.
+- **Pair 1 filter sits in the existing loops.** No new pass or buffer.
+- **Pair 2 is serial and separate.** Written from `phase_vision_senses`, not the
+  scalar-call redirect.
 - **Where pair 2 is written (checked in source).** Serial vision
   (`vision_tick.wgsl` and `cached_brain_vision_tick.wgsl`) calls
   `phase_vision_senses`, which holds the only scent write. Under
   `XAGENT_VISION_PARALLEL_SCENT=1`, `vision_prepare_scent` only prepares a value and
-  `phase_vision_senses` still runs with its scalar call redirected, so pair 2 is
+  `phase_vision_senses` still runs with its scalar call redirected: pair 2 is
   written in both modes.
   - `phase_vision_parallel.wgsl` and `phase_vision_object_queries.wgsl` contain no scent
     write (confirm by search). If `cached_brain_vision_tick.wgsl` does not reach
@@ -109,28 +107,26 @@ flag-built kernel (second-odour-kernel), the 0003 parity test (plan dependency).
 - **Redirect interaction.** One vision variant rewrites `sensory_buffer[` to
   `sensory_next[` and asserts none remains (`gpu_kernel.rs` near line 1709); the
   pair-2 writes use `sensory_buffer[` too, so they are redirected alike.
-- **Fail-closed GPU tests.** The helper `fn gpu_or_skip() -> bool` in the new test file
-  returns `true` when `GpuKernel::is_available()`. When it is false and
-  `std::env::var_os("XAGENT_REQUIRE_GPU").is_some()`, it panics with a message that
-  names the missing adapter. Otherwise it prints a skip line and returns `false`. Every
+- **Fail-closed GPU tests.** Test-file helper `fn gpu_or_skip() -> bool`
+  returns `true` when `GpuKernel::is_available()`; else, if
+  `std::env::var_os("XAGENT_REQUIRE_GPU").is_some()`, it panics naming the missing
+  adapter; otherwise it prints a skip line and returns `false`. Every
   test starts with `if !gpu_or_skip() { return; }`.
 - **Readback.** Sensory values come from `read_agent_telemetry_blocking(index)`
   (`gpu_kernel.rs` line 4005), which reads `sensory_buffer` at `layout.sensory_stride`.
-  Physics state comes from `read_full_state_blocking()`. Add no readback helper. The
+  Physics state: `read_full_state_blocking()`. Add no readback helper. The
   expected odour is computed in the test from the Rust mirrors of
   `NOSTRIL_FORWARD_OFFSET`, `NOSTRIL_SIDE_OFFSET`, `SCENT_RANGE` and
-  `SCENT_DECAY_LENGTH` (verify each name by search) under the shader's law.
+  `SCENT_DECAY_LENGTH` (verify each by search) under the shader's law.
 
 ## Steps
 
 **Steps:**
 
 1. In `phase_vision.wgsl` `sense_scent`, add the First-only `continue` after the
-   food-flag check. In `phase_vision_scent_parallel.wgsl`, extend the per-slot guard
-   in `vision_prepare_scent` as specified above. Do not change the scalar call text.
+   food-flag check; extend the `vision_prepare_scent` guard as specified above.
 2. In `phase_vision.wgsl`, add `sense_second_odour` after `sense_scent` and,
-   immediately after `sensory_buffer[scent_base + 1u] = scent.y;`, the guarded
-   pair-2 write described under Scope. Use no literal offset.
+   the guarded pair-2 write described under Scope.
 3. Create `crates/xagent-brain/tests/food_kind_senses.rs` with the `gpu_or_skip`
    helper and `food_kind_senses_default_off_matches_baseline`: kinds off, second
    sense off; pair-1 scent equals the baseline odour law over all uneaten items
@@ -140,18 +136,18 @@ flag-built kernel (second-odour-kernel), the 0003 parity test (plan dependency).
    only; the two extra channels at sensory index `vision_count +
    crate::buffers::NON_VISUAL_COUNT` and that index + 1 equal the law over `Second`
    items only (`1e-6` relative). Then `reset_agents_seeded` with a different seed,
-   same positions and tick count (re-upload positions if the reset moves them):
+   same positions and ticks (re-upload positions if the reset moves them):
    `nourishing_food_kind()` changed and every sensory value is unchanged. Do not
    change the assertion to make it pass.
 5. Add `food_kind_senses_parallel_scent_matches_serial`: kinds on, living agents
    only. Read the serial kernel first, then set `XAGENT_VISION_PARALLEL_SCENT=1`
-   only around the parallel kernel's construction and restore the previous value.
+   only around the parallel kernel's construction, then restore it.
    Pair-1 values are bit-identical (`to_bits()`) and the extra channels equal.
 
-- **Done when:** the focused-proof check (the three `food_kind_senses` tests), the scent-regression, sandbox-sensory-regression and parity checks all exit 0 on the host, proving INV-04 (pair 1 smells only `First` and the extra channels right after scent smell only `Second` under the baseline law, and serial and parallel pair-1 values are bit-identical), INV-02 (the sensory values are unchanged by the redraw), INV-01 (with kinds and the second sense off, odour and stride equal the baseline and the parity golden is unchanged), and INV-10 (every new GPU test calls `gpu_or_skip` and panics without an adapter when `XAGENT_REQUIRE_GPU` is set).
+- **Done when:** focused-proof (the three `food_kind_senses` tests), scent-regression, sandbox-sensory-regression and parity all exit 0 on the host, proving INV-04 (pair 1 smells only `First` and the extra channels right after scent smell only `Second` under the baseline law, and serial and parallel pair-1 values are bit-identical), INV-02 (the sensory values are unchanged by the redraw), INV-01 (with kinds and the second sense off, odour and stride equal the baseline and the parity golden is unchanged), and INV-10 (every new GPU test calls `gpu_or_skip` and panics without an adapter when `XAGENT_REQUIRE_GPU` is set).
 
 ## Risks
 
 - Serial `sense_scent` has no alive guard while `vision_prepare_scent` zeroes dead
   agents; the parallel test uses living agents only and this stays unchanged.
-- The env-var window is unlocked; asserted values are identical on either route.
+- The env-var window is unlocked; asserted values match on either route.

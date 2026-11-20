@@ -270,3 +270,15 @@ Authority: the same standing authorization (correct a plan record the review cou
 - Correction: 0205 gains a "Review record" section restating L1/L2 and their resolution
   (commit a9e1963). No requirement changes.
 - Witness: `git diff bcd26ac^ a9e1963 -- crates/xagent-brain crates/xagent-sandbox/src/bin crates/xagent-sandbox/src/food_kind_metrics.rs` is empty; task gates focused-proof and agent-unit.
+
+## Repair 2026-11-20: food-kind-senses packet body within the 8000-character limit
+
+- Authority: the plan owner's standing authorization for automatic repair of this run.
+- Superseded record: the `tasks/0103-food-kind-senses.md` body (8356 characters after
+  the in-run amendment carried in 9edfd57), which validate_plan refuses (limit 8000).
+- Contradiction: the amended packet text exceeded the packet size limit, so the published
+  record failed validation.
+- Correction: wording only. A duplicated sentence in Steps 1-2 that repeated Scope was
+  removed and several sentences were made shorter. Frontmatter, checks, touches,
+  dependencies, every requirement, name, bound and the amendment content are unchanged.
+- Witness: `validate_plan docs/plans/0004-food-contingency-learning` returns ok, 17 tasks.

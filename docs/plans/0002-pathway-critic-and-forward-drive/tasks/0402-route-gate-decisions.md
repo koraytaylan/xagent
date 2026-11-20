@@ -10,8 +10,8 @@ depends_on:
   - route-gate-tool
   - critic-input-decision
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "2e98ce4228a766bd7d62eeaf080d7349b5ed462b"
 touches:
   - docs/decisions/pathway-critic-route.md
   - docs/decisions/pathway-critic-route.json

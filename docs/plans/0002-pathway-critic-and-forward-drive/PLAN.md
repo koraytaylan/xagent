@@ -14,7 +14,7 @@ objective: >-
   route stays off.
 depends_on:
   - 0001-free-life-harness-and-trunk-lesions
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

@@ -53,7 +53,22 @@ const S_TD_ERROR: u32 = 1u;
 const S_HOMEO_PRED_ERROR: u32 = 2u;
 const S_STEP_NORMALIZER: u32 = 3u;
 const S_REWARD: u32 = 4u;
-var<workgroup> s_pred_td: array<f32, 5>;
+// Index 5 is the critic's own step normalizer; it equals S_STEP_NORMALIZER
+// when the critic reads the encoding alone.
+const S_CRITIC_NORMALIZER: u32 = 5u;
+var<workgroup> s_pred_td: array<f32, 6>;
+// Critic input source (CFG_CRITIC_INPUT).
+const CRITIC_INPUT_ENCODING: u32 = 0u;
+const CRITIC_INPUT_PATHWAY: u32 = 1u;
+const CRITIC_INPUT_ENCODING_AND_PATHWAY: u32 = 2u;
+// The whitened pathway inputs of the previous brain tick, as the critic reads
+// them this tick (scent first, then the visual hemifields), are copied here
+// before whitening overwrites them. Thread 0 alone fills and reads this
+// copy: the fill, the value dot, the normaliser, the trace update and the
+// store-pass write to O_RECENT_PATHWAY_KEYS all sit in tid == 0u blocks of
+// one invocation and no other thread reads it, so private storage holds the
+// same values a shared copy would, without adding workgroup memory.
+var<private> s_critic_pathway_input: array<f32, 10>;
 // Exploration noise terms [forward, turn] published by thread 0's motor
 // block for the parallel eligibility-trace update.
 var<workgroup> s_explore: array<f32, 3>;
@@ -1407,7 +1422,8 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // s_credit as ENCODED_DIMENSION-sized scratch — it is rewritten
         // with the encoder-credit values later in this block, after the
         // reduction below has consumed these partials.
-        if (tid < ENCODED_DIMENSION) {
+        let critic_mode = u32(bc_f32(CFG_CRITIC_INPUT));
+        if (tid < ENCODED_DIMENSION && critic_mode != CRITIC_INPUT_PATHWAY) {
             s_credit[tid] =
                 brain_state[brain_base + O_VALUE_WEIGHTS + tid] * s_memory_key[tid];
         }
@@ -1416,7 +1432,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Value dot reduction (all threads, parallel tree reduce) — MUST happen before
         // s_credit is overwritten with encoder-credit at the end of this block.
         {
-            if (tid < ENCODED_DIMENSION) {
+            if (tid < ENCODED_DIMENSION && critic_mode != CRITIC_INPUT_PATHWAY) {
                 s_dense_partials[tid] = s_credit[tid];
             } else {
                 s_dense_partials[tid] = 0.0;
@@ -1424,6 +1440,26 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             workgroupBarrier();
             wg_reduce_dense(tid);
             if (tid == 0u) { s_value = s_dense_partials[0]; }
+            workgroupBarrier();
+        }
+
+        // Pathway critic input: copy the stored whitened inputs before this
+        // tick's whitening overwrites them, and add their weighted sum.
+        if (critic_mode != CRITIC_INPUT_ENCODING) {
+            if (tid == 0u) {
+                var pathway_dot = 0.0;
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    var c = 0.0;
+                    if (k < SCENT_CHANNELS) {
+                        c = brain_state[brain_base + O_SCENT_WHITENED + k];
+                    } else {
+                        c = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+                    }
+                    s_critic_pathway_input[k] = c;
+                    pathway_dot += brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + k] * c;
+                }
+                s_value += pathway_dot;
+            }
             workgroupBarrier();
         }
 
@@ -1443,6 +1479,23 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             wg_reduce_dense(tid);
             if (tid == 0u) {
                 s_pred_td[S_STEP_NORMALIZER] = 1.0 / (1.0 + s_dense_partials[0]);
+                // The critic's own normalizer counts only the input sets it
+                // reads; the pathway part is the previous tick's |c|², which
+                // is then replaced by this tick's.
+                var critic_denominator = 1.0;
+                if (critic_mode != CRITIC_INPUT_PATHWAY) {
+                    critic_denominator += s_dense_partials[0];
+                }
+                if (critic_mode != CRITIC_INPUT_ENCODING) {
+                    critic_denominator += brain_state[brain_base + O_PREV_PATHWAY_INPUT_NORM];
+                    var pathway_norm_sq = 0.0;
+                    for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                        let c = s_critic_pathway_input[k];
+                        pathway_norm_sq += c * c;
+                    }
+                    brain_state[brain_base + O_PREV_PATHWAY_INPUT_NORM] = pathway_norm_sq;
+                }
+                s_pred_td[S_CRITIC_NORMALIZER] = 1.0 / critic_denominator;
             }
             workgroupBarrier();
         }
@@ -1474,7 +1527,7 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let critic_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
             let forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
             brain_state[brain_base + O_VALUE_BIAS] +=
-                CRITIC_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * critic_bias_trace;
+                CRITIC_LEARNING_RATE * s_pred_td[S_CRITIC_NORMALIZER] * td_error * critic_bias_trace;
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
             // The turn channel has no bias (see O_ACT_BIASES).
@@ -1511,6 +1564,49 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                     }
                 }
             }
+            // Pathway critic weights: own L2 ball over the ten inputs.
+            if (critic_mode != CRITIC_INPUT_ENCODING) {
+                var critic_pathway_norm_sq = 0.0;
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    let slot = brain_base + O_CRITIC_PATHWAY_WEIGHTS + k;
+                    brain_state[slot] += CRITIC_LEARNING_RATE * s_pred_td[S_CRITIC_NORMALIZER]
+                        * td_error * brain_state[brain_base + O_TRACE_CRITIC_PATHWAY + k];
+                    critic_pathway_norm_sq += brain_state[slot] * brain_state[slot];
+                }
+                let critic_pathway_norm = sqrt(critic_pathway_norm_sq);
+                if (critic_pathway_norm > MAX_WEIGHT_NORM) {
+                    for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                        brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + k] *=
+                            MAX_WEIGHT_NORM / critic_pathway_norm;
+                    }
+                }
+            }
+            // Forward pathway weights, one L2 ball per sense, from the trace
+            // as it stood before this tick's trace update.
+            if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
+                var forward_scent_norm_sq = 0.0;
+                var forward_vision_norm_sq = 0.0;
+                let forward_vision_rate = vision_pathway_learning_rate(brain_base);
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    let slot = brain_base + O_FORWARD_PATHWAY_WEIGHTS + k;
+                    let rate = select(forward_vision_rate, ACTION_WEIGHT_LEARNING_RATE, k < SCENT_CHANNELS);
+                    brain_state[slot] += rate * td_error
+                        * brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + k];
+                    if (k < SCENT_CHANNELS) {
+                        forward_scent_norm_sq += brain_state[slot] * brain_state[slot];
+                    } else {
+                        forward_vision_norm_sq += brain_state[slot] * brain_state[slot];
+                    }
+                }
+                let forward_scent_norm = sqrt(forward_scent_norm_sq);
+                let forward_vision_norm = sqrt(forward_vision_norm_sq);
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    let norm = select(forward_vision_norm, forward_scent_norm, k < SCENT_CHANNELS);
+                    if (norm > MAX_WEIGHT_NORM) {
+                        brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + k] *= MAX_WEIGHT_NORM / norm;
+                    }
+                }
+            }
         }
         workgroupBarrier();
 
@@ -1520,8 +1616,10 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             let critic_trace = brain_state[brain_base + O_TRACE_CRITIC + tid];
             let forward_trace = brain_state[brain_base + O_TRACE_FWD + tid];
             let turn_trace = brain_state[brain_base + O_TRACE_TURN + tid];
-            brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
-                CRITIC_LEARNING_RATE * s_pred_td[S_STEP_NORMALIZER] * td_error * critic_trace;
+            if (critic_mode != CRITIC_INPUT_PATHWAY) {
+                brain_state[brain_base + O_VALUE_WEIGHTS + tid] +=
+                    CRITIC_LEARNING_RATE * s_pred_td[S_CRITIC_NORMALIZER] * td_error * critic_trace;
+            }
             brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + tid] +=
                 ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * td_error * forward_trace;
             if (steering_weights_learn()) {
@@ -1731,6 +1829,19 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         var turn: f32 = s_turn_dot + scent_dot + vision_dot;
         if (lesion_forward_weights()) {
             forward = brain_state[brain_base + O_ACT_BIASES];
+        }
+        // Learned pathway term of the forward command, on this tick's
+        // whitened inputs.
+        if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
+            for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                var x = 0.0;
+                if (k < SCENT_CHANNELS) {
+                    x = brain_state[brain_base + O_SCENT_WHITENED + k];
+                } else {
+                    x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+                }
+                forward += brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + k] * x;
+            }
         }
 
         // Memory blend: recalled experiences influence motor output via valence.
@@ -1962,10 +2073,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
     // kicks (and the states they occurred in) that caused them.
     {
         let trace_decay = TD_DISCOUNT * TD_LAMBDA;
+        let critic_mode = u32(bc_f32(CFG_CRITIC_INPUT));
         if (tid < ENCODED_DIMENSION) {
             let enc = s_encoded[tid];
-            brain_state[brain_base + O_TRACE_CRITIC + tid] =
-                brain_state[brain_base + O_TRACE_CRITIC + tid] * trace_decay + s_memory_key[tid];
+            if (critic_mode != CRITIC_INPUT_PATHWAY) {
+                brain_state[brain_base + O_TRACE_CRITIC + tid] =
+                    brain_state[brain_base + O_TRACE_CRITIC + tid] * trace_decay + s_memory_key[tid];
+            }
             brain_state[brain_base + O_TRACE_FWD + tid] =
                 brain_state[brain_base + O_TRACE_FWD + tid] * trace_decay + s_explore[0u] * enc;
             brain_state[brain_base + O_TRACE_TURN + tid] =
@@ -1998,6 +2112,40 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 let slot = brain_base + O_TRACE_VISION + k;
                 brain_state[slot] = brain_state[slot] * trace_decay
                     + s_explore[2u] * input / (1.0 + vision_sq);
+            }
+            if (critic_mode != CRITIC_INPUT_ENCODING) {
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    let slot = brain_base + O_TRACE_CRITIC_PATHWAY + k;
+                    brain_state[slot] = brain_state[slot] * trace_decay + s_critic_pathway_input[k];
+                }
+            }
+            if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
+                var forward_scent_sq = 0.0;
+                var forward_vision_sq = 0.0;
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    var x = 0.0;
+                    if (k < SCENT_CHANNELS) {
+                        x = brain_state[brain_base + O_SCENT_WHITENED + k];
+                        forward_scent_sq += x * x;
+                    } else {
+                        x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+                        forward_vision_sq += x * x;
+                    }
+                }
+                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                    var x = 0.0;
+                    var sense_sq = 0.0;
+                    if (k < SCENT_CHANNELS) {
+                        x = brain_state[brain_base + O_SCENT_WHITENED + k];
+                        sense_sq = forward_scent_sq;
+                    } else {
+                        x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+                        sense_sq = forward_vision_sq;
+                    }
+                    let slot = brain_base + O_TRACE_FORWARD_PATHWAY + k;
+                    brain_state[slot] = brain_state[slot] * trace_decay
+                        + s_explore[0u] * x / (1.0 + sense_sq);
+                }
             }
         }
     }
@@ -2281,7 +2429,14 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         brain_state[brain_base + O_RECENT_KEYS + store_slot * ENCODED_DIMENSION + tid] =
             s_memory_key[tid];
     }
+    let replay_mode = u32(bc_f32(CFG_CRITIC_INPUT));
     if (tid == 0u) {
+        if (replay_mode != CRITIC_INPUT_ENCODING) {
+            for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                brain_state[brain_base + O_RECENT_PATHWAY_KEYS + store_slot * PATHWAY_INPUT_COUNT + k] =
+                    s_critic_pathway_input[k];
+            }
+        }
         brain_state[brain_base + O_RECENT_RETURNS + store_slot] = 0.0;
         brain_state[brain_base + O_RECENT_TICKS + store_slot] = tick;
         brain_state[brain_base + O_RECENT_STATE + store_slot] = RECENT_OPEN;
@@ -2296,7 +2451,7 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     let replay_slot = pcg_hash(agent_id ^ (u32(tick) * REPLAY_HASH_SALT)) % RECENT_CAP;
     let replay_key = brain_base + O_RECENT_KEYS + replay_slot * ENCODED_DIMENSION;
     let replay_settled = brain_state[brain_base + O_RECENT_STATE + replay_slot] == RECENT_SETTLED;
-    if (tid < ENCODED_DIMENSION) {
+    if (tid < ENCODED_DIMENSION && replay_mode != CRITIC_INPUT_PATHWAY) {
         s_dense_partials[tid] = brain_state[brain_base + O_VALUE_WEIGHTS + tid]
             * brain_state[replay_key + tid];
     } else {
@@ -2304,9 +2459,21 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
     }
     workgroupBarrier();
     wg_reduce_dense(tid);
+    let replay_pathway_key = brain_base + O_RECENT_PATHWAY_KEYS + replay_slot * PATHWAY_INPUT_COUNT;
     if (tid == 0u) {
-        let key_norm_sq = brain_state[brain_base + O_RECENT_NORMS + replay_slot];
-        let replay_value = brain_state[brain_base + O_VALUE_BIAS] + s_dense_partials[0];
+        var key_norm_sq = 0.0;
+        if (replay_mode != CRITIC_INPUT_PATHWAY) {
+            key_norm_sq = brain_state[brain_base + O_RECENT_NORMS + replay_slot];
+        }
+        var replay_pathway_dot = 0.0;
+        if (replay_mode != CRITIC_INPUT_ENCODING) {
+            for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
+                let key = brain_state[replay_pathway_key + k];
+                replay_pathway_dot += brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + k] * key;
+                key_norm_sq += key * key;
+            }
+        }
+        let replay_value = brain_state[brain_base + O_VALUE_BIAS] + s_dense_partials[0] + replay_pathway_dot;
         let replay_error = brain_state[brain_base + O_RECENT_RETURNS + replay_slot] - select(
             replay_value,
             brain_state[brain_base + O_VALUE_BIAS],
@@ -2320,7 +2487,11 @@ fn coop_learn_and_store(agent_id: u32, tid: u32, run_encoder_credit: bool) {
         brain_state[brain_base + O_VALUE_BIAS] += s_value;
     }
     workgroupBarrier();
-    if (tid < ENCODED_DIMENSION) {
+    if (tid < ENCODED_DIMENSION && replay_mode != CRITIC_INPUT_PATHWAY) {
         brain_state[brain_base + O_VALUE_WEIGHTS + tid] += s_value * brain_state[replay_key + tid];
+    }
+    if (tid < PATHWAY_INPUT_COUNT && replay_mode != CRITIC_INPUT_ENCODING) {
+        brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + tid] +=
+            s_value * brain_state[replay_pathway_key + tid];
     }
 }

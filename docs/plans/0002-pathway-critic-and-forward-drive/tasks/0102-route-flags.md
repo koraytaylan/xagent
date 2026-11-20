@@ -10,8 +10,8 @@ touches:
   - crates/xagent-shared/src/config.rs
   - crates/xagent-shared/src/lib.rs
   - crates/xagent-sandbox/src/agent/mod.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "910bd519146131c31d48fbdc7d263024a7647ad4"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-shared"

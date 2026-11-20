@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - brain-slot-layout
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "74cba2d3f6afff0d759121e1b40cecd4e3b93889"
 touches:
   - crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl
   - crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl

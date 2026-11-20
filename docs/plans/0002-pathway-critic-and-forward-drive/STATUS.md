@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status
@@ -17,3 +17,7 @@ Progress: 0/9 tasks complete.
 | route-gate-tool | todo |
 | critic-input-decision | todo |
 | route-gate-decisions | todo |
+
+## Factory runs
+
+- 2026-11-20 03:45:58Z — completed 9/9; final plan gates passed

@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - route-flags
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "217b3de76502c383edd8dabcbefb3f71e7236b53"
 touches:
   - crates/xagent-sandbox/src/bin/pathway_route_gate.rs
 checks:

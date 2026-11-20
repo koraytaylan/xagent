@@ -8,8 +8,8 @@ depends_on:
   - default-fingerprint
   - route-flags
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "d7ca88a180892f8b90538bbf099a3115e495e9f6"
 touches:
   - crates/xagent-brain/src/buffers.rs
   - crates/xagent-brain/src/shaders/kernel/common.wgsl

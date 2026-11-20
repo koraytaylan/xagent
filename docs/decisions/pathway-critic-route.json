@@ -1,0 +1,18 @@
+{
+  "route": "critic",
+  "commit": "fd7419c7c0c4cc4c4fba4ad7026e1fe0458eccbf",
+  "setting_under_test": "encoding",
+  "verdict": "not_applicable",
+  "failed_gate": null,
+  "g1": "not_applicable",
+  "g2": "not_applicable",
+  "g3": "not_applicable",
+  "g4": "not_applicable",
+  "seeds": [],
+  "agents_per_seed": 0,
+  "ticks_per_seed": null,
+  "config": null,
+  "agents": [],
+  "per_seed": [],
+  "pooled": null
+}

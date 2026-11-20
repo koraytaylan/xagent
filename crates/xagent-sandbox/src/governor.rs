@@ -173,8 +173,20 @@ fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
 
 /// Decode a `node_brain` blob written by [`encode_brain_state`]. Returns `None`
 /// when the header is missing or the payload size disagrees with the lengths
-/// the header declares.
+/// the header declares, or when the brain length matches no known layout.
+/// Blobs of the previous layout gain a zero pathway-route block.
 fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
+    let raw = decode_raw_brain_state(bytes)?;
+    let brain_state = xagent_brain::buffers::upgrade_legacy_brain_state(&raw.brain_state)?;
+    Some(AgentBrainState {
+        brain_state,
+        patterns: raw.patterns,
+    })
+}
+
+/// Decode a `node_brain` blob's framing only, without checking or upgrading
+/// the brain layout. `None` when the header or payload size is malformed.
+fn decode_raw_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
     let header_bytes = BRAIN_BLOB_HEADER_WORDS * BRAIN_BLOB_WORD_BYTES;
     if bytes.len() < header_bytes || bytes.len() % BRAIN_BLOB_WORD_BYTES != 0 {
         return None;
@@ -329,7 +341,11 @@ pub fn load_champion_read_only(
         .map_err(query_err)?
         .ok_or(ChampionLoadError::NoStoredChampion)?;
     let blob = blob.ok_or(ChampionLoadError::NodeWithoutBrain(id))?;
-    let brain = decode_brain_state(&blob).ok_or(ChampionLoadError::MalformedBrain(id))?;
+    // A well-framed blob whose brain length matches no known layout is
+    // returned as stored, so the caller's layout check reports the mismatch.
+    let brain = decode_brain_state(&blob)
+        .or_else(|| decode_raw_brain_state(&blob))
+        .ok_or(ChampionLoadError::MalformedBrain(id))?;
     let config = serde_json::from_str::<BrainConfig>(&config_json)
         .map_err(|_| ChampionLoadError::MalformedConfig(id))?;
     Ok(StoredChampion {
@@ -2484,6 +2500,38 @@ mod tests {
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
+    }
+
+    // ─── brain blob decode tests ────────────────────────────────────
+
+    /// RNG seed for the brains built by the decode tests.
+    const DECODE_TEST_SEED: u64 = 7;
+    /// Bytes cut from the end of an encoded brain to make it truncated.
+    const TRUNCATED_TAIL_BYTES: usize = 4;
+
+    #[test]
+    fn decode_upgrades_legacy_length_brain() {
+        use xagent_brain::buffers::{feature_count_for_brain_stride, PATHWAY_ROUTE_SLOT_COUNT};
+        let mut rng = SmallRng::seed_from_u64(DECODE_TEST_SEED);
+        let fresh = crate::agent::fresh_brain_state(&BrainConfig::default(), &mut rng);
+        let len = fresh.brain_state.len();
+        let end = len - feature_count_for_brain_stride(len).unwrap();
+        let range = end - PATHWAY_ROUTE_SLOT_COUNT..end;
+        let mut legacy = fresh.clone();
+        legacy.brain_state.drain(range.clone());
+        let bytes = encode_brain_state(&legacy).unwrap();
+        let decoded = decode_brain_state(&bytes).unwrap();
+        assert_eq!(decoded.brain_state.len(), len);
+        assert!(decoded.brain_state[range].iter().all(|v| *v == 0.0));
+        assert_eq!(decoded.patterns, legacy.patterns);
+    }
+
+    #[test]
+    fn decode_rejects_truncated_blob() {
+        let mut rng = SmallRng::seed_from_u64(DECODE_TEST_SEED);
+        let fresh = crate::agent::fresh_brain_state(&BrainConfig::default(), &mut rng);
+        let bytes = encode_brain_state(&fresh).unwrap();
+        assert!(decode_brain_state(&bytes[..bytes.len() - TRUNCATED_TAIL_BYTES]).is_none());
     }
 
     // ─── advance_ticks tests ────────────────────────────────────────
@@ -5764,11 +5812,15 @@ mod tests {
 
     // ─── champion brain inheritance ─────────────────────────────────
 
-    /// A small brain whose every value identifies `tag`, so a test can tell
-    /// which node's champion came back.
+    /// A current-layout brain whose every value identifies `tag`, so a test
+    /// can tell which node's champion came back.
     fn tagged_brain(tag: f32) -> AgentBrainState {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let len = crate::agent::fresh_brain_state(&BrainConfig::default(), &mut rng)
+            .brain_state
+            .len();
         AgentBrainState {
-            brain_state: vec![tag, tag + 0.5, -tag],
+            brain_state: vec![tag; len],
             patterns: vec![tag * 2.0],
         }
     }

@@ -7,8 +7,8 @@ role: architect
 depends_on:
   - return-fit-tool
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "8a05145e9077e0997622b2aa33d3b7206a7c7254"
 touches:
   - docs/decisions/pathway-critic-inputs.md
   - docs/decisions/pathway-critic-inputs.json

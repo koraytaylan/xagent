@@ -349,7 +349,21 @@ override O_VISION_PATHWAY_INPUT: u32 =
     O_VISION_PATHWAY_WHITENING + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
 override O_VISION_TURN_WEIGHTS: u32 = O_VISION_PATHWAY_INPUT + VISION_PATHWAY_INPUTS;
 override O_TRACE_VISION: u32 = O_VISION_TURN_WEIGHTS + VISION_PATHWAY_INPUTS;
-override O_SENSORY_MEAN: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+// Pathway slot block (mirrors buffers.rs). Every slot is zero at birth.
+// Forward and critic weights survive death; their traces are episodic and
+// zeroed at death. The previous input norm is rewritten each brain tick and
+// survives death. The recent-key ring survives death, like O_RECENT_KEYS.
+const PATHWAY_INPUT_COUNT: u32 = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;
+override O_FORWARD_PATHWAY_WEIGHTS: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+override O_TRACE_FORWARD_PATHWAY: u32 = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
+override O_CRITIC_PATHWAY_WEIGHTS: u32 = O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT;
+override O_TRACE_CRITIC_PATHWAY: u32 = O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
+override O_PREV_PATHWAY_INPUT_NORM: u32 = O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT;
+override O_RECENT_PATHWAY_KEYS: u32 = O_PREV_PATHWAY_INPUT_NORM + 1;
+// Running mean of each sensory feature, layout-sized and the last region of
+// the brain state. Unchanged by the pathway block: zero at birth and it
+// survives death.
+override O_SENSORY_MEAN: u32 = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
@@ -447,6 +461,10 @@ const CFG_LESION_MEMORY_BLEND: u32 = 18u;
 const CFG_LESION_CRITIC: u32 = 19u;
 // 1.0 makes the brain pass write the measurement block.
 const CFG_BRAIN_TICK_PROBE: u32 = 20u;
+// Which inputs the critic reads: 0.0 encoding, 1.0 pathway, 2.0 both.
+const CFG_CRITIC_INPUT: u32 = 21u;
+// 1.0 enables the forward pathway route.
+const CFG_FORWARD_PATHWAY_ENABLED: u32 = 22u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 

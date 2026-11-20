@@ -270,6 +270,41 @@ pub struct BrainConfig {
     /// `xagent_brain::buffers`.
     #[serde(default)]
     pub cortex_stage_limit: u32,
+    /// Which inputs the critic reads. Locked per batch, not heritable, not
+    /// perturbed by `mutate_config`. Default [`DEFAULT_CRITIC_INPUT`].
+    #[serde(default = "default_critic_input")]
+    pub critic_input: CriticInput,
+    /// Whether the forward pathway route is on. Locked per batch, not
+    /// heritable, not perturbed by `mutate_config`. Default
+    /// [`DEFAULT_FORWARD_PATHWAY_ENABLED`].
+    #[serde(default = "default_forward_pathway_enabled")]
+    pub forward_pathway_enabled: bool,
+}
+
+/// Which inputs the critic reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticInput {
+    /// The critic reads the centred 128-d encoding.
+    Encoding,
+    /// The critic reads the ten whitened pathway inputs.
+    Pathway,
+    /// The critic reads both the encoding and the pathway inputs.
+    EncodingAndPathway,
+}
+
+/// Default critic input. Each route is off until its gate passes.
+pub const DEFAULT_CRITIC_INPUT: CriticInput = CriticInput::Encoding;
+/// Default for the forward pathway route. Each route is off until its gate
+/// passes.
+pub const DEFAULT_FORWARD_PATHWAY_ENABLED: bool = false;
+
+fn default_critic_input() -> CriticInput {
+    DEFAULT_CRITIC_INPUT
+}
+
+fn default_forward_pathway_enabled() -> bool {
+    DEFAULT_FORWARD_PATHWAY_ENABLED
 }
 
 /// Upper bound (exclusive) for `orientation_offset`: π. Orientation is
@@ -660,6 +695,8 @@ impl Default for BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            critic_input: DEFAULT_CRITIC_INPUT,
+            forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
         }
     }
 }
@@ -761,6 +798,8 @@ impl BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            critic_input: DEFAULT_CRITIC_INPUT,
+            forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
         }
     }
 
@@ -805,6 +844,8 @@ impl BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            critic_input: DEFAULT_CRITIC_INPUT,
+            forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
         }
     }
 }
@@ -867,6 +908,50 @@ impl Default for AgentDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_flags_default_when_keys_absent() {
+        let mut value = serde_json::to_value(BrainConfig::default()).unwrap();
+        let map = value.as_object_mut().unwrap();
+        map.remove("critic_input");
+        map.remove("forward_pathway_enabled");
+        let config: BrainConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.critic_input, DEFAULT_CRITIC_INPUT);
+        assert_eq!(
+            config.forward_pathway_enabled,
+            DEFAULT_FORWARD_PATHWAY_ENABLED
+        );
+    }
+
+    #[test]
+    fn critic_input_names_round_trip() {
+        for (name, variant) in [
+            ("encoding", CriticInput::Encoding),
+            ("pathway", CriticInput::Pathway),
+            ("encoding_and_pathway", CriticInput::EncodingAndPathway),
+        ] {
+            let json = format!("\"{name}\"");
+            let parsed: CriticInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+            assert_eq!(serde_json::to_string(&variant).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn critic_input_unknown_name_fails() {
+        assert!(serde_json::from_str::<CriticInput>("\"both\"").is_err());
+    }
+
+    #[test]
+    fn forward_pathway_enabled_round_trips() {
+        let config = BrainConfig {
+            forward_pathway_enabled: true,
+            ..BrainConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: BrainConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.forward_pathway_enabled);
+    }
 
     #[test]
     fn brain_config_tuned_defaults() {

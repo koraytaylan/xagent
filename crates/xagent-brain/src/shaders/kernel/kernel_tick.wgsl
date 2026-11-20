@@ -718,6 +718,24 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     let terminal_step_normalizer = step_normalizer_for_prev_encoded(brain_base);
     let terminal_critic_step = CRITIC_LEARNING_RATE * terminal_step_normalizer;
     let terminal_turn_step = ACTION_WEIGHT_LEARNING_RATE * terminal_step_normalizer;
+    // The critic's own terminal step counts only the input sets it reads.
+    let terminal_critic_mode = u32(bc_f32(CFG_CRITIC_INPUT));
+    var terminal_critic_denominator = 1.0;
+    if (terminal_critic_mode != CRITIC_INPUT_PATHWAY) {
+        for (var i = 0u; i < ENCODED_DIMENSION; i++) {
+            let x = brain_state[brain_base + O_PREV_ENCODED + i]
+                - brain_state[brain_base + O_ENCODED_MEAN + i];
+            terminal_critic_denominator += x * x;
+        }
+    }
+    if (terminal_critic_mode != CRITIC_INPUT_ENCODING) {
+        terminal_critic_denominator += brain_state[brain_base + O_PREV_PATHWAY_INPUT_NORM];
+    }
+    let terminal_critic_route_step = select(
+        CRITIC_LEARNING_RATE / terminal_critic_denominator,
+        terminal_critic_step,
+        terminal_critic_mode == CRITIC_INPUT_ENCODING,
+    );
 
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
         brain_state[brain_base + O_HAB_EMA + i] = 0.0;
@@ -733,13 +751,55 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // and the full-energy respawn makes death read as a free heal.
     let terminal_value_bias_trace = brain_state[brain_base + O_TRACE_BIASES];
     let terminal_forward_bias_trace = brain_state[brain_base + O_TRACE_BIASES + 1u];
-    brain_state[brain_base + O_VALUE_BIAS] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
+    brain_state[brain_base + O_VALUE_BIAS] += terminal_critic_route_step * TERMINAL_DEATH_TD_ERROR * terminal_value_bias_trace;
     brain_state[brain_base + O_ACT_BIASES] += ACTION_WEIGHT_LEARNING_RATE * TERMINAL_DEATH_TD_ERROR * terminal_forward_bias_trace;
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
-        brain_state[brain_base + O_VALUE_WEIGHTS + i] += terminal_critic_step * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
+        if (terminal_critic_mode != CRITIC_INPUT_PATHWAY) {
+            brain_state[brain_base + O_VALUE_WEIGHTS + i] += terminal_critic_route_step * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_CRITIC + i];
+        }
         brain_state[brain_base + O_ACTION_FORWARD_WEIGHTS + i] += ACTION_WEIGHT_LEARNING_RATE * ACTOR_VECTOR_SCALE * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_FWD + i];
         if (steering_weights_learn()) {
             brain_state[brain_base + O_ACTION_TURN_WEIGHTS + i] += terminal_turn_step * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_TURN + i];
+        }
+    }
+    if (terminal_critic_mode != CRITIC_INPUT_ENCODING) {
+        var terminal_pathway_norm_sq = 0.0;
+        for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
+            let slot = brain_base + O_CRITIC_PATHWAY_WEIGHTS + i;
+            brain_state[slot] += terminal_critic_route_step * TERMINAL_DEATH_TD_ERROR
+                * brain_state[brain_base + O_TRACE_CRITIC_PATHWAY + i];
+            terminal_pathway_norm_sq += brain_state[slot] * brain_state[slot];
+        }
+        let terminal_pathway_norm = sqrt(terminal_pathway_norm_sq);
+        for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
+            if (terminal_pathway_norm > MAX_WEIGHT_NORM) {
+                brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + i] *= MAX_WEIGHT_NORM / terminal_pathway_norm;
+            }
+            brain_state[brain_base + O_TRACE_CRITIC_PATHWAY + i] = 0.0;
+        }
+    }
+    if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
+        var terminal_scent_norm_sq = 0.0;
+        var terminal_vision_norm_sq = 0.0;
+        for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
+            let slot = brain_base + O_FORWARD_PATHWAY_WEIGHTS + i;
+            let rate = select(vision_pathway_learning_rate(brain_base), ACTION_WEIGHT_LEARNING_RATE, i < SCENT_CHANNELS);
+            brain_state[slot] += rate * TERMINAL_DEATH_TD_ERROR
+                * brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + i];
+            if (i < SCENT_CHANNELS) {
+                terminal_scent_norm_sq += brain_state[slot] * brain_state[slot];
+            } else {
+                terminal_vision_norm_sq += brain_state[slot] * brain_state[slot];
+            }
+        }
+        let terminal_scent_norm = sqrt(terminal_scent_norm_sq);
+        let terminal_vision_norm = sqrt(terminal_vision_norm_sq);
+        for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
+            let sense_norm = select(terminal_vision_norm, terminal_scent_norm, i < SCENT_CHANNELS);
+            if (sense_norm > MAX_WEIGHT_NORM) {
+                brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + i] *= MAX_WEIGHT_NORM / sense_norm;
+            }
+            brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + i] = 0.0;
         }
     }
 
@@ -750,7 +810,9 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     // are episodic — credit must never leak across the death boundary.
     // The value weights themselves are learned knowledge and survive.
     for (var i = 0u; i < ENCODED_DIMENSION; i++) {
-        brain_state[brain_base + O_TRACE_CRITIC + i] = 0.0;
+        if (terminal_critic_mode != CRITIC_INPUT_PATHWAY) {
+            brain_state[brain_base + O_TRACE_CRITIC + i] = 0.0;
+        }
         brain_state[brain_base + O_TRACE_FWD + i] = 0.0;
         brain_state[brain_base + O_TRACE_TURN + i] = 0.0;
     }

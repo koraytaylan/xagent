@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - brain-slot-layout
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "af815731881ac32b723b52d118ea5e972b579f19"
 touches:
   - crates/xagent-sandbox/src/governor.rs
   - crates/xagent-sandbox/tests/pathway_route_state.rs

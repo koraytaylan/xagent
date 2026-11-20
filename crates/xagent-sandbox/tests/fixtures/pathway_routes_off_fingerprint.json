@@ -1,0 +1,15 @@
+{
+  "digest_algorithm": "fnv1a-64",
+  "parameters": {
+    "seed": 5,
+    "agent_count": 10,
+    "ticks": 20000,
+    "brain_source": "fresh"
+  },
+  "command": "xagent --config <config> --seed 5 --free-life --free-life-agents 10 --free-life-ticks 20000 --free-life-log <scratch>/ticks.bin --free-life-out <scratch>/metrics.json",
+  "metrics_scope": "agents",
+  "log_scope": "payload_after_header_line",
+  "gpu_adapter": "AMD Ryzen 9 7950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO)",
+  "metrics_digest": "8f50fd0c9dd06ce6",
+  "log_digest": "f4678e3f4bb64d35"
+}

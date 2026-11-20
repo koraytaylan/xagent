@@ -6,8 +6,8 @@ kind: task
 role: architect
 depends_on: []
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "9f2a77d09217b96eae8ccd74145bfb5dbfa4c15b"
 touches:
   - crates/xagent-sandbox/tests/pathway_default_fingerprint.rs
   - crates/xagent-sandbox/tests/fixtures/pathway_routes_off_config.json

@@ -6,8 +6,8 @@ kind: task
 role: developer
 depends_on: []
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "630d6113afd5931b63c1a7eb3040ef1074e15d2d"
 touches:
   - crates/xagent-sandbox/src/bin/pathway_return_fit.rs
 checks:

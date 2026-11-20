@@ -236,13 +236,39 @@ pub const RECENT_SETTLED: f32 = 2.0;
 /// Running mean of each sensory feature for sensory adaptation
 /// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
 /// slots, so it is the one layout-sized region after the fixed tail.
-pub const O_SENSORY_MEAN: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+pub const O_SENSORY_MEAN: usize = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;
 pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
+/// Inputs of the whole pathway: the scent channels, then the visual inputs
+/// (`PATHWAY_INPUT_COUNT` in `common.wgsl`).
+pub const PATHWAY_INPUT_COUNT: usize = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;
+/// Forward-drive weights on the pathway input. Zero at birth; heritable once
+/// written, so it survives death.
+pub const O_FORWARD_PATHWAY_WEIGHTS: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+/// Eligibility traces of the forward pathway weights. Zero at birth; episodic,
+/// zeroed at death.
+pub const O_TRACE_FORWARD_PATHWAY: usize = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
+/// Critic weights on the pathway input. Zero at birth; survives death.
+pub const O_CRITIC_PATHWAY_WEIGHTS: usize = O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT;
+/// Eligibility traces of the critic pathway weights. Zero at birth; episodic,
+/// zeroed at death.
+pub const O_TRACE_CRITIC_PATHWAY: usize = O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
+/// Norm of the previous brain tick's pathway input. Zero at birth; rewritten
+/// each brain tick; survives death.
+pub const O_PREV_PATHWAY_INPUT_NORM: usize = O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT;
+/// Pathway-input keys of the recent-experience ring, `RECENT_CAP` rows of
+/// `PATHWAY_INPUT_COUNT`. Zero at birth; survives death with the ring, like
+/// `O_RECENT_KEYS`.
+pub const O_RECENT_PATHWAY_KEYS: usize = O_PREV_PATHWAY_INPUT_NORM + 1;
+/// Number of slots in the pathway block between `O_TRACE_VISION` (after its
+/// visual inputs) and `O_SENSORY_MEAN`.
+pub const PATHWAY_ROUTE_SLOT_COUNT: usize =
+    4 * PATHWAY_INPUT_COUNT + 1 + RECENT_CAP * PATHWAY_INPUT_COUNT;
+
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
-/// to `O_SENSORY_MEAN` (exclusive). This tail is layout-independent: it
-/// doesn't change with feature_count / vision dimensions. The sensory mean
-/// (`feature_count` slots) follows it.
+/// to `O_SENSORY_MEAN` (exclusive), ending with the pathway slot block. This
+/// tail is layout-independent: it doesn't change with feature_count / vision
+/// dimensions. The sensory mean (`feature_count` slots) follows it.
 pub const FIXED_TAIL_SIZE: usize = O_SENSORY_MEAN - O_PREDICTOR_CONTEXT_WEIGHT;
 
 /// Feature count of the layout that produced a `brain_state` of length
@@ -256,6 +282,40 @@ pub fn feature_count_for_brain_stride(brain_stride: usize) -> Option<usize> {
         ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE,
     )?;
     (variable % (ENCODED_DIMENSION + 1) == 0).then_some(variable / (ENCODED_DIMENSION + 1))
+}
+
+/// Upgrades a `brain_state` saved before the pathway slot block existed by
+/// inserting the block, zeroed, ahead of the sensory mean. A current-layout
+/// state is returned as a copy; `None` if the length matches no layout.
+pub fn upgrade_legacy_brain_state(brain_state: &[f32]) -> Option<Vec<f32>> {
+    if feature_count_for_brain_stride(brain_state.len()).is_some() {
+        return Some(brain_state.to_vec());
+    }
+    let legacy_tail = FIXED_TAIL_SIZE.checked_sub(PATHWAY_ROUTE_SLOT_COUNT)?;
+    let fixed = PREDICTOR_DIMENSION
+        .checked_mul(ENCODED_DIMENSION)?
+        .checked_add(legacy_tail)?;
+    let legacy_base = ENCODED_DIMENSION.checked_add(fixed)?;
+    let variable = brain_state.len().checked_sub(legacy_base)?;
+    let row = ENCODED_DIMENSION.checked_add(1)?;
+    if variable % row != 0 {
+        return None;
+    }
+    let fc = variable / row;
+    if fc < 1 {
+        return None;
+    }
+    let insert_at = fc
+        .checked_mul(ENCODED_DIMENSION)?
+        .checked_add(ENCODED_DIMENSION)?
+        .checked_add(fixed)?;
+    let head = brain_state.get(..insert_at)?;
+    let rest = brain_state.get(insert_at..)?;
+    let mut out = Vec::with_capacity(brain_state.len().checked_add(PATHWAY_ROUTE_SLOT_COUNT)?);
+    out.extend_from_slice(head);
+    out.resize(insert_at.checked_add(PATHWAY_ROUTE_SLOT_COUNT)?, 0.0);
+    out.extend_from_slice(rest);
+    Some(out)
 }
 
 /// Offset of the fixed tail (this layout's `O_PREDICTOR_CONTEXT_WEIGHT`) in a
@@ -833,6 +893,19 @@ pub const CFG_LESION_CRITIC: usize = 19;
 /// `1.0` makes the brain pass write the probe block of the decision buffer.
 /// Mirrored in `common.wgsl`.
 pub const CFG_BRAIN_TICK_PROBE: usize = 20;
+/// Which inputs the critic reads, as one of `CRITIC_INPUT_ENCODING`,
+/// `CRITIC_INPUT_PATHWAY` or `CRITIC_INPUT_ENCODING_AND_PATHWAY`. Mirrored by
+/// `CFG_CRITIC_INPUT` in `common.wgsl`.
+pub const CFG_CRITIC_INPUT: usize = 21;
+/// `1.0` enables the forward pathway route. Mirrored by
+/// `CFG_FORWARD_PATHWAY_ENABLED` in `common.wgsl`.
+pub const CFG_FORWARD_PATHWAY_ENABLED: usize = 22;
+/// `CFG_CRITIC_INPUT` encoding: the critic reads the centred encoding.
+pub const CRITIC_INPUT_ENCODING: f32 = 0.0;
+/// `CFG_CRITIC_INPUT` encoding: the critic reads the pathway inputs.
+pub const CRITIC_INPUT_PATHWAY: f32 = 1.0;
+/// `CFG_CRITIC_INPUT` encoding: the critic reads both.
+pub const CRITIC_INPUT_ENCODING_AND_PATHWAY: f32 = 2.0;
 pub const CONFIG_SIZE: usize = 24; // padded for uniform vec4 alignment (6 × vec4)
 
 /// Which trunk pathways are cut out of the decision; each `true` field
@@ -1307,6 +1380,16 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     };
     cfg[CFG_HOMEO_PREDICTOR_LEARNING_RATE] = config.homeo_predictor_learning_rate;
     cfg[CFG_HOMEO_PREDICTIVE_CREDIT_BETA] = config.homeo_predictive_credit_beta;
+    cfg[CFG_CRITIC_INPUT] = match config.critic_input {
+        xagent_shared::CriticInput::Encoding => CRITIC_INPUT_ENCODING,
+        xagent_shared::CriticInput::Pathway => CRITIC_INPUT_PATHWAY,
+        xagent_shared::CriticInput::EncodingAndPathway => CRITIC_INPUT_ENCODING_AND_PATHWAY,
+    };
+    cfg[CFG_FORWARD_PATHWAY_ENABLED] = if config.forward_pathway_enabled {
+        1.0
+    } else {
+        0.0
+    };
     cfg
 }
 
@@ -1451,7 +1534,10 @@ mod tests {
         assert_eq!(O_RECENT_KEYS, O_TURN_NOISE + 1);
         assert_eq!(O_SCENT_MEAN, O_RECENT_NORMS + RECENT_CAP);
         assert_eq!(O_VISION_PATHWAY_MEAN, O_TRACE_SCENT + 2);
-        assert_eq!(O_SENSORY_MEAN, O_TRACE_VISION + VISION_PATHWAY_INPUTS);
+        assert_eq!(
+            O_SENSORY_MEAN,
+            O_TRACE_VISION + VISION_PATHWAY_INPUTS + PATHWAY_ROUTE_SLOT_COUNT
+        );
         assert_eq!(BRAIN_STRIDE, O_SENSORY_MEAN + FEATURE_COUNT);
     }
 
@@ -1674,6 +1760,8 @@ mod tests {
         assert!(CFG_LESION_MEMORY_BLEND < CONFIG_SIZE);
         assert!(CFG_LESION_CRITIC < CONFIG_SIZE);
         assert!(CFG_BRAIN_TICK_PROBE < CONFIG_SIZE);
+        assert!(CFG_CRITIC_INPUT < CONFIG_SIZE);
+        assert!(CFG_FORWARD_PATHWAY_ENABLED < CONFIG_SIZE);
         assert_eq!(CONFIG_SIZE, 24);
     }
 
@@ -1961,6 +2049,141 @@ mod tests {
             }
         }
         map
+    }
+
+    #[test]
+    fn pathway_block_offsets_are_contiguous_and_ordered() {
+        assert_eq!(PATHWAY_INPUT_COUNT, 10);
+        assert_eq!(PATHWAY_ROUTE_SLOT_COUNT, 1321);
+        assert_eq!(
+            O_FORWARD_PATHWAY_WEIGHTS,
+            O_TRACE_VISION + VISION_PATHWAY_INPUTS
+        );
+        assert_eq!(
+            O_TRACE_FORWARD_PATHWAY,
+            O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT
+        );
+        assert_eq!(
+            O_CRITIC_PATHWAY_WEIGHTS,
+            O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT
+        );
+        assert_eq!(
+            O_TRACE_CRITIC_PATHWAY,
+            O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT
+        );
+        assert_eq!(
+            O_PREV_PATHWAY_INPUT_NORM,
+            O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT
+        );
+        assert_eq!(O_RECENT_PATHWAY_KEYS, O_PREV_PATHWAY_INPUT_NORM + 1);
+        assert_eq!(
+            O_SENSORY_MEAN,
+            O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT
+        );
+        assert_eq!(
+            O_SENSORY_MEAN - O_FORWARD_PATHWAY_WEIGHTS,
+            PATHWAY_ROUTE_SLOT_COUNT
+        );
+    }
+
+    #[test]
+    fn legacy_tail_excludes_pathway_block() {
+        assert_eq!(
+            FIXED_TAIL_SIZE - PATHWAY_ROUTE_SLOT_COUNT,
+            O_TRACE_VISION + VISION_PATHWAY_INPUTS - O_PREDICTOR_CONTEXT_WEIGHT
+        );
+    }
+
+    #[test]
+    fn pathway_block_and_cfg_slots_match_wgsl() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+        assert_eq!(wgsl["CFG_CRITIC_INPUT"], CFG_CRITIC_INPUT as u32);
+        assert_eq!(
+            wgsl["CFG_FORWARD_PATHWAY_ENABLED"],
+            CFG_FORWARD_PATHWAY_ENABLED as u32
+        );
+        for line in [
+            "override O_FORWARD_PATHWAY_WEIGHTS: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;",
+            "override O_TRACE_FORWARD_PATHWAY: u32 = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;",
+            "override O_CRITIC_PATHWAY_WEIGHTS: u32 = O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT;",
+            "override O_TRACE_CRITIC_PATHWAY: u32 = O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;",
+            "override O_PREV_PATHWAY_INPUT_NORM: u32 = O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT;",
+            "override O_RECENT_PATHWAY_KEYS: u32 = O_PREV_PATHWAY_INPUT_NORM + 1;",
+            "override O_SENSORY_MEAN: u32 = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;",
+            "const PATHWAY_INPUT_COUNT: u32 = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;",
+        ] {
+            assert!(src.contains(line), "missing WGSL line: {line}");
+        }
+    }
+
+    #[test]
+    fn fresh_brain_state_has_zero_pathway_block() {
+        let config = BrainConfig::default();
+        let mut rng = rand::rng();
+        let state = init_brain_state(&config, &mut rng);
+        let base =
+            fixed_tail_base(state.len()) + (O_FORWARD_PATHWAY_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let block = &state[base..base + PATHWAY_ROUTE_SLOT_COUNT];
+        assert!(block.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn build_config_packs_route_slots() {
+        let mut config = BrainConfig::default();
+        for (input, expected) in [
+            (xagent_shared::CriticInput::Encoding, 0.0),
+            (xagent_shared::CriticInput::Pathway, 1.0),
+            (xagent_shared::CriticInput::EncodingAndPathway, 2.0),
+        ] {
+            for (flag, flag_expected) in [(false, 0.0), (true, 1.0)] {
+                config.critic_input = input;
+                config.forward_pathway_enabled = flag;
+                let packed = build_config(&config);
+                assert_eq!(packed[CFG_CRITIC_INPUT], expected);
+                assert_eq!(packed[CFG_FORWARD_PATHWAY_ENABLED], flag_expected);
+            }
+        }
+    }
+
+    fn legacy_len(fc: usize) -> usize {
+        fc * (ENCODED_DIMENSION + 1)
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+            + FIXED_TAIL_SIZE
+            - PATHWAY_ROUTE_SLOT_COUNT
+    }
+
+    #[test]
+    fn legacy_lengths_are_never_current_lengths() {
+        for fc in 1..=8192 {
+            assert!(feature_count_for_brain_stride(legacy_len(fc)).is_none());
+        }
+    }
+
+    #[test]
+    fn upgrade_inserts_zero_block_into_legacy_state() {
+        let config = BrainConfig::default();
+        let mut rng = rand::rng();
+        let state = init_brain_state(&config, &mut rng);
+        let insert_at =
+            fixed_tail_base(state.len()) + (O_FORWARD_PATHWAY_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let mut legacy = state.clone();
+        legacy.drain(insert_at..insert_at + PATHWAY_ROUTE_SLOT_COUNT);
+        assert_eq!(upgrade_legacy_brain_state(&legacy), Some(state));
+    }
+
+    #[test]
+    fn upgrade_current_length_is_unchanged_copy() {
+        let state = vec![0.5_f32; BRAIN_STRIDE];
+        assert_eq!(upgrade_legacy_brain_state(&state), Some(state));
+    }
+
+    #[test]
+    fn upgrade_rejects_unknown_lengths() {
+        for len in [0, 1, BRAIN_STRIDE - 1, BRAIN_STRIDE + 1, legacy_len(1) - 1] {
+            assert!(upgrade_legacy_brain_state(&vec![0.0; len]).is_none());
+        }
     }
 
     #[test]

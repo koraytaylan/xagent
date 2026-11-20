@@ -75,6 +75,10 @@ preflight_checks:
   - name: pf-inheritance-apis
     command: |-
       sh -c 'grep -qF "pub fn fresh_brain_state(config: &BrainConfig, rng: &mut impl Rng) -> AgentBrainState {" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn mutate_steering_weights(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn steering_population(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "pub fn mutate_brain_state_seeded(" crates/xagent-sandbox/src/agent/mod.rs && grep -qF "rand = { workspace = true }" crates/xagent-sandbox/Cargo.toml && grep -qF "mutate_steering_weights_for" docs/plans/0003-uniform-sense-motor-route/tasks/0203-descriptor-driven-mutation.md'
+  - name: pf-flag-on-tail-base
+    command: |-
+      sh -c 'grep -qF "pub fn feature_count_for_brain_stride(brain_stride: usize) -> Option<usize> {" crates/xagent-brain/src/buffers.rs && grep -qF "pub fn fixed_tail_base(brain_stride: usize) -> usize {" crates/xagent-brain/src/buffers.rs && grep -qF "pub fn from_config(config: &BrainConfig) -> Self {" crates/xagent-brain/src/buffers.rs && cargo test -p xagent-brain --lib buffers:: --no-run'
+    timeout_ms: 3600000
   - name: pf-metrics-sources
     command: |-
       sh -c 'grep -qF "pub const P_MOTOR_TURN_OUT: usize = 28;" crates/xagent-brain/src/buffers.rs && grep -qF "pub const FOOD_STATE_STRIDE: usize = 4;" crates/xagent-brain/src/buffers.rs && grep -qF "pub const P_NEAREST_FOOD_BEARING: usize = 34;" crates/xagent-brain/src/buffers.rs && grep -qF "pub mod headless;" crates/xagent-sandbox/src/lib.rs && grep -qF "serde_json = { workspace = true }" crates/xagent-sandbox/Cargo.toml'

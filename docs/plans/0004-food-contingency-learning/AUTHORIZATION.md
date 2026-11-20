@@ -282,3 +282,15 @@ Authority: the same standing authorization (correct a plan record the review cou
   removed and several sentences were made shorter. Frontmatter, checks, touches,
   dependencies, every requirement, name, bound and the amendment content are unchanged.
 - Witness: `validate_plan docs/plans/0004-food-contingency-learning` returns ok, 17 tasks.
+
+## Repair 2026-11-20: flag-on-tail-base preflight check declared
+
+- Authority: the plan owner's standing authorization for automatic repair of this run.
+- Superseded record: PLAN.md `preflight_checks`, which lacked `pf-flag-on-tail-base`
+  although the ARCHITECTURE.md Feasibility row for flag-on-tail-base names it.
+- Contradiction: the host continuation proof refused the plan because the feasibility
+  witness names an unavailable preflight check.
+- Correction: `pf-flag-on-tail-base` is added to `preflight_checks` with the same command
+  as the existing named constraint check. No requirement, bound or dependency changes.
+- Witness: the command exits 0 on the baseline (`cargo test -p xagent-brain --lib buffers:: --no-run`
+  builds); validate_plan returns ok.

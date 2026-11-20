@@ -41,10 +41,18 @@ is nourishing (ARCHITECTURE.md INV-04, INV-02, INV-01).
 - `phase_vision.wgsl` colour site (line 103, inside the loop that defines `fidx`
   at line 89): replace `hit_color = vec4<f32>(0.7, 0.95, 0.2, 1.0);` with
   `hit_color = food_item_color(fidx);`.
-- `phase_vision_parallel.wgsl` (line 191): the same replacement, using `fidx`
-  (in scope from line 73).
-- `phase_vision_object_queries.wgsl` (line 196): the same replacement. Read
-  lines 185-200 and use the food-index variable in scope there; invent no index.
+- `phase_vision_parallel.wgsl` (line 191, in `vision_parallel_rays`): no food
+  index is in scope there; `fidx` (line 73) is local to `vision_parallel_sample`,
+  which returns only the event kind. Recover the hit item at the colour site by
+  re-running the existing food-grid test at the ray's first hit step (the scan may
+  be factored into a helper that the sample function also calls, with the same
+  order and arithmetic), bind its `fidx` and set `hit_color = food_item_color(fidx);`.
+- `phase_vision_object_queries.wgsl` (line 196, in `vision_object_write_ray`): no
+  food index is in scope there; the caller's `food_id` loop folds into the
+  `atomicMin` of the event word. Recover the hit item inside the FOOD branch by
+  looping `food_id` over the existing `vision_object_cache` and taking the lowest
+  `food_id` whose existing `vision_object_first_hit` step equals the ray's first
+  step (the sequential order), then set `hit_color = food_item_color(food_id);`.
 - `crates/xagent-brain/tests/food_kind_colour.rs` (new): the tests under Steps.
 
 `food_item_color(i)` (from food-kind-layout in `common.wgsl`) returns
@@ -54,8 +62,15 @@ are on. The kernel packs `WC_FOOD_KINDS` (kernel-food-kind-draw).
 
 ## Decisions
 
-- **One helper, no new pass.** Only the three literals change; no scent code,
-  buffer or binding changes here (task `food-kind-senses`).
+- **One helper, no new pass.** The three literals become `food_item_color(..)`;
+  in the parallel and object-queries shaders the hit index is recovered at the
+  colour site by re-running the existing food test as Scope says. Required: no
+  new storage buffer, binding, or workgroup variable; the event word, its
+  encoding and its `atomicMin` stay unchanged; depth and event selection stay
+  bit-identical (vision-regression and parity). Not required, and not ruled
+  out: keeping each shader's other code byte-identical; factoring the existing
+  food test into a helper that both the event search and the colour site call.
+  No scent code changes here (task `food-kind-senses`).
 - **No value label.** No vision code reads `food_item_is_nourishing`.
 - **Fail-closed GPU tests.** The test file defines `fn gpu_or_skip() -> bool`:
   `true` when `GpuKernel::is_available()`; when false and

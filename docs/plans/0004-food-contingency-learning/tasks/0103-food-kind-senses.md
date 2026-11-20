@@ -36,7 +36,8 @@ checks:
 With food kinds on, nostril pair 1 smells
 only `First` items. The extra sensory channels that directly follow the scent
 channels smell only `Second` items under the same odour law, and are written
-whenever `EXTRA_SENSORY_CHANNELS` is at least `SCENT_CHANNELS`. Serial and
+whenever `EXTRA_SENSORY_CHANNELS` is at least `NON_VISUAL_FEATURE_CHANNELS` (the
+WGSL scent channel count). Serial and
 parallel pair-1 scent agree bit for bit. With kinds off and the second sense off,
 scent and the sensory stride equal the baseline. Kind colour is task
 `food-kind-colour`, which edits `phase_vision.wgsl` first.
@@ -59,9 +60,12 @@ scent and the sensory stride equal the baseline. Kind colour is task
     and keep `sensory_buffer[scent_base] = scent.x;` and
     `sensory_buffer[scent_base + 1u] = scent.y;`. Immediately after the second of
     these, add:
-    `if (EXTRA_SENSORY_CHANNELS >= SCENT_CHANNELS) { let second = sense_second_odour(pos, facing, smell_strength); sensory_buffer[scent_base + SCENT_CHANNELS] = second.x; sensory_buffer[scent_base + SCENT_CHANNELS + 1u] = second.y; }`
-    Use one integer type in the comparison (`u32(SCENT_CHANNELS)` if needed) and no
-    literal offset.
+    `if (EXTRA_SENSORY_CHANNELS >= NON_VISUAL_FEATURE_CHANNELS) { let second = sense_second_odour(pos, facing, smell_strength); sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS] = second.x; sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS + 1u] = second.y; }`
+    Both sides are `u32`, so no cast is needed; use no literal offset. In WGSL the
+    scent channel count is `NON_VISUAL_FEATURE_CHANNELS` (`common.wgsl`, `2u`), 0003's
+    rename of the WGSL `SCENT_CHANNELS`; do not write or define `SCENT_CHANNELS` in
+    WGSL (0003's `SENSE_SPECIFIC_NAMES` bans it). The Rust `SCENT_CHANNELS`
+    (`buffers.rs`) is the same count and may be used in the Rust test file.
 - `crates/xagent-brain/src/shaders/kernel/phase_vision_scent_parallel.wgsl`: in
   `vision_prepare_scent`, change line 56 from `if alive && food_flags[food] == 0u {`
   to `if alive && food_flags[food] == 0u && !(food_kinds_enabled() && food_item_kind(food) != FOOD_KIND_FIRST) {`.
@@ -69,7 +73,7 @@ scent and the sensory stride equal the baseline. Kind colour is task
   under Steps.
 
 WGSL names used: `food_kinds_enabled()`, `food_item_kind(i)`, `FOOD_KIND_FIRST`,
-`FOOD_KIND_SECOND`, `SCENT_CHANNELS` and `EXTRA_SENSORY_CHANNELS`.
+`FOOD_KIND_SECOND`, `NON_VISUAL_FEATURE_CHANNELS` and `EXTRA_SENSORY_CHANNELS`.
 
 ## Non-goals
 
@@ -77,7 +81,7 @@ WGSL names used: `food_kinds_enabled()`, `food_item_kind(i)`, `FOOD_KIND_FIRST`,
   `buffers.rs` or `agent/senses.rs`; a missing name is a stop-and-report. The scalar
   call text stays.
 - No `second_odour` text or `senses.rs` use in WGSL: pair 2 sits at
-  `scent_base + SCENT_CHANNELS` via `EXTRA_SENSORY_CHANNELS` (PLAN.md "Owner
+  `scent_base + NON_VISUAL_FEATURE_CHANNELS` via `EXTRA_SENSORY_CHANNELS` (PLAN.md "Owner
   decisions on the 0003 interface", item 2).
 - No read of `food_item_is_nourishing`; no channel encodes which kind nourishes.
 - No CPU mirror, GUI or reward change; no planning vocabulary or `TODO` in source.

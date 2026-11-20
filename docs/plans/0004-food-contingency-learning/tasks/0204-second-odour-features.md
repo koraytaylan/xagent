@@ -45,8 +45,11 @@ times and every feature is unchanged (ARCHITECTURE.md INV-05, INV-01).
   `coop_feature_extract`: directly after
   `s_features[fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;`
   add
-  `for (var k: u32 = 0u; k < EXTRA_SENSORY_CHANNELS; k = k + 1u) { s_features[fi] = sensory_buffer[s_base + scent_offset + SCENT_CHANNELS + k]; fi = fi + 1u; }`
-  (use `u32(SCENT_CHANNELS)` if it is an abstract integer).
+  `for (var k: u32 = 0u; k < EXTRA_SENSORY_CHANNELS; k = k + 1u) { s_features[fi] = sensory_buffer[s_base + scent_offset + NON_VISUAL_FEATURE_CHANNELS + k]; fi = fi + 1u; }`.
+  `NON_VISUAL_FEATURE_CHANNELS` (`common.wgsl`, `2u`) is 0003's rename of the
+  WGSL `SCENT_CHANNELS`; do not write or define `SCENT_CHANNELS` in WGSL (0003's
+  `SENSE_SPECIFIC_NAMES` bans it). The Rust `buffers::SCENT_CHANNELS` stays
+  usable in Rust tests.
 - `crates/xagent-brain/src/shaders/kernel/phase_brain_features.wgsl`: the same
   loop directly after
   `brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;`,
@@ -63,7 +66,8 @@ third feature extractor exists, stop and report its file and line.
 
 ## Decisions
 
-- **Generic only.** The loop names `EXTRA_SENSORY_CHANNELS` and `SCENT_CHANNELS`;
+- **Generic only.** The loop names `EXTRA_SENSORY_CHANNELS` and `NON_VISUAL_FEATURE_CHANNELS`
+  (no literal scent width);
   no `second_odour` text, no new binding, no sense-specific block code.
 - **Readback.** Only existing APIs: `dispatch_feature_phase_for_test`,
   `read_brain_scratch_blocking`, `read_agent_telemetry_blocking`,

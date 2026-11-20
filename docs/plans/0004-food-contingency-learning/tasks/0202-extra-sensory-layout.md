@@ -85,7 +85,10 @@ inputs".
   and `extra_sensory_channels` is 0.
 - `second_odour_on_grows_sensory_and_feature_width_by_two`: with the flag on,
   `sensory_stride` and `feature_count` each grow by exactly 2 and `brain_stride`
-  by exactly `2 * (ENCODED_DIMENSION + 1)` (derived from the formula in source).
+  by exactly `2 * (ENCODED_DIMENSION + 1) + 11` (derived from the unchanged formula
+  in source: the feature-width term plus the third block's 11 extra-sense slots,
+  which the existing `extra_sense_slots` term adds; the test may spell the 11 as
+  `on.sensory_mean_base() - off.sensory_mean_base()`).
   `sense_blocks().len()` is 3; the third block has `forward` and `critic` `None`
   and a footprint of mean 2 + covariance 3 + whitened 2 + turn 2 + trace 2 = 11
   slots, all inside `[end of the 0003 route block, sensory_mean_base)`. For the

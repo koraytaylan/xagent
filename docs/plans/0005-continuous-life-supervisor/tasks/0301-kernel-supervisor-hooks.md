@@ -86,8 +86,8 @@ and the plan-level `depends_on` carries that. Used: `FoodKind { First, Second }`
 (0101); `food_kinds_enabled`, `nourishing_food_kind`, `food_kind_draws` and
 `world_config_scratch` (0105); `WC_FOOD_KINDS`, `food_kinds_slot_value` (0104);
 `nourishing_food_kind()` (0105); `P_HARMFUL_MEAL_COUNT` and the placement in
-`tests/food_kind_meals.rs` (0102). If a landed name differs, report the file and
-line; do not rename.
+`tests/food_kind_meals.rs` (0102). If a landed name differs, report file and line;
+do not rename.
 
 ## Decisions
 
@@ -136,10 +136,9 @@ line; do not rename.
    the setter after `reset_agents_seeded`; `First` set gives `P_FOOD_COUNT` 1,
    `Second` set gives `P_HARMFUL_MEAL_COUNT` 1).
 
-- **Done when:** the checks focused-proof, brain-lib, food-kind-default, sense-parity and seeded-digest-determinism all pass on the host, with focused-proof reporting ok for gpu_guard_fails_closed_when_required, spawn_row_matches_upload_agents, replace_slot_resets_row_and_writes_brain, replace_slot_rejects_bad_index_and_lengths, set_kind_refused_when_kinds_off, set_kind_keeps_agents_and_draw_counter and set_kind_changes_meal_outcome; together they prove INV-09 (the replaced slot's row equals its spawn row and its brain the birth brain, every other agent is unchanged, and a bad index or length errors with no write), INV-10 (the setter changes the kind the next upload packs, resets no agent, leaves the draw counter unchanged, and is refused when kinds are off), INV-01 (the sense-parity golden, the food-kind-default check pass unchanged after the upload_agents refactor, spawn_row_matches_upload_agents shows the refactored rows equal the builder rows, and the seeded headless run gives the same digest twice; this task does not require the digest to equal the recorded fixture, whose value is adapter-specific and was recorded on a different adapter at 0976448), and INV-15 (the GPU guard panics without an adapter when required).
+- **Done when:** the checks focused-proof, brain-lib, food-kind-default, sense-parity and seeded-digest-determinism all pass on the host, with focused-proof reporting ok for all seven tests of Steps 4 and 5; together they prove INV-09 (the replaced slot's row equals its spawn row and its brain the birth brain, every other agent is unchanged, and a bad index or length errors with no write), INV-10 (the setter changes the kind the next upload packs, resets no agent, leaves the draw counter unchanged, and is refused when kinds are off), INV-01 (the sense-parity golden, the food-kind-default check pass unchanged after the upload_agents refactor, spawn_row_matches_upload_agents shows the refactored rows equal the builder rows, and the seeded headless run gives the same digest twice; this task does not require the digest to equal the recorded fixture, whose value is adapter-specific and was recorded on a different adapter at 0976448), and INV-15 (the GPU guard panics without an adapter when required).
 
 ## Evidence and risks
 
-The worker has no shell; host-run checks are the proof. The uniform effect is
-proven through the meal outcome at dispatch time. Brain equality compares the
-`brain_state` and `patterns` vectors.
+No worker shell; host-run checks are the proof. The meal outcome at dispatch
+proves the uniform effect. Brain equality compares `brain_state` and `patterns`.

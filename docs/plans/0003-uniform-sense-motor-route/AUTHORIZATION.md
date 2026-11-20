@@ -351,3 +351,162 @@ this plan's run.
   gate, task, dependency or behavior changed.
 - Witness: in the plan checkout the new command exits 0. On the task branch
   `visual_pathway_composition_preserves_other_passes` passes (1 passed).
+
+## Corrected requirement: remove-sense-specific-wgsl touches and readers (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run.
+
+- Superseded: task 0208's Decisions claim that each renamed constant "is read
+  only inside the two touched WGSL files", its step 1 confinement of readers to
+  `common.wgsl` and `brain_passes.wgsl`, and its Non-goal forbidding edits to
+  the validation modules and other `.wgsl` fragments, as applied to the names
+  this task must remove.
+- Contradiction: `kernel_tick.wgsl:786/789/798` and `phase_death.wgsl:209/212/221`
+  call `vision_pathway_learning_rate` and read `SCENT_CHANNELS`, and
+  `gpu_kernel/whitening_validation.rs:54` asserts
+  `const VISION_WHITENING_REFRESH` in `common.wgsl`. Removing the names (required
+  by the source test) breaks shader composition and brain-lib; keeping them
+  fails the source test. The stop rule forbade the only fix.
+- Correction: add those three files to the touches and permit exactly the
+  value-preserving rewrites: `vision_pathway_learning_rate(brain_base)` becomes
+  `sense_learning_rate(brain_base, 1u)` (the wrapper's own body,
+  `common.wgsl:1061-1063`), `SCENT_CHANNELS` becomes the planned
+  `NON_VISUAL_FEATURE_CHANNELS`, and the test anchor becomes
+  `override SENSE1_REFRESH_TICKS: u32 = {REFRESH_CYCLES}u;` (existing default 20,
+  `common.wgsl:407`, equal to `REFRESH_CYCLES`). `whitening_storage_validation.rs`
+  and `visual_pathway_validation.rs` only assert absence and stay unedited. The
+  removed list, source test, gates, dependencies and behavior are unchanged.
+- Witness: the task's brain-lib, pathway-tests and parity checks, with
+  focused-proof's `sense_specific_wgsl_has_no_sense_names`.
+
+## Corrected requirement: remove-sense-specific-wgsl buffers.rs pinned lines (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run.
+
+- Superseded: task 0208's Non-goals "No edit to `buffers.rs`" and "No change
+  ... to existing test bodies", as applied to the WGSL lines pinned by
+  `buffers::tests::pathway_block_and_cfg_slots_match_wgsl`.
+- Contradiction: that test (`buffers.rs:2375/2381/2382`) asserts `common.wgsl`
+  contains `override O_FORWARD_PATHWAY_WEIGHTS: u32 = O_TRACE_VISION +
+  VISION_PATHWAY_INPUTS;`, the initialized `override O_SENSORY_MEAN: u32 =
+  ...;` and `const PATHWAY_INPUT_COUNT: u32 = SCENT_CHANNELS +
+  VISION_PATHWAY_INPUTS;`. The task must remove `O_TRACE_VISION`, rename
+  `SCENT_CHANNELS` and declare `O_SENSORY_MEAN` uninitialized (step 2 and
+  `sense_specific_*` tests), while brain-lib must pass. No implementation
+  satisfies both.
+- Correction: add `buffers.rs` to the touches and permit only those three
+  string literals to be updated to the new `common.wgsl` lines (forward-weights
+  default without any removed name and with unchanged value, e.g.
+  `SENSE1_TURN_TRACE + SENSE1_CHANNELS`; `override O_SENSORY_MEAN: u32;`;
+  `NON_VISUAL_FEATURE_CHANNELS + VISION_PATHWAY_INPUTS`). The removed list,
+  source tests, gates, dependencies, values and behavior are unchanged; the
+  test still pins every pathway-block line.
+- Witness: focused-proof (`sense_specific_wgsl_has_no_sense_names`,
+  `sense_specific_sensory_mean_matches_layout`), brain-lib (including
+  `pathway_block_and_cfg_slots_match_wgsl`) and parity byte-identical.
+
+## Corrected requirement: modulator-study output paths (2026-11-20)
+
+Authority: host-authorized plan amendment for task `modulator-study`.
+
+- Superseded: task 0402's touches, `focused-proof` check, Scope/steps/Done
+  when, PLAN.md deliverables list and ARCHITECTURE.md INV-08 witness, which
+  placed the task's outputs at
+  `docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md` and
+  `docs/plans/0003-uniform-sense-motor-route/0402-evo-reference.json`.
+- Contradiction: those paths lie inside the protected plan record. The host
+  discards any implementation edit there ("the architect edited protected plan
+  record(s) ... the host discarded the edits"), so the task cannot both write
+  its required records and pass; the `focused-proof` grep then fails on the
+  missing file.
+- Correction: the outputs move to `docs/decisions/modulator-study.md` and
+  `docs/decisions/modulator-study-evo-reference.json`, the repository's
+  existing location for study decision records (plan 0002's
+  `docs/decisions/pathway-*-route.{md,json}`). The verdict lines, rule,
+  required content, other touches, gates, dependencies and behavior are
+  unchanged; only the path changes.
+- Witness: the amended `focused-proof` command exits 0 against a file at
+  `docs/decisions/modulator-study.md` holding the two verdict lines, and fails
+  when it is absent.
+
+## Corrected requirement: pooling-study decision record path (2026-11-20)
+
+Authority: host-authorized plan amendment for task `pooling-study`.
+
+- Superseded: task 0301's touches, `verdict` check, step 4 and Done when;
+  task 0302's touches comment, `verdict` check and Context/step 1; PLAN.md's
+  decision-record list; and ARCHITECTURE.md INV-06 witness, which placed the
+  study's decision record at
+  `docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`.
+- Contradiction: that path lies inside the protected plan record. The host
+  discards any implementation edit there ("the architect edited protected plan
+  record(s) (docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md);
+  the host discarded the edits"), so the task cannot both write its required
+  record and pass; the `verdict` grep then fails on the missing file, and
+  0302's `verdict` check could never read it. This is the same defect corrected
+  above for `modulator-study`.
+- Correction: the record moves to `docs/decisions/pooling-study.md`, the
+  repository's existing location for study decision records
+  (`docs/decisions/modulator-study.md`, plan 0002's `pathway-*-route.md`).
+  The verdict lines, gate rule, required content, other touches, gates,
+  dependencies, gated flags and behavior are unchanged; only the path changes.
+- Witness: the amended 0301 `verdict` command exits 0 against a file at
+  `docs/decisions/pooling-study.md` ending in `Verdict: NOT PORTED`, and exits
+  non-zero (2) when it is absent; the amended 0302 `verdict` command takes its NOT PORTED
+  branch and exits 0 on the same file.
+
+## Corrected requirement: pooling-study score food-side sign (2026-11-20)
+
+Authority: host-authorized plan amendment for task `pooling-study`.
+
+- Superseded: task 0301's fixed decision **Score**, which correlated the turn
+  output with `sign(food_bearing)`.
+- Contradiction: ARCHITECTURE.md (Investigations: Pooling, line 179) defines
+  the score as the correlation of the policy's turn "with the food side", and
+  the plan 0001 free-life harness the task reuses defines the food side as
+  `food_side: -sign(bearing)` (crates/xagent-sandbox/src/free_life/metrics.rs:460).
+  The task's own sanity references (B `+0.16`, A `+0.33`, from the
+  learner-foraging investigation) are positive on that food-side scale. The
+  literal `sign(food_bearing)` negates every score (measured A +0.2865,
+  C +0.0435, D +0.0417 become -0.2865, -0.0435, -0.0417), so the fixed gate
+  `max(C, D) >= A` would flip from NOT PORTED to PORTED and adopt a worse
+  input, the outcome INV-06 exists to prevent, and both sanity lines would
+  invert. No implementation satisfies both texts.
+- Correction: the score correlates the turn output with the food side,
+  `-sign(food_bearing)`, the harness's `food_side` convention. Gate rule,
+  window, exclusion rule, sanity references, verdict lines, touches, checks,
+  dependencies and gated flags are unchanged.
+- Witness: the `focused-proof` check (`cargo test -p xagent-sandbox --lib
+  pooling_study`) passes its `planted_side_cue_is_learned_by_reference_arm`
+  test, a positive score for a cue on the food side under this convention; the
+  `verdict` check reads `Verdict: NOT PORTED` from
+  `docs/decisions/pooling-study.md`.
+
+## Corrected requirement: pooling-study harness reuse (2026-11-20)
+
+Authority: host-authorized plan amendment for task `pooling-study`.
+
+- Superseded: task 0301's fixed decision **Harness reuse**, read as requiring the
+  runner to drive plan 0001's own per-life run path for the life.
+- Contradiction: that path is `headless::run_free_life`
+  (crates/xagent-sandbox/src/headless.rs:1829). Its `FreeLifeOptions`
+  (headless.rs:1480-1493) has no execution-schedule field, and the default fused
+  schedule never writes the adapted visual block to scratch (the first run read
+  all-zero column means); it has no per-tick hook, so the required
+  `read_brain_scratch_blocking` column reads cannot happen during the life; and
+  `build_sample` (headless.rs:1724) and `AgentAccumulator::step`
+  (free_life/metrics.rs:439) are private. Changing any of this needs a plan 0001
+  file edit, which the same decision forbids ("No plan 0001 file is edited").
+  The named modules `metrics.rs` and `tick_log.rs` contain no life loop.
+- Correction: the runner keeps its own life loop, builds each `FreeLifeSample` as
+  `build_sample` does, feeds the harness's `AgentAccumulator` and
+  `TickLogWriter`, takes the credit fields and ground truth from that sample, and
+  restates food in view from `FOOD_IN_VIEW_DISTANCE` and `VIEW_HALF_ANGLE`. It may
+  use a schedule that writes the adapted block to scratch, stated in the record.
+  The no-edit rule for plan 0001 files, log format, score, gate, runs, touches,
+  checks, dependencies and gated flags are unchanged.
+- Witness: the `focused-proof` check (`cargo test -p xagent-sandbox --lib
+  pooling_study`) passes, and the `verdict` check reads `Verdict: NOT PORTED`
+  from `docs/decisions/pooling-study.md`, produced by the runner under this design.

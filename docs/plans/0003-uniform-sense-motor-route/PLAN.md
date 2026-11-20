@@ -296,7 +296,9 @@ execution_checks:
               && grep -q "O_VISION_PATHWAY_MEAN" crates/xagent-brain/src/shaders/kernel/brain_cooperative_visual_pathway.wgsl
               && grep -q "O_VISION_PATHWAY_COVARIANCE" crates/xagent-brain/src/shaders/kernel/brain_cooperative_jacobi.wgsl'
           - name: composition-tests
-            command: cargo test -p xagent-brain --lib -- --exact gpu_kernel::visual_pathway_validation::visual_pathway_composition_preserves_other_passes gpu_kernel::cooperative_jacobi_validation::jacobi_composition_keeps_other_helpers_and_scratch
+            command: >-
+              sh -c 'grep -q "fn visual_pathway_composition_preserves_other_passes" crates/xagent-brain/src/gpu_kernel/visual_pathway_validation.rs
+              && cargo test -p xagent-brain --lib -- --exact gpu_kernel::cooperative_jacobi_validation::jacobi_composition_keeps_other_helpers_and_scratch'
             timeout_ms: 3600000
       - task: remove-sense-specific-wgsl
         name: cascade-and-readme

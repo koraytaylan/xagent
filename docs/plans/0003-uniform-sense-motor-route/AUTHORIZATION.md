@@ -329,3 +329,25 @@ this plan's run.
   `brain_passes.wgsl`. Host verify on that branch passed focused-proof,
   alternate-schedules, parity, clippy and guard. fmt failed only on a line
   wrap, which its declared fix `cargo fmt --all` rewrites.
+
+## Corrected requirement: generic-schedule-candidates baseline constraint (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run.
+
+- Superseded: PLAN.md constraint `generic-schedule-candidates /
+  candidate-fragments-known / composition-tests`, which ran
+  `visual_pathway_composition_preserves_other_passes` and
+  `jacobi_composition_keeps_other_helpers_and_scratch` against the baseline.
+- Contradiction: source proofs must hold on baseline code. On the plan
+  baseline the landed `generic-sense-block-sites` task already rewrote the
+  serial block, so the old visual-pathway test's `ORIGINAL_CALL` anchor matches
+  0 times (`visual_pathway_validation.rs:64`, left 0 right 1). Updating that
+  test to the generic block is this task's own deliverable, so the baseline
+  proof could not pass before the task runs.
+- Correction: the baseline constraint now checks that the visual-pathway test
+  exists and runs the Jacobi composition test, which passes on baseline. The
+  task's own gates still require both composition tests unchanged. No bound,
+  gate, task, dependency or behavior changed.
+- Witness: in the plan checkout the new command exits 0. On the task branch
+  `visual_pathway_composition_preserves_other_passes` passes (1 passed).

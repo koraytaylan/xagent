@@ -160,7 +160,7 @@ execution_checks:
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration -- --exact gpu_adapter_present_when_required
     actions:
       - name: headless-cli-help
-        command: cargo run -p xagent-sandbox -- --help
+        command: cargo run -p xagent-sandbox --bin xagent -- --help
         timeout_ms: 3600000
     constraints:
       - task: modulator-study

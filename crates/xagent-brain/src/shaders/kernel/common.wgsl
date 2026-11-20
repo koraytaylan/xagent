@@ -163,10 +163,10 @@ override VISION_GROUPS_PER_AGENT: u32 =
 override VISION_COLOR_COUNT: u32 = VISION_RAYS * 4u;
 override VISION_DEPTH_COUNT: u32 = VISION_RAYS;
 const MAX_TOUCH_CONTACTS: u32 = 4u;
-// Scent channels: the perceived odour at the left and right nostrils, packed
-// after the touch contacts. Mirrors `SCENT_CHANNELS` in `buffers.rs`.
-const SCENT_CHANNELS: u32 = 2u;
-override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u + SCENT_CHANNELS;
+// Non-visual feature channels packed after the touch contacts (the left and
+// right nostrils). Mirrors the smell channel count in `buffers.rs`.
+const NON_VISUAL_FEATURE_CHANNELS: u32 = 2u;
+override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u + NON_VISUAL_FEATURE_CHANNELS;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ override DANGER_PERCEPT_FEATURES_ACTIVE: u32 = 0u;
 // `NON_VISUAL_FEATURE_COUNT` in `buffers.rs`. The base is constant but the
 // tail width changes with the danger-percept flag; the leading visual block
 // changes independently with the cortex flag.
-override NON_VISUAL_FEATURE_COUNT: u32 = 25u + SCENT_CHANNELS + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
+override NON_VISUAL_FEATURE_COUNT: u32 = 25u + NON_VISUAL_FEATURE_CHANNELS + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
 // Encoder input width. Flag off: the legacy raw-vision slice
 // (VISION_COLOR_COUNT + VISION_DEPTH_COUNT) + the non-visual tail — byte-identical
 // to the pre-cortex build. Flag on: the compact complex-cell vector
@@ -323,47 +323,116 @@ override O_RECENT_RETURNS: u32 = O_RECENT_KEYS + RECENT_CAP * ENCODED_DIMENSION;
 override O_RECENT_TICKS: u32 = O_RECENT_RETURNS + RECENT_CAP;
 override O_RECENT_STATE: u32 = O_RECENT_TICKS + RECENT_CAP;
 override O_RECENT_NORMS: u32 = O_RECENT_STATE + RECENT_CAP;
-// Running mean of each sensory feature for sensory adaptation (see
-// SENSORY_ADAPTATION_RATE); only the visual block is used. Sized by the
-// layout (FEATURE_COUNT slots), so it follows the fixed tail. Survives death:
-// it describes the surroundings, not an episode.
-// The smell pathway to the turn policy: a running mean and covariance of the
-// two nostrils (surviving death: they describe the agent's odour world), this
-// tick's whitened scent, two learned turn weights on it, and their episodic
-// eligibility traces. See `whiten_scent` and the turn policy evaluation.
-override O_SCENT_MEAN: u32 = O_RECENT_NORMS + RECENT_CAP;
-override O_SCENT_COVARIANCE: u32 = O_SCENT_MEAN + 2u;
-override O_SCENT_WHITENED: u32 = O_SCENT_COVARIANCE + 3u;
-override O_SCENT_TURN_WEIGHTS: u32 = O_SCENT_WHITENED + 2u;
-override O_TRACE_SCENT: u32 = O_SCENT_TURN_WEIGHTS + 2u;
-// The visual pathway to the turn policy: the left and right halves of the
-// adapted visual field (red, green, blue, depth each), centred and whitened by
-// their running mean and covariance, read by learned turn weights. The
-// statistics and whitening matrix survive death; the traces do not. See
-// `vision_pathway_step`.
-override O_VISION_PATHWAY_MEAN: u32 = O_TRACE_SCENT + 2u;
-override O_VISION_PATHWAY_COVARIANCE: u32 = O_VISION_PATHWAY_MEAN + VISION_PATHWAY_INPUTS;
-override O_VISION_PATHWAY_WHITENING: u32 =
-    O_VISION_PATHWAY_COVARIANCE + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
-override O_VISION_PATHWAY_INPUT: u32 =
-    O_VISION_PATHWAY_WHITENING + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
-override O_VISION_TURN_WEIGHTS: u32 = O_VISION_PATHWAY_INPUT + VISION_PATHWAY_INPUTS;
-override O_TRACE_VISION: u32 = O_VISION_TURN_WEIGHTS + VISION_PATHWAY_INPUTS;
+// The per-sense blocks follow O_RECENT_NORMS + RECENT_CAP; their slot
+// offsets come from the SENSE{k}_* overrides of the sense table below.
 // Pathway slot block (mirrors buffers.rs). Every slot is zero at birth.
 // Forward and critic weights survive death; their traces are episodic and
 // zeroed at death. The previous input norm is rewritten each brain tick and
 // survives death. The recent-key ring survives death, like O_RECENT_KEYS.
-const PATHWAY_INPUT_COUNT: u32 = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;
-override O_FORWARD_PATHWAY_WEIGHTS: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+const PATHWAY_INPUT_COUNT: u32 = NON_VISUAL_FEATURE_CHANNELS + VISION_PATHWAY_INPUTS;
+override O_FORWARD_PATHWAY_WEIGHTS: u32 = SENSE1_TURN_TRACE + SENSE1_CHANNELS;
 override O_TRACE_FORWARD_PATHWAY: u32 = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
 override O_CRITIC_PATHWAY_WEIGHTS: u32 = O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT;
 override O_TRACE_CRITIC_PATHWAY: u32 = O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
 override O_PREV_PATHWAY_INPUT_NORM: u32 = O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT;
 override O_RECENT_PATHWAY_KEYS: u32 = O_PREV_PATHWAY_INPUT_NORM + 1;
-// Running mean of each sensory feature, layout-sized and the last region of
-// the brain state. Unchanged by the pathway block: zero at birth and it
-// survives death.
-override O_SENSORY_MEAN: u32 = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;
+// Running mean of each sensory feature for sensory adaptation (see
+// SENSORY_ADAPTATION_RATE); only the visual block is used. Layout-sized and
+// the last region of the brain state: zero at birth and it survives death. The
+// host supplies its index from the brain layout (`vision_override_constants`).
+override O_SENSORY_MEAN: u32;
+
+// Sense table. The host supplies one override per sense parameter from the
+// brain layout's sense table (`insert_sense_overrides` in gpu_kernel.rs); the
+// defaults below equal the declared table. Slot offsets are per-agent
+// brain_state indices, added to brain_base at use. `INPUT_OFFSET` of a
+// non-visual sense is the feature offset inside the non-visual tail. A field a
+// sense lacks, and every field of an unused slot, is zero.
+// Route-mask bits and kind codes mirror the constants in `senses.rs`.
+const SENSE_ROUTE_TURN: u32 = 1u;
+const SENSE_ROUTE_FORWARD: u32 = 2u;
+const SENSE_ROUTE_CRITIC: u32 = 4u;
+const SENSE_INPUT_KIND_NON_VISUAL_FEATURES: u32 = 0u;
+const SENSE_INPUT_KIND_VISUAL_HEMIFIELDS: u32 = 1u;
+const SENSE_WHITENING_KIND_CLOSED_FORM_2: u32 = 0u;
+const SENSE_WHITENING_KIND_JACOBI: u32 = 1u;
+override SENSE_COUNT: u32 = 2u;
+
+override SENSE0_INPUT_KIND: u32 = 0u;
+override SENSE0_INPUT_OFFSET: u32 = 25u;
+override SENSE0_CHANNELS: u32 = 2u;
+override SENSE0_WHITENING_KIND: u32 = 0u;
+override SENSE0_REFRESH_TICKS: u32 = 0u;
+override SENSE0_ADAPTATION_RATE: f32 = 0.01f;
+override SENSE0_LEARNING_RATE_GENE: u32 = 0u;
+override SENSE0_ROUTE_MASK: u32 = 1u;
+override SENSE0_MEAN: u32 = 69320u;
+override SENSE0_COVARIANCE: u32 = 69322u;
+override SENSE0_WHITENING: u32 = 0u;
+override SENSE0_INPUT: u32 = 69325u;
+override SENSE0_TURN_WEIGHTS: u32 = 69327u;
+override SENSE0_TURN_TRACE: u32 = 69329u;
+override SENSE0_FORWARD_WEIGHTS: u32 = 0u;
+override SENSE0_FORWARD_TRACE: u32 = 0u;
+override SENSE0_CRITIC_WEIGHTS: u32 = 0u;
+override SENSE0_CRITIC_TRACE: u32 = 0u;
+
+override SENSE1_INPUT_KIND: u32 = 1u;
+override SENSE1_INPUT_OFFSET: u32 = 0u;
+override SENSE1_CHANNELS: u32 = 8u;
+override SENSE1_WHITENING_KIND: u32 = 1u;
+override SENSE1_REFRESH_TICKS: u32 = 20u;
+override SENSE1_ADAPTATION_RATE: f32 = 0.01f;
+override SENSE1_LEARNING_RATE_GENE: u32 = 51644u;
+override SENSE1_ROUTE_MASK: u32 = 1u;
+override SENSE1_MEAN: u32 = 69331u;
+override SENSE1_COVARIANCE: u32 = 69339u;
+override SENSE1_WHITENING: u32 = 69403u;
+override SENSE1_INPUT: u32 = 69467u;
+override SENSE1_TURN_WEIGHTS: u32 = 69475u;
+override SENSE1_TURN_TRACE: u32 = 69483u;
+override SENSE1_FORWARD_WEIGHTS: u32 = 0u;
+override SENSE1_FORWARD_TRACE: u32 = 0u;
+override SENSE1_CRITIC_WEIGHTS: u32 = 0u;
+override SENSE1_CRITIC_TRACE: u32 = 0u;
+
+override SENSE2_INPUT_KIND: u32 = 0u;
+override SENSE2_INPUT_OFFSET: u32 = 0u;
+override SENSE2_CHANNELS: u32 = 0u;
+override SENSE2_WHITENING_KIND: u32 = 0u;
+override SENSE2_REFRESH_TICKS: u32 = 0u;
+override SENSE2_ADAPTATION_RATE: f32 = 0f;
+override SENSE2_LEARNING_RATE_GENE: u32 = 0u;
+override SENSE2_ROUTE_MASK: u32 = 0u;
+override SENSE2_MEAN: u32 = 0u;
+override SENSE2_COVARIANCE: u32 = 0u;
+override SENSE2_WHITENING: u32 = 0u;
+override SENSE2_INPUT: u32 = 0u;
+override SENSE2_TURN_WEIGHTS: u32 = 0u;
+override SENSE2_TURN_TRACE: u32 = 0u;
+override SENSE2_FORWARD_WEIGHTS: u32 = 0u;
+override SENSE2_FORWARD_TRACE: u32 = 0u;
+override SENSE2_CRITIC_WEIGHTS: u32 = 0u;
+override SENSE2_CRITIC_TRACE: u32 = 0u;
+
+override SENSE3_INPUT_KIND: u32 = 0u;
+override SENSE3_INPUT_OFFSET: u32 = 0u;
+override SENSE3_CHANNELS: u32 = 0u;
+override SENSE3_WHITENING_KIND: u32 = 0u;
+override SENSE3_REFRESH_TICKS: u32 = 0u;
+override SENSE3_ADAPTATION_RATE: f32 = 0f;
+override SENSE3_LEARNING_RATE_GENE: u32 = 0u;
+override SENSE3_ROUTE_MASK: u32 = 0u;
+override SENSE3_MEAN: u32 = 0u;
+override SENSE3_COVARIANCE: u32 = 0u;
+override SENSE3_WHITENING: u32 = 0u;
+override SENSE3_INPUT: u32 = 0u;
+override SENSE3_TURN_WEIGHTS: u32 = 0u;
+override SENSE3_TURN_TRACE: u32 = 0u;
+override SENSE3_FORWARD_WEIGHTS: u32 = 0u;
+override SENSE3_FORWARD_TRACE: u32 = 0u;
+override SENSE3_CRITIC_WEIGHTS: u32 = 0u;
+override SENSE3_CRITIC_TRACE: u32 = 0u;
 
 // ── Per-agent buffer strides ────────────────────────────────────────────────
 
@@ -465,6 +534,10 @@ const CFG_BRAIN_TICK_PROBE: u32 = 20u;
 const CFG_CRITIC_INPUT: u32 = 21u;
 // 1.0 enables the forward pathway route.
 const CFG_FORWARD_PATHWAY_ENABLED: u32 = 22u;
+// Mirror buffers.rs: 1.0 keeps the klinotaxis turn gain, 0.0 pins it to 1.0.
+const CFG_KLINOTAXIS_TURN_GAIN_ENABLED: u32 = 23u;
+// Mirror buffers.rs: 1.0 keeps the motor-fatigue factor, 0.0 pins it to 1.0.
+const CFG_MOTOR_FATIGUE_ENABLED: u32 = 24u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
@@ -677,53 +750,36 @@ const NOSTRIL_FORWARD_OFFSET: f32 = 0.5;
 const NOSTRIL_SIDE_OFFSET: f32 = 1.0;
 const SMELL_STRENGTH_MIN: f32 = 0.0;
 const SMELL_STRENGTH_MAX: f32 = 5.0;
-// Position of the two scent features inside the non-visual feature tail
-// (after speed, facing, angular velocity, energy, integrity, the two deltas and
-// the touch contacts).
-const SCENT_FEATURE_OFFSET: u32 = 25u;
-// Per-brain-tick rate of the running scent mean and covariance that whiten
-// the smell pathway: the same ~100-brain-tick memory as sensory adaptation.
-const SCENT_WHITENING_RATE: f32 = 0.01;
-// Starting variance of each nostril (mirrors SCENT_INITIAL_VARIANCE in
-// buffers.rs), and the floor on the covariance's eigenvalues.
-const SCENT_INITIAL_VARIANCE: f32 = 1e-4;
-const SCENT_EIGEN_FLOOR: f32 = 1e-8;
-// Visual pathway: mean adapted red, green, blue and depth over each half of
-// the field (mirrors VISION_PATHWAY_INPUTS in buffers.rs).
-const VISION_PATHWAY_CHANNELS: u32 = 4u;
-const VISION_PATHWAY_INPUTS: u32 = 2u * VISION_PATHWAY_CHANNELS;
-// Rate of the running mean and covariance, and how often (in brain ticks)
-// the whitening matrix is recomputed from the covariance: the statistics move
-// at 1% per tick, so a refresh every 20 ticks loses nothing measurable.
-const VISION_PATHWAY_RATE: f32 = 0.01;
-const VISION_WHITENING_REFRESH: u32 = 20u;
-// Starting variance (mirrors VISION_PATHWAY_INITIAL_VARIANCE in buffers.rs).
-const VISION_PATHWAY_INITIAL_VARIANCE: f32 = 1e-4;
+// Floor on the eigenvalues of a closed-form 2x2 whitening covariance.
+const CLOSED_FORM2_EIGEN_FLOOR: f32 = 1e-8;
+// Visual hemifield input: mean adapted red, green, blue and depth over each
+// half of the field (mirrors VISION_PATHWAY_INPUTS in buffers.rs).
+const HEMIFIELD_CHANNELS: u32 = 4u;
+const VISION_PATHWAY_INPUTS: u32 = 2u * HEMIFIELD_CHANNELS;
 // Jacobi sweeps for the 8×8 eigen-decomposition, and the eigenvalue floor
 // relative to the mean eigenvalue.
 const JACOBI_SWEEPS: u32 = 12u;
 const WHITENING_RELATIVE_FLOOR: f32 = 1e-6;
-// Bounds of the heritable visual pathway plasticity gene, a multiplier on
-// the pathway's learning rate (mirror VISION_PLASTICITY_* in xagent-shared
-// `config.rs`).
-const VISION_PLASTICITY_MIN: f32 = 0.0;
-const VISION_PLASTICITY_MAX: f32 = 30.0;
+// Bounds of a sense's heritable plasticity gene, a multiplier on the sense's
+// learning rate (mirror the plasticity bounds in xagent-shared `config.rs`).
+const PLASTICITY_GENE_MIN: f32 = 0.0;
+const PLASTICITY_GENE_MAX: f32 = 30.0;
 
-// Whiten a centred 2-nostril scent by the covariance [a, b, c] =
+// Whiten a centred two-channel input by the covariance [a, b, c] =
 // [left², left·right, right²]: rotate onto the covariance's eigenvectors,
 // divide each component by the square root of its eigenvalue, rotate back
 // (C^(−1/2) · centred). Both directions of the odour field — overall
 // strength and the left−right difference — then vary equally, so the turn
 // rule's step no longer favours what the nostrils share over what tells them
 // apart.
-fn whiten_scent(centred: vec2<f32>, covariance: vec3<f32>) -> vec2<f32> {
+fn sense_whiten_closed_form(sense: u32, centred: vec2<f32>, covariance: vec3<f32>) -> vec2<f32> {
     let a = covariance.x;
     let b = covariance.y;
     let c = covariance.z;
     let half_trace = 0.5 * (a + c);
     let radius = sqrt(0.25 * (a - c) * (a - c) + b * b);
-    let major = max(half_trace + radius, SCENT_EIGEN_FLOOR);
-    let minor = max(half_trace - radius, SCENT_EIGEN_FLOOR);
+    let major = max(half_trace + radius, CLOSED_FORM2_EIGEN_FLOOR);
+    let minor = max(half_trace - radius, CLOSED_FORM2_EIGEN_FLOOR);
     var axis = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a >= c);
     if (abs(b) > 1e-12) {
         axis = vec2<f32>(major - c, b);
@@ -960,32 +1016,219 @@ const TERMINAL_DEATH_TD_ERROR: f32 = -MAX_TD_ERROR;
 // the end of the life is its last outcome, the terminal lesson discounted by
 // the moment's age at the life's last brain tick, with no state left to
 // bootstrap from. Single-threaded: called from the death paths.
-// The visual pathway's learning rate: the actors' rate scaled by the agent's
-// heritable plasticity gene.
-fn vision_pathway_learning_rate(brain_base: u32) -> f32 {
-    let plasticity = clamp(
-        brain_state[brain_base + O_VISION_PLASTICITY], VISION_PLASTICITY_MIN, VISION_PLASTICITY_MAX);
-    return ACTION_WEIGHT_LEARNING_RATE * plasticity;
+// A sense's learning rate: the actors' rate, scaled by the sense's heritable
+// plasticity gene when it has one.
+fn sense_learning_rate(brain_base: u32, sense: u32) -> f32 {
+    let gene = sense_learning_rate_gene(sense);
+    if (gene == 0u) {
+        return ACTION_WEIGHT_LEARNING_RATE;
+    }
+    return ACTION_WEIGHT_LEARNING_RATE
+        * clamp(brain_state[brain_base + gene], PLASTICITY_GENE_MIN, PLASTICITY_GENE_MAX);
 }
 
-// Death's terminal lesson reaches the smell and visual pathways' turn weights
-// through their traces, as it does the other channels, and the traces are
-// cleared. Single-threaded: called from the death paths.
-fn settle_turn_pathways_at_death(brain_base: u32) {
-    let learns = steering_weights_learn();
-    for (var k = 0u; k < 2u; k++) {
+// Death's terminal lesson reaches a sense's turn weights through its trace,
+// and the trace is cleared. Single-threaded: called from the death paths.
+fn sense_settle_routes_at_death(brain_base: u32, sense: u32) {
+    let learns = steering_weights_learn() && (sense_route_mask(sense) & SENSE_ROUTE_TURN) != 0u;
+    for (var k = 0u; k < sense_channels(sense); k++) {
         if (learns) {
-            brain_state[brain_base + O_SCENT_TURN_WEIGHTS + k] += ACTION_WEIGHT_LEARNING_RATE
-                * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_SCENT + k];
+            brain_state[brain_base + sense_turn_weights(sense) + k] += sense_learning_rate(brain_base, sense)
+                * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + sense_turn_trace(sense) + k];
         }
-        brain_state[brain_base + O_TRACE_SCENT + k] = 0.0;
+        brain_state[brain_base + sense_turn_trace(sense) + k] = 0.0;
     }
-    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-        if (learns) {
-            brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] += vision_pathway_learning_rate(brain_base)
-                * TERMINAL_DEATH_TD_ERROR * brain_state[brain_base + O_TRACE_VISION + k];
-        }
-        brain_state[brain_base + O_TRACE_VISION + k] = 0.0;
+}
+
+fn settle_senses_at_death(brain_base: u32) {
+    for (var sense = 0u; sense < sense_count(); sense++) {
+        sense_settle_routes_at_death(brain_base, sense);
+    }
+}
+
+const MAX_SENSE_CHANNELS: u32 = 8u;
+
+fn sense_count() -> u32 {
+    return SENSE_COUNT;
+}
+
+fn sense_channels(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_CHANNELS; }
+        case 1u: { return SENSE1_CHANNELS; }
+        case 2u: { return SENSE2_CHANNELS; }
+        case 3u: { return SENSE3_CHANNELS; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_input_kind(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_INPUT_KIND; }
+        case 1u: { return SENSE1_INPUT_KIND; }
+        case 2u: { return SENSE2_INPUT_KIND; }
+        case 3u: { return SENSE3_INPUT_KIND; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_input_offset(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_INPUT_OFFSET; }
+        case 1u: { return SENSE1_INPUT_OFFSET; }
+        case 2u: { return SENSE2_INPUT_OFFSET; }
+        case 3u: { return SENSE3_INPUT_OFFSET; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_whitening_kind(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_WHITENING_KIND; }
+        case 1u: { return SENSE1_WHITENING_KIND; }
+        case 2u: { return SENSE2_WHITENING_KIND; }
+        case 3u: { return SENSE3_WHITENING_KIND; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_refresh_ticks(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_REFRESH_TICKS; }
+        case 1u: { return SENSE1_REFRESH_TICKS; }
+        case 2u: { return SENSE2_REFRESH_TICKS; }
+        case 3u: { return SENSE3_REFRESH_TICKS; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_adaptation_rate(sense: u32) -> f32 {
+    switch sense {
+        case 0u: { return SENSE0_ADAPTATION_RATE; }
+        case 1u: { return SENSE1_ADAPTATION_RATE; }
+        case 2u: { return SENSE2_ADAPTATION_RATE; }
+        case 3u: { return SENSE3_ADAPTATION_RATE; }
+        default: { return 0.0; }
+    }
+}
+
+fn sense_learning_rate_gene(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_LEARNING_RATE_GENE; }
+        case 1u: { return SENSE1_LEARNING_RATE_GENE; }
+        case 2u: { return SENSE2_LEARNING_RATE_GENE; }
+        case 3u: { return SENSE3_LEARNING_RATE_GENE; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_route_mask(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_ROUTE_MASK; }
+        case 1u: { return SENSE1_ROUTE_MASK; }
+        case 2u: { return SENSE2_ROUTE_MASK; }
+        case 3u: { return SENSE3_ROUTE_MASK; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_mean(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_MEAN; }
+        case 1u: { return SENSE1_MEAN; }
+        case 2u: { return SENSE2_MEAN; }
+        case 3u: { return SENSE3_MEAN; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_covariance(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_COVARIANCE; }
+        case 1u: { return SENSE1_COVARIANCE; }
+        case 2u: { return SENSE2_COVARIANCE; }
+        case 3u: { return SENSE3_COVARIANCE; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_whitening(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_WHITENING; }
+        case 1u: { return SENSE1_WHITENING; }
+        case 2u: { return SENSE2_WHITENING; }
+        case 3u: { return SENSE3_WHITENING; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_input(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_INPUT; }
+        case 1u: { return SENSE1_INPUT; }
+        case 2u: { return SENSE2_INPUT; }
+        case 3u: { return SENSE3_INPUT; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_turn_weights(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_TURN_WEIGHTS; }
+        case 1u: { return SENSE1_TURN_WEIGHTS; }
+        case 2u: { return SENSE2_TURN_WEIGHTS; }
+        case 3u: { return SENSE3_TURN_WEIGHTS; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_turn_trace(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_TURN_TRACE; }
+        case 1u: { return SENSE1_TURN_TRACE; }
+        case 2u: { return SENSE2_TURN_TRACE; }
+        case 3u: { return SENSE3_TURN_TRACE; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_forward_weights(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_FORWARD_WEIGHTS; }
+        case 1u: { return SENSE1_FORWARD_WEIGHTS; }
+        case 2u: { return SENSE2_FORWARD_WEIGHTS; }
+        case 3u: { return SENSE3_FORWARD_WEIGHTS; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_forward_trace(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_FORWARD_TRACE; }
+        case 1u: { return SENSE1_FORWARD_TRACE; }
+        case 2u: { return SENSE2_FORWARD_TRACE; }
+        case 3u: { return SENSE3_FORWARD_TRACE; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_critic_weights(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_CRITIC_WEIGHTS; }
+        case 1u: { return SENSE1_CRITIC_WEIGHTS; }
+        case 2u: { return SENSE2_CRITIC_WEIGHTS; }
+        case 3u: { return SENSE3_CRITIC_WEIGHTS; }
+        default: { return 0u; }
+    }
+}
+
+fn sense_critic_trace(sense: u32) -> u32 {
+    switch sense {
+        case 0u: { return SENSE0_CRITIC_TRACE; }
+        case 1u: { return SENSE1_CRITIC_TRACE; }
+        case 2u: { return SENSE2_CRITIC_TRACE; }
+        case 3u: { return SENSE3_CRITIC_TRACE; }
+        default: { return 0u; }
     }
 }
 
@@ -993,26 +1236,29 @@ fn settle_turn_pathways_at_death(brain_base: u32) {
 // covariance: cyclic Jacobi eigen-decomposition of the symmetric 8×8 matrix,
 // eigenvalues floored relative to their mean, W = V · diag(1/√λ) · Vᵀ (the
 // symmetric, ZCA whitening, which keeps each input closest to its own axis so
-// learned and inherited weights keep their meaning). Single-threaded.
-fn refresh_vision_whitening(brain_base: u32) {
+// learned and inherited weights keep their meaning). Single-threaded. The
+// generic body keeps its two private 8×8 matrices; the workgroup schedule
+// rewrites them onto shared scratch storage.
+fn sense_refresh_jacobi_whitening(brain_base: u32, sense: u32) {
+    let n = sense_channels(sense);
     var a: array<array<f32, 8>, 8>;
     var v: array<array<f32, 8>, 8>;
-    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
-        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
-            a[i][j] = brain_state[brain_base + O_VISION_PATHWAY_COVARIANCE + i * VISION_PATHWAY_INPUTS + j];
+    for (var i = 0u; i < n; i++) {
+        for (var j = 0u; j < n; j++) {
+            a[i][j] = brain_state[brain_base + sense_covariance(sense) + i * n + j];
             v[i][j] = select(0.0, 1.0, i == j);
         }
     }
     for (var sweep = 0u; sweep < JACOBI_SWEEPS; sweep++) {
         var off = 0.0;
-        for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
-            for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
+        for (var p = 0u; p < n; p++) {
+            for (var q = p + 1u; q < n; q++) {
                 off += a[p][q] * a[p][q];
             }
         }
         if (off < 1e-30) { break; }
-        for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
-            for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
+        for (var p = 0u; p < n; p++) {
+            for (var q = p + 1u; q < n; q++) {
                 let apq = a[p][q];
                 if (abs(apq) < 1e-30) { continue; }
                 let theta = (a[q][q] - a[p][p]) / (2.0 * apq);
@@ -1020,19 +1266,19 @@ fn refresh_vision_whitening(brain_base: u32) {
                 if (theta == 0.0) { t = 1.0; }
                 let c = 1.0 / sqrt(t * t + 1.0);
                 let s = t * c;
-                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                for (var k = 0u; k < n; k++) {
                     let akp = a[k][p];
                     let akq = a[k][q];
                     a[k][p] = c * akp - s * akq;
                     a[k][q] = s * akp + c * akq;
                 }
-                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                for (var k = 0u; k < n; k++) {
                     let apk = a[p][k];
                     let aqk = a[q][k];
                     a[p][k] = c * apk - s * aqk;
                     a[q][k] = s * apk + c * aqk;
                 }
-                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+                for (var k = 0u; k < n; k++) {
                     let vkp = v[k][p];
                     let vkq = v[k][q];
                     v[k][p] = c * vkp - s * vkq;
@@ -1042,17 +1288,17 @@ fn refresh_vision_whitening(brain_base: u32) {
         }
     }
     var trace = 0.0;
-    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+    for (var k = 0u; k < n; k++) {
         trace += a[k][k];
     }
-    let floor_value = WHITENING_RELATIVE_FLOOR * trace / f32(VISION_PATHWAY_INPUTS) + 1e-14;
-    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
-        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
+    let floor_value = WHITENING_RELATIVE_FLOOR * trace / f32(n) + 1e-14;
+    for (var i = 0u; i < n; i++) {
+        for (var j = 0u; j < n; j++) {
             var w = 0.0;
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
+            for (var k = 0u; k < n; k++) {
                 w += v[i][k] * v[j][k] / sqrt(max(a[k][k], floor_value));
             }
-            brain_state[brain_base + O_VISION_PATHWAY_WHITENING + i * VISION_PATHWAY_INPUTS + j] = w;
+            brain_state[brain_base + sense_whitening(sense) + i * n + j] = w;
         }
     }
 }
@@ -1091,7 +1337,7 @@ fn settle_recent_moments_at_death(brain_base: u32) {
 @group(0) @binding(11) var<storage, read_write> brain_state:       array<f32>;
 @group(0) @binding(12) var<storage, read_write> pattern_buffer:       array<f32>;
 @group(0) @binding(13) var<storage, read_write> brain_scratch:       array<f32>;
-@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 6>;
+@group(0) @binding(14) var<uniform>             brain_config:      array<vec4<f32>, 7>;
 @group(0) @binding(15) var<storage, read_write> dispatch_args:     array<u32, 6>;
 @group(0) @binding(16) var<storage, read_write> trail_ring:        array<f32>;
 @group(0) @binding(17) var<storage, read_write> sensory_next:      array<f32>;

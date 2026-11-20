@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - remove-sense-specific-wgsl
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "6377a86dcb28845fe5fc803d8b9e7c77d286b5e8"
 touches:
   - crates/xagent-brain/tests/sense_block_extension.rs
 checks:

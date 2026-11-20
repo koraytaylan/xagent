@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - pooling-study
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "2f0624604fb8097443cb88954cba4be96a21bcfc"
 touches:
   # All conditional on Verdict: PORTED in docs/decisions/pooling-study.md; with NOT PORTED no file changes.
   - crates/xagent-brain/src/senses.rs

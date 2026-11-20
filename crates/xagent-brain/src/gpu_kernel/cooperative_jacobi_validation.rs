@@ -145,6 +145,15 @@ fn trajectory(kernel: &mut GpuKernel) -> TestResult<Vec<State>> {
 }
 
 #[test]
+fn candidate_jacobi_senses_are_hemifield_only() {
+    for sense in DECLARED_SENSES {
+        if matches!(sense.whitening, Whitening::Jacobi { .. }) {
+            assert_eq!(sense.input, SenseInput::VisualHemifields);
+        }
+    }
+}
+
+#[test]
 fn jacobi_composition_keeps_other_helpers_and_scratch() {
     let original = optimized_brain();
     let candidate = cooperative_rotations(&original);

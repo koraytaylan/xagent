@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - derived-sense-layout
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "e76884e763c5944f88d4a03f5e8990e6a9658129"
 touches:
   - crates/xagent-sandbox/src/agent/mod.rs
 checks:

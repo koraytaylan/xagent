@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - parity-golden
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "597683140a9739ebb74514d270817e16c0cd24d9"
 touches:
   - crates/xagent-brain/src/senses.rs
   - crates/xagent-brain/src/lib.rs

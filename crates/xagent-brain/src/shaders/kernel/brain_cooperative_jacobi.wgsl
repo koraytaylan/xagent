@@ -9,41 +9,45 @@ const JACOBI_COSINE: u32 = JACOBI_ROTATION_FLAG + 1u;
 const JACOBI_SINE: u32 = JACOBI_COSINE + 1u;
 
 fn cooperative_refresh_vision_whitening(brain_base: u32, tid: u32) {
+    for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+    let n = sense_channels(sense);
     if (tid == 0u) {
-        let refresh = bc_f32(CFG_VISUAL_CORTEX_ENABLED) == 0.0
-            && u32(brain_state[brain_base + O_TICK_COUNT]) % VISION_WHITENING_REFRESH == 0u;
+        let refresh = sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI
+            && !(bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0
+                && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)
+            && u32(brain_state[brain_base + O_TICK_COUNT]) % sense_refresh_ticks(sense) == 0u;
         s_reinf_dot[JACOBI_REFRESH_FLAG] = select(0.0, 1.0, refresh);
     }
     // The builtin publishes a uniform value and synchronizes its readers.
     // Ordinary and cortex ticks never enter any rotation-loop barriers.
     let refresh = workgroupUniformLoad(&s_reinf_dot[JACOBI_REFRESH_FLAG]) != 0.0;
     if (refresh) {
-        if (tid < WHITENING_MATRIX_CELLS) {
-            let i = tid / VISION_PATHWAY_INPUTS;
-            let j = tid % VISION_PATHWAY_INPUTS;
-            s_reinf_dot[whitening_covariance_index(i, j)] = brain_state[brain_base + O_VISION_PATHWAY_COVARIANCE + i * VISION_PATHWAY_INPUTS + j];
-            s_reinf_dot[whitening_eigenvector_index(i, j)] = select(0.0, 1.0, i == j);
+        if (tid < n * n) {
+            let i = tid / n;
+            let j = tid % n;
+            s_reinf_dot[whitening_covariance_index(i, j, n)] = brain_state[brain_base + sense_covariance(sense) + i * n + j];
+            s_reinf_dot[whitening_eigenvector_index(i, j, n)] = select(0.0, 1.0, i == j);
         }
         workgroupBarrier();
         for (var sweep = 0u; sweep < JACOBI_SWEEPS; sweep++) {
             if (tid == 0u) {
                 var off = 0.0;
-                for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
-                    for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
-                        off += s_reinf_dot[whitening_covariance_index(p, q)] * s_reinf_dot[whitening_covariance_index(p, q)];
+                for (var p = 0u; p < n; p++) {
+                    for (var q = p + 1u; q < n; q++) {
+                        off += s_reinf_dot[whitening_covariance_index(p, q, n)] * s_reinf_dot[whitening_covariance_index(p, q, n)];
                     }
                 }
                 s_reinf_dot[JACOBI_SWEEP_FLAG] = select(1.0, 0.0, off < 1e-30);
             }
             let continue_sweep = workgroupUniformLoad(&s_reinf_dot[JACOBI_SWEEP_FLAG]) != 0.0;
             if (!continue_sweep) { break; }
-            for (var p = 0u; p < VISION_PATHWAY_INPUTS; p++) {
-                for (var q = p + 1u; q < VISION_PATHWAY_INPUTS; q++) {
+            for (var p = 0u; p < n; p++) {
+                for (var q = p + 1u; q < n; q++) {
                     if (tid == 0u) {
-                        let apq = s_reinf_dot[whitening_covariance_index(p, q)];
+                        let apq = s_reinf_dot[whitening_covariance_index(p, q, n)];
                         s_reinf_dot[JACOBI_ROTATION_FLAG] = select(1.0, 0.0, abs(apq) < 1e-30);
                         if (!(abs(apq) < 1e-30)) {
-                            let theta = (s_reinf_dot[whitening_covariance_index(q, q)] - s_reinf_dot[whitening_covariance_index(p, p)]) / (2.0 * apq);
+                            let theta = (s_reinf_dot[whitening_covariance_index(q, q, n)] - s_reinf_dot[whitening_covariance_index(p, p, n)]) / (2.0 * apq);
                             var t = sign(theta) / (abs(theta) + sqrt(theta * theta + 1.0));
                             if (theta == 0.0) { t = 1.0; }
                             let c = 1.0 / sqrt(t * t + 1.0);
@@ -56,30 +60,30 @@ fn cooperative_refresh_vision_whitening(brain_base: u32, tid: u32) {
                     // Each lane owns two cells in one row. Eigenvectors are
                     // independent of covariance, so their column update can
                     // share this phase without changing any dependency.
-                    if (s_reinf_dot[JACOBI_ROTATION_FLAG] != 0.0 && tid < VISION_PATHWAY_INPUTS) {
+                    if (s_reinf_dot[JACOBI_ROTATION_FLAG] != 0.0 && tid < n) {
                         let k = tid;
                         let c = s_reinf_dot[JACOBI_COSINE];
                         let s = s_reinf_dot[JACOBI_SINE];
-                        let akp = s_reinf_dot[whitening_covariance_index(k, p)];
-                        let akq = s_reinf_dot[whitening_covariance_index(k, q)];
-                        s_reinf_dot[whitening_covariance_index(k, p)] = c * akp - s * akq;
-                        s_reinf_dot[whitening_covariance_index(k, q)] = s * akp + c * akq;
-                        let vkp = s_reinf_dot[whitening_eigenvector_index(k, p)];
-                        let vkq = s_reinf_dot[whitening_eigenvector_index(k, q)];
-                        s_reinf_dot[whitening_eigenvector_index(k, p)] = c * vkp - s * vkq;
-                        s_reinf_dot[whitening_eigenvector_index(k, q)] = s * vkp + c * vkq;
+                        let akp = s_reinf_dot[whitening_covariance_index(k, p, n)];
+                        let akq = s_reinf_dot[whitening_covariance_index(k, q, n)];
+                        s_reinf_dot[whitening_covariance_index(k, p, n)] = c * akp - s * akq;
+                        s_reinf_dot[whitening_covariance_index(k, q, n)] = s * akp + c * akq;
+                        let vkp = s_reinf_dot[whitening_eigenvector_index(k, p, n)];
+                        let vkq = s_reinf_dot[whitening_eigenvector_index(k, q, n)];
+                        s_reinf_dot[whitening_eigenvector_index(k, p, n)] = c * vkp - s * vkq;
+                        s_reinf_dot[whitening_eigenvector_index(k, q, n)] = s * vkp + c * vkq;
                     }
                     workgroupBarrier();
                     // The column phase must finish before any lane reads the
                     // intersecting row cells. Both operands precede stores.
-                    if (s_reinf_dot[JACOBI_ROTATION_FLAG] != 0.0 && tid < VISION_PATHWAY_INPUTS) {
+                    if (s_reinf_dot[JACOBI_ROTATION_FLAG] != 0.0 && tid < n) {
                         let k = tid;
                         let c = s_reinf_dot[JACOBI_COSINE];
                         let s = s_reinf_dot[JACOBI_SINE];
-                        let apk = s_reinf_dot[whitening_covariance_index(p, k)];
-                        let aqk = s_reinf_dot[whitening_covariance_index(q, k)];
-                        s_reinf_dot[whitening_covariance_index(p, k)] = c * apk - s * aqk;
-                        s_reinf_dot[whitening_covariance_index(q, k)] = s * apk + c * aqk;
+                        let apk = s_reinf_dot[whitening_covariance_index(p, k, n)];
+                        let aqk = s_reinf_dot[whitening_covariance_index(q, k, n)];
+                        s_reinf_dot[whitening_covariance_index(p, k, n)] = c * apk - s * aqk;
+                        s_reinf_dot[whitening_covariance_index(q, k, n)] = s * apk + c * aqk;
                     }
                     // Skipped rotations also reach this barrier: no wave may
                     // overwrite the next pair's flag while another reads it.
@@ -87,21 +91,22 @@ fn cooperative_refresh_vision_whitening(brain_base: u32, tid: u32) {
                 }
             }
         }
-        if (tid < WHITENING_MATRIX_CELLS) {
-            let i = tid / VISION_PATHWAY_INPUTS;
-            let j = tid % VISION_PATHWAY_INPUTS;
+        if (tid < n * n) {
+            let i = tid / n;
+            let j = tid % n;
             var trace = 0.0;
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                trace += s_reinf_dot[whitening_covariance_index(k, k)];
+            for (var k = 0u; k < n; k++) {
+                trace += s_reinf_dot[whitening_covariance_index(k, k, n)];
             }
-            let floor_value = WHITENING_RELATIVE_FLOOR * trace / f32(VISION_PATHWAY_INPUTS) + 1e-14;
+            let floor_value = WHITENING_RELATIVE_FLOOR * trace / f32(n) + 1e-14;
             var w = 0.0;
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                w += s_reinf_dot[whitening_eigenvector_index(i, k)] * s_reinf_dot[whitening_eigenvector_index(j, k)] / sqrt(max(s_reinf_dot[whitening_covariance_index(k, k)], floor_value));
+            for (var k = 0u; k < n; k++) {
+                w += s_reinf_dot[whitening_eigenvector_index(i, k, n)] * s_reinf_dot[whitening_eigenvector_index(j, k, n)] / sqrt(max(s_reinf_dot[whitening_covariance_index(k, k, n)], floor_value));
             }
-            brain_state[brain_base + O_VISION_PATHWAY_WHITENING + i * VISION_PATHWAY_INPUTS + j] = w;
+            brain_state[brain_base + sense_whitening(sense) + i * n + j] = w;
         }
     }
     storageBarrier();
     workgroupBarrier();
+    }
 }

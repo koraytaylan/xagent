@@ -10,8 +10,8 @@ depends_on:
   - generic-schedule-candidates
   - sense-reader-rewrites
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "a955d3705bdef571e7e333326b429457161b0ecb"
 touches:
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
   - crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl

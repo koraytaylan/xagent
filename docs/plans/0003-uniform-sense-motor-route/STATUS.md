@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # 0003 — Uniform sense-motor route: status
@@ -24,3 +24,7 @@ Progress: 0/16 tasks done.
 | tasks/0300-pooling-fit.md | pooling-fit | Offline pooling fit library | todo |
 | tasks/0301-pooling-study.md | pooling-study | Learned pooling against hemifields | todo |
 | tasks/0302-learned-pooling-port.md | learned-pooling-port | Apply the pooling verdict to the vision sense | todo |
+
+## Factory runs
+
+- 2026-11-20 12:11:03Z — completed 16/16; final plan gates passed

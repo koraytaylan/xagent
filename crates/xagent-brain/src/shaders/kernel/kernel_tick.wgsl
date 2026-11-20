@@ -783,10 +783,10 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
         var terminal_vision_norm_sq = 0.0;
         for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
             let slot = brain_base + O_FORWARD_PATHWAY_WEIGHTS + i;
-            let rate = select(vision_pathway_learning_rate(brain_base), ACTION_WEIGHT_LEARNING_RATE, i < SCENT_CHANNELS);
+            let rate = select(sense_learning_rate(brain_base, 1u), ACTION_WEIGHT_LEARNING_RATE, i < NON_VISUAL_FEATURE_CHANNELS);
             brain_state[slot] += rate * TERMINAL_DEATH_TD_ERROR
                 * brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + i];
-            if (i < SCENT_CHANNELS) {
+            if (i < NON_VISUAL_FEATURE_CHANNELS) {
                 terminal_scent_norm_sq += brain_state[slot] * brain_state[slot];
             } else {
                 terminal_vision_norm_sq += brain_state[slot] * brain_state[slot];
@@ -795,7 +795,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
         let terminal_scent_norm = sqrt(terminal_scent_norm_sq);
         let terminal_vision_norm = sqrt(terminal_vision_norm_sq);
         for (var i = 0u; i < PATHWAY_INPUT_COUNT; i++) {
-            let sense_norm = select(terminal_vision_norm, terminal_scent_norm, i < SCENT_CHANNELS);
+            let sense_norm = select(terminal_vision_norm, terminal_scent_norm, i < NON_VISUAL_FEATURE_CHANNELS);
             if (sense_norm > MAX_WEIGHT_NORM) {
                 brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + i] *= MAX_WEIGHT_NORM / sense_norm;
             }
@@ -804,7 +804,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     }
 
     settle_recent_moments_at_death(brain_base);
-    settle_turn_pathways_at_death(brain_base);
+    settle_senses_at_death(brain_base);
 
     // Reset TD transients: eligibility traces and the previous-state value
     // are episodic — credit must never leak across the death boundary.

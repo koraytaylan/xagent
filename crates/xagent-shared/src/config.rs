@@ -279,6 +279,14 @@ pub struct BrainConfig {
     /// [`DEFAULT_FORWARD_PATHWAY_ENABLED`].
     #[serde(default = "default_forward_pathway_enabled")]
     pub forward_pathway_enabled: bool,
+    /// Population-wide runtime switch, not heritable. When `false` the
+    /// klinotaxis turn-gain factor is exactly `1.0`. Default `true`.
+    #[serde(default = "default_modulator_gate_enabled")]
+    pub klinotaxis_turn_gain_enabled: bool,
+    /// Population-wide runtime switch, not heritable. When `false` the
+    /// motor-fatigue factor is exactly `1.0`. Default `true`.
+    #[serde(default = "default_modulator_gate_enabled")]
+    pub motor_fatigue_enabled: bool,
 }
 
 /// Which inputs the critic reads.
@@ -301,6 +309,10 @@ pub const DEFAULT_FORWARD_PATHWAY_ENABLED: bool = false;
 
 fn default_critic_input() -> CriticInput {
     DEFAULT_CRITIC_INPUT
+}
+
+fn default_modulator_gate_enabled() -> bool {
+    true
 }
 
 fn default_forward_pathway_enabled() -> bool {
@@ -697,6 +709,8 @@ impl Default for BrainConfig {
             cortex_stage_limit: 0,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
+            klinotaxis_turn_gain_enabled: true,
+            motor_fatigue_enabled: true,
         }
     }
 }
@@ -800,6 +814,8 @@ impl BrainConfig {
             cortex_stage_limit: 0,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
+            klinotaxis_turn_gain_enabled: true,
+            motor_fatigue_enabled: true,
         }
     }
 
@@ -846,6 +862,8 @@ impl BrainConfig {
             cortex_stage_limit: 0,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
+            klinotaxis_turn_gain_enabled: true,
+            motor_fatigue_enabled: true,
         }
     }
 }
@@ -921,6 +939,23 @@ mod tests {
             config.forward_pathway_enabled,
             DEFAULT_FORWARD_PATHWAY_ENABLED
         );
+    }
+
+    #[test]
+    fn modulator_flags_default_on() {
+        let mut value = serde_json::to_value(BrainConfig::default()).unwrap();
+        let map = value.as_object_mut().unwrap();
+        map.remove("klinotaxis_turn_gain_enabled");
+        map.remove("motor_fatigue_enabled");
+        let config: BrainConfig = serde_json::from_value(value).unwrap();
+        assert!(config.klinotaxis_turn_gain_enabled && config.motor_fatigue_enabled);
+        for preset in [
+            BrainConfig::default(),
+            BrainConfig::tiny(),
+            BrainConfig::large(),
+        ] {
+            assert!(preset.klinotaxis_turn_gain_enabled && preset.motor_fatigue_enabled);
+        }
     }
 
     #[test]

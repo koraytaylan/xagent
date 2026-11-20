@@ -39,8 +39,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 pub(super) fn workgroup_whitening_common() -> String {
     let common = include_str!("../shaders/kernel/common.wgsl");
-    let begin = "fn refresh_vision_whitening(brain_base: u32) {";
-    let end = "fn settle_recent_moments_at_death(brain_base: u32) {";
+    let begin = "fn sense_refresh_jacobi_whitening(";
+    let end = "fn settle_recent_moments_at_death";
     assert_eq!(common.matches(begin).count(), 1);
     assert_eq!(common.matches(end).count(), 1);
     let start = common.find(begin).unwrap();
@@ -65,13 +65,29 @@ pub(super) fn workgroup_whitening_common() -> String {
 
 fn make_shared_pipeline(kernel: &GpuKernel) -> wgpu::ComputePipeline {
     let common = workgroup_whitening_common();
-    // The refresh's only caller is vision_pathway_step, itself called only
-    // inside coop_predict_and_act's tid==0 exploration block. Each workgroup
-    // serves one agent, so the matrices have one writer and reader. No new
-    // barrier is required; the following existing pass barrier is unchanged.
+    // The refresh's only caller is the scheduled refresh loop, itself called
+    // only inside coop_predict_and_act's tid==0 exploration block. Each
+    // workgroup serves one agent, so the matrices have one writer and reader.
+    // No new barrier is required; the following existing pass barrier is
+    // unchanged.
     let passes = include_str!("../shaders/kernel/brain_passes.wgsl");
-    assert_eq!(passes.matches("refresh_vision_whitening(").count(), 1);
-    assert_eq!(passes.matches("vision_pathway_step(").count(), 2);
+    assert_eq!(passes.matches("sense_refresh_jacobi_whitening(").count(), 1);
+    // The refresh, input, dot product, update, forward update and trace loops,
+    // plus the critic gather, forward term, forward trace and probe loops.
+    assert_eq!(
+        passes
+            .matches("for (var sense = 0u; sense < SENSE_COUNT; sense++) {")
+            .count(),
+        10
+    );
+    for wrapper in [
+        "whiten_scent(",
+        "refresh_vision_whitening(",
+        "vision_pathway_learning_rate(",
+        "settle_turn_pathways_at_death(",
+    ] {
+        assert_eq!(passes.matches(wrapper).count(), 0);
+    }
     let source = apply_subgroup_markers(
         &[
             common.as_str(),

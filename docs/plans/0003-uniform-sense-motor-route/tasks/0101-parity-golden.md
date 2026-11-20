@@ -6,8 +6,8 @@ kind: task
 role: architect
 depends_on: []
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "71e2ce7bf53bc9c9377f38bd3a151f503f7560b6"
 touches:
   - crates/xagent-sandbox/tests/sense_block_parity.rs
   - crates/xagent-sandbox/tests/fixtures/sense_block_parity.golden

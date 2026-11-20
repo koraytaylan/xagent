@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - generic-sense-block-sites
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "c3e8a130a96a847398e6d337d54e1d394e1cf89b"
 touches:
   - crates/xagent-brain/src/gpu_kernel/visual_pathway_validation.rs
   - crates/xagent-brain/src/gpu_kernel/cooperative_jacobi_validation.rs

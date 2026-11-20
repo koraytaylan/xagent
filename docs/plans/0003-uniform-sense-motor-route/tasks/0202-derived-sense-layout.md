@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - sense-descriptor
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "9dcf59ff6ca8bd063d633cdb3b497773fd20de7e"
 touches:
   - crates/xagent-brain/src/buffers.rs
 checks:

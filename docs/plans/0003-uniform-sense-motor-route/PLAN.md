@@ -13,7 +13,7 @@ objective: >-
   recorded.
 depends_on:
   - 0002-pathway-critic-and-forward-drive
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

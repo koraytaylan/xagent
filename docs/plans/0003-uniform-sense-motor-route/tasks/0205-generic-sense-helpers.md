@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - sense-override-constants
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "64d9568398c4822a732c2f38dd83b3927156fdce"
 touches:
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl

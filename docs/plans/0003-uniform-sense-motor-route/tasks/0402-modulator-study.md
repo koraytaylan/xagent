@@ -8,8 +8,8 @@ depends_on:
   - modulator-flags
   - declared-sense-extension-test
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "e91625ee5b992d56e55e9c83983713740f5cfddc"
 touches:
   - docs/decisions/modulator-study.md
   - docs/decisions/modulator-study-evo-reference.json

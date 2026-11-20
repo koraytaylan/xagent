@@ -896,7 +896,7 @@ fn vision_hemifields() -> array<f32, 8> {
         for (var col = 0u; col < VISION_W; col++) {
             let ray = row * VISION_W + col;
             let right = col >= half;
-            let side = select(0u, VISION_PATHWAY_CHANNELS, right);
+            let side = select(0u, HEMIFIELD_CHANNELS, right);
             let count = select(left_count, right_count, right);
             out[side] += s_features[ray * 4u] / count;
             out[side + 1u] += s_features[ray * 4u + 1u] / count;
@@ -907,44 +907,39 @@ fn vision_hemifields() -> array<f32, 8> {
     return out;
 }
 
-// One brain tick of the visual pathway (thread 0): refresh the whitening
-// matrix on schedule, whiten the centred hemifields with it, store the
-// result, and fold the new input into the running mean and covariance.
-// Returns the turn contribution, weights · whitened input. With the visual
-// cortex on there are no rays to pool, so the pathway stays silent.
-fn vision_pathway_step(brain_base: u32, tick: f32, cortex_on: bool) -> f32 {
-    if (cortex_on) {
-        for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-            brain_state[brain_base + O_VISION_PATHWAY_INPUT + k] = 0.0;
-        }
-        return 0.0;
+// The pooled hemifield input of a sense that reads the adapted visual field.
+fn sense_hemifield_input() -> array<f32, MAX_SENSE_CHANNELS> {
+    return vision_hemifields();
+}
+
+// Most senses a brain can declare; sizes per-sense scratch.
+const MAX_SENSE_SLOTS: u32 = 4u;
+
+// Where a sense's channels begin within a pathway block: the channel counts
+// of the senses declared before it.
+fn sense_pathway_offset(sense: u32) -> u32 {
+    var offset = 0u;
+    for (var earlier = 0u; earlier < sense; earlier++) {
+        offset += sense_channels(earlier);
     }
-    if (u32(tick) % VISION_WHITENING_REFRESH == 0u) {
-        refresh_vision_whitening(brain_base);
-    }
-    let raw = vision_hemifields();
-    var centred: array<f32, 8>;
-    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-        centred[k] = raw[k] - brain_state[brain_base + O_VISION_PATHWAY_MEAN + k];
-    }
-    var turn = 0.0;
-    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
-        var whitened = 0.0;
-        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
-            whitened += brain_state[brain_base + O_VISION_PATHWAY_WHITENING + i * VISION_PATHWAY_INPUTS + j]
-                * centred[j];
-        }
-        brain_state[brain_base + O_VISION_PATHWAY_INPUT + i] = whitened;
-        turn += brain_state[brain_base + O_VISION_TURN_WEIGHTS + i] * whitened;
-    }
-    for (var i = 0u; i < VISION_PATHWAY_INPUTS; i++) {
-        brain_state[brain_base + O_VISION_PATHWAY_MEAN + i] += VISION_PATHWAY_RATE * centred[i];
-        for (var j = 0u; j < VISION_PATHWAY_INPUTS; j++) {
-            let slot = brain_base + O_VISION_PATHWAY_COVARIANCE + i * VISION_PATHWAY_INPUTS + j;
-            brain_state[slot] += VISION_PATHWAY_RATE * (centred[i] * centred[j] - brain_state[slot]);
+    return offset;
+}
+
+// Where the non-visual features begin in the feature vector.
+fn raw_feature_base(visual_cortex_on: bool) -> u32 {
+    return select(VISION_COLOR_COUNT + VISION_DEPTH_COUNT, VISUAL_FEATURE_COUNT, visual_cortex_on);
+}
+
+// Refresh every Jacobi-whitened sense's matrix on its schedule (thread 0). A
+// hemifield sense is not refreshed while the visual cortex is on.
+fn refresh_senses_on_schedule(brain_base: u32, visual_cortex_on: bool) {
+    for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+        if (sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI
+            && !(visual_cortex_on && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)
+            && u32(brain_state[brain_base + O_TICK_COUNT]) % sense_refresh_ticks(sense) == 0u) {
+            sense_refresh_jacobi_whitening(brain_base, sense);
         }
     }
-    return turn;
 }
 
 fn coop_encode(agent_id: u32, tid: u32) {
@@ -1448,15 +1443,13 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         if (critic_mode != CRITIC_INPUT_ENCODING) {
             if (tid == 0u) {
                 var pathway_dot = 0.0;
-                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                    var c = 0.0;
-                    if (k < SCENT_CHANNELS) {
-                        c = brain_state[brain_base + O_SCENT_WHITENED + k];
-                    } else {
-                        c = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+                for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                    let pathway = sense_pathway_offset(sense);
+                    for (var j = 0u; j < sense_channels(sense); j++) {
+                        let c = brain_state[brain_base + sense_input(sense) + j];
+                        s_critic_pathway_input[pathway + j] = c;
+                        pathway_dot += brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + pathway + j] * c;
                     }
-                    s_critic_pathway_input[k] = c;
-                    pathway_dot += brain_state[brain_base + O_CRITIC_PATHWAY_WEIGHTS + k] * c;
                 }
                 s_value += pathway_dot;
             }
@@ -1531,36 +1524,27 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             brain_state[brain_base + O_ACT_BIASES] +=
                 ACTION_WEIGHT_LEARNING_RATE * td_error * forward_bias_trace;
             // The turn channel has no bias (see O_ACT_BIASES).
-            // Smell pathway: the two scent turn weights learn through their
-            // own traces (already normalised per input), kept in the L2 ball.
+            // Each turn route's weights learn through the sense's own trace
+            // (already normalised per input) at the sense's own rate, kept in
+            // the sense's L2 ball.
             if (steering_weights_learn()) {
-                var scent_weights = vec2<f32>(
-                    brain_state[brain_base + O_SCENT_TURN_WEIGHTS],
-                    brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u],
-                ) + ACTION_WEIGHT_LEARNING_RATE * td_error * vec2<f32>(
-                    brain_state[brain_base + O_TRACE_SCENT],
-                    brain_state[brain_base + O_TRACE_SCENT + 1u],
-                );
-                let scent_norm = length(scent_weights);
-                if (scent_norm > MAX_WEIGHT_NORM) {
-                    scent_weights *= MAX_WEIGHT_NORM / scent_norm;
-                }
-                brain_state[brain_base + O_SCENT_TURN_WEIGHTS] = scent_weights.x;
-                brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] = scent_weights.y;
-                // Visual pathway weights, the same way at the agent's own
-                // heritable plasticity.
-                let vision_rate = vision_pathway_learning_rate(brain_base);
-                var vision_norm_sq = 0.0;
-                for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                    let slot = brain_base + O_VISION_TURN_WEIGHTS + k;
-                    brain_state[slot] += vision_rate * td_error
-                        * brain_state[brain_base + O_TRACE_VISION + k];
-                    vision_norm_sq += brain_state[slot] * brain_state[slot];
-                }
-                let vision_norm = sqrt(vision_norm_sq);
-                if (vision_norm > MAX_WEIGHT_NORM) {
-                    for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                        brain_state[brain_base + O_VISION_TURN_WEIGHTS + k] *= MAX_WEIGHT_NORM / vision_norm;
+                for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                    if ((sense_route_mask(sense) & SENSE_ROUTE_TURN) != 0u) {
+                        let route_rate = sense_learning_rate(brain_base, sense);
+                        var route_norm_sq = 0.0;
+                        for (var k = 0u; k < sense_channels(sense); k++) {
+                            let slot = brain_base + sense_turn_weights(sense) + k;
+                            brain_state[slot] += route_rate * td_error
+                                * brain_state[brain_base + sense_turn_trace(sense) + k];
+                            route_norm_sq += brain_state[slot] * brain_state[slot];
+                        }
+                        let route_norm = sqrt(route_norm_sq);
+                        if (route_norm > MAX_WEIGHT_NORM) {
+                            for (var k = 0u; k < sense_channels(sense); k++) {
+                                brain_state[brain_base + sense_turn_weights(sense) + k] *=
+                                    MAX_WEIGHT_NORM / route_norm;
+                            }
+                        }
                     }
                 }
             }
@@ -1584,26 +1568,22 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // Forward pathway weights, one L2 ball per sense, from the trace
             // as it stood before this tick's trace update.
             if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
-                var forward_scent_norm_sq = 0.0;
-                var forward_vision_norm_sq = 0.0;
-                let forward_vision_rate = vision_pathway_learning_rate(brain_base);
-                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                    let slot = brain_base + O_FORWARD_PATHWAY_WEIGHTS + k;
-                    let rate = select(forward_vision_rate, ACTION_WEIGHT_LEARNING_RATE, k < SCENT_CHANNELS);
-                    brain_state[slot] += rate * td_error
-                        * brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + k];
-                    if (k < SCENT_CHANNELS) {
-                        forward_scent_norm_sq += brain_state[slot] * brain_state[slot];
-                    } else {
-                        forward_vision_norm_sq += brain_state[slot] * brain_state[slot];
+                for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                    let route_rate = sense_learning_rate(brain_base, sense);
+                    let pathway_offset = sense_pathway_offset(sense);
+                    var route_norm_sq = 0.0;
+                    for (var k = 0u; k < sense_channels(sense); k++) {
+                        let slot = brain_base + O_FORWARD_PATHWAY_WEIGHTS + pathway_offset + k;
+                        brain_state[slot] += route_rate * td_error
+                            * brain_state[brain_base + O_TRACE_FORWARD_PATHWAY + pathway_offset + k];
+                        route_norm_sq += brain_state[slot] * brain_state[slot];
                     }
-                }
-                let forward_scent_norm = sqrt(forward_scent_norm_sq);
-                let forward_vision_norm = sqrt(forward_vision_norm_sq);
-                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                    let norm = select(forward_vision_norm, forward_scent_norm, k < SCENT_CHANNELS);
-                    if (norm > MAX_WEIGHT_NORM) {
-                        brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + k] *= MAX_WEIGHT_NORM / norm;
+                    let route_norm = sqrt(route_norm_sq);
+                    if (route_norm > MAX_WEIGHT_NORM) {
+                        for (var k = 0u; k < sense_channels(sense); k++) {
+                            brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + pathway_offset + k] *=
+                                MAX_WEIGHT_NORM / route_norm;
+                        }
                     }
                 }
             }
@@ -1785,62 +1765,109 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         let urgency = s_homeo[2u];
         let prediction_error = s_pred_td[S_PRED_ERROR];
 
-        // Smell pathway: whiten this tick's two nostrils by their running
-        // mean and covariance (then fold the scent into those statistics),
-        // so the turn policy reads them with overall strength and left−right
-        // difference on an equal footing.
+        // Each declared sense: gather this tick's input, centre it by the
+        // running mean, whiten it by the running covariance, store the
+        // whitened input, then fold the input into those statistics.
         let visual_cortex_on = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
-        let scent_base = select(VISUAL_FEATURE_COUNT, VISION_COLOR_COUNT + VISION_DEPTH_COUNT, !visual_cortex_on)
-            + SCENT_FEATURE_OFFSET;
-        let scent = vec2<f32>(s_features[scent_base], s_features[scent_base + 1u]);
-        let scent_mean = vec2<f32>(
-            brain_state[brain_base + O_SCENT_MEAN],
-            brain_state[brain_base + O_SCENT_MEAN + 1u],
-        );
-        let scent_covariance = vec3<f32>(
-            brain_state[brain_base + O_SCENT_COVARIANCE],
-            brain_state[brain_base + O_SCENT_COVARIANCE + 1u],
-            brain_state[brain_base + O_SCENT_COVARIANCE + 2u],
-        );
-        let scent_centred = scent - scent_mean;
-        let scent_whitened = whiten_scent(scent_centred, scent_covariance);
-        brain_state[brain_base + O_SCENT_WHITENED] = scent_whitened.x;
-        brain_state[brain_base + O_SCENT_WHITENED + 1u] = scent_whitened.y;
-        let next_scent_mean = scent_mean + SCENT_WHITENING_RATE * scent_centred;
-        let next_scent_covariance = scent_covariance + SCENT_WHITENING_RATE * (vec3<f32>(
-            scent_centred.x * scent_centred.x,
-            scent_centred.x * scent_centred.y,
-            scent_centred.y * scent_centred.y,
-        ) - scent_covariance);
-        brain_state[brain_base + O_SCENT_MEAN] = next_scent_mean.x;
-        brain_state[brain_base + O_SCENT_MEAN + 1u] = next_scent_mean.y;
-        brain_state[brain_base + O_SCENT_COVARIANCE] = next_scent_covariance.x;
-        brain_state[brain_base + O_SCENT_COVARIANCE + 1u] = next_scent_covariance.y;
-        brain_state[brain_base + O_SCENT_COVARIANCE + 2u] = next_scent_covariance.z;
-        let scent_dot = brain_state[brain_base + O_SCENT_TURN_WEIGHTS] * scent_whitened.x
-            + brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u] * scent_whitened.y;
-        // Visual pathway: the two halves of the adapted field, whitened.
-        let vision_dot = vision_pathway_step(
-            brain_base, brain_state[brain_base + O_TICK_COUNT], visual_cortex_on);
+        refresh_senses_on_schedule(brain_base, visual_cortex_on);
+        for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+            let channels = sense_channels(sense);
+            let silent = visual_cortex_on
+                && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS;
+            if (silent) {
+                for (var k = 0u; k < channels; k++) {
+                    brain_state[brain_base + sense_input(sense) + k] = 0.0;
+                }
+                continue;
+            }
+            var raw: array<f32, MAX_SENSE_CHANNELS>;
+            if (sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS) {
+                raw = sense_hemifield_input();
+            } else {
+                let input_base = raw_feature_base(visual_cortex_on) + sense_input_offset(sense);
+                for (var k = 0u; k < channels; k++) {
+                    raw[k] = s_features[input_base + k];
+                }
+            }
+            var centred: array<f32, MAX_SENSE_CHANNELS>;
+            for (var k = 0u; k < channels; k++) {
+                centred[k] = raw[k] - brain_state[brain_base + sense_mean(sense) + k];
+            }
+            let rate = sense_adaptation_rate(sense);
+            if (sense_whitening_kind(sense) == SENSE_WHITENING_KIND_CLOSED_FORM_2) {
+                let mean = vec2<f32>(
+                    brain_state[brain_base + sense_mean(sense)],
+                    brain_state[brain_base + sense_mean(sense) + 1u],
+                );
+                let covariance = vec3<f32>(
+                    brain_state[brain_base + sense_covariance(sense)],
+                    brain_state[brain_base + sense_covariance(sense) + 1u],
+                    brain_state[brain_base + sense_covariance(sense) + 2u],
+                );
+                let centred_pair = vec2<f32>(centred[0u], centred[1u]);
+                let whitened = sense_whiten_closed_form(sense, centred_pair, covariance);
+                brain_state[brain_base + sense_input(sense)] = whitened.x;
+                brain_state[brain_base + sense_input(sense) + 1u] = whitened.y;
+                let next_mean = mean + rate * centred_pair;
+                let next_covariance = covariance + rate * (vec3<f32>(
+                    centred_pair.x * centred_pair.x,
+                    centred_pair.x * centred_pair.y,
+                    centred_pair.y * centred_pair.y,
+                ) - covariance);
+                brain_state[brain_base + sense_mean(sense)] = next_mean.x;
+                brain_state[brain_base + sense_mean(sense) + 1u] = next_mean.y;
+                brain_state[brain_base + sense_covariance(sense)] = next_covariance.x;
+                brain_state[brain_base + sense_covariance(sense) + 1u] = next_covariance.y;
+                brain_state[brain_base + sense_covariance(sense) + 2u] = next_covariance.z;
+            } else {
+                for (var i = 0u; i < channels; i++) {
+                    var whitened = 0.0;
+                    for (var j = 0u; j < channels; j++) {
+                        whitened += brain_state[brain_base + sense_whitening(sense) + i * channels + j]
+                            * centred[j];
+                    }
+                    brain_state[brain_base + sense_input(sense) + i] = whitened;
+                }
+                for (var i = 0u; i < channels; i++) {
+                    brain_state[brain_base + sense_mean(sense) + i] += rate * centred[i];
+                    for (var j = 0u; j < channels; j++) {
+                        let slot = brain_base + sense_covariance(sense) + i * channels + j;
+                        brain_state[slot] += rate * (centred[i] * centred[j] - brain_state[slot]);
+                    }
+                }
+            }
+        }
 
         // Policy evaluation: forward bias plus dot product; the turn channel
         // has no bias, so it can only turn in response to what it senses.
         var forward: f32 = brain_state[brain_base + O_ACT_BIASES] + s_forward_dot;
-        var turn: f32 = s_turn_dot + scent_dot + vision_dot;
+        var turn: f32 = s_turn_dot;
+        var sense_dots: array<f32, MAX_SENSE_SLOTS>;
+        for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+            let silent = visual_cortex_on
+                && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS;
+            if ((sense_route_mask(sense) & SENSE_ROUTE_TURN) != 0u && !silent) {
+                var route_dot = 0.0;
+                for (var k = 0u; k < sense_channels(sense); k++) {
+                    route_dot += brain_state[brain_base + sense_turn_weights(sense) + k]
+                        * brain_state[brain_base + sense_input(sense) + k];
+                }
+                sense_dots[sense] = route_dot;
+                turn += route_dot;
+            }
+        }
         if (lesion_forward_weights()) {
             forward = brain_state[brain_base + O_ACT_BIASES];
         }
         // Learned pathway term of the forward command, on this tick's
         // whitened inputs.
         if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
-            for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                var x = 0.0;
-                if (k < SCENT_CHANNELS) {
-                    x = brain_state[brain_base + O_SCENT_WHITENED + k];
-                } else {
-                    x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
+            for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                let pathway = sense_pathway_offset(sense);
+                for (var j = 0u; j < sense_channels(sense); j++) {
+                    let x = brain_state[brain_base + sense_input(sense) + j];
+                    forward += brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + pathway + j] * x;
                 }
-                forward += brain_state[brain_base + O_FORWARD_PATHWAY_WEIGHTS + k] * x;
             }
         }
 
@@ -1920,8 +1947,9 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // Compute staleness: compare actual displacement to expected
         let p_len = u32(new_pos_len);
         let floor_val = brain_state[brain_base + O_FATIGUE_FLOOR];
+        let motor_fatigue_on = bc_f32(CFG_MOTOR_FATIGUE_ENABLED) != 0.0;
         var fatigue_factor: f32 = 1.0;
-        if (p_len >= 4u) {
+        if (motor_fatigue_on && p_len >= 4u) {
             // Oldest valid entry in the ring. When the ring is not yet full,
             // (pos_cursor + 1) points at the next write slot rather than the
             // oldest sample, so compute from the current valid length instead.
@@ -1977,7 +2005,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         //   Sustained (ticks 4+): fast recovered, medium still shifted → suppress turns → go straight → escape
         // This produces the biological escape sequence: brief reorientation then straight-line flight.
         let gradient_deviation = s_homeo[3u] - s_homeo[4u];
-        let klinotaxis_factor = clamp(1.0 - gradient_deviation * KLINOTAXIS_SENSITIVITY, 0.3, 3.0);
+        var klinotaxis_factor: f32 = 1.0;
+        let klinotaxis_on = bc_f32(CFG_KLINOTAXIS_TURN_GAIN_ENABLED) != 0.0;
+        if (klinotaxis_on) {
+            klinotaxis_factor = clamp(1.0 - gradient_deviation * KLINOTAXIS_SENSITIVITY, 0.3, 3.0);
+        }
         turn *= klinotaxis_factor;
 
         // Publish the exploration noise terms for the eligibility-trace
@@ -2011,13 +2043,12 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
         // while the probe is enabled.
         if (brain_tick_probe_enabled()) {
             let probe_base = decision_base + DECISION_PROBE;
-            decision_buffer[probe_base + PROBE_PATHWAY_INPUTS] =
-                brain_state[brain_base + O_SCENT_WHITENED];
-            decision_buffer[probe_base + PROBE_PATHWAY_INPUTS + 1u] =
-                brain_state[brain_base + O_SCENT_WHITENED + 1u];
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                decision_buffer[probe_base + PROBE_PATHWAY_INPUTS + 2u + k] =
-                    brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
+            for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                let pathway = sense_pathway_offset(sense);
+                for (var j = 0u; j < sense_channels(sense); j++) {
+                    decision_buffer[probe_base + PROBE_PATHWAY_INPUTS + pathway + j] =
+                        brain_state[brain_base + sense_input(sense) + j];
+                }
             }
             decision_buffer[probe_base + PROBE_REWARD] = s_pred_td[S_REWARD];
             decision_buffer[probe_base + PROBE_VALUE] = brain_state[brain_base + O_PREV_VALUE];
@@ -2028,11 +2059,11 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
             // Recomputed from the stored inputs: a second use of `scent_dot`
             // would let the compiler contract the turn sum differently.
             decision_buffer[probe_base + PROBE_SCENT_TURN_OUTPUT] =
-                brain_state[brain_base + O_SCENT_TURN_WEIGHTS]
-                    * brain_state[brain_base + O_SCENT_WHITENED]
-                + brain_state[brain_base + O_SCENT_TURN_WEIGHTS + 1u]
-                    * brain_state[brain_base + O_SCENT_WHITENED + 1u];
-            decision_buffer[probe_base + PROBE_VISION_TURN_OUTPUT] = vision_dot;
+                brain_state[brain_base + sense_turn_weights(0u)]
+                    * brain_state[brain_base + sense_input(0u)]
+                + brain_state[brain_base + sense_turn_weights(0u) + 1u]
+                    * brain_state[brain_base + sense_input(0u) + 1u];
+            decision_buffer[probe_base + PROBE_VISION_TURN_OUTPUT] = sense_dots[1u];
             decision_buffer[probe_base + PROBE_ENCODING_FORWARD_OUTPUT] = s_forward_dot;
         }
 
@@ -2090,28 +2121,22 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 brain_state[brain_base + O_TRACE_BIASES] * trace_decay + 1.0;
             brain_state[brain_base + O_TRACE_BIASES + 1u] =
                 brain_state[brain_base + O_TRACE_BIASES + 1u] * trace_decay + s_explore[0u];
-            // Smell pathway trace: innovation × whitened scent, normalised by
-            // 1 + |whitened scent|² as it enters.
-            let whitened = vec2<f32>(
-                brain_state[brain_base + O_SCENT_WHITENED],
-                brain_state[brain_base + O_SCENT_WHITENED + 1u],
-            );
-            let scent_term = s_explore[2u] * whitened / (1.0 + dot(whitened, whitened));
-            brain_state[brain_base + O_TRACE_SCENT] =
-                brain_state[brain_base + O_TRACE_SCENT] * trace_decay + scent_term.x;
-            brain_state[brain_base + O_TRACE_SCENT + 1u] =
-                brain_state[brain_base + O_TRACE_SCENT + 1u] * trace_decay + scent_term.y;
-            // Visual pathway trace, the same way.
-            var vision_sq = 0.0;
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                let input = brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
-                vision_sq += input * input;
-            }
-            for (var k = 0u; k < VISION_PATHWAY_INPUTS; k++) {
-                let input = brain_state[brain_base + O_VISION_PATHWAY_INPUT + k];
-                let slot = brain_base + O_TRACE_VISION + k;
-                brain_state[slot] = brain_state[slot] * trace_decay
-                    + s_explore[2u] * input / (1.0 + vision_sq);
+            // Each turn route's trace: innovation × the sense's whitened
+            // input, normalised by 1 + |input|² as it enters.
+            for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                if ((sense_route_mask(sense) & SENSE_ROUTE_TURN) != 0u) {
+                    var input_sq = 0.0;
+                    for (var k = 0u; k < sense_channels(sense); k++) {
+                        let input = brain_state[brain_base + sense_input(sense) + k];
+                        input_sq += input * input;
+                    }
+                    for (var k = 0u; k < sense_channels(sense); k++) {
+                        let input = brain_state[brain_base + sense_input(sense) + k];
+                        let slot = brain_base + sense_turn_trace(sense) + k;
+                        brain_state[slot] = brain_state[slot] * trace_decay
+                            + s_explore[2u] * input / (1.0 + input_sq);
+                    }
+                }
             }
             if (critic_mode != CRITIC_INPUT_ENCODING) {
                 for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
@@ -2120,31 +2145,20 @@ fn coop_predict_and_act(agent_id: u32, tid: u32, use_scratch_prediction: bool) {
                 }
             }
             if (bc_f32(CFG_FORWARD_PATHWAY_ENABLED) != 0.0) {
-                var forward_scent_sq = 0.0;
-                var forward_vision_sq = 0.0;
-                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                    var x = 0.0;
-                    if (k < SCENT_CHANNELS) {
-                        x = brain_state[brain_base + O_SCENT_WHITENED + k];
-                        forward_scent_sq += x * x;
-                    } else {
-                        x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
-                        forward_vision_sq += x * x;
-                    }
-                }
-                for (var k = 0u; k < PATHWAY_INPUT_COUNT; k++) {
-                    var x = 0.0;
+                for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+                    let channels = sense_channels(sense);
+                    let pathway = sense_pathway_offset(sense);
                     var sense_sq = 0.0;
-                    if (k < SCENT_CHANNELS) {
-                        x = brain_state[brain_base + O_SCENT_WHITENED + k];
-                        sense_sq = forward_scent_sq;
-                    } else {
-                        x = brain_state[brain_base + O_VISION_PATHWAY_INPUT + (k - SCENT_CHANNELS)];
-                        sense_sq = forward_vision_sq;
+                    for (var j = 0u; j < channels; j++) {
+                        let x = brain_state[brain_base + sense_input(sense) + j];
+                        sense_sq += x * x;
                     }
-                    let slot = brain_base + O_TRACE_FORWARD_PATHWAY + k;
-                    brain_state[slot] = brain_state[slot] * trace_decay
-                        + s_explore[0u] * x / (1.0 + sense_sq);
+                    for (var j = 0u; j < channels; j++) {
+                        let x = brain_state[brain_base + sense_input(sense) + j];
+                        let slot = brain_base + O_TRACE_FORWARD_PATHWAY + pathway + j;
+                        brain_state[slot] = brain_state[slot] * trace_decay
+                            + s_explore[0u] * x / (1.0 + sense_sq);
+                    }
                 }
             }
         }

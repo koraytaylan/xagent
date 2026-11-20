@@ -12,6 +12,7 @@ pub mod headless;
 pub mod momentum;
 pub mod overlay;
 pub mod physics;
+pub mod pooling_study;
 pub mod renderer;
 pub mod replay;
 pub mod ui;

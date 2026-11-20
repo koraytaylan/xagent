@@ -89,6 +89,7 @@ use xagent_shared::{BrainConfig, WorldConfig};
 
 use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
+use crate::senses::{SenseDescriptor, SenseInput, Whitening, DECLARED_SENSES, MAX_SENSE_SLOTS};
 
 #[cfg(test)]
 mod agent_projection_dot_validation;
@@ -327,9 +328,106 @@ fn vision_rays_per_workgroup(agent_count: u32, rays: u32) -> u32 {
     per_workgroup.min(MAX_RAYS_PER_WORKGROUP)
 }
 
+/// Converts a layout offset or count to an override value, failing loudly
+/// when it does not fit a shader `u32`.
+fn override_number(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("sense override exceeds u32 range"))
+}
+
+/// Moves a static tail offset into `layout`, whose fixed tail starts at
+/// its own predictor-context-weight offset; zero (no slot) stays zero.
+fn layout_tail_offset(layout: &BrainLayout, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let tail_base = layout.feature_count * ENCODED_DIMENSION
+        + ENCODED_DIMENSION
+        + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+    offset - O_PREDICTOR_CONTEXT_WEIGHT + tail_base
+}
+
+/// Inserts `SENSE_COUNT` and the per-slot `SENSE{k}_*` overrides from the
+/// layout's sense table; slots past the table carry zero for every key.
+fn insert_sense_overrides(map: &mut HashMap<String, f64>, layout: &BrainLayout) {
+    let senses = layout.senses();
+    let blocks = layout.sense_blocks();
+    map.insert("SENSE_COUNT".to_string(), override_number(senses.len()));
+    for slot in 0..MAX_SENSE_SLOTS {
+        let mut values = [0.0_f64; SENSE_OVERRIDE_KEYS.len()];
+        if let (Some(sense), Some(block)) = (senses.get(slot), blocks.get(slot)) {
+            let tail = |offset: usize| override_number(layout_tail_offset(layout, offset));
+            let optional = |offset: Option<usize>| offset.map_or(0.0, tail);
+            let input_offset = match sense.input {
+                SenseInput::NonVisualFeatures { offset } => offset,
+                SenseInput::VisualHemifields => 0,
+            };
+            let refresh_ticks = match sense.whitening {
+                Whitening::Jacobi { refresh_ticks, .. } => refresh_ticks,
+                Whitening::ClosedForm2 { .. } => 0,
+            };
+            values = [
+                f64::from(sense.input.kind_code()),
+                override_number(input_offset),
+                override_number(block.channels),
+                f64::from(sense.whitening.kind_code()),
+                f64::from(refresh_ticks),
+                f64::from(sense.adaptation_rate),
+                override_number(layout_tail_offset(
+                    layout,
+                    sense.learning_rate.gene_offset_or_zero(),
+                )),
+                f64::from(sense.route_mask()),
+                tail(block.mean),
+                tail(block.covariance),
+                optional(block.whitening),
+                tail(block.whitened_input),
+                tail(block.turn_weights),
+                tail(block.turn_trace),
+                optional(block.forward_weights),
+                optional(block.forward_trace),
+                optional(block.critic_weights),
+                optional(block.critic_trace),
+            ];
+        }
+        for (name, value) in SENSE_OVERRIDE_KEYS.iter().zip(values) {
+            map.insert(format!("SENSE{slot}_{name}"), value);
+        }
+    }
+}
+
+/// Per-slot override key suffixes, in the order `insert_sense_overrides`
+/// computes their values.
+const SENSE_OVERRIDE_KEYS: [&str; 18] = [
+    "INPUT_KIND",
+    "INPUT_OFFSET",
+    "CHANNELS",
+    "WHITENING_KIND",
+    "REFRESH_TICKS",
+    "ADAPTATION_RATE",
+    "LEARNING_RATE_GENE",
+    "ROUTE_MASK",
+    "MEAN",
+    "COVARIANCE",
+    "WHITENING",
+    "INPUT",
+    "TURN_WEIGHTS",
+    "TURN_TRACE",
+    "FORWARD_WEIGHTS",
+    "FORWARD_TRACE",
+    "CRITIC_WEIGHTS",
+    "CRITIC_TRACE",
+];
+
 fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
     let mut map = HashMap::new();
     map.insert("VISION_W".to_string(), f64::from(layout.vision_width));
+    insert_sense_overrides(&mut map, layout);
+    // The sensory mean follows the sense blocks, so its index comes from the
+    // layout; WGSL declares `O_SENSORY_MEAN` without a default.
+    map.insert(
+        "O_SENSORY_MEAN".to_string(),
+        override_number(layout_tail_offset(layout, layout.sensory_mean_base())),
+    );
     map.insert("VISION_H".to_string(), f64::from(layout.vision_height));
     // Retina width/height feed the WGSL `RETINA_WIDTH`/`RETINA_HEIGHT` overrides;
     // `RETINA_PIXEL_COUNT` derives from them in the shader (single canonical
@@ -636,7 +734,7 @@ fn compose_brain_passes(cooperative_whitening: bool) -> String {
         return source.to_owned();
     }
     const RECALL_DEFINITION: &str = "fn coop_recall_score(agent_id: u32, tid: u32) {";
-    const REFRESH_BLOCK: &str = "    if (u32(tick) % VISION_WHITENING_REFRESH == 0u) {\n        refresh_vision_whitening(brain_base);\n    }\n";
+    const REFRESH_BLOCK: &str = "    for (var sense = 0u; sense < SENSE_COUNT; sense++) {\n        if (sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI\n            && !(visual_cortex_on && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)\n            && u32(brain_state[brain_base + O_TICK_COUNT]) % sense_refresh_ticks(sense) == 0u) {\n            sense_refresh_jacobi_whitening(brain_base, sense);\n        }\n    }\n";
     const EXPLORATION_BOUNDARY: &str =
         "    // ── Thread 0: exploration, noise, motor, telemetry ─────────────────────────────────────\n";
     for marker in [RECALL_DEFINITION, REFRESH_BLOCK, EXPLORATION_BOUNDARY] {
@@ -1260,6 +1358,24 @@ impl GpuKernel {
         brain_config: &BrainConfig,
         world_config: &WorldConfig,
     ) -> Self {
+        Self::new_with_senses(
+            agent_count,
+            food_count,
+            brain_config,
+            world_config,
+            DECLARED_SENSES,
+        )
+    }
+
+    /// Create the fused kernel for an explicit sense table; [`GpuKernel::new`]
+    /// uses the declared senses.
+    pub fn new_with_senses(
+        agent_count: u32,
+        food_count: usize,
+        brain_config: &BrainConfig,
+        world_config: &WorldConfig,
+        senses: &'static [SenseDescriptor],
+    ) -> Self {
         let _vulkan = vulkan_gate::enter();
         let n = agent_count as usize;
         let f = food_count;
@@ -1353,7 +1469,7 @@ impl GpuKernel {
         ))
         .expect("Failed to create GPU device");
 
-        let layout = BrainLayout::from_config(brain_config);
+        let layout = BrainLayout::with_senses(brain_config, senses);
         let brain_tick_stride = brain_config.brain_tick_stride;
 
         // Sensory-lag bound (issue #115). The brain reads vision/proprioception
@@ -4479,6 +4595,11 @@ impl Drop for GpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::senses::{
+        SENSE_INPUT_KIND_NON_VISUAL_FEATURES, SENSE_INPUT_KIND_VISUAL_HEMIFIELDS,
+        SENSE_ROUTE_CRITIC, SENSE_ROUTE_FORWARD, SENSE_ROUTE_TURN,
+        SENSE_WHITENING_KIND_CLOSED_FORM_2, SENSE_WHITENING_KIND_JACOBI,
+    };
 
     const BRAIN_PASSES_SRC: &str = include_str!("shaders/kernel/brain_passes.wgsl");
     const BRAIN_TICK_SRC: &str = include_str!("shaders/kernel/brain_tick.wgsl");
@@ -4580,6 +4701,284 @@ mod tests {
         // must NOT be set from Rust or the chain becomes two sources of truth.
         assert!(!map.contains_key("FEATURE_COUNT"));
         assert!(!map.contains_key("BRAIN_STRIDE"));
+    }
+
+    /// Literal text of a WGSL declaration line `<keyword> NAME: TYPE = LITERAL;`
+    /// with the type suffix removed, as `(NAME, LITERAL)`.
+    fn declared_literal(line: &str, keyword: &str) -> (String, String) {
+        let body = line
+            .trim_start()
+            .strip_prefix(keyword)
+            .expect("declaration keyword")
+            .trim_start();
+        let name = body.split(':').next().expect("name").trim().to_string();
+        let literal = body
+            .split('=')
+            .nth(1)
+            .and_then(|value| value.split(';').next())
+            .expect("literal")
+            .trim()
+            .trim_end_matches(['u', 'f'])
+            .to_string();
+        (name, literal)
+    }
+
+    #[test]
+    fn sense_override_defaults_match_table() {
+        let map = vision_override_constants(&BrainLayout::default());
+        let mut declared = Vec::new();
+        for line in COMMON_SRC.lines() {
+            if !line.starts_with("override SENSE") {
+                continue;
+            }
+            let (name, literal) = declared_literal(line, "override ");
+            let expected = map
+                .get(&name)
+                .copied()
+                .unwrap_or_else(|| panic!("{name} is declared but the map has no such key"));
+            let parsed: f64 = if name.ends_with("_ADAPTATION_RATE") {
+                f64::from(literal.parse::<f32>().expect("f32 literal"))
+            } else {
+                literal.parse().expect("numeric literal")
+            };
+            assert!(
+                parsed.to_bits() == expected.to_bits(),
+                "{name}: map value {expected}, declared literal {literal}"
+            );
+            declared.push(name);
+        }
+        for key in map.keys().filter(|key| key.starts_with("SENSE")) {
+            assert!(declared.contains(key), "{key} is in the map but undeclared");
+        }
+        assert_eq!(
+            declared.len(),
+            1 + MAX_SENSE_SLOTS * SENSE_OVERRIDE_KEYS.len()
+        );
+    }
+
+    #[test]
+    fn sense_learning_rate_gene_follows_cortex_layout() {
+        let config = BrainConfig {
+            visual_cortex_enabled: true,
+            ..BrainConfig::default()
+        };
+        let layout = BrainLayout::from_config(&config);
+        let map = vision_override_constants(&layout);
+        let tail_base = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let expected = tail_base + (O_VISION_PLASTICITY - O_PREDICTOR_CONTEXT_WEIGHT);
+        assert_ne!(expected, O_VISION_PLASTICITY);
+        let gene = map
+            .get("SENSE1_LEARNING_RATE_GENE")
+            .copied()
+            .expect("SENSE1_LEARNING_RATE_GENE override");
+        assert_eq!(gene.to_bits(), override_number(expected).to_bits());
+        assert_ne!(
+            gene.to_bits(),
+            override_number(O_VISION_PLASTICITY).to_bits()
+        );
+        let turn_expected = tail_base + (O_VISION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let turn = map
+            .get("SENSE1_TURN_WEIGHTS")
+            .copied()
+            .expect("SENSE1_TURN_WEIGHTS override");
+        assert_eq!(turn.to_bits(), override_number(turn_expected).to_bits());
+    }
+
+    #[test]
+    fn sense_override_wgsl_mirrors_rust_codes() {
+        let rust = [
+            ("SENSE_ROUTE_TURN", SENSE_ROUTE_TURN),
+            ("SENSE_ROUTE_FORWARD", SENSE_ROUTE_FORWARD),
+            ("SENSE_ROUTE_CRITIC", SENSE_ROUTE_CRITIC),
+            (
+                "SENSE_INPUT_KIND_NON_VISUAL_FEATURES",
+                SENSE_INPUT_KIND_NON_VISUAL_FEATURES,
+            ),
+            (
+                "SENSE_INPUT_KIND_VISUAL_HEMIFIELDS",
+                SENSE_INPUT_KIND_VISUAL_HEMIFIELDS,
+            ),
+            (
+                "SENSE_WHITENING_KIND_CLOSED_FORM_2",
+                SENSE_WHITENING_KIND_CLOSED_FORM_2,
+            ),
+            ("SENSE_WHITENING_KIND_JACOBI", SENSE_WHITENING_KIND_JACOBI),
+        ];
+        let mut mirrored = 0;
+        for line in COMMON_SRC.lines().filter(|l| l.starts_with("const SENSE_")) {
+            let (name, literal) = declared_literal(line, "const ");
+            let code = rust
+                .iter()
+                .find(|(rust_name, _)| *rust_name == name)
+                .unwrap_or_else(|| panic!("{name} has no Rust constant"))
+                .1;
+            assert_eq!(literal.parse::<u32>().expect("u32 literal"), code, "{name}");
+            mirrored += 1;
+        }
+        assert_eq!(mirrored, rust.len());
+    }
+
+    /// The declared senses plus a two-channel closed-form sense that drives
+    /// only the turn route.
+    const EXTRA_SENSE_TABLE: &[SenseDescriptor] = &[
+        crate::senses::SMELL,
+        crate::senses::VISION,
+        SenseDescriptor {
+            name: "extra",
+            channels: 2,
+            input: SenseInput::NonVisualFeatures { offset: 3 },
+            adaptation_rate: 0.5,
+            whitening: Whitening::ClosedForm2 {
+                initial_variance: 1.0,
+            },
+            learning_rate: crate::senses::LearningRate::Actor,
+            routes: crate::senses::SENSE_ROUTES,
+        },
+    ];
+
+    #[test]
+    fn sense_override_test_sense_table() {
+        let layout = BrainLayout::with_senses(&BrainConfig::default(), EXTRA_SENSE_TABLE);
+        let map = vision_override_constants(&layout);
+        assert_eq!(map["SENSE_COUNT"], 3.0);
+        let block = layout.sense_blocks()[2];
+        let expected = [
+            ("INPUT_KIND", 0.0),
+            ("INPUT_OFFSET", 3.0),
+            ("CHANNELS", f64::from(2_u32)),
+            ("WHITENING_KIND", 0.0),
+            ("REFRESH_TICKS", 0.0),
+            ("ADAPTATION_RATE", 0.5),
+            ("LEARNING_RATE_GENE", 0.0),
+            ("ROUTE_MASK", 1.0),
+            ("MEAN", override_number(block.mean)),
+            ("COVARIANCE", override_number(block.covariance)),
+            ("WHITENING", 0.0),
+            ("INPUT", override_number(block.whitened_input)),
+            ("TURN_WEIGHTS", override_number(block.turn_weights)),
+            ("TURN_TRACE", override_number(block.turn_trace)),
+            ("FORWARD_WEIGHTS", 0.0),
+            ("FORWARD_TRACE", 0.0),
+            ("CRITIC_WEIGHTS", 0.0),
+            ("CRITIC_TRACE", 0.0),
+        ];
+        assert_eq!(expected.len(), SENSE_OVERRIDE_KEYS.len());
+        for (suffix, value) in expected {
+            assert_eq!(map[&format!("SENSE2_{suffix}")], value, "SENSE2_{suffix}");
+        }
+        for suffix in SENSE_OVERRIDE_KEYS {
+            assert_eq!(map[&format!("SENSE3_{suffix}")], 0.0, "SENSE3_{suffix}");
+        }
+    }
+
+    /// Removed sense-specific WGSL names, plus the constants renamed to kind
+    /// names.
+    const SENSE_SPECIFIC_NAMES: &[&str] = &[
+        "SCENT_FEATURE_OFFSET",
+        "SCENT_WHITENING_RATE",
+        "SCENT_INITIAL_VARIANCE",
+        "VISION_PATHWAY_RATE",
+        "VISION_WHITENING_REFRESH",
+        "VISION_PATHWAY_INITIAL_VARIANCE",
+        "whiten_scent",
+        "refresh_vision_whitening",
+        "vision_pathway_learning_rate",
+        "settle_turn_pathways_at_death",
+        "vision_pathway_step",
+        "O_SCENT_MEAN",
+        "O_SCENT_COVARIANCE",
+        "O_SCENT_WHITENED",
+        "O_SCENT_TURN_WEIGHTS",
+        "O_TRACE_SCENT",
+        "O_VISION_PATHWAY_MEAN",
+        "O_VISION_PATHWAY_COVARIANCE",
+        "O_VISION_PATHWAY_WHITENING",
+        "O_VISION_PATHWAY_INPUT",
+        "O_VISION_TURN_WEIGHTS",
+        "O_TRACE_VISION",
+        "SCENT_CHANNELS",
+        "SCENT_EIGEN_FLOOR",
+        "VISION_PLASTICITY_MIN",
+        "VISION_PLASTICITY_MAX",
+        "VISION_PATHWAY_CHANNELS",
+    ];
+
+    /// Whether `src` contains `name` as a whole identifier: the characters
+    /// before and after the match are not identifier characters.
+    fn has_whole_identifier(src: &str, name: &str) -> bool {
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        src.match_indices(name).any(|(start, _)| {
+            let before = src[..start].chars().next_back();
+            let after = src[start + name.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+    }
+
+    #[test]
+    fn sense_specific_wgsl_has_no_sense_names() {
+        assert!(has_whole_identifier("a whiten_scent(b", "whiten_scent"));
+        assert!(!has_whole_identifier(
+            "cooperative_refresh_vision_whitening(",
+            "refresh_vision_whitening"
+        ));
+        for (file, src) in [
+            ("brain_passes.wgsl", BRAIN_PASSES_SRC),
+            ("common.wgsl", COMMON_SRC),
+        ] {
+            for name in SENSE_SPECIFIC_NAMES {
+                assert!(
+                    !has_whole_identifier(src, name),
+                    "{file} still names `{name}`"
+                );
+            }
+        }
+        for name in [
+            "NON_VISUAL_FEATURE_CHANNELS",
+            "CLOSED_FORM2_EIGEN_FLOOR",
+            "PLASTICITY_GENE_MIN",
+            "PLASTICITY_GENE_MAX",
+            "HEMIFIELD_CHANNELS",
+        ] {
+            assert!(
+                has_whole_identifier(COMMON_SRC, name),
+                "common.wgsl lacks `{name}`"
+            );
+        }
+        assert!(has_whole_identifier(BRAIN_PASSES_SRC, "HEMIFIELD_CHANNELS"));
+    }
+
+    #[test]
+    fn sense_specific_sensory_mean_matches_layout() {
+        assert!(COMMON_SRC.contains("override O_SENSORY_MEAN: u32;"));
+        let default = BrainLayout::default();
+        let extra = BrainLayout::with_senses(&BrainConfig::default(), EXTRA_SENSE_TABLE);
+        assert_eq!(default.brain_stride - default.feature_count, O_SENSORY_MEAN);
+        for layout in [default, extra] {
+            let map = vision_override_constants(&layout);
+            let expected = override_number(layout.brain_stride - layout.feature_count);
+            assert_eq!(
+                map["O_SENSORY_MEAN"].to_bits(),
+                expected.to_bits(),
+                "O_SENSORY_MEAN override"
+            );
+        }
+    }
+
+    #[test]
+    fn sense_override_extra_sense_composes() {
+        let layout = BrainLayout::with_senses(&BrainConfig::default(), EXTRA_SENSE_TABLE);
+        assert_eq!(vision_override_constants(&layout)["SENSE_COUNT"], 3.0);
+        let source = apply_subgroup_markers(&composed_brain_shader(), false);
+        let module = wgpu::naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
     }
 
     // ────────────────────────────────────────────────────────────────────────

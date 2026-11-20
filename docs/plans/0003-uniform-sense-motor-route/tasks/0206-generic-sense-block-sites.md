@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - generic-sense-helpers
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "5a339189b4b29b603e270e40cb507067719f7fbe"
 touches:
   - crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl
   - crates/xagent-brain/src/gpu_kernel.rs

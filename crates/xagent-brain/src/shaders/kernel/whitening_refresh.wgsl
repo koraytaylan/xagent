@@ -7,11 +7,15 @@ fn whitening_refresh(@builtin(workgroup_id) workgroup: vec3u) {
     let agent = workgroup.x;
     if agent >= wc_u32(WC_AGENT_COUNT) { return; }
     if !(physics_state[agent * PHYS_STRIDE + P_ALIVE] >= 0.5) { return; }
-    if bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0 { return; }
+    let visual_cortex_on = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
     let brain_base = agent * BRAIN_STRIDE;
     let tick = brain_state[brain_base + O_TICK_COUNT];
-    if u32(tick) % VISION_WHITENING_REFRESH == 0u {
-        refresh_vision_whitening(brain_base);
+    for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+        if sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI
+            && !(visual_cortex_on && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)
+            && u32(tick) % sense_refresh_ticks(sense) == 0u {
+            sense_refresh_jacobi_whitening(brain_base, sense);
+        }
     }
 }
 

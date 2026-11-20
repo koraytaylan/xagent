@@ -8,8 +8,8 @@ depends_on:
   - descriptor-driven-mutation
   - remove-sense-specific-wgsl
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "2466cc6c6e8d974f1b8db7f0459cb2deafbe2021"
 touches:
   - crates/xagent-shared/src/config.rs
   - crates/xagent-brain/src/buffers.rs

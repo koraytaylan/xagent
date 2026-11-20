@@ -8,8 +8,8 @@ depends_on:
   - modulator-study
   - pooling-fit
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "b1e97c0afb7d93c7a3bc1fe3ef4540744b1f5418"
 touches:
   - crates/xagent-sandbox/examples/pooling_study.rs
   - docs/decisions/pooling-study.md

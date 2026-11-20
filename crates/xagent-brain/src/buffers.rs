@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
 
 use crate::complex::VISUAL_FEATURE_COUNT;
+use crate::senses::{MotorRoute, SenseDescriptor, Whitening, DECLARED_SENSES, MAX_SENSE_SLOTS};
 
 /// First-hit guard for the `representation_dimension` vs `ENCODED_DIMENSION`
 /// mismatch warning in `build_config_for`. `build_config_for` runs on every
@@ -191,38 +192,39 @@ pub const O_RECENT_STATE: usize = O_RECENT_TICKS + RECENT_CAP;
 pub const O_RECENT_NORMS: usize = O_RECENT_STATE + RECENT_CAP;
 /// Running mean of the two nostrils' scent, for whitening the smell pathway
 /// to the turn policy (`O_SCENT_MEAN` in `common.wgsl`). Survives death.
-pub const O_SCENT_MEAN: usize = O_RECENT_NORMS + RECENT_CAP;
+pub const O_SCENT_MEAN: usize = DEFAULT_SENSE_LAYOUT.blocks[0].mean;
 /// Running covariance of the two nostrils, packed `[left², left·right,
 /// right²]`. Survives death.
-pub const O_SCENT_COVARIANCE: usize = O_SCENT_MEAN + 2;
+pub const O_SCENT_COVARIANCE: usize = DEFAULT_SENSE_LAYOUT.blocks[0].covariance;
 /// This brain tick's whitened scent, the smell pathway's input.
-pub const O_SCENT_WHITENED: usize = O_SCENT_COVARIANCE + 3;
+pub const O_SCENT_WHITENED: usize = DEFAULT_SENSE_LAYOUT.blocks[0].whitened_input;
 /// Learned turn weights on the whitened scent (left, right). Learned, not
 /// mutated; zero at birth.
-pub const O_SCENT_TURN_WEIGHTS: usize = O_SCENT_WHITENED + 2;
+pub const O_SCENT_TURN_WEIGHTS: usize = DEFAULT_SENSE_LAYOUT.blocks[0].turn_weights;
 /// Eligibility traces of the scent turn weights; episodic, zeroed on death.
-pub const O_TRACE_SCENT: usize = O_SCENT_TURN_WEIGHTS + 2;
+pub const O_TRACE_SCENT: usize = DEFAULT_SENSE_LAYOUT.blocks[0].turn_trace;
 /// Inputs of the visual pathway to the turn policy: mean adapted red,
 /// green, blue and depth over the left half of the field, then the right
 /// (`VISION_PATHWAY_INPUTS` in `common.wgsl`).
 pub const VISION_PATHWAY_INPUTS: usize = 8;
 /// Running mean of the visual pathway's inputs. Survives death.
-pub const O_VISION_PATHWAY_MEAN: usize = O_TRACE_SCENT + 2;
+pub const O_VISION_PATHWAY_MEAN: usize = DEFAULT_SENSE_LAYOUT.blocks[1].mean;
 /// Running covariance of the visual pathway's inputs, row-major
 /// `VISION_PATHWAY_INPUTS²`. Survives death.
-pub const O_VISION_PATHWAY_COVARIANCE: usize = O_VISION_PATHWAY_MEAN + VISION_PATHWAY_INPUTS;
+pub const O_VISION_PATHWAY_COVARIANCE: usize = DEFAULT_SENSE_LAYOUT.blocks[1].covariance;
 /// The whitening matrix C^(−1/2), row-major, refreshed from the covariance
 /// every `VISION_WHITENING_REFRESH` brain ticks. Survives death.
-pub const O_VISION_PATHWAY_WHITENING: usize =
-    O_VISION_PATHWAY_COVARIANCE + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+pub const O_VISION_PATHWAY_WHITENING: usize = match DEFAULT_SENSE_LAYOUT.blocks[1].whitening {
+    Some(offset) => offset,
+    None => panic!("the vision sense declares Jacobi whitening"),
+};
 /// This brain tick's whitened visual input.
-pub const O_VISION_PATHWAY_INPUT: usize =
-    O_VISION_PATHWAY_WHITENING + VISION_PATHWAY_INPUTS * VISION_PATHWAY_INPUTS;
+pub const O_VISION_PATHWAY_INPUT: usize = DEFAULT_SENSE_LAYOUT.blocks[1].whitened_input;
 /// Turn weights on the whitened visual input. Heritable (part of the
 /// steering genome) and learned.
-pub const O_VISION_TURN_WEIGHTS: usize = O_VISION_PATHWAY_INPUT + VISION_PATHWAY_INPUTS;
+pub const O_VISION_TURN_WEIGHTS: usize = DEFAULT_SENSE_LAYOUT.blocks[1].turn_weights;
 /// Eligibility traces of the visual turn weights; episodic.
-pub const O_TRACE_VISION: usize = O_VISION_TURN_WEIGHTS + VISION_PATHWAY_INPUTS;
+pub const O_TRACE_VISION: usize = DEFAULT_SENSE_LAYOUT.blocks[1].turn_trace;
 /// Starting variance of each visual pathway input (mirrors
 /// `VISION_PATHWAY_INITIAL_VARIANCE` in `common.wgsl`).
 pub const VISION_PATHWAY_INITIAL_VARIANCE: f32 = 1e-4;
@@ -236,7 +238,7 @@ pub const RECENT_SETTLED: f32 = 2.0;
 /// Running mean of each sensory feature for sensory adaptation
 /// (`SENSORY_ADAPTATION_RATE` in `common.wgsl`). It holds `feature_count`
 /// slots, so it is the one layout-sized region after the fixed tail.
-pub const O_SENSORY_MEAN: usize = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;
+pub const O_SENSORY_MEAN: usize = DEFAULT_SENSE_LAYOUT.sensory_mean_base;
 pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 
 /// Inputs of the whole pathway: the scent channels, then the visual inputs
@@ -244,7 +246,7 @@ pub const BRAIN_STRIDE: usize = O_SENSORY_MEAN + FEATURE_COUNT;
 pub const PATHWAY_INPUT_COUNT: usize = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;
 /// Forward-drive weights on the pathway input. Zero at birth; heritable once
 /// written, so it survives death.
-pub const O_FORWARD_PATHWAY_WEIGHTS: usize = O_TRACE_VISION + VISION_PATHWAY_INPUTS;
+pub const O_FORWARD_PATHWAY_WEIGHTS: usize = DEFAULT_SENSE_LAYOUT.route_base;
 /// Eligibility traces of the forward pathway weights. Zero at birth; episodic,
 /// zeroed at death.
 pub const O_TRACE_FORWARD_PATHWAY: usize = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;
@@ -262,8 +264,201 @@ pub const O_PREV_PATHWAY_INPUT_NORM: usize = O_TRACE_CRITIC_PATHWAY + PATHWAY_IN
 pub const O_RECENT_PATHWAY_KEYS: usize = O_PREV_PATHWAY_INPUT_NORM + 1;
 /// Number of slots in the pathway block between `O_TRACE_VISION` (after its
 /// visual inputs) and `O_SENSORY_MEAN`.
-pub const PATHWAY_ROUTE_SLOT_COUNT: usize =
-    4 * PATHWAY_INPUT_COUNT + 1 + RECENT_CAP * PATHWAY_INPUT_COUNT;
+pub const PATHWAY_ROUTE_SLOT_COUNT: usize = route_slot_count(PATHWAY_INPUT_COUNT);
+
+/// First slot after the base senses' blocks: the start of the route block.
+pub const SENSE_BASE: usize = O_RECENT_NORMS + RECENT_CAP;
+
+/// Offset between the two variance slots of a closed-form covariance packed
+/// `[a², a·b, b²]`.
+const CLOSED_FORM2_VARIANCE_STRIDE: usize = 2;
+
+/// Slots of a packed closed-form two-channel covariance.
+const CLOSED_FORM2_COVARIANCE_SLOTS: usize = 3;
+
+/// Absolute `brain_state` offsets of one sense's slots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SenseBlockOffsets {
+    /// Number of input channels.
+    pub channels: usize,
+    /// Running mean of the channels.
+    pub mean: usize,
+    /// Running covariance (packed for closed form, row-major for Jacobi).
+    pub covariance: usize,
+    /// Whitening matrix; present only for Jacobi whitening.
+    pub whitening: Option<usize>,
+    /// This brain tick's whitened input.
+    pub whitened_input: usize,
+    /// Turn weights on the whitened input.
+    pub turn_weights: usize,
+    /// Eligibility traces of the turn weights.
+    pub turn_trace: usize,
+    /// Forward-drive weights slice; present only if the forward route is declared.
+    pub forward_weights: Option<usize>,
+    /// Forward-drive traces slice; present only if the forward route is declared.
+    pub forward_trace: Option<usize>,
+    /// Critic weights slice; present only if the critic route is declared.
+    pub critic_weights: Option<usize>,
+    /// Critic traces slice; present only if the critic route is declared.
+    pub critic_trace: Option<usize>,
+}
+
+/// Result of deriving the sense region of `brain_state` from a sense table.
+#[derive(Clone, Copy, Debug)]
+pub struct SenseLayout {
+    /// Per-sense offsets; the first `count` entries are filled.
+    pub blocks: [SenseBlockOffsets; MAX_SENSE_SLOTS],
+    /// Number of senses in the table.
+    pub count: usize,
+    /// Absolute offset of the route block.
+    pub route_base: usize,
+    /// Absolute offset of the sensory mean, the end of the sense region.
+    pub sensory_mean_base: usize,
+}
+
+/// A block with every offset zeroed, used to fill unused array entries.
+const EMPTY_SENSE_BLOCK: SenseBlockOffsets = SenseBlockOffsets {
+    channels: 0,
+    mean: 0,
+    covariance: 0,
+    whitening: None,
+    whitened_input: 0,
+    turn_weights: 0,
+    turn_trace: 0,
+    forward_weights: None,
+    forward_trace: None,
+    critic_weights: None,
+    critic_trace: None,
+};
+
+/// Whether the descriptor declares the given route.
+const fn declares_route(sense: &SenseDescriptor, wanted: MotorRoute) -> bool {
+    let mut i = 0;
+    while i < sense.routes.len() {
+        let found = matches!(
+            (sense.routes[i].route, wanted),
+            (MotorRoute::Turn, MotorRoute::Turn)
+                | (MotorRoute::Forward, MotorRoute::Forward)
+                | (MotorRoute::Critic, MotorRoute::Critic)
+        );
+        if found {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Lays out one sense's slots starting at `cursor`; returns the block and the
+/// first slot after it.
+const fn place_sense(sense: &SenseDescriptor, cursor: usize) -> (SenseBlockOffsets, usize) {
+    let channels = sense.channels;
+    let mean = cursor;
+    let covariance = mean + channels;
+    let (covariance_slots, whitening_slots) = match sense.whitening {
+        Whitening::ClosedForm2 { .. } => (CLOSED_FORM2_COVARIANCE_SLOTS, 0),
+        Whitening::Jacobi { .. } => (channels * channels, channels * channels),
+    };
+    let whitening_start = covariance + covariance_slots;
+    let whitened_input = whitening_start + whitening_slots;
+    let turn_weights = whitened_input + channels;
+    let turn_trace = turn_weights + channels;
+    let block = SenseBlockOffsets {
+        channels,
+        mean,
+        covariance,
+        whitening: if whitening_slots > 0 {
+            Some(whitening_start)
+        } else {
+            None
+        },
+        whitened_input,
+        turn_weights,
+        turn_trace,
+        ..EMPTY_SENSE_BLOCK
+    };
+    (block, turn_trace + channels)
+}
+
+/// Derives every sense slot offset from a sense table. The first
+/// `DECLARED_SENSES.len()` entries are base senses, followed by the route
+/// block; further entries append after the route block and may declare only
+/// the turn route.
+pub const fn derive_sense_layout(senses: &[SenseDescriptor]) -> SenseLayout {
+    assert!(senses.len() <= MAX_SENSE_SLOTS);
+    let base_count = if senses.len() < DECLARED_SENSES.len() {
+        senses.len()
+    } else {
+        DECLARED_SENSES.len()
+    };
+    let mut blocks = [EMPTY_SENSE_BLOCK; MAX_SENSE_SLOTS];
+    let mut cursor = SENSE_BASE;
+    let mut input_total = 0;
+    let mut i = 0;
+    while i < base_count {
+        let (block, next) = place_sense(&senses[i], cursor);
+        blocks[i] = block;
+        cursor = next;
+        input_total += senses[i].channels;
+        i += 1;
+    }
+    let route_base = cursor;
+    let mut input_start = 0;
+    i = 0;
+    while i < base_count {
+        let sense = &senses[i];
+        if declares_route(sense, MotorRoute::Forward) {
+            blocks[i].forward_weights = Some(route_base + input_start);
+            blocks[i].forward_trace = Some(route_base + input_total + input_start);
+        }
+        if declares_route(sense, MotorRoute::Critic) {
+            blocks[i].critic_weights =
+                Some(route_base + CRITIC_WEIGHTS_SLICE * input_total + input_start);
+            blocks[i].critic_trace =
+                Some(route_base + CRITIC_TRACE_SLICE * input_total + input_start);
+        }
+        input_start += sense.channels;
+        i += 1;
+    }
+    cursor = route_base + route_slot_count(input_total);
+    while i < senses.len() {
+        let sense = &senses[i];
+        assert!(
+            !declares_route(sense, MotorRoute::Forward)
+                && !declares_route(sense, MotorRoute::Critic),
+            "extra senses may declare only the turn route"
+        );
+        let (block, next) = place_sense(sense, cursor);
+        blocks[i] = block;
+        cursor = next;
+        i += 1;
+    }
+    SenseLayout {
+        blocks,
+        count: senses.len(),
+        route_base,
+        sensory_mean_base: cursor,
+    }
+}
+
+/// Position, in joint-input-sized slices, of the critic weights within the
+/// route block (after forward weights and forward trace).
+const CRITIC_WEIGHTS_SLICE: usize = 2;
+/// Position, in joint-input-sized slices, of the critic trace within the
+/// route block.
+const CRITIC_TRACE_SLICE: usize = 3;
+/// Joint-input-sized slices in the route block: forward and critic weights
+/// and traces.
+const ROUTE_SLICES_PER_INPUT: usize = 4;
+
+/// Slots of the route block for `inputs` joint pathway inputs: forward and
+/// critic weights and traces, the previous input norm, and the key ring.
+const fn route_slot_count(inputs: usize) -> usize {
+    ROUTE_SLICES_PER_INPUT * inputs + 1 + RECENT_CAP * inputs
+}
+
+/// Offsets derived from the declared senses.
+const DEFAULT_SENSE_LAYOUT: SenseLayout = derive_sense_layout(DECLARED_SENSES);
 
 /// Number of elements in `brain_state` from `O_PREDICTOR_CONTEXT_WEIGHT` (inclusive)
 /// to `O_SENSORY_MEAN` (exclusive), ending with the pathway slot block. This
@@ -566,6 +761,14 @@ pub struct BrainLayout {
     pub sensory_stride: usize,
     pub brain_stride: usize,
     pub brain_scratch_stride: usize,
+    /// Per-sense offsets; the first `block_count` entries are filled.
+    blocks: [SenseBlockOffsets; MAX_SENSE_SLOTS],
+    /// Number of filled entries in `blocks`.
+    block_count: usize,
+    /// Absolute index of the sensory mean in `brain_state`.
+    sensory_mean_base: usize,
+    /// Sense table the offsets were derived from.
+    senses: &'static [SenseDescriptor],
 }
 
 impl BrainLayout {
@@ -588,14 +791,7 @@ impl BrainLayout {
     /// constructor `GpuKernel::new` uses; the flag must agree with the WGSL
     /// FEATURE_COUNT pipeline override (`vision_override_constants`).
     pub fn from_config(config: &BrainConfig) -> Self {
-        Self::with_retina_flagged(
-            config.vision_width,
-            config.vision_height,
-            config.retina_width,
-            config.retina_height,
-            config.visual_cortex_enabled,
-            config.danger_percept_enabled,
-        )
+        Self::with_senses(config, DECLARED_SENSES)
     }
 
     /// Build a layout with an explicit retina grid and the legacy raw-vision
@@ -635,6 +831,30 @@ impl BrainLayout {
         visual_cortex_enabled: bool,
         danger_percept_enabled: bool,
     ) -> Self {
+        Self::build(
+            vision_width,
+            vision_height,
+            retina_width,
+            retina_height,
+            visual_cortex_enabled,
+            danger_percept_enabled,
+            DECLARED_SENSES,
+        )
+    }
+
+    /// Shared constructor behind every public builder.
+    fn build(
+        vision_width: u32,
+        vision_height: u32,
+        retina_width: usize,
+        retina_height: usize,
+        visual_cortex_enabled: bool,
+        danger_percept_enabled: bool,
+        senses: &'static [SenseDescriptor],
+    ) -> Self {
+        let sense_layout = derive_sense_layout(senses);
+        let extra_sense_slots =
+            sense_layout.sensory_mean_base - (sense_layout.route_base + PATHWAY_ROUTE_SLOT_COUNT);
         let retina_pixel_count = retina_width
             .checked_mul(retina_height)
             .expect("retina pixel count overflow");
@@ -679,6 +899,7 @@ impl BrainLayout {
             .and_then(|v| v.checked_add(ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(PREDICTOR_DIMENSION * ENCODED_DIMENSION))
             .and_then(|v| v.checked_add(FIXED_TAIL_SIZE))
+            .and_then(|v| v.checked_add(extra_sense_slots))
             .and_then(|v| v.checked_add(feature_count))
             .expect("vision dimensions overflow brain stride");
         let brain_scratch_stride = feature_count
@@ -705,7 +926,42 @@ impl BrainLayout {
             sensory_stride,
             brain_stride,
             brain_scratch_stride,
+            blocks: sense_layout.blocks,
+            block_count: sense_layout.count,
+            sensory_mean_base: sense_layout.sensory_mean_base,
+            senses,
         }
+    }
+
+    /// Per-sense slot offsets, one entry per sense in declared order.
+    pub fn sense_blocks(&self) -> &[SenseBlockOffsets] {
+        &self.blocks[..self.block_count]
+    }
+
+    /// The sense table this layout was built from, in declared order.
+    pub fn senses(&self) -> &'static [SenseDescriptor] {
+        self.senses
+    }
+
+    /// Absolute index of the sensory mean in `brain_state`.
+    pub fn sensory_mean_base(&self) -> usize {
+        self.sensory_mean_base
+    }
+
+    /// Builds a layout from a full [`BrainConfig`] over an explicit sense
+    /// table. The first `DECLARED_SENSES.len()` entries are the base senses;
+    /// any further entries are appended after the route block and may declare
+    /// only the turn route.
+    pub fn with_senses(config: &BrainConfig, senses: &'static [SenseDescriptor]) -> Self {
+        Self::build(
+            config.vision_width,
+            config.vision_height,
+            config.retina_width,
+            config.retina_height,
+            config.visual_cortex_enabled,
+            config.danger_percept_enabled,
+            senses,
+        )
     }
 }
 
@@ -906,7 +1162,13 @@ pub const CRITIC_INPUT_ENCODING: f32 = 0.0;
 pub const CRITIC_INPUT_PATHWAY: f32 = 1.0;
 /// `CFG_CRITIC_INPUT` encoding: the critic reads both.
 pub const CRITIC_INPUT_ENCODING_AND_PATHWAY: f32 = 2.0;
-pub const CONFIG_SIZE: usize = 24; // padded for uniform vec4 alignment (6 × vec4)
+/// `1.0` keeps the klinotaxis turn gain; `0.0` pins it to `1.0`. Mirrored by
+/// `CFG_KLINOTAXIS_TURN_GAIN_ENABLED` in `common.wgsl`.
+pub const CFG_KLINOTAXIS_TURN_GAIN_ENABLED: usize = 23;
+/// `1.0` keeps the motor-fatigue factor; `0.0` pins it to `1.0`. Mirrored by
+/// `CFG_MOTOR_FATIGUE_ENABLED` in `common.wgsl`.
+pub const CFG_MOTOR_FATIGUE_ENABLED: usize = 24;
+pub const CONFIG_SIZE: usize = 28; // padded for uniform vec4 alignment (7 × vec4)
 
 /// Which trunk pathways are cut out of the decision; each `true` field
 /// enables the matching lesion switch.
@@ -1254,19 +1516,30 @@ pub fn init_brain_state_for(
     state[o_pred_ctx_wt + delta_vertical_fov] = config.vertical_fov_degrees;
     state[o_pred_ctx_wt + delta_smell_strength] = config.smell_strength;
     state[o_pred_ctx_wt + delta_vision_plasticity] = config.vision_plasticity;
-    // The smell pathway's whitening starts from a small isotropic variance.
-    let delta_scent_covariance = O_SCENT_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
-    state[o_pred_ctx_wt + delta_scent_covariance] = SCENT_INITIAL_VARIANCE;
-    state[o_pred_ctx_wt + delta_scent_covariance + 2] = SCENT_INITIAL_VARIANCE;
-    // The visual pathway's whitening starts from a small isotropic variance
-    // and the matching whitening matrix.
-    let delta_vision_covariance = O_VISION_PATHWAY_COVARIANCE - O_PREDICTOR_CONTEXT_WEIGHT;
-    let delta_vision_whitening = O_VISION_PATHWAY_WHITENING - O_PREDICTOR_CONTEXT_WEIGHT;
-    for input in 0..VISION_PATHWAY_INPUTS {
-        let diagonal = input * VISION_PATHWAY_INPUTS + input;
-        state[o_pred_ctx_wt + delta_vision_covariance + diagonal] = VISION_PATHWAY_INITIAL_VARIANCE;
-        state[o_pred_ctx_wt + delta_vision_whitening + diagonal] =
-            1.0 / VISION_PATHWAY_INITIAL_VARIANCE.sqrt();
+    // Each sense's whitening starts from a small isotropic variance and, for
+    // iterative whitening, the matching whitening matrix.
+    for (block, sense) in layout.sense_blocks().iter().zip(layout.senses()) {
+        let covariance = o_pred_ctx_wt + block.covariance - O_PREDICTOR_CONTEXT_WEIGHT;
+        match sense.whitening {
+            Whitening::ClosedForm2 { initial_variance } => {
+                state[covariance] = initial_variance;
+                state[covariance + CLOSED_FORM2_VARIANCE_STRIDE] = initial_variance;
+            }
+            Whitening::Jacobi {
+                initial_variance, ..
+            } => {
+                let whitening = block
+                    .whitening
+                    .map(|w| o_pred_ctx_wt + w - O_PREDICTOR_CONTEXT_WEIGHT);
+                for input in 0..block.channels {
+                    let diagonal = input * block.channels + input;
+                    state[covariance + diagonal] = initial_variance;
+                    if let Some(whitening) = whitening {
+                        state[whitening + diagonal] = 1.0 / initial_variance.sqrt();
+                    }
+                }
+            }
+        }
     }
 
     state
@@ -1390,6 +1663,16 @@ pub fn build_config_for(config: &BrainConfig, layout: &BrainLayout) -> Vec<f32> 
     } else {
         0.0
     };
+    cfg[CFG_KLINOTAXIS_TURN_GAIN_ENABLED] = if config.klinotaxis_turn_gain_enabled {
+        1.0
+    } else {
+        0.0
+    };
+    cfg[CFG_MOTOR_FATIGUE_ENABLED] = if config.motor_fatigue_enabled {
+        1.0
+    } else {
+        0.0
+    };
     cfg
 }
 
@@ -1476,6 +1759,7 @@ impl BrainTickProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::senses::{Heritability, LearningRate, RouteDescriptor, SenseInput, SMELL, VISION};
     use xagent_shared::SensoryFrame;
 
     #[test]
@@ -1762,7 +2046,9 @@ mod tests {
         assert!(CFG_BRAIN_TICK_PROBE < CONFIG_SIZE);
         assert!(CFG_CRITIC_INPUT < CONFIG_SIZE);
         assert!(CFG_FORWARD_PATHWAY_ENABLED < CONFIG_SIZE);
-        assert_eq!(CONFIG_SIZE, 24);
+        assert!(CFG_KLINOTAXIS_TURN_GAIN_ENABLED < CONFIG_SIZE);
+        assert!(CFG_MOTOR_FATIGUE_ENABLED < CONFIG_SIZE);
+        assert_eq!(CONFIG_SIZE, 28);
     }
 
     #[test]
@@ -2103,15 +2389,23 @@ mod tests {
             wgsl["CFG_FORWARD_PATHWAY_ENABLED"],
             CFG_FORWARD_PATHWAY_ENABLED as u32
         );
+        assert_eq!(
+            wgsl["CFG_KLINOTAXIS_TURN_GAIN_ENABLED"],
+            CFG_KLINOTAXIS_TURN_GAIN_ENABLED as u32
+        );
+        assert_eq!(
+            wgsl["CFG_MOTOR_FATIGUE_ENABLED"],
+            CFG_MOTOR_FATIGUE_ENABLED as u32
+        );
         for line in [
-            "override O_FORWARD_PATHWAY_WEIGHTS: u32 = O_TRACE_VISION + VISION_PATHWAY_INPUTS;",
+            "override O_FORWARD_PATHWAY_WEIGHTS: u32 = SENSE1_TURN_TRACE + SENSE1_CHANNELS;",
             "override O_TRACE_FORWARD_PATHWAY: u32 = O_FORWARD_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;",
             "override O_CRITIC_PATHWAY_WEIGHTS: u32 = O_TRACE_FORWARD_PATHWAY + PATHWAY_INPUT_COUNT;",
             "override O_TRACE_CRITIC_PATHWAY: u32 = O_CRITIC_PATHWAY_WEIGHTS + PATHWAY_INPUT_COUNT;",
             "override O_PREV_PATHWAY_INPUT_NORM: u32 = O_TRACE_CRITIC_PATHWAY + PATHWAY_INPUT_COUNT;",
             "override O_RECENT_PATHWAY_KEYS: u32 = O_PREV_PATHWAY_INPUT_NORM + 1;",
-            "override O_SENSORY_MEAN: u32 = O_RECENT_PATHWAY_KEYS + RECENT_CAP * PATHWAY_INPUT_COUNT;",
-            "const PATHWAY_INPUT_COUNT: u32 = SCENT_CHANNELS + VISION_PATHWAY_INPUTS;",
+            "override O_SENSORY_MEAN: u32;",
+            "const PATHWAY_INPUT_COUNT: u32 = NON_VISUAL_FEATURE_CHANNELS + VISION_PATHWAY_INPUTS;",
         ] {
             assert!(src.contains(line), "missing WGSL line: {line}");
         }
@@ -2144,6 +2438,179 @@ mod tests {
                 assert_eq!(packed[CFG_FORWARD_PATHWAY_ENABLED], flag_expected);
             }
         }
+    }
+
+    const EXTRA_TURN_ROUTES: &[RouteDescriptor] = &[RouteDescriptor {
+        route: MotorRoute::Turn,
+        heritability: Heritability::LearnedOnly,
+    }];
+
+    const EXTRA_SENSE: SenseDescriptor = SenseDescriptor {
+        name: "extra",
+        channels: 2,
+        input: SenseInput::NonVisualFeatures { offset: 0 },
+        adaptation_rate: 0.01,
+        whitening: Whitening::ClosedForm2 {
+            initial_variance: 1e-4,
+        },
+        learning_rate: LearningRate::Actor,
+        routes: EXTRA_TURN_ROUTES,
+    };
+
+    const EXTRA_TABLE: &[SenseDescriptor] = &[SMELL, VISION, EXTRA_SENSE];
+
+    const ALL_ROUTES: &[RouteDescriptor] = &[
+        RouteDescriptor {
+            route: MotorRoute::Turn,
+            heritability: Heritability::Mutated,
+        },
+        RouteDescriptor {
+            route: MotorRoute::Forward,
+            heritability: Heritability::LearnedOnly,
+        },
+        RouteDescriptor {
+            route: MotorRoute::Critic,
+            heritability: Heritability::LearnedOnly,
+        },
+    ];
+
+    const ALL_ROUTES_TABLE: &[SenseDescriptor] = &[
+        SenseDescriptor {
+            routes: ALL_ROUTES,
+            ..SMELL
+        },
+        SenseDescriptor {
+            routes: ALL_ROUTES,
+            ..VISION
+        },
+    ];
+
+    #[test]
+    fn derived_offsets_match_pre_plan_cascade() {
+        assert_eq!(O_SCENT_MEAN, O_RECENT_NORMS + RECENT_CAP);
+        assert_eq!(O_SCENT_COVARIANCE, O_SCENT_MEAN + 2);
+        assert_eq!(O_SCENT_WHITENED, O_SCENT_COVARIANCE + 3);
+        assert_eq!(O_SCENT_TURN_WEIGHTS, O_SCENT_WHITENED + 2);
+        assert_eq!(O_TRACE_SCENT, O_SCENT_TURN_WEIGHTS + 2);
+        assert_eq!(O_VISION_PATHWAY_MEAN, O_TRACE_SCENT + 2);
+        assert_eq!(O_VISION_PATHWAY_COVARIANCE, O_VISION_PATHWAY_MEAN + 8);
+        assert_eq!(O_VISION_PATHWAY_WHITENING, O_VISION_PATHWAY_COVARIANCE + 64);
+        assert_eq!(O_VISION_PATHWAY_INPUT, O_VISION_PATHWAY_WHITENING + 64);
+        assert_eq!(O_VISION_TURN_WEIGHTS, O_VISION_PATHWAY_INPUT + 8);
+        assert_eq!(O_TRACE_VISION, O_VISION_TURN_WEIGHTS + 8);
+        assert_eq!(O_FORWARD_PATHWAY_WEIGHTS, O_TRACE_VISION + 8);
+        assert_eq!(O_TRACE_FORWARD_PATHWAY, O_FORWARD_PATHWAY_WEIGHTS + 10);
+        assert_eq!(O_CRITIC_PATHWAY_WEIGHTS, O_TRACE_FORWARD_PATHWAY + 10);
+        assert_eq!(O_TRACE_CRITIC_PATHWAY, O_CRITIC_PATHWAY_WEIGHTS + 10);
+        assert_eq!(O_PREV_PATHWAY_INPUT_NORM, O_TRACE_CRITIC_PATHWAY + 10);
+        assert_eq!(O_RECENT_PATHWAY_KEYS, O_PREV_PATHWAY_INPUT_NORM + 1);
+        assert_eq!(O_SENSORY_MEAN, O_RECENT_PATHWAY_KEYS + RECENT_CAP * 10);
+    }
+
+    #[test]
+    fn default_stride_and_tail_match_pre_plan_formula() {
+        assert_eq!(
+            BRAIN_STRIDE,
+            O_RECENT_NORMS + RECENT_CAP + 171 + PATHWAY_ROUTE_SLOT_COUNT + FEATURE_COUNT
+        );
+        assert_eq!(
+            FIXED_TAIL_SIZE,
+            O_RECENT_NORMS + RECENT_CAP - O_PREDICTOR_CONTEXT_WEIGHT
+                + 171
+                + PATHWAY_ROUTE_SLOT_COUNT
+        );
+    }
+
+    #[test]
+    fn extra_sense_grows_stride_by_eleven() {
+        let base = derive_sense_layout(DECLARED_SENSES);
+        let extra = derive_sense_layout(EXTRA_TABLE);
+        assert_eq!(extra.count, DECLARED_SENSES.len() + 1);
+        assert_eq!(extra.route_base, base.route_base);
+        assert_eq!(extra.blocks[..2], base.blocks[..2]);
+        assert_eq!(extra.sensory_mean_base, base.sensory_mean_base + 11);
+        assert_eq!(extra.blocks[2].forward_weights, None);
+        assert_eq!(extra.blocks[2].critic_weights, None);
+        let config = BrainConfig::default();
+        let grown = BrainLayout::with_senses(&config, EXTRA_TABLE);
+        assert_eq!(grown.brain_stride, BrainLayout::default().brain_stride + 11);
+    }
+
+    #[test]
+    fn route_slices_split_joint_inputs() {
+        let layout = derive_sense_layout(ALL_ROUTES_TABLE);
+        let rb = layout.route_base;
+        let n = PATHWAY_INPUT_COUNT;
+        let smell = layout.blocks[0];
+        let vision = layout.blocks[1];
+        assert_eq!(smell.forward_weights, Some(rb));
+        assert_eq!(vision.forward_weights, Some(rb + 2));
+        assert_eq!(smell.forward_trace, Some(rb + n));
+        assert_eq!(vision.forward_trace, Some(rb + n + 2));
+        assert_eq!(smell.critic_weights, Some(rb + 2 * n));
+        assert_eq!(vision.critic_weights, Some(rb + 2 * n + 2));
+        assert_eq!(smell.critic_trace, Some(rb + 3 * n));
+        assert_eq!(vision.critic_trace, Some(rb + 3 * n + 2));
+    }
+
+    #[test]
+    fn baseline_length_legacy_blob_upgrades() {
+        /// Modulus of the repeating fill pattern for the legacy blob.
+        const LEGACY_FILL_MODULUS: usize = 97;
+        let state: Vec<f32> = (0..BRAIN_STRIDE)
+            .map(|i| f32::from(u16::try_from(i % LEGACY_FILL_MODULUS + 1).expect("fill fits u16")))
+            .collect();
+        let insert_at = fixed_tail_base(BRAIN_STRIDE)
+            + (O_FORWARD_PATHWAY_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+        let mut legacy = state.clone();
+        legacy.drain(insert_at..insert_at + PATHWAY_ROUTE_SLOT_COUNT);
+        assert_eq!(legacy.len(), BRAIN_STRIDE - PATHWAY_ROUTE_SLOT_COUNT);
+        let upgraded = upgrade_legacy_brain_state(&legacy).expect("legacy length upgrades");
+        assert_eq!(upgraded.len(), BRAIN_STRIDE);
+        assert!(upgraded[insert_at..insert_at + PATHWAY_ROUTE_SLOT_COUNT]
+            .iter()
+            .all(|v| *v == 0.0));
+        assert_eq!(upgraded[..insert_at], legacy[..insert_at]);
+        assert_eq!(
+            upgraded[insert_at + PATHWAY_ROUTE_SLOT_COUNT..],
+            legacy[insert_at..]
+        );
+    }
+
+    #[test]
+    fn init_writes_default_sense_slots() {
+        let config = BrainConfig::default();
+        let mut rng = rand::rng();
+        let state = init_brain_state(&config, &mut rng);
+        let base = fixed_tail_base(state.len()) - O_PREDICTOR_CONTEXT_WEIGHT;
+        let at = |offset: usize| state[base + offset];
+        assert_eq!(at(O_SCENT_COVARIANCE), SCENT_INITIAL_VARIANCE);
+        assert_eq!(at(O_SCENT_COVARIANCE + 1), 0.0);
+        assert_eq!(at(O_SCENT_COVARIANCE + 2), SCENT_INITIAL_VARIANCE);
+        for i in 0..VISION_PATHWAY_INPUTS {
+            for j in 0..VISION_PATHWAY_INPUTS {
+                let k = i * VISION_PATHWAY_INPUTS + j;
+                let (cov, white) = if i == j {
+                    (
+                        VISION_PATHWAY_INITIAL_VARIANCE,
+                        1.0 / VISION_PATHWAY_INITIAL_VARIANCE.sqrt(),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                assert_eq!(at(O_VISION_PATHWAY_COVARIANCE + k), cov);
+                assert_eq!(at(O_VISION_PATHWAY_WHITENING + k), white);
+            }
+        }
+    }
+
+    #[test]
+    fn default_layout_senses_match_declared_table() {
+        let layout = BrainLayout::default();
+        let names: Vec<&str> = layout.senses().iter().map(|s| s.name).collect();
+        let declared: Vec<&str> = DECLARED_SENSES.iter().map(|s| s.name).collect();
+        assert_eq!(names, declared);
+        assert_eq!(layout.sense_blocks().len(), DECLARED_SENSES.len());
     }
 
     fn legacy_len(fc: usize) -> usize {

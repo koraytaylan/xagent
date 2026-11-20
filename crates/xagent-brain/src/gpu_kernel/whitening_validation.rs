@@ -41,7 +41,7 @@ struct WhiteningPipelines {
 }
 
 fn isolated_brain_source(interleaved_recall: bool) -> String {
-    const REFRESH_BLOCK: &str = "    if (u32(tick) % VISION_WHITENING_REFRESH == 0u) {\n        refresh_vision_whitening(brain_base);\n    }\n";
+    const REFRESH_BLOCK: &str = "    for (var sense = 0u; sense < SENSE_COUNT; sense++) {\n        if (sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI\n            && !(visual_cortex_on && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)\n            && u32(brain_state[brain_base + O_TICK_COUNT]) % sense_refresh_ticks(sense) == 0u) {\n            sense_refresh_jacobi_whitening(brain_base, sense);\n        }\n    }\n";
     let passes = if interleaved_recall {
         interleaved_brain_passes()
     } else {
@@ -49,12 +49,12 @@ fn isolated_brain_source(interleaved_recall: bool) -> String {
     };
     let common = include_str!("../shaders/kernel/common.wgsl");
     assert_eq!(passes.matches(REFRESH_BLOCK).count(), 1);
-    assert_eq!(passes.matches("refresh_vision_whitening(").count(), 1);
+    assert_eq!(passes.matches("sense_refresh_jacobi_whitening(").count(), 1);
     assert!(common.contains(&format!(
-        "const VISION_WHITENING_REFRESH: u32 = {REFRESH_CYCLES}u;"
+        "override SENSE1_REFRESH_TICKS: u32 = {REFRESH_CYCLES}u;"
     )));
     let separated = passes.replacen(REFRESH_BLOCK, "", 1);
-    assert!(!separated.contains("refresh_vision_whitening("));
+    assert!(!separated.contains("sense_refresh_jacobi_whitening("));
     [
         common,
         separated.as_str(),

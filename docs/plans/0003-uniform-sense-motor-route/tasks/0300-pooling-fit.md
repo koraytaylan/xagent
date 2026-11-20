@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - modulator-study
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "b8b32c467874a8f9dceb3ecdaa712ef0dca0d7ed"
 touches:
   - crates/xagent-sandbox/src/pooling_study.rs
   - crates/xagent-sandbox/src/lib.rs

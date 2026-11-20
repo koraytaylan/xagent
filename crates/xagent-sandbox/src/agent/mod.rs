@@ -17,9 +17,10 @@ use xagent_brain::buffers::{
     feature_count_for_brain_stride, init_brain_state_for, init_pattern_memory,
     seed_instinct_patterns, AgentBrainState, BrainLayout, ENCODED_DIMENSION, MAX_WEIGHT_NORM,
     O_ACTION_FORWARD_WEIGHTS, O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT,
-    O_SCENT_TURN_WEIGHTS, O_VISION_TURN_WEIGHTS, PREDICTOR_DIMENSION, SCENT_CHANNELS,
-    VISION_PATHWAY_INPUTS,
+    PREDICTOR_DIMENSION,
 };
+use xagent_brain::senses::{Heritability, MotorRoute};
+use xagent_brain::{SenseDescriptor, DECLARED_SENSES};
 use xagent_shared::{
     BodyState, BrainConfig, InternalState, SensoryFrame, DOG_SURROUND_RATIO_MAX,
     DOG_SURROUND_RATIO_MIN, GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX,
@@ -505,25 +506,25 @@ struct BrainWeightOffsets {
     predictor_weights: usize,
     forward_weights: usize,
     turn_weights: usize,
-    scent_turn_weights: usize,
-    vision_turn_weights: usize,
+}
+
+/// Start of the predictor-context weights for a brain with `feature_count`
+/// encoder inputs; layout slots after it are addressed relative to this.
+fn predictor_context_offset(feature_count: usize) -> usize {
+    let predictor_weights = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION;
+    predictor_weights + PREDICTOR_DIMENSION * ENCODED_DIMENSION
 }
 
 fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
     let feature_count = feature_count_for_brain_stride(state.brain_state.len())
         .expect("brain_state length matches no BrainLayout");
     let predictor_weights = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION;
-    let predictor_context = predictor_weights + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+    let predictor_context = predictor_context_offset(feature_count);
     let forward_weights =
         predictor_context + (O_ACTION_FORWARD_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
     let turn_weights = predictor_context + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
-    let scent_turn_weights =
-        predictor_context + (O_SCENT_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
-    let vision_turn_weights =
-        predictor_context + (O_VISION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
     assert!(
-        turn_weights + ENCODED_DIMENSION <= state.brain_state.len()
-            && vision_turn_weights + VISION_PATHWAY_INPUTS <= state.brain_state.len(),
+        turn_weights + ENCODED_DIMENSION <= state.brain_state.len(),
         "computed offsets exceed brain_state bounds"
     );
     BrainWeightOffsets {
@@ -531,8 +532,6 @@ fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
         predictor_weights,
         forward_weights,
         turn_weights,
-        scent_turn_weights,
-        vision_turn_weights,
     }
 }
 
@@ -590,26 +589,58 @@ pub fn mutate_steering_weights(
     strength: f32,
     rng: &mut impl Rng,
 ) -> AgentBrainState {
+    let feature_count = feature_count_for_brain_stride(state.brain_state.len())
+        .expect("brain_state length matches no BrainLayout");
+    mutate_steering_weights_for(state, feature_count, DECLARED_SENSES, strength, rng)
+}
+
+/// Steering mutation over an explicit sense table: the action turn weights,
+/// then the turn block of every sense with a mutated turn route, in table
+/// order. Each block is rescaled into the shader's L2 ball. Routes that are
+/// learned only are left untouched. A mutated route that is not a turn route
+/// panics before any draw.
+pub fn mutate_steering_weights_for(
+    state: &AgentBrainState,
+    feature_count: usize,
+    senses: &'static [SenseDescriptor],
+    strength: f32,
+    rng: &mut impl Rng,
+) -> AgentBrainState {
+    for sense in senses {
+        for route in sense.routes {
+            assert!(
+                route.heritability != Heritability::Mutated || route.route == MotorRoute::Turn,
+                "sense {} declares a mutated route that is not a turn route",
+                sense.name
+            );
+        }
+    }
+    let predictor_context = predictor_context_offset(feature_count);
+    let turn_weights = predictor_context + (O_ACTION_TURN_WEIGHTS - O_PREDICTOR_CONTEXT_WEIGHT);
+    let layout = BrainLayout::with_senses(&BrainConfig::default(), senses);
     let mut mutated = state.clone();
-    let offsets = brain_weight_offsets(state);
     for index in 0..ENCODED_DIMENSION {
         if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
             let kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
-            mutated.brain_state[offsets.turn_weights + index] += kick;
+            mutated.brain_state[turn_weights + index] += kick;
         }
     }
-    rescale_turn_weights(&mut mutated.brain_state, offsets.turn_weights);
-    for (start, len) in [
-        (offsets.scent_turn_weights, SCENT_CHANNELS),
-        (offsets.vision_turn_weights, VISION_PATHWAY_INPUTS),
-    ] {
-        for index in 0..len {
-            if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
-                let kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
-                mutated.brain_state[start + index] += kick;
+    rescale_turn_weights(&mut mutated.brain_state, turn_weights);
+    for (sense, block) in senses.iter().zip(layout.sense_blocks()) {
+        let start = predictor_context + (block.turn_weights - O_PREDICTOR_CONTEXT_WEIGHT);
+        let len = sense.channels;
+        for route in sense.routes {
+            if route.heritability != Heritability::Mutated {
+                continue;
             }
+            for index in 0..len {
+                if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
+                    let kick = (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
+                    mutated.brain_state[start + index] += kick;
+                }
+            }
+            rescale_into_ball(&mut mutated.brain_state, start, len);
         }
-        rescale_into_ball(&mut mutated.brain_state, start, len);
     }
     mutated
 }
@@ -739,6 +770,8 @@ fn mutate_config_with_strength_rng(
         // Route flags are locked per batch and inherited unchanged.
         critic_input: parent.critic_input,
         forward_pathway_enabled: parent.forward_pathway_enabled,
+        klinotaxis_turn_gain_enabled: parent.klinotaxis_turn_gain_enabled,
+        motor_fatigue_enabled: parent.motor_fatigue_enabled,
         // Heritable visual-genome genes. Each is perturbed with
         // momentum and clamped to the same bounds the shader re-imposes after
         // reading the gene. `orientation_offset` has no hard clamp — orientation
@@ -953,6 +986,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         // Route flags are locked per batch and inherited unchanged.
         critic_input: a.critic_input,
         forward_pathway_enabled: a.forward_pathway_enabled,
+        klinotaxis_turn_gain_enabled: a.klinotaxis_turn_gain_enabled,
+        motor_fatigue_enabled: a.motor_fatigue_enabled,
         // Heritable visual-genome genes: uniform per-gene crossover.
         gabor_wavelength: if rng.random::<f32>() < 0.5 {
             a.gabor_wavelength
@@ -1137,7 +1172,12 @@ pub fn generate_all_agents_mesh(agents: &[Agent]) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xagent_brain::buffers::O_ACTION_TURN_WEIGHTS;
+    use xagent_brain::buffers::{
+        O_CRITIC_PATHWAY_WEIGHTS, O_FORWARD_PATHWAY_WEIGHTS, O_SCENT_TURN_WEIGHTS,
+        O_TRACE_CRITIC_PATHWAY, O_TRACE_FORWARD_PATHWAY, O_VISION_TURN_WEIGHTS,
+        PATHWAY_INPUT_COUNT, SCENT_CHANNELS, VISION_PATHWAY_INPUTS,
+    };
+    use xagent_brain::senses::{RouteDescriptor, Whitening, SMELL, VISION};
 
     #[test]
     fn reset_for_new_life_clears_fatigue_history() {
@@ -1229,6 +1269,193 @@ mod tests {
         let mut zero_rng = rand::rngs::SmallRng::seed_from_u64(7);
         let held = mutate_steering_weights(&state, 0.0, &mut zero_rng);
         assert_eq!(held.brain_state, state.brain_state);
+    }
+
+    /// Mutated-route sense used to exercise the non-turn assertion.
+    const FORWARD_MUTATED_ROUTES: &[RouteDescriptor] = &[RouteDescriptor {
+        route: MotorRoute::Forward,
+        heritability: Heritability::Mutated,
+    }];
+
+    /// Learned-only turn route used by the extra test sense.
+    const LEARNED_ONLY_ROUTES: &[RouteDescriptor] = &[RouteDescriptor {
+        route: MotorRoute::Turn,
+        heritability: Heritability::LearnedOnly,
+    }];
+
+    /// Test-only sense whose only route is a mutated forward route.
+    const FORWARD_MUTATED_SENSE: SenseDescriptor = SenseDescriptor {
+        name: "forward_mutated",
+        routes: FORWARD_MUTATED_ROUTES,
+        ..VISION
+    };
+
+    /// Test-only two-channel sense with a learned-only turn route.
+    const EXTRA_SENSE: SenseDescriptor = SenseDescriptor {
+        name: "extra",
+        channels: SCENT_CHANNELS,
+        whitening: Whitening::ClosedForm2 {
+            initial_variance: 1.0,
+        },
+        routes: LEARNED_ONLY_ROUTES,
+        ..SMELL
+    };
+
+    /// Sense table with the extra learned-only sense appended.
+    const EXTENDED_SENSES: &[SenseDescriptor] = &[SMELL, VISION, EXTRA_SENSE];
+
+    /// Sense table whose second sense mutates a non-turn route.
+    const FORWARD_MUTATED_SENSES: &[SenseDescriptor] = &[SMELL, FORWARD_MUTATED_SENSE];
+
+    #[test]
+    fn mutate_steering_weights_matches_two_block_reference() {
+        use rand::SeedableRng;
+
+        let mut seed_rng = rand::rngs::SmallRng::seed_from_u64(5);
+        let template = fresh_brain_state(&BrainConfig::default(), &mut seed_rng);
+        for seed in 1..=8_u64 {
+            for strength in [0.1_f32, 0.5] {
+                let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+                let actual = mutate_steering_weights(&template, strength, &mut rng);
+
+                let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+                let mut reference = template.clone();
+                for index in 0..ENCODED_DIMENSION {
+                    if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
+                        let kick =
+                            (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
+                        reference.brain_state[O_ACTION_TURN_WEIGHTS + index] += kick;
+                    }
+                }
+                rescale_into_ball(
+                    &mut reference.brain_state,
+                    O_ACTION_TURN_WEIGHTS,
+                    ENCODED_DIMENSION,
+                );
+                for (start, len) in [
+                    (O_SCENT_TURN_WEIGHTS, SCENT_CHANNELS),
+                    (O_VISION_TURN_WEIGHTS, VISION_PATHWAY_INPUTS),
+                ] {
+                    for index in 0..len {
+                        if rng.random::<f32>() < STEERING_MUTATION_FRACTION {
+                            let kick =
+                                (rng.random::<f32>() * 2.0 - 1.0) * strength * STEERING_WEIGHT_STEP;
+                            reference.brain_state[start + index] += kick;
+                        }
+                    }
+                    rescale_into_ball(&mut reference.brain_state, start, len);
+                }
+
+                assert_ne!(
+                    reference.brain_state, template.brain_state,
+                    "the reference must differ from the template"
+                );
+                let actual_bits: Vec<u32> =
+                    actual.brain_state.iter().map(|w| w.to_bits()).collect();
+                let reference_bits: Vec<u32> =
+                    reference.brain_state.iter().map(|w| w.to_bits()).collect();
+                assert_eq!(
+                    actual_bits, reference_bits,
+                    "seed {seed} strength {strength}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn learned_only_sense_stays_zero_under_mutation() {
+        use rand::SeedableRng;
+
+        let config = BrainConfig::default();
+        let layout = BrainLayout::with_senses(&config, EXTENDED_SENSES);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(2);
+        let state = AgentBrainState {
+            brain_state: init_brain_state_for(&config, &layout, &mut rng),
+            patterns: init_pattern_memory(),
+        };
+        let blocks = layout.sense_blocks();
+        let extra_start = blocks[2].turn_weights;
+        let extra_range = extra_start..extra_start + SCENT_CHANNELS;
+        assert!(state.brain_state[extra_range.clone()]
+            .iter()
+            .all(|w| *w == 0.0));
+
+        let mut smell_changed = false;
+        let mut vision_changed = false;
+        for seed in 1..=8_u64 {
+            let mut mutate_rng = rand::rngs::SmallRng::seed_from_u64(seed);
+            let mutated = mutate_steering_weights_for(
+                &state,
+                layout.feature_count,
+                EXTENDED_SENSES,
+                0.5,
+                &mut mutate_rng,
+            );
+            assert!(mutated.brain_state[extra_range.clone()]
+                .iter()
+                .all(|w| *w == 0.0));
+            let smell = blocks[0].turn_weights..blocks[0].turn_weights + SCENT_CHANNELS;
+            let vision = blocks[1].turn_weights..blocks[1].turn_weights + VISION_PATHWAY_INPUTS;
+            smell_changed |= mutated.brain_state[smell.clone()] != state.brain_state[smell];
+            vision_changed |= mutated.brain_state[vision.clone()] != state.brain_state[vision];
+        }
+        assert!(smell_changed, "the smell turn block must change");
+        assert!(vision_changed, "the vision turn block must change");
+    }
+
+    #[test]
+    fn forward_and_critic_route_blocks_are_never_mutated() {
+        use rand::SeedableRng;
+        use xagent_shared::CriticInput;
+
+        const ROUTE_SLOT_VALUE: f32 = 0.5;
+        let config = BrainConfig {
+            critic_input: CriticInput::Pathway,
+            forward_pathway_enabled: true,
+            ..BrainConfig::default()
+        };
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(4);
+        let mut state = fresh_brain_state(&config, &mut rng);
+        let route_starts = [
+            O_FORWARD_PATHWAY_WEIGHTS,
+            O_TRACE_FORWARD_PATHWAY,
+            O_CRITIC_PATHWAY_WEIGHTS,
+            O_TRACE_CRITIC_PATHWAY,
+        ];
+        for start in route_starts {
+            for slot in start..start + PATHWAY_INPUT_COUNT {
+                state.brain_state[slot] = ROUTE_SLOT_VALUE;
+            }
+        }
+        let mut mutate_rng = rand::rngs::SmallRng::seed_from_u64(6);
+        let mutated = mutate_steering_weights(&state, 0.5, &mut mutate_rng);
+        for start in route_starts {
+            for slot in start..start + PATHWAY_INPUT_COUNT {
+                assert_eq!(
+                    mutated.brain_state[slot].to_bits(),
+                    state.brain_state[slot].to_bits(),
+                    "route slot {slot} must not be mutated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "mutated route that is not a turn route")]
+    fn mutated_non_turn_route_is_rejected() {
+        use rand::SeedableRng;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
+        let state = fresh_brain_state(&BrainConfig::default(), &mut rng);
+        let feature_count = feature_count_for_brain_stride(state.brain_state.len())
+            .expect("brain_state length matches a BrainLayout");
+        let _ = mutate_steering_weights_for(
+            &state,
+            feature_count,
+            FORWARD_MUTATED_SENSES,
+            0.5,
+            &mut rng,
+        );
     }
 
     #[test]

@@ -36,7 +36,20 @@ const WHITENING_SENTINEL: f32 = -7.0;
 const MAX_DIFFERENCE_SAMPLES: usize = 12;
 const HELPER: &str = include_str!("../shaders/kernel/brain_cooperative_visual_pathway.wgsl");
 const REFRESH_CALL: &str = "    cooperative_refresh_vision_whitening(brain_base, tid);\n";
-const ORIGINAL_CALL: &str = "let vision_dot = vision_pathway_step(\n            brain_base, brain_state[brain_base + O_TICK_COUNT], visual_cortex_on);";
+const ORIGINAL_CALL: &str = "            let channels = sense_channels(sense);\n            let silent = visual_cortex_on\n";
+const TURN_CALL: &str = "                var route_dot = 0.0;\n                for (var k = 0u; k < sense_channels(sense); k++) {\n                    route_dot += brain_state[brain_base + sense_turn_weights(sense) + k]\n                        * brain_state[brain_base + sense_input(sense) + k];\n                }\n";
+const CANDIDATE_TURN: &str = "    if (tid == 0u) {
+        let visual_cortex_on = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
+        var turn = 0.0;
+        for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+            if (sense_prepared_cooperatively(sense)) {
+                turn += prepared_sense_turn(brain_base, sense, visual_cortex_on);
+            }
+        }
+        decision_buffer[group.x * DECISION_STRIDE + DECISION_MOTOR + 1u] = turn;
+    }
+}
+";
 
 const PROBE_ENTRY: &str = r"
 @compute @workgroup_size(256)
@@ -50,7 +63,46 @@ fn visual_pathway_probe(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_
     // PREPARE_PATHWAY
     if (tid == 0u) {
         let visual_cortex_on = bc_f32(CFG_VISUAL_CORTEX_ENABLED) != 0.0;
-        let turn = vision_pathway_step(brain_base, brain_state[brain_base + O_TICK_COUNT], visual_cortex_on);
+        var turn = 0.0;
+        for (var sense = 0u; sense < SENSE_COUNT; sense++) {
+            if (!(sense_whitening_kind(sense) == SENSE_WHITENING_KIND_JACOBI
+                && sense_input_kind(sense) == SENSE_INPUT_KIND_VISUAL_HEMIFIELDS)) { continue; }
+            let channels = sense_channels(sense);
+            if (visual_cortex_on) {
+                for (var k = 0u; k < channels; k++) {
+                    brain_state[brain_base + sense_input(sense) + k] = 0.0;
+                }
+                continue;
+            }
+            // Direct hemifield gather, the same call the candidate helper makes.
+            let raw = vision_hemifields();
+            var centred: array<f32, MAX_SENSE_CHANNELS>;
+            for (var k = 0u; k < channels; k++) {
+                centred[k] = raw[k] - brain_state[brain_base + sense_mean(sense) + k];
+            }
+            let rate = sense_adaptation_rate(sense);
+            for (var i = 0u; i < channels; i++) {
+                var whitened = 0.0;
+                for (var j = 0u; j < channels; j++) {
+                    whitened += brain_state[brain_base + sense_whitening(sense) + i * channels + j]
+                        * centred[j];
+                }
+                brain_state[brain_base + sense_input(sense) + i] = whitened;
+            }
+            for (var i = 0u; i < channels; i++) {
+                brain_state[brain_base + sense_mean(sense) + i] += rate * centred[i];
+                for (var j = 0u; j < channels; j++) {
+                    let slot = brain_base + sense_covariance(sense) + i * channels + j;
+                    brain_state[slot] += rate * (centred[i] * centred[j] - brain_state[slot]);
+                }
+            }
+            var route_dot = 0.0;
+            for (var k = 0u; k < channels; k++) {
+                route_dot += brain_state[brain_base + sense_turn_weights(sense) + k]
+                    * brain_state[brain_base + sense_input(sense) + k];
+            }
+            turn += route_dot;
+        }
         decision_buffer[group.x * DECISION_STRIDE + DECISION_MOTOR + 1u] = turn;
     }
 }
@@ -76,12 +128,17 @@ fn cooperative_pathway(original: &str) -> String {
     let candidate = original
         .replacen(
             REFRESH_CALL,
-            &format!("{REFRESH_CALL}    cooperative_prepare_vision_pathway(brain_base, tid);\n"),
+            &format!("{REFRESH_CALL}    cooperative_prepare_jacobi_senses(brain_base, tid);\n"),
             1,
         )
         .replacen(
             ORIGINAL_CALL,
-            "let vision_dot = prepared_vision_pathway_turn(brain_base, visual_cortex_on);",
+            &format!("            if (sense_prepared_cooperatively(sense)) {{ continue; }}\n{ORIGINAL_CALL}"),
+            1,
+        )
+        .replacen(
+            TURN_CALL,
+            "                var route_dot = 0.0;\n                if (sense_prepared_cooperatively(sense)) {\n                    route_dot = prepared_sense_turn(brain_base, sense, visual_cortex_on);\n                } else {\n                for (var k = 0u; k < sense_channels(sense); k++) {\n                    route_dot += brain_state[brain_base + sense_turn_weights(sense) + k]\n                        * brain_state[brain_base + sense_input(sense) + k];\n                }\n                }\n",
             1,
         );
     let candidate = format!("{candidate}\n{HELPER}");
@@ -158,6 +215,44 @@ fn trajectory(kernel: &mut GpuKernel) -> TestResult<Vec<State>> {
 }
 
 #[test]
+fn candidate_fragments_drop_sense_specific_names() {
+    let fragments = [
+        HELPER,
+        include_str!("../shaders/kernel/brain_cooperative_jacobi.wgsl"),
+        include_str!("../shaders/kernel/whitening_refresh.wgsl"),
+        include_str!("../shaders/kernel/brain_cooperative_whitening.wgsl"),
+    ];
+    for token in [
+        "O_SCENT_",
+        "O_VISION_PATHWAY_",
+        "O_VISION_TURN_WEIGHTS",
+        "O_TRACE_SCENT",
+        "O_TRACE_VISION",
+        "whiten_scent",
+        "refresh_vision_whitening",
+        "vision_pathway_learning_rate",
+        "settle_turn_pathways_at_death",
+        "VISION_WHITENING_REFRESH",
+        "VISION_PATHWAY_RATE",
+    ] {
+        for fragment in fragments {
+            let occurrences = fragment
+                .lines()
+                .map(|line| {
+                    line.replace("cooperative_refresh_vision_whitening", "")
+                        .matches(token)
+                        .count()
+                })
+                .sum::<usize>();
+            assert_eq!(
+                occurrences, 0,
+                "forbidden token {token} in a candidate fragment"
+            );
+        }
+    }
+}
+
+#[test]
 fn visual_pathway_composition_preserves_other_passes() {
     let original = optimized_brain();
     let candidate = cooperative_pathway(&original);
@@ -167,9 +262,11 @@ fn visual_pathway_composition_preserves_other_passes() {
     assert!(candidate.contains(&original[refresh_definition..]));
     for expression in [
         "let raw = vision_hemifields();",
-        "s_reinf_dot[k] = raw[k] - brain_state[brain_base + O_VISION_PATHWAY_MEAN + k];",
-        "brain_state[slot] += VISION_PATHWAY_RATE * (s_reinf_dot[i] * s_reinf_dot[j] - brain_state[slot]);",
-    ] { assert!(HELPER.contains(expression)); }
+        "s_reinf_dot[k] = raw[k] - brain_state[brain_base + sense_mean(sense) + k];",
+        "brain_state[slot] += rate * (s_reinf_dot[i] * s_reinf_dot[j] - brain_state[slot]);",
+    ] {
+        assert!(HELPER.contains(expression));
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let source = apply_subgroup_markers(
@@ -223,8 +320,12 @@ fn cooperative_visual_pathway_preserves_complete_state() -> TestResult {
 
 fn probe_entry(candidate: bool) -> String {
     if candidate {
-        PROBE_ENTRY.replace("    // PREPARE_PATHWAY", "    cooperative_prepare_vision_pathway(brain_base, tid);")
-            .replace("vision_pathway_step(brain_base, brain_state[brain_base + O_TICK_COUNT], visual_cortex_on)", "prepared_vision_pathway_turn(brain_base, visual_cortex_on)")
+        let cut = PROBE_ENTRY.find("    if (tid == 0u) {").unwrap();
+        let head = PROBE_ENTRY[..cut].replace(
+            "    // PREPARE_PATHWAY",
+            "    cooperative_prepare_jacobi_senses(brain_base, tid);",
+        );
+        format!("{head}{CANDIDATE_TURN}")
     } else {
         PROBE_ENTRY.to_owned()
     }

@@ -9,8 +9,8 @@ depends_on:
   - generic-sense-helpers
   - generic-schedule-candidates
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "f3e7cb0345f067c4101ba0ba497f2f40c61789c0"
 touches:
   - crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl

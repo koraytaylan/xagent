@@ -110,6 +110,9 @@ preflight_checks:
   - name: pf-task-modulator-study
     command: "sh -c 'grep -q \"KLINOTAXIS_SENSITIVITY\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"turn \\*= klinotaxis_factor;\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"brain_state\\[brain_base + O_FATIGUE_FACTOR\\] = fatigue_factor;\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && grep -q \"pub const CONFIG_SIZE: usize\" crates/xagent-brain/src/buffers.rs && grep -q \"pub danger_percept_enabled: bool,\" crates/xagent-shared/src/config.rs && env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration -- --exact gpu_adapter_present_when_required'"
     timeout_ms: 3600000
+  - name: pf-task-sense-reader-rewrites
+    command: "sh -c 'grep -q \"vision_pathway_learning_rate(brain_base)\" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl && grep -q \"vision_pathway_learning_rate(brain_base)\" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl && grep -q \"const VISION_WHITENING_REFRESH: u32 = {REFRESH_CYCLES}u;\" crates/xagent-brain/src/gpu_kernel/whitening_validation.rs && cargo test -p xagent-sandbox --test contributing_guard'"
+    timeout_ms: 3600000
   - name: pf-task-pooling-fit
     command: "sh -c 'grep -q \"pub mod free_life;\" crates/xagent-sandbox/src/lib.rs && grep -q \"columns, whitened, learned | +0.16\" docs/reviews/2026-09-25-learner-foraging-investigation.md && grep -q \"hemifields, whitened, learned\\*\\* | \\*\\*+0.33\" docs/reviews/2026-09-25-learner-foraging-investigation.md && grep -q \"ACTION_WEIGHT_LEARNING_RATE\" crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl && cargo test -p xagent-sandbox --test contributing_guard'"
     timeout_ms: 3600000
@@ -207,6 +210,7 @@ execution_checks:
       - generic-sense-helpers
       - generic-sense-block-sites
       - generic-schedule-candidates
+      - sense-reader-rewrites
       - remove-sense-specific-wgsl
       - declared-sense-extension-test
       - modulator-flags
@@ -314,6 +318,18 @@ execution_checks:
             command: >-
               sh -c 'grep -q "override O_VISION_PATHWAY_MEAN: u32" crates/xagent-brain/src/shaders/kernel/common.wgsl
               && grep -q "O_SCENT_MEAN" crates/xagent-brain/README.md'
+      - task: sense-reader-rewrites
+        name: reader-anchors
+        sources:
+          - crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
+          - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
+          - crates/xagent-brain/src/gpu_kernel/whitening_validation.rs
+        checks:
+          - name: readers-present
+            command: >-
+              sh -c 'grep -q "SCENT_CHANNELS" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
+              && grep -q "SCENT_CHANNELS" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
+              && grep -q "VISION_WHITENING_REFRESH" crates/xagent-brain/src/gpu_kernel/whitening_validation.rs'
       - task: pooling-fit
         name: fit-library-surfaces
         sources:
@@ -482,7 +498,7 @@ execution_checks:
 is staged so every step stays byte-identical within six files:
 `sense-override-constants` → `generic-sense-helpers` →
 `generic-sense-block-sites` → `generic-schedule-candidates` →
-`remove-sense-specific-wgsl` → `declared-sense-extension-test`.
+`sense-reader-rewrites` → `remove-sense-specific-wgsl` → `declared-sense-extension-test`.
 `modulator-flags` follows the chain and the mutation task (shared shader,
 layout, config and agent files); `modulator-study` lands or reverts each
 modulator; `pooling-fit` builds the offline fit library and `pooling-study` then measures pooling on the final learner and

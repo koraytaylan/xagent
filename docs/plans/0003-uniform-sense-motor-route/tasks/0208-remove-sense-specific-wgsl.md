@@ -8,6 +8,7 @@ depends_on:
   - sense-descriptor
   - sense-override-constants
   - generic-schedule-candidates
+  - sense-reader-rewrites
 gated: false
 status: todo
 merged_as: ""
@@ -17,9 +18,6 @@ touches:
   - crates/xagent-brain/src/gpu_kernel.rs
   - crates/xagent-brain/src/senses.rs
   - crates/xagent-brain/README.md
-  - crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
-  - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
-  - crates/xagent-brain/src/gpu_kernel/whitening_validation.rs
   - crates/xagent-brain/src/buffers.rs
 checks:
   - name: focused-proof
@@ -87,17 +85,9 @@ Default behaviour, the parity golden and the pathway tests are unchanged.
 - `cooperative_refresh_vision_whitening` is the accepted naming exception. It
   does not match the removed name `refresh_vision_whitening` because matching is
   whole-identifier.
-- Out-of-file readers rewritten in step: `kernel_tick.wgsl` and
-  `phase_death.wgsl` (terminal forward-pathway settle) call
-  `vision_pathway_learning_rate(brain_base)` and read `SCENT_CHANNELS`; replace
-  each call with `sense_learning_rate(brain_base, 1u)` (the removed wrapper's
-  exact body) and each `SCENT_CHANNELS` with `NON_VISUAL_FEATURE_CHANNELS`,
-  changing nothing else. `gpu_kernel/whitening_validation.rs` asserts
-  `const VISION_WHITENING_REFRESH: u32 = {REFRESH_CYCLES}u;` in `common.wgsl`;
-  change only that anchor to the generated default
-  `override SENSE1_REFRESH_TICKS: u32 = {REFRESH_CYCLES}u;`.
-  `whitening_storage_validation.rs` and `visual_pathway_validation.rs` only
-  assert these names are absent and need no edit.
+- Out-of-file readers (`kernel_tick.wgsl`, `phase_death.wgsl`,
+  `gpu_kernel/whitening_validation.rs`) were moved off the removed names by
+  `sense-reader-rewrites`; this task does not edit them.
 - `buffers.rs` test `pathway_block_and_cfg_slots_match_wgsl` pins three
   `common.wgsl` lines that name `O_TRACE_VISION`, `SCENT_CHANNELS` and the
   initialized `O_SENSORY_MEAN`. Update only those three string literals to the
@@ -107,7 +97,7 @@ Default behaviour, the parity golden and the pathway tests are unchanged.
   `const PATHWAY_INPUT_COUNT: u32 = NON_VISUAL_FEATURE_CHANNELS +
   VISION_PATHWAY_INPUTS;`. Nothing else in `buffers.rs` changes.
 - Stop rule: a removed name, or a constant renamed away, still referenced outside
-  the nine touches (for example a Rust splice anchor in `gpu_kernel/*.rs` or a
+  the six touches (for example a Rust splice anchor in `gpu_kernel/*.rs` or a
   WGSL fragment) gets no edit there. Stop and report the file and line.
 
 **Steps:**
@@ -117,8 +107,7 @@ Default behaviour, the parity golden and the pathway tests are unchanged.
    outside the touches, other than Rust constants of the same name (`buffers.rs`
    and its users), comments, and tests that assert a name is absent, trigger
    the stop rule. Confirm each renamed constant's WGSL readers are only in the
-   touched `.wgsl` files; if not, stop and report. Then apply the out-of-file
-   rewrites named in Decisions.
+   touched `.wgsl` files; if not, stop and report.
 2. **common.wgsl.** Delete any remaining copy of the four wrapper functions,
    the removed constants and the hand-written `override O_SCENT_*`,
    `O_VISION_PATHWAY_*`, `O_VISION_TURN_WEIGHTS`, `O_TRACE_SCENT` and
@@ -170,10 +159,8 @@ Default behaviour, the parity golden and the pathway tests are unchanged.
 
 - No new sense, route, input kind, config flag or override value; no change to
   a constant's value or to `BRAIN_STRIDE`.
-- No edit to `buffers.rs` beyond the three string literals above, the validation modules other than the one
-  `whitening_validation.rs` anchor above, `phase_vision*.wgsl` or the other
-  `.wgsl` fragments; no edit in `kernel_tick.wgsl` or `phase_death.wgsl`
-  beyond the call-site renames above.
+- No edit to `buffers.rs` beyond the three string literals above, the validation modules, `phase_vision*.wgsl` or the other
+  `.wgsl` fragments.
 - No change to the golden, to existing test bodies (except the senses.rs mirror
   test and the three `buffers.rs` literals named above), or to test names.
 - No TODO, plan or task names in comments; no `as` casts in Rust.

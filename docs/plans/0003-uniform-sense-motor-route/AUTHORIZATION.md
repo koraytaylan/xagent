@@ -538,8 +538,32 @@ this plan's run (stopped on the junior-task bounds refusal).
 - Witness: bodies are now 5318 (`pooling-fit`) and 4895 (`pooling-study`)
   characters with 2 touches each; the preflight `pf-task-pooling-fit` and the
   `fit-library-surfaces` constraint exit 0 on the baseline.
-- Not changed: `remove-sense-specific-wgsl` (9 touches, 8225-character body)
-  is already done on the plan branch, landed as
-  a955d3705bdef571e7e333326b429457161b0ecb (an ancestor of
-  plan/0003-uniform-sense-motor-route), so it is not pending work and is not
-  split.
+- `remove-sense-specific-wgsl` is split separately; see the next entry.
+
+## Corrected requirement: remove-sense-specific-wgsl split into sense-reader-rewrites (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run (stopped on the junior-task bounds refusal).
+
+- Superseded: task `remove-sense-specific-wgsl` (tasks/0208) as one packet
+  with 9 touches and an 8225-character body, including the out-of-file reader
+  rewrites added by the "touches and readers" correction above.
+- Contradiction: the host's task bounds allow at most 6 touches and 8000
+  characters, and plan validation applies them to this record, so the run
+  refused to resume.
+- Correction: the three reader files (`kernel_tick.wgsl`, `phase_death.wgsl`,
+  `gpu_kernel/whitening_validation.rs`) move into the new non-gated developer
+  task `sense-reader-rewrites` (tasks/0210, depends on
+  `sense-override-constants`, `generic-sense-helpers`,
+  `generic-schedule-candidates`). It renames the readers, keeping their values,
+  to names that exist both before and after removal: `sense_learning_rate(brain_base, 1u)`,
+  `SENSE0_CHANNELS` (or the already-landed `NON_VISUAL_FEATURE_CHANNELS`,
+  same value 2) and the anchor `override SENSE1_REFRESH_TICKS: u32 =
+  {REFRESH_CYCLES}u;`. `remove-sense-specific-wgsl` now also depends on it and
+  keeps 6 touches, every check, its removed list, source tests, buffers.rs
+  literals and Done when. No bound, proof, gated flag or existing dependency
+  changed. In the saved run the landed remove commit (a955d37) already contains
+  these rewrites, so the new task's gates pass there with no edit needed.
+- Witness: 0208 now has 6 touches and a 7466-character body; 0210 has 3
+  touches; `pf-task-sense-reader-rewrites` and the `reader-anchors` constraint
+  exit 0 on the baseline; validate_plan reports no issues.

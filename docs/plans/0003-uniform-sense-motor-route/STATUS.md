@@ -4,7 +4,7 @@ status: todo
 
 # 0003 — Uniform sense-motor route: status
 
-Progress: 0/15 tasks done.
+Progress: 0/16 tasks done.
 
 | file | task id | title | status |
 |---|---|---|---|
@@ -16,6 +16,7 @@ Progress: 0/15 tasks done.
 | tasks/0205-generic-sense-helpers.md | generic-sense-helpers | Sense-indexed WGSL helpers behind the existing names | todo |
 | tasks/0206-generic-sense-block-sites.md | generic-sense-block-sites | Brain passes loop over the declared senses | todo |
 | tasks/0207-generic-schedule-candidates.md | generic-schedule-candidates | Alternate brain schedules over every Jacobi sense | todo |
+| tasks/0210-sense-reader-rewrites.md | sense-reader-rewrites | Move out-of-file WGSL readers off the sense-specific names | todo |
 | tasks/0208-remove-sense-specific-wgsl.md | remove-sense-specific-wgsl | Remove the sense-specific WGSL names | todo |
 | tasks/0209-declared-sense-extension-test.md | declared-sense-extension-test | An extra declared sense needs no new code path | todo |
 | tasks/0401-modulator-flags.md | modulator-flags | Klinotaxis and fatigue flags | todo |

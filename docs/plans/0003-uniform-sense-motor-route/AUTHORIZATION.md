@@ -280,3 +280,25 @@ this plan's run.
 - Witness: the `brain-lib` check (new test) and the `parity` check
   (`cortex_trajectory_matches_golden`, which passed 4/4 with this change in
   failure 5).
+
+## Corrected requirement: generic-sense-helpers Jacobi placement wording, second clarification (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run.
+
+- Superseded: packet `tasks/0205-generic-sense-helpers.md` placement sentence
+  "it contains no `a[` or `v[` only after the `a`/`v` rewrite to
+  `whitening_scratch` that `whitening_storage_validation.rs` performs".
+- Contradiction: review again read it as forbidding `a[`/`v[` indexing in the
+  shader source slice (finding on common.wgsl:1295-1357), while the unchanged
+  gate test `crates/xagent-brain/src/gpu_kernel/whitening_storage_validation.rs:50-51`
+  asserts the source slice holds one `PRIVATE_MATRICES` declaration and
+  `a[`/`v[` indexing; renaming them failed it (left 0, right 1, exit 101).
+- Correction: the sentence now states explicitly that the source slice must
+  keep the declaration and all `a[`/`v[` indexing, that such indexing is not a
+  defect, and that the "no `a[`/`v[`" property applies only to the test's
+  in-memory rewritten copy (lines 52-56). Same requirement, unambiguous; no
+  bound, task, dependency, gate, test or behavior changed.
+- Witness: the `alternate-schedules` check
+  (`workgroup_whitening_matches_complete_serial_state`) and host verify (all
+  seven gates passed) on the task branch's unrenamed Jacobi arrays.

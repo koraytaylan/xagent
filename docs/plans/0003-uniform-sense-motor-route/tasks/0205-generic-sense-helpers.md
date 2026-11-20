@@ -120,10 +120,14 @@ and their order are unchanged, so seeded trajectories stay byte-identical.
   becomes a wrapper calling it with `1u`.
 - **Placement (accepted constraint).** The slice from `fn refresh_vision_whitening(brain_base: u32) {`
   to `fn settle_recent_moments_at_death` contains only the wrapper followed by
-  `sense_refresh_jacobi_whitening`; the accessors sit above the wrapper. The
-  extracted slice keeps the single private `var a`/`var v` matrix declaration
-  and its `a[`/`v[` indexing; it contains no `a[` or `v[` only after the `a`/`v`
-  rewrite to `whitening_scratch` that `whitening_storage_validation.rs` performs.
+  `sense_refresh_jacobi_whitening`; the accessors sit above the wrapper. In the
+  shader source, the extracted slice MUST keep the single private `var a`/`var v`
+  matrix declaration AND every `a[`/`v[` index expression of the Jacobi body
+  (unrenamed; `whitening_storage_validation.rs:50-51` asserts both). Source
+  `a[`/`v[` indexing anywhere in the slice is required, not a defect. The
+  "no `a[`/`v[`" property applies solely to the test's in-memory copy after
+  its own rewrite to `whitening_scratch` (`whitening_storage_validation.rs:52-56`);
+  the shader source is never rewritten to `whitening_scratch` by this task.
 
 **Steps:**
 

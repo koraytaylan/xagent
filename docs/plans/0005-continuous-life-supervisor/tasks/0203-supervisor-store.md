@@ -7,8 +7,8 @@ role: developer
 depends_on: [supervisor-core]
 gated: false
 touches: [crates/xagent-sandbox/src/lib.rs, crates/xagent-sandbox/src/supervisor_store.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "22edd9cf247c3282418e85d6e1a65bc761096982"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --lib supervisor_store::tests::"}
   - {name: sandbox-clippy, command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings", timeout_ms: 3600000}

@@ -12,8 +12,8 @@ touches:
   - crates/xagent-sandbox/src/governor.rs
   - crates/xagent-sandbox/tests/integration.rs
   - crates/xagent-sandbox/tests/pathway_route_state.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "d3cd74aa775c5c25bc3c4a48eee04e207da37255"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-shared --lib supervisor_config_"

@@ -7,8 +7,8 @@ role: developer
 depends_on: [archive-brain-source]
 gated: false
 touches: [crates/xagent-sandbox/src/main.rs, crates/xagent-sandbox/tests/evolution_cli_exit.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "5a495efd0787cb96e71ef331e5111305fb4889ea"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --bin xagent -- evolution_cli_"}
   - {name: exit-test, command: "cargo test -p xagent-sandbox --test evolution_cli_exit", timeout_ms: 3600000}

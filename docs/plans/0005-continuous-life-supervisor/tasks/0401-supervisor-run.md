@@ -7,8 +7,8 @@ role: developer
 depends_on: [supervisor-store, kernel-supervisor-hooks]
 gated: false
 touches: [crates/xagent-sandbox/src/lib.rs, crates/xagent-sandbox/src/supervisor_run.rs, crates/xagent-sandbox/tests/supervisor_run.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "a46cfc54c6654b03d48243f65d2e84b55bf6d8a9"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_run", timeout_ms: 3600000}
   - {name: sandbox-clippy, command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings", timeout_ms: 3600000}

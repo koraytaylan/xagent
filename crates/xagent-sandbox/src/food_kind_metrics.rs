@@ -95,7 +95,12 @@ pub fn nearest_food_of_kind(
 ) -> Option<NearestFood> {
     let range_sq = range * range;
     let mut best: Option<(f32, f32, f32)> = None;
-    for (i, item) in food_state.as_chunks::<FOOD_STATE_STRIDE>().0.iter().enumerate() {
+    for (i, item) in food_state
+        .as_chunks::<FOOD_STATE_STRIDE>()
+        .0
+        .iter()
+        .enumerate()
+    {
         if FoodKind::of_item(i) != kind || item[FOOD_RESPAWN_TIMER] != 0.0 {
             continue;
         }
@@ -415,8 +420,14 @@ mod tests {
         assert!((c.credit(FoodKind::First) - 1.0).abs() < 1e-6);
         assert_eq!(c.credit(FoodKind::Second), 0.0);
         let v = c.credit(FoodKind::First);
-        assert_eq!(signed_for_nourishing(v, FoodKind::First, FoodKind::First), v);
-        assert_eq!(signed_for_nourishing(v, FoodKind::First, FoodKind::Second), -v);
+        assert_eq!(
+            signed_for_nourishing(v, FoodKind::First, FoodKind::First),
+            v
+        );
+        assert_eq!(
+            signed_for_nourishing(v, FoodKind::First, FoodKind::Second),
+            -v
+        );
     }
 
     #[test]

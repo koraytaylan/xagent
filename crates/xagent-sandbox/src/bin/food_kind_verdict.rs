@@ -100,7 +100,10 @@ impl fmt::Display for VerdictError {
             VerdictError::Parse(message) => write!(formatter, "parse error: {message}"),
             VerdictError::Invalid(message) => write!(formatter, "invalid input: {message}"),
             VerdictError::Mismatch { expected, actual } => {
-                write!(formatter, "verdict mismatch: expected {expected}, got {actual}")
+                write!(
+                    formatter,
+                    "verdict mismatch: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -123,8 +126,7 @@ fn file_name(arm: Arm, seed: u64) -> String {
 fn read_run(path: &Path) -> Result<RunFoodKindSummary, VerdictError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| VerdictError::Io(format!("{}: {e}", path.display())))?;
-    serde_json::from_str(&text)
-        .map_err(|e| VerdictError::Parse(format!("{}: {e}", path.display())))
+    serde_json::from_str(&text).map_err(|e| VerdictError::Parse(format!("{}: {e}", path.display())))
 }
 
 /// Loads runs from an exact-name directory or a bundle file.
@@ -234,7 +236,11 @@ fn validate_runs(runs: &[RunFoodKindSummary]) -> Result<(), VerdictError> {
     Ok(())
 }
 
-fn find(runs: &[RunFoodKindSummary], seed: u64, arm: Arm) -> Result<&RunFoodKindSummary, VerdictError> {
+fn find(
+    runs: &[RunFoodKindSummary],
+    seed: u64,
+    arm: Arm,
+) -> Result<&RunFoodKindSummary, VerdictError> {
     runs.iter()
         .find(|r| r.seed == seed && r.arm == arm)
         .ok_or_else(|| VerdictError::Invalid(format!("missing run for seed {seed} {arm:?}")))
@@ -321,7 +327,12 @@ fn gate_report(runs: &[RunFoodKindSummary]) -> Result<GateReport, VerdictError> 
     for seed in SEEDS {
         let learning = find(runs, seed, Arm::Learning)?;
         let frozen = find(runs, seed, Arm::Frozen)?;
-        learning_agents.extend(learning.agents.iter().map(|a| (a, learning.nourishing_kind)));
+        learning_agents.extend(
+            learning
+                .agents
+                .iter()
+                .map(|a| (a, learning.nourishing_kind)),
+        );
         let col = |agents: &[AgentFoodKindSummary], g: fn(&AgentFoodKindSummary) -> f32| {
             mean(&agents.iter().map(g).collect::<Vec<_>>())
         };
@@ -334,13 +345,28 @@ fn gate_report(runs: &[RunFoodKindSummary]) -> Result<GateReport, VerdictError> 
             share_q0_learning: pooled_share(&learning.agents, FIRST_QUARTER),
             share_q3_learning: pooled_share(&learning.agents, LAST_QUARTER),
             share_q3_frozen: pooled_share(&frozen.agents, LAST_QUARTER),
-            readout_accuracy: mean_option(learning.agents.iter().map(|a| a.readout_balanced_accuracy)),
-            readout_shuffled: mean_option(learning.agents.iter().map(|a| a.readout_shuffled_accuracy)),
+            readout_accuracy: mean_option(
+                learning.agents.iter().map(|a| a.readout_balanced_accuracy),
+            ),
+            readout_shuffled: mean_option(
+                learning.agents.iter().map(|a| a.readout_shuffled_accuracy),
+            ),
         });
     }
-    let majority = |pred: &dyn Fn(&SeedRow) -> bool| rows.iter().filter(|r| pred(r)).count() >= SEED_MAJORITY;
-    let toward_pooled = mean(&learning_agents.iter().map(|(a, _)| late_toward(a)).collect::<Vec<_>>());
-    let away_pooled = mean(&learning_agents.iter().map(|(a, _)| late_away(a)).collect::<Vec<_>>());
+    let majority =
+        |pred: &dyn Fn(&SeedRow) -> bool| rows.iter().filter(|r| pred(r)).count() >= SEED_MAJORITY;
+    let toward_pooled = mean(
+        &learning_agents
+            .iter()
+            .map(|(a, _)| late_toward(a))
+            .collect::<Vec<_>>(),
+    );
+    let away_pooled = mean(
+        &learning_agents
+            .iter()
+            .map(|(a, _)| late_away(a))
+            .collect::<Vec<_>>(),
+    );
     let b1 = toward_pooled > 0.0 && majority(&|r| r.toward_learning > r.toward_frozen);
     let b2 = away_pooled > 0.0 && majority(&|r| r.away_learning > r.away_frozen);
     let b3 = majority(&|r| greater(r.share_q3_learning, r.share_q0_learning))
@@ -355,7 +381,12 @@ fn gate_report(runs: &[RunFoodKindSummary]) -> Result<GateReport, VerdictError> 
         for (agent, nourishing_kind) in &learning_agents {
             let raw = pick(agent);
             for (index, kind) in [FoodKind::First, FoodKind::Second].into_iter().enumerate() {
-                if xagent_sandbox::food_kind_metrics::signed_for_nourishing(raw[index], kind, *nourishing_kind) > 0.0 {
+                if xagent_sandbox::food_kind_metrics::signed_for_nourishing(
+                    raw[index],
+                    kind,
+                    *nourishing_kind,
+                ) > 0.0
+                {
                     counts[index] += 1;
                 }
             }
@@ -446,8 +477,8 @@ fn write_bundle(runs: &[RunFoodKindSummary], path: &Path) -> Result<(), VerdictE
     validate_runs(runs)?;
     let mut sorted = runs.to_vec();
     sorted.sort_by_key(|r| (r.seed, r.arm == Arm::Frozen));
-    let text = serde_json::to_string_pretty(&sorted)
-        .map_err(|e| VerdictError::Parse(e.to_string()))?;
+    let text =
+        serde_json::to_string_pretty(&sorted).map_err(|e| VerdictError::Parse(e.to_string()))?;
     std::fs::write(path, text).map_err(|e| VerdictError::Io(format!("{}: {e}", path.display())))
 }
 
@@ -535,7 +566,9 @@ mod tests {
             .collect()
     }
 
-    fn learning_agents_mut(runs: &mut [RunFoodKindSummary]) -> impl Iterator<Item = &mut AgentFoodKindSummary> {
+    fn learning_agents_mut(
+        runs: &mut [RunFoodKindSummary],
+    ) -> impl Iterator<Item = &mut AgentFoodKindSummary> {
         runs.iter_mut()
             .filter(|r| r.arm == Arm::Learning)
             .flat_map(|r| r.agents.iter_mut())

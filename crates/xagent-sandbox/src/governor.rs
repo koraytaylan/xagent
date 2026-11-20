@@ -154,7 +154,7 @@ const NODE_BRAIN_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS node_brain (
 /// Layout (all little-endian): `u32 brain_state_len`, `u32 patterns_len`, then
 /// `brain_state_len` `f32`s followed by `patterns_len` `f32`s. Returns `None`
 /// if a length does not fit a `u32` or the byte size overflows.
-fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
+pub(crate) fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
     let brain_len = u32::try_from(state.brain_state.len()).ok()?;
     let pattern_len = u32::try_from(state.patterns.len()).ok()?;
     let word_count = state
@@ -175,7 +175,7 @@ fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
 /// when the header is missing or the payload size disagrees with the lengths
 /// the header declares, or when the brain length matches no known layout.
 /// Blobs of the previous layout gain a zero pathway-route block.
-fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
+pub(crate) fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
     let raw = decode_raw_brain_state(bytes)?;
     let brain_state = xagent_brain::buffers::upgrade_legacy_brain_state(&raw.brain_state)?;
     Some(AgentBrainState {
@@ -368,7 +368,7 @@ pub fn load_champion_read_only(
 /// can no longer collapse the composite into the noise floor where foraging
 /// variance is invisible. `total_grid_cells` is the per-generation exploration
 /// denominator.
-fn composite_fitness(
+pub(crate) fn composite_fitness(
     death_count: u32,
     food_consumed: u32,
     cells_explored: u32,
@@ -842,7 +842,18 @@ impl Governor {
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q1_food_rate REAL;");
         let _ = db.execute_batch("ALTER TABLE node ADD COLUMN q4_food_rate REAL;");
         let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
+        let _ = db.execute_batch("ALTER TABLE run ADD COLUMN mode TEXT DEFAULT 'generations';");
         db.execute_batch(NODE_BRAIN_SCHEMA)?;
+
+        let run_mode: String = db.query_row(
+            "SELECT COALESCE(mode, 'generations') FROM run ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if run_mode == "supervisor" {
+            log::warn!("refusing to resume a run recorded in '{run_mode}' mode");
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
 
         let (run_id, run_seed, governor_json, spawn_parent_id, momentum_json): (
             i64,
@@ -1024,7 +1035,7 @@ impl Governor {
         // Absolute fitness scoring — no intra-generational normalization.
         // The exploration denominator is the reachable quarter of the heatmap
         // grid; foraging is food per unit energy burned.
-        let total_grid_cells = (HEATMAP_RES * HEATMAP_RES / 4) as f32;
+        let total_grid_cells = exploration_grid_cells();
 
         for r in &mut results {
             r.composite_fitness = composite_fitness(
@@ -2225,7 +2236,12 @@ pub struct TreeNode {
 
 // ── Schema & helpers ────────────────────────────────────────────────────
 
-fn init_schema(db: &Connection) -> SqlResult<()> {
+/// Per-generation exploration denominator: a quarter of the heatmap grid.
+pub(crate) fn exploration_grid_cells() -> f32 {
+    (HEATMAP_RES * HEATMAP_RES / 4) as f32
+}
+
+pub(crate) fn init_schema(db: &Connection) -> SqlResult<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS run (
             id INTEGER PRIMARY KEY,
@@ -2286,6 +2302,7 @@ fn init_schema(db: &Connection) -> SqlResult<()> {
 
     // Backwards-compatible migration: cumulative simulation ticks of the run.
     let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN mode TEXT DEFAULT 'generations';");
 
     // Backwards-compatible migration: add island_id if missing
     let _ = db.execute_batch("ALTER TABLE node ADD COLUMN island_id INTEGER;");
@@ -2497,9 +2514,130 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
+    }
+
+    // ─── run mode column tests ──────────────────────────────────────
+
+    /// Baseline `run` and `node` tables without the `mode` column, with one
+    /// run whose `mode` is not set by the caller.
+    fn create_pre_plan_db(path: &str) {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE run (
+                id INTEGER PRIMARY KEY,
+                seed INTEGER NOT NULL,
+                governor_config TEXT NOT NULL,
+                brain_config TEXT NOT NULL,
+                world_config TEXT NOT NULL,
+                started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                wall_time_secs REAL DEFAULT 0,
+                best_score REAL DEFAULT -1,
+                spawn_parent_id INTEGER,
+                momentum_json TEXT DEFAULT '[]'
+            );
+            CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER REFERENCES run(id),
+                parent_id INTEGER REFERENCES node(id),
+                generation INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                best_fitness REAL,
+                avg_fitness REAL,
+                mutated_param TEXT,
+                mutation_direction REAL,
+                status TEXT DEFAULT 'active',
+                spawn_attempts INTEGER DEFAULT 0,
+                island_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO run (id, seed, governor_config, brain_config, world_config)
+                VALUES (1, 7, '{}', '{}', '{}');
+            INSERT INTO node (id, run_id, generation, config_json)
+                VALUES (1, 1, 0, '{}');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn evolution_mode_pre_plan_database_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre_plan.db");
+        let path = path.to_str().unwrap();
+        create_pre_plan_db(path);
+        let gov = Governor::resume(path).unwrap();
+        assert_eq!(
+            gov.config.evolution_mode,
+            xagent_shared::EvolutionMode::Generations
+        );
+        let db = Connection::open(path).unwrap();
+        let mode: String = db
+            .query_row("SELECT mode FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "generations");
+    }
+
+    #[test]
+    fn evolution_mode_migration_is_idempotent() {
+        let db = Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+        init_schema(&db).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('run') WHERE name = 'mode'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn evolution_mode_resume_refuses_supervisor_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.db");
+        let path = path.to_str().unwrap();
+        create_pre_plan_db(path);
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(
+            "ALTER TABLE run ADD COLUMN mode TEXT DEFAULT 'generations';
+             UPDATE run SET mode = 'supervisor';",
+        )
+        .unwrap();
+        drop(db);
+        assert!(Governor::resume(path).is_err());
+    }
+
+    #[test]
+    fn evolution_mode_new_run_records_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new_run.db");
+        let path = path.to_str().unwrap();
+        let _gov = Governor::new_seeded(
+            path,
+            GovernorConfig::default(),
+            &BrainConfig::default(),
+            "{}",
+            7,
+        )
+        .unwrap();
+        let db = Connection::open(path).unwrap();
+        let mode: String = db
+            .query_row("SELECT mode FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "generations");
+    }
+
+    #[test]
+    fn evolution_mode_exploration_grid_cells_is_quarter_heatmap() {
+        assert_eq!(
+            exploration_grid_cells(),
+            (HEATMAP_RES * HEATMAP_RES / 4) as f32
+        );
+        assert_eq!(exploration_grid_cells(), 1024.0);
     }
 
     // ─── brain blob decode tests ────────────────────────────────────
@@ -2611,6 +2749,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         Governor::new(":memory:", config, &brain, "{}").unwrap()
@@ -3119,6 +3258,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: CALIBRATION_MOMENTUM_DECAY,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -3972,6 +4112,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4021,6 +4162,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4179,6 +4321,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4297,6 +4440,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4415,6 +4559,7 @@ mod tests {
             num_islands: 3,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4445,6 +4590,7 @@ mod tests {
             num_islands: 3,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4648,6 +4794,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4707,6 +4854,7 @@ mod tests {
             num_islands: 2,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
 
@@ -4748,6 +4896,7 @@ mod tests {
             num_islands: 3,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4767,6 +4916,7 @@ mod tests {
             num_islands: 3,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4834,6 +4984,7 @@ mod tests {
             num_islands: 2,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4876,6 +5027,7 @@ mod tests {
             num_islands: 2,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4913,6 +5065,7 @@ mod tests {
             num_islands: 2,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -4958,6 +5111,7 @@ mod tests {
             num_islands: 2,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let mut gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -5000,6 +5154,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let _gov_init = Governor::new(":memory:", config.clone(), &brain, "{}").unwrap();
@@ -5103,6 +5258,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let brain = BrainConfig::default();
         let gov = Governor::new(":memory:", config, &brain, "{}").unwrap();
@@ -5746,6 +5902,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         Governor::new_seeded(db_path, config, &BrainConfig::default(), "{}", seed)
             .expect("Governor::new_seeded")
@@ -5889,6 +6046,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let gov = Governor::new(db_path, config, &BrainConfig::default(), "{}").unwrap();
         let config_json = serde_json::to_string(&BrainConfig::default()).unwrap();
@@ -6104,6 +6262,7 @@ mod tests {
             num_islands: 1,
             migration_interval: 0,
             momentum_decay: 0.9,
+            ..GovernorConfig::default()
         };
         let root_id = {
             let mut gov = Governor::new(db_path, config, &BrainConfig::default(), "{}").unwrap();

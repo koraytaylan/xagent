@@ -162,12 +162,18 @@ fn food_kind_meals_nourishing_and_harmful() {
     let control_energy = out.at(CONTROL, P_ENERGY);
 
     let gain = out.at(nourishing, P_ENERGY) - control_energy;
-    assert!((gain - out.food_energy).abs() <= LOSS_TOLERANCE, "gain {gain}");
+    assert!(
+        (gain - out.food_energy).abs() <= LOSS_TOLERANCE,
+        "gain {gain}"
+    );
     assert_eq!(out.at(nourishing, P_FOOD_COUNT), 1.0);
     assert_eq!(out.at(nourishing, P_HARMFUL_MEAL_COUNT), 0.0);
 
     let harmful_gain = out.at(harmful, P_ENERGY) - control_energy;
-    assert!(harmful_gain.abs() <= LOSS_TOLERANCE, "harmful gain {harmful_gain}");
+    assert!(
+        harmful_gain.abs() <= LOSS_TOLERANCE,
+        "harmful gain {harmful_gain}"
+    );
     let lost = FULL_METER - out.at(harmful, P_INTEGRITY);
     let expected = expected_loss(out.food_energy);
     assert!(

@@ -865,6 +865,81 @@ fn with_plain_grid_bindings(common: &str) -> String {
     source
 }
 
+/// Spawn parameters for one agent slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlotSpawn {
+    pub position: glam::Vec3,
+    pub max_energy: f32,
+    pub max_integrity: f32,
+    pub memory_capacity: usize,
+    pub processing_slots: usize,
+}
+
+/// The full physics row for a freshly spawned agent, as `(slot, value)` pairs
+/// in slot order. Slots not named here start at 0.0.
+pub fn slot_spawn_physics_row(spawn: &SlotSpawn) -> Vec<(usize, f32)> {
+    let mut row = vec![0.0f32; PHYS_STRIDE];
+    row[P_POS_X] = spawn.position.x;
+    row[P_POS_Y] = spawn.position.y;
+    row[P_POS_Z] = spawn.position.z;
+    row[P_FACING_Z] = 1.0;
+    row[P_ENERGY] = spawn.max_energy;
+    row[P_MAX_ENERGY] = spawn.max_energy;
+    row[P_PREV_ENERGY] = spawn.max_energy;
+    row[P_INTEGRITY] = spawn.max_integrity;
+    row[P_MAX_INTEGRITY] = spawn.max_integrity;
+    row[P_PREV_INTEGRITY] = spawn.max_integrity;
+    row[P_ALIVE] = 1.0;
+    row[P_MEMORY_CAP] = spawn.memory_capacity as f32;
+    row[P_PROCESSING_SLOTS] = spawn.processing_slots as f32;
+    row.into_iter().enumerate().collect()
+}
+
+/// Why `replace_agent_slot` refused a write.
+#[derive(Debug)]
+pub enum SlotReplaceError {
+    IndexOutOfRange { index: u32, agent_count: u32 },
+    BrainStateLength { expected: usize, actual: usize },
+    PatternLength { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for SlotReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfRange { index, agent_count } => {
+                write!(
+                    f,
+                    "agent index {index} out of range (agent_count={agent_count})"
+                )
+            }
+            Self::BrainStateLength { expected, actual } => {
+                write!(f, "brain_state length {actual}, expected {expected}")
+            }
+            Self::PatternLength { expected, actual } => {
+                write!(f, "patterns length {actual}, expected {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SlotReplaceError {}
+
+/// Why `set_nourishing_food_kind` refused.
+#[derive(Debug)]
+pub enum FoodKindSetError {
+    FoodKindsDisabled,
+}
+
+impl std::fmt::Display for FoodKindSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FoodKindsDisabled => write!(f, "food kinds are disabled"),
+        }
+    }
+}
+
+impl std::error::Error for FoodKindSetError {}
+
 #[allow(dead_code)] // GPU buffers are read via bind groups, not Rust field access
 pub struct GpuKernel {
     device: wgpu::Device,
@@ -1107,10 +1182,8 @@ impl GpuKernel {
     /// Redraw the nourishing kind when food kinds are on; no-op otherwise.
     fn draw_food_kind(&mut self) {
         if self.food_kinds_enabled {
-            self.nourishing_food_kind = Some(
-                self.world_config
-                    .nourishing_food_kind(self.food_kind_draws),
-            );
+            self.nourishing_food_kind =
+                Some(self.world_config.nourishing_food_kind(self.food_kind_draws));
             self.food_kind_draws += 1;
         }
     }
@@ -1370,6 +1443,17 @@ impl GpuKernel {
             return;
         }
         *out = decoded;
+    }
+
+    /// Set the nourishing food kind without drawing. The kernel's owning
+    /// thread is the only caller. Refused when food kinds are disabled.
+    pub fn set_nourishing_food_kind(&mut self, kind: FoodKind) -> Result<(), FoodKindSetError> {
+        if !self.food_kinds_enabled {
+            return Err(FoodKindSetError::FoodKindsDisabled);
+        }
+        self.nourishing_food_kind = Some(kind);
+        self.world_config_scratch[WC_FOOD_KINDS] = food_kinds_slot_value(Some(kind));
+        Ok(())
     }
 
     /// Hold (`true`) or release (`false`) the turn-policy weights. The flag is
@@ -2553,21 +2637,20 @@ impl GpuKernel {
     ) {
         let _vulkan = vulkan_gate::enter();
         let mut data = vec![0.0f32; self.agent_count as usize * PHYS_STRIDE];
-        for (i, &(pos, max_e, max_i, mem_cap, proc_slots)) in agents.iter().enumerate() {
+        for (i, &(position, max_energy, max_integrity, memory_capacity, processing_slots)) in
+            agents.iter().enumerate()
+        {
             let base = i * PHYS_STRIDE;
-            data[base + P_POS_X] = pos.x;
-            data[base + P_POS_Y] = pos.y;
-            data[base + P_POS_Z] = pos.z;
-            data[base + P_FACING_Z] = 1.0;
-            data[base + P_ENERGY] = max_e;
-            data[base + P_MAX_ENERGY] = max_e;
-            data[base + P_INTEGRITY] = max_i;
-            data[base + P_MAX_INTEGRITY] = max_i;
-            data[base + P_PREV_ENERGY] = max_e;
-            data[base + P_PREV_INTEGRITY] = max_i;
-            data[base + P_ALIVE] = 1.0;
-            data[base + P_MEMORY_CAP] = mem_cap as f32;
-            data[base + P_PROCESSING_SLOTS] = proc_slots as f32;
+            let row = slot_spawn_physics_row(&SlotSpawn {
+                position,
+                max_energy,
+                max_integrity,
+                memory_capacity,
+                processing_slots,
+            });
+            for (slot, value) in row {
+                data[base + slot] = value;
+            }
         }
         self.queue
             .write_buffer(&self.agent_phys_buffer, 0, bytemuck::cast_slice(&data));
@@ -3977,6 +4060,40 @@ impl GpuKernel {
                 bytemuck::cast_slice(&[value]),
             );
         }
+    }
+
+    /// Replace one agent slot with a newborn: brain state, heritable config and
+    /// the spawn physics row. A single-slot write used between dispatches; it
+    /// touches no other agent. Inputs are validated before any write.
+    pub fn replace_agent_slot(
+        &self,
+        index: u32,
+        birth: &AgentBrainState,
+        config: &BrainConfig,
+        spawn: &SlotSpawn,
+    ) -> Result<(), SlotReplaceError> {
+        if index >= self.agent_count {
+            return Err(SlotReplaceError::IndexOutOfRange {
+                index,
+                agent_count: self.agent_count,
+            });
+        }
+        if birth.brain_state.len() != self.layout.brain_stride {
+            return Err(SlotReplaceError::BrainStateLength {
+                expected: self.layout.brain_stride,
+                actual: birth.brain_state.len(),
+            });
+        }
+        if birth.patterns.len() != PATTERN_STRIDE {
+            return Err(SlotReplaceError::PatternLength {
+                expected: PATTERN_STRIDE,
+                actual: birth.patterns.len(),
+            });
+        }
+        self.write_agent_state(index, birth);
+        self.write_agent_heritable_config(index, config);
+        self.write_agent_physics_fields(index, &slot_spawn_physics_row(spawn));
+        Ok(())
     }
 
     /// Non-blocking: kick off async readback of one agent's brain state.

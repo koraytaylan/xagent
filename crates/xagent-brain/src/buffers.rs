@@ -10,7 +10,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use xagent_shared::{BrainConfig, FoodKind,SensoryFrame, TouchContact};
+use xagent_shared::{BrainConfig, FoodKind, SensoryFrame, TouchContact};
 
 use crate::complex::VISUAL_FEATURE_COUNT;
 use crate::senses::{MotorRoute, SenseDescriptor, Whitening, DECLARED_SENSES, MAX_SENSE_SLOTS};

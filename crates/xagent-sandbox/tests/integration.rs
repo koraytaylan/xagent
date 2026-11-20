@@ -7424,6 +7424,7 @@ fn recorded_telemetry_persists_in_agent_fitness() {
         num_islands: 1,
         migration_interval: 0,
         momentum_decay: 0.9,
+        ..GovernorConfig::default()
     };
     let gov = Governor::new(":memory:", gov_config, &brain, "{}").unwrap();
 

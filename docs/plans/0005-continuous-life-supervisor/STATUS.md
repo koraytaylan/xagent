@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: continuous life supervisor
@@ -23,3 +23,7 @@ Progress: 0/15 tasks complete.
 | gui-supervisor-wiring | GUI start, events and snapshot for supervisor mode | todo |
 | supervisor-verdict | Fail-closed supervisor verdict binary | todo |
 | supervisor-decision | Supervisor evidence runs and decision record | todo |
+
+## Factory runs
+
+- 2026-11-20 22:02:11Z — completed 15/15; final plan gates passed

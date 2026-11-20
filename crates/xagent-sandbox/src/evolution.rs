@@ -14,7 +14,7 @@ use rand::Rng;
 use xagent_brain::AgentBrainState;
 use xagent_sandbox::agent::{mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{reset_database, AdvanceResult, Governor};
-use xagent_sandbox::ui::{EvolutionAction, EvolutionSnapshot, EvolutionState};
+use xagent_sandbox::ui::{EvolutionAction, EvolutionSnapshot, EvolutionState, SupervisorSnapshot};
 use xagent_shared::BrainConfig;
 
 use crate::app::{App, PendingGeneration};
@@ -47,6 +47,34 @@ impl App {
             EvolutionAction::Start => {
                 let brain_config = self.evo_snapshot.edit_brain.clone();
                 let gov_config = self.evo_snapshot.edit_governor.clone();
+                if gov_config.evolution_mode == xagent_shared::EvolutionMode::Supervisor {
+                    let population = gov_config.population_size as u64;
+                    let budget = gov_config.supervisor.agent_tick_budget;
+                    let total_ticks = if budget > 0 && population > 0 {
+                        Some(budget / population)
+                    } else {
+                        None
+                    };
+                    self.governor_config = gov_config;
+                    self.brain_config = brain_config;
+                    self.evo_snapshot.state = EvolutionState::Running;
+                    self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
+                        total_ticks,
+                        ..Default::default()
+                    });
+                    self.evo_wall_accumulated = 0.0;
+                    self.session_tick_count = 0;
+                    self.evo_wall_segment_start = Some(Instant::now());
+                    self.tps_tick_count = 0;
+                    self.tps_last_reset = Instant::now();
+                    self.tps_display = 0.0;
+                    self.paused = false;
+                    self.stop_sim_worker();
+                    self.spawn_evolution_population();
+                    self.start_sim_worker();
+                    self.log_msg("[EVOLUTION] Started supervisor run".into());
+                    return;
+                }
                 let world_json = serde_json::to_string(&self.world_config).unwrap_or_default();
                 match Governor::new_seeded(
                     &self.db_path,

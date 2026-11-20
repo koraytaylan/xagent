@@ -7,8 +7,8 @@ role: architect
 depends_on: [evolution-cli, supervisor-verdict]
 gated: false
 touches: [docs/measurements/continuous-supervisor/DECISION.md, docs/measurements/continuous-supervisor/results.json]
-status: todo
-merged_as: ""
+status: done
+merged_as: "7f16e89d0221c496e303b586636d92b9f6e7922e"
 checks:
   - name: decision-consistency
     command: |-

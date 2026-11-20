@@ -7,8 +7,8 @@ role: developer
 depends_on: [worker-supervisor]
 gated: false
 touches: [crates/xagent-sandbox/src/ui.rs, crates/xagent-sandbox/src/evolution.rs, crates/xagent-sandbox/src/gpu_orchestration.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "53b6eb84e6ac3c3f226259bece45170b15fc9a1f"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --lib ui::tests::supervisor_"}
   - {name: gui-bin-tests, command: "cargo test -p xagent-sandbox --bin xagent -- gui_supervisor_"}

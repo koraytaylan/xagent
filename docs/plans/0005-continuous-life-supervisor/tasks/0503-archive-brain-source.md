@@ -7,8 +7,8 @@ role: developer
 depends_on: [generation-run-summary, supervisor-verdict]
 gated: false
 touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/archive_free_life.rs, crates/xagent-sandbox/src/bin/pathway_route_gate.rs, crates/xagent-sandbox/src/bin/supervisor_verdict.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "6e7a7603731eededb4058a70945416a48b2088df"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test archive_free_life", timeout_ms: 3600000}
   - {name: headless-lib-tests, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --lib headless::tests::", timeout_ms: 3600000}

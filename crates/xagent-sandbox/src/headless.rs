@@ -10,7 +10,13 @@ use std::time::Instant;
 use log::info;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use xagent_shared::{BrainConfig, FullConfig};
+use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, SUPERVISOR_SAMPLE_TICKS};
+
+use crate::run_summary::{RunSummaryAccumulator, RunSummaryError};
+use crate::supervisor_run::{SampleReport, SupervisorFinish, SupervisorRun, SupervisorRunError};
+use crate::supervisor_store::{
+    load_archive_entry_read_only, ArchiveLoadError, StoreError, SupervisorStore,
+};
 
 use xagent_brain::buffers::{
     fixed_tail_base, SenseBlockOffsets, P_FACING_X, P_FACING_Z, P_HARMFUL_MEAL_COUNT,
@@ -75,9 +81,266 @@ fn write_steering_population(
     }
 }
 
+/// Options of a headless run beyond the config.
+#[derive(Clone, Debug, Default)]
+pub struct HeadlessOptions {
+    /// Where to write the run summary as JSON; `None` skips measurement.
+    pub run_summary: Option<PathBuf>,
+}
+
+/// Why a headless run failed.
+#[derive(Debug)]
+pub enum HeadlessError {
+    /// Supervisor runs cannot resume.
+    ResumeInSupervisorMode,
+    /// The supervisor store failed.
+    Store(StoreError),
+    /// The supervisor run failed.
+    SupervisorRun(SupervisorRunError),
+    /// The run summary could not be encoded, produced or written; encode
+    /// failures arrive as `std::io::Error` through serde_json's conversion.
+    Summary(std::io::Error),
+    /// The agent-tick budget is not a whole number of generations.
+    InvalidAgentTickBudget,
+}
+
+impl fmt::Display for HeadlessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResumeInSupervisorMode => write!(f, "supervisor runs cannot be resumed"),
+            Self::Store(e) => write!(f, "{e}"),
+            Self::SupervisorRun(e) => write!(f, "{e}"),
+            Self::Summary(e) => write!(f, "run summary could not be written: {e}"),
+            Self::InvalidAgentTickBudget => write!(
+                f,
+                "the agent-tick budget must be a positive whole multiple of population times tick budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HeadlessError {}
+
+impl From<StoreError> for HeadlessError {
+    fn from(err: StoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+impl From<SupervisorRunError> for HeadlessError {
+    fn from(err: SupervisorRunError) -> Self {
+        Self::SupervisorRun(err)
+    }
+}
+
+impl From<std::io::Error> for HeadlessError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Summary(err)
+    }
+}
+
+impl From<serde_json::Error> for HeadlessError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Summary(err.into())
+    }
+}
+
 /// Run the headless evolution loop: no window, no rendering, max speed.
-/// Creates a Governor, runs generations until complete or interrupted.
+/// Picks the driver from `governor.evolution_mode`; errors are printed.
 pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: bool) {
+    if let Err(err) =
+        run_headless_with_options(config, db_path, resume, &HeadlessOptions::default())
+    {
+        eprintln!("{err}");
+    }
+}
+
+/// Run the headless driver the config's evolution mode selects.
+///
+/// # Errors
+///
+/// Returns a [`HeadlessError`] for an unsupported option combination or a
+/// failed supervisor run, store or summary write.
+pub fn run_headless_with_options(
+    config: FullConfig,
+    db_path: &str,
+    resume: bool,
+    options: &HeadlessOptions,
+) -> Result<(), HeadlessError> {
+    match config.governor.evolution_mode {
+        EvolutionMode::Generations => {
+            let Some(path) = options.run_summary.as_ref() else {
+                run_generations(config, db_path, resume, None)?;
+                return Ok(());
+            };
+            let mut acc = RunSummaryAccumulator::new(
+                EvolutionMode::Generations,
+                None,
+                config.world.seed,
+                config.governor.population_size,
+                config.world.food_kinds_enabled,
+            );
+            let ticks = run_generations(config, db_path, resume, Some(&mut acc))?;
+            let summary = acc.finish(ticks).map_err(summary_error)?;
+            let json = serde_json::to_string_pretty(&summary)?;
+            std::fs::write(path, json)?;
+            Ok(())
+        }
+        EvolutionMode::Supervisor => {
+            if resume {
+                return Err(HeadlessError::ResumeInSupervisorMode);
+            }
+            run_supervisor(config, db_path, options)
+        }
+    }
+}
+
+/// One sample period as the kernel's batch tick count, checked at compile time.
+const SAMPLE_BATCH_TICKS: u32 = {
+    assert!(SUPERVISOR_SAMPLE_TICKS <= u32::MAX as u64);
+    SUPERVISOR_SAMPLE_TICKS as u32
+};
+
+/// Run the supervisor loop on one kernel and write the summary when asked.
+fn run_supervisor(
+    config: FullConfig,
+    db_path: &str,
+    options: &HeadlessOptions,
+) -> Result<(), HeadlessError> {
+    let store = SupervisorStore::create(db_path, &config)?;
+    // A population past u32 has a last slot index the kernel cannot address.
+    let population = u32::try_from(config.governor.population_size).map_err(|_| {
+        SupervisorRunError::SlotRange {
+            slot: config.governor.population_size - 1,
+        }
+    })?;
+    let batch = SAMPLE_BATCH_TICKS;
+    let food_count = WorldState::new(config.world.clone()).food_items.len();
+    let mut kernel = GpuKernel::new(population, food_count, &config.brain, &config.world);
+    let mut run = SupervisorRun::start(
+        &mut kernel,
+        &config,
+        Some(store),
+        options.run_summary.is_some(),
+    )?;
+    println!("Supervisor run | Population: {population}");
+    let mut next_progress = 1_u64;
+    while !run.is_finished() {
+        let report = supervisor_step(&mut run, &mut kernel, batch)?;
+        print_supervisor_progress(&report, run.total_ticks(), &mut next_progress);
+    }
+    let finish = run.finish()?;
+    write_run_summary(finish, options)
+}
+
+/// Dispatch one sample period, read it back and hand it to the run.
+fn supervisor_step(
+    run: &mut SupervisorRun,
+    kernel: &mut GpuKernel,
+    batch: u32,
+) -> Result<SampleReport, HeadlessError> {
+    kernel.dispatch_batch(run.tick(), batch);
+    while !kernel.try_collect_state_snapshot() {
+        std::thread::yield_now();
+    }
+    let physics = kernel.cached_state().to_vec();
+    let food = kernel.cached_food_state().map(<[f32]>::to_vec);
+    Ok(run.on_sample(kernel, run.next_sample_tick(), &physics, food.as_deref())?)
+}
+
+/// Number of progress steps across a bounded budget.
+const PROGRESS_STEPS: u64 = 10;
+
+/// Percent scale of the progress label.
+const PERCENT: u64 = 100;
+
+/// One line per replacement and season flip, plus one every 10% of the budget.
+fn print_supervisor_progress(report: &SampleReport, total: Option<u64>, next_progress: &mut u64) {
+    if let Some(boundary) = report.boundary.as_ref().filter(|b| b.slot.is_some()) {
+        println!(
+            "tick {} | replaced slot {:?} ({:?}) | archive {}",
+            boundary.tick, boundary.slot, boundary.reason, boundary.archive_len
+        );
+    }
+    if let Some(kind) = report.season {
+        println!("tick {} | season flip: nourishing {:?}", report.tick, kind);
+    }
+    if let Some(total) = total.filter(|t| *t > 0) {
+        while *next_progress <= PROGRESS_STEPS
+            && report.tick >= total.saturating_mul(*next_progress) / PROGRESS_STEPS
+        {
+            println!(
+                "tick {} / {} ({}%)",
+                report.tick,
+                total,
+                *next_progress * PERCENT / PROGRESS_STEPS
+            );
+            *next_progress += 1;
+        }
+    }
+}
+
+/// Write the run summary when one was requested.
+fn write_run_summary(
+    finish: SupervisorFinish,
+    options: &HeadlessOptions,
+) -> Result<(), HeadlessError> {
+    let Some(path) = options.run_summary.as_ref() else {
+        return Ok(());
+    };
+    let summary = finish.summary.ok_or_else(|| {
+        HeadlessError::Summary(std::io::Error::other("the run produced no summary"))
+    })?;
+    let json = serde_json::to_string_pretty(&summary)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+/// Convert a run-summary rejection into a [`HeadlessError`].
+fn summary_error(err: RunSummaryError) -> HeadlessError {
+    HeadlessError::Summary(std::io::Error::other(err.to_string()))
+}
+
+/// Convert an agent-tick budget into the `max_generations` that runs it.
+///
+/// The loop checks `evolution_complete()` at the top of each generation,
+/// which is `max > 0 && generation + 1 >= max`. A fresh governor starts at
+/// `generation = 0`, and `advance` breeds (increments `generation`) only when
+/// it does not finish. So generation indices `0..max-1` run, which is
+/// `max - 1` generations. With `q = budget / (population * tick_budget)`
+/// generations wanted, `max = q + 1`. Resumed runs are out of scope.
+///
+/// # Errors
+///
+/// [`HeadlessError::InvalidAgentTickBudget`] when an input is zero, the
+/// budget is not a multiple of `population * tick_budget`, or on overflow.
+pub fn max_generations_for_agent_ticks(
+    budget: u64,
+    population: usize,
+    tick_budget: u64,
+) -> Result<u64, HeadlessError> {
+    let population =
+        u64::try_from(population).map_err(|_| HeadlessError::InvalidAgentTickBudget)?;
+    let product = population
+        .checked_mul(tick_budget)
+        .ok_or(HeadlessError::InvalidAgentTickBudget)?;
+    if budget == 0 || product == 0 || budget % product != 0 {
+        return Err(HeadlessError::InvalidAgentTickBudget);
+    }
+    (budget / product)
+        .checked_add(1)
+        .ok_or(HeadlessError::InvalidAgentTickBudget)
+}
+
+/// The generation-mode loop: a governor, generations until complete or
+/// interrupted. Returns the ticks of completed generations.
+fn run_generations(
+    config: FullConfig,
+    db_path: &str,
+    resume: bool,
+    mut summary: Option<&mut RunSummaryAccumulator>,
+) -> Result<u64, HeadlessError> {
+    let mut completed_ticks: u64 = 0;
     info!("Running headless evolution");
     let world_json = serde_json::to_string(&config.world).unwrap_or_default();
     let start_time = Instant::now();
@@ -218,6 +481,13 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
 
         governor.gen_tick = 0;
 
+        let generation_start_tick = completed_ticks;
+        if let Some(acc) = summary.as_deref_mut() {
+            acc.reset_all_baselines();
+            acc.begin_season(generation_start_tick, kernel.nourishing_food_kind())
+                .map_err(summary_error)?;
+        }
+
         // Run generation in chunks
         let gen_start = Instant::now();
         let tick_budget = governor.config.tick_budget;
@@ -234,6 +504,14 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
             // Drain async readback, then sample cached state for heatmap
             while !kernel.try_collect_state_snapshot() {
                 std::thread::yield_now();
+            }
+            if let Some(acc) = summary.as_deref_mut() {
+                acc.record_physics_sample(
+                    generation_start_tick + ticks_done,
+                    kernel.cached_state(),
+                    kernel.cached_food_state(),
+                )
+                .map_err(summary_error)?;
             }
             let state = kernel.cached_state();
             for i in 0..agents.len() {
@@ -323,6 +601,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         );
 
         governor.update_wall_time(start_time.elapsed().as_secs_f64());
+        completed_ticks = completed_ticks.saturating_add(tick_budget);
         simulation_ticks = simulation_ticks.saturating_add(governor.config.tick_budget);
         governor.update_simulation_ticks(simulation_ticks);
 
@@ -361,6 +640,7 @@ pub fn run_headless(config: FullConfig, db_path: &str, resume: bool, _has_gpu: b
         total_time.as_secs_f64(),
         governor.generation,
     );
+    Ok(completed_ticks)
 }
 
 /// Store the accepted node's champion brain and return the brain the next
@@ -1459,6 +1739,13 @@ pub enum BrainSource {
         /// Node to load; `None` selects the newest stored champion.
         node_id: Option<i64>,
     },
+    /// A supervisor archive entry, read only.
+    Archive {
+        /// Path of the supervisor database.
+        db_path: String,
+        /// Rank of the entry in the archive, best first.
+        rank: usize,
+    },
 }
 
 /// Default number of agents in a free life.
@@ -1484,6 +1771,8 @@ const LESION_NONE: &str = "none";
 const SOURCE_FRESH: &str = "fresh";
 /// Report label of a stored champion birth brain.
 const SOURCE_CHAMPION: &str = "champion";
+/// Report label of a supervisor archive birth brain.
+const SOURCE_ARCHIVE: &str = "archive";
 
 /// Options of one seeded free life.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1550,11 +1839,25 @@ pub enum FreeLifeError {
     MissingSense(&'static str),
     /// The food-kind summary could not be serialised or written.
     SummaryIo(String),
+    /// The archive entry could not be loaded.
+    ArchiveLoad(ArchiveLoadError),
+    /// The archive entry's brain does not fit its config's layout.
+    ArchiveLayout {
+        /// Brain length the config's layout needs.
+        expected: usize,
+        /// Brain length stored.
+        found: usize,
+    },
 }
 
 impl fmt::Display for FreeLifeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArchiveLoad(err) => write!(f, "cannot load archive entry: {err:?}"),
+            Self::ArchiveLayout { expected, found } => write!(
+                f,
+                "archive brain has {found} values, its config needs {expected}"
+            ),
             Self::FoodKindChampion => write!(
                 f,
                 "--food-kinds cannot start from a stored champion brain; use a fresh brain"
@@ -1597,10 +1900,13 @@ pub struct FreeLifeReport {
     pub agent_count: usize,
     pub ticks: u64,
     pub seed: u64,
-    /// `"fresh"` or `"champion"`.
+    /// `"fresh"`, `"champion"` or `"archive"`.
     pub brain_source: String,
     pub champion_node_id: Option<i64>,
     pub champion_generation: Option<i64>,
+    /// Entry id of the archive entry; `Some` only for the archive source.
+    #[serde(default)]
+    pub archive_entry_id: Option<i64>,
     /// Names of the lesioned parts.
     pub lesions: Vec<String>,
     pub kernel_batch_size: u32,
@@ -1648,6 +1954,7 @@ struct Birth {
     champion_brain: Option<AgentBrainState>,
     node_id: Option<i64>,
     generation: Option<i64>,
+    archive_entry_id: Option<i64>,
 }
 
 /// Resolve the birth source, check its layout and the vision stride.
@@ -1658,7 +1965,29 @@ fn resolve_birth(config: &FullConfig, source: &BrainSource) -> Result<Birth, Fre
             champion_brain: None,
             node_id: None,
             generation: None,
+            archive_entry_id: None,
         },
+        BrainSource::Archive { db_path, rank } => {
+            let stored =
+                load_archive_entry_read_only(db_path, *rank).map_err(FreeLifeError::ArchiveLoad)?;
+            let expected = BrainLayout::from_config(&stored.config).brain_stride;
+            let found = stored.brain.brain_state.len();
+            if expected != found {
+                return Err(FreeLifeError::ArchiveLayout { expected, found });
+            }
+            let entry_id = i64::try_from(stored.entry_id).map_err(|_| {
+                FreeLifeError::ArchiveLoad(ArchiveLoadError::MalformedBlob {
+                    entry_id: stored.entry_id,
+                })
+            })?;
+            Birth {
+                brain_config: stored.config,
+                champion_brain: Some(stored.brain),
+                node_id: None,
+                generation: None,
+                archive_entry_id: Some(entry_id),
+            }
+        }
         BrainSource::Champion { db_path, node_id } => {
             let stored =
                 load_champion_read_only(db_path, *node_id).map_err(FreeLifeError::ChampionLoad)?;
@@ -1672,6 +2001,7 @@ fn resolve_birth(config: &FullConfig, source: &BrainSource) -> Result<Birth, Fre
                 champion_brain: Some(stored.brain),
                 node_id: Some(stored.node_id),
                 generation: Some(stored.generation),
+                archive_entry_id: None,
             }
         }
     };
@@ -2174,19 +2504,21 @@ fn run_free_life_inner(
         w.finish()
             .map_err(|e| FreeLifeError::LogIo(e.to_string()))?;
     }
-    let from_champion = birth.node_id.is_some();
+    let source_label = if birth.archive_entry_id.is_some() {
+        SOURCE_ARCHIVE
+    } else if birth.node_id.is_some() {
+        SOURCE_CHAMPION
+    } else {
+        SOURCE_FRESH
+    };
     let report = FreeLifeReport {
         agent_count: options.agent_count,
         ticks: options.ticks,
         seed: options.seed,
-        brain_source: if from_champion {
-            SOURCE_CHAMPION
-        } else {
-            SOURCE_FRESH
-        }
-        .to_string(),
+        brain_source: source_label.to_string(),
         champion_node_id: birth.node_id,
         champion_generation: birth.generation,
+        archive_entry_id: birth.archive_entry_id,
         lesions: lesion_names(options.lesions)
             .into_iter()
             .map(str::to_string)

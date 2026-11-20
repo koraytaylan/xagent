@@ -7,8 +7,8 @@ role: developer
 depends_on: [run-summary]
 gated: false
 touches: [crates/xagent-sandbox/src/bin/supervisor_verdict.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "2482a7ce95cf9875544805ca216ee142218a57f6"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --bin supervisor_verdict"}
   - {name: main-binary-help, command: "cargo run -p xagent-sandbox -- --help"}

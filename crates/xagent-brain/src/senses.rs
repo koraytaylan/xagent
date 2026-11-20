@@ -487,8 +487,12 @@ mod tests {
         );
         match (SECOND_ODOUR.whitening, SMELL.whitening) {
             (
-                Whitening::ClosedForm2 { initial_variance: a },
-                Whitening::ClosedForm2 { initial_variance: b },
+                Whitening::ClosedForm2 {
+                    initial_variance: a,
+                },
+                Whitening::ClosedForm2 {
+                    initial_variance: b,
+                },
             ) => assert_eq!(a.to_bits(), b.to_bits()),
             _ => panic!("second odour must use smell's closed-form whitening"),
         }

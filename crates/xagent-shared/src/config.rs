@@ -653,6 +653,233 @@ pub struct GovernorConfig {
     /// Higher = longer memory of winning mutation directions.
     #[serde(default = "default_momentum_decay")]
     pub momentum_decay: f32,
+    /// How evolution is driven: fixed generations or a continuous supervisor.
+    #[serde(default)]
+    pub evolution_mode: EvolutionMode,
+    /// Settings used only in supervisor mode.
+    #[serde(default)]
+    pub supervisor: SupervisorConfig,
+}
+
+/// How evolution is driven.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionMode {
+    /// Fixed-length generations (the original behaviour).
+    #[default]
+    Generations,
+    /// One continuous life with local replacement.
+    Supervisor,
+}
+
+/// What a supervisor newborn inherits from its parent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Inheritance {
+    /// Mutated birth genome only.
+    #[default]
+    Darwinian,
+    /// Copy of a living agent's learned state (comparison arm only).
+    WeightCopy,
+}
+
+/// Headless readback interval; every supervisor tick value is a multiple of it.
+pub const SUPERVISOR_SAMPLE_TICKS: u64 = 100;
+
+/// Largest permitted supervisor archive capacity.
+pub const MAX_ARCHIVE_CAPACITY: usize = 1024;
+
+/// One replacement per 4,000 ticks matches the generation reference's turnover
+/// (10 agents per 40,000-tick generation).
+pub const DEFAULT_BOUNDARY_INTERVAL_TICKS: u64 = 4_000;
+
+/// Half a 40,000-tick generation before an agent can be judged an underperformer.
+pub const DEFAULT_MIN_AGE_TICKS: u64 = 20_000;
+
+/// A quarter generation, the within-life tracker's window.
+pub const DEFAULT_SCORE_WINDOW_TICKS: u64 = 10_000;
+
+/// Bounded parent pool holding several generations of champions.
+pub const DEFAULT_ARCHIVE_CAPACITY: usize = 32;
+
+/// One food-kind season per generation length.
+pub const DEFAULT_SEASON_PERIOD_TICKS: u64 = 40_000;
+
+/// Fewest agents a supervisor run needs: replacement copies one agent into another's slot.
+pub const MIN_SUPERVISOR_AGENTS: usize = 2;
+
+/// Fewest sample periods a boundary or season span must cover, so each span holds a full sample interval.
+pub const MIN_SPAN_SAMPLES: u64 = 2;
+
+/// Zero means the supervisor run has no agent-tick limit.
+pub const DEFAULT_AGENT_TICK_BUDGET: u64 = 0;
+
+fn default_boundary_interval_ticks() -> u64 {
+    DEFAULT_BOUNDARY_INTERVAL_TICKS
+}
+
+fn default_min_age_ticks() -> u64 {
+    DEFAULT_MIN_AGE_TICKS
+}
+
+fn default_score_window_ticks() -> u64 {
+    DEFAULT_SCORE_WINDOW_TICKS
+}
+
+fn default_archive_capacity() -> usize {
+    DEFAULT_ARCHIVE_CAPACITY
+}
+
+fn default_season_period_ticks() -> u64 {
+    DEFAULT_SEASON_PERIOD_TICKS
+}
+
+fn default_inheritance() -> Inheritance {
+    Inheritance::default()
+}
+
+fn default_agent_tick_budget() -> u64 {
+    DEFAULT_AGENT_TICK_BUDGET
+}
+
+/// Settings for the continuous-life supervisor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorConfig {
+    /// Ticks between replacement boundaries.
+    #[serde(default = "default_boundary_interval_ticks")]
+    pub boundary_interval_ticks: u64,
+    /// Minimum age before an agent can be replaced for low score.
+    #[serde(default = "default_min_age_ticks")]
+    pub min_age_ticks: u64,
+    /// Length of the score window.
+    #[serde(default = "default_score_window_ticks")]
+    pub score_window_ticks: u64,
+    /// Maximum archive entries.
+    #[serde(default = "default_archive_capacity")]
+    pub archive_capacity: usize,
+    /// Ticks between food-kind seasons.
+    #[serde(default = "default_season_period_ticks")]
+    pub season_period_ticks: u64,
+    /// What newborns inherit.
+    #[serde(default = "default_inheritance")]
+    pub inheritance: Inheritance,
+    /// Total agent-tick budget (0 = unlimited).
+    #[serde(default = "default_agent_tick_budget")]
+    pub agent_tick_budget: u64,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            boundary_interval_ticks: default_boundary_interval_ticks(),
+            min_age_ticks: default_min_age_ticks(),
+            score_window_ticks: default_score_window_ticks(),
+            archive_capacity: default_archive_capacity(),
+            season_period_ticks: default_season_period_ticks(),
+            inheritance: default_inheritance(),
+            agent_tick_budget: default_agent_tick_budget(),
+        }
+    }
+}
+
+/// Reason a [`SupervisorConfig`] is infeasible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorConfigError {
+    /// Fewer than two agents.
+    AgentCountTooSmall { agent_count: usize },
+    /// Boundary interval not a multiple of the sample grid or too small.
+    BoundaryIntervalInvalid,
+    /// Season period not a multiple of the sample grid or too small.
+    SeasonPeriodInvalid,
+    /// Score window zero or not a multiple of the sample grid.
+    ScoreWindowInvalid,
+    /// Minimum age is below the score window.
+    MinAgeBelowWindow,
+    /// Archive capacity outside 1..=MAX_ARCHIVE_CAPACITY.
+    ArchiveCapacityOutOfRange { archive_capacity: usize },
+    /// Budget not a multiple of agent count times the sample grid.
+    AgentTickBudgetNotAligned,
+    /// Budget alignment computation overflowed.
+    AgentTickBudgetOverflow,
+}
+
+impl std::fmt::Display for SupervisorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentCountTooSmall { agent_count } => {
+                write!(f, "supervisor needs at least 2 agents, got {agent_count}")
+            }
+            Self::BoundaryIntervalInvalid => write!(
+                f,
+                "boundary_interval_ticks must be a multiple of {SUPERVISOR_SAMPLE_TICKS} and at least twice that"
+            ),
+            Self::SeasonPeriodInvalid => write!(
+                f,
+                "season_period_ticks must be a multiple of {SUPERVISOR_SAMPLE_TICKS} and at least twice that"
+            ),
+            Self::ScoreWindowInvalid => write!(
+                f,
+                "score_window_ticks must be a nonzero multiple of {SUPERVISOR_SAMPLE_TICKS}"
+            ),
+            Self::MinAgeBelowWindow => {
+                write!(f, "min_age_ticks must be at least score_window_ticks")
+            }
+            Self::ArchiveCapacityOutOfRange { archive_capacity } => write!(
+                f,
+                "archive_capacity {archive_capacity} must be in 1..={MAX_ARCHIVE_CAPACITY}"
+            ),
+            Self::AgentTickBudgetNotAligned => write!(
+                f,
+                "agent_tick_budget must be a multiple of agent_count * {SUPERVISOR_SAMPLE_TICKS}"
+            ),
+            Self::AgentTickBudgetOverflow => {
+                write!(f, "agent_count * {SUPERVISOR_SAMPLE_TICKS} overflows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SupervisorConfigError {}
+
+impl SupervisorConfig {
+    /// Checks the schedule is feasible for `agent_count` agents, returning the
+    /// first failing rule: agent count, boundary interval, season period,
+    /// score window, minimum age, archive capacity, then tick budget alignment.
+    pub fn validate(&self, agent_count: usize) -> Result<(), SupervisorConfigError> {
+        use SupervisorConfigError as E;
+        if agent_count < MIN_SUPERVISOR_AGENTS {
+            return Err(E::AgentCountTooSmall { agent_count });
+        }
+        let min_span = MIN_SPAN_SAMPLES * SUPERVISOR_SAMPLE_TICKS;
+        let grid = |v: u64| v % SUPERVISOR_SAMPLE_TICKS == 0;
+        if !grid(self.boundary_interval_ticks) || self.boundary_interval_ticks < min_span {
+            return Err(E::BoundaryIntervalInvalid);
+        }
+        if !grid(self.season_period_ticks) || self.season_period_ticks < min_span {
+            return Err(E::SeasonPeriodInvalid);
+        }
+        if self.score_window_ticks == 0 || !grid(self.score_window_ticks) {
+            return Err(E::ScoreWindowInvalid);
+        }
+        if self.min_age_ticks < self.score_window_ticks {
+            return Err(E::MinAgeBelowWindow);
+        }
+        if self.archive_capacity < 1 || self.archive_capacity > MAX_ARCHIVE_CAPACITY {
+            return Err(E::ArchiveCapacityOutOfRange {
+                archive_capacity: self.archive_capacity,
+            });
+        }
+        if self.agent_tick_budget != 0 {
+            let unit = u64::try_from(agent_count)
+                .ok()
+                .and_then(|n| n.checked_mul(SUPERVISOR_SAMPLE_TICKS))
+                .ok_or(E::AgentTickBudgetOverflow)?;
+            if self.agent_tick_budget % unit != 0 {
+                return Err(E::AgentTickBudgetNotAligned);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Default population (agents per generation).
@@ -711,6 +938,8 @@ impl Default for GovernorConfig {
             num_islands: 1,
             migration_interval: 5,
             momentum_decay: 0.9,
+            evolution_mode: EvolutionMode::default(),
+            supervisor: SupervisorConfig::default(),
         }
     }
 }
@@ -995,6 +1224,106 @@ impl Default for AgentDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_config_defaults_when_omitted() {
+        let full: FullConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(full.governor.evolution_mode, EvolutionMode::Generations);
+        assert_eq!(full.governor.supervisor, SupervisorConfig::default());
+        let gov: GovernorConfig = serde_json::from_str(
+            r#"{"tick_budget":1,"elitism_count":1,"max_generations":0,"patience":1}"#,
+        )
+        .unwrap();
+        assert_eq!(gov.evolution_mode, EvolutionMode::Generations);
+        assert_eq!(gov.supervisor, SupervisorConfig::default());
+    }
+
+    #[test]
+    fn supervisor_config_round_trip() {
+        let mut gov = GovernorConfig::default();
+        gov.evolution_mode = EvolutionMode::Supervisor;
+        gov.supervisor.inheritance = Inheritance::WeightCopy;
+        gov.supervisor.archive_capacity = 7;
+        gov.supervisor.boundary_interval_ticks = 800;
+        let json = serde_json::to_string(&gov).unwrap();
+        assert!(json.contains("\"supervisor\""));
+        assert!(json.contains("\"weight_copy\""));
+        let back: GovernorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.evolution_mode, EvolutionMode::Supervisor);
+        assert_eq!(back.supervisor, gov.supervisor);
+    }
+
+    #[test]
+    fn supervisor_config_validate_rejects_each_rule() {
+        use SupervisorConfigError as E;
+        let ok = SupervisorConfig::default();
+        assert_eq!(ok.validate(10), Ok(()));
+        assert_eq!(
+            ok.validate(1),
+            Err(E::AgentCountTooSmall { agent_count: 1 })
+        );
+        let mut c = ok.clone();
+        c.boundary_interval_ticks = 150;
+        assert_eq!(c.validate(10), Err(E::BoundaryIntervalInvalid));
+        let mut c = ok.clone();
+        c.season_period_ticks = 100;
+        assert_eq!(c.validate(10), Err(E::SeasonPeriodInvalid));
+        let mut c = ok.clone();
+        c.score_window_ticks = 0;
+        assert_eq!(c.validate(10), Err(E::ScoreWindowInvalid));
+        let mut c = ok.clone();
+        c.min_age_ticks = c.score_window_ticks - SUPERVISOR_SAMPLE_TICKS;
+        assert_eq!(c.validate(10), Err(E::MinAgeBelowWindow));
+        let mut c = ok.clone();
+        c.archive_capacity = 0;
+        assert_eq!(
+            c.validate(10),
+            Err(E::ArchiveCapacityOutOfRange {
+                archive_capacity: 0
+            })
+        );
+        let mut c = ok.clone();
+        c.archive_capacity = MAX_ARCHIVE_CAPACITY + 1;
+        assert!(matches!(
+            c.validate(10),
+            Err(E::ArchiveCapacityOutOfRange { .. })
+        ));
+        let mut c = ok.clone();
+        c.agent_tick_budget = 1_500;
+        assert_eq!(c.validate(10), Err(E::AgentTickBudgetNotAligned));
+        let mut c = ok.clone();
+        c.agent_tick_budget = u64::MAX;
+        assert_eq!(c.validate(usize::MAX), Err(E::AgentTickBudgetOverflow));
+        let mut c = ok;
+        c.agent_tick_budget = 10_000;
+        assert_eq!(c.validate(10), Ok(()));
+    }
+
+    #[test]
+    fn supervisor_config_default_is_valid_for_default_population() {
+        assert_eq!(
+            SupervisorConfig::default().validate(default_population_size()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn supervisor_config_not_in_brain_config() {
+        let json = serde_json::to_string(&BrainConfig::default()).unwrap();
+        for key in [
+            "supervisor",
+            "evolution_mode",
+            "inheritance",
+            "boundary_interval_ticks",
+            "min_age_ticks",
+            "score_window_ticks",
+            "archive_capacity",
+            "season_period_ticks",
+            "agent_tick_budget",
+        ] {
+            assert!(!json.contains(key), "BrainConfig leaks {key}");
+        }
+    }
 
     #[test]
     fn food_kind_item_parity() {

@@ -6,7 +6,7 @@
 //! control commands (speed, pause, selection) on change, drains worker events
 //! each frame, applies the newest state snapshot to the CPU-side agent caches,
 //! and records the per-snapshot overlays/histories/replay. It performs no GPU
-//! work and never calls `GpuKernel` directly.
+//! work and never drives the compute kernel directly.
 
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,30 @@ use xagent_brain::AgentTelemetry;
 use crate::app::{App, PendingUpload};
 use crate::sim_runtime::{
     partition_events, SimCommand, SimEvent, SimInit, SimRuntime, StateSnapshot,
+    SupervisorWorkerInit,
 };
+use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, GovernorConfig, WorldConfig};
+
+/// Worker init for a supervisor session, or `None` outside one.
+fn supervisor_worker_init(
+    governor: &GovernorConfig,
+    brain: &BrainConfig,
+    world: &WorldConfig,
+    db_path: &str,
+    session_active: bool,
+) -> Option<SupervisorWorkerInit> {
+    if governor.evolution_mode != EvolutionMode::Supervisor || !session_active {
+        return None;
+    }
+    Some(SupervisorWorkerInit {
+        config: FullConfig {
+            brain: brain.clone(),
+            world: world.clone(),
+            governor: governor.clone(),
+        },
+        db_path: Some(db_path.to_string()),
+    })
+}
 
 impl App {
     /// Build the world + agent upload for the current population, or `None`
@@ -89,20 +112,34 @@ impl App {
             .get(self.selected_agent_idx)
             .map_or(0, |a| a.brain_idx);
 
+        let session_active = self.evo_snapshot.supervisor.is_some();
+        let supervisor = supervisor_worker_init(
+            &self.governor_config,
+            &self.brain_config,
+            &world_config,
+            &self.db_path,
+            session_active,
+        );
+        let supervisor_mode = supervisor.is_some();
         let init = SimInit {
             agent_count,
             food_count,
             brain_config: self.brain_config.clone(),
             world_config,
             upload,
-            tick_budget: self.governor_config.tick_budget,
+            tick_budget: if supervisor_mode {
+                0
+            } else {
+                self.governor_config.tick_budget
+            },
             speed_multiplier: self.speed_multiplier,
             paused: self.paused,
             selected_agent,
             generation_epoch: self.generation_epoch,
-            search_steering_genome: self.governor.is_some(),
+            search_steering_genome: !supervisor_mode && self.governor.is_some(),
             steering_group_size: self.governor_config.eval_repeats.max(1),
             steering_mutation_strength: self.governor_config.mutation_strength,
+            supervisor,
         };
 
         self.sim_runtime = Some(SimRuntime::start(init));
@@ -192,6 +229,15 @@ impl App {
                 }
                 // Plain snapshots are folded into latest-wins above.
                 SimEvent::Snapshot(_) => {}
+                SimEvent::SupervisorSample(report) => {
+                    if let Some(sup) = self.evo_snapshot.supervisor.as_mut() {
+                        sup.apply(&report);
+                    }
+                    if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
+                        self.log_msg(format!("[SUPERVISOR] replaced slot {slot}"));
+                    }
+                    self.snap_dirty = true;
+                }
                 SimEvent::Telemetry {
                     agent_index,
                     telemetry,
@@ -385,5 +431,53 @@ impl App {
             counters.snapshots_applied,
             counters.generation_boundaries,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supervisor_worker_init;
+    use xagent_shared::{BrainConfig, EvolutionMode, GovernorConfig, WorldConfig};
+
+    #[test]
+    fn gui_supervisor_worker_init_only_in_supervisor_mode() {
+        let brain = BrainConfig::default();
+        let world = WorldConfig::default();
+        let mut governor = GovernorConfig::default();
+
+        governor.evolution_mode = EvolutionMode::Generations;
+        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", true).is_none());
+
+        governor.evolution_mode = EvolutionMode::Supervisor;
+        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", false).is_none());
+
+        let init = supervisor_worker_init(&governor, &brain, &world, "a.db", true)
+            .expect("supervisor session yields init");
+        assert_eq!(
+            init.config.governor.evolution_mode,
+            EvolutionMode::Supervisor
+        );
+        assert_eq!(init.db_path.as_deref(), Some("a.db"));
+    }
+
+    #[test]
+    fn gui_supervisor_main_thread_never_touches_kernel() {
+        let sources = [
+            ("gpu_orchestration.rs", include_str!("gpu_orchestration.rs")),
+            ("evolution.rs", include_str!("evolution.rs")),
+            ("snapshot.rs", include_str!("snapshot.rs")),
+            ("app.rs", include_str!("app.rs")),
+        ];
+        let needles = [
+            concat!("Gpu", "Kernel"),
+            concat!("SupervisorRun", "::"),
+            concat!("read_full_state", "_blocking"),
+            concat!("on_", "sample("),
+        ];
+        for (name, source) in sources {
+            for needle in needles {
+                assert!(!source.contains(needle), "{name} names {needle}");
+            }
+        }
     }
 }

@@ -47,6 +47,7 @@ fn governor_config() -> GovernorConfig {
         num_islands: 1,
         migration_interval: 0,
         momentum_decay: TEST_MOMENTUM_DECAY,
+        ..GovernorConfig::default()
     }
 }
 

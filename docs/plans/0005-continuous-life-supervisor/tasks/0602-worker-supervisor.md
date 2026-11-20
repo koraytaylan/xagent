@@ -7,8 +7,8 @@ role: developer
 depends_on: [supervisor-run]
 gated: false
 touches: [crates/xagent-sandbox/src/sim_runtime.rs, crates/xagent-sandbox/src/gpu_orchestration.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "505b9b11a7364b29ab1ad91802fa1e7840b70116"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --bin xagent -- sim_runtime::tests::supervisor_", timeout_ms: 3600000}
   - {name: worker-tests, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --bin xagent -- sim_runtime::", timeout_ms: 3600000}

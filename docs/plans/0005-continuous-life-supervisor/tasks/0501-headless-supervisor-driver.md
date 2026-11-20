@@ -7,8 +7,8 @@ role: developer
 depends_on: [supervisor-run]
 gated: false
 touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/supervisor_headless.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "8970dc5b529bb8c4286ba1e82e516ba726939af0"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_headless", timeout_ms: 3600000}
   - {name: seeded-digest-determinism, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test seeded_headless_digest", timeout_ms: 3600000}

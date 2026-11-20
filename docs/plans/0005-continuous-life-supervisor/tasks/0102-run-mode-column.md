@@ -7,8 +7,8 @@ role: developer
 depends_on: [evolution-mode-config]
 gated: false
 touches: [crates/xagent-sandbox/src/governor.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "1c5f3b0e7a05236f5a974ab167f52e8f7425ea0d"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --lib governor::tests::evolution_mode_"}
   - {name: governor-tests, command: "cargo test -p xagent-sandbox --lib governor::tests::", timeout_ms: 3600000}

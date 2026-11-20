@@ -2067,6 +2067,7 @@ mod tests {
                 brain_source: FRESH_BRAIN_SOURCE.to_string(),
                 champion_node_id: None,
                 champion_generation: None,
+                archive_entry_id: None,
                 lesions: Vec::new(),
                 kernel_batch_size: 1,
                 brain_ticks: FIXTURE_BRAIN_TICKS,

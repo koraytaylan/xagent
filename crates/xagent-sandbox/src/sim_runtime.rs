@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use xagent_brain::buffers::{BrainLayout, TrailSample, PATTERN_STRIDE};
 use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
-use xagent_shared::{BrainConfig, WorldConfig};
+use xagent_sandbox::supervisor_run::{SampleReport, SupervisorRun};
+use xagent_sandbox::supervisor_store::SupervisorStore;
+use xagent_shared::{BrainConfig, FullConfig, WorldConfig, SUPERVISOR_SAMPLE_TICKS};
 
 use crate::app::{PendingUpload, SIM_DT};
 
@@ -87,6 +89,20 @@ fn clamp_ticks_to_generation_budget(
     } else {
         (ticks_to_run, false)
     }
+}
+
+/// Clamp a requested tick batch so it ends on the next supervisor sample tick.
+///
+/// A `sample_ticks` of zero means "no grid" and never clamps. Otherwise the
+/// result is at most the distance from `tick` to the next multiple of
+/// `sample_ticks`, so a dispatch never crosses a sample it does not end on.
+fn clamp_ticks_to_supervisor_sample(ticks_to_run: u32, tick: u64, sample_ticks: u64) -> u32 {
+    if sample_ticks == 0 {
+        return ticks_to_run;
+    }
+    let to_next = sample_ticks - tick % sample_ticks;
+    let to_next = u32::try_from(to_next).unwrap_or(u32::MAX);
+    ticks_to_run.min(to_next)
 }
 
 /// Shape a dispatch so every trail-sample boundary falls on a dispatch end or
@@ -212,10 +228,22 @@ pub enum SimEvent {
         request_id: u64,
         state: Option<AgentBrainState>,
     },
+    /// A supervisor sample that carried a boundary, a season flip or the end of
+    /// the run.
+    // The payload is consumed by the UI consumer, which a later task adds.
+    #[allow(dead_code)]
+    SupervisorSample(SampleReport),
     /// Human-readable worker log line.
     Log(String),
     /// Worker error (e.g. no GPU adapter); the worker may be degraded.
     Error(String),
+}
+
+/// Supervisor-mode setup: the run configuration and optional store path.
+#[allow(dead_code)] // Constructed by the supervisor entry point and tests only.
+pub struct SupervisorWorkerInit {
+    pub config: FullConfig,
+    pub db_path: Option<String>,
 }
 
 /// Initial configuration handed to [`SimRuntime::start`].
@@ -242,6 +270,9 @@ pub struct SimInit {
     /// Turn-policy mutation strength for the first generation, before a
     /// champion brain exists. Later generations use [`InheritedBrain`].
     pub steering_mutation_strength: f32,
+    /// Supervisor mode: the worker owns one `SupervisorRun` instead of
+    /// generations. `None` keeps generation mode.
+    pub supervisor: Option<SupervisorWorkerInit>,
 }
 
 /// Partition a batch of drained events into the newest current-epoch state
@@ -392,6 +423,42 @@ struct Worker {
     /// Each agent's brain as written at the start of the current generation,
     /// indexed by brain index. What a champion passes on.
     birth_states: Vec<AgentBrainState>,
+    /// The supervisor driver; `None` in generation mode or after it ended.
+    supervisor: Option<SupervisorRun>,
+    /// Whether the worker was built for supervisor mode.
+    supervisor_mode: bool,
+    /// Control events queued for blocking delivery on the next step.
+    supervisor_events: Vec<SimEvent>,
+}
+
+/// Start the supervisor run on `kernel`, opening the store when configured.
+fn start_supervisor(
+    kernel: &mut GpuKernel,
+    init: &SupervisorWorkerInit,
+) -> Result<SupervisorRun, String> {
+    let store = match init.db_path.as_deref() {
+        Some(path) => Some(
+            SupervisorStore::create(path, &init.config)
+                .map_err(|e| format!("supervisor store: {e:?}"))?,
+        ),
+        None => None,
+    };
+    SupervisorRun::start(kernel, &init.config, store, false)
+        .map_err(|e| format!("supervisor start: {e}"))
+}
+
+/// Birth brains of every slot of `run`, indexed by slot.
+fn supervisor_birth_states(
+    run: &SupervisorRun,
+    population: u32,
+) -> Result<Vec<AgentBrainState>, String> {
+    (0..usize::try_from(population).unwrap_or(0))
+        .map(|slot| {
+            run.birth_state(slot)
+                .cloned()
+                .map_err(|e| format!("supervisor birth state {slot}: {e}"))
+        })
+        .collect()
 }
 
 /// Read back every agent's brain before the generation's first tick
@@ -442,46 +509,74 @@ fn patch_agent_configs(kernel: &GpuKernel, configs: &[BrainConfig]) {
 impl Worker {
     /// Create the kernel and upload the initial world + agents.
     fn new(init: SimInit) -> Self {
-        let kernel = GpuKernel::new(
+        let mut kernel = GpuKernel::new(
             init.agent_count,
             init.food_count,
             &init.brain_config,
             &init.world_config,
         );
-        kernel.upload_world(
-            &init.upload.heights,
-            &init.upload.biomes,
-            &init.upload.food_pos,
-            &init.upload.food_consumed,
-            &init.upload.food_timers,
-        );
-        kernel.upload_agents(&init.upload.agent_data);
-        if init.search_steering_genome {
-            let mut rng = rand::rng();
-            let birth = fresh_brain_state(&init.brain_config, &mut rng);
-            let count = usize::try_from(kernel.agent_count()).unwrap_or(0);
-            let genomes = steering_population(
-                &birth,
-                count,
-                init.steering_group_size,
-                init.steering_mutation_strength,
-                &mut rng,
+        let supervisor_mode = init.supervisor.is_some();
+        let mut paused = init.paused;
+        let mut tick_budget = init.tick_budget;
+        let mut supervisor = None;
+        let mut supervisor_events = Vec::new();
+        let birth_states;
+        if let Some(sup_init) = init.supervisor.as_ref() {
+            tick_budget = 0;
+            match start_supervisor(&mut kernel, sup_init) {
+                Ok(run) => match supervisor_birth_states(&run, kernel.agent_count()) {
+                    Ok(states) => {
+                        birth_states = states;
+                        supervisor = Some(run);
+                    }
+                    Err(message) => {
+                        birth_states = Vec::new();
+                        paused = true;
+                        supervisor_events.push(SimEvent::Error(message));
+                    }
+                },
+                Err(message) => {
+                    birth_states = Vec::new();
+                    paused = true;
+                    supervisor_events.push(SimEvent::Error(message));
+                }
+            }
+        } else {
+            kernel.upload_world(
+                &init.upload.heights,
+                &init.upload.biomes,
+                &init.upload.food_pos,
+                &init.upload.food_consumed,
+                &init.upload.food_timers,
             );
-            kernel.batch_write_agent_states(count, |index| genomes[index].clone());
+            kernel.upload_agents(&init.upload.agent_data);
+            if init.search_steering_genome {
+                let mut rng = rand::rng();
+                let birth = fresh_brain_state(&init.brain_config, &mut rng);
+                let count = usize::try_from(kernel.agent_count()).unwrap_or(0);
+                let genomes = steering_population(
+                    &birth,
+                    count,
+                    init.steering_group_size,
+                    init.steering_mutation_strength,
+                    &mut rng,
+                );
+                kernel.batch_write_agent_states(count, |index| genomes[index].clone());
+            }
+            patch_agent_configs(&kernel, &init.upload.agent_configs);
+            birth_states = read_birth_states(&kernel);
         }
-        patch_agent_configs(&kernel, &init.upload.agent_configs);
-        let birth_states = read_birth_states(&kernel);
         Self {
             kernel,
             brain_config: init.brain_config,
             world_config: init.world_config,
-            paused: init.paused,
+            paused,
             speed_multiplier: init.speed_multiplier,
             selected_agent: init.selected_agent,
             tick: 0,
             gen_tick: 0,
             generation_epoch: init.generation_epoch,
-            tick_budget: init.tick_budget,
+            tick_budget,
             budget_reached: false,
             sim_accumulator: 0.0,
             last_frame: Instant::now(),
@@ -493,6 +588,9 @@ impl Worker {
             steering_group_size: init.steering_group_size.max(1),
             steering_mutation_strength: init.steering_mutation_strength,
             birth_states,
+            supervisor,
+            supervisor_mode,
+            supervisor_events,
         }
     }
 
@@ -516,6 +614,9 @@ impl Worker {
                     .and_then(|index| self.birth_states.get(index))
                     .cloned();
                 let _ = event_tx.send(SimEvent::BirthState { request_id, state });
+            }
+            SimCommand::ResetPopulation(_) if self.supervisor_mode => {
+                log::warn!("[SIM] ResetPopulation ignored in supervisor mode");
             }
             SimCommand::ResetPopulation(request) => {
                 let resume = request.resume;
@@ -660,6 +761,11 @@ impl Worker {
 
         self.maybe_log_counters();
 
+        // Control events are never dropped: block until delivered.
+        for event in self.supervisor_events.drain(..) {
+            let _ = event_tx.send(event);
+        }
+
         if self.paused {
             return false;
         }
@@ -683,6 +789,9 @@ impl Worker {
     /// is a shorter remainder batch — the same partial-batch decomposition the
     /// kernel has always produced at sub-batch tick counts.
     fn advance_compute(&mut self, dt: f64) -> bool {
+        if self.supervisor_mode && self.supervisor.is_none() {
+            return false;
+        }
         let sim_delta_time = SIM_DT as f64;
         self.sim_accumulator += dt * self.speed_multiplier as f64;
 
@@ -728,6 +837,10 @@ impl Worker {
         if did_clamp {
             self.counters.generation_clamps += 1;
         }
+        if self.supervisor.is_some() {
+            ticks_to_run =
+                clamp_ticks_to_supervisor_sample(ticks_to_run, self.tick, SUPERVISOR_SAMPLE_TICKS);
+        }
 
         if ticks_to_run == 0 {
             return false;
@@ -740,7 +853,57 @@ impl Worker {
         self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
         self.tick += u64::from(ticks_to_run);
         self.gen_tick = self.gen_tick.saturating_add(u64::from(ticks_to_run));
+        self.on_supervisor_sample();
         true
+    }
+
+    /// Hand the supervisor its sample when the tick reaches the next sample
+    /// tick. Fails closed: an error or the end of the run drops the run and
+    /// pauses, so nothing dispatches afterwards.
+    fn on_supervisor_sample(&mut self) {
+        let Some(mut run) = self.supervisor.take() else {
+            return;
+        };
+        if self.tick != run.next_sample_tick() {
+            self.supervisor = Some(run);
+            return;
+        }
+        let physics = self.kernel.read_full_state_blocking().to_vec();
+        match run.on_sample(&mut self.kernel, self.tick, &physics, None) {
+            Ok(report) => {
+                if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
+                    match run.birth_state(slot) {
+                        Ok(state) => {
+                            if let Some(entry) = self.birth_states.get_mut(slot) {
+                                *entry = state.clone();
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("[SIM] supervisor birth state {slot} failed: {error}");
+                        }
+                    }
+                }
+                let finished = report.finished;
+                if report.boundary.is_some() || report.season.is_some() || finished {
+                    self.supervisor_events
+                        .push(SimEvent::SupervisorSample(report));
+                }
+                if finished {
+                    if let Err(error) = run.finish() {
+                        log::error!("[SIM] supervisor finish failed: {error}");
+                    }
+                    self.paused = true;
+                } else {
+                    self.supervisor = Some(run);
+                }
+            }
+            Err(error) => {
+                self.supervisor_events.push(SimEvent::Error(format!(
+                    "supervisor sample failed: {error}"
+                )));
+                self.paused = true;
+            }
+        }
     }
 
     /// Request a CPU-visible state snapshot at most `STATE_SNAPSHOT_MAX_HZ`.
@@ -1181,7 +1344,28 @@ mod tests {
         (upload, world.food_items.len())
     }
 
+    /// Serialize GPU-heavy tests: the guard is parked in a thread-local and
+    /// released when the test thread exits.
+    fn hold_gpu_test_lock() {
+        static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        thread_local! {
+            static HELD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if held.is_none() {
+                *held = Some(
+                    GPU_TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            }
+        });
+    }
+
     fn test_init(tick_budget: u64, paused: bool, speed_multiplier: u32) -> SimInit {
+        hold_gpu_test_lock();
         let (upload, food_count) = test_upload();
         SimInit {
             agent_count: 1,
@@ -1197,6 +1381,7 @@ mod tests {
             search_steering_genome: false,
             steering_group_size: 1,
             steering_mutation_strength: 0.0,
+            supervisor: None,
         }
     }
 
@@ -1294,6 +1479,7 @@ mod tests {
             search_steering_genome: false,
             steering_group_size: 1,
             steering_mutation_strength: 0.0,
+            supervisor: None,
         });
 
         // The champion is agent 0's inherited state: it carries WAVELENGTH_A in
@@ -1367,6 +1553,7 @@ mod tests {
             search_steering_genome: true,
             steering_group_size: 1,
             steering_mutation_strength: 0.1,
+            supervisor: None,
         });
         let birth = worker.kernel.read_agent_state(0);
         worker.kernel.dispatch_batch(0, LIFETIME_TICKS);
@@ -1574,5 +1761,318 @@ mod tests {
         );
 
         drop(runtime);
+    }
+
+    // ── supervisor mode ───────────────────────────────────────────────
+
+    /// Pure fail-closed rule: `Ok(true)` runs, `Ok(false)` skips, `Err` fails.
+    fn supervisor_gpu_guard_decision(
+        available: bool,
+        required: bool,
+    ) -> Result<bool, &'static str> {
+        if available {
+            Ok(true)
+        } else if required {
+            Err("XAGENT_REQUIRE_GPU is set but no GPU adapter is available")
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Whether a supervisor GPU test should run; panics when the GPU is
+    /// required and missing.
+    fn supervisor_gpu_or_skip() -> bool {
+        let decision = supervisor_gpu_guard_decision(
+            GpuKernel::is_available(),
+            std::env::var_os("XAGENT_REQUIRE_GPU").is_some(),
+        );
+        match decision {
+            Ok(true) => {
+                hold_gpu_test_lock();
+                true
+            }
+            Ok(false) => {
+                eprintln!("Skipping: no GPU/fallback adapter available");
+                false
+            }
+            Err(message) => panic!("{message}"),
+        }
+    }
+
+    /// Agents in a supervisor test run.
+    const SUPERVISOR_TEST_AGENTS: usize = 10;
+
+    fn supervisor_test_config_with_budget(agent_tick_budget: u64) -> FullConfig {
+        let mut config = FullConfig::default();
+        config.governor.population_size = SUPERVISOR_TEST_AGENTS;
+        config.governor.supervisor.boundary_interval_ticks = 1_000;
+        config.governor.supervisor.min_age_ticks = 2_000;
+        config.governor.supervisor.score_window_ticks = 1_000;
+        config.governor.supervisor.season_period_ticks = 3_000;
+        config.governor.supervisor.agent_tick_budget = agent_tick_budget;
+        config
+    }
+
+    fn supervisor_test_config() -> FullConfig {
+        supervisor_test_config_with_budget(100_000)
+    }
+
+    fn supervisor_init(config: &FullConfig, db_path: Option<String>) -> SimInit {
+        let (upload, _) = test_upload();
+        let food_count = xagent_sandbox::world::WorldState::new(config.world.clone())
+            .food_items
+            .len();
+        let mut init = test_init(0, false, 1);
+        init.agent_count = u32::try_from(config.governor.population_size).expect("fits");
+        init.food_count = food_count;
+        init.brain_config = config.brain.clone();
+        init.world_config = config.world.clone();
+        init.upload = upload;
+        init.supervisor = Some(SupervisorWorkerInit {
+            config: config.clone(),
+            db_path,
+        });
+        init
+    }
+
+    /// Advance with a synthetic wall-clock delta until `target` ticks or the
+    /// worker pauses; returns the reports queued for delivery.
+    fn supervisor_run_to(worker: &mut Worker, dt: f64, target: u64) -> Vec<SampleReport> {
+        let mut reports = Vec::new();
+        for _ in 0..1_000_000 {
+            if worker.tick >= target || worker.paused {
+                break;
+            }
+            worker.advance_compute(dt);
+            for event in worker.supervisor_events.drain(..) {
+                if let SimEvent::SupervisorSample(report) = event {
+                    reports.push(report);
+                }
+            }
+        }
+        reports
+    }
+
+    /// Delta that yields roughly `ticks` ticks of accumulation at speed 1.
+    fn supervisor_dt(ticks: f64) -> f64 {
+        (ticks + 0.01) * f64::from(SIM_DT)
+    }
+
+    #[test]
+    fn supervisor_gpu_guard_fails_closed_when_required() {
+        assert!(supervisor_gpu_guard_decision(false, true).is_err());
+        assert_eq!(supervisor_gpu_guard_decision(false, false), Ok(false));
+        assert_eq!(supervisor_gpu_guard_decision(true, true), Ok(true));
+        assert_eq!(supervisor_gpu_guard_decision(true, false), Ok(true));
+    }
+
+    #[test]
+    fn supervisor_clamp_never_crosses_sample_grid() {
+        assert_eq!(clamp_ticks_to_supervisor_sample(500, 0, 0), 500);
+        assert_eq!(clamp_ticks_to_supervisor_sample(1000, 30, 100), 70);
+        assert_eq!(clamp_ticks_to_supervisor_sample(50, 0, 100), 50);
+        assert_eq!(clamp_ticks_to_supervisor_sample(100, 100, 100), 100);
+        assert_eq!(clamp_ticks_to_supervisor_sample(1000, 100, 100), 100);
+        for run in [10_u32, 37, 250, 999] {
+            let mut tick = 0_u64;
+            let mut samples = 0_u64;
+            for _ in 0..500 {
+                let ticks = clamp_ticks_to_supervisor_sample(run, tick, 100);
+                assert!(ticks > 0);
+                let next = tick + u64::from(ticks);
+                let crossed = next / 100 - tick / 100;
+                assert!(crossed == 0 || next % 100 == 0, "{tick}->{next}");
+                samples += crossed;
+                tick = next;
+            }
+            assert_eq!(samples, tick / 100);
+        }
+    }
+
+    #[test]
+    fn supervisor_worker_matches_headless_driver() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        const TARGET: u64 = 2_000;
+        let config = supervisor_test_config();
+        let keep = |r: &SampleReport| r.boundary.is_some() || r.season.is_some() || r.finished;
+
+        let reference = {
+            let mut kernel = GpuKernel::new(
+                u32::try_from(SUPERVISOR_TEST_AGENTS).expect("fits"),
+                xagent_sandbox::world::WorldState::new(config.world.clone())
+                    .food_items
+                    .len(),
+                &config.brain,
+                &config.world,
+            );
+            let mut run =
+                SupervisorRun::start(&mut kernel, &config, None, false).expect("run starts");
+            let mut reports = Vec::new();
+            let mut tick = 0;
+            while tick < TARGET {
+                kernel.dispatch_batch(tick, 100);
+                while !kernel.try_collect_state_snapshot() {
+                    std::hint::spin_loop();
+                }
+                tick += 100;
+                let physics = kernel.cached_state().to_vec();
+                let report = run
+                    .on_sample(&mut kernel, tick, &physics, None)
+                    .expect("sample is handled");
+                if keep(&report) {
+                    reports.push(report);
+                }
+            }
+            reports
+        };
+        assert!(!reference.is_empty(), "reference run produced no reports");
+
+        let mut results = Vec::new();
+        for (speed, dt) in [(1_u32, supervisor_dt(10.0)), (1_000, 0.05)] {
+            let mut init = supervisor_init(&config, None);
+            init.speed_multiplier = speed;
+            let mut worker = Worker::new(init);
+            let reports = supervisor_run_to(&mut worker, dt, TARGET);
+            assert_eq!(worker.tick, TARGET);
+            assert_eq!(reports, reference, "speed {speed}");
+            results.push(worker.counters.dispatch_calls);
+        }
+        assert_ne!(results[0], results[1], "dispatch counts should differ");
+    }
+
+    #[test]
+    fn supervisor_worker_uses_one_kernel_and_exact_batches() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let mut init = supervisor_init(&config, None);
+        init.speed_multiplier = 1_000;
+        let mut worker = Worker::new(init);
+        let batch = u64::from(worker.kernel.kernel_batch_size());
+        let check = |worker: &Worker| {
+            assert_eq!(worker.kernel.probe_kernel_batches(), worker.tick / batch);
+        };
+
+        supervisor_run_to(&mut worker, 0.05, 1_500);
+        check(&worker);
+        let (event_tx, _event_rx) = sync_channel(8);
+        let (upload, _) = test_upload();
+        let before = worker.kernel.probe_kernel_batches();
+        worker.handle_command(
+            SimCommand::ResetPopulation(Box::new(ResetRequest {
+                upload,
+                brain_config: BrainConfig::default(),
+                tick_budget: 0,
+                inherited: None,
+                resume: true,
+                generation_epoch: 1,
+                search_steering_genome: false,
+            })),
+            &event_tx,
+        );
+        assert_eq!(worker.kernel.probe_kernel_batches(), before);
+        check(&worker);
+
+        supervisor_run_to(&mut worker, 0.05, 3_000);
+        assert!(worker.tick >= 3_000 && worker.tick % SUPERVISOR_SAMPLE_TICKS == 0);
+        check(&worker);
+        assert_eq!(
+            worker.kernel.agent_count(),
+            u32::try_from(config.governor.population_size).expect("fits")
+        );
+    }
+
+    #[test]
+    fn supervisor_worker_ignores_reset_population() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let mut worker = Worker::new(supervisor_init(&config, None));
+        supervisor_run_to(&mut worker, 0.05, 200);
+        let (tick, agents) = (worker.tick, worker.kernel.agent_count());
+        let (event_tx, event_rx) = sync_channel(8);
+        let (upload, _) = test_upload();
+        worker.handle_command(
+            SimCommand::ResetPopulation(Box::new(ResetRequest {
+                upload,
+                brain_config: BrainConfig::default(),
+                tick_budget: 50,
+                inherited: None,
+                resume: false,
+                generation_epoch: 9,
+                search_steering_genome: false,
+            })),
+            &event_tx,
+        );
+        assert_eq!(worker.tick, tick);
+        assert_eq!(worker.kernel.agent_count(), agents);
+        assert_eq!(worker.tick_budget, 0);
+        assert_eq!(worker.generation_epoch, 0);
+        assert!(!worker.paused);
+        assert!(worker.supervisor.is_some());
+        assert!(event_rx.try_recv().is_err(), "no reset log expected");
+    }
+
+    #[test]
+    fn supervisor_worker_pauses_when_finished() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config_with_budget(50_000);
+        let mut init = supervisor_init(&config, None);
+        init.speed_multiplier = 1_000;
+        let mut worker = Worker::new(init);
+        let reports = supervisor_run_to(&mut worker, 0.05, u64::MAX);
+        assert!(worker.paused);
+        assert!(worker.supervisor.is_none());
+        assert_eq!(worker.tick, 5_000);
+        assert!(reports.last().is_some_and(|r| r.finished));
+        let dispatches = worker.counters.dispatch_calls;
+        worker.paused = false;
+        assert!(!worker.advance_compute(0.05));
+        assert_eq!(worker.counters.dispatch_calls, dispatches);
+    }
+
+    #[test]
+    fn supervisor_worker_answers_birth_state_from_ledger() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let mut init = supervisor_init(&config, None);
+        init.speed_multiplier = 1_000;
+        let mut worker = Worker::new(init);
+        assert_eq!(worker.birth_states.len(), SUPERVISOR_TEST_AGENTS);
+        supervisor_run_to(&mut worker, 0.05, 3_000);
+        let bits = |s: &AgentBrainState| -> Vec<u32> {
+            s.brain_state
+                .iter()
+                .chain(&s.patterns)
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let (event_tx, event_rx) = sync_channel(SUPERVISOR_TEST_AGENTS);
+        for slot in 0..SUPERVISOR_TEST_AGENTS {
+            worker.handle_command(
+                SimCommand::RequestBirthState {
+                    agent_index: u32::try_from(slot).expect("fits"),
+                    request_id: u64::try_from(slot).expect("fits"),
+                },
+                &event_tx,
+            );
+            let Ok(SimEvent::BirthState {
+                state: Some(state), ..
+            }) = event_rx.try_recv()
+            else {
+                panic!("slot {slot} should answer a birth state");
+            };
+            let run = worker.supervisor.as_ref().expect("run is live");
+            let ledger = run.birth_state(slot).expect("slot exists");
+            assert_eq!(bits(&state), bits(ledger), "slot {slot}");
+        }
     }
 }

@@ -160,6 +160,40 @@ pub enum EvolutionAction {
 /// clock, independent of how fast the simulation actually runs.
 pub const SIMULATION_TICKS_PER_SECOND: f64 = 60.0;
 
+/// Main-thread view of a supervisor session, folded from worker sample reports.
+#[derive(Default, Clone, Debug)]
+pub struct SupervisorSnapshot {
+    pub tick: u64,
+    pub total_ticks: Option<u64>,
+    pub boundaries: u64,
+    pub replacements: u64,
+    pub last_replacement: Option<String>,
+    pub archive_len: usize,
+    pub best_outcome: Option<f32>,
+    pub nourishing_kind: Option<xagent_shared::FoodKind>,
+    pub finished: bool,
+}
+
+impl SupervisorSnapshot {
+    /// Fold one sample report into the snapshot. Never changes `total_ticks`.
+    pub fn apply(&mut self, report: &crate::supervisor_run::SampleReport) {
+        self.tick = report.tick;
+        self.finished = report.finished;
+        if let Some(boundary) = &report.boundary {
+            self.boundaries += 1;
+            self.archive_len = boundary.archive_len;
+            self.best_outcome = boundary.best_outcome;
+            if let Some(slot) = boundary.slot {
+                self.replacements += 1;
+                self.last_replacement = Some(format!("slot {slot}: {:?}", boundary.reason));
+            }
+        }
+        if let Some(kind) = report.season {
+            self.nourishing_kind = Some(kind);
+        }
+    }
+}
+
 /// Snapshot of evolution state for UI rendering (rebuilt from governor each frame).
 pub struct EvolutionSnapshot {
     pub state: EvolutionState,
@@ -198,6 +232,8 @@ pub struct EvolutionSnapshot {
     /// [`max_vision_pixels`]). Defaults to the conservative wgpu floor until the
     /// renderer reports the real adapter limit.
     pub gpu_storage_buffer_limit: u64,
+    /// Supervisor session state; `None` outside supervisor mode.
+    pub supervisor: Option<SupervisorSnapshot>,
 }
 
 impl Default for EvolutionSnapshot {
@@ -233,6 +269,7 @@ impl Default for EvolutionSnapshot {
             gpu_storage_buffer_limit: (wgpu::Limits::default().max_storage_buffer_binding_size
                 as u64)
                 .min(wgpu::Limits::default().max_buffer_size),
+            supervisor: None,
         }
     }
 }
@@ -1493,6 +1530,19 @@ impl<'a> TabContext<'a> {
     }
 
     fn render_config_editor(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.radio_value(
+                &mut evo.edit_governor.evolution_mode,
+                xagent_shared::EvolutionMode::Generations,
+                "Generations",
+            );
+            ui.radio_value(
+                &mut evo.edit_governor.evolution_mode,
+                xagent_shared::EvolutionMode::Supervisor,
+                "Supervisor",
+            );
+        });
         ui.collapsing("🧠 Brain Config", |ui| {
             egui::Grid::new("brain_edit_grid")
                 .num_columns(2)
@@ -1856,6 +1906,30 @@ impl<'a> TabContext<'a> {
     }
 
     fn render_running_dashboard(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
+        if let Some(sup) = &evo.supervisor {
+            ui.label(egui::RichText::new("Supervisor").strong().size(13.0));
+            let total = sup
+                .total_ticks
+                .map_or_else(|| "unlimited".to_string(), |t| t.to_string());
+            ui.label(format!("Tick: {} / {}", sup.tick, total));
+            ui.label(format!("Replacements: {}", sup.replacements));
+            ui.label(format!(
+                "Last replacement: {}",
+                sup.last_replacement.as_deref().unwrap_or("none")
+            ));
+            let best = sup
+                .best_outcome
+                .map_or_else(|| "n/a".to_string(), |b| format!("{b:.3}"));
+            ui.label(format!("Archive: {} (best {})", sup.archive_len, best));
+            let kind = sup
+                .nourishing_kind
+                .map_or_else(|| "n/a".to_string(), |k| format!("{k:?}"));
+            ui.label(format!("Nourishing kind: {kind}"));
+            if sup.finished {
+                ui.label("Finished");
+            }
+            return;
+        }
         // ── Fitness chart at top of tab (always visible) ────────
         if !evo.fitness_history.is_empty() {
             Self::render_fitness_chart(ui, &evo.fitness_history);
@@ -2464,6 +2538,77 @@ impl<'a> TabContext<'a> {
         let current_marker = if is_current { ">> " } else { "" };
 
         format!("{}Gen {} {}", current_marker, node.generation, fitness_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvolutionSnapshot, SupervisorSnapshot};
+    use crate::supervisor::ReplaceReason;
+    use crate::supervisor_run::{BoundaryReport, SampleReport};
+    use xagent_shared::FoodKind;
+
+    fn report(tick: u64) -> SampleReport {
+        SampleReport {
+            tick,
+            boundary: None,
+            season: None,
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn supervisor_snapshot_default_is_none() {
+        assert!(EvolutionSnapshot::default().supervisor.is_none());
+    }
+
+    #[test]
+    fn supervisor_snapshot_apply_counts_reports() {
+        let mut snap = SupervisorSnapshot {
+            total_ticks: Some(500),
+            ..Default::default()
+        };
+
+        snap.apply(&report(10));
+        assert_eq!(snap.tick, 10);
+        assert_eq!(snap.boundaries, 0);
+        assert_eq!(snap.replacements, 0);
+        assert!(!snap.finished);
+
+        let mut season = report(20);
+        season.season = Some(FoodKind::Second);
+        snap.apply(&season);
+        assert_eq!(snap.tick, 20);
+        assert_eq!(snap.nourishing_kind, Some(FoodKind::Second));
+        assert_eq!(snap.boundaries, 0);
+
+        let mut boundary = report(30);
+        boundary.boundary = Some(BoundaryReport {
+            tick: 30,
+            slot: Some(2),
+            reason: Some(ReplaceReason::Death),
+            occupant_id: None,
+            parent: None,
+            archive_len: 4,
+            best_outcome: Some(1.5),
+        });
+        snap.apply(&boundary);
+        assert_eq!(snap.boundaries, 1);
+        assert_eq!(snap.replacements, 1);
+        assert_eq!(snap.archive_len, 4);
+        assert_eq!(snap.best_outcome, Some(1.5));
+        assert_eq!(
+            snap.last_replacement.as_deref(),
+            Some("slot 2: Some(Death)")
+        );
+
+        let mut last = report(40);
+        last.finished = true;
+        snap.apply(&last);
+        assert_eq!(snap.tick, 40);
+        assert!(snap.finished);
+        assert_eq!(snap.boundaries, 1);
+        assert_eq!(snap.total_ticks, Some(500));
     }
 }
 

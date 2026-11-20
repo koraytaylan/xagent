@@ -7,8 +7,8 @@ role: developer
 depends_on: [evolution-mode-config]
 gated: false
 touches: [crates/xagent-sandbox/src/lib.rs, crates/xagent-sandbox/src/run_summary.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "068d689048044eea3be76a2c0ed71214e2a8229a"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --lib run_summary::tests::"}
   - {name: sandbox-clippy, command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings", timeout_ms: 3600000}

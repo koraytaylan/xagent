@@ -12,7 +12,7 @@ objective: >-
   the flag stays off whatever the result.
 depends_on:
   - 0004-food-contingency-learning
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

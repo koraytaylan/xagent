@@ -7,8 +7,8 @@ role: developer
 depends_on: []
 gated: false
 touches: [crates/xagent-brain/src/gpu_kernel.rs, crates/xagent-brain/tests/supervisor_kernel.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "dac82554068e53979572613b51ed69855342fe24"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test supervisor_kernel", timeout_ms: 3600000}
   - {name: brain-lib, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --lib", timeout_ms: 5400000}

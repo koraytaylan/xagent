@@ -327,9 +327,9 @@ execution_checks:
         checks:
           - name: readers-present
             command: >-
-              sh -c 'grep -q "SCENT_CHANNELS" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
-              && grep -q "SCENT_CHANNELS" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
-              && grep -q "VISION_WHITENING_REFRESH" crates/xagent-brain/src/gpu_kernel/whitening_validation.rs'
+              sh -c 'grep -qE "SCENT_CHANNELS|SENSE0_CHANNELS|NON_VISUAL_FEATURE_CHANNELS" crates/xagent-brain/src/shaders/kernel/kernel_tick.wgsl
+              && grep -qE "SCENT_CHANNELS|SENSE0_CHANNELS|NON_VISUAL_FEATURE_CHANNELS" crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
+              && grep -qE "VISION_WHITENING_REFRESH|SENSE1_REFRESH_TICKS" crates/xagent-brain/src/gpu_kernel/whitening_validation.rs'
       - task: pooling-fit
         name: fit-library-surfaces
         sources:

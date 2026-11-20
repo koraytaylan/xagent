@@ -567,3 +567,17 @@ this plan's run (stopped on the junior-task bounds refusal).
 - Witness: 0208 now has 6 touches and a 7466-character body; 0210 has 3
   touches; `pf-task-sense-reader-rewrites` and the `reader-anchors` constraint
   exit 0 on the baseline; validate_plan reports no issues.
+
+## Correction: reader-anchors constraint accepts landed names
+
+- Authority: the plan owner's standing repair authorization.
+- Superseded requirement: constraint `sense-reader-rewrites/reader-anchors/readers-present`
+  required the old names `SCENT_CHANNELS` and `VISION_WHITENING_REFRESH` in the three reader files.
+- Contradiction: the saved run's integration tree already holds the landed
+  rewrites (a955d37), so the old names are gone and the check exits 1 there,
+  although the task's Done when holds.
+- Correction: each grep accepts the old name or its value-preserving successor
+  (`SENSE0_CHANNELS`/`NON_VISUAL_FEATURE_CHANNELS`, `SENSE1_REFRESH_TICKS`).
+  The check still proves the reader anchors exist. No task proof changed.
+- Witness: the corrected command exits 0 on the baseline and on the saved
+  checkout `.makina/factory/0003-uniform-sense-motor-route/wt/plan`.

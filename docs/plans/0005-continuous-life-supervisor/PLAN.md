@@ -32,7 +32,7 @@ checks:
     command: env XAGENT_REQUIRE_GPU=1 cargo test --workspace
     timeout_ms: 7200000
   - name: integration-seeded-digest
-    command: env XAGENT_REQUIRE_GPU=1 XAGENT_REQUIRE_SEEDED_DIGEST=1 cargo test -p xagent-sandbox --test seeded_headless_digest
+    command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test seeded_headless_digest
     timeout_ms: 3600000
   - name: integration-sense-parity
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored

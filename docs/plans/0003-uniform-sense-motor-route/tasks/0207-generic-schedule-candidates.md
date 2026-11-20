@@ -76,8 +76,11 @@ skipped run unskipped. Test names and assertion counts are unchanged.
 - Cadence: refresh when `brain_state[brain_base + O_TICK_COUNT]` (as `u32`)
   `% sense_refresh_ticks(k) == 0u`. A `VisualHemifields` sense is not refreshed while
   the visual cortex is on, as the vision gate does today.
-- Visual-pathway prepare runs for each Jacobi hemifield sense. Its gather is
-  `vision_hemifields()`.
+- Visual-pathway prepare runs for each Jacobi hemifield sense. Its gather, in the
+  fragment and in the test's probe prepare, is a direct `vision_hemifields()`
+  call (`let raw = vision_hemifields();`). `sense_hemifield_input()` is the
+  serial block's wrapper in `brain_passes.wgsl` that returns `vision_hemifields()`;
+  its serial-block call stays as is and is not a finding against this task.
 - Arithmetic: every float expression keeps its operand order, because the
   validations compare full state bit for bit. Keep the expression strings the
   composition tests search for, changing only operand names to accessors.

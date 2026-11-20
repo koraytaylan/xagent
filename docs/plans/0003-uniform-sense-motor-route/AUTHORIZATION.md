@@ -302,3 +302,30 @@ this plan's run.
 - Witness: the `alternate-schedules` check
   (`workgroup_whitening_matches_complete_serial_state`) and host verify (all
   seven gates passed) on the task branch's unrenamed Jacobi arrays.
+
+## Corrected requirement: generic-schedule-candidates gather wording (2026-11-20)
+
+Authority: the plan owner's standing authorization for automatic repair of
+this plan's run.
+
+- Superseded: packet `tasks/0207-generic-schedule-candidates.md` sentence
+  "Visual-pathway prepare runs for each Jacobi hemifield sense. Its gather is
+  `vision_hemifields()`."
+- Contradiction: review flagged `visual_pathway_validation.rs:77`
+  (`let raw = vision_hemifields();`) as "the `sense_hemifield_input()` gather"
+  and asked to change it to `vision_hemifields()`, which it already is. In the
+  shipped code `sense_hemifield_input()` (`brain_passes.wgsl:911-913`) only
+  returns `vision_hemifields()`, and its one call is the serial block
+  (`brain_passes.wgsl:1785`), which Non-goals forbid editing. No edit could
+  close the finding.
+- Correction: the sentence now says the fragment and probe gather is a direct
+  `let raw = vision_hemifields();` call, and that the serial block's
+  `sense_hemifield_input()` wrapper call stays and is not a finding. Same
+  requirement, unambiguous. No bound, task, dependency, gate, test or behavior
+  changed.
+- Witness: `grep -rn "sense_hemifield_input\|vision_hemifields" crates/xagent-brain/src`
+  on the task branch shows the direct call at `visual_pathway_validation.rs:77`
+  and `brain_cooperative_visual_pathway.wgsl:18`, and the wrapper only in
+  `brain_passes.wgsl`. Host verify on that branch passed focused-proof,
+  alternate-schedules, parity, clippy and guard. fmt failed only on a line
+  wrap, which its declared fix `cargo fmt --all` rewrites.

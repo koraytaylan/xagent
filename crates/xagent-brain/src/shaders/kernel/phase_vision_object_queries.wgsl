@@ -193,7 +193,20 @@ fn vision_object_write_ray(agent_id: u32, ray_idx: u32, first_event: u32) {
         let first_step = first_event / VISION_EVENT_STEP_STRIDE;
         hit_depth = f32(first_step + 1u) * VISION_STEP_SIZE;
         if event == VISION_EVENT_FOOD {
-            hit_color = vec4<f32>(0.7, 0.95, 0.2, 1.0);
+            // The lowest food ID first hit at this step owns the pixel.
+            let origin = vision_object_cache[VISION_OBJECT_ORIGIN_BASE].xyz;
+            let direction = vision_object_direction(agent_id, ray_idx);
+            let food_count = wc_u32(WC_FOOD_COUNT);
+            for (var food_id = 0u; food_id < food_count; food_id++) {
+                let food = vision_object_cache[food_id];
+                if food.w == 0.0 { continue; }
+                let step = vision_object_first_hit(origin, direction, food.xyz,
+                    VISION_OBJECT_FOOD_RADIUS, FOOD_RAY_RADIUS_SQ, VISION_EVENT_NONE);
+                if step == first_step {
+                    hit_color = food_item_color(food_id);
+                    break;
+                }
+            }
         } else if event == VISION_EVENT_AGENT {
             hit_color = vec4<f32>(0.9, 0.2, 0.6, 1.0);
         } else if event == VISION_EVENT_TERRAIN_GREEN {

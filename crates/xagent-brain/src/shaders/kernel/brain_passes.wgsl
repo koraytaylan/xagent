@@ -245,6 +245,7 @@ fn coop_feature_extract(agent_id: u32, tid: u32) {
         let scent_offset = touch_offset + MAX_TOUCH_CONTACTS * 4u;
         s_features[fi] = sensory_buffer[s_base + scent_offset]; fi = fi + 1u;
         s_features[fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;
+        for (var k: u32 = 0u; k < EXTRA_SENSORY_CHANNELS; k = k + 1u) { s_features[fi] = sensory_buffer[s_base + scent_offset + NON_VISUAL_FEATURE_CHANNELS + k]; fi = fi + 1u; }
         // Danger percept: when enabled, pack the nearest-danger distance and
         // bearing from `physics_state` into the two extra feature slots. These
         // are read same-cycle from physics — exactly the pattern used for

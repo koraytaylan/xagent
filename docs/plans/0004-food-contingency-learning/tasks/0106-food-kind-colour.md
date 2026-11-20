@@ -13,8 +13,8 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/phase_vision_parallel.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_vision_object_queries.wgsl
   - crates/xagent-brain/tests/food_kind_colour.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "833a14da80fe812843b456162b0b3de521da24cd"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test food_kind_colour"

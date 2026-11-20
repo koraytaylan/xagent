@@ -25,6 +25,7 @@ pub mod complex;
 pub mod dog;
 pub mod gabor;
 pub mod gpu_kernel;
+pub mod kind_readout;
 pub mod senses;
 
 pub use buffers::{AgentBrainState, BrainLayout};

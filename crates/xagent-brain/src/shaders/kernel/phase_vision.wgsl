@@ -100,7 +100,7 @@ fn vision_single_ray(agent_id: u32, ray_idx: u32) {
                     let dist_sq = dx * dx + dy * dy + dz * dz;
 
                     if dist_sq < FOOD_RAY_RADIUS_SQ {
-                        hit_color = vec4<f32>(0.7, 0.95, 0.2, 1.0);
+                        hit_color = food_item_color(fidx);
                         hit_depth = t;
                         hit = true;
                         break;
@@ -411,6 +411,11 @@ fn phase_vision_senses(tid: u32) {
     let scent = sense_scent(pos, facing, smell_strength);
     sensory_buffer[scent_base] = scent.x;
     sensory_buffer[scent_base + 1u] = scent.y;
+    if (EXTRA_SENSORY_CHANNELS >= NON_VISUAL_FEATURE_CHANNELS) {
+        let second = sense_second_odour(pos, facing, smell_strength);
+        sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS] = second.x;
+        sensory_buffer[scent_base + NON_VISUAL_FEATURE_CHANNELS + 1u] = second.y;
+    }
 }
 
 // Perceived food odour at the left and right nostrils. The nostrils sit
@@ -430,6 +435,42 @@ fn sense_scent(pos: vec3<f32>, facing: vec3<f32>, strength: f32) -> vec2<f32> {
     let food_count = wc_u32(WC_FOOD_COUNT);
     for (var f: u32 = 0u; f < food_count; f++) {
         if (food_flags[f] != 0u) { continue; }
+        if (food_kinds_enabled() && food_item_kind(f) != FOOD_KIND_FIRST) { continue; }
+        let fbase = f * FOOD_STATE_STRIDE;
+        let fx = food_state[fbase + FOOD_POSITION_X];
+        let fz = food_state[fbase + FOOD_POSITION_Z];
+        let left_dx = fx - left_nostril.x;
+        let left_dz = fz - left_nostril.z;
+        let left_sq = left_dx * left_dx + left_dz * left_dz;
+        if (left_sq < range_sq) {
+            concentration.x += exp(-sqrt(left_sq) / SCENT_DECAY_LENGTH);
+        }
+        let right_dx = fx - right_nostril.x;
+        let right_dz = fz - right_nostril.z;
+        let right_sq = right_dx * right_dx + right_dz * right_dz;
+        if (right_sq < range_sq) {
+            concentration.y += exp(-sqrt(right_sq) / SCENT_DECAY_LENGTH);
+        }
+    }
+    return vec2<f32>(1.0, 1.0) - exp(-strength * concentration);
+}
+
+// Odour of `Second` food items at the two nostrils, under the same law as
+// `sense_scent`. Smells nothing when food kinds are off.
+fn sense_second_odour(pos: vec3<f32>, facing: vec3<f32>, strength: f32) -> vec2<f32> {
+    if (!food_kinds_enabled()) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let right = vec3<f32>(facing.z, 0.0, -facing.x);
+    let nose = pos + facing * NOSTRIL_FORWARD_OFFSET;
+    let left_nostril = nose - right * NOSTRIL_SIDE_OFFSET;
+    let right_nostril = nose + right * NOSTRIL_SIDE_OFFSET;
+    let range_sq = SCENT_RANGE * SCENT_RANGE;
+    var concentration = vec2<f32>(0.0, 0.0);
+    let food_count = wc_u32(WC_FOOD_COUNT);
+    for (var f: u32 = 0u; f < food_count; f++) {
+        if (food_flags[f] != 0u) { continue; }
+        if (food_item_kind(f) != FOOD_KIND_SECOND) { continue; }
         let fbase = f * FOOD_STATE_STRIDE;
         let fx = food_state[fbase + FOOD_POSITION_X];
         let fz = food_state[fbase + FOOD_POSITION_Z];

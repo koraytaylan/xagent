@@ -11,8 +11,8 @@ touches:
   - crates/xagent-sandbox/tests/second_odour_inheritance.rs
   - crates/xagent-sandbox/src/agent/mod.rs
   - crates/xagent-brain/src/buffers.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "3f2c67cd347883b7e355cfa5e03cc6fcace68bfd"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --test second_odour_inheritance"

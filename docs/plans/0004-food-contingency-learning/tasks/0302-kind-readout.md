@@ -9,8 +9,8 @@ gated: false
 touches:
   - crates/xagent-brain/src/lib.rs
   - crates/xagent-brain/src/kind_readout.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "ffcff76c069499601f61835f66f7007e19c23660"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib kind_readout"

@@ -79,5 +79,6 @@ fn phase_brain_features(
         let scent_offset = touch_offset + MAX_TOUCH_CONTACTS * 4u;
         brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset]; fi = fi + 1u;
         brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset + 1u]; fi = fi + 1u;
+        for (var k: u32 = 0u; k < EXTRA_SENSORY_CHANNELS; k = k + 1u) { brain_scratch[agent_base + SCRATCH_FEATURES + fi] = sensory_buffer[s_base + scent_offset + NON_VISUAL_FEATURE_CHANNELS + k]; fi = fi + 1u; }
     }
 }

@@ -9,8 +9,8 @@ depends_on:
 gated: false
 touches:
   - crates/xagent-brain/src/senses.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "17015b2a34d602bdb9cc3164353438a50e9b2e14"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib -- senses::tests::"

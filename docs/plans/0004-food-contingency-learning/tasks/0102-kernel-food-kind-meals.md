@@ -15,8 +15,8 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/persistent_tick.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_death.wgsl
   - crates/xagent-brain/tests/food_kind_meals.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "7b56de14aad188324f7a88b5db8f0e899945de39"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test food_kind_meals"

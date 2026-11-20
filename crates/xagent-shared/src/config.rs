@@ -270,6 +270,10 @@ pub struct BrainConfig {
     /// `xagent_brain::buffers`.
     #[serde(default)]
     pub cortex_stage_limit: u32,
+    /// Declares the second nostril-pair sense. Not a heritable gene: never
+    /// mutated, and crossover copies it from parent `a`. Default `false`.
+    #[serde(default)]
+    pub second_odour_sense_enabled: bool,
     /// Which inputs the critic reads. Locked per batch, not heritable, not
     /// perturbed by `mutate_config`. Default [`DEFAULT_CRITIC_INPUT`].
     #[serde(default = "default_critic_input")]
@@ -399,6 +403,51 @@ pub struct WorldConfig {
     /// Random seed for world generation.
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Opt-in two-kind food scenario; off keeps the world exactly as before.
+    #[serde(default)]
+    pub food_kinds_enabled: bool,
+}
+
+/// Golden-ratio gamma that spreads consecutive draw indices across the word.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+/// First splitmix64 finalizer shift.
+const SPLITMIX_SHIFT_A: u32 = 30;
+/// First standard splitmix64 finalizer multiplier.
+const SPLITMIX_MUL_A: u64 = 0xBF58_476D_1CE4_E5B9;
+/// Second splitmix64 finalizer shift.
+const SPLITMIX_SHIFT_B: u32 = 27;
+/// Second standard splitmix64 finalizer multiplier.
+const SPLITMIX_MUL_B: u64 = 0x94D0_49BB_1331_11EB;
+/// Third splitmix64 finalizer shift.
+const SPLITMIX_SHIFT_C: u32 = 31;
+
+/// Which of the two food kinds an item is. A kind is an index property and is
+/// never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FoodKind {
+    /// Kind of even-indexed items.
+    First,
+    /// Kind of odd-indexed items.
+    Second,
+}
+
+impl FoodKind {
+    /// Kind of the food item at `index`: even is `First`, odd is `Second`.
+    pub fn of_item(index: usize) -> Self {
+        if index % 2 == 0 {
+            Self::First
+        } else {
+            Self::Second
+        }
+    }
+
+    /// Numeric index of the kind: `First` 0, `Second` 1.
+    pub fn index(self) -> u32 {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
 }
 
 fn default_distress_exponent() -> f32 {
@@ -707,6 +756,7 @@ impl Default for BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            second_odour_sense_enabled: false,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
             klinotaxis_turn_gain_enabled: true,
@@ -812,6 +862,7 @@ impl BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            second_odour_sense_enabled: false,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
             klinotaxis_turn_gain_enabled: true,
@@ -860,6 +911,7 @@ impl BrainConfig {
             smell_strength: default_smell_strength(),
             vision_plasticity: default_vision_plasticity(),
             cortex_stage_limit: 0,
+            second_odour_sense_enabled: false,
             critic_input: DEFAULT_CRITIC_INPUT,
             forward_pathway_enabled: DEFAULT_FORWARD_PATHWAY_ENABLED,
             klinotaxis_turn_gain_enabled: true,
@@ -880,11 +932,28 @@ impl Default for WorldConfig {
             food_density: 0.005,
             tick_rate: 30.0,
             seed: 42,
+            food_kinds_enabled: false,
         }
     }
 }
 
 impl WorldConfig {
+    /// Deterministic nourishing kind for a draw. The kernel draws index 0 at
+    /// construction and the next index on every agent reset.
+    pub fn nourishing_food_kind(&self, draw_index: u64) -> FoodKind {
+        let x = self.seed ^ draw_index.wrapping_mul(SPLITMIX_GAMMA);
+        let mut z = x ^ (x >> SPLITMIX_SHIFT_A);
+        z = z.wrapping_mul(SPLITMIX_MUL_A);
+        z ^= z >> SPLITMIX_SHIFT_B;
+        z = z.wrapping_mul(SPLITMIX_MUL_B);
+        z ^= z >> SPLITMIX_SHIFT_C;
+        if z & 1 == 0 {
+            FoodKind::First
+        } else {
+            FoodKind::Second
+        }
+    }
+
     /// Lots of food, slow energy drain, mild hazards.
     pub fn easy() -> Self {
         Self {
@@ -926,6 +995,99 @@ impl Default for AgentDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn food_kind_item_parity() {
+        assert_eq!(FoodKind::of_item(0), FoodKind::First);
+        assert_eq!(FoodKind::of_item(1), FoodKind::Second);
+        assert_eq!(FoodKind::of_item(10), FoodKind::First);
+        assert_eq!(FoodKind::First.index(), 0);
+        assert_eq!(FoodKind::Second.index(), 1);
+    }
+
+    #[test]
+    fn food_kind_draw_is_deterministic() {
+        let a = WorldConfig::default();
+        let b = WorldConfig::default();
+        for i in 0..64 {
+            assert_eq!(a.nourishing_food_kind(i), b.nourishing_food_kind(i));
+        }
+        let first = a.nourishing_food_kind(0);
+        assert!((0..64).any(|i| a.nourishing_food_kind(i) != first));
+    }
+
+    #[test]
+    fn food_kind_draw_is_balanced() {
+        let mut firsts = 0u32;
+        for s in 0..1000u64 {
+            let cfg = WorldConfig {
+                seed: s,
+                ..WorldConfig::default()
+            };
+            if cfg.nourishing_food_kind(0) == FoodKind::First {
+                firsts += 1;
+            }
+        }
+        let share = f64::from(firsts) / 1000.0;
+        assert!((0.45..=0.55).contains(&share), "seed share {share}");
+
+        let cfg = WorldConfig {
+            seed: 42,
+            ..WorldConfig::default()
+        };
+        let mut firsts = 0u32;
+        for i in 0..1000u64 {
+            if cfg.nourishing_food_kind(i) == FoodKind::First {
+                firsts += 1;
+            }
+        }
+        let share = f64::from(firsts) / 1000.0;
+        assert!((0.45..=0.55).contains(&share), "index share {share}");
+    }
+
+    #[test]
+    fn food_kind_flags_default_off() {
+        for w in [
+            WorldConfig::default(),
+            WorldConfig::easy(),
+            WorldConfig::hard(),
+        ] {
+            assert!(!w.food_kinds_enabled);
+        }
+        for b in [
+            BrainConfig::default(),
+            BrainConfig::tiny(),
+            BrainConfig::large(),
+        ] {
+            assert!(!b.second_odour_sense_enabled);
+        }
+        let mut bv = serde_json::to_value(BrainConfig::default()).unwrap();
+        bv.as_object_mut()
+            .unwrap()
+            .remove("second_odour_sense_enabled");
+        let b: BrainConfig = serde_json::from_value(bv).unwrap();
+        assert!(!b.second_odour_sense_enabled);
+        let mut wv = serde_json::to_value(WorldConfig::default()).unwrap();
+        wv.as_object_mut().unwrap().remove("food_kinds_enabled");
+        let w: WorldConfig = serde_json::from_value(wv).unwrap();
+        assert!(!w.food_kinds_enabled);
+    }
+
+    #[test]
+    fn food_kind_flags_round_trip() {
+        let b = BrainConfig {
+            second_odour_sense_enabled: true,
+            ..BrainConfig::default()
+        };
+        let w = WorldConfig {
+            food_kinds_enabled: true,
+            ..WorldConfig::default()
+        };
+        let b2: BrainConfig = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        let w2: WorldConfig = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert!(b2.second_odour_sense_enabled);
+        assert!(w2.food_kinds_enabled);
+    }
 
     #[test]
     fn route_flags_default_when_keys_absent() {

@@ -10,8 +10,8 @@ gated: false
 touches:
   - crates/xagent-brain/src/gpu_kernel.rs
   - crates/xagent-brain/tests/food_kind_draw.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "a01a9da3e684d85deb4f5a9c425bfd6a86059284"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test food_kind_draw"

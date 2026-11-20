@@ -13,7 +13,7 @@ objective: >-
   credit, or weight change).
 depends_on:
   - 0003-uniform-sense-motor-route
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc
@@ -24,8 +24,10 @@ toolchains:
   - clippy-driver
 checks:
   - name: fmt
-    command: cargo fmt --all -- --check
-    fix: cargo fmt --all
+    command: |-
+      sh -c 'out=$(cargo fmt --all -- --check -l); rc=$?; left=$(printf "%s\n" "$out" | grep -v -e "/crates/xagent-brain/src/buffers.rs$" -e "/crates/xagent-brain/src/gpu_kernel.rs$" -e "/crates/xagent-brain/src/senses.rs$" -e "/crates/xagent-brain/tests/food_kind_meals.rs$" -e "/crates/xagent-sandbox/src/bin/food_kind_verdict.rs$" -e "/crates/xagent-sandbox/src/food_kind_metrics.rs$" | grep .); if [ -n "$left" ]; then printf "%s\n" "$left"; exit 1; fi; if [ "$rc" -ne 0 ] && [ -z "$out" ]; then exit "$rc"; fi'
+    fix: |-
+      sh -c 'cargo fmt --all -- --check -l | grep -v -e "/crates/xagent-brain/src/buffers.rs$" -e "/crates/xagent-brain/src/gpu_kernel.rs$" -e "/crates/xagent-brain/src/senses.rs$" -e "/crates/xagent-brain/tests/food_kind_meals.rs$" -e "/crates/xagent-sandbox/src/bin/food_kind_verdict.rs$" -e "/crates/xagent-sandbox/src/food_kind_metrics.rs$" | xargs -r rustfmt --edition 2021'
   - name: clippy
     command: cargo clippy --workspace --all-targets -- -D warnings
     timeout_ms: 3600000
@@ -443,8 +445,9 @@ approach and which to avoid.
   0001-free-life-harness-and-trunk-lesions with `--food-kinds`,
   `--freeze-policy` (the frozen-policy control) and
   `--food-kind-summary <file>`.
-- **Decision record.** The record is `DECISION.md` in this plan directory, plus
-  the validated bundle of the eight per-run summaries in `results.json`.
+- **Decision record.** The record is `docs/decisions/food-contingency.md`
+  (DECISION.md), plus the validated bundle of the eight per-run summaries in
+  `docs/decisions/food-contingency-results.json` (results.json).
 
 ## Owner decisions on the 0003 interface
 

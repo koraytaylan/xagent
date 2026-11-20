@@ -83,7 +83,8 @@ Decisions:
   `cargo run -p xagent-sandbox` meaning the main binary. The verdict reads
   either the directory of 8 per-run files or a bundle file. It writes the
   validated bundle with `--write-bundle`. The committed evidence is one bundle,
-  `results.json`.
+  `results.json`, at `docs/decisions/food-contingency-results.json`; DECISION.md
+  is `docs/decisions/food-contingency.md`.
 - **Control.** The frozen-policy arm is the same run with
   `GpuKernel::set_freeze_steering_weights(true)`.
 - **GPU tests fail closed.** New GPU tests panic without an adapter when
@@ -98,7 +99,7 @@ Decisions:
 | INV-03 | Harm only through the body: a harmful meal adds no energy. It subtracts `food_energy/max_energy × HARMFUL_MEAL_INTEGRITY_PER_ENERGY × max_integrity` from integrity, clamps to `[0, max_integrity]`, and marks death in the same scope when integrity reaches 0. It increments `P_HARMFUL_MEAL_COUNT`, which survives respawn like `P_FOOD_COUNT`, and not `P_FOOD_COUNT`. No reward term or flag is added. | The homeostatic-only learning contract | `phase_food_claim.wgsl`, `phase_death.wgsl`, `kernel_tick.wgsl`, `common.wgsl`, `buffers.rs` |
 | INV-04 | Kind cues: while kinds are on, `Second` items render `FOOD_SECOND_KIND_COLOR` in every vision path. Nostril pair 1 smells only `First` items and pair 2 only `Second` items, with the same odour law as baseline smell. Pair 2 lands in the extra sensory channels right after scent. The serial and parallel pair-1 paths agree exactly. | The kinds are distinguishable by colour and odour only | `phase_vision.wgsl`, `phase_vision_parallel.wgsl`, `phase_vision_object_queries.wgsl`, `phase_vision_scent_parallel.wgsl` |
 | INV-05 | Declared sense: the second pair enters only through the `SECOND_ODOUR` descriptor, read through the existing `NonVisualFeatures` input kind at feature offset 27. Its only route is `Turn` / `LearnedOnly`, and there is no sense-specific block code. With the flag on, the layout appends one `ClosedForm2` block after the 0003 route block without moving any base-sense slot relative to the tail. `sensory_stride` and `feature_count` each grow by exactly 2, the kernel emits `EXTRA_SENSORY_CHANNELS = 2`, and both feature extractors copy the two extra channels to features 27 and 28. Its block weights are zero in every birth brain and stay zero through mutation, crossover and inheritance. They become nonzero only through within-life learning. `second_odour_sense_enabled` is never mutated and is copied from parent A in crossover. | No hand-built pathway; learned-only weights; a feasible route through 0003 | `crates/xagent-brain/src/senses.rs`, `crates/xagent-brain/src/buffers.rs`, `crates/xagent-brain/src/gpu_kernel.rs`, `brain_passes.wgsl`, `phase_brain_features.wgsl`, `crates/xagent-sandbox/src/agent/mod.rs` |
-| INV-06 | Measurement only: metrics, readout and link accumulators read kernel snapshots and copied samples. They never write brain, physics, food or config state. | The probes do not change what they measure | `food_kind_metrics.rs`, `kind_readout.rs`, `headless.rs` (free-life runner) |
+| INV-06 | Measurement only: metrics, readout and link accumulators read kernel snapshots (including read-only `read_agent_state` brain-state copies) and copied samples. They never write brain, physics, food or config state. | The probes do not change what they measure | `food_kind_metrics.rs`, `kind_readout.rs`, `headless.rs` (free-life runner) |
 | INV-07 | Control parity: the frozen arm shares the learning arm's seed, fresh brains, nourishing kind and every config value except `freeze_steering_weights`. Under freeze, the `second_odour` turn weights stay exactly 0 for a whole run. | A fair within-life comparison | `headless.rs` (free-life runner) |
 | INV-08 | Verdict by code: the verdict comes from exactly 8 summaries (seeds 5–8 × learning/frozen, 300,000 ticks, 10 fresh agents, the same nourishing kind per seed) with the thresholds fixed in PLAN.md. FAIL names the first failing link in the order readout → credit → weight change. A missing, duplicate, malformed or mismatched input is an error. `--expect-verdict` exits non-zero on mismatch. `DECISION.md`'s verdict line matches the bundle. | The decision record cannot drift from the evidence | `crates/xagent-sandbox/src/bin/food_kind_verdict.rs`, `DECISION.md`, `results.json` |
 | INV-09 | Scenario brain guard: `--food-kinds` with a stored champion brain is refused with an error before any dispatch. | Prevents layout mismatch | `headless.rs` (free-life runner) |
@@ -117,7 +118,7 @@ Decisions:
 | Extra sensory channels (second odour) | serial vision pass, thread per agent | Rewritten every vision batch | Single writer per agent slot |
 | `second_odour` sense block slots | 0003 sense block | Weights zero at birth. Mean and covariance follow the block's rules. | Brain workgroup, under the block's existing barriers |
 | Per-run food-kind accumulators and readout samples | harness (`run_free_life` in `headless.rs`) via `food_kind_metrics` / `kind_readout` | Live for one run, then serialised to the summary JSON | Single-threaded CPU |
-| `results.json`, `DECISION.md` | food-contingency-decision (architect) | Written once by the decision task; durable | None |
+| `docs/decisions/food-contingency-results.json` (results.json), `docs/decisions/food-contingency.md` (DECISION.md) | food-contingency-decision (architect) | Written once by the decision task; durable | None |
 
 ## Untrusted inputs
 

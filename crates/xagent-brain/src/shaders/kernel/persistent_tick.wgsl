@@ -60,7 +60,7 @@ fn persistent_tick(
             agent_food_detect(agent, tid);
             storageBarrier(); workgroupBarrier();
         }
-        if tid < agent_count { resolve_food_claim(tid); }
+        if tid < agent_count { resolve_food_claim(tid, cycle_tick); }
         storageBarrier(); workgroupBarrier();
 
         // These phases read no mutable state belonging to another agent.

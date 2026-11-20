@@ -12,8 +12,8 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/phase_vision.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_vision_scent_parallel.wgsl
   - crates/xagent-brain/tests/food_kind_senses.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "a4af834b702f5dc528f377aafe56eb99a27d79d4"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test food_kind_senses"

@@ -53,7 +53,7 @@ fn vision_prepare_scent(agent_id: u32, tid: u32, group_threads: u32) {
             let food = chunk_start + slot;
             var contribution = vec2<f32>(0.0, 0.0);
             var valid = 0u;
-            if alive && food_flags[food] == 0u {
+            if alive && food_flags[food] == 0u && !(food_kinds_enabled() && food_item_kind(food) != FOOD_KIND_FIRST) {
                 let fbase = food * FOOD_STATE_STRIDE;
                 let fx = food_state[fbase + FOOD_POSITION_X];
                 let fz = food_state[fbase + FOOD_POSITION_Z];

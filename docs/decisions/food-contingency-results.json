@@ -1,0 +1,2082 @@
+[
+  {
+    "seed": 5,
+    "arm": "learning",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "First",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": 0.00070848776,
+        "turn_toward_nourishing_late": 0.0001312178,
+        "turn_away_harmful_whole": -0.0036933282,
+        "turn_away_harmful_late": -0.008009929,
+        "nourishing_meals_by_quarter": [
+          19,
+          11,
+          5,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          5,
+          2,
+          1
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.6664542,
+        "readout_shuffled_accuracy": 0.5000288,
+        "signed_credit_pair_first": -0.79038453,
+        "signed_credit_pair_second": -5.080082,
+        "signed_weight_difference_pair_first": 0.047561854,
+        "signed_weight_difference_pair_second": 0.025454266
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0005458359,
+        "turn_toward_nourishing_late": -0.0005673474,
+        "turn_away_harmful_whole": 0.00052435003,
+        "turn_away_harmful_late": -0.0034705894,
+        "nourishing_meals_by_quarter": [
+          23,
+          18,
+          9,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          8,
+          14,
+          0
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.7174157,
+        "readout_shuffled_accuracy": 0.50357854,
+        "signed_credit_pair_first": 2.3163617,
+        "signed_credit_pair_second": 1.610725,
+        "signed_weight_difference_pair_first": -0.031964153,
+        "signed_weight_difference_pair_second": 0.001194274
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0019633798,
+        "turn_toward_nourishing_late": -0.00032566083,
+        "turn_away_harmful_whole": 0.00011784696,
+        "turn_away_harmful_late": 0.001319575,
+        "nourishing_meals_by_quarter": [
+          23,
+          17,
+          12,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          6,
+          2,
+          3
+        ],
+        "deaths": 48,
+        "readout_balanced_accuracy": 0.6733871,
+        "readout_shuffled_accuracy": 0.5000125,
+        "signed_credit_pair_first": 2.2999194,
+        "signed_credit_pair_second": -4.735196,
+        "signed_weight_difference_pair_first": 0.004083045,
+        "signed_weight_difference_pair_second": 0.027836565
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0059113046,
+        "turn_toward_nourishing_late": 0.0049150106,
+        "turn_away_harmful_whole": -0.0009173506,
+        "turn_away_harmful_late": 0.0023939046,
+        "nourishing_meals_by_quarter": [
+          28,
+          7,
+          6,
+          21
+        ],
+        "harmful_meals_by_quarter": [
+          20,
+          14,
+          6,
+          8
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.7019002,
+        "readout_shuffled_accuracy": 0.49724582,
+        "signed_credit_pair_first": 2.8796809,
+        "signed_credit_pair_second": 6.059391,
+        "signed_weight_difference_pair_first": 0.008576132,
+        "signed_weight_difference_pair_second": -0.03310892
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0026448537,
+        "turn_toward_nourishing_late": -0.013491406,
+        "turn_away_harmful_whole": -0.008866048,
+        "turn_away_harmful_late": -0.03342703,
+        "nourishing_meals_by_quarter": [
+          9,
+          8,
+          3,
+          12
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          4,
+          2,
+          5
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.6926025,
+        "readout_shuffled_accuracy": 0.4996319,
+        "signed_credit_pair_first": -1.1884067,
+        "signed_credit_pair_second": 0.53196234,
+        "signed_weight_difference_pair_first": -0.038390912,
+        "signed_weight_difference_pair_second": -0.005724605
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0042744805,
+        "turn_toward_nourishing_late": 0.00030255268,
+        "turn_away_harmful_whole": 0.002259892,
+        "turn_away_harmful_late": 0.0039860015,
+        "nourishing_meals_by_quarter": [
+          13,
+          8,
+          6,
+          6
+        ],
+        "harmful_meals_by_quarter": [
+          12,
+          6,
+          4,
+          5
+        ],
+        "deaths": 50,
+        "readout_balanced_accuracy": 0.70935774,
+        "readout_shuffled_accuracy": 0.5014066,
+        "signed_credit_pair_first": 1.831504,
+        "signed_credit_pair_second": 3.9955518,
+        "signed_weight_difference_pair_first": -0.03597208,
+        "signed_weight_difference_pair_second": 0.018536948
+      },
+      {
+        "turn_toward_nourishing_whole": 0.000598158,
+        "turn_toward_nourishing_late": -0.010738186,
+        "turn_away_harmful_whole": -0.0040336503,
+        "turn_away_harmful_late": -0.009671355,
+        "nourishing_meals_by_quarter": [
+          15,
+          12,
+          3,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          18,
+          12,
+          5,
+          7
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.6369406,
+        "readout_shuffled_accuracy": 0.4999098,
+        "signed_credit_pair_first": 0.54831916,
+        "signed_credit_pair_second": 9.669684,
+        "signed_weight_difference_pair_first": 0.022917004,
+        "signed_weight_difference_pair_second": -0.029687794
+      },
+      {
+        "turn_toward_nourishing_whole": -0.004952158,
+        "turn_toward_nourishing_late": -0.0106510315,
+        "turn_away_harmful_whole": 0.0007769274,
+        "turn_away_harmful_late": -0.000954097,
+        "nourishing_meals_by_quarter": [
+          6,
+          2,
+          10,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          4,
+          2,
+          6,
+          4
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.6553022,
+        "readout_shuffled_accuracy": 0.49985063,
+        "signed_credit_pair_first": 4.9257994,
+        "signed_credit_pair_second": -14.014856,
+        "signed_weight_difference_pair_first": -0.034101017,
+        "signed_weight_difference_pair_second": 0.005642947
+      },
+      {
+        "turn_toward_nourishing_whole": -0.003168292,
+        "turn_toward_nourishing_late": -0.0054502063,
+        "turn_away_harmful_whole": -0.0002219018,
+        "turn_away_harmful_late": -0.0003172363,
+        "nourishing_meals_by_quarter": [
+          12,
+          13,
+          4,
+          4
+        ],
+        "harmful_meals_by_quarter": [
+          15,
+          4,
+          8,
+          4
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.7295597,
+        "readout_shuffled_accuracy": 0.500211,
+        "signed_credit_pair_first": 0.6092067,
+        "signed_credit_pair_second": 0.97531325,
+        "signed_weight_difference_pair_first": -0.038837593,
+        "signed_weight_difference_pair_second": 0.016301315
+      },
+      {
+        "turn_toward_nourishing_whole": 0.009965223,
+        "turn_toward_nourishing_late": 0.028841628,
+        "turn_away_harmful_whole": -0.0026358122,
+        "turn_away_harmful_late": -0.0065804445,
+        "nourishing_meals_by_quarter": [
+          24,
+          25,
+          9,
+          6
+        ],
+        "harmful_meals_by_quarter": [
+          25,
+          9,
+          5,
+          1
+        ],
+        "deaths": 50,
+        "readout_balanced_accuracy": 0.6974953,
+        "readout_shuffled_accuracy": 0.4999457,
+        "signed_credit_pair_first": 0.81554896,
+        "signed_credit_pair_second": -2.593379,
+        "signed_weight_difference_pair_first": 0.0723301,
+        "signed_weight_difference_pair_second": 0.09061727
+      }
+    ]
+  },
+  {
+    "seed": 5,
+    "arm": "frozen",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "First",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": -0.000038725055,
+        "turn_toward_nourishing_late": -0.0007020845,
+        "turn_away_harmful_whole": 0.0029534523,
+        "turn_away_harmful_late": 0.0021228108,
+        "nourishing_meals_by_quarter": [
+          12,
+          8,
+          6,
+          11
+        ],
+        "harmful_meals_by_quarter": [
+          13,
+          11,
+          7,
+          10
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.69183034,
+        "readout_shuffled_accuracy": 0.49989158,
+        "signed_credit_pair_first": 1.96927,
+        "signed_credit_pair_second": 6.144796,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0003998393,
+        "turn_toward_nourishing_late": 0.00037547757,
+        "turn_away_harmful_whole": -0.0009009242,
+        "turn_away_harmful_late": -0.0006131835,
+        "nourishing_meals_by_quarter": [
+          20,
+          15,
+          5,
+          7
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          5,
+          7,
+          5
+        ],
+        "deaths": 59,
+        "readout_balanced_accuracy": 0.73560816,
+        "readout_shuffled_accuracy": 0.50027466,
+        "signed_credit_pair_first": 5.3877273,
+        "signed_credit_pair_second": -8.702515,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0012065443,
+        "turn_toward_nourishing_late": -0.00047398225,
+        "turn_away_harmful_whole": 0.0018065814,
+        "turn_away_harmful_late": 0.0038911237,
+        "nourishing_meals_by_quarter": [
+          14,
+          33,
+          27,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          15,
+          36,
+          42,
+          13
+        ],
+        "deaths": 122,
+        "readout_balanced_accuracy": 0.7717576,
+        "readout_shuffled_accuracy": 0.50346196,
+        "signed_credit_pair_first": 2.0499048,
+        "signed_credit_pair_second": 3.8204548,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00020063888,
+        "turn_toward_nourishing_late": 0.00022100928,
+        "turn_away_harmful_whole": -0.0008138267,
+        "turn_away_harmful_late": 0.0003511753,
+        "nourishing_meals_by_quarter": [
+          10,
+          2,
+          3,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          4,
+          1,
+          5
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.6789059,
+        "readout_shuffled_accuracy": 0.50068164,
+        "signed_credit_pair_first": 4.0816393,
+        "signed_credit_pair_second": 2.2146025,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.000544358,
+        "turn_toward_nourishing_late": -0.00023349849,
+        "turn_away_harmful_whole": 0.00118393,
+        "turn_away_harmful_late": 0.0006321783,
+        "nourishing_meals_by_quarter": [
+          18,
+          5,
+          8,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          12,
+          5,
+          8,
+          4
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.68160254,
+        "readout_shuffled_accuracy": 0.5000391,
+        "signed_credit_pair_first": 0.8722049,
+        "signed_credit_pair_second": -1.1290224,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0009473134,
+        "turn_toward_nourishing_late": -0.0018530907,
+        "turn_away_harmful_whole": 0.002849473,
+        "turn_away_harmful_late": 0.0047303466,
+        "nourishing_meals_by_quarter": [
+          11,
+          16,
+          9,
+          24
+        ],
+        "harmful_meals_by_quarter": [
+          12,
+          10,
+          10,
+          20
+        ],
+        "deaths": 73,
+        "readout_balanced_accuracy": 0.7462138,
+        "readout_shuffled_accuracy": 0.50069726,
+        "signed_credit_pair_first": -2.5879016,
+        "signed_credit_pair_second": 0.53249794,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0030793138,
+        "turn_toward_nourishing_late": -0.0051572407,
+        "turn_away_harmful_whole": -0.0009332886,
+        "turn_away_harmful_late": -0.004478328,
+        "nourishing_meals_by_quarter": [
+          19,
+          4,
+          18,
+          17
+        ],
+        "harmful_meals_by_quarter": [
+          18,
+          4,
+          10,
+          26
+        ],
+        "deaths": 72,
+        "readout_balanced_accuracy": 0.7435983,
+        "readout_shuffled_accuracy": 0.5001397,
+        "signed_credit_pair_first": -3.011477,
+        "signed_credit_pair_second": -12.766619,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.002528458,
+        "turn_toward_nourishing_late": 0.00082641,
+        "turn_away_harmful_whole": -0.0010575305,
+        "turn_away_harmful_late": -0.001353447,
+        "nourishing_meals_by_quarter": [
+          24,
+          6,
+          3,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          22,
+          6,
+          9,
+          3
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.6734027,
+        "readout_shuffled_accuracy": 0.49993572,
+        "signed_credit_pair_first": 0.5073388,
+        "signed_credit_pair_second": 2.7116473,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00017816601,
+        "turn_toward_nourishing_late": -0.00012453184,
+        "turn_away_harmful_whole": 0.0000017716625,
+        "turn_away_harmful_late": -0.002190866,
+        "nourishing_meals_by_quarter": [
+          16,
+          7,
+          6,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          15,
+          10,
+          7,
+          4
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.7335738,
+        "readout_shuffled_accuracy": 0.5002605,
+        "signed_credit_pair_first": -3.8323433,
+        "signed_credit_pair_second": 2.1483905,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0004735688,
+        "turn_toward_nourishing_late": 0.0035660218,
+        "turn_away_harmful_whole": -0.000010692404,
+        "turn_away_harmful_late": -0.00088133046,
+        "nourishing_meals_by_quarter": [
+          16,
+          14,
+          9,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          7,
+          2,
+          6
+        ],
+        "deaths": 59,
+        "readout_balanced_accuracy": 0.7167842,
+        "readout_shuffled_accuracy": 0.50005347,
+        "signed_credit_pair_first": 3.4243371,
+        "signed_credit_pair_second": 7.272977,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      }
+    ]
+  },
+  {
+    "seed": 6,
+    "arm": "learning",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "Second",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": -0.003989122,
+        "turn_toward_nourishing_late": -0.008546636,
+        "turn_away_harmful_whole": -0.0020872634,
+        "turn_away_harmful_late": -0.0020462354,
+        "nourishing_meals_by_quarter": [
+          18,
+          11,
+          6,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          20,
+          7,
+          2
+        ],
+        "deaths": 60,
+        "readout_balanced_accuracy": 0.7327109,
+        "readout_shuffled_accuracy": 0.49942884,
+        "signed_credit_pair_first": -2.2194185,
+        "signed_credit_pair_second": 1.563222,
+        "signed_weight_difference_pair_first": -0.026268365,
+        "signed_weight_difference_pair_second": -0.060546055
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0067011733,
+        "turn_toward_nourishing_late": 0.010932144,
+        "turn_away_harmful_whole": 0.0022274063,
+        "turn_away_harmful_late": 0.004421551,
+        "nourishing_meals_by_quarter": [
+          21,
+          28,
+          18,
+          21
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          21,
+          11,
+          2
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.74882877,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": 0.55161375,
+        "signed_credit_pair_second": -0.67403495,
+        "signed_weight_difference_pair_first": 0.06494994,
+        "signed_weight_difference_pair_second": 0.088818505
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00043434498,
+        "turn_toward_nourishing_late": 0.0040926985,
+        "turn_away_harmful_whole": 0.00526949,
+        "turn_away_harmful_late": 0.025504304,
+        "nourishing_meals_by_quarter": [
+          15,
+          6,
+          11,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          7,
+          12,
+          6
+        ],
+        "deaths": 59,
+        "readout_balanced_accuracy": 0.6851279,
+        "readout_shuffled_accuracy": 0.5013728,
+        "signed_credit_pair_first": -1.4520942,
+        "signed_credit_pair_second": 0.6263798,
+        "signed_weight_difference_pair_first": -0.04997516,
+        "signed_weight_difference_pair_second": -0.035723682
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0019702113,
+        "turn_toward_nourishing_late": -0.0048762294,
+        "turn_away_harmful_whole": -0.0018017705,
+        "turn_away_harmful_late": -0.0062805153,
+        "nourishing_meals_by_quarter": [
+          19,
+          3,
+          2,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          19,
+          4,
+          1,
+          2
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.68842876,
+        "readout_shuffled_accuracy": 0.49988315,
+        "signed_credit_pair_first": 3.9985642,
+        "signed_credit_pair_second": 0.23833205,
+        "signed_weight_difference_pair_first": -0.014656585,
+        "signed_weight_difference_pair_second": 0.009443868
+      },
+      {
+        "turn_toward_nourishing_whole": 0.006038505,
+        "turn_toward_nourishing_late": 0.0069084554,
+        "turn_away_harmful_whole": -0.0016040842,
+        "turn_away_harmful_late": -0.0067610694,
+        "nourishing_meals_by_quarter": [
+          9,
+          8,
+          0,
+          18
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          5,
+          8,
+          12
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.69854033,
+        "readout_shuffled_accuracy": 0.4991563,
+        "signed_credit_pair_first": 11.626484,
+        "signed_credit_pair_second": -7.0066833,
+        "signed_weight_difference_pair_first": -0.006645184,
+        "signed_weight_difference_pair_second": 0.06613862
+      },
+      {
+        "turn_toward_nourishing_whole": 0.004775791,
+        "turn_toward_nourishing_late": -0.0026893895,
+        "turn_away_harmful_whole": -0.0038369412,
+        "turn_away_harmful_late": 0.008513854,
+        "nourishing_meals_by_quarter": [
+          31,
+          10,
+          15,
+          8
+        ],
+        "harmful_meals_by_quarter": [
+          33,
+          14,
+          22,
+          10
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.70758075,
+        "readout_shuffled_accuracy": 0.49993214,
+        "signed_credit_pair_first": 0.022733679,
+        "signed_credit_pair_second": -3.2512918,
+        "signed_weight_difference_pair_first": -0.002106968,
+        "signed_weight_difference_pair_second": 0.017077032
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0009764008,
+        "turn_toward_nourishing_late": -0.00083023176,
+        "turn_away_harmful_whole": 0.0031675005,
+        "turn_away_harmful_late": 0.0052260375,
+        "nourishing_meals_by_quarter": [
+          17,
+          8,
+          10,
+          1
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          5,
+          9,
+          1
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.6984811,
+        "readout_shuffled_accuracy": 0.50008047,
+        "signed_credit_pair_first": 0.99175036,
+        "signed_credit_pair_second": 3.674556,
+        "signed_weight_difference_pair_first": 0.022655139,
+        "signed_weight_difference_pair_second": 0.03184302
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0013250518,
+        "turn_toward_nourishing_late": -0.0063608927,
+        "turn_away_harmful_whole": 0.00519247,
+        "turn_away_harmful_late": 0.013224321,
+        "nourishing_meals_by_quarter": [
+          15,
+          14,
+          4,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          11,
+          1,
+          5
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.68913466,
+        "readout_shuffled_accuracy": 0.5000203,
+        "signed_credit_pair_first": -0.19366232,
+        "signed_credit_pair_second": 1.199429,
+        "signed_weight_difference_pair_first": 0.01811868,
+        "signed_weight_difference_pair_second": 0.009713845
+      },
+      {
+        "turn_toward_nourishing_whole": 0.009152222,
+        "turn_toward_nourishing_late": 0.019566413,
+        "turn_away_harmful_whole": -0.0029479514,
+        "turn_away_harmful_late": -0.0089884745,
+        "nourishing_meals_by_quarter": [
+          28,
+          11,
+          3,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          26,
+          9,
+          11,
+          3
+        ],
+        "deaths": 59,
+        "readout_balanced_accuracy": 0.6962759,
+        "readout_shuffled_accuracy": 0.5001186,
+        "signed_credit_pair_first": -1.9721509,
+        "signed_credit_pair_second": 2.0817702,
+        "signed_weight_difference_pair_first": -0.025814809,
+        "signed_weight_difference_pair_second": -0.0580697
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0026777997,
+        "turn_toward_nourishing_late": 0.0014691605,
+        "turn_away_harmful_whole": 0.004501508,
+        "turn_away_harmful_late": 0.0064241793,
+        "nourishing_meals_by_quarter": [
+          10,
+          7,
+          5,
+          0
+        ],
+        "harmful_meals_by_quarter": [
+          9,
+          2,
+          8,
+          4
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.6843033,
+        "readout_shuffled_accuracy": 0.5001804,
+        "signed_credit_pair_first": -2.0228083,
+        "signed_credit_pair_second": 1.0197667,
+        "signed_weight_difference_pair_first": 0.06010426,
+        "signed_weight_difference_pair_second": -0.02914834
+      }
+    ]
+  },
+  {
+    "seed": 6,
+    "arm": "frozen",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "Second",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": 0.0021907755,
+        "turn_toward_nourishing_late": 0.0030452635,
+        "turn_away_harmful_whole": 0.00017720691,
+        "turn_away_harmful_late": 0.00050529605,
+        "nourishing_meals_by_quarter": [
+          26,
+          16,
+          2,
+          4
+        ],
+        "harmful_meals_by_quarter": [
+          26,
+          13,
+          5,
+          11
+        ],
+        "deaths": 64,
+        "readout_balanced_accuracy": 0.6829373,
+        "readout_shuffled_accuracy": 0.5000057,
+        "signed_credit_pair_first": -1.7004089,
+        "signed_credit_pair_second": -0.24488819,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0018021829,
+        "turn_toward_nourishing_late": 0.00019505613,
+        "turn_away_harmful_whole": 0.0011352606,
+        "turn_away_harmful_late": -0.002386812,
+        "nourishing_meals_by_quarter": [
+          9,
+          8,
+          2,
+          7
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          4,
+          7,
+          8
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.6874114,
+        "readout_shuffled_accuracy": 0.4999398,
+        "signed_credit_pair_first": -1.071216,
+        "signed_credit_pair_second": -0.40041786,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0020087135,
+        "turn_toward_nourishing_late": 0.0041209343,
+        "turn_away_harmful_whole": -0.0009153577,
+        "turn_away_harmful_late": -0.0018630882,
+        "nourishing_meals_by_quarter": [
+          15,
+          4,
+          11,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          18,
+          5,
+          11,
+          6
+        ],
+        "deaths": 59,
+        "readout_balanced_accuracy": 0.7029494,
+        "readout_shuffled_accuracy": 0.5007277,
+        "signed_credit_pair_first": -1.3871466,
+        "signed_credit_pair_second": 0.06724303,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0008112575,
+        "turn_toward_nourishing_late": 0.0013009616,
+        "turn_away_harmful_whole": -0.00043987588,
+        "turn_away_harmful_late": 0.0012237958,
+        "nourishing_meals_by_quarter": [
+          23,
+          3,
+          3,
+          7
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          12,
+          6,
+          6
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.7056091,
+        "readout_shuffled_accuracy": 0.50034815,
+        "signed_credit_pair_first": 1.1252967,
+        "signed_credit_pair_second": -0.25018623,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00039902807,
+        "turn_toward_nourishing_late": 0.0030360017,
+        "turn_away_harmful_whole": -0.000886553,
+        "turn_away_harmful_late": -0.0043753725,
+        "nourishing_meals_by_quarter": [
+          11,
+          5,
+          5,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          23,
+          6,
+          2,
+          10
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.69408834,
+        "readout_shuffled_accuracy": 0.5002795,
+        "signed_credit_pair_first": -1.969047,
+        "signed_credit_pair_second": 10.347831,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0009364965,
+        "turn_toward_nourishing_late": -0.0051107085,
+        "turn_away_harmful_whole": -0.00023572602,
+        "turn_away_harmful_late": -0.00028551448,
+        "nourishing_meals_by_quarter": [
+          22,
+          18,
+          8,
+          7
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          7,
+          22,
+          8
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.6983868,
+        "readout_shuffled_accuracy": 0.5005799,
+        "signed_credit_pair_first": 3.0105379,
+        "signed_credit_pair_second": 0.5974147,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0008954897,
+        "turn_toward_nourishing_late": 0.0005143351,
+        "turn_away_harmful_whole": -0.00080559816,
+        "turn_away_harmful_late": -0.001993719,
+        "nourishing_meals_by_quarter": [
+          24,
+          8,
+          6,
+          11
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          3,
+          6,
+          10
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.6772524,
+        "readout_shuffled_accuracy": 0.49996236,
+        "signed_credit_pair_first": 1.6990212,
+        "signed_credit_pair_second": -1.2343553,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.000394777,
+        "turn_toward_nourishing_late": 0.00039187568,
+        "turn_away_harmful_whole": -0.0003033776,
+        "turn_away_harmful_late": -0.0031669692,
+        "nourishing_meals_by_quarter": [
+          11,
+          5,
+          9,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          7,
+          6,
+          2
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.69277364,
+        "readout_shuffled_accuracy": 0.500043,
+        "signed_credit_pair_first": -0.26759034,
+        "signed_credit_pair_second": 0.8594518,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00042910772,
+        "turn_toward_nourishing_late": 0.0013549874,
+        "turn_away_harmful_whole": 0.00066871545,
+        "turn_away_harmful_late": -0.00042896264,
+        "nourishing_meals_by_quarter": [
+          13,
+          3,
+          4,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          12,
+          3,
+          4,
+          9
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.7232211,
+        "readout_shuffled_accuracy": 0.49995548,
+        "signed_credit_pair_first": 1.0056374,
+        "signed_credit_pair_second": 0.24413872,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0011165513,
+        "turn_toward_nourishing_late": -0.0017589859,
+        "turn_away_harmful_whole": 0.00019680095,
+        "turn_away_harmful_late": 0.0018874772,
+        "nourishing_meals_by_quarter": [
+          19,
+          13,
+          18,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          15,
+          11,
+          5
+        ],
+        "deaths": 60,
+        "readout_balanced_accuracy": 0.7293413,
+        "readout_shuffled_accuracy": 0.5026986,
+        "signed_credit_pair_first": -0.4904847,
+        "signed_credit_pair_second": 1.6497717,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      }
+    ]
+  },
+  {
+    "seed": 7,
+    "arm": "learning",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "Second",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": 0.0049420367,
+        "turn_toward_nourishing_late": 0.010676981,
+        "turn_away_harmful_whole": -0.011391966,
+        "turn_away_harmful_late": -0.026341083,
+        "nourishing_meals_by_quarter": [
+          19,
+          3,
+          6,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          19,
+          11,
+          2,
+          5
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.7099415,
+        "readout_shuffled_accuracy": 0.50031316,
+        "signed_credit_pair_first": 4.0786614,
+        "signed_credit_pair_second": -7.410935,
+        "signed_weight_difference_pair_first": -0.119432226,
+        "signed_weight_difference_pair_second": 0.13692464
+      },
+      {
+        "turn_toward_nourishing_whole": 0.008753365,
+        "turn_toward_nourishing_late": 0.011913013,
+        "turn_away_harmful_whole": -0.0019144154,
+        "turn_away_harmful_late": -0.008039545,
+        "nourishing_meals_by_quarter": [
+          17,
+          10,
+          7,
+          12
+        ],
+        "harmful_meals_by_quarter": [
+          11,
+          9,
+          4,
+          10
+        ],
+        "deaths": 50,
+        "readout_balanced_accuracy": 0.70575005,
+        "readout_shuffled_accuracy": 0.5034969,
+        "signed_credit_pair_first": -0.43989247,
+        "signed_credit_pair_second": -3.8632934,
+        "signed_weight_difference_pair_first": -0.014957529,
+        "signed_weight_difference_pair_second": 0.0862307
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00029577446,
+        "turn_toward_nourishing_late": 0.001120459,
+        "turn_away_harmful_whole": 0.002045066,
+        "turn_away_harmful_late": 0.0061360495,
+        "nourishing_meals_by_quarter": [
+          18,
+          8,
+          6,
+          6
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          4,
+          4,
+          8
+        ],
+        "deaths": 52,
+        "readout_balanced_accuracy": 0.7284235,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": 2.8392177,
+        "signed_credit_pair_second": 4.01147,
+        "signed_weight_difference_pair_first": 0.0054555703,
+        "signed_weight_difference_pair_second": -0.003803853
+      },
+      {
+        "turn_toward_nourishing_whole": 0.008003932,
+        "turn_toward_nourishing_late": 0.019365491,
+        "turn_away_harmful_whole": -0.014138855,
+        "turn_away_harmful_late": -0.019728899,
+        "nourishing_meals_by_quarter": [
+          19,
+          12,
+          4,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          22,
+          16,
+          4,
+          2
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.6744646,
+        "readout_shuffled_accuracy": 0.49993175,
+        "signed_credit_pair_first": 2.2246068,
+        "signed_credit_pair_second": 0.15859538,
+        "signed_weight_difference_pair_first": -0.04892764,
+        "signed_weight_difference_pair_second": 0.04998008
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0026796898,
+        "turn_toward_nourishing_late": 0.0017545774,
+        "turn_away_harmful_whole": 0.00025587325,
+        "turn_away_harmful_late": -0.0050733346,
+        "nourishing_meals_by_quarter": [
+          19,
+          9,
+          1,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          19,
+          3,
+          2
+        ],
+        "deaths": 62,
+        "readout_balanced_accuracy": 0.68826497,
+        "readout_shuffled_accuracy": 0.50222576,
+        "signed_credit_pair_first": 1.1025965,
+        "signed_credit_pair_second": -2.3155563,
+        "signed_weight_difference_pair_first": -0.0610014,
+        "signed_weight_difference_pair_second": -0.018581739
+      },
+      {
+        "turn_toward_nourishing_whole": 0.006021124,
+        "turn_toward_nourishing_late": 0.0053155036,
+        "turn_away_harmful_whole": -0.0064916876,
+        "turn_away_harmful_late": -0.0065615634,
+        "nourishing_meals_by_quarter": [
+          17,
+          11,
+          13,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          24,
+          10,
+          4,
+          5
+        ],
+        "deaths": 49,
+        "readout_balanced_accuracy": 0.67503494,
+        "readout_shuffled_accuracy": 0.4997903,
+        "signed_credit_pair_first": -2.1023762,
+        "signed_credit_pair_second": 1.2769575,
+        "signed_weight_difference_pair_first": -0.030626915,
+        "signed_weight_difference_pair_second": 0.021961922
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0011559236,
+        "turn_toward_nourishing_late": -0.0036965283,
+        "turn_away_harmful_whole": 0.00059032574,
+        "turn_away_harmful_late": -0.00916213,
+        "nourishing_meals_by_quarter": [
+          23,
+          11,
+          4,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          7,
+          2,
+          2
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.6757997,
+        "readout_shuffled_accuracy": 0.50014246,
+        "signed_credit_pair_first": 2.210515,
+        "signed_credit_pair_second": -0.9991419,
+        "signed_weight_difference_pair_first": -0.033002697,
+        "signed_weight_difference_pair_second": 0.031808656
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0046695257,
+        "turn_toward_nourishing_late": 0.012886952,
+        "turn_away_harmful_whole": 0.0010146566,
+        "turn_away_harmful_late": -0.0014990828,
+        "nourishing_meals_by_quarter": [
+          11,
+          3,
+          1,
+          4
+        ],
+        "harmful_meals_by_quarter": [
+          18,
+          1,
+          5,
+          7
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.63843316,
+        "readout_shuffled_accuracy": 0.5000456,
+        "signed_credit_pair_first": -5.471687,
+        "signed_credit_pair_second": 7.214435,
+        "signed_weight_difference_pair_first": 0.041906033,
+        "signed_weight_difference_pair_second": 0.0054075792
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00150093,
+        "turn_toward_nourishing_late": 0.0033944186,
+        "turn_away_harmful_whole": 0.0053676725,
+        "turn_away_harmful_late": 0.0046422556,
+        "nourishing_meals_by_quarter": [
+          9,
+          7,
+          7,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          7,
+          6,
+          7,
+          8
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.709283,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": 0.14191616,
+        "signed_credit_pair_second": -0.17069055,
+        "signed_weight_difference_pair_first": 0.05383485,
+        "signed_weight_difference_pair_second": 0.002738364
+      },
+      {
+        "turn_toward_nourishing_whole": 0.019033048,
+        "turn_toward_nourishing_late": 0.03700233,
+        "turn_away_harmful_whole": -0.0021157642,
+        "turn_away_harmful_late": 0.0006619915,
+        "nourishing_meals_by_quarter": [
+          9,
+          8,
+          5,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          5,
+          6,
+          6,
+          1
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.6592528,
+        "readout_shuffled_accuracy": 0.5001024,
+        "signed_credit_pair_first": -0.78597504,
+        "signed_credit_pair_second": 0.7434649,
+        "signed_weight_difference_pair_first": -0.030412829,
+        "signed_weight_difference_pair_second": 0.06215786
+      }
+    ]
+  },
+  {
+    "seed": 7,
+    "arm": "frozen",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "Second",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": -0.0025344042,
+        "turn_toward_nourishing_late": -0.004143942,
+        "turn_away_harmful_whole": 0.0009763831,
+        "turn_away_harmful_late": 0.00204243,
+        "nourishing_meals_by_quarter": [
+          13,
+          6,
+          7,
+          12
+        ],
+        "harmful_meals_by_quarter": [
+          15,
+          8,
+          6,
+          7
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.7439784,
+        "readout_shuffled_accuracy": 0.50139576,
+        "signed_credit_pair_first": 3.0790915,
+        "signed_credit_pair_second": 2.661222,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0022873343,
+        "turn_toward_nourishing_late": 0.0016138015,
+        "turn_away_harmful_whole": 0.0005605282,
+        "turn_away_harmful_late": 0.0004727944,
+        "nourishing_meals_by_quarter": [
+          7,
+          4,
+          1,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          11,
+          7,
+          4,
+          3
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.6787164,
+        "readout_shuffled_accuracy": 0.49986306,
+        "signed_credit_pair_first": -1.2115213,
+        "signed_credit_pair_second": -0.5888468,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0007947597,
+        "turn_toward_nourishing_late": -0.0013611047,
+        "turn_away_harmful_whole": 0.00015550811,
+        "turn_away_harmful_late": 0.005250657,
+        "nourishing_meals_by_quarter": [
+          16,
+          14,
+          7,
+          24
+        ],
+        "harmful_meals_by_quarter": [
+          10,
+          8,
+          5,
+          29
+        ],
+        "deaths": 81,
+        "readout_balanced_accuracy": 0.74069613,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": 1.6987761,
+        "signed_credit_pair_second": 1.0375695,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0016474492,
+        "turn_toward_nourishing_late": 0.00087601476,
+        "turn_away_harmful_whole": 0.001957658,
+        "turn_away_harmful_late": 0.0024869423,
+        "nourishing_meals_by_quarter": [
+          13,
+          6,
+          0,
+          8
+        ],
+        "harmful_meals_by_quarter": [
+          11,
+          10,
+          4,
+          10
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.68571407,
+        "readout_shuffled_accuracy": 0.50021386,
+        "signed_credit_pair_first": 3.2835522,
+        "signed_credit_pair_second": -2.0442994,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00025441515,
+        "turn_toward_nourishing_late": 0.00020323682,
+        "turn_away_harmful_whole": -0.0020757888,
+        "turn_away_harmful_late": -0.0015414198,
+        "nourishing_meals_by_quarter": [
+          13,
+          8,
+          3,
+          10
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          11,
+          3,
+          13
+        ],
+        "deaths": 64,
+        "readout_balanced_accuracy": 0.6292803,
+        "readout_shuffled_accuracy": 0.5004683,
+        "signed_credit_pair_first": -0.32579136,
+        "signed_credit_pair_second": 2.27523,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0016147365,
+        "turn_toward_nourishing_late": -0.00019826737,
+        "turn_away_harmful_whole": 0.00035828643,
+        "turn_away_harmful_late": -0.0011444623,
+        "nourishing_meals_by_quarter": [
+          11,
+          4,
+          2,
+          8
+        ],
+        "harmful_meals_by_quarter": [
+          10,
+          1,
+          8,
+          7
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.6686828,
+        "readout_shuffled_accuracy": 0.50017184,
+        "signed_credit_pair_first": 2.6599846,
+        "signed_credit_pair_second": 2.253442,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00093362486,
+        "turn_toward_nourishing_late": 0.004715941,
+        "turn_away_harmful_whole": -0.000117812335,
+        "turn_away_harmful_late": 0.002732458,
+        "nourishing_meals_by_quarter": [
+          13,
+          0,
+          3,
+          12
+        ],
+        "harmful_meals_by_quarter": [
+          13,
+          5,
+          3,
+          19
+        ],
+        "deaths": 65,
+        "readout_balanced_accuracy": 0.67218405,
+        "readout_shuffled_accuracy": 0.5001565,
+        "signed_credit_pair_first": 6.969608,
+        "signed_credit_pair_second": -0.940736,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0008066303,
+        "turn_toward_nourishing_late": -0.001480209,
+        "turn_away_harmful_whole": 0.0030050788,
+        "turn_away_harmful_late": 0.0032409737,
+        "nourishing_meals_by_quarter": [
+          15,
+          5,
+          12,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          8,
+          6,
+          11,
+          15
+        ],
+        "deaths": 56,
+        "readout_balanced_accuracy": 0.67849135,
+        "readout_shuffled_accuracy": 0.4999383,
+        "signed_credit_pair_first": 1.8409069,
+        "signed_credit_pair_second": 2.9755886,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00047765416,
+        "turn_toward_nourishing_late": -0.0015926722,
+        "turn_away_harmful_whole": -0.0018790795,
+        "turn_away_harmful_late": -0.008481327,
+        "nourishing_meals_by_quarter": [
+          10,
+          6,
+          6,
+          14
+        ],
+        "harmful_meals_by_quarter": [
+          6,
+          3,
+          6,
+          2
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.72344756,
+        "readout_shuffled_accuracy": 0.5005845,
+        "signed_credit_pair_first": -2.136966,
+        "signed_credit_pair_second": -0.47386461,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.000053245993,
+        "turn_toward_nourishing_late": -0.005534106,
+        "turn_away_harmful_whole": -0.00033776555,
+        "turn_away_harmful_late": -0.00033434216,
+        "nourishing_meals_by_quarter": [
+          26,
+          10,
+          9,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          6,
+          3,
+          8,
+          9
+        ],
+        "deaths": 51,
+        "readout_balanced_accuracy": 0.7271224,
+        "readout_shuffled_accuracy": 0.5000155,
+        "signed_credit_pair_first": 1.4116133,
+        "signed_credit_pair_second": 2.2473185,
+        "signed_weight_difference_pair_first": -0.0,
+        "signed_weight_difference_pair_second": 0.0
+      }
+    ]
+  },
+  {
+    "seed": 8,
+    "arm": "learning",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "First",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": -0.0043384475,
+        "turn_toward_nourishing_late": -0.0028112798,
+        "turn_away_harmful_whole": 0.007940215,
+        "turn_away_harmful_late": 0.013279755,
+        "nourishing_meals_by_quarter": [
+          20,
+          3,
+          5,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          15,
+          6,
+          7,
+          14
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.6854377,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": 0.4261572,
+        "signed_credit_pair_second": -1.2047161,
+        "signed_weight_difference_pair_first": -0.0005197497,
+        "signed_weight_difference_pair_second": 0.11999298
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0033569,
+        "turn_toward_nourishing_late": 0.0022557394,
+        "turn_away_harmful_whole": -0.006697949,
+        "turn_away_harmful_late": -0.001966366,
+        "nourishing_meals_by_quarter": [
+          23,
+          5,
+          2,
+          1
+        ],
+        "harmful_meals_by_quarter": [
+          13,
+          11,
+          8,
+          6
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.7072949,
+        "readout_shuffled_accuracy": 0.5000813,
+        "signed_credit_pair_first": 7.986109,
+        "signed_credit_pair_second": 0.7707175,
+        "signed_weight_difference_pair_first": -0.06825155,
+        "signed_weight_difference_pair_second": -0.045736335
+      },
+      {
+        "turn_toward_nourishing_whole": 0.008610494,
+        "turn_toward_nourishing_late": 0.01371166,
+        "turn_away_harmful_whole": -0.010343505,
+        "turn_away_harmful_late": -0.013714538,
+        "nourishing_meals_by_quarter": [
+          16,
+          12,
+          10,
+          10
+        ],
+        "harmful_meals_by_quarter": [
+          21,
+          16,
+          25,
+          24
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.745233,
+        "readout_shuffled_accuracy": 0.5000858,
+        "signed_credit_pair_first": 0.12376377,
+        "signed_credit_pair_second": -1.1366752,
+        "signed_weight_difference_pair_first": 0.08293693,
+        "signed_weight_difference_pair_second": -0.10235751
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00485673,
+        "turn_toward_nourishing_late": 0.0012863529,
+        "turn_away_harmful_whole": 0.0020515071,
+        "turn_away_harmful_late": 0.0044351215,
+        "nourishing_meals_by_quarter": [
+          9,
+          15,
+          5,
+          6
+        ],
+        "harmful_meals_by_quarter": [
+          20,
+          7,
+          5,
+          11
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.6886206,
+        "readout_shuffled_accuracy": 0.50005853,
+        "signed_credit_pair_first": -4.7216277,
+        "signed_credit_pair_second": 0.95607954,
+        "signed_weight_difference_pair_first": 0.07743274,
+        "signed_weight_difference_pair_second": 0.074745834
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0009760684,
+        "turn_toward_nourishing_late": 0.00038765176,
+        "turn_away_harmful_whole": -0.0046310653,
+        "turn_away_harmful_late": -0.007206647,
+        "nourishing_meals_by_quarter": [
+          15,
+          16,
+          8,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          20,
+          20,
+          8,
+          4
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.7143021,
+        "readout_shuffled_accuracy": 0.5004086,
+        "signed_credit_pair_first": 1.1886613,
+        "signed_credit_pair_second": -0.5733547,
+        "signed_weight_difference_pair_first": -0.043241456,
+        "signed_weight_difference_pair_second": -0.05302182
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0018080813,
+        "turn_toward_nourishing_late": 0.003949005,
+        "turn_away_harmful_whole": 0.00061396376,
+        "turn_away_harmful_late": 0.00520692,
+        "nourishing_meals_by_quarter": [
+          14,
+          7,
+          6,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          14,
+          10,
+          7,
+          3
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.7106927,
+        "readout_shuffled_accuracy": 0.50013894,
+        "signed_credit_pair_first": -1.9955494,
+        "signed_credit_pair_second": -0.28302944,
+        "signed_weight_difference_pair_first": 0.038947843,
+        "signed_weight_difference_pair_second": -0.114253744
+      },
+      {
+        "turn_toward_nourishing_whole": -0.007531117,
+        "turn_toward_nourishing_late": -0.010475322,
+        "turn_away_harmful_whole": 0.0065278397,
+        "turn_away_harmful_late": 0.010534649,
+        "nourishing_meals_by_quarter": [
+          16,
+          9,
+          7,
+          6
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          1,
+          0,
+          7
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.6749554,
+        "readout_shuffled_accuracy": 0.49958435,
+        "signed_credit_pair_first": 0.17505936,
+        "signed_credit_pair_second": 1.065195,
+        "signed_weight_difference_pair_first": -0.0915447,
+        "signed_weight_difference_pair_second": 0.108525924
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0155586,
+        "turn_toward_nourishing_late": 0.019918742,
+        "turn_away_harmful_whole": -0.010223154,
+        "turn_away_harmful_late": -0.0135578215,
+        "nourishing_meals_by_quarter": [
+          25,
+          32,
+          44,
+          37
+        ],
+        "harmful_meals_by_quarter": [
+          37,
+          36,
+          37,
+          14
+        ],
+        "deaths": 70,
+        "readout_balanced_accuracy": 0.7560886,
+        "readout_shuffled_accuracy": 0.5003536,
+        "signed_credit_pair_first": -3.584839,
+        "signed_credit_pair_second": -0.61236215,
+        "signed_weight_difference_pair_first": 0.11438766,
+        "signed_weight_difference_pair_second": -0.03440565
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0003725954,
+        "turn_toward_nourishing_late": 0.0030844684,
+        "turn_away_harmful_whole": 0.0010483962,
+        "turn_away_harmful_late": -0.002302748,
+        "nourishing_meals_by_quarter": [
+          19,
+          14,
+          10,
+          18
+        ],
+        "harmful_meals_by_quarter": [
+          18,
+          6,
+          7,
+          7
+        ],
+        "deaths": 54,
+        "readout_balanced_accuracy": 0.73096,
+        "readout_shuffled_accuracy": 0.5002696,
+        "signed_credit_pair_first": -1.8054821,
+        "signed_credit_pair_second": -0.6914483,
+        "signed_weight_difference_pair_first": 0.013737642,
+        "signed_weight_difference_pair_second": -0.0018037818
+      },
+      {
+        "turn_toward_nourishing_whole": 0.009683314,
+        "turn_toward_nourishing_late": 0.010654069,
+        "turn_away_harmful_whole": -0.008143963,
+        "turn_away_harmful_late": -0.00779671,
+        "nourishing_meals_by_quarter": [
+          26,
+          27,
+          8,
+          20
+        ],
+        "harmful_meals_by_quarter": [
+          29,
+          26,
+          8,
+          8
+        ],
+        "deaths": 57,
+        "readout_balanced_accuracy": 0.73073083,
+        "readout_shuffled_accuracy": 0.5007931,
+        "signed_credit_pair_first": -3.4124665,
+        "signed_credit_pair_second": -3.277056,
+        "signed_weight_difference_pair_first": 0.048711926,
+        "signed_weight_difference_pair_second": -0.006281321
+      }
+    ]
+  },
+  {
+    "seed": 8,
+    "arm": "frozen",
+    "ticks": 300000,
+    "agent_count": 10,
+    "fresh_brains": true,
+    "nourishing_kind": "First",
+    "agents": [
+      {
+        "turn_toward_nourishing_whole": -0.00040900637,
+        "turn_toward_nourishing_late": -0.0012118059,
+        "turn_away_harmful_whole": 0.00016577228,
+        "turn_away_harmful_late": 0.0008811438,
+        "nourishing_meals_by_quarter": [
+          16,
+          6,
+          11,
+          4
+        ],
+        "harmful_meals_by_quarter": [
+          10,
+          10,
+          4,
+          1
+        ],
+        "deaths": 53,
+        "readout_balanced_accuracy": 0.68529135,
+        "readout_shuffled_accuracy": 0.499799,
+        "signed_credit_pair_first": -0.20224485,
+        "signed_credit_pair_second": 0.6398908,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00004803988,
+        "turn_toward_nourishing_late": 0.0019797042,
+        "turn_away_harmful_whole": 0.00053009245,
+        "turn_away_harmful_late": -0.0006928978,
+        "nourishing_meals_by_quarter": [
+          12,
+          6,
+          5,
+          9
+        ],
+        "harmful_meals_by_quarter": [
+          13,
+          5,
+          3,
+          12
+        ],
+        "deaths": 58,
+        "readout_balanced_accuracy": 0.605796,
+        "readout_shuffled_accuracy": 0.5004272,
+        "signed_credit_pair_first": -0.28463584,
+        "signed_credit_pair_second": 2.4172754,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0005804747,
+        "turn_toward_nourishing_late": -0.0009876142,
+        "turn_away_harmful_whole": 0.0002681495,
+        "turn_away_harmful_late": 0.0016743598,
+        "nourishing_meals_by_quarter": [
+          17,
+          11,
+          10,
+          2
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          14,
+          10,
+          4
+        ],
+        "deaths": 55,
+        "readout_balanced_accuracy": 0.700231,
+        "readout_shuffled_accuracy": 0.49996406,
+        "signed_credit_pair_first": 4.227623,
+        "signed_credit_pair_second": -14.081826,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0007370461,
+        "turn_toward_nourishing_late": 0.003750811,
+        "turn_away_harmful_whole": 0.0008039305,
+        "turn_away_harmful_late": -0.0012758819,
+        "nourishing_meals_by_quarter": [
+          23,
+          10,
+          23,
+          29
+        ],
+        "harmful_meals_by_quarter": [
+          13,
+          3,
+          17,
+          20
+        ],
+        "deaths": 87,
+        "readout_balanced_accuracy": 0.7570016,
+        "readout_shuffled_accuracy": 0.5001295,
+        "signed_credit_pair_first": 1.2253741,
+        "signed_credit_pair_second": -1.8217685,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00008019968,
+        "turn_toward_nourishing_late": 0.002052766,
+        "turn_away_harmful_whole": -0.0011501131,
+        "turn_away_harmful_late": -0.005269581,
+        "nourishing_meals_by_quarter": [
+          9,
+          5,
+          4,
+          21
+        ],
+        "harmful_meals_by_quarter": [
+          11,
+          4,
+          7,
+          22
+        ],
+        "deaths": 65,
+        "readout_balanced_accuracy": 0.69885296,
+        "readout_shuffled_accuracy": 0.5,
+        "signed_credit_pair_first": -2.1737707,
+        "signed_credit_pair_second": -2.739422,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00053892727,
+        "turn_toward_nourishing_late": 0.00039464055,
+        "turn_away_harmful_whole": 0.0011597077,
+        "turn_away_harmful_late": 0.00166446,
+        "nourishing_meals_by_quarter": [
+          15,
+          19,
+          9,
+          4
+        ],
+        "harmful_meals_by_quarter": [
+          16,
+          17,
+          5,
+          10
+        ],
+        "deaths": 61,
+        "readout_balanced_accuracy": 0.7129071,
+        "readout_shuffled_accuracy": 0.50013226,
+        "signed_credit_pair_first": 1.7052735,
+        "signed_credit_pair_second": 2.4247286,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.00075226545,
+        "turn_toward_nourishing_late": 0.0018167973,
+        "turn_away_harmful_whole": 0.000047615034,
+        "turn_away_harmful_late": -0.0017331776,
+        "nourishing_meals_by_quarter": [
+          16,
+          17,
+          5,
+          3
+        ],
+        "harmful_meals_by_quarter": [
+          23,
+          14,
+          5,
+          8
+        ],
+        "deaths": 65,
+        "readout_balanced_accuracy": 0.74340403,
+        "readout_shuffled_accuracy": 0.5000284,
+        "signed_credit_pair_first": -5.795833,
+        "signed_credit_pair_second": -0.9660857,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.0024941843,
+        "turn_toward_nourishing_late": -0.006274354,
+        "turn_away_harmful_whole": -0.0010055146,
+        "turn_away_harmful_late": -0.0011317356,
+        "nourishing_meals_by_quarter": [
+          16,
+          4,
+          5,
+          13
+        ],
+        "harmful_meals_by_quarter": [
+          20,
+          8,
+          7,
+          17
+        ],
+        "deaths": 65,
+        "readout_balanced_accuracy": 0.6931096,
+        "readout_shuffled_accuracy": 0.49997422,
+        "signed_credit_pair_first": -2.307965,
+        "signed_credit_pair_second": 3.8242898,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": -0.00010282871,
+        "turn_toward_nourishing_late": 0.00044182077,
+        "turn_away_harmful_whole": 0.0011753966,
+        "turn_away_harmful_late": 0.006293247,
+        "nourishing_meals_by_quarter": [
+          20,
+          14,
+          5,
+          5
+        ],
+        "harmful_meals_by_quarter": [
+          20,
+          9,
+          2,
+          12
+        ],
+        "deaths": 64,
+        "readout_balanced_accuracy": 0.72618806,
+        "readout_shuffled_accuracy": 0.5005002,
+        "signed_credit_pair_first": -5.7296996,
+        "signed_credit_pair_second": -3.3648632,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      },
+      {
+        "turn_toward_nourishing_whole": 0.0050293677,
+        "turn_toward_nourishing_late": 0.015046998,
+        "turn_away_harmful_whole": -0.0016823033,
+        "turn_away_harmful_late": -0.0031639147,
+        "nourishing_meals_by_quarter": [
+          16,
+          7,
+          10,
+          26
+        ],
+        "harmful_meals_by_quarter": [
+          17,
+          7,
+          12,
+          27
+        ],
+        "deaths": 85,
+        "readout_balanced_accuracy": 0.71780163,
+        "readout_shuffled_accuracy": 0.5000929,
+        "signed_credit_pair_first": 2.0136433,
+        "signed_credit_pair_second": -5.6268826,
+        "signed_weight_difference_pair_first": 0.0,
+        "signed_weight_difference_pair_second": -0.0
+      }
+    ]
+  }
+]

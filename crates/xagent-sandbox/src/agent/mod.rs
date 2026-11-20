@@ -516,8 +516,7 @@ fn predictor_context_offset(feature_count: usize) -> usize {
 }
 
 fn brain_weight_offsets(state: &AgentBrainState) -> BrainWeightOffsets {
-    let feature_count = feature_count_for_brain_stride(state.brain_state.len())
-        .expect("brain_state length matches no BrainLayout");
+    let feature_count = steering_feature_count(state.brain_state.len());
     let predictor_weights = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION;
     let predictor_context = predictor_context_offset(feature_count);
     let forward_weights =
@@ -589,9 +588,35 @@ pub fn mutate_steering_weights(
     strength: f32,
     rng: &mut impl Rng,
 ) -> AgentBrainState {
-    let feature_count = feature_count_for_brain_stride(state.brain_state.len())
-        .expect("brain_state length matches no BrainLayout");
+    let feature_count = steering_feature_count(state.brain_state.len());
     mutate_steering_weights_for(state, feature_count, DECLARED_SENSES, strength, rng)
+}
+
+/// Feature count of a `brain_state` of length `len`, for the default layout
+/// or one with the second-odour sense enabled. The second-odour block lies
+/// after the steering route block, so the steering offsets relative to the
+/// fixed tail are unchanged.
+fn steering_feature_count(len: usize) -> usize {
+    feature_count_for_brain_stride(len)
+        .or_else(|| {
+            let base = BrainConfig::default();
+            let flag_on = BrainConfig {
+                second_odour_sense_enabled: true,
+                ..base.clone()
+            };
+            let (on, off) = (
+                BrainLayout::from_config(&flag_on),
+                BrainLayout::from_config(&base),
+            );
+            // Extra sense slots only: the extra feature channels are already
+            // inferred from the length through the per-feature stride.
+            let extra = on.brain_stride
+                - off.brain_stride
+                - (on.feature_count - off.feature_count) * (ENCODED_DIMENSION + 1);
+            len.checked_sub(extra)
+                .and_then(feature_count_for_brain_stride)
+        })
+        .expect("brain_state length matches no BrainLayout")
 }
 
 /// Steering mutation over an explicit sense table: the action turn weights,
@@ -767,6 +792,8 @@ fn mutate_config_with_strength_rng(
         innate_instincts_enabled: parent.innate_instincts_enabled,
         // Cortex profiling stage limit is runtime-only (not heritable); pass through.
         cortex_stage_limit: parent.cortex_stage_limit,
+        // Second-odour sense flag passes through unchanged.
+        second_odour_sense_enabled: parent.second_odour_sense_enabled,
         // Route flags are locked per batch and inherited unchanged.
         critic_input: parent.critic_input,
         forward_pathway_enabled: parent.forward_pathway_enabled,
@@ -983,6 +1010,8 @@ pub fn crossover_config(a: &BrainConfig, b: &BrainConfig) -> BrainConfig {
         innate_instincts_enabled: a.innate_instincts_enabled,
         // Cortex profiling stage limit is runtime-only (not heritable); default off.
         cortex_stage_limit: 0,
+        // Second-odour flag is locked per batch (not heritable); take from `a`.
+        second_odour_sense_enabled: a.second_odour_sense_enabled,
         // Route flags are locked per batch and inherited unchanged.
         critic_input: a.critic_input,
         forward_pathway_enabled: a.forward_pathway_enabled,
@@ -1178,6 +1207,42 @@ mod tests {
         PATHWAY_INPUT_COUNT, SCENT_CHANNELS, VISION_PATHWAY_INPUTS,
     };
     use xagent_brain::senses::{RouteDescriptor, Whitening, SMELL, VISION};
+
+    #[test]
+    fn crossover_keeps_second_odour_sense_flag_from_parent_a() {
+        for (a_flag, b_flag) in [(true, false), (false, true)] {
+            let a = BrainConfig {
+                second_odour_sense_enabled: a_flag,
+                ..BrainConfig::default()
+            };
+            let b = BrainConfig {
+                second_odour_sense_enabled: b_flag,
+                ..BrainConfig::default()
+            };
+            for _ in 0..32 {
+                assert_eq!(crossover_config(&a, &b).second_odour_sense_enabled, a_flag);
+            }
+        }
+    }
+
+    #[test]
+    fn crossover_family_mutation_keeps_second_odour_sense_flag() {
+        for flag in [true, false] {
+            let parent = BrainConfig {
+                second_odour_sense_enabled: flag,
+                ..BrainConfig::default()
+            };
+            assert_eq!(mutate_config(&parent).second_odour_sense_enabled, flag);
+            assert_eq!(
+                mutate_config_seeded(&parent, 7).second_odour_sense_enabled,
+                flag
+            );
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(11);
+            let child = mutate_sensory_genes(&parent, 0.1, &MutationMomentum::new(0.9), &mut rng);
+            assert_eq!(child.second_odour_sense_enabled, flag);
+        }
+    }
 
     #[test]
     fn reset_for_new_life_clears_fatigue_history() {
@@ -1525,6 +1590,22 @@ mod tests {
     fn mutate_brain_state_rejects_short_buffer() {
         let state = AgentBrainState::new_for(10); // way too small
         let _ = mutate_brain_state(&state, 0.1);
+    }
+
+    #[test]
+    fn steering_feature_count_matches_default_and_second_odour_layouts() {
+        let base = BrainConfig::default();
+        let flag_on = BrainConfig {
+            second_odour_sense_enabled: true,
+            ..base.clone()
+        };
+        for config in [base, flag_on] {
+            let layout = BrainLayout::from_config(&config);
+            assert_eq!(
+                steering_feature_count(layout.brain_stride),
+                layout.feature_count
+            );
+        }
     }
 
     #[test]

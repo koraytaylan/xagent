@@ -11,8 +11,8 @@ gated: false
 touches:
   - crates/xagent-brain/src/gpu_kernel.rs
   - crates/xagent-brain/tests/second_odour_kernel.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "e83c8089068feba8cbf4e5ce53b8908bf9abd390"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test second_odour_kernel"

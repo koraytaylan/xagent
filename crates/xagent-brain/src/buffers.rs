@@ -10,7 +10,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use xagent_shared::{BrainConfig, SensoryFrame, TouchContact};
+use xagent_shared::{BrainConfig, FoodKind,SensoryFrame, TouchContact};
 
 use crate::complex::VISUAL_FEATURE_COUNT;
 use crate::senses::{MotorRoute, SenseDescriptor, Whitening, DECLARED_SENSES, MAX_SENSE_SLOTS};
@@ -473,10 +473,19 @@ pub const FIXED_TAIL_SIZE: usize = O_SENSORY_MEAN - O_PREDICTOR_CONTEXT_WEIGHT;
 /// feature count), so the length alone determines it. `None` if no layout
 /// has this length.
 pub fn feature_count_for_brain_stride(brain_stride: usize) -> Option<usize> {
-    let variable = brain_stride.checked_sub(
-        ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE,
-    )?;
-    (variable % (ENCODED_DIMENSION + 1) == 0).then_some(variable / (ENCODED_DIMENSION + 1))
+    let default_inferred = brain_stride
+        .checked_sub(ENCODED_DIMENSION + PREDICTOR_DIMENSION * ENCODED_DIMENSION + FIXED_TAIL_SIZE)
+        .and_then(|variable| {
+            (variable % (ENCODED_DIMENSION + 1) == 0).then_some(variable / (ENCODED_DIMENSION + 1))
+        });
+    if default_inferred.is_some() {
+        return default_inferred;
+    }
+    let second_odour = BrainLayout::from_config(&BrainConfig {
+        second_odour_sense_enabled: true,
+        ..BrainConfig::default()
+    });
+    (brain_stride == second_odour.brain_stride).then_some(second_odour.feature_count)
 }
 
 /// Upgrades a `brain_state` saved before the pathway slot block existed by
@@ -666,7 +675,34 @@ pub const P_FOOD_CLAIM: usize = 52;
 /// actually predict, so clearing the slot to zero would be a false sample.
 /// Mirrored by `HOMEO_PREDICTION_ABSENT` in `common.wgsl`.
 pub const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
-pub const PHYS_STRIDE: usize = 53;
+/// Generation-cumulative count of harmful meals, preserved across respawn
+/// like `P_FOOD_COUNT`. Mirrored by `P_HARMFUL_MEAL_COUNT` in `common.wgsl`.
+pub const P_HARMFUL_MEAL_COUNT: usize = 53;
+/// Floats per agent in the physics buffer.
+pub const PHYS_STRIDE: usize = 54;
+/// Rust mirror of the WGSL `ENERGY_WEIGHT / INTEGRITY_WEIGHT`, so a harmful
+/// meal's raw gradient is the negative of a nourishing meal's.
+pub const HARMFUL_MEAL_INTEGRITY_PER_ENERGY: f32 = 0.6 / 0.4;
+/// Divisor guard for the harmful-meal loss when `max_energy` is zero.
+const HARMFUL_MEAL_MAX_ENERGY_FLOOR: f32 = 1e-6;
+
+/// Integrity lost to a harmful meal of `food_energy`, scaled so the raw
+/// gradient is the negative of a nourishing meal's. Clamping stays in WGSL.
+pub fn harmful_meal_integrity_loss(food_energy: f32, max_energy: f32, max_integrity: f32) -> f32 {
+    food_energy / max_energy.max(HARMFUL_MEAL_MAX_ENERGY_FLOOR)
+        * HARMFUL_MEAL_INTEGRITY_PER_ENERGY
+        * max_integrity
+}
+
+/// Slot value of `WC_FOOD_KINDS` for the nourishing kind: `0.0` for `None`,
+/// `1.0` for `First`, `2.0` for `Second`.
+pub fn food_kinds_slot_value(nourishing: Option<FoodKind>) -> f32 {
+    match nourishing {
+        None => 0.0,
+        Some(FoodKind::First) => 1.0,
+        Some(FoodKind::Second) => 2.0,
+    }
+}
 /// Number of sample slots in the GPU trail ring. Each slot holds one position
 /// record per agent plus a header record, written by the global pass at every
 /// trail-sample boundary; the CPU reads the ring with each state snapshot.
@@ -757,6 +793,9 @@ pub struct BrainLayout {
     /// `DANGER_PERCEPT_FEATURES_ACTIVE` pipeline override (`vision_override_constants`).
     /// Locked per batch.
     pub danger_percept_enabled: bool,
+    /// Mirrors the WGSL `EXTRA_SENSORY_CHANNELS` override; 0 unless the second
+    /// odour sense is declared.
+    pub extra_sensory_channels: usize,
     pub feature_count: usize,
     pub sensory_stride: usize,
     pub brain_stride: usize,
@@ -791,7 +830,7 @@ impl BrainLayout {
     /// constructor `GpuKernel::new` uses; the flag must agree with the WGSL
     /// FEATURE_COUNT pipeline override (`vision_override_constants`).
     pub fn from_config(config: &BrainConfig) -> Self {
-        Self::with_senses(config, DECLARED_SENSES)
+        Self::with_senses(config, crate::senses::senses_for_config(config))
     }
 
     /// Build a layout with an explicit retina grid and the legacy raw-vision
@@ -839,10 +878,13 @@ impl BrainLayout {
             visual_cortex_enabled,
             danger_percept_enabled,
             DECLARED_SENSES,
+            0,
         )
     }
 
-    /// Shared constructor behind every public builder.
+    /// Shared constructor behind every public builder. `extra_sensory_channels`
+    /// widens both `feature_count` and `sensory_stride`.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         vision_width: u32,
         vision_height: u32,
@@ -851,6 +893,7 @@ impl BrainLayout {
         visual_cortex_enabled: bool,
         danger_percept_enabled: bool,
         senses: &'static [SenseDescriptor],
+        extra_sensory_channels: usize,
     ) -> Self {
         let sense_layout = derive_sense_layout(senses);
         let extra_sense_slots =
@@ -884,10 +927,12 @@ impl BrainLayout {
         let feature_count = visual_block
             .checked_add(NON_VISUAL_FEATURE_COUNT)
             .and_then(|v| v.checked_add(danger_feature_width))
+            .and_then(|v| v.checked_add(extra_sensory_channels))
             .expect("vision dimensions overflow feature count");
         let sensory_stride = color_count
             .checked_add(depth_count)
             .and_then(|v| v.checked_add(NON_VISUAL_COUNT))
+            .and_then(|v| v.checked_add(extra_sensory_channels))
             .expect("vision dimensions overflow sensory stride");
         // brain_stride = feature_count * ENCODED_DIMENSION + ENCODED_DIMENSION
         //   + ENCODED_DIMENSION*ENCODED_DIMENSION + FIXED_TAIL_SIZE + feature_count
@@ -922,6 +967,7 @@ impl BrainLayout {
             retina_pixel_count,
             visual_cortex_enabled,
             danger_percept_enabled,
+            extra_sensory_channels,
             feature_count,
             sensory_stride,
             brain_stride,
@@ -952,7 +998,19 @@ impl BrainLayout {
     /// table. The first `DECLARED_SENSES.len()` entries are the base senses;
     /// any further entries are appended after the route block and may declare
     /// only the turn route.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config.second_odour_sense_enabled` disagrees with whether
+    /// `senses` contains the second odour sense.
     pub fn with_senses(config: &BrainConfig, senses: &'static [SenseDescriptor]) -> Self {
+        let declared = senses
+            .iter()
+            .any(|s| s.name == crate::senses::SECOND_ODOUR.name);
+        assert_eq!(
+            declared, config.second_odour_sense_enabled,
+            "second_odour_sense_enabled must match whether the sense table contains the second odour sense"
+        );
         Self::build(
             config.vision_width,
             config.vision_height,
@@ -961,6 +1019,7 @@ impl BrainLayout {
             config.visual_cortex_enabled,
             config.danger_percept_enabled,
             senses,
+            crate::senses::extra_sensory_channels(config),
         )
     }
 }
@@ -1035,6 +1094,10 @@ pub const WC_DANGER_PERCEPT_ENABLED: usize = 25;
 /// is `1.0`. Uses a previously-unused padding slot, so `WORLD_CONFIG_SIZE` is
 /// unchanged. Mirrored by `WC_DANGER_PERCEPT_BLINDED` in `common.wgsl`.
 pub const WC_DANGER_PERCEPT_BLINDED: usize = 26;
+/// Food-kind slot: `0.0` off, `1.0` `First` nourishing, `2.0` `Second`
+/// nourishing. Uses the padding slot unused at baseline, so
+/// `WORLD_CONFIG_SIZE` is unchanged. Mirrored by `WC_FOOD_KINDS` in `common.wgsl`.
+pub const WC_FOOD_KINDS: usize = 27;
 pub const WORLD_CONFIG_SIZE: usize = 28; // padded to 7 × vec4
 
 // ── Transient buffer sizes (per agent) ────────────────────────────────
@@ -2279,6 +2342,38 @@ mod tests {
 
     // ── Shader↔Rust constant sync ────────────────────────────────────────
 
+    #[test]
+    fn food_kinds_slot_value_maps_each_choice() {
+        assert_eq!(food_kinds_slot_value(None), 0.0);
+        assert_eq!(food_kinds_slot_value(Some(FoodKind::First)), 1.0);
+        assert_eq!(food_kinds_slot_value(Some(FoodKind::Second)), 2.0);
+    }
+
+    #[test]
+    fn harmful_meal_loss_matches_ratio_formula() {
+        let loss = harmful_meal_integrity_loss(30.0, 100.0, 100.0);
+        assert!((loss - 45.0).abs() < 1e-4, "loss {loss}");
+    }
+
+    #[test]
+    fn harmful_meal_loss_guards_zero_max_energy() {
+        assert!(harmful_meal_integrity_loss(30.0, 0.0, 100.0).is_finite());
+    }
+
+    #[test]
+    fn food_kind_wgsl_mirror_matches_rust() {
+        let src = include_str!("shaders/kernel/common.wgsl");
+        let wgsl = parse_wgsl_u32_constants(src);
+        assert_eq!(wgsl["PHYS_STRIDE"], 54);
+        assert_eq!(wgsl["WC_FOOD_KINDS"], 27);
+        assert_eq!(P_HARMFUL_MEAL_COUNT, 53);
+        let ratio = parse_wgsl_f32_constant(src, "ENERGY_WEIGHT")
+            / parse_wgsl_f32_constant(src, "INTEGRITY_WEIGHT");
+        assert_eq!(ratio, HARMFUL_MEAL_INTEGRITY_PER_ENERGY);
+        assert!(src.lines().any(|l| l
+            == "const HARMFUL_MEAL_INTEGRITY_PER_ENERGY: f32 = ENERGY_WEIGHT / INTEGRITY_WEIGHT;"));
+    }
+
     fn parse_wgsl_f32_constant(src: &str, name: &str) -> f32 {
         let prefix = format!("const {name}: f32 =");
         for line in src.lines() {
@@ -2613,6 +2708,179 @@ mod tests {
         assert_eq!(layout.sense_blocks().len(), DECLARED_SENSES.len());
     }
 
+    fn second_odour_config() -> BrainConfig {
+        BrainConfig {
+            second_odour_sense_enabled: true,
+            ..BrainConfig::default()
+        }
+    }
+
+    #[test]
+    fn flag_on_stride_infers_feature_count() {
+        let layout = BrainLayout::from_config(&second_odour_config());
+        assert_eq!(
+            feature_count_for_brain_stride(layout.brain_stride),
+            Some(layout.feature_count)
+        );
+    }
+
+    #[test]
+    fn flag_on_fixed_tail_base_matches_layout() {
+        let layout = BrainLayout::from_config(&second_odour_config());
+        let expected = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        assert_eq!(fixed_tail_base(layout.brain_stride), expected);
+    }
+
+    #[test]
+    fn default_stride_inference_unchanged() {
+        for fc in 1..=64usize {
+            let stride = fc * (ENCODED_DIMENSION + 1)
+                + ENCODED_DIMENSION
+                + PREDICTOR_DIMENSION * ENCODED_DIMENSION
+                + FIXED_TAIL_SIZE;
+            assert_eq!(feature_count_for_brain_stride(stride), Some(fc));
+        }
+        let on = BrainLayout::from_config(&second_odour_config());
+        assert_eq!(feature_count_for_brain_stride(on.brain_stride + 1), None);
+        assert_eq!(feature_count_for_brain_stride(0), None);
+    }
+
+    #[test]
+    fn extra_sensory_wgsl_mirror_matches_rust() {
+        let source = include_str!("shaders/kernel/common.wgsl");
+        let declaration = "override EXTRA_SENSORY_CHANNELS: u32 = 0u;";
+        assert!(source.lines().any(|l| l == declaration));
+        let default = declaration
+            .rsplit('=')
+            .next()
+            .expect("declaration has a default")
+            .trim()
+            .trim_end_matches(';')
+            .trim_end_matches('u');
+        assert_eq!(default.parse::<usize>().expect("default parses"), 0);
+        for prefix in [
+            "override SENSORY_STRIDE: u32 =",
+            "override NON_VISUAL_FEATURE_COUNT: u32 =",
+        ] {
+            let line = source
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .expect("override line present");
+            assert!(line.contains("EXTRA_SENSORY_CHANNELS"));
+        }
+    }
+
+    #[test]
+    fn second_odour_off_layout_is_unchanged() {
+        let default = BrainLayout::from_config(&BrainConfig::default());
+        let off = BrainLayout::from_config(&BrainConfig {
+            second_odour_sense_enabled: false,
+            ..BrainConfig::default()
+        });
+        assert_eq!(format!("{default:?}"), format!("{off:?}"));
+        assert_eq!(default.extra_sensory_channels, 0);
+    }
+
+    #[test]
+    fn second_odour_on_grows_sensory_and_feature_width_by_two() {
+        let off = BrainLayout::from_config(&BrainConfig::default());
+        let on = BrainLayout::from_config(&second_odour_config());
+        assert_eq!(on.extra_sensory_channels, 2);
+        assert_eq!(on.sensory_stride, off.sensory_stride + 2);
+        assert_eq!(on.feature_count, off.feature_count + 2);
+        // Feature-width term plus the third block's 11 extra-sense slots,
+        // which the unchanged `extra_sense_slots` term of `build` adds.
+        assert_eq!(
+            on.brain_stride,
+            off.brain_stride
+                + 2 * (ENCODED_DIMENSION + 1)
+                + (on.sensory_mean_base() - off.sensory_mean_base())
+        );
+        assert_eq!(on.sense_blocks().len(), 3);
+        assert_eq!(off.sense_blocks().len(), 2);
+        let third = on.sense_blocks()[2];
+        assert_eq!(third.forward_weights, None);
+        assert_eq!(third.forward_trace, None);
+        assert_eq!(third.critic_weights, None);
+        assert_eq!(third.critic_trace, None);
+        let route_end = derive_sense_layout(on.senses()).route_base + PATHWAY_ROUTE_SLOT_COUNT;
+        let window = route_end..on.sensory_mean_base();
+        assert_eq!(third.whitening, None);
+        let slots = [
+            (third.mean, 2),
+            (third.covariance, 3),
+            (third.whitened_input, 2),
+            (third.turn_weights, 2),
+            (third.turn_trace, 2),
+        ];
+        assert_eq!(slots.iter().map(|(_, n)| n).sum::<usize>(), 11);
+        for (start, len) in slots {
+            assert!(start >= window.start && start + len <= window.end);
+        }
+        for (a, b) in on.sense_blocks()[..2].iter().zip(off.sense_blocks()) {
+            assert_eq!(a.channels, b.channels);
+            let pairs = [
+                (a.mean, b.mean),
+                (a.covariance, b.covariance),
+                (a.whitened_input, b.whitened_input),
+                (a.turn_weights, b.turn_weights),
+                (a.turn_trace, b.turn_trace),
+            ];
+            let optional = [
+                (a.whitening, b.whitening),
+                (a.forward_weights, b.forward_weights),
+                (a.forward_trace, b.forward_trace),
+                (a.critic_weights, b.critic_weights),
+                (a.critic_trace, b.critic_trace),
+            ];
+            let block_shift = a.mean.wrapping_sub(b.mean);
+            for (x, y) in pairs {
+                assert_eq!(x.wrapping_sub(y), block_shift);
+            }
+            for (x, y) in optional {
+                assert_eq!(x.is_some(), y.is_some());
+                if let (Some(x), Some(y)) = (x, y) {
+                    assert_eq!(x.wrapping_sub(y), block_shift);
+                }
+            }
+            // Offsets are measured from the fixed tail, which the new block
+            // follows, so every base slot keeps its offset.
+            assert_eq!(block_shift, 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "second_odour_sense_enabled")]
+    fn with_senses_rejects_mismatched_table() {
+        let _ = BrainLayout::with_senses(&second_odour_config(), DECLARED_SENSES);
+    }
+
+    #[test]
+    fn second_odour_initial_state_is_zero_weights() {
+        let config = second_odour_config();
+        let layout = BrainLayout::from_config(&config);
+        let mut rng = rand::rng();
+        let state = init_brain_state_for(&config, &layout, &mut rng);
+        let third = layout.sense_blocks()[2];
+        let smell = layout.sense_blocks()[0];
+        let tail = layout.feature_count * ENCODED_DIMENSION
+            + ENCODED_DIMENSION
+            + PREDICTOR_DIMENSION * ENCODED_DIMENSION;
+        let base = tail - O_PREDICTOR_CONTEXT_WEIGHT;
+        let at = |offset: usize| state[base + offset];
+        for i in 0..2 {
+            assert_eq!(at(third.turn_weights + i), 0.0);
+            assert_eq!(at(third.turn_trace + i), 0.0);
+        }
+        let variance = at(smell.covariance);
+        assert!(variance > 0.0);
+        assert_eq!(at(third.covariance), variance);
+        assert_eq!(at(third.covariance + 1), 0.0);
+        assert_eq!(at(third.covariance + 2), variance);
+    }
+
     fn legacy_len(fc: usize) -> usize {
         fc * (ENCODED_DIMENSION + 1)
             + ENCODED_DIMENSION
@@ -2745,6 +3013,8 @@ mod tests {
         assert_eq!(wgsl["P_PREV_INTEGRITY"], P_PREV_INTEGRITY as u32);
         assert_eq!(wgsl["P_ALIVE"], P_ALIVE as u32);
         assert_eq!(wgsl["P_FOOD_COUNT"], P_FOOD_COUNT as u32);
+        assert_eq!(wgsl["P_HARMFUL_MEAL_COUNT"], P_HARMFUL_MEAL_COUNT as u32);
+        assert_eq!(wgsl["WC_FOOD_KINDS"], WC_FOOD_KINDS as u32);
         assert_eq!(wgsl["P_TICKS_ALIVE"], P_TICKS_ALIVE as u32);
         assert_eq!(wgsl["P_DIED_FLAG"], P_DIED_FLAG as u32);
         assert_eq!(wgsl["P_MEMORY_CAP"], P_MEMORY_CAP as u32);
@@ -3043,6 +3313,7 @@ mod tests {
             P_PREV_INTEGRITY,
             P_ALIVE,
             P_FOOD_COUNT,
+            P_HARMFUL_MEAL_COUNT,
             P_TICKS_ALIVE,
             P_DIED_FLAG,
             P_MEMORY_CAP,

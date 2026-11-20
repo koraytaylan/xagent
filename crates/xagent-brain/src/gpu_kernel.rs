@@ -85,11 +85,13 @@
 use std::collections::HashMap;
 
 use wgpu;
-use xagent_shared::{BrainConfig, WorldConfig};
+use xagent_shared::{BrainConfig, FoodKind, WorldConfig};
 
 use crate::async_readback::{ReadbackStatus, ReadbackTracker};
 use crate::buffers::*;
-use crate::senses::{SenseDescriptor, SenseInput, Whitening, DECLARED_SENSES, MAX_SENSE_SLOTS};
+#[cfg(test)]
+use crate::senses::DECLARED_SENSES;
+use crate::senses::{SenseDescriptor, SenseInput, Whitening, MAX_SENSE_SLOTS};
 
 #[cfg(test)]
 mod agent_projection_dot_validation;
@@ -474,6 +476,14 @@ fn vision_override_constants(layout: &BrainLayout) -> HashMap<String, f64> {
         } else {
             0.0
         },
+    );
+    // Extra sensory channels appended after the sense blocks.
+    map.insert(
+        "EXTRA_SENSORY_CHANNELS".to_string(),
+        f64::from(
+            u32::try_from(layout.extra_sensory_channels)
+                .expect("extra sensory channel count fits in u32"),
+        ),
     );
     map
 }
@@ -941,6 +951,9 @@ pub struct GpuKernel {
 
     // ── Config ──
     world_config: WorldConfig,
+    food_kinds_enabled: bool,
+    food_kind_draws: u64,
+    nourishing_food_kind: Option<FoodKind>,
     layout: BrainLayout,
     brain_tick_stride: u32,
     speed_cost_exponent: f32,
@@ -1079,6 +1092,29 @@ mod vulkan_gate {
 }
 
 impl GpuKernel {
+    /// The nourishing food kind of the current run, or `None` when food kinds
+    /// are off. The kernel's owning thread (sim worker or headless loop) is the
+    /// only writer of the draw state.
+    pub fn nourishing_food_kind(&self) -> Option<FoodKind> {
+        self.nourishing_food_kind
+    }
+
+    /// The layout the pipelines were built from.
+    pub fn brain_layout(&self) -> &BrainLayout {
+        &self.layout
+    }
+
+    /// Redraw the nourishing kind when food kinds are on; no-op otherwise.
+    fn draw_food_kind(&mut self) {
+        if self.food_kinds_enabled {
+            self.nourishing_food_kind = Some(
+                self.world_config
+                    .nourishing_food_kind(self.food_kind_draws),
+            );
+            self.food_kind_draws += 1;
+        }
+    }
+
     /// Check whether a GPU (or fallback CPU) adapter is available.
     pub fn is_available() -> bool {
         let _vulkan = vulkan_gate::enter();
@@ -1213,6 +1249,7 @@ impl GpuKernel {
 
     fn reset_agents_with_rng(&mut self, brain_config: &BrainConfig, rng: &mut impl rand::Rng) {
         let _vulkan = vulkan_gate::enter();
+        self.draw_food_kind();
         self.invalidate_packed_encoder();
         // Drain any pending async readback so staging buffers are clean.
         for i in 0..STAGING_SLOTS {
@@ -1363,7 +1400,7 @@ impl GpuKernel {
             food_count,
             brain_config,
             world_config,
-            DECLARED_SENSES,
+            crate::senses::senses_for_config(brain_config),
         )
     }
 
@@ -2410,6 +2447,9 @@ impl GpuKernel {
             pending_telemetry: None,
             cached_telemetry: None,
             world_config: world_config.clone(),
+            food_kinds_enabled: world_config.food_kinds_enabled,
+            food_kind_draws: 0,
+            nourishing_food_kind: None,
             layout,
             agent_state_staging: None,
             brain_tick_stride,
@@ -2457,6 +2497,7 @@ impl GpuKernel {
             kernel.global_credit =
                 global_credit::Pipelines::new(&kernel, &brain_passes_src, &vision_overrides);
         }
+        kernel.draw_food_kind();
         kernel
     }
 
@@ -2620,6 +2661,7 @@ impl GpuKernel {
             self.danger_percept_blinded,
         );
         self.world_config_scratch[WC_PHASE_MASK] = phase_mask as f32;
+        self.world_config_scratch[WC_FOOD_KINDS] = food_kinds_slot_value(self.nourishing_food_kind);
         self.queue.write_buffer(
             &self.world_config_bufs[self.active_config_index],
             0,
@@ -4132,6 +4174,7 @@ impl GpuKernel {
         }
         self.staging_index = 0;
         self.clear_trail_ring();
+        self.draw_food_kind();
 
         let n = self.agent_count as usize;
 
@@ -4701,6 +4744,31 @@ mod tests {
         // must NOT be set from Rust or the chain becomes two sources of truth.
         assert!(!map.contains_key("FEATURE_COUNT"));
         assert!(!map.contains_key("BRAIN_STRIDE"));
+    }
+
+    #[test]
+    fn extra_sensory_override_is_zero_by_default() {
+        let layout = BrainLayout::from_config(&BrainConfig::default());
+        let map = vision_override_constants(&layout);
+        assert_eq!(map.get("EXTRA_SENSORY_CHANNELS").copied(), Some(0.0));
+    }
+
+    #[test]
+    fn extra_sensory_override_follows_second_odour_flag() {
+        let config = BrainConfig {
+            second_odour_sense_enabled: true,
+            ..BrainConfig::default()
+        };
+        let layout = BrainLayout::from_config(&config);
+        let map = vision_override_constants(&layout);
+        assert_eq!(map.get("EXTRA_SENSORY_CHANNELS").copied(), Some(2.0));
+    }
+
+    #[test]
+    fn extra_sensory_override_is_declared_in_common() {
+        assert!(COMMON_SRC
+            .lines()
+            .any(|line| line == "override EXTRA_SENSORY_CHANNELS: u32 = 0u;"));
     }
 
     /// Literal text of a WGSL declaration line `<keyword> NAME: TYPE = LITERAL;`

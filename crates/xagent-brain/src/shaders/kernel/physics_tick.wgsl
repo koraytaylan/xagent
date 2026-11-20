@@ -29,7 +29,7 @@ fn run_physics_tick(tid: u32, tick: u32, agent_count: u32) {
     if (tid < agent_count) { phase_food_detect(tid); }
     storageBarrier(); workgroupBarrier();
 
-    if (tid < agent_count) { resolve_food_claim(tid); }
+    if (tid < agent_count) { resolve_food_claim(tid, tick); }
     storageBarrier(); workgroupBarrier();
 
     phase_food_respawn(tid, tick);

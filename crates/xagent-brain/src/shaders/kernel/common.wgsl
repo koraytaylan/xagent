@@ -166,7 +166,11 @@ const MAX_TOUCH_CONTACTS: u32 = 4u;
 // Non-visual feature channels packed after the touch contacts (the left and
 // right nostrils). Mirrors the smell channel count in `buffers.rs`.
 const NON_VISUAL_FEATURE_CHANNELS: u32 = 2u;
-override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u + NON_VISUAL_FEATURE_CHANNELS;
+/// Extra sensory channels sit right after the two scent channels and are copied
+/// into features right after the scent features. Mirrors
+/// `BrainLayout::extra_sensory_channels`.
+override EXTRA_SENSORY_CHANNELS: u32 = 0u;
+override SENSORY_STRIDE: u32 = VISION_COLOR_COUNT + VISION_DEPTH_COUNT + 27u + NON_VISUAL_FEATURE_CHANNELS + EXTRA_SENSORY_CHANNELS;
 
 // ── Brain dimensions ────────────────────────────────────────────────────────
 
@@ -202,7 +206,7 @@ override DANGER_PERCEPT_FEATURES_ACTIVE: u32 = 0u;
 // `NON_VISUAL_FEATURE_COUNT` in `buffers.rs`. The base is constant but the
 // tail width changes with the danger-percept flag; the leading visual block
 // changes independently with the cortex flag.
-override NON_VISUAL_FEATURE_COUNT: u32 = 25u + NON_VISUAL_FEATURE_CHANNELS + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
+override NON_VISUAL_FEATURE_COUNT: u32 = 25u + NON_VISUAL_FEATURE_CHANNELS + EXTRA_SENSORY_CHANNELS + 2u * DANGER_PERCEPT_FEATURES_ACTIVE;
 // Encoder input width. Flag off: the legacy raw-vision slice
 // (VISION_COLOR_COUNT + VISION_DEPTH_COUNT) + the non-visual tail — byte-identical
 // to the pre-cortex build. Flag on: the compact complex-cell vector
@@ -541,7 +545,9 @@ const CFG_MOTOR_FATIGUE_ENABLED: u32 = 24u;
 
 // ── Agent physics buffer layout (P_*) ───────────────────────────────────────
 
-const PHYS_STRIDE: u32 = 53u;
+const PHYS_STRIDE: u32 = 54u;
+const P_HARMFUL_MEAL_COUNT: u32 = 53u;
+const WC_FOOD_KINDS: u32 = 27u;
 // Trail ring: TRAIL_RING_SLOTS slots, each (agent_count + 1) records of
 // TRAIL_RECORD_STRIDE floats. Records 0..agent_count are (x, y, z, death count);
 // the final record is the slot header whose first float is the sample number
@@ -853,6 +859,11 @@ const MAX_HOMEOSTATIC_DELTA: f32 = 0.3;
 const HOMEO_PREDICTION_ABSENT: f32 = 2.0;
 const ENERGY_WEIGHT: f32 = 0.6;
 const INTEGRITY_WEIGHT: f32 = 0.4;
+const HARMFUL_MEAL_INTEGRITY_PER_ENERGY: f32 = ENERGY_WEIGHT / INTEGRITY_WEIGHT;
+const FOOD_KIND_FIRST: u32 = 0u;
+const FOOD_KIND_SECOND: u32 = 1u;
+const FOOD_BASE_COLOR: vec4<f32> = vec4<f32>(0.7, 0.95, 0.2, 1.0);
+const FOOD_SECOND_KIND_COLOR: vec4<f32> = vec4<f32>(0.85, 0.3, 0.75, 1.0);
 const GRADIENT_FAST_BLEND: f32 = 0.6;
 const GRADIENT_MEDIUM_BLEND: f32 = 0.04;
 const GRADIENT_SLOW_BLEND: f32 = 0.004;
@@ -1354,6 +1365,28 @@ fn wc_f32(idx: u32) -> f32 {
 
 fn wc_u32(idx: u32) -> u32 {
     return u32(wconfig[idx / 4u][idx % 4u]);
+}
+
+fn food_kinds_enabled() -> bool {
+    return wc_f32(WC_FOOD_KINDS) > 0.5;
+}
+
+fn food_item_kind(item: u32) -> u32 {
+    return item % 2u;
+}
+
+fn food_item_is_nourishing(item: u32) -> bool {
+    if (!food_kinds_enabled()) {
+        return true;
+    }
+    return food_item_kind(item) + 1u == u32(wc_f32(WC_FOOD_KINDS));
+}
+
+fn food_item_color(item: u32) -> vec4<f32> {
+    if (food_kinds_enabled() && food_item_kind(item) == FOOD_KIND_SECOND) {
+        return FOOD_SECOND_KIND_COLOR;
+    }
+    return FOOD_BASE_COLOR;
 }
 
 fn bc_f32(idx: u32) -> f32 {

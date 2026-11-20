@@ -2,6 +2,7 @@
 name = "xagent-sandbox"
 version.workspace = true
 edition.workspace = true
+default-run = "xagent"
 
 [[bin]]
 name = "xagent"

@@ -294,3 +294,73 @@ Authority: the same standing authorization (correct a plan record the review cou
   as the existing named constraint check. No requirement, bound or dependency changes.
 - Witness: the command exits 0 on the baseline (`cargo test -p xagent-brain --lib buffers:: --no-run`
   builds); validate_plan returns ok.
+
+## Amendment 2026-11-20: food-kind-free-life per-tick brain-state snapshot
+
+- Authority: the host-authorized plan amendment for task food-kind-free-life.
+- Superseded reading: INV-06 and the 0401 Decisions "snapshot and log reads only", read by
+  review (Failure 4, finding 1) as forbidding a per-tick `GpuKernel::read_agent_state`
+  copy and as requiring the 0001 probe to be extended with whitened sense inputs.
+- Contradiction: the same Decisions require per-tick pair credit and readout features from
+  every declared sense's whitened inputs, including the two `second_odour` inputs, read
+  through `BrainLayout` offsets. Those exist only in brain state
+  (`SenseBlockOffsets.whitened_input`); `BrainTickProbe.pathway_inputs` (buffers.rs:1766)
+  holds only the ten smell and vision inputs, and extending the probe changes
+  buffers/WGSL/kernel, which the Non-goals forbid. INV-06 itself requires only reading
+  "kernel snapshots and copied samples" and writing no state, which a read-only
+  `read_agent_state` copy satisfies.
+- Correction (wording only, nothing required is dropped): the 0401 Decisions now say a
+  read-only per-agent `read_agent_state` copy each brain tick is a permitted snapshot and
+  the probe stays as is; the ARCHITECTURE INV-06 row names such copies as snapshots. Other
+  0401 sentences were tightened to keep the body within 8000 characters; no requirement,
+  touch, dependency, check, task id or gated flag changes.
+- Witness: this task's focused-proof (`env XAGENT_REQUIRE_GPU=1 cargo test -p
+  xagent-sandbox --test food_kind_free_life`), 3 tests ok on the preserved work.
+
+## Amendment 2026-11-20: fmt check scoped away from six landed baseline files
+
+- Authority: the host-authorized plan amendment for task food-kind-free-life.
+- Superseded requirement: PLAN.md check `fmt` (`cargo fmt --all -- --check`, fix
+  `cargo fmt --all`), together with the 0401 Non-goal "no file outside the three touches".
+- Contradiction: on the baseline, before any 0401 edit, the fmt check fails only in six
+  files landed by other tasks: crates/xagent-brain/src/buffers.rs,
+  crates/xagent-brain/src/gpu_kernel.rs, crates/xagent-brain/src/senses.rs,
+  crates/xagent-brain/tests/food_kind_meals.rs,
+  crates/xagent-sandbox/src/bin/food_kind_verdict.rs and
+  crates/xagent-sandbox/src/food_kind_metrics.rs. 0401 could not pass it by editing
+  only its touches, and the fix rewrote those files, so the boundary finding came back
+  every review (Failures 4, 6, 7). Adding them to 0401 touches is refused by
+  validate_plan (9 touches > 6; food_kind_verdict.rs is claimed by food-kind-verdict).
+- Correction: the fmt check still runs `cargo fmt --all -- --check -l` but ignores those
+  six listed files (and still fails on a cargo fmt error with no file listed); its fix
+  runs rustfmt only on the other files the check lists. Every other file stays under
+  the fmt check. The 0401 Non-goal stands as written: the six files must stay at
+  baseline. No task, touch, dependency, gated flag or other check changes.
+- Witness: the amended fmt command exits 0 on the preserved 0401 work, exits 1 naming
+  headless.rs when headless.rs is made unformatted, and after the amended fix exits 0
+  with the six files left byte-identical (cargo fmt --check still lists only them).
+
+## Amendment 2026-11-20: food-contingency-decision record paths
+
+- Authority: the host-authorized plan amendment for task food-contingency-decision.
+- Superseded requirement: task 0501's touches, `decision-consistency` check, Outcome,
+  Scope, Verdict command, step 5 and Done when; PLAN.md's Decision record bullet; and
+  ARCHITECTURE.md's verdict-binary note and output-ownership row, which placed the
+  task's outputs at `docs/plans/0004-food-contingency-learning/DECISION.md` and
+  `docs/plans/0004-food-contingency-learning/results.json`.
+- Contradiction: those paths lie inside the protected plan record. The host discarded
+  the task's verdict-binary bundle and decision record ("the architect edited protected
+  plan record(s) (docs/plans/0004-food-contingency-learning/DECISION.md,
+  docs/plans/0004-food-contingency-learning/results.json); the host discarded the
+  edits"), so the task cannot both write its required outputs and pass. Same defect as
+  plan 0003's modulator-study and pooling-study path corrections.
+- Correction: the outputs move to `docs/decisions/food-contingency.md` and
+  `docs/decisions/food-contingency-results.json`, the repository's existing location
+  for study decision records. The runs, thresholds, verdict rule, required content,
+  write-only-by-`--write-bundle` rule, checks' logic, dependencies, gated flag and task
+  id are unchanged; only the paths change.
+- Witness: the amended `decision-consistency` check reads the verdict line from
+  `docs/decisions/food-contingency.md` and runs `food_kind_verdict` on
+  `docs/decisions/food-contingency-results.json --expect-verdict`; it fails (test -n /
+  missing file) when either is absent, and passes once the task writes them as the
+  preserved implementation did (decision-consistency passed there on the old paths).

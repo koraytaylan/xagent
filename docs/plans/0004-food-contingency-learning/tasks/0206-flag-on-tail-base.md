@@ -9,8 +9,8 @@ depends_on:
 gated: false
 touches:
   - crates/xagent-brain/src/buffers.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "e19ef98db003ee9c46252c351b1501864733cd14"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib buffers::"

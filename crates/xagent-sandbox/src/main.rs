@@ -190,6 +190,18 @@ struct Cli {
     /// Write the free-life JSON report to this file instead of stdout
     #[arg(long)]
     free_life_out: Option<PathBuf>,
+
+    /// Free life with two food kinds and per-kind measurement; needs --free-life
+    #[arg(long)]
+    food_kinds: bool,
+
+    /// Hold the turn weights for the whole food-kind free life
+    #[arg(long)]
+    freeze_policy: bool,
+
+    /// Write the food-kind run summary JSON to this file
+    #[arg(long)]
+    food_kind_summary: Option<PathBuf>,
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -806,8 +818,28 @@ fn run_free_life_cli(cli: &Cli, config: &FullConfig) {
         std::process::exit(1);
     };
     let options = free_life_options_from_cli(cli, config).unwrap_or_else(|e| fail(e));
-    let report = headless::run_free_life(config, &options)
-        .unwrap_or_else(|e| fail(format!("free life failed: {}", e)));
+    let report = if cli.food_kinds {
+        let run = headless::FoodKindRun {
+            freeze_policy: cli.freeze_policy,
+            summary_path: cli.food_kind_summary.clone(),
+        };
+        let outcome = headless::run_free_life_food_kind(config, &options, &run)
+            .unwrap_or_else(|e| fail(format!("free life failed: {}", e)));
+        eprintln!(
+            "Food-kind run: seed {}, arm {:?}, nourishing {:?}, {} agents",
+            outcome.summary.seed,
+            outcome.summary.arm,
+            outcome.summary.nourishing_kind,
+            outcome.summary.agent_count
+        );
+        outcome.report
+    } else {
+        if cli.freeze_policy || cli.food_kind_summary.is_some() {
+            fail("--freeze-policy and --food-kind-summary require --food-kinds".to_string());
+        }
+        headless::run_free_life(config, &options)
+            .unwrap_or_else(|e| fail(format!("free life failed: {}", e)))
+    };
     let json = serde_json::to_string_pretty(&report)
         .unwrap_or_else(|e| fail(format!("cannot serialise report: {}", e)));
     match &cli.free_life_out {

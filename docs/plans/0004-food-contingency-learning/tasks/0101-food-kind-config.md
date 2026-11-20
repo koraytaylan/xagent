@@ -10,8 +10,8 @@ touches:
   - crates/xagent-shared/src/config.rs
   - crates/xagent-shared/src/lib.rs
   - crates/xagent-sandbox/src/agent/mod.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "4bbc44d56d63836fe0b914b104b945e75cd3a8ab"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-shared --lib food_kind"

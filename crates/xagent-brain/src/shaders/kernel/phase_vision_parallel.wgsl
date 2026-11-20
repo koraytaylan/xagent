@@ -22,23 +22,13 @@ const VISION_EVENT_NONE: u32 = 0xffffffffu;
 var<workgroup> vision_first_events:
     array<atomic<u32>, VISION_PARALLEL_MAX_RAYS_PER_WORKGROUP>;
 
-// Returns the first event at a single unchanged discrete sample. A sky
-// event terminates the ray even if a later sample would encounter an object.
-fn vision_parallel_sample(agent_id: u32, ray_idx: u32, step: u32) -> u32 {
+fn vision_parallel_ray_dir(agent_id: u32, ray_idx: u32) -> vec3<f32> {
     let base = agent_id * PHYS_STRIDE;
-    let pos = vec3<f32>(
-        physics_state[base + P_POS_X],
-        physics_state[base + P_POS_Y],
-        physics_state[base + P_POS_Z],
-    );
     let facing = vec3<f32>(
         physics_state[base + P_FACING_X],
         physics_state[base + P_FACING_Y],
         physics_state[base + P_FACING_Z],
     );
-    let grid_width = wc_u32(WC_GRID_WIDTH);
-    let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
-
     let col = ray_idx % VISION_W;
     let row = ray_idx / VISION_W;
     let u = (f32(col) / f32(VISION_W - 1u)) * 2.0 - 1.0;
@@ -51,11 +41,13 @@ fn vision_parallel_sample(agent_id: u32, ray_idx: u32, step: u32) -> u32 {
     let tan_half_horizontal = tan(radians(horizontal_fov) * 0.5);
     let tan_half_vertical = tan(radians(vertical_fov) * 0.5);
     let right = vec3<f32>(facing.z, 0.0, -facing.x);
-    let ray_dir = normalize(
+    return normalize(
         facing + right * u * tan_half_horizontal + vec3<f32>(0.0, -v * tan_half_vertical, 0.0));
-    let t = f32(step + 1u) * VISION_STEP_SIZE;
-    let ray_pos = pos + ray_dir * t;
+}
 
+// Returns the first food item the sample touches in grid order, or
+// VISION_EVENT_NONE when the sample touches no food.
+fn vision_parallel_food_at(ray_pos: vec3<f32>, grid_width: u32, grid_offset: i32) -> u32 {
     let food_cx_low = cell_coord(ray_pos.x - FOOD_PROBE_HALF_WIDTH) + grid_offset;
     let food_cx_high = cell_coord(ray_pos.x + FOOD_PROBE_HALF_WIDTH) + grid_offset;
     let food_cz_low = cell_coord(ray_pos.z - FOOD_PROBE_HALF_WIDTH) + grid_offset;
@@ -81,10 +73,31 @@ fn vision_parallel_sample(agent_id: u32, ray_idx: u32, step: u32) -> u32 {
                 let dz = ray_pos.z - fz;
                 let dist_sq = dx * dx + dy * dy + dz * dz;
                 if dist_sq < FOOD_RAY_RADIUS_SQ {
-                    return VISION_EVENT_FOOD;
+                    return fidx;
                 }
             }
         }
+    }
+    return VISION_EVENT_NONE;
+}
+
+// Returns the first event at a single unchanged discrete sample. A sky
+// event terminates the ray even if a later sample would encounter an object.
+fn vision_parallel_sample(agent_id: u32, ray_idx: u32, step: u32) -> u32 {
+    let base = agent_id * PHYS_STRIDE;
+    let pos = vec3<f32>(
+        physics_state[base + P_POS_X],
+        physics_state[base + P_POS_Y],
+        physics_state[base + P_POS_Z],
+    );
+    let grid_width = wc_u32(WC_GRID_WIDTH);
+    let grid_offset = i32(wc_u32(WC_GRID_OFFSET));
+    let ray_dir = vision_parallel_ray_dir(agent_id, ray_idx);
+    let t = f32(step + 1u) * VISION_STEP_SIZE;
+    let ray_pos = pos + ray_dir * t;
+
+    if vision_parallel_food_at(ray_pos, grid_width, grid_offset) != VISION_EVENT_NONE {
+        return VISION_EVENT_FOOD;
     }
 
     if vision_parallel_agent_sample(agent_id, ray_pos, grid_width, grid_offset) {
@@ -188,7 +201,16 @@ fn vision_parallel_rays(agent_id: u32, first_ray: u32, tid: u32) {
             let first_step = first_event / VISION_EVENT_STEP_STRIDE;
             hit_depth = f32(first_step + 1u) * VISION_STEP_SIZE;
             if event == VISION_EVENT_FOOD {
-                hit_color = vec4<f32>(0.7, 0.95, 0.2, 1.0);
+                let pb = agent_id * PHYS_STRIDE;
+                let pos = vec3<f32>(
+                    physics_state[pb + P_POS_X],
+                    physics_state[pb + P_POS_Y],
+                    physics_state[pb + P_POS_Z],
+                );
+                let ray_pos = pos + vision_parallel_ray_dir(agent_id, ray_idx) * hit_depth;
+                let fidx = vision_parallel_food_at(
+                    ray_pos, wc_u32(WC_GRID_WIDTH), i32(wc_u32(WC_GRID_OFFSET)));
+                hit_color = food_item_color(fidx);
             } else if event == VISION_EVENT_AGENT {
                 hit_color = vec4<f32>(0.9, 0.2, 0.6, 1.0);
             } else if event == VISION_EVENT_TERRAIN_GREEN {

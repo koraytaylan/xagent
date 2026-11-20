@@ -9,14 +9,14 @@ depends_on:
   - food-kind-verdict
 gated: false
 touches:
-  - docs/plans/0004-food-contingency-learning/DECISION.md
-  - docs/plans/0004-food-contingency-learning/results.json
-status: todo
-merged_as: ""
+  - docs/decisions/food-contingency.md
+  - docs/decisions/food-contingency-results.json
+status: done
+merged_as: "83777681dc29bbbac226b162fcfcae6903de1d6d"
 checks:
   - name: decision-consistency
     command: |-
-      sh -c 'v=$(grep -m1 "^Verdict: " docs/plans/0004-food-contingency-learning/DECISION.md | cut -d" " -f2-) && test -n "$v" && cargo run -p xagent-sandbox --bin food_kind_verdict -- docs/plans/0004-food-contingency-learning/results.json --expect-verdict "$v"'
+      sh -c 'v=$(grep -m1 "^Verdict: " docs/decisions/food-contingency.md | cut -d" " -f2-) && test -n "$v" && cargo run -p xagent-sandbox --bin food_kind_verdict -- docs/decisions/food-contingency-results.json --expect-verdict "$v"'
     timeout_ms: 3600000
   - name: release-gpu-bench
     command: |-
@@ -35,7 +35,7 @@ The food-contingency gate is run exactly as PLAN.md fixes it: eight
 300,000-tick GPU lives on seeds 5 to 8, learning and frozen arms. The eight
 per-run summaries are written to a scratch directory inside this job's durable
 directory and are not committed. The verdict binary validates them fail-closed
-and writes one bundle, `docs/plans/0004-food-contingency-learning/results.json`.
+and writes one bundle, `docs/decisions/food-contingency-results.json`.
 `DECISION.md` states the verdict computed by that binary and the behaviour, link
 and outcome evidence behind it. A negative result names the failed link
 (readout, credit or weight change).
@@ -47,9 +47,9 @@ and outcome evidence behind it. A negative result names the failed link
   the harness through `--food-kind-summary`. `$TMPDIR` is not used.
 - Stdout and stderr of each run, and the verdict output, go to
   `$MAKINA_SHELL_JOB/output/`.
-- `docs/plans/0004-food-contingency-learning/results.json` is written only by
+- `docs/decisions/food-contingency-results.json` is written only by
   the verdict binary through `--write-bundle`.
-- `docs/plans/0004-food-contingency-learning/DECISION.md` is the decision record.
+- `docs/decisions/food-contingency.md` is the decision record.
 - The host commits the touches of this task. The architect does not run Git.
 
 ## Non-goals
@@ -73,7 +73,7 @@ and outcome evidence behind it. A negative result names the failed link
 - **Learning arm.** `cargo run --release -p xagent-sandbox -- <0001 flags> --food-kinds --food-kind-summary $MAKINA_SHELL_JOB/summaries/learning-seed<N>.json`.
 - **Frozen arm.** The same command for the same seed, plus `--freeze-policy`,
   with the summary `$MAKINA_SHELL_JOB/summaries/frozen-seed<N>.json`.
-- **Verdict.** `cargo run --release -p xagent-sandbox --bin food_kind_verdict -- $MAKINA_SHELL_JOB/summaries --write-bundle docs/plans/0004-food-contingency-learning/results.json`.
+- **Verdict.** `cargo run --release -p xagent-sandbox --bin food_kind_verdict -- $MAKINA_SHELL_JOB/summaries --write-bundle docs/decisions/food-contingency-results.json`.
   Its `Verdict:` line is the only source of the verdict.
 - **No adapter, no task.** If no GPU adapter is present, the task is BLOCKED.
   Write no summary, no bundle and no `DECISION.md`, and report the blocker.
@@ -101,7 +101,7 @@ and outcome evidence behind it. A negative result names the failed link
 4. Verdict. Run the verdict command from Decisions. Save its full output (the
    `Verdict:` line and the `GateReport` table) to
    `$MAKINA_SHELL_JOB/output/verdict.txt`. Confirm that `results.json` was written.
-5. Write `docs/plans/0004-food-contingency-learning/DECISION.md`. Its first line is
+5. Write `docs/decisions/food-contingency.md`. Its first line is
    `Verdict: <PASS | FAIL readout | FAIL credit | FAIL weight-change>`, copied
    exactly from the verdict output. Then write these sections in order: Question;
    Setup (commands as run with flag names, build profile, GPU adapter name, wall

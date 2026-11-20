@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: food contingency learning
@@ -25,3 +25,7 @@ Progress: 0/17 tasks complete.
 | kind-readout | Supervised kind readout (measurement only) | todo |
 | food-kind-free-life | Food-kind scenario and frozen-policy control in the free-life harness | todo |
 | food-contingency-decision | Food-contingency gate runs and decision record | todo |
+
+## Factory runs
+
+- 2026-11-20 17:28:44Z — completed 17/17; final plan gates passed

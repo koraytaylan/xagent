@@ -10,8 +10,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/lib.rs
   - crates/xagent-sandbox/src/food_kind_metrics.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "b9c75c76cc0610c099ad7c29c44b0fcd435248af"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib food_kind_metrics"

@@ -11,8 +11,8 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/brain_passes.wgsl
   - crates/xagent-brain/src/shaders/kernel/phase_brain_features.wgsl
   - crates/xagent-brain/tests/second_odour_features.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "c4c68df5938ee9f0cf5577611eb8b04690d61c49"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test second_odour_features"

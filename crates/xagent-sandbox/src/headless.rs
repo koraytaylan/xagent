@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use xagent_shared::{BrainConfig, FullConfig};
 
 use xagent_brain::buffers::{
+    fixed_tail_base, SenseBlockOffsets, P_FACING_X, P_FACING_Z, P_HARMFUL_MEAL_COUNT,
+};
+use xagent_brain::buffers::{
     BrainLayout, BrainTickProbe, TrunkLesions, ENCODED_DIMENSION, O_ACTION_FORWARD_WEIGHTS,
     O_ACTION_TURN_WEIGHTS, O_PREDICTOR_CONTEXT_WEIGHT, PHYS_STRIDE, PREDICTOR_DIMENSION, P_ALIVE,
     P_APPROACH_SENSE_RANGE_TICKS, P_APPROACH_TURNS_TOWARD, P_AVOIDANCE_SENSE_RANGE_TICKS,
@@ -21,9 +24,16 @@ use xagent_brain::buffers::{
     P_MOTOR_TURN_OUT, P_NEAREST_DANGER_BEARING, P_NEAREST_DANGER_DISTANCE, P_NEAREST_FOOD_BEARING,
     P_NEAREST_FOOD_DISTANCE, P_POS_X, P_POS_Y, P_POS_Z, P_TICKS_ALIVE, TD_TRACE_DECAY,
 };
+use xagent_brain::kind_readout::{fit_kind_readout, ReadoutSample};
 use xagent_brain::{AgentBrainState, GpuKernel};
+use xagent_shared::{FoodKind, SCENT_RANGE};
 
 use crate::agent::{fresh_brain_state, steering_population, Agent, MAX_AGENTS};
+use crate::food_kind_metrics::{
+    nearest_food_of_kind, signed_for_nourishing, signed_weight_difference, AgentFoodKindSummary,
+    Arm, KindMealQuarters, KindTurnAccumulator, PairCreditAccumulator, RunFoodKindSummary,
+    QUARTER_COUNT,
+};
 use crate::free_life::metrics::{AgentAccumulator, AgentMetrics, FreeLifeSample, MetricsConfig};
 use crate::free_life::tick_log::TickLogWriter;
 use crate::governor::{
@@ -1530,11 +1540,29 @@ pub enum FreeLifeError {
     },
     /// The tick log could not be written.
     LogIo(String),
+    /// The food-kind run was asked to start from a stored champion brain.
+    FoodKindChampion,
+    /// The kernel drew no nourishing food kind.
+    NoNourishingKind,
+    /// A cumulative meal count decreased.
+    MealCounts,
+    /// A required sense is missing from the brain layout.
+    MissingSense(&'static str),
+    /// The food-kind summary could not be serialised or written.
+    SummaryIo(String),
 }
 
 impl fmt::Display for FreeLifeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FoodKindChampion => write!(
+                f,
+                "--food-kinds cannot start from a stored champion brain; use a fresh brain"
+            ),
+            Self::NoNourishingKind => write!(f, "the kernel drew no nourishing food kind"),
+            Self::MealCounts => write!(f, "a cumulative meal count decreased"),
+            Self::MissingSense(name) => write!(f, "brain layout has no '{name}' sense"),
+            Self::SummaryIo(msg) => write!(f, "food-kind summary error: {msg}"),
             Self::NoGpu => write!(f, "no GPU adapter available"),
             Self::VisionStride(s) => write!(f, "vision stride must be 1, got {s}"),
             Self::AgentCount(n) => write!(f, "agent count must be in 1..={MAX_AGENTS}, got {n}"),
@@ -1810,6 +1838,7 @@ fn run_batches(
     batch_size: u32,
     accumulators: &mut [AgentAccumulator],
     writer: &mut Option<TickLogWriter>,
+    mut tracker: Option<&mut FoodKindTracker>,
 ) -> Result<(), FreeLifeError> {
     let mut probes: Vec<BrainTickProbe> = Vec::new();
     for batch in 0..batches {
@@ -1821,8 +1850,258 @@ fn run_batches(
         kernel.read_brain_tick_probes_blocking(&mut probes);
         let state = kernel.read_full_state_blocking();
         feed_tick(batch, &probes, state, accumulators, writer)?;
+        if let Some(t) = tracker.as_deref_mut() {
+            t.observe(kernel, batch, &probes)?;
+        }
     }
     Ok(())
+}
+
+/// Food-kind run configuration; every field is opt-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoodKindRun {
+    /// Hold the turn weights for the whole run.
+    pub freeze_policy: bool,
+    /// File that receives the run summary as JSON.
+    pub summary_path: Option<PathBuf>,
+}
+
+/// Name of the first odour sense in the brain layout.
+const SENSE_SMELL: &str = "smell";
+/// Name of the second odour sense in the brain layout.
+const SENSE_SECOND_ODOUR: &str = "second_odour";
+/// Index of the left channel of an odour pair.
+const CHANNEL_LEFT: usize = 0;
+/// Index of the right channel of an odour pair.
+const CHANNEL_RIGHT: usize = 1;
+/// Multiplier that spreads agent indices over the shuffle seed space.
+const SHUFFLE_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Shuffle seed of the readout of one agent.
+fn readout_shuffle_seed(run_seed: u64, agent_index: usize) -> u64 {
+    let index = u64::try_from(agent_index).unwrap_or(u64::MAX);
+    run_seed ^ index.wrapping_add(1).wrapping_mul(SHUFFLE_SEED_STRIDE)
+}
+
+/// Narrow a kernel counter to `u32`, saturating.
+fn counter_u32(v: f32) -> u32 {
+    u32::try_from(counter_value(v)).unwrap_or(u32::MAX)
+}
+
+/// Sense blocks with offsets rebased onto absolute `brain_state` indices.
+/// Layout offsets are relative to the fixed-tail base, which moves with the
+/// feature count.
+fn absolute_sense_blocks(layout: &BrainLayout) -> Vec<SenseBlockOffsets> {
+    let shift = fixed_tail_base(layout.brain_stride) - O_PREDICTOR_CONTEXT_WEIGHT;
+    let add = |o: Option<usize>| o.map(|v| v + shift);
+    layout
+        .sense_blocks()
+        .iter()
+        .map(|b| SenseBlockOffsets {
+            mean: b.mean + shift,
+            covariance: b.covariance + shift,
+            whitening: add(b.whitening),
+            whitened_input: b.whitened_input + shift,
+            turn_weights: b.turn_weights + shift,
+            turn_trace: b.turn_trace + shift,
+            forward_weights: add(b.forward_weights),
+            forward_trace: add(b.forward_trace),
+            critic_weights: add(b.critic_weights),
+            critic_trace: add(b.critic_trace),
+            ..*b
+        })
+        .collect()
+}
+
+/// Turn weights of every sense, per sense then per channel.
+fn turn_weights_of(brain: &[f32], blocks: &[SenseBlockOffsets]) -> Vec<Vec<f32>> {
+    blocks
+        .iter()
+        .map(|b| brain[b.turn_weights..b.turn_weights + b.channels].to_vec())
+        .collect()
+}
+
+/// Per-agent running measurements of a food-kind run.
+struct AgentKindTrack {
+    turns: KindTurnAccumulator,
+    credit: PairCreditAccumulator,
+    samples: Vec<ReadoutSample>,
+    cumulative: [(u32, u32); QUARTER_COUNT],
+}
+
+/// Reads snapshots (including read-only per-agent brain-state copies) and
+/// logs only; never writes kernel state.
+struct FoodKindTracker {
+    nourishing: FoodKind,
+    harmful: FoodKind,
+    blocks: Vec<SenseBlockOffsets>,
+    smell: usize,
+    second: usize,
+    boundaries: [u64; QUARTER_COUNT],
+    agents: Vec<AgentKindTrack>,
+}
+
+impl FoodKindTracker {
+    fn new(kernel: &GpuKernel, agent_count: usize, batches: u64) -> Result<Self, FreeLifeError> {
+        let nourishing = kernel
+            .nourishing_food_kind()
+            .ok_or(FreeLifeError::NoNourishingKind)?;
+        let harmful = match nourishing {
+            FoodKind::First => FoodKind::Second,
+            FoodKind::Second => FoodKind::First,
+        };
+        let layout = kernel.brain_layout();
+        let find = |name: &'static str| {
+            layout
+                .senses()
+                .iter()
+                .position(|s| s.name == name)
+                .ok_or(FreeLifeError::MissingSense(name))
+        };
+        let smell = find(SENSE_SMELL)?;
+        let second = find(SENSE_SECOND_ODOUR)?;
+        let quarters = u64::try_from(QUARTER_COUNT).unwrap_or(1);
+        let mut boundaries = [0u64; QUARTER_COUNT];
+        for (q, b) in boundaries.iter_mut().enumerate() {
+            let step = u64::try_from(q + 1).unwrap_or(1);
+            *b = batches.saturating_mul(step) / quarters;
+        }
+        let agents = (0..agent_count)
+            .map(|_| AgentKindTrack {
+                turns: KindTurnAccumulator::new(batches),
+                credit: PairCreditAccumulator::default(),
+                samples: Vec::new(),
+                cumulative: [(0, 0); QUARTER_COUNT],
+            })
+            .collect();
+        Ok(Self {
+            nourishing,
+            harmful,
+            blocks: absolute_sense_blocks(layout),
+            smell,
+            second,
+            boundaries,
+            agents,
+        })
+    }
+
+    /// Record one brain tick from the physics snapshot, food snapshot, brain log
+    /// and a read-only copy of each brain state (the only published source of
+    /// the whitened sense inputs).
+    fn observe(
+        &mut self,
+        kernel: &mut GpuKernel,
+        brain_tick: u64,
+        probes: &[BrainTickProbe],
+    ) -> Result<(), FreeLifeError> {
+        // The snapshot staged by the dispatch is already complete.
+        let _collected = kernel.try_collect_state_snapshot();
+        let state = kernel.cached_state();
+        let needed = self.agents.len().saturating_mul(PHYS_STRIDE);
+        if state.len() < needed {
+            return Err(FreeLifeError::ReadbackLength {
+                what: "physics snapshot",
+                expected: needed,
+                found: state.len(),
+            });
+        }
+        let food = kernel
+            .cached_food_state()
+            .ok_or(FreeLifeError::ReadbackLength {
+                what: "food snapshot",
+                expected: 1,
+                found: 0,
+            })?;
+        for (i, (track, probe)) in self.agents.iter_mut().zip(probes).enumerate() {
+            let phys = &state[i * PHYS_STRIDE..(i + 1) * PHYS_STRIDE];
+            let position = [phys[P_POS_X], phys[P_POS_Y], phys[P_POS_Z]];
+            let facing = [phys[P_FACING_X], phys[P_FACING_Z]];
+            let near = nearest_food_of_kind(position, facing, food, self.nourishing, SCENT_RANGE);
+            let far = nearest_food_of_kind(position, facing, food, self.harmful, SCENT_RANGE);
+            track.turns.record(
+                brain_tick,
+                phys[P_MOTOR_TURN_OUT],
+                near.map(|n| n.bearing),
+                far.map(|n| n.bearing),
+            );
+            let index = u32::try_from(i).unwrap_or(u32::MAX);
+            let brain = kernel.read_agent_state(index).brain_state;
+            for (kind, sense) in [
+                (FoodKind::First, self.smell),
+                (FoodKind::Second, self.second),
+            ] {
+                let at = self.blocks[sense].whitened_input;
+                track.credit.record(
+                    kind,
+                    probe.td_error,
+                    probe.turn_innovation,
+                    brain[at + CHANNEL_LEFT],
+                    brain[at + CHANNEL_RIGHT],
+                );
+            }
+            let label = match (near, far) {
+                (Some(n), Some(f)) => Some(n.distance <= f.distance),
+                (Some(_), None) => Some(true),
+                (None, Some(_)) => Some(false),
+                (None, None) => None,
+            };
+            if let Some(label) = label {
+                let features: Vec<f32> = self
+                    .blocks
+                    .iter()
+                    .flat_map(|b| brain[b.whitened_input..b.whitened_input + b.channels].to_vec())
+                    .collect();
+                track.samples.push(ReadoutSample { features, label });
+            }
+            for (q, boundary) in self.boundaries.iter().enumerate() {
+                if brain_tick + 1 == *boundary {
+                    track.cumulative[q] = (
+                        counter_u32(phys[P_FOOD_COUNT]),
+                        counter_u32(phys[P_HARMFUL_MEAL_COUNT]),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Result of a food-kind free life.
+#[derive(Clone, Debug)]
+pub struct FoodKindOutcome {
+    /// The ordinary free-life report.
+    pub report: FreeLifeReport,
+    /// The run summary, as written to the summary file.
+    pub summary: RunFoodKindSummary,
+    /// Sense names in layout order.
+    pub sense_names: Vec<&'static str>,
+    /// Birth turn weights, per agent, sense and channel.
+    pub birth_turn_weights: Vec<Vec<Vec<f32>>>,
+    /// Final turn weights, per agent, sense and channel.
+    pub final_turn_weights: Vec<Vec<Vec<f32>>>,
+}
+
+/// Run one seeded free life with the food-kind scenario.
+pub fn run_free_life_food_kind(
+    config: &FullConfig,
+    options: &FreeLifeOptions,
+    food_kind: &FoodKindRun,
+) -> Result<FoodKindOutcome, FreeLifeError> {
+    if options.brain_source != BrainSource::Fresh {
+        return Err(FreeLifeError::FoodKindChampion);
+    }
+    let mut kind_config = config.clone();
+    kind_config.world.food_kinds_enabled = true;
+    kind_config.brain.second_odour_sense_enabled = true;
+    let (_report, outcome) = run_free_life_inner(&kind_config, options, Some(food_kind))?;
+    let outcome = outcome.ok_or(FreeLifeError::NoNourishingKind)?;
+    if let Some(path) = &food_kind.summary_path {
+        let json = serde_json::to_string_pretty(&outcome.summary)
+            .map_err(|e| FreeLifeError::SummaryIo(e.to_string()))?;
+        std::fs::write(path, json)
+            .map_err(|e| FreeLifeError::SummaryIo(format!("{}: {e}", path.display())))?;
+    }
+    Ok(outcome)
 }
 
 /// Run one seeded free life and report per-agent metrics.
@@ -1830,6 +2109,14 @@ pub fn run_free_life(
     config: &FullConfig,
     options: &FreeLifeOptions,
 ) -> Result<FreeLifeReport, FreeLifeError> {
+    run_free_life_inner(config, options, None).map(|(report, _)| report)
+}
+
+fn run_free_life_inner(
+    config: &FullConfig,
+    options: &FreeLifeOptions,
+    food_kind: Option<&FoodKindRun>,
+) -> Result<(FreeLifeReport, Option<FoodKindOutcome>), FreeLifeError> {
     if !GpuKernel::is_available() {
         return Err(FreeLifeError::NoGpu);
     }
@@ -1871,19 +2158,24 @@ pub fn run_free_life(
     let mut accumulators: Vec<AgentAccumulator> = (0..options.agent_count)
         .map(|_| AgentAccumulator::new(metrics_config))
         .collect();
+    let (mut tracker, birth_turn_weights) = match food_kind {
+        Some(run) => prepare_food_kind(&mut kernel, run, options.agent_count, batches)?,
+        None => (None, Vec::new()),
+    };
     run_batches(
         &mut kernel,
         batches,
         batch_size,
         &mut accumulators,
         &mut writer,
+        tracker.as_mut(),
     )?;
     if let Some(w) = writer {
         w.finish()
             .map_err(|e| FreeLifeError::LogIo(e.to_string()))?;
     }
     let from_champion = birth.node_id.is_some();
-    Ok(FreeLifeReport {
+    let report = FreeLifeReport {
         agent_count: options.agent_count,
         ticks: options.ticks,
         seed: options.seed,
@@ -1905,7 +2197,125 @@ pub fn run_free_life(
             .into_iter()
             .map(AgentAccumulator::finish)
             .collect(),
-    })
+    };
+    let (Some(run), Some(tracker)) = (food_kind, tracker) else {
+        return Ok((report, None));
+    };
+    let outcome = build_food_kind_outcome(
+        &mut kernel,
+        &tracker,
+        options,
+        run,
+        report.clone(),
+        birth_turn_weights,
+    )?;
+    Ok((report, Some(outcome)))
+}
+
+/// Food-kind tracker and birth turn weights; sets the freeze flag for the
+/// frozen arm before the first dispatch.
+fn prepare_food_kind(
+    kernel: &mut GpuKernel,
+    run: &FoodKindRun,
+    agent_count: usize,
+    batches: u64,
+) -> Result<(Option<FoodKindTracker>, Vec<Vec<Vec<f32>>>), FreeLifeError> {
+    let tracker = FoodKindTracker::new(kernel, agent_count, batches)?;
+    let birth = read_turn_weights(kernel, agent_count);
+    if run.freeze_policy {
+        kernel.set_freeze_steering_weights(true);
+    }
+    Ok((Some(tracker), birth))
+}
+
+/// Every agent's turn weights, per sense then per channel.
+fn read_turn_weights(kernel: &GpuKernel, agent_count: usize) -> Vec<Vec<Vec<f32>>> {
+    let blocks = absolute_sense_blocks(kernel.brain_layout());
+    (0..agent_count)
+        .map(|i| {
+            let index = u32::try_from(i).unwrap_or(u32::MAX);
+            turn_weights_of(&kernel.read_agent_state(index).brain_state, &blocks)
+        })
+        .collect()
+}
+
+/// End-of-run weight read, readouts and summary of a food-kind run.
+fn build_food_kind_outcome(
+    kernel: &mut GpuKernel,
+    tracker: &FoodKindTracker,
+    options: &FreeLifeOptions,
+    run: &FoodKindRun,
+    report: FreeLifeReport,
+    birth_turn_weights: Vec<Vec<Vec<f32>>>,
+) -> Result<FoodKindOutcome, FreeLifeError> {
+    let final_turn_weights = read_turn_weights(kernel, options.agent_count);
+    let physics = kernel.read_full_state_blocking();
+    let mut agents = Vec::new();
+    for (i, track) in tracker.agents.iter().enumerate() {
+        let weights = &final_turn_weights[i];
+        let diff = |sense: usize, kind: FoodKind| {
+            signed_weight_difference(
+                weights[sense][CHANNEL_LEFT],
+                weights[sense][CHANNEL_RIGHT],
+                kind,
+                tracker.nourishing,
+            )
+        };
+        let quarters =
+            KindMealQuarters::from_cumulative(track.cumulative).ok_or(FreeLifeError::MealCounts)?;
+        let means = track.turns.finish();
+        let score = fit_kind_readout(&track.samples, readout_shuffle_seed(options.seed, i));
+        agents.push(AgentFoodKindSummary {
+            turn_toward_nourishing_whole: means.turn_toward_nourishing_whole,
+            turn_toward_nourishing_late: means.turn_toward_nourishing_late,
+            turn_away_harmful_whole: means.turn_away_harmful_whole,
+            turn_away_harmful_late: means.turn_away_harmful_late,
+            nourishing_meals_by_quarter: quarters.nourishing_by_quarter,
+            harmful_meals_by_quarter: quarters.harmful_by_quarter,
+            deaths: counter_u32(physics[i * PHYS_STRIDE + P_DEATH_COUNT]),
+            readout_balanced_accuracy: score.as_ref().map(|s| s.balanced_accuracy),
+            readout_shuffled_accuracy: score.as_ref().map(|s| s.shuffled_balanced_accuracy),
+            signed_credit_pair_first: signed_for_nourishing(
+                track.credit.credit(FoodKind::First),
+                FoodKind::First,
+                tracker.nourishing,
+            ),
+            signed_credit_pair_second: signed_for_nourishing(
+                track.credit.credit(FoodKind::Second),
+                FoodKind::Second,
+                tracker.nourishing,
+            ),
+            signed_weight_difference_pair_first: diff(tracker.smell, FoodKind::First),
+            signed_weight_difference_pair_second: diff(tracker.second, FoodKind::Second),
+        });
+    }
+    let summary = RunFoodKindSummary {
+        seed: options.seed,
+        arm: if run.freeze_policy {
+            Arm::Frozen
+        } else {
+            Arm::Learning
+        },
+        ticks: options.ticks,
+        agent_count: options.agent_count,
+        fresh_brains: report.champion_node_id.is_none(),
+        nourishing_kind: tracker.nourishing,
+        agents,
+    };
+    let sense_names = kernel
+        .brain_layout()
+        .senses()
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    let outcome = FoodKindOutcome {
+        report,
+        summary,
+        sense_names,
+        birth_turn_weights,
+        final_turn_weights,
+    };
+    Ok(outcome)
 }
 
 #[cfg(test)]

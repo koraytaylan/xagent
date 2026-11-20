@@ -9,6 +9,7 @@ use crate::buffers::{
     O_VISION_PLASTICITY, SCENT_CHANNELS, SCENT_INITIAL_VARIANCE, VISION_PATHWAY_INITIAL_VARIANCE,
     VISION_PATHWAY_INPUTS,
 };
+use xagent_shared::BrainConfig;
 
 /// Where a sense reads its raw inputs from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -249,13 +250,13 @@ const CLOSED_FORM2_CHANNELS: usize = 2;
 
 /// Checks the declared table against the shader limits: slot count, channel
 /// bound, and that closed-form whitening is only used with two channels.
-const fn declared_senses_are_valid() -> bool {
-    if DECLARED_SENSES.len() > MAX_SENSE_SLOTS {
+const fn senses_are_valid(table: &[SenseDescriptor]) -> bool {
+    if table.len() > MAX_SENSE_SLOTS {
         return false;
     }
     let mut i = 0;
-    while i < DECLARED_SENSES.len() {
-        let sense = &DECLARED_SENSES[i];
+    while i < table.len() {
+        let sense = &table[i];
         if sense.channels > MAX_SENSE_CHANNELS {
             return false;
         }
@@ -269,7 +270,58 @@ const fn declared_senses_are_valid() -> bool {
     true
 }
 
-const _: () = assert!(declared_senses_are_valid());
+const _: () = assert!(senses_are_valid(DECLARED_SENSES));
+
+/// Index of the first non-visual feature slot after the two scent features.
+pub const SECOND_ODOUR_FEATURE_OFFSET: usize = SCENT_FEATURE_OFFSET + SCENT_CHANNELS;
+
+/// Routes of the second odour: turn only, learned within a life. The layout
+/// builder admits only the turn route for a sense appended after the base
+/// senses and panics otherwise.
+pub const SECOND_ODOUR_ROUTES: &[RouteDescriptor] = &[RouteDescriptor {
+    route: MotorRoute::Turn,
+    heritability: Heritability::LearnedOnly,
+}];
+
+/// The second odour sense: a second pair of scent channels read from the
+/// non-visual features after the smell channels, with smell's statistics.
+pub const SECOND_ODOUR: SenseDescriptor = SenseDescriptor {
+    name: "second_odour",
+    channels: SCENT_CHANNELS,
+    input: SenseInput::NonVisualFeatures {
+        offset: SECOND_ODOUR_FEATURE_OFFSET,
+    },
+    adaptation_rate: SMELL.adaptation_rate,
+    whitening: SMELL.whitening,
+    learning_rate: LearningRate::Actor,
+    routes: SECOND_ODOUR_ROUTES,
+};
+
+/// The declared senses with the second odour appended last.
+pub const SENSES_WITH_SECOND_ODOUR: &[SenseDescriptor] = &[SMELL, VISION, SECOND_ODOUR];
+
+const _: () = assert!(
+    senses_are_valid(SENSES_WITH_SECOND_ODOUR) && SENSES_WITH_SECOND_ODOUR.len() <= MAX_SENSE_SLOTS
+);
+
+/// Sense table selected by the brain configuration.
+pub fn senses_for_config(config: &BrainConfig) -> &'static [SenseDescriptor] {
+    if config.second_odour_sense_enabled {
+        SENSES_WITH_SECOND_ODOUR
+    } else {
+        DECLARED_SENSES
+    }
+}
+
+/// Number of sensory channels appended after the scent channels, consumed by
+/// the layout and the kernel override.
+pub fn extra_sensory_channels(config: &BrainConfig) -> usize {
+    if config.second_odour_sense_enabled {
+        SECOND_ODOUR.channels
+    } else {
+        0
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -415,6 +467,69 @@ mod tests {
                     assert!(sense.name == "smell" || sense.name == "vision");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn second_odour_descriptor_matches_decisions() {
+        assert_eq!(SECOND_ODOUR.name, "second_odour");
+        assert_eq!(SECOND_ODOUR.channels, 2);
+        assert_eq!(
+            SECOND_ODOUR.input,
+            SenseInput::NonVisualFeatures {
+                offset: SCENT_FEATURE_OFFSET + SCENT_CHANNELS
+            }
+        );
+        assert_eq!(SECOND_ODOUR_FEATURE_OFFSET, 27);
+        assert_eq!(
+            SECOND_ODOUR.adaptation_rate.to_bits(),
+            SMELL.adaptation_rate.to_bits()
+        );
+        match (SECOND_ODOUR.whitening, SMELL.whitening) {
+            (
+                Whitening::ClosedForm2 { initial_variance: a },
+                Whitening::ClosedForm2 { initial_variance: b },
+            ) => assert_eq!(a.to_bits(), b.to_bits()),
+            _ => panic!("second odour must use smell's closed-form whitening"),
+        }
+        assert_eq!(SECOND_ODOUR.learning_rate, LearningRate::Actor);
+        assert_eq!(
+            SECOND_ODOUR.routes,
+            &[RouteDescriptor {
+                route: MotorRoute::Turn,
+                heritability: Heritability::LearnedOnly,
+            }]
+        );
+    }
+
+    #[test]
+    fn senses_for_config_off_is_declared_table() {
+        let config = BrainConfig::default();
+        // A const has no single address, so the tables are compared by value.
+        assert_eq!(senses_for_config(&config), DECLARED_SENSES);
+        assert_eq!(extra_sensory_channels(&config), 0);
+    }
+
+    #[test]
+    fn senses_for_config_on_appends_second_odour_last() {
+        let config = BrainConfig {
+            second_odour_sense_enabled: true,
+            ..BrainConfig::default()
+        };
+        let table = senses_for_config(&config);
+        assert_eq!(table.len(), 3);
+        assert_eq!(&table[..2], DECLARED_SENSES);
+        assert_eq!(table[2], SECOND_ODOUR);
+        assert_eq!(extra_sensory_channels(&config), 2);
+    }
+
+    #[test]
+    fn second_odour_routes_are_turn_only() {
+        for route in SECOND_ODOUR.routes {
+            assert_eq!(route.route, MotorRoute::Turn);
+            assert_ne!(route.route, MotorRoute::Forward);
+            assert_ne!(route.route, MotorRoute::Critic);
+            assert_ne!(route.heritability, Heritability::Mutated);
         }
     }
 

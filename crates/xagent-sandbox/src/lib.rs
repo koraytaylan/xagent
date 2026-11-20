@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod bench;
+pub mod food_kind_metrics;
 pub mod free_life;
 pub mod governor;
 pub mod headless;

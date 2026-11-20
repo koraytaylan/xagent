@@ -621,6 +621,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
 
     // 2. Preserve fitness fields
     let saved_food_count   = physics_state[base + P_FOOD_COUNT];
+    let saved_harmful_meal_count = physics_state[base + P_HARMFUL_MEAL_COUNT];
     let saved_ticks_alive  = physics_state[base + P_TICKS_ALIVE];
     let saved_death_count  = physics_state[base + P_DEATH_COUNT] + 1.0;
     let max_energy         = physics_state[base + P_MAX_ENERGY];
@@ -661,6 +662,7 @@ fn agent_death_respawn(agent_id: u32, tick: u32) {
     physics_state[base + P_MEMORY_CAP]      = memory_cap;
     physics_state[base + P_PROCESSING_SLOTS] = processing_slots;
     physics_state[base + P_FOOD_COUNT]      = saved_food_count;
+    physics_state[base + P_HARMFUL_MEAL_COUNT] = saved_harmful_meal_count;
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
     physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;
@@ -923,7 +925,7 @@ fn kernel_tick(
     // Settle the food claims of the claim step: the lowest-index claimant of
     // each item eats it. Thread 0 broadcasts `P_ALIVE` for the passes below.
     if (tid == 0u) {
-        resolve_food_claim(agent_id);
+        resolve_food_claim(agent_id, base_tick);
         s_alive = select(0u, 1u, physics_state[agent_id * PHYS_STRIDE + P_ALIVE] >= 0.5);
     }
     storageBarrier(); workgroupBarrier();

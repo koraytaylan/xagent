@@ -37,6 +37,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
 
     // ── 2. Preserve fitness fields before reset ────────────────────────────
     let saved_food_count   = physics_state[base + P_FOOD_COUNT];
+    let saved_harmful_meal_count = physics_state[base + P_HARMFUL_MEAL_COUNT];
     let saved_ticks_alive  = physics_state[base + P_TICKS_ALIVE];
     let saved_death_count  = physics_state[base + P_DEATH_COUNT] + 1.0;
     let max_energy         = physics_state[base + P_MAX_ENERGY];
@@ -83,6 +84,7 @@ fn phase_death_respawn(tid: u32, tick: u32) {
     physics_state[base + P_PROCESSING_SLOTS] = processing_slots;
     // Restore fitness fields
     physics_state[base + P_FOOD_COUNT]      = saved_food_count;
+    physics_state[base + P_HARMFUL_MEAL_COUNT] = saved_harmful_meal_count;
     physics_state[base + P_TICKS_ALIVE]     = saved_ticks_alive;
     physics_state[base + P_DEATH_COUNT]     = saved_death_count;
     physics_state[base + P_LAST_DEATH_TICK] = saved_last_death_tick;

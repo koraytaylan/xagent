@@ -10,8 +10,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/bin/food_kind_verdict.rs
   - crates/xagent-sandbox/Cargo.toml
-status: todo
-merged_as: ""
+status: done
+merged_as: "6c6045de5568520f05b53a6658f9ce1ffacba70e"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --bin food_kind_verdict"

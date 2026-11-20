@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use rand::SeedableRng;
 use rusqlite::Connection;
 use xagent_brain::buffers::PHYS_STRIDE;
-use xagent_brain::buffers::P_DEATH_COUNT;
+use xagent_brain::buffers::{P_DEATH_COUNT, P_HARMFUL_MEAL_COUNT};
 use xagent_brain::{AgentBrainState, BrainLayout, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, steering_population};
 use xagent_sandbox::governor::Governor;
@@ -219,9 +219,26 @@ fn run_chunked(kernel: &mut GpuKernel, ticks: u32) {
     }
 }
 
-/// Full physics state plus every agent's brain state and patterns.
+/// Physics slots per agent the golden was recorded from.
+const PRE_SCENARIO_PHYSICS_SLOTS: usize = P_HARMFUL_MEAL_COUNT;
+
+/// Pre-scenario physics slots of every agent, in agent order, plus every
+/// agent's brain state and patterns. Asserts the harmful-meal slot is `0.0`.
 fn kernel_state_bytes(kernel: &mut GpuKernel) -> Vec<u8> {
-    let mut bytes = f32_bytes(kernel.read_full_state_blocking());
+    let physics = kernel.read_full_state_blocking();
+    assert_eq!(
+        physics.len(),
+        AGENTS as usize * PHYS_STRIDE,
+        "physics buffer must hold every agent at PHYS_STRIDE"
+    );
+    let mut bytes = Vec::new();
+    for agent in physics.as_chunks::<PHYS_STRIDE>().0 {
+        assert_eq!(
+            agent[P_HARMFUL_MEAL_COUNT], 0.0,
+            "harmful-meal slot must stay zero"
+        );
+        bytes.extend(f32_bytes(&agent[..PRE_SCENARIO_PHYSICS_SLOTS]));
+    }
     for agent in 0..AGENTS {
         let state = kernel.read_agent_state(agent);
         bytes.extend(f32_bytes(&state.brain_state));

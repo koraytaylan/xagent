@@ -12,8 +12,8 @@ touches:
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
   - crates/xagent-brain/src/gpu_kernel/rounding_validation.rs
   - crates/xagent-sandbox/tests/sense_block_parity.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "ea1b2260ac6e98a7e7fe03b5d85cb57cd33466c9"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-brain --lib buffers"

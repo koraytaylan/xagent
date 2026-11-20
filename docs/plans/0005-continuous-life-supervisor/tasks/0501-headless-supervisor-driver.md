@@ -11,7 +11,7 @@ status: todo
 merged_as: ""
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_headless", timeout_ms: 3600000}
-  - {name: seeded-digest-strict, command: "env XAGENT_REQUIRE_GPU=1 XAGENT_REQUIRE_SEEDED_DIGEST=1 cargo test -p xagent-sandbox --test seeded_headless_digest", timeout_ms: 3600000}
+  - {name: seeded-digest-determinism, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test seeded_headless_digest", timeout_ms: 3600000}
   - {name: sandbox-clippy, command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings", timeout_ms: 3600000}
   - {name: sandbox-fmt, command: "cargo fmt -p xagent-sandbox -- --check", fix: "cargo fmt -p xagent-sandbox"}
   - {name: sandbox-guard, command: "cargo test -p xagent-sandbox --test contributing_guard"}
@@ -102,16 +102,19 @@ generation behaviour.
    generation node rows exist and no `supervisor_*` rows).
 
 - **Done when:** the checks focused-proof (all five named tests report ok) and
-  seeded-digest-strict pass on the host, proving INV-12 (mode picks the driver,
+  seeded-digest-determinism pass on the host, proving INV-12 (mode picks the driver,
   `run_headless` signature and generation path unchanged, identical supervisor
-  event and archive rows across two same-seed runs), INV-01 (the strict seeded
-  digest is unchanged) and INV-15 (the GPU guard panics when required and no
+  event and archive rows across two same-seed runs), INV-01 (the seeded headless
+  run through the unchanged `run_headless` gives the same digest twice, and the
+  generation body is moved into `run_generations` verbatim; this task does not
+  require the digest to equal the recorded fixture, whose value is
+  adapter-specific and was recorded on a different adapter at 0976448) and INV-15 (the GPU guard panics when required and no
   adapter exists).
 
 ## Evidence and risks
 
 - The worker has no shell; the host-run checks named above are the proof.
 - Risk: the generation-mode byte path must not change. Any edit to the moved body
-  shows up in the seeded digest check.
+  must be a verbatim move; the seeded digest determinism check runs that path.
 - Risk: `on_sample` must receive `run.next_sample_tick()`, not a locally counted
   tick, or it fails the `tick == next_sample_tick()` guard from 0401.

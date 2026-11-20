@@ -11,6 +11,7 @@ touches:
   - crates/xagent-shared/src/lib.rs
   - crates/xagent-sandbox/src/governor.rs
   - crates/xagent-sandbox/tests/integration.rs
+  - crates/xagent-sandbox/tests/pathway_route_state.rs
 status: todo
 merged_as: ""
 checks:
@@ -23,8 +24,8 @@ checks:
     command: "cargo clippy -p xagent-shared -p xagent-sandbox --all-targets -- -D warnings"
     timeout_ms: 3600000
   - name: crates-fmt
-    command: "cargo fmt -p xagent-shared -p xagent-sandbox -- --check"
-    fix: "cargo fmt -p xagent-shared -p xagent-sandbox"
+    command: "rustfmt --check --edition 2021 crates/xagent-shared/src/lib.rs crates/xagent-sandbox/src/governor.rs crates/xagent-sandbox/tests/integration.rs crates/xagent-sandbox/tests/pathway_route_state.rs"
+    fix: "rustfmt --edition 2021 crates/xagent-shared/src/lib.rs crates/xagent-sandbox/src/governor.rs crates/xagent-sandbox/tests/integration.rs crates/xagent-sandbox/tests/pathway_route_state.rs"
   - name: sandbox-guard
     command: "cargo test -p xagent-sandbox --test contributing_guard"
 ---
@@ -74,6 +75,12 @@ database, resume or supervisor logic changes.
   `let gov_config = GovernorConfig {` (about line 7416) gets
   `..GovernorConfig::default()` as its last field. The literal near line 10011
   already ends in `..Default::default()` and stays.
+- `crates/xagent-sandbox/tests/pathway_route_state.rs`: the full literal in
+  `fn governor_config()` (about line 39) gets `..GovernorConfig::default()` as
+  its last field. No other change.
+- crates-fmt formats only the touched files (`lib.rs` pulls in `config.rs`).
+  `src/bin/food_kind_verdict.rs` and `src/food_kind_metrics.rs` are already
+  unformatted at the baseline; they are out of scope and stay unedited.
 
 ## Non-goals
 
@@ -112,7 +119,8 @@ list already exist at the baseline in `config.rs` and `lib.rs`.
 4. In the `config.rs` tests module, add the five `supervisor_config_` tests listed
    under Tests.
 5. In the `governor.rs` tests module and in `tests/integration.rs`, add
-   `..GovernorConfig::default()` to every full literal listed under Scope.
+   `..GovernorConfig::default()` to every full literal listed under Scope,
+   including the one in `tests/pathway_route_state.rs`.
 6. Fix any failure the host reports, in the touched files only.
 
 ## Tests
@@ -144,4 +152,6 @@ Config tests module in `config.rs`, one line per test:
 - If a full `GovernorConfig {` literal exists outside the touched files, or
   `FullConfig` or `GovernorConfig` lacks a serde trait the tests need, report the
   file and line. Do not edit outside touches or change other fields. At planning,
-  only `governor.rs` and `tests/integration.rs` hold full literals.
+  only `governor.rs`, `tests/integration.rs` and `tests/pathway_route_state.rs`
+  hold full literals (`tests/sense_block_parity.rs` already ends in
+  `..Default::default()`).

@@ -101,7 +101,8 @@ Evidence: RunSummary JSON (--run-summary), FreeLifeReport (0001, BrainSource::Ar
   `approach_sign_of(bearing) = -signum(bearing)` (`0.0` maps to `0.0`), which
   re-states 0004's convention because 0004 exports no sign helper, position
   `P_POS_*`, facing `[P_FACING_X, P_FACING_Z]`); `finish(self, ticks: u64) ->
-  RunSummary` (`agent_ticks = ticks * agent_count`, checked).
+  Result<RunSummary, RunSummaryError>` (`agent_ticks = ticks * agent_count`,
+  checked; overflow is `Err(SizeOverflow)`; callers propagate the error).
 - Windows are counted in sample intervals inside each season: with `n`
   intervals in a season (its actual length, the last season truncated at the
   run end), the early window is the first `n * 3 / 10` intervals and the late
@@ -314,7 +315,7 @@ recomputed ones. It prints `Verdict: ADOPT|OPTION|REJECT` and a metrics table
 
 | task | constraints and sources | compatibility witness | preflight check |
 |---|---|---|---|
-| evolution-mode-config | `GovernorConfig` derives serde with per-field defaults and an explicit `impl Default` (`crates/xagent-shared/src/config.rs`), embedded in `FullConfig`; `resume` parses the stored config with `unwrap_or_default`, so old JSON loads with the new serde defaults; the only full `GovernorConfig` literals are in `governor.rs` tests and `tests/integration.rs` (others use `..Default::default()`). This task edits only those literals in the two sandbox files. | The config struct, re-export list and every literal site exist at baseline | `pf-evolution-mode-config` |
+| evolution-mode-config | `GovernorConfig` derives serde with per-field defaults and an explicit `impl Default` (`crates/xagent-shared/src/config.rs`), embedded in `FullConfig`; `resume` parses the stored config with `unwrap_or_default`, so old JSON loads with the new serde defaults; the only full `GovernorConfig` literals are in `governor.rs` tests, `tests/integration.rs` and `tests/pathway_route_state.rs` (others use `..Default::default()`). This task edits only those literals in the three sandbox files. | The config struct, re-export list and every literal site exist at baseline | `pf-evolution-mode-config` |
 | run-mode-column | `governor.rs` has the private `composite_fitness`, blob codec and `init_schema` with the `let _ = db.execute_batch("ALTER TABLE run ...")` migration pattern (also repeated in `resume`), `resume`'s latest-run query, and the inline grid-size expression in `evaluate`; `tempfile` is a dev-dependency for file databases; the digest test is in the 0001 plan. | Every hook site exists at baseline; adapter present for the digest check | `pf-run-mode-column` |
 | run-summary | 0004 task `food-kind-metrics` declares the public `nearest_food_of_kind` and `pub struct NearestFood { pub distance: f32, pub bearing: f32 }` (its sign helper is not public, so run-summary re-states `-signum(bearing)` locally and pins it with a unit test); 0004 adds `P_HARMFUL_MEAL_COUNT`; `SCENT_RANGE` is re-exported by `xagent-shared`; `P_FOOD_COUNT` 18, `P_DEATH_COUNT` 23, `P_MOTOR_TURN_OUT` 28; the module slot is free. | The helper signatures, physics slots and range constant exist (baseline or committed 0004 text) | `pf-run-summary` |
 | supervisor-core | `composite_fitness` (made crate-visible by run-mode-column), `HEATMAP_RES` 64, public `mutate_steering_weights`, `mutate_sensory_genes`, `steering_population`, `fresh_brain_state`, `MutationMomentum::new(decay)`, `rand` dependency; CPU only. | All APIs exist at baseline | `pf-supervisor-core` |

@@ -4,15 +4,15 @@ title: "Free-life archive brain source"
 workstream: "0500"
 kind: task
 role: developer
-depends_on: [generation-run-summary]
+depends_on: [generation-run-summary, supervisor-verdict]
 gated: false
-touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/archive_free_life.rs]
+touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/archive_free_life.rs, crates/xagent-sandbox/src/bin/pathway_route_gate.rs, crates/xagent-sandbox/src/bin/supervisor_verdict.rs]
 status: todo
 merged_as: ""
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test archive_free_life", timeout_ms: 3600000}
   - {name: headless-lib-tests, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --lib headless::tests::", timeout_ms: 3600000}
-  - {name: seeded-digest-strict, command: "env XAGENT_REQUIRE_GPU=1 XAGENT_REQUIRE_SEEDED_DIGEST=1 cargo test -p xagent-sandbox --test seeded_headless_digest", timeout_ms: 3600000}
+  - {name: seeded-digest-determinism, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test seeded_headless_digest", timeout_ms: 3600000}
   - {name: sandbox-clippy, command: "cargo clippy -p xagent-sandbox --all-targets -- -D warnings", timeout_ms: 3600000}
   - {name: sandbox-fmt, command: "cargo fmt -p xagent-sandbox -- --check", fix: "cargo fmt -p xagent-sandbox"}
   - {name: sandbox-guard, command: "cargo test -p xagent-sandbox --test contributing_guard"}
@@ -34,6 +34,9 @@ checks:
 
 - `headless.rs`: the variant, the archive branch of steps 2-3 of `run_free_life`,
   the two new `FreeLifeError` variants, and the report field.
+- `src/bin/pathway_route_gate.rs` and `src/bin/supervisor_verdict.rs`: add
+  `archive_entry_id: None` to their full `FreeLifeReport` literals, the only
+  change the new field forces there; nothing else in those bins changes.
 - `tests/archive_free_life.rs` (new): a fail-closed GPU helper copied from
   `gpu_adapter_present_when_required`, named consts for a small
   `SupervisorConfig`, and the tests below.
@@ -90,9 +93,10 @@ checks:
 
 - **Done when:** the focused-proof check (all six tests in `archive_free_life`
   pass), the headless-lib-tests check (0001's free-life unit tests still pass)
-  and the seeded-digest-strict check pass on the host, proving INV-11 (read-only
+  and the seeded-digest-determinism check pass on the host, proving INV-11 (read-only
   archive loading leaves the DB unchanged and free lives run archive entries),
-  INV-01 (the strict seeded digest is unchanged) and INV-15 (the GPU guard panics
+  INV-01 (the seeded digest is deterministic, and the generation path is
+  untouched because this task changes only free-life code) and INV-15 (the GPU guard panics
   when required and no adapter exists).
 
 ## Evidence and risks

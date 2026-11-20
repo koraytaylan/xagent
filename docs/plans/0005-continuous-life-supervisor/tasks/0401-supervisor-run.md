@@ -83,7 +83,8 @@ borrows the caller's `GpuKernel`, never builds one, and never builds a second
   `kernel.replace_agent_slot`, `accumulator.reset_agent_baseline(slot)`,
   `store.record_boundary`. An idle boundary calls `store.record_idle_boundary`.
 - **Finish.** `core.finish` → `store.record_archive_changes` → `store.record_ticks`;
-  `accumulator.finish(ticks)` gives the summary. Done when `tick` reaches
+  `accumulator.finish(ticks)` gives the summary as a `Result`; its
+  `RunSummaryError` propagates as a `SupervisorRunError`. Done when `tick` reaches
   `total_ticks` (`agent_tick_budget / population_size`; 0 means never).
 
 ## Steps

@@ -154,11 +154,6 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
 5. Run the checks `focused-proof`, `verdict`, `parity`, `fmt`, `clippy` and `guard`.
    Fix only failures caused by this task's changes; report others as pre-existing
    with output. Do not edit the golden or change any test to pass.
-6. Before submitting, sweep every file in `touches` once, tests included, for the
-   CONTRIBUTING.md Magic Numbers rule (only `0`, `1`, `-1`, `0.0`, `1.0` unnamed):
-   `powi` exponents, array lengths, index and count thresholds, seeds, loop
-   bounds, slice offsets and arm ids all need a named, documented `const` (or an
-   equivalent form such as `d * d`), so review does not find sites one by one.
 
 - **Done when:** INV-06 is proved: the `focused-proof` check passes with
   `planted_side_cue_is_learned_by_reference_arm`, `cue_free_log_scores_near_zero`,

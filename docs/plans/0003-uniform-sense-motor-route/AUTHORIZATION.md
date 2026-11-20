@@ -510,19 +510,3 @@ Authority: host-authorized plan amendment for task `pooling-study`.
 - Witness: the `focused-proof` check (`cargo test -p xagent-sandbox --lib
   pooling_study`) passes, and the `verdict` check reads `Verdict: NOT PORTED`
   from `docs/decisions/pooling-study.md`, produced by the runner under this design.
-
-## Repair: pooling-study review-loop exhaustion (2026-11-20)
-
-Authority: the plan owner's standing authorization for automatic repair of
-this plan's run.
-
-- Blocker: `pooling-study` exhausted its architect retry budget in review.
-  Every gate passed (focused-proof 9 passed, verdict, parity, fmt, clippy,
-  guard); each review round found further CONTRIBUTING.md Magic Numbers sites
-  one at a time (last: `(s - mean).powi(2)` in `pooling_study.rs`).
-- Not a contradiction: the rule is repository policy and stays. No bound, gate,
-  task, dependency or behavior changed.
-- Correction: the in-run amendments recorded above were carried onto the
-  published base (status fields untouched), and the packet gains step 6, one
-  whole-file Magic Numbers sweep (tests included) before submitting.
-- Witness: `validate_plan` on this plan reports ok with no readiness issues.

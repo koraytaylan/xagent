@@ -71,17 +71,9 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
   `turn_innovation`, `food_bearing`, `food_in_view` (0 or 1), `death` (0 or 1),
   `agent`, `tick`. The reader checks file length = header + whole records and that
   every value is finite; any other length or bad magic is an error naming the file.
-- **Harness reuse**: the runner reuses plan 0001's free-life harness
+- **Harness reuse**: the runner drives plan 0001's free-life harness
   (`crates/xagent-sandbox/src/free_life/`, `metrics.rs` and `tick_log.rs`) for the
-  credit fields, ground truth, metrics and tick log, and adds only the 32 adapted
-  column means. `headless::run_free_life` exposes no execution-schedule option and
-  no per-tick hook, so the runner runs its own life loop: each brain tick it builds
-  a `FreeLifeSample` field for field as `headless.rs` `build_sample` does, feeds it
-  to the harness's `AgentAccumulator` and `TickLogWriter`, and takes reward, value,
-  turn innovation, food bearing and death from that sample; food in view is
-  restated from the harness rule (alive, distance `<= FOOD_IN_VIEW_DISTANCE`,
-  `|bearing| < VIEW_HALF_ANGLE`). It may use a schedule that writes the adapted
-  visual block to scratch, stated in the record.
+  life, credit fields and ground truth, and adds only the 32 adapted column means.
   `FOOD_IN_VIEW_DISTANCE = 5.5` and `VIEW_HALF_ANGLE = pi/4` are the harness's own.
   No plan 0001 file is edited.
 - **Column means**: read from each agent's adapted visual block through
@@ -106,8 +98,7 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
   basis vectors, on centred column means, step `OJA_RATE = 0.01`, normalised by
   `1 + |c|²`; the components then go through arm A's rule.
 - **Score**: per agent, Pearson correlation over records with `food_in_view == 1`
-  and tick `>= 0.7 * 300000`, between the turn output and the food side,
-  `-sign(food_bearing)` (the free-life harness's convention, metrics.rs `food_side`).
+  and tick `>= 0.7 * 300000`, between the turn output and `sign(food_bearing)`.
   Agents with fewer than 30 such records are excluded and counted, not scored zero.
   Report mean ± standard error over scored agents and the count above zero.
 - **Gate (INV-06)**: `best = max(mean(C), mean(D))`; `Verdict: PORTED` iff

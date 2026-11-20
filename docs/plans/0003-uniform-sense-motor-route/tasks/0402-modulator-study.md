@@ -11,14 +11,14 @@ gated: false
 status: todo
 merged_as: ""
 touches:
-  - docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md
-  - docs/plans/0003-uniform-sense-motor-route/0402-evo-reference.json
+  - docs/decisions/modulator-study.md
+  - docs/decisions/modulator-study-evo-reference.json
   - crates/xagent-shared/src/config.rs
   - crates/xagent-sandbox/tests/modulator_flags.rs
   - crates/xagent-sandbox/tests/fixtures/sense_block_parity.golden
 checks:
   - name: focused-proof
-    command: "sh -c 'grep -Eq \"^Klinotaxis turn-gain: (LANDED|REVERTED)$\" docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md && grep -Eq \"^Motor fatigue: (LANDED|REVERTED)$\" docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md'"
+    command: "sh -c 'grep -Eq \"^Klinotaxis turn-gain: (LANDED|REVERTED)$\" docs/decisions/modulator-study.md && grep -Eq \"^Motor fatigue: (LANDED|REVERTED)$\" docs/decisions/modulator-study.md'"
   - name: flags
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test modulator_flags -- --include-ignored"
     timeout_ms: 3600000
@@ -51,7 +51,7 @@ checks:
 - Record the reference config (with the commit it was dumped at), the
   within-life and 80-generation per-seed numbers, the rule applied line by
   line, and the two verdicts in
-  `docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md`.
+  `docs/decisions/modulator-study.md`.
 - Land or revert each modulator independently, judged against the control
   alone (no combined arm). Landing flips only that flag's default to `false`;
   reverting changes no code.
@@ -82,7 +82,7 @@ checks:
   and copied verbatim into the record.
 - Reference config: `--dump-config` output (default config) with
   `governor.tick_budget` set to 40000, written to
-  `docs/plans/0003-uniform-sense-motor-route/0402-evo-reference.json`. Record
+  `docs/decisions/modulator-study-evo-reference.json`. Record
   the commit (`git rev-parse HEAD` output at dump time) and the exact commands
   in the decision record. The JSON must parse as `FullConfig`.
 - Three arms, differing only in the modulator flags: control (both flags as
@@ -120,7 +120,7 @@ Otherwise REVERT.
 **Steps:**
 
 1. Dump the default config with `--dump-config`, set `governor.tick_budget` to
-   40000, write `docs/plans/0003-uniform-sense-motor-route/0402-evo-reference.json`,
+   40000, write `docs/decisions/modulator-study-evo-reference.json`,
    confirm it parses as `FullConfig` JSON, and create the two off-variant
    configs under `target/` from it. Record the dump commit and commands.
 2. Run the within-life arms (control and both off-variants, seeds 5–8, 10
@@ -154,7 +154,7 @@ Otherwise REVERT.
    pre-existing with its output.
 
 - **Done when:** INV-08 and INV-07 are proved: the `focused-proof` check finds both verdict lines in
-  `docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md`, that
+  `docs/decisions/modulator-study.md`, that
   record holds the per-seed within-life and 80-generation numbers for control
   and each arm with the rule applied line by line (INV-08), and the
   `flags`, `config-tests` and `parity` checks pass on the resulting defaults,

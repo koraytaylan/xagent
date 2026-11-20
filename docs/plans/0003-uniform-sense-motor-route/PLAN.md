@@ -471,5 +471,5 @@ modulator; `pooling-study` then measures pooling on the final learner and
 ## Decision records (authored by tasks)
 
 - `docs/decisions/sense-route-wiring.md`
-- `docs/plans/0003-uniform-sense-motor-route/0402-MODULATOR-DECISION.md`
-- `docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`
+- `docs/decisions/modulator-study.md`
+- `docs/decisions/pooling-study.md`

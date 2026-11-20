@@ -13,14 +13,14 @@ touches:
   - crates/xagent-sandbox/src/pooling_study.rs
   - crates/xagent-sandbox/src/lib.rs
   - crates/xagent-sandbox/examples/pooling_study.rs
-  - docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md
+  - docs/decisions/pooling-study.md
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib pooling_study"
     timeout_ms: 3600000
   - name: verdict
     command: >-
-      sh -c 'grep -Eqx "Verdict: (PORTED|NOT PORTED)" docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md'
+      sh -c 'grep -Eqx "Verdict: (PORTED|NOT PORTED)" docs/decisions/pooling-study.md'
   - name: parity
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored"
     timeout_ms: 5400000
@@ -71,9 +71,17 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
   `turn_innovation`, `food_bearing`, `food_in_view` (0 or 1), `death` (0 or 1),
   `agent`, `tick`. The reader checks file length = header + whole records and that
   every value is finite; any other length or bad magic is an error naming the file.
-- **Harness reuse**: the runner drives plan 0001's free-life harness
+- **Harness reuse**: the runner reuses plan 0001's free-life harness
   (`crates/xagent-sandbox/src/free_life/`, `metrics.rs` and `tick_log.rs`) for the
-  life, credit fields and ground truth, and adds only the 32 adapted column means.
+  credit fields, ground truth, metrics and tick log, and adds only the 32 adapted
+  column means. `headless::run_free_life` exposes no execution-schedule option and
+  no per-tick hook, so the runner runs its own life loop: each brain tick it builds
+  a `FreeLifeSample` field for field as `headless.rs` `build_sample` does, feeds it
+  to the harness's `AgentAccumulator` and `TickLogWriter`, and takes reward, value,
+  turn innovation, food bearing and death from that sample; food in view is
+  restated from the harness rule (alive, distance `<= FOOD_IN_VIEW_DISTANCE`,
+  `|bearing| < VIEW_HALF_ANGLE`). It may use a schedule that writes the adapted
+  visual block to scratch, stated in the record.
   `FOOD_IN_VIEW_DISTANCE = 5.5` and `VIEW_HALF_ANGLE = pi/4` are the harness's own.
   No plan 0001 file is edited.
 - **Column means**: read from each agent's adapted visual block through
@@ -98,7 +106,8 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
   basis vectors, on centred column means, step `OJA_RATE = 0.01`, normalised by
   `1 + |c|²`; the components then go through arm A's rule.
 - **Score**: per agent, Pearson correlation over records with `food_in_view == 1`
-  and tick `>= 0.7 * 300000`, between the turn output and `sign(food_bearing)`.
+  and tick `>= 0.7 * 300000`, between the turn output and the food side,
+  `-sign(food_bearing)` (the free-life harness's convention, metrics.rs `food_side`).
   Agents with fewer than 30 such records are excluded and counted, not scored zero.
   Report mean ± standard error over scored agents and the count above zero.
 - **Gate (INV-06)**: `best = max(mean(C), mean(D))`; `Verdict: PORTED` iff
@@ -136,7 +145,7 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
    with output under `$MAKINA_SHELL_JOB/output` and an explicit timeout:
    `cargo run --release -p xagent-sandbox --example pooling_study -- --out-dir <job-dir>`.
    Re-run `--fit-only <job-dir>` and confirm the same table and verdict.
-4. Write `docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`: the
+4. Write `docs/decisions/pooling-study.md`: the
    method (fixed decisions above, in substance); the per-seed and pooled A–D table
    with excluded and above-zero counts; the gate applied line by line with numbers;
    the sanity lines; the winning arm by name; and, only if PORTED, the winning arm's
@@ -154,5 +163,5 @@ Score, gate and verdict are fixed in `docs/plans/0003-uniform-sense-motor-route/
 - **Done when:** INV-06 is proved: the `focused-proof` check passes with
   `planted_side_cue_is_learned_by_reference_arm`, `cue_free_log_scores_near_zero`,
   `malformed_records_are_rejected` and `gate_matches_fixed_rule` reported ok; the
-  `verdict` check passes against `0301-POOLING-DECISION.md`; and the `parity`
+  `verdict` check passes against `docs/decisions/pooling-study.md`; and the `parity`
   check stays green on the unchanged golden, so the default input is still the hemifields.

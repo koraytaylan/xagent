@@ -10,7 +10,7 @@ gated: false
 status: todo
 merged_as: ""
 touches:
-  # All conditional on Verdict: PORTED in 0301-POOLING-DECISION.md; with NOT PORTED no file changes.
+  # All conditional on Verdict: PORTED in docs/decisions/pooling-study.md; with NOT PORTED no file changes.
   - crates/xagent-brain/src/senses.rs
   - crates/xagent-brain/src/buffers.rs
   - crates/xagent-brain/src/shaders/kernel/common.wgsl
@@ -20,7 +20,7 @@ touches:
 checks:
   - name: focused-proof
     command: >-
-      sh -c 'if grep -qx "Verdict: PORTED" docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md; then env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test learned_pooling -- --include-ignored; else grep -qx "Verdict: NOT PORTED" docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md; fi'
+      sh -c 'if grep -qx "Verdict: PORTED" docs/decisions/pooling-study.md; then env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test learned_pooling -- --include-ignored; else grep -qx "Verdict: NOT PORTED" docs/decisions/pooling-study.md; fi'
     timeout_ms: 3600000
   - name: parity
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored"
@@ -41,7 +41,7 @@ checks:
 ## Outcome
 
 The vision sense's input matches the verdict recorded in
-`docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`, which
+`docs/decisions/pooling-study.md`, which
 contains exactly one line `Verdict: PORTED` or `Verdict: NOT PORTED`.
 
 - **NOT PORTED** (the expected case: the reference is +0.16 against +0.33).
@@ -70,7 +70,7 @@ contains exactly one line `Verdict: PORTED` or `Verdict: NOT PORTED`.
 
 **Steps:**
 
-1. Read `docs/plans/0003-uniform-sense-motor-route/0301-POOLING-DECISION.md`
+1. Read `docs/decisions/pooling-study.md`
    and note the single `Verdict:` line and the winning arm. If the verdict is
    `Verdict: NOT PORTED`, make no edit and go straight to the checks.
 2. (PORTED) In `crates/xagent-shared/src/config.rs`, add the

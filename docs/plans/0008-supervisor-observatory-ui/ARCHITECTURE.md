@@ -119,7 +119,9 @@ All paths are under `crates/xagent-sandbox/src/`. `lib.rs` gains
   is logged, stored in `supervisor_resume_error`, and the state returns to
   `SupervisorSession`. Supervisor Start sets `observatory =
   Some(ObservatoryModel::default())`. The event drain converts each plan 0006
-  telemetry `SimEvent` into an `ObservatoryRecord` and folds it.
+  telemetry `SimEvent` (`SupervisorBoundary` or `SupervisorTelemetry`) into every
+  `ObservatoryRecord` it carries, through the one `observatory_record(&model, &event)`
+  conversion, and folds each one.
 
 ## Invariants
 

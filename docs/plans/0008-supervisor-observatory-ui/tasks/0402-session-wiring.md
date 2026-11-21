@@ -94,12 +94,17 @@ through the session state, folds live plan 0006 telemetry into
     the runtime as Reset does.
   - Supervisor Start: `observatory = Some(m)` with `m = ObservatoryModel::default()`
     and `m.source = ModelSource::Live`.
-- **Live fold.** gpu_orchestration.rs gets a free fn `observatory_record(event:
-  &SimEvent) -> Option<ObservatoryRecord>` that only matches the `SimEvent` variant and
-  delegates to the `From` conversions in `observatory/mod.rs` (owned by
-  `observatory-model`). The event drain calls it per event and, when it returns
-  `Some(r)` and `evo_snapshot.observatory` is `Some(m)`, calls `m.fold(r)`. Keep the
-  `SupervisorSample` arm.
+- **Live fold.** gpu_orchestration.rs gets a free fn `observatory_record(model:
+  &ObservatoryModel, event: &SimEvent) -> Vec<ObservatoryRecord>`, the single place the
+  drain converts events into records. It only matches the `SimEvent` variant: for
+  `SupervisorBoundary` it returns the one parent-resolved `model.boundary_record`; for
+  `SupervisorTelemetry` it returns every record the frame carries (`model.slot_record`
+  per slot, the `From` conversions for each intake row and the progress record, and
+  `ObservatoryRecord::series_from_frame`), all delegating to `observatory/mod.rs` (owned
+  by `observatory-model`); for every other event it returns an empty Vec. One event may
+  therefore yield several records. The event drain calls it per event and, when
+  `evo_snapshot.observatory` is `Some(m)`, calls `m.fold(r)` for each returned record;
+  the drain holds no other record conversion. Keep the `SupervisorSample` arm.
 - **Needles.** The kernel needle test stays unchanged.
 - **Helpers.** `apply_browse_supervisor` and `apply_resume_refusal` are free fns in
   evolution.rs, testable without a worker.

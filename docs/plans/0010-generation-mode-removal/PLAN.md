@@ -84,6 +84,9 @@ preflight_checks:
   - name: pf-headless-supervisor-only
     command: |-
       sh -c 'grep -qF "fn run_generations(" crates/xagent-sandbox/src/headless.rs && grep -qF "pub fn dump_tree(db_path: &str) {" crates/xagent-sandbox/src/headless.rs && grep -qF "pub fn validate_danger_percept(" crates/xagent-sandbox/src/headless.rs && grep -qF "pub enum BrainSource {" crates/xagent-sandbox/src/headless.rs && grep -qF "pub mode: EvolutionMode," crates/xagent-sandbox/src/run_summary.rs && grep -qF "fn generation_mode_is_the_default_driver() {" crates/xagent-sandbox/tests/supervisor_headless.rs && grep -qF "fn food_kind_free_life_refuses_champion_brain() {" crates/xagent-sandbox/tests/food_kind_free_life.rs && grep -qF "fn free_life_champion_source_reports_node_and_generation() {" crates/xagent-sandbox/tests/free_life.rs'
+  - name: pf-headless-champion-source
+    command: |-
+      sh -c 'grep -qF "pub enum BrainSource {" crates/xagent-sandbox/src/headless.rs && grep -qF "fn food_kind_free_life_refuses_champion_brain() {" crates/xagent-sandbox/tests/food_kind_free_life.rs && grep -qF "fn free_life_champion_source_reports_node_and_generation() {" crates/xagent-sandbox/tests/free_life.rs && test -f crates/xagent-sandbox/tests/archive_free_life.rs'
   - name: pf-governor-removal
     command: |-
       sh -c 'grep -qF "pub mod governor;" crates/xagent-sandbox/src/lib.rs && grep -qF "pub mod replay;" crates/xagent-sandbox/src/lib.rs && grep -qF "pub struct Governor {" crates/xagent-sandbox/src/governor.rs && grep -qF "use xagent_sandbox::governor::Governor;" crates/xagent-sandbox/tests/pathway_route_state.rs && test -f crates/xagent-sandbox/src/replay.rs'
@@ -200,9 +203,9 @@ execution_checks:
           - crates/xagent-sandbox/tests/free_life.rs
           - crates/xagent-sandbox/tests/archive_free_life.rs
         checks:
-          - name: pf-headless-supervisor-only
+          - name: pf-headless-champion-source
             command: |-
-              sh -c 'grep -qF "fn run_generations(" crates/xagent-sandbox/src/headless.rs && grep -qF "pub fn dump_tree(db_path: &str) {" crates/xagent-sandbox/src/headless.rs && grep -qF "pub fn validate_danger_percept(" crates/xagent-sandbox/src/headless.rs && grep -qF "pub enum BrainSource {" crates/xagent-sandbox/src/headless.rs && grep -qF "pub mode: EvolutionMode," crates/xagent-sandbox/src/run_summary.rs && grep -qF "fn generation_mode_is_the_default_driver() {" crates/xagent-sandbox/tests/supervisor_headless.rs && grep -qF "fn food_kind_free_life_refuses_champion_brain() {" crates/xagent-sandbox/tests/food_kind_free_life.rs && grep -qF "fn free_life_champion_source_reports_node_and_generation() {" crates/xagent-sandbox/tests/free_life.rs'
+              sh -c 'grep -qF "pub enum BrainSource {" crates/xagent-sandbox/src/headless.rs && grep -qF "fn food_kind_free_life_refuses_champion_brain() {" crates/xagent-sandbox/tests/food_kind_free_life.rs && grep -qF "fn free_life_champion_source_reports_node_and_generation() {" crates/xagent-sandbox/tests/free_life.rs && test -f crates/xagent-sandbox/tests/archive_free_life.rs'
           - name: gpu-adapter-present
             command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test integration -- --exact gpu_adapter_present_when_required
             timeout_ms: 3600000

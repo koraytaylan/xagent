@@ -107,7 +107,7 @@ or not `'supervisor'`; `generation` is `MAX(node.generation)` when readable.
 | ui-replay-supervisor-only | "Previous Session Found" exists in `ui.rs`; the generation replay wiring is in the bin | grep on `ui.rs` and `main.rs` | pf-gui-cli-supervisor-only |
 | cli-supervisor-only | generation CLI fields and `mod replay_coord;` exist in `main.rs`; `evolution_cli_exit.rs` exists | grep on `main.rs`, `test -f` | pf-gui-cli-supervisor-only |
 | headless-supervisor-only | `run_generations`, `dump_tree`, validators, `RunSummary.mode` and `generation_mode_is_the_default_driver` exist | grep on headless, run_summary and tests | pf-headless-supervisor-only |
-| headless-champion-source | `BrainSource` and the champion tests in `food_kind_free_life.rs` and `free_life.rs` exist | grep on headless and tests | pf-headless-supervisor-only |
+| headless-champion-source | `BrainSource` and the champion tests in `food_kind_free_life.rs` and `free_life.rs` exist | grep on headless and tests | pf-headless-champion-source |
 | governor-removal | `lib.rs` declares `governor` and `replay`; `pathway_route_state.rs` imports `Governor` | grep on `lib.rs`, governor, test | pf-governor-removal |
 | config-generation-fields | `EvolutionMode`, the eight dead fields and the four survivors exist; no `deny_unknown_fields` in config | grep on `config.rs`, `lib.rs` | pf-config-generation-fields |
 | guard-baseline | guard baseline row for `governor.rs` exists | grep on guard | pf-docs-supervisor-only |

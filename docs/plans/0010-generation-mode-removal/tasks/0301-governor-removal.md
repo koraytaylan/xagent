@@ -21,6 +21,7 @@ touches:
   - crates/xagent-sandbox/src/replay.rs
   - crates/xagent-sandbox/src/lib.rs
   - crates/xagent-sandbox/tests/pathway_route_state.rs
+  - crates/xagent-sandbox/src/observatory/store_read.rs
 status: todo
 merged_as: ""
 checks:
@@ -72,6 +73,12 @@ This task runs after every caller-side task of the plan. It does not edit
   `replay_coord.rs`, `ui.rs`, `app.rs`, `evolution.rs`, `headless.rs` or
   `tests/integration.rs`), the earlier task that owns it has not landed. Do not
   edit that file here. Stop and report it as a blocker for plan correction.
+- **`observatory/store_read.rs` import.** This file is the one exception to
+  the Callers rule: it imports `crate::governor::decode_brain_state`, the codec
+  `store-legacy-guard` moved to `supervisor_store.rs`, and no earlier task owns
+  it. Change only that import to `crate::supervisor_store::decode_brain_state`,
+  merged into the file's existing `crate::supervisor_store::{...}` import group.
+  No other line of the file changes.
 - **Deletion method.** Delete `governor.rs` and `pathway_route_state.rs` with the
   shell `rm`, which is why this task is architect-owned.
 
@@ -81,6 +88,8 @@ This task runs after every caller-side task of the plan. It does not edit
    `VISION_KEYFRAME_INTERVAL` and `replay::` users. Every hit outside this task's
    touches must be gone, because the owning earlier task removed it. Any
    remaining hit outside the touches is a blocker: report the file and stop.
+   In `crates/xagent-sandbox/src/observatory/store_read.rs`, rewrite the
+   `decode_brain_state` import as in Decisions.
 2. Delete `crates/xagent-sandbox/src/governor.rs` and
    `crates/xagent-sandbox/tests/pathway_route_state.rs` with `rm`. Remove the line
    `pub mod governor;` from `crates/xagent-sandbox/src/lib.rs`. Leave
@@ -98,7 +107,7 @@ This task runs after every caller-side task of the plan. It does not edit
    codec and fitness helpers.
 6. Run the check `all-targets-compile`. It must succeed with no error, so every
    integration test and binary still compiles against the trimmed `replay.rs`.
-   Remove any `use` line that the compiler reports as unused in the four touched
+   Remove any `use` line that the compiler reports as unused in the five touched
    files. Then run all three checks on the host.
 
 - **Done when:** the checks `focused-proof`, `sandbox-lib-unit` and

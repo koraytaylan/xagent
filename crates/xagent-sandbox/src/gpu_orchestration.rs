@@ -49,6 +49,7 @@ fn supervisor_worker_init(
             governor: governor.clone(),
         },
         db_path: Some(db_path.to_string()),
+        resume: false,
     })
 }
 

@@ -23,7 +23,7 @@ objective: >-
   generation-mode-removal to delete.
 depends_on:
   - 0006-supervisor-decision-telemetry
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

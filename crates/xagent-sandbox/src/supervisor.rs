@@ -15,7 +15,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
 use xagent_brain::buffers::{
     AgentBrainState, PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_DISTANCE_TRAVELED, P_ENERGY_SPENT,
     P_FOOD_COUNT, P_POS_X, P_POS_Z,
@@ -70,9 +71,70 @@ pub fn stream_seed(run_seed: u64, tag: u64) -> u64 {
     z ^ (z >> SPLITMIX_SHIFT_3)
 }
 
+/// Bytes one generator step yields in `fill_bytes`.
+const BYTES_PER_STEP: usize = 8;
+
+/// Largest step count a restored stream may carry.
+const MAX_STREAM_STEPS: u64 = 1 << 40;
+
+/// A `SmallRng` that counts its steps, so it can be rebuilt from a seed and a
+/// step count.
+///
+/// Counting rule: `next_u32` and `next_u64` each add 1 to the step count;
+/// `fill_bytes(dest)` adds `ceil(dest.len() / 8)` (zero for an empty slice).
+/// Draw values are those of the wrapped `SmallRng`.
+#[derive(Clone, Debug)]
+pub struct StreamRng {
+    inner: SmallRng,
+    seed: u64,
+    steps: u64,
+}
+
+impl StreamRng {
+    /// A stream seeded as `SmallRng::seed_from_u64(seed)`, at step 0.
+    pub fn seed_from(seed: u64) -> Self {
+        Self {
+            inner: SmallRng::seed_from_u64(seed),
+            seed,
+            steps: 0,
+        }
+    }
+
+    /// Steps taken so far.
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+
+    /// The stream seeded with `seed` and advanced `steps` steps.
+    pub fn restore(seed: u64, steps: u64) -> Self {
+        let mut inner = SmallRng::seed_from_u64(seed);
+        for _ in 0..steps {
+            inner.next_u64();
+        }
+        Self { inner, seed, steps }
+    }
+}
+
+impl RngCore for StreamRng {
+    fn next_u32(&mut self) -> u32 {
+        self.steps += 1;
+        self.inner.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.steps += 1;
+        self.inner.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.steps += dest.len().div_ceil(BYTES_PER_STEP) as u64;
+        self.inner.fill_bytes(dest);
+    }
+}
+
 /// Jittered schedule of tick values on the sample grid.
 pub struct TickSchedule {
-    rng: SmallRng,
+    rng: StreamRng,
     low: u64,
     high: u64,
     next: u64,
@@ -87,7 +149,7 @@ impl TickSchedule {
         let low = (mean - mean / HALF_DIVISOR_INT).max(1);
         let high = (mean + mean / HALF_DIVISOR_INT).max(low);
         let mut schedule = Self {
-            rng: SmallRng::seed_from_u64(seed),
+            rng: StreamRng::seed_from(seed),
             low,
             high,
             next: 0,
@@ -131,6 +193,8 @@ pub enum SupervisorError {
     LearnedStateUnexpected,
     /// A plan named an archive entry that is no longer held.
     UnknownArchiveEntry { entry_id: u64 },
+    /// A captured state cannot be restored.
+    InvalidState { reason: String },
 }
 
 impl fmt::Display for SupervisorError {
@@ -153,6 +217,7 @@ impl fmt::Display for SupervisorError {
             Self::UnknownArchiveEntry { entry_id } => {
                 write!(f, "archive entry {entry_id} is not held")
             }
+            Self::InvalidState { reason } => write!(f, "supervisor state is invalid: {reason}"),
         }
     }
 }
@@ -594,10 +659,10 @@ fn eligible_slots(
 /// Picks the slot to replace: death-eligible first, else underperformers, with
 /// exactly one draw when any candidate exists. The drawn index is the position
 /// of the returned slot in the chosen pool, which holds distinct slots.
-fn choose_candidate(
+fn choose_candidate<R: Rng + ?Sized>(
     deaths: &[usize],
     under: &[usize],
-    rng: &mut SmallRng,
+    rng: &mut R,
 ) -> Option<(usize, ReplaceReason)> {
     let (pool, reason) = if !deaths.is_empty() {
         (deaths, ReplaceReason::Death)
@@ -710,7 +775,7 @@ impl Archive {
 }
 
 /// Where a newborn's parent comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParentRef {
     /// An archive entry, by id; its birth brain is the parent.
     ArchiveEntry(u64),
@@ -781,8 +846,8 @@ pub struct Supervisor {
     slots: Vec<SlotLedger>,
     archive: Archive,
     boundary: TickSchedule,
-    tiebreak_rng: SmallRng,
-    parent_rng: SmallRng,
+    tiebreak_rng: StreamRng,
+    parent_rng: StreamRng,
     next_tick: u64,
     next_occupant: u64,
     retired: Option<RetiredSlot>,
@@ -840,8 +905,8 @@ impl Supervisor {
             mutation_strength: governor.mutation_strength,
             momentum_decay: governor.momentum_decay,
             world_size,
-            tiebreak_rng: SmallRng::seed_from_u64(stream_seed(run_seed, TIEBREAK_STREAM)),
-            parent_rng: SmallRng::seed_from_u64(stream_seed(run_seed, PARENT_STREAM)),
+            tiebreak_rng: StreamRng::seed_from(stream_seed(run_seed, TIEBREAK_STREAM)),
+            parent_rng: StreamRng::seed_from(stream_seed(run_seed, PARENT_STREAM)),
             next_tick: SUPERVISOR_SAMPLE_TICKS,
             retired: None,
             parent_draw: None,
@@ -1137,6 +1202,613 @@ impl Supervisor {
             }
         }
         changes
+    }
+}
+
+/// Serialised position of one random stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StreamRngState {
+    seed: u64,
+    steps: u64,
+}
+
+impl StreamRngState {
+    fn capture(rng: &StreamRng) -> Self {
+        Self {
+            seed: rng.seed,
+            steps: rng.steps,
+        }
+    }
+
+    fn rebuild(&self) -> Result<StreamRng, SupervisorError> {
+        if self.steps > MAX_STREAM_STEPS {
+            return Err(invalid("stream step count is out of range"));
+        }
+        Ok(StreamRng::restore(self.seed, self.steps))
+    }
+}
+
+fn invalid(reason: &str) -> SupervisorError {
+    SupervisorError::InvalidState {
+        reason: reason.to_string(),
+    }
+}
+
+/// Serialised brain state with bit-exact floats.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BrainStateRecord {
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits::vec")]
+    brain_state: Vec<f32>,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits::vec")]
+    patterns: Vec<f32>,
+}
+
+impl From<&AgentBrainState> for BrainStateRecord {
+    fn from(state: &AgentBrainState) -> Self {
+        Self {
+            brain_state: state.brain_state.clone(),
+            patterns: state.patterns.clone(),
+        }
+    }
+}
+
+impl From<BrainStateRecord> for AgentBrainState {
+    fn from(record: BrainStateRecord) -> Self {
+        Self {
+            brain_state: record.brain_state,
+            patterns: record.patterns,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TickScheduleState {
+    rng: StreamRngState,
+    low: u64,
+    high: u64,
+    next: u64,
+}
+
+impl TickScheduleState {
+    pub(crate) fn capture(schedule: &TickSchedule) -> Self {
+        Self {
+            rng: StreamRngState::capture(&schedule.rng),
+            low: schedule.low,
+            high: schedule.high,
+            next: schedule.next,
+        }
+    }
+
+    pub(crate) fn rebuild(&self) -> Result<TickSchedule, SupervisorError> {
+        if self.low == 0 || self.low > self.high {
+            return Err(invalid("tick schedule bounds are inconsistent"));
+        }
+        Ok(TickSchedule {
+            rng: self.rng.rebuild()?,
+            low: self.low,
+            high: self.high,
+            next: self.next,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CountersState {
+    alive: bool,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    deaths: f32,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    food: f32,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    distance: f32,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    energy_spent: f32,
+    cell: Option<u16>,
+}
+
+impl From<&SlotCounters> for CountersState {
+    fn from(c: &SlotCounters) -> Self {
+        Self {
+            alive: c.alive,
+            deaths: c.deaths,
+            food: c.food,
+            distance: c.distance,
+            energy_spent: c.energy_spent,
+            cell: c.cell,
+        }
+    }
+}
+
+impl From<&CountersState> for SlotCounters {
+    fn from(c: &CountersState) -> Self {
+        Self {
+            alive: c.alive,
+            deaths: c.deaths,
+            food: c.food,
+            distance: c.distance,
+            energy_spent: c.energy_spent,
+            cell: c.cell,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlotLedgerState {
+    occupant_id: u64,
+    born_tick: u64,
+    birth_brain: BrainStateRecord,
+    config: BrainConfig,
+    parent: Option<ParentRef>,
+    pending_death: bool,
+    window_len: usize,
+    window: Vec<CountersState>,
+    life_cells: Vec<u16>,
+}
+
+impl SlotLedgerState {
+    fn capture(ledger: &SlotLedger) -> Self {
+        Self {
+            occupant_id: ledger.occupant_id,
+            born_tick: ledger.born_tick,
+            birth_brain: BrainStateRecord::from(&ledger.birth_brain),
+            config: ledger.config.clone(),
+            parent: ledger.parent,
+            pending_death: ledger.pending_death,
+            window_len: ledger.window_len,
+            window: ledger.window.iter().map(CountersState::from).collect(),
+            life_cells: ledger.life_cells.iter().copied().collect(),
+        }
+    }
+
+    fn rebuild(self) -> Result<SlotLedger, SupervisorError> {
+        if self.window_len == 0 || self.window.len() > self.window_len {
+            return Err(invalid("slot window is inconsistent"));
+        }
+        Ok(SlotLedger {
+            occupant_id: self.occupant_id,
+            born_tick: self.born_tick,
+            birth_brain: self.birth_brain.into(),
+            config: self.config,
+            parent: self.parent,
+            pending_death: self.pending_death,
+            window_len: self.window_len,
+            window: self.window.iter().map(SlotCounters::from).collect(),
+            life_cells: self.life_cells.into_iter().collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ArchiveEntryState {
+    entry_id: u64,
+    occupant_id: u64,
+    born_tick: u64,
+    retired_tick: u64,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    outcome: f32,
+    config: BrainConfig,
+    birth_brain: BrainStateRecord,
+}
+
+impl ArchiveEntryState {
+    fn capture(entry: &ArchiveEntry) -> Self {
+        Self {
+            entry_id: entry.entry_id,
+            occupant_id: entry.occupant_id,
+            born_tick: entry.born_tick,
+            retired_tick: entry.retired_tick,
+            outcome: entry.outcome,
+            config: entry.config.clone(),
+            birth_brain: BrainStateRecord::from(&entry.birth_brain),
+        }
+    }
+
+    fn rebuild(self) -> ArchiveEntry {
+        ArchiveEntry {
+            entry_id: self.entry_id,
+            occupant_id: self.occupant_id,
+            born_tick: self.born_tick,
+            retired_tick: self.retired_tick,
+            outcome: self.outcome,
+            config: self.config,
+            birth_brain: self.birth_brain.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ArchiveState {
+    capacity: usize,
+    entries: Vec<ArchiveEntryState>,
+    next_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RetiredSlotState {
+    slot: usize,
+    archived: Option<ArchiveEntryState>,
+    evicted: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ParentDrawRecord {
+    pool_len: usize,
+    drawn_index: usize,
+}
+
+impl From<&ParentDraw> for ParentDrawRecord {
+    fn from(d: &ParentDraw) -> Self {
+        Self {
+            pool_len: d.pool_len,
+            drawn_index: d.drawn_index,
+        }
+    }
+}
+
+impl From<ParentDrawRecord> for ParentDraw {
+    fn from(d: ParentDrawRecord) -> Self {
+        Self {
+            pool_len: d.pool_len,
+            drawn_index: d.drawn_index,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum GroundRecord {
+    Death,
+    BelowMedian { score: u32, median: u32 },
+    TooYoung,
+    NoFullWindow,
+    NoPeerMedian,
+    AtOrAboveMedian { score: u32, median: u32 },
+}
+
+impl From<&EligibilityGround> for GroundRecord {
+    fn from(g: &EligibilityGround) -> Self {
+        match g {
+            EligibilityGround::Death => Self::Death,
+            EligibilityGround::BelowMedian { score, median } => Self::BelowMedian {
+                score: score.to_bits(),
+                median: median.to_bits(),
+            },
+            EligibilityGround::TooYoung => Self::TooYoung,
+            EligibilityGround::NoFullWindow => Self::NoFullWindow,
+            EligibilityGround::NoPeerMedian => Self::NoPeerMedian,
+            EligibilityGround::AtOrAboveMedian { score, median } => Self::AtOrAboveMedian {
+                score: score.to_bits(),
+                median: median.to_bits(),
+            },
+        }
+    }
+}
+
+impl From<GroundRecord> for EligibilityGround {
+    fn from(g: GroundRecord) -> Self {
+        match g {
+            GroundRecord::Death => Self::Death,
+            GroundRecord::BelowMedian { score, median } => Self::BelowMedian {
+                score: f32::from_bits(score),
+                median: f32::from_bits(median),
+            },
+            GroundRecord::TooYoung => Self::TooYoung,
+            GroundRecord::NoFullWindow => Self::NoFullWindow,
+            GroundRecord::NoPeerMedian => Self::NoPeerMedian,
+            GroundRecord::AtOrAboveMedian { score, median } => Self::AtOrAboveMedian {
+                score: f32::from_bits(score),
+                median: f32::from_bits(median),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StandingRecord {
+    slot: usize,
+    occupant_id: u64,
+    age_ticks: u64,
+    alive: bool,
+    meals: u32,
+    deaths: u32,
+    window_score: Option<u32>,
+    peer_median: Option<u32>,
+    ground: GroundRecord,
+    parent: Option<ParentRef>,
+}
+
+impl From<&SlotStanding> for StandingRecord {
+    fn from(s: &SlotStanding) -> Self {
+        Self {
+            slot: s.slot,
+            occupant_id: s.occupant_id,
+            age_ticks: s.age_ticks,
+            alive: s.alive,
+            meals: s.meals,
+            deaths: s.deaths,
+            window_score: s.window_score.map(f32::to_bits),
+            peer_median: s.peer_median.map(f32::to_bits),
+            ground: GroundRecord::from(&s.ground),
+            parent: s.parent,
+        }
+    }
+}
+
+impl From<StandingRecord> for SlotStanding {
+    fn from(s: StandingRecord) -> Self {
+        Self {
+            slot: s.slot,
+            occupant_id: s.occupant_id,
+            age_ticks: s.age_ticks,
+            alive: s.alive,
+            meals: s.meals,
+            deaths: s.deaths,
+            window_score: s.window_score.map(f32::from_bits),
+            peer_median: s.peer_median.map(f32::from_bits),
+            ground: s.ground.into(),
+            parent: s.parent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum BoundaryRecord {
+    Replaced {
+        tick: u64,
+        candidates: Vec<StandingRecord>,
+        slot: usize,
+        death: bool,
+        tiebreak_pool: Vec<usize>,
+        tiebreak_drawn_index: usize,
+        parent: ParentRef,
+        parent_draw: Option<ParentDrawRecord>,
+        retired_occupant: u64,
+        retired_born_tick: u64,
+    },
+    Idle {
+        tick: u64,
+        standings: Vec<StandingRecord>,
+        too_young: usize,
+        no_full_window: usize,
+        no_peer_median: usize,
+        at_or_above_median: usize,
+    },
+}
+
+impl From<&BoundaryDetail> for BoundaryRecord {
+    fn from(b: &BoundaryDetail) -> Self {
+        match b {
+            BoundaryDetail::Replaced {
+                tick,
+                candidates,
+                slot,
+                reason,
+                tiebreak,
+                parent,
+                parent_draw,
+                retired_occupant,
+                retired_born_tick,
+            } => Self::Replaced {
+                tick: *tick,
+                candidates: candidates.iter().map(StandingRecord::from).collect(),
+                slot: *slot,
+                death: matches!(reason, ReplaceReason::Death),
+                tiebreak_pool: tiebreak.pool.clone(),
+                tiebreak_drawn_index: tiebreak.drawn_index,
+                parent: *parent,
+                parent_draw: parent_draw.as_ref().map(ParentDrawRecord::from),
+                retired_occupant: *retired_occupant,
+                retired_born_tick: *retired_born_tick,
+            },
+            BoundaryDetail::Idle {
+                tick,
+                standings,
+                reason,
+            } => Self::Idle {
+                tick: *tick,
+                standings: standings.iter().map(StandingRecord::from).collect(),
+                too_young: reason.too_young,
+                no_full_window: reason.no_full_window,
+                no_peer_median: reason.no_peer_median,
+                at_or_above_median: reason.at_or_above_median,
+            },
+        }
+    }
+}
+
+impl From<BoundaryRecord> for BoundaryDetail {
+    fn from(b: BoundaryRecord) -> Self {
+        match b {
+            BoundaryRecord::Replaced {
+                tick,
+                candidates,
+                slot,
+                death,
+                tiebreak_pool,
+                tiebreak_drawn_index,
+                parent,
+                parent_draw,
+                retired_occupant,
+                retired_born_tick,
+            } => Self::Replaced {
+                tick,
+                candidates: candidates.into_iter().map(SlotStanding::from).collect(),
+                slot,
+                reason: if death {
+                    ReplaceReason::Death
+                } else {
+                    ReplaceReason::Underperformer
+                },
+                tiebreak: TieBreak {
+                    pool: tiebreak_pool,
+                    drawn_index: tiebreak_drawn_index,
+                },
+                parent,
+                parent_draw: parent_draw.map(ParentDraw::from),
+                retired_occupant,
+                retired_born_tick,
+            },
+            BoundaryRecord::Idle {
+                tick,
+                standings,
+                too_young,
+                no_full_window,
+                no_peer_median,
+                at_or_above_median,
+            } => Self::Idle {
+                tick,
+                standings: standings.into_iter().map(SlotStanding::from).collect(),
+                reason: IdleReason {
+                    too_young,
+                    no_full_window,
+                    no_peer_median,
+                    at_or_above_median,
+                },
+            },
+        }
+    }
+}
+
+/// Everything needed to rebuild a `Supervisor` that continues identically,
+/// including the pending parent draw and the latest boundary detail.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupervisorState {
+    config: SupervisorConfig,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    mutation_strength: f32,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    momentum_decay: f32,
+    #[serde(with = "crate::supervisor_checkpoint::f32_bits")]
+    world_size: f32,
+    slots: Vec<SlotLedgerState>,
+    archive: ArchiveState,
+    boundary: TickScheduleState,
+    tiebreak_rng: StreamRngState,
+    parent_rng: StreamRngState,
+    next_tick: u64,
+    next_occupant: u64,
+    retired: Option<RetiredSlotState>,
+    parent_draw: Option<ParentDrawRecord>,
+    last_boundary: Option<BoundaryRecord>,
+}
+
+impl Supervisor {
+    /// Captures the core so `restore` can continue it identically.
+    pub fn capture(&self) -> SupervisorState {
+        let Supervisor {
+            config,
+            mutation_strength,
+            momentum_decay,
+            world_size,
+            slots,
+            archive,
+            boundary,
+            tiebreak_rng,
+            parent_rng,
+            next_tick,
+            next_occupant,
+            retired,
+            parent_draw,
+            last_boundary,
+        } = self;
+        SupervisorState {
+            config: config.clone(),
+            mutation_strength: *mutation_strength,
+            momentum_decay: *momentum_decay,
+            world_size: *world_size,
+            slots: slots.iter().map(SlotLedgerState::capture).collect(),
+            archive: ArchiveState {
+                capacity: archive.capacity,
+                entries: archive
+                    .entries
+                    .iter()
+                    .map(ArchiveEntryState::capture)
+                    .collect(),
+                next_id: archive.next_id,
+            },
+            boundary: TickScheduleState::capture(boundary),
+            tiebreak_rng: StreamRngState::capture(tiebreak_rng),
+            parent_rng: StreamRngState::capture(parent_rng),
+            next_tick: *next_tick,
+            next_occupant: *next_occupant,
+            retired: retired.as_ref().map(|r| RetiredSlotState {
+                slot: r.slot,
+                archived: r.archived.as_ref().map(ArchiveEntryState::capture),
+                evicted: r.evicted,
+            }),
+            parent_draw: parent_draw.as_ref().map(ParentDrawRecord::from),
+            last_boundary: last_boundary.as_ref().map(BoundaryRecord::from),
+        }
+    }
+
+    /// Rebuilds a supervisor from a captured state.
+    pub fn restore(state: SupervisorState) -> Result<Supervisor, SupervisorError> {
+        let SupervisorState {
+            config,
+            mutation_strength,
+            momentum_decay,
+            world_size,
+            slots,
+            archive,
+            boundary,
+            tiebreak_rng,
+            parent_rng,
+            next_tick,
+            next_occupant,
+            retired,
+            parent_draw,
+            last_boundary,
+        } = state;
+        let tiebreak_rng = tiebreak_rng.rebuild()?;
+        let parent_rng = parent_rng.rebuild()?;
+        let boundary = boundary.rebuild()?;
+        if slots.is_empty() {
+            return Err(invalid("no slots"));
+        }
+        config
+            .validate(slots.len())
+            .map_err(SupervisorError::Config)?;
+        if next_occupant < slots.len() as u64 {
+            return Err(invalid("next occupant id precedes the live occupants"));
+        }
+        let slots = slots
+            .into_iter()
+            .map(SlotLedgerState::rebuild)
+            .collect::<Result<Vec<_>, _>>()?;
+        let retired = match retired {
+            Some(r) if r.slot >= slots.len() => {
+                return Err(invalid("retired slot is not a valid slot index"));
+            }
+            Some(r) => Some(RetiredSlot {
+                slot: r.slot,
+                archived: r.archived.map(ArchiveEntryState::rebuild),
+                evicted: r.evicted,
+            }),
+            None => None,
+        };
+        Ok(Supervisor {
+            config,
+            mutation_strength,
+            momentum_decay,
+            world_size,
+            slots,
+            archive: Archive {
+                capacity: archive.capacity,
+                entries: archive
+                    .entries
+                    .into_iter()
+                    .map(ArchiveEntryState::rebuild)
+                    .collect(),
+                next_id: archive.next_id,
+            },
+            boundary,
+            tiebreak_rng,
+            parent_rng,
+            next_tick,
+            next_occupant,
+            retired,
+            parent_draw: parent_draw.map(ParentDraw::from),
+            last_boundary: last_boundary.map(BoundaryDetail::from),
+        })
     }
 }
 
@@ -1966,5 +2638,138 @@ mod tests {
         for name in forbidden {
             assert!(!core.contains(name), "core mentions {name}");
         }
+    }
+
+    /// Fill lengths cycled by the mixed draws.
+    const FILL_LENS: [usize; 6] = [0, 1, 7, 8, 9, 13];
+    /// Seed of the stream tests.
+    const STREAM_SEED: u64 = 0xC0FFEE;
+    /// Draws in the prefix of the stream tests.
+    const PREFIX_DRAWS: usize = 10_000;
+    /// Draws compared after a restore.
+    const RESUME_DRAWS: usize = 1_000;
+    /// Samples driven before the supervisor capture.
+    const CAPTURE_SAMPLES: usize = 200;
+    /// Samples driven after the capture.
+    const RESUME_SAMPLES: usize = 1_000;
+    /// Draw kinds cycled by the mixed draws.
+    const DRAW_KINDS: usize = 3;
+
+    /// One draw of a kind chosen by `i`, as bytes.
+    fn mixed_draw(rng: &mut impl RngCore, i: usize) -> Vec<u8> {
+        match i % DRAW_KINDS {
+            0 => rng.next_u32().to_le_bytes().to_vec(),
+            1 => rng.next_u64().to_le_bytes().to_vec(),
+            _ => {
+                let mut buf = vec![0u8; FILL_LENS[(i / DRAW_KINDS) % FILL_LENS.len()]];
+                rng.fill_bytes(&mut buf);
+                buf
+            }
+        }
+    }
+
+    #[test]
+    fn stream_rng_matches_small_rng() {
+        let mut counted = StreamRng::seed_from(STREAM_SEED);
+        let mut plain = SmallRng::seed_from_u64(STREAM_SEED);
+        for i in 0..PREFIX_DRAWS {
+            assert_eq!(mixed_draw(&mut counted, i), mixed_draw(&mut plain, i));
+        }
+    }
+
+    #[test]
+    fn stream_rng_restore_resumes() {
+        let mut original = StreamRng::seed_from(STREAM_SEED);
+        for i in 0..PREFIX_DRAWS {
+            mixed_draw(&mut original, i);
+        }
+        let mut restored = StreamRng::restore(STREAM_SEED, original.steps());
+        assert_eq!(restored.steps(), original.steps());
+        for i in PREFIX_DRAWS..PREFIX_DRAWS + RESUME_DRAWS {
+            assert_eq!(mixed_draw(&mut original, i), mixed_draw(&mut restored, i));
+            assert_eq!(original.steps(), restored.steps());
+        }
+    }
+
+    /// Feeds one sample; completes any replacement and returns a comparable
+    /// record of the step.
+    fn step_core(
+        sup: &mut Supervisor,
+    ) -> (
+        SampleDecision,
+        Option<(u64, Vec<u32>, Vec<u32>, Option<u64>)>,
+    ) {
+        let tick = sup.next_sample_tick();
+        let counters = counters_at(tick, &[1, 2, 3], &[0]);
+        let decision = sup.record_sample(tick, &counters).expect("sample accepted");
+        let outcome = if let SampleDecision::Replace(plan) = &decision {
+            let out = sup
+                .complete_replacement(plan.clone(), tick, None)
+                .expect("replacement completes");
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            Some((
+                out.occupant_id,
+                bits(&out.newborn_brain.brain_state),
+                bits(&out.newborn_brain.patterns),
+                out.archived.map(|e| e.entry_id),
+            ))
+        } else {
+            None
+        };
+        (decision, outcome)
+    }
+
+    #[test]
+    fn supervisor_restore_continues_identically() {
+        let mut original = supervisor(Inheritance::Darwinian, 3);
+        for _ in 0..CAPTURE_SAMPLES {
+            step_core(&mut original);
+        }
+        let json = serde_json::to_string(&original.capture()).expect("serialises");
+        let state: SupervisorState = serde_json::from_str(&json).expect("deserialises");
+        let mut restored = Supervisor::restore(state).expect("restores");
+        let mut replaced = 0;
+        for _ in 0..RESUME_SAMPLES {
+            let a = step_core(&mut original);
+            let b = step_core(&mut restored);
+            if a.1.is_some() {
+                replaced += 1;
+            }
+            assert_eq!(a, b);
+            assert_eq!(original.tiebreak_rng.steps(), restored.tiebreak_rng.steps());
+            assert_eq!(original.parent_rng.steps(), restored.parent_rng.steps());
+            assert_eq!(original.boundary.rng.steps(), restored.boundary.rng.steps());
+        }
+        assert!(replaced > 0, "the run must replace at least once");
+    }
+
+    #[test]
+    fn supervisor_restore_between_replace_and_completion() {
+        let mut original = supervisor(Inheritance::Darwinian, 3);
+        let (tick, plan) = (0..RESUME_SAMPLES)
+            .find_map(|_| {
+                let tick = original.next_sample_tick();
+                let counters = counters_at(tick, &[1, 2, 3], &[0]);
+                match original.record_sample(tick, &counters).expect("accepted") {
+                    SampleDecision::Replace(plan) => Some((tick, plan)),
+                    _ => None,
+                }
+            })
+            .expect("a replacement is planned");
+        let json = serde_json::to_string(&original.capture()).expect("serialises");
+        let state: SupervisorState = serde_json::from_str(&json).expect("deserialises");
+        let mut restored = Supervisor::restore(state).expect("restores");
+        assert_eq!(original.last_boundary(), restored.last_boundary());
+        assert!(matches!(
+            restored.last_boundary(),
+            Some(BoundaryDetail::Replaced { .. })
+        ));
+        original
+            .complete_replacement(plan.clone(), tick, None)
+            .expect("original completes");
+        restored
+            .complete_replacement(plan, tick, None)
+            .expect("restored completes");
+        assert_eq!(original.last_boundary(), restored.last_boundary());
     }
 }

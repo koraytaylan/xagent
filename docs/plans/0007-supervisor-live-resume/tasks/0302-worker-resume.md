@@ -10,8 +10,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/sim_runtime.rs
   - crates/xagent-sandbox/src/gpu_orchestration.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "1a0bc7951d236bb8be4a30ce01b3c4a6bc1ee06a"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --bin xagent sim_runtime::"

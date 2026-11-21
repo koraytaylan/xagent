@@ -8,3 +8,4 @@
 | 0004 | 0004-food-contingency-learning | ✅ Complete | 17/17 | — | [status](0004-food-contingency-learning/STATUS.md) |
 | 0005 | 0005-continuous-life-supervisor | ✅ Complete | 15/15 | — | [status](0005-continuous-life-supervisor/STATUS.md) |
 | 0006 | 0006-supervisor-decision-telemetry | ✅ Complete | 10/10 | — | [status](0006-supervisor-decision-telemetry/STATUS.md) |
+| 0007 | 0007-supervisor-live-resume | ✅ Complete | 8/8 | — | [status](0007-supervisor-live-resume/STATUS.md) |

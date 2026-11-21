@@ -225,6 +225,20 @@ impl Cache {
         self.valid.store(false, Ordering::Release);
     }
 
+    /// Checkpoint restore: invalidate the cache and zero the scratch prefix,
+    /// which holds the context, food-grid, gathered-context and physics cache
+    /// metadata headers, so the restored kernel matches a freshly built one.
+    pub(super) fn reset_for_restore(&self, queue: &wgpu::Queue) {
+        self.invalidate();
+        // A prefix that does not fit usize would leave stale cache headers
+        // behind; refuse loudly rather than skip the reset.
+        let len = usize::try_from(self.shape.prefix_bytes).unwrap_or_else(|_| {
+            log::error!("[GpuKernel] packed cache prefix does not fit usize");
+            panic!("packed cache prefix does not fit usize");
+        });
+        queue.write_buffer(&self.buffer, 0, &vec![0_u8; len]);
+    }
+
     /// Record a cold import before the first packed compute pass in a batch.
     /// The caller must submit this encoder before another packed dispatch, or
     /// invalidate the cache if recording is abandoned. Atomic claiming avoids

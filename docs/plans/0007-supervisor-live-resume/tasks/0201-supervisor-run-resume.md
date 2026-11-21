@@ -13,9 +13,10 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/supervisor_run.rs
   - crates/xagent-sandbox/src/run_summary.rs
+  - crates/xagent-sandbox/src/supervisor.rs
   - crates/xagent-sandbox/tests/supervisor_run_resume.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "c12438bd67fd1a45da903fc805867b6b1e7be4fa"
 checks:
   - name: focused-proof
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_run_resume
@@ -56,7 +57,9 @@ kernel capture, core capture, envelope and store primitives come from the four
   self.core.next_boundary_tick()`.
 - **`SupervisorRunState`** derives `Serialize, Deserialize` and holds `core`
   (`SupervisorState`), `season` (the `TickSchedule` state from
-  `supervisor-core-state`), `accumulator: Option<RunSummaryAccumulator>`,
+  `supervisor-core-state`: the field is `season: TickScheduleState`, filled by
+  `TickScheduleState::capture` and restored with `TickScheduleState::rebuild`; a
+  replayed advance counter does not satisfy this), `accumulator: Option<RunSummaryAccumulator>`,
   `population`, `kinds_on`, `nourishing: Option<FoodKind>`, `tick`, `budget`,
   `next_occupant`, `spawn_draws`, and every field 0006 added (names in
   `docs/plans/0006-supervisor-decision-telemetry/ARCHITECTURE.md`). `f32` values
@@ -77,14 +80,19 @@ kernel capture, core capture, envelope and store primitives come from the four
 - **`ResumePoint` and loaders.** `ResumePoint { run_id, tick, config, state,
   kernel, physics, food }`. `load_resume_point` reads via `read_checkpoint` (`None`
   gives `Missing`), decodes the envelope, and compares the `config` section with
-  `run_configs()` (mismatch gives `ConfigMismatch`). It decodes `kernel.cpu` with
+  the run row's three config strings, the same `governor_config`, `brain_config`
+  and `world_config` columns `run_configs()` returns (mismatch gives
+  `ConfigMismatch`). Because the store's only constructors (`create`,
+  `reopen_for_resume`) write to the database, the loader reads that row through a
+  read-only `rusqlite` connection that sets `busy_timeout` before querying; it
+  must not open a `SupervisorStore` or mutate the database. It decodes `kernel.cpu` with
   `KernelCpuState::from_bytes` (error gives `Malformed`) into `KernelCheckpoint.cpu`
   and keeps the other `kernel.<name>` sections as `KernelSection`s. It checks that
   `T` is a multiple of `SUPERVISOR_SAMPLE_TICKS`, the tick rule above, and that the
   slot count equals `population_size`. `physics = KernelCheckpoint::physics(&self)
   -> &[f32]` copied to `Vec<f32>`; `food = KernelCheckpoint::food(&self) ->
-  Option<&[f32]>` copied. Food must be `Some` exactly when `kinds_on`, else
-  `Malformed`. `load_checkpoint_config` runs only the config part.
+  Option<&[f32]>` copied. Food must be `Some` exactly when the config's world
+  has food items, else `Malformed` (amendment A4; `kinds_on` plays no part). `load_checkpoint_config` runs only the config part.
 - **`resume(kernel, config, store, state, &KernelCheckpoint)`** runs `validate`,
   builds `WorldState::new`, stores `config`, replays `spawn_draws` calls, calls
   `upload_world` as `start` does, then `restore_checkpoint`, rebuilds the core with
@@ -99,7 +107,9 @@ kernel capture, core capture, envelope and store primitives come from the four
 
 ## Non-goals
 
-- No edits to `world/mod.rs`, `supervisor.rs`, `supervisor_checkpoint.rs`,
+- No edits to `supervisor.rs` beyond making `TickScheduleState`, its
+  `capture` and its `rebuild` `pub(crate)` (no behaviour, field or test change).
+- No edits to `world/mod.rs`, `supervisor_checkpoint.rs`,
   `supervisor_store.rs`, `gpu_kernel*.rs`, `headless.rs`, `main.rs` or
   `sim_runtime.rs`.
 - No dependency or version change.
@@ -113,7 +123,9 @@ kernel capture, core capture, envelope and store primitives come from the four
 1. In `run_summary.rs`, derive `Serialize, Deserialize` on `RunSummaryAccumulator`
    and its parts. Use `f32_bits` for `f32`, and a private `f64_bits` module (stores
    `to_bits()` as `u64`) for `f64`. Change no existing method or test.
-2. In `supervisor_run.rs`, add the `spawn_draws` and `config` fields, the spawn
+2. In `supervisor.rs`, make `TickScheduleState`, `TickScheduleState::capture` and
+   `TickScheduleState::rebuild` `pub(crate)`; change nothing else there.
+   In `supervisor_run.rs`, add the `spawn_draws` and `config` fields, the spawn
    helper used at every call site, `SupervisorRunState`, `capture_state`,
    `checkpoint_due`, `write_checkpoint`, and the two `SupervisorRunError` variants
    with `Display` arms.
@@ -125,7 +137,11 @@ kernel capture, core capture, envelope and store primitives come from the four
    `supervisor_run_resume_matches_uninterrupted` (two runs, the interrupted one
    stopped after its second checkpoint write and before `on_sample` at that tick,
    then `SupervisorStore::reopen_for_resume`; compare all `SampleReport`s from T
-   on and every table row by rowid, including `supervisor_checkpoint`),
+   on and every table row by rowid, including `supervisor_checkpoint`, except
+   `supervisor_slot`, which is compared ordered by its `(run_id, slot)` key with
+   every non-rowid column equal: `upsert_slot` uses `INSERT OR REPLACE`, so its
+   rowids differ after resume's rewrite. The only other masked value is the `run`
+   row's wall-clock `started_at`),
    `supervisor_run_resume_refuses_config_mismatch` (edit the run row's
    `brain_config` with rusqlite; expect `ConfigMismatch`), and
    `run_summary_accumulator_serde_round_trip`.

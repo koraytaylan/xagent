@@ -9,8 +9,9 @@ depends_on:
 gated: false
 touches:
   - crates/xagent-sandbox/tests/supervisor_resume_digest.rs
-status: todo
-merged_as: ""
+  - crates/xagent-sandbox/src/supervisor_run.rs
+status: done
+merged_as: "fe032984cfb29f7042cd9fe4c575af14a0461f30"
 checks:
   - name: focused-proof
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_resume_digest
@@ -19,8 +20,8 @@ checks:
     command: cargo clippy -p xagent-sandbox --all-targets -- -D warnings
     timeout_ms: 3600000
   - name: sandbox-fmt
-    command: rustfmt --edition 2021 --check crates/xagent-sandbox/tests/supervisor_resume_digest.rs
-    fix: rustfmt --edition 2021 crates/xagent-sandbox/tests/supervisor_resume_digest.rs
+    command: rustfmt --edition 2021 --check crates/xagent-sandbox/tests/supervisor_resume_digest.rs crates/xagent-sandbox/src/supervisor_run.rs
+    fix: rustfmt --edition 2021 crates/xagent-sandbox/tests/supervisor_resume_digest.rs crates/xagent-sandbox/src/supervisor_run.rs
 ---
 
 # Stop-and-resume digest and refusal gate
@@ -38,7 +39,10 @@ INV-1 and INV-2 through the headless driver.
   checkpoints are refused with the matching `CheckpointError`, and the database is
   left unchanged.
 
-Only this test file is added; no product code changes.
+The only product change (A4) is in `load_resume_point` (`supervisor_run.rs`):
+food rows must be `Some` exactly when
+`WorldState::new(config.world.clone()).food_items.len() > 0`, else `Malformed`;
+`kinds_on` plays no part. Nothing else in `supervisor_run.rs` changes.
 
 ## Prerequisites used (not reimplemented)
 
@@ -107,7 +111,8 @@ Only this test file is added; no product code changes.
 
 ## Non-goals
 
-- No product code; no change to `headless.rs`, `supervisor_checkpoint.rs`,
+- No product code beyond the A4 food-presence check in `load_resume_point`; no
+  other change to `supervisor_run.rs` and no change to `headless.rs`, `supervisor_checkpoint.rs`,
   `supervisor_store.rs`, or any `gpu_kernel` file.
 - No submit-count test and no INV-4 claim.
 - No checkpoint history, no new dependency, no edit to the 0006 fixture or gate.
@@ -116,7 +121,9 @@ Only this test file is added; no product code changes.
 
 **Steps:**
 
-1. Create `crates/xagent-sandbox/tests/supervisor_resume_digest.rs` with a module doc,
+1. Apply the A4 check above in `load_resume_point` (replacing
+   `food.is_some() != state.kinds_on`), then create
+   `crates/xagent-sandbox/tests/supervisor_resume_digest.rs` with a module doc,
    constants (`SEED = 5`, `AGENTS = 10`, `AGENT_TICK_BUDGET = 600_000`,
    `STOP_AT_TICK = 10_000`), the config helper, `gpu_or_skip`, and copied
    `adapter_description` and `env_flag`.
@@ -134,8 +141,8 @@ Only this test file is added; no product code changes.
    `resume_refuses_config_mismatch`, each refusal test following the decisions above.
 5. Request `focused-proof` through `verify` and read its output: all six named tests
    pass, none skipped, with `XAGENT_REQUIRE_GPU=1` set. If one fails, fix this file
-   only and request again.
+   (or the A4 check) and request again.
 6. Request `sandbox-clippy` and `sandbox-fmt` through `verify`. If `sandbox-fmt`
-   fails, apply its fix and request all three again. Edit nothing outside `touches`.
+   fails, apply its fix and request all three again. Edit nothing outside `touches`; in `supervisor_run.rs` change only the A4 check.
 
 - **Done when:** the focused-proof check passes with resume_digest_matches_uninterrupted, resume_digest_checkpointing_does_not_change_digest, resume_refuses_truncated, resume_refuses_corrupt_byte, resume_refuses_version_mismatch and resume_refuses_config_mismatch all passing and none skipped, and the sandbox-clippy and sandbox-fmt checks pass, proving INV-1 (uninterrupted checkpoint-writing digest equals the 0006 golden and the stop-and-resumed digest equals the uninterrupted digest) and INV-2 (truncated, corrupt and version-mismatched checkpoints are refused with the matching CheckpointError, config-mismatched with ConfigMismatch, and non-checkpoint tables are unchanged).

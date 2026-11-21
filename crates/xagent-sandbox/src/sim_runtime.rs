@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use xagent_brain::buffers::{BrainLayout, TrailSample, PATTERN_STRIDE};
 use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
-use xagent_sandbox::supervisor_run::{SampleReport, SupervisorRun};
+use xagent_sandbox::supervisor_checkpoint::CheckpointError;
+use xagent_sandbox::supervisor_run::{load_resume_point, SampleReport, SupervisorRun};
 use xagent_sandbox::supervisor_store::SupervisorStore;
 use xagent_sandbox::supervisor_telemetry::{BoundaryRecord, TelemetryFrame};
 use xagent_shared::{BrainConfig, FullConfig, WorldConfig, SUPERVISOR_SAMPLE_TICKS};
@@ -253,6 +254,9 @@ pub enum SimEvent {
 pub struct SupervisorWorkerInit {
     pub config: FullConfig,
     pub db_path: Option<String>,
+    /// Restore the run from the checkpoint in `db_path` instead of starting a
+    /// new one.
+    pub resume: bool,
 }
 
 /// Initial configuration handed to [`SimRuntime::start`].
@@ -449,7 +453,12 @@ struct Worker {
 fn start_supervisor(
     kernel: &mut GpuKernel,
     init: &SupervisorWorkerInit,
-) -> Result<SupervisorRun, String> {
+    counts: (u32, usize),
+) -> Result<(SupervisorRun, u64, Option<SampleReport>), String> {
+    if init.resume {
+        let (run, tick, report) = resume_supervisor(kernel, init, counts)?;
+        return Ok((run, tick, Some(report)));
+    }
     let store = match init.db_path.as_deref() {
         Some(path) => Some(
             SupervisorStore::create(path, &init.config)
@@ -458,7 +467,49 @@ fn start_supervisor(
         None => None,
     };
     SupervisorRun::start(kernel, &init.config, store, false)
+        .map(|run| (run, 0, None))
         .map_err(|e| format!("supervisor start: {e}"))
+}
+
+/// Restore the run from the checkpoint in `init.db_path` and replay its
+/// checkpoint sample. Every refusal happens before any store write.
+fn resume_supervisor(
+    kernel: &mut GpuKernel,
+    init: &SupervisorWorkerInit,
+    (agent_count, init_food_count): (u32, usize),
+) -> Result<(SupervisorRun, u64, SampleReport), String> {
+    let path = init
+        .db_path
+        .as_deref()
+        .ok_or_else(|| "checkpoint resume needs a database path".to_string())?;
+    let point = load_resume_point(path).map_err(|e| e.to_string())?;
+    let stored = serde_json::to_string(&point.config).map_err(|e| e.to_string())?;
+    let requested = serde_json::to_string(&init.config).map_err(|e| e.to_string())?;
+    if stored != requested {
+        return Err(CheckpointError::ConfigMismatch.to_string());
+    }
+    let food_count = xagent_sandbox::world::WorldState::new(point.config.world.clone())
+        .food_items
+        .len();
+    if usize::try_from(agent_count).ok() != Some(point.config.governor.population_size)
+        || init_food_count != food_count
+    {
+        return Err("checkpoint kernel counts differ from worker init".to_string());
+    }
+    let store = SupervisorStore::reopen_for_resume(path, point.run_id, point.tick)
+        .map_err(|e| format!("supervisor store: {e:?}"))?;
+    let mut run = SupervisorRun::resume(
+        kernel,
+        &init.config,
+        Some(store),
+        point.state,
+        &point.kernel,
+    )
+    .map_err(|e| format!("supervisor resume: {e}"))?;
+    let report = run
+        .on_sample(kernel, point.tick, &point.physics, None)
+        .map_err(|e| format!("supervisor resume: {e}"))?;
+    Ok((run, point.tick, report))
 }
 
 /// Birth brains of every slot of `run`, indexed by slot.
@@ -535,20 +586,32 @@ impl Worker {
         let mut supervisor = None;
         let mut supervisor_events = Vec::new();
         let birth_states;
+        let mut initial_tick = 0;
         if let Some(sup_init) = init.supervisor.as_ref() {
             tick_budget = 0;
-            match start_supervisor(&mut kernel, sup_init) {
-                Ok(run) => match supervisor_birth_states(&run, kernel.agent_count()) {
-                    Ok(states) => {
-                        birth_states = states;
-                        supervisor = Some(run);
+            match start_supervisor(&mut kernel, sup_init, (init.agent_count, init.food_count)) {
+                Ok((run, start_tick, replay)) => {
+                    match supervisor_birth_states(&run, kernel.agent_count()) {
+                        Ok(states) => {
+                            birth_states = states;
+                            supervisor = Some(run);
+                            initial_tick = start_tick;
+                            if let Some(report) = replay {
+                                if report.boundary.is_some()
+                                    || report.season.is_some()
+                                    || report.finished
+                                {
+                                    supervisor_events.push(SimEvent::SupervisorSample(report));
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            birth_states = Vec::new();
+                            paused = true;
+                            supervisor_events.push(SimEvent::Error(message));
+                        }
                     }
-                    Err(message) => {
-                        birth_states = Vec::new();
-                        paused = true;
-                        supervisor_events.push(SimEvent::Error(message));
-                    }
-                },
+                }
                 Err(message) => {
                     birth_states = Vec::new();
                     paused = true;
@@ -587,7 +650,7 @@ impl Worker {
             paused,
             speed_multiplier: init.speed_multiplier,
             selected_agent: init.selected_agent,
-            tick: 0,
+            tick: initial_tick,
             gen_tick: 0,
             generation_epoch: init.generation_epoch,
             tick_budget,
@@ -888,7 +951,19 @@ impl Worker {
             self.supervisor = Some(run);
             return;
         }
-        let physics = self.kernel.read_full_state_blocking().to_vec();
+        let physics = if run.checkpoint_due(self.tick) {
+            let checkpoint = self.kernel.read_checkpoint_blocking();
+            if let Err(error) = run.write_checkpoint(self.tick, &checkpoint) {
+                self.supervisor_events.push(SimEvent::Error(format!(
+                    "supervisor sample failed: {error}"
+                )));
+                self.paused = true;
+                return;
+            }
+            checkpoint.physics().to_vec()
+        } else {
+            self.kernel.read_full_state_blocking().to_vec()
+        };
         let food = self.kernel.cached_food_state().map(<[f32]>::to_vec);
         if let Some((at, tick0)) = self.supervisor_sample_clock {
             let elapsed = at.elapsed().as_secs_f64();
@@ -1866,6 +1941,7 @@ mod tests {
         init.supervisor = Some(SupervisorWorkerInit {
             config: config.clone(),
             db_path,
+            resume: false,
         });
         init
     }
@@ -1925,6 +2001,152 @@ mod tests {
             events.append(&mut worker.supervisor_events);
         }
         events
+    }
+
+    #[test]
+    fn worker_resume_matches_uninterrupted() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        const TARGET: u64 = 4_000;
+        let mut config = supervisor_test_config();
+        // Food kinds on so the resumed run also exercises the season state.
+        config.world.food_kinds_enabled = true;
+        let dt = supervisor_dt(10.0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_a = dir.path().join("a.db").to_string_lossy().into_owned();
+        let path_b = dir.path().join("b.db").to_string_lossy().into_owned();
+
+        let reports_a = {
+            let mut worker = Worker::new(supervisor_init(&config, Some(path_a.clone())));
+            let reports = supervisor_run_to(&mut worker, dt, TARGET);
+            assert_eq!(worker.tick, TARGET);
+            reports
+        };
+        std::fs::copy(&path_a, &path_b).expect("copy database");
+        let point = xagent_sandbox::supervisor_run::load_resume_point(&path_b).expect("checkpoint");
+        let resume_tick = point.tick;
+        assert!(resume_tick > 0);
+
+        let mut init = supervisor_init(&config, Some(path_b));
+        if let Some(sup) = init.supervisor.as_mut() {
+            sup.resume = true;
+        }
+        let mut worker = Worker::new(init);
+        assert_eq!(worker.tick, resume_tick);
+        let mut reports_b: Vec<SampleReport> = worker
+            .supervisor_events
+            .drain(..)
+            .filter_map(|event| match event {
+                SimEvent::SupervisorSample(report) => Some(report),
+                _ => None,
+            })
+            .collect();
+        reports_b.extend(supervisor_run_to(&mut worker, dt, TARGET));
+        assert!(!reports_b.is_empty(), "resumed worker reported nothing");
+        let after = |reports: &[SampleReport]| -> Vec<SampleReport> {
+            reports
+                .iter()
+                .filter(|r| r.tick > resume_tick)
+                .cloned()
+                .collect()
+        };
+        assert_eq!(after(&reports_a), after(&reports_b));
+    }
+
+    #[test]
+    fn worker_resume_invalid_checkpoint_errors_and_pauses() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let mut config = supervisor_test_config();
+        config.world.food_kinds_enabled = true;
+        let dt = supervisor_dt(10.0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("c.db").to_string_lossy().into_owned();
+        {
+            let mut worker = Worker::new(supervisor_init(&config, Some(path.clone())));
+            supervisor_run_to(&mut worker, dt, 1_500);
+        }
+        let corrupted = {
+            let db = rusqlite::Connection::open(&path).expect("open");
+            let mut payload: Vec<u8> = db
+                .query_row("SELECT payload FROM supervisor_checkpoint", [], |row| {
+                    row.get(0)
+                })
+                .expect("payload");
+            let middle = payload.len() / 2;
+            payload[middle] ^= 0xFF;
+            db.execute("UPDATE supervisor_checkpoint SET payload = ?1", [&payload])
+                .expect("corrupt");
+            payload
+        };
+
+        let mut init = supervisor_init(&config, Some(path.clone()));
+        if let Some(sup) = init.supervisor.as_mut() {
+            sup.resume = true;
+        }
+        let worker = Worker::new(init);
+        let errors: Vec<&String> = worker
+            .supervisor_events
+            .iter()
+            .filter_map(|event| match event {
+                SimEvent::Error(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("checkpoint"), "{}", errors[0]);
+        assert_eq!(worker.supervisor_events.len(), 1);
+        assert!(worker.paused);
+        assert!(worker.supervisor.is_none());
+        assert_eq!(worker.counters.dispatch_calls, 0);
+        assert_eq!(worker.tick, 0);
+        let db = rusqlite::Connection::open(&path).expect("open");
+        let stored: Vec<u8> = db
+            .query_row("SELECT payload FROM supervisor_checkpoint", [], |row| {
+                row.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored, corrupted);
+
+        let mut init = supervisor_init(&config, None);
+        if let Some(sup) = init.supervisor.as_mut() {
+            sup.resume = true;
+        }
+        let worker = Worker::new(init);
+        assert_eq!(worker.supervisor_events.len(), 1);
+        assert!(matches!(worker.supervisor_events[0], SimEvent::Error(_)));
+        assert!(worker.paused);
+    }
+
+    #[test]
+    fn worker_checkpoint_adds_no_submit() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        const TARGET: u64 = 3_000;
+        let config = supervisor_test_config();
+        let dt = supervisor_dt(10.0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("d.db").to_string_lossy().into_owned();
+        let measure = |db_path: Option<String>| {
+            let mut worker = Worker::new(supervisor_init(&config, db_path));
+            let events = supervisor_collect_events(&mut worker, dt, TARGET, false);
+            let samples = events
+                .iter()
+                .filter(|event| matches!(event, SimEvent::SupervisorSample(_)))
+                .count();
+            (
+                worker.counters.dispatch_calls,
+                worker.counters.sim_ticks,
+                worker.kernel.queue_submit_count(),
+                samples,
+            )
+        };
+        let with_db = measure(Some(path));
+        let without_db = measure(None);
+        assert_eq!(with_db, without_db);
     }
 
     #[test]

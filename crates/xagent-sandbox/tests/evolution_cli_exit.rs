@@ -20,7 +20,7 @@ fn evolution_cli_exit_resume_supervisor() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Error:"), "{stderr}");
-    assert!(stderr.contains("supervisor"), "{stderr}");
+    assert!(stderr.contains("checkpoint"), "{stderr}");
     assert!(!db.exists());
 }
 

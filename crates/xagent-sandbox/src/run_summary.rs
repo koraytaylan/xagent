@@ -110,23 +110,99 @@ impl fmt::Display for RunSummaryError {
 
 impl std::error::Error for RunSummaryError {}
 
+/// Serde helpers storing `f64` by bit pattern.
+mod f64_bits {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    // serde's `with` calls `serialize` with a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        v.to_bits().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(f64::from_bits(u64::deserialize(d)?))
+    }
+}
+
+/// [`KindWindowTotals`] with every `f64` held by bit pattern.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindTotalsBits {
+    late_toward_nourishing_sum: u64,
+    late_toward_nourishing_samples: u64,
+    late_away_harmful_sum: u64,
+    late_away_harmful_samples: u64,
+    late_nourishing_meals: u64,
+    late_harmful_meals: u64,
+    early_nourishing_meals: u64,
+    early_harmful_meals: u64,
+}
+
+impl From<&KindWindowTotals> for KindTotalsBits {
+    fn from(t: &KindWindowTotals) -> Self {
+        Self {
+            late_toward_nourishing_sum: t.late_toward_nourishing_sum.to_bits(),
+            late_toward_nourishing_samples: t.late_toward_nourishing_samples,
+            late_away_harmful_sum: t.late_away_harmful_sum.to_bits(),
+            late_away_harmful_samples: t.late_away_harmful_samples,
+            late_nourishing_meals: t.late_nourishing_meals,
+            late_harmful_meals: t.late_harmful_meals,
+            early_nourishing_meals: t.early_nourishing_meals,
+            early_harmful_meals: t.early_harmful_meals,
+        }
+    }
+}
+
+impl From<&KindTotalsBits> for KindWindowTotals {
+    fn from(b: &KindTotalsBits) -> Self {
+        Self {
+            late_toward_nourishing_sum: f64::from_bits(b.late_toward_nourishing_sum),
+            late_toward_nourishing_samples: b.late_toward_nourishing_samples,
+            late_away_harmful_sum: f64::from_bits(b.late_away_harmful_sum),
+            late_away_harmful_samples: b.late_away_harmful_samples,
+            late_nourishing_meals: b.late_nourishing_meals,
+            late_harmful_meals: b.late_harmful_meals,
+            early_nourishing_meals: b.early_nourishing_meals,
+            early_harmful_meals: b.early_harmful_meals,
+        }
+    }
+}
+
+/// Serde helpers storing [`KindWindowTotals`] with bit-exact floats.
+mod kind_totals_bits {
+    use super::{KindTotalsBits, KindWindowTotals};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &KindWindowTotals, s: S) -> Result<S::Ok, S::Error> {
+        KindTotalsBits::from(v).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<KindWindowTotals, D::Error> {
+        Ok(KindWindowTotals::from(&KindTotalsBits::deserialize(d)?))
+    }
+}
+
 /// Sample-interval record buffered inside an open season.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct Interval {
     nourishing_meals: u64,
     harmful_meals: u64,
+    #[serde(with = "f64_bits")]
     toward_sum: f64,
     toward_samples: u64,
+    #[serde(with = "f64_bits")]
     away_sum: f64,
     away_samples: u64,
 }
 
 /// Season whose intervals are still being collected.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct OpenSeason {
     intervals: Vec<Interval>,
 }
 
 /// Collects a [`RunSummary`] from physics samples.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunSummaryAccumulator {
     mode: EvolutionMode,
     inheritance: Option<Inheritance>,
@@ -141,6 +217,7 @@ pub struct RunSummaryAccumulator {
     deaths: u64,
     seasons: u64,
     open: Option<OpenSeason>,
+    #[serde(with = "kind_totals_bits")]
     totals: KindWindowTotals,
 }
 

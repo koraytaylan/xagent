@@ -9,8 +9,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/supervisor_checkpoint.rs
   - crates/xagent-sandbox/src/lib.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "bc4c5a29452dd4882c8aee193efd67ce714d3b9e"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --lib supervisor_checkpoint

@@ -18,6 +18,7 @@ pub mod renderer;
 pub mod replay;
 pub mod run_summary;
 pub mod supervisor;
+pub mod supervisor_checkpoint;
 pub mod supervisor_run;
 pub mod supervisor_store;
 pub mod supervisor_telemetry;

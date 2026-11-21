@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use xagent_brain::GpuKernel;
 use xagent_sandbox::headless::{run_headless_with_options, HeadlessError, HeadlessOptions};
 use xagent_sandbox::run_summary::RunSummary;
+use xagent_sandbox::supervisor_checkpoint::CheckpointError;
 use xagent_shared::{EvolutionMode, FullConfig, Inheritance, SupervisorConfig};
 
 /// Agents in every run.
@@ -167,6 +168,7 @@ fn supervisor_headless_writes_run_summary() {
     let summary_path = dir.path().join("summary.json");
     let options = HeadlessOptions {
         run_summary: Some(summary_path.clone()),
+        ..HeadlessOptions::default()
     };
     run_headless_with_options(
         supervisor_config(),
@@ -181,7 +183,7 @@ fn supervisor_headless_writes_run_summary() {
 }
 
 #[test]
-fn supervisor_headless_refuses_resume() {
+fn supervisor_headless_resume_without_checkpoint_is_missing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("resume.db");
     let result = run_headless_with_options(
@@ -190,8 +192,36 @@ fn supervisor_headless_refuses_resume() {
         true,
         &HeadlessOptions::default(),
     );
-    assert!(matches!(result, Err(HeadlessError::ResumeInSupervisorMode)));
+    assert!(matches!(
+        result,
+        Err(HeadlessError::Checkpoint(CheckpointError::Missing))
+    ));
     assert!(!db_path.exists(), "no database was touched");
+}
+
+#[test]
+fn supervisor_headless_stop_and_resume_finishes() {
+    if !gpu_or_skip() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("stop.db");
+    let path = db_path.to_str().expect("utf8 path");
+    let summary_path = dir.path().join("summary.json");
+    let stop = HeadlessOptions {
+        run_summary: Some(summary_path.clone()),
+        stop_after_checkpoint_at_or_after: Some(BOUNDARY_TICKS),
+    };
+    run_headless_with_options(supervisor_config(), path, false, &stop).expect("stopped run");
+    assert!(!summary_path.exists(), "a stopped run writes no summary");
+    let options = HeadlessOptions {
+        run_summary: Some(summary_path.clone()),
+        ..HeadlessOptions::default()
+    };
+    run_headless_with_options(supervisor_config(), path, true, &options).expect("resumed run");
+    let text = std::fs::read_to_string(&summary_path).expect("summary written");
+    let summary: RunSummary = serde_json::from_str(&text).expect("summary parses");
+    assert_eq!(summary.mode, EvolutionMode::Supervisor);
 }
 
 #[test]

@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, SUPERVISOR_SAMPLE_TICKS};
 
 use crate::run_summary::{RunSummaryAccumulator, RunSummaryError};
-use crate::supervisor_run::{SampleReport, SupervisorFinish, SupervisorRun, SupervisorRunError};
+use crate::supervisor_checkpoint::CheckpointError;
+use crate::supervisor_run::{
+    load_resume_point, ResumePoint, SampleReport, SupervisorFinish, SupervisorRun,
+    SupervisorRunError,
+};
 use crate::supervisor_store::{
     load_archive_entry_read_only, ArchiveLoadError, StoreError, SupervisorStore,
 };
@@ -86,13 +90,15 @@ fn write_steering_population(
 pub struct HeadlessOptions {
     /// Where to write the run summary as JSON; `None` skips measurement.
     pub run_summary: Option<PathBuf>,
+    /// Stop right after the first checkpoint at or after this tick.
+    pub stop_after_checkpoint_at_or_after: Option<u64>,
 }
 
 /// Why a headless run failed.
 #[derive(Debug)]
 pub enum HeadlessError {
-    /// Supervisor runs cannot resume.
-    ResumeInSupervisorMode,
+    /// The stored checkpoint is missing or refused.
+    Checkpoint(CheckpointError),
     /// The supervisor store failed.
     Store(StoreError),
     /// The supervisor run failed.
@@ -107,7 +113,7 @@ pub enum HeadlessError {
 impl fmt::Display for HeadlessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ResumeInSupervisorMode => write!(f, "supervisor runs cannot be resumed"),
+            Self::Checkpoint(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::SupervisorRun(e) => write!(f, "{e}"),
             Self::Summary(e) => write!(f, "run summary could not be written: {e}"),
@@ -120,6 +126,12 @@ impl fmt::Display for HeadlessError {
 }
 
 impl std::error::Error for HeadlessError {}
+
+impl From<CheckpointError> for HeadlessError {
+    fn from(err: CheckpointError) -> Self {
+        Self::Checkpoint(err)
+    }
+}
 
 impl From<StoreError> for HeadlessError {
     fn from(err: StoreError) -> Self {
@@ -188,7 +200,7 @@ pub fn run_headless_with_options(
         }
         EvolutionMode::Supervisor => {
             if resume {
-                return Err(HeadlessError::ResumeInSupervisorMode);
+                return resume_supervisor(db_path, &config, options);
             }
             run_supervisor(config, db_path, options)
         }
@@ -240,21 +252,106 @@ pub fn run_supervisor_with_recording(
     run.set_recording(record);
     println!("Supervisor run | Population: {population}");
     let mut next_progress = 1_u64;
+    drive_supervisor(run, &mut kernel, options, batch, &mut next_progress)
+}
+
+/// Run the loop to completion (or the stop option) and write the summary.
+fn drive_supervisor(
+    mut run: SupervisorRun,
+    kernel: &mut GpuKernel,
+    options: &HeadlessOptions,
+    batch: u32,
+    next_progress: &mut u64,
+) -> Result<(), HeadlessError> {
     while !run.is_finished() {
-        let report = supervisor_step(&mut run, &mut kernel, batch)?;
-        print_supervisor_progress(&report, run.total_ticks(), &mut next_progress);
+        let Some(report) = supervisor_step(&mut run, kernel, batch, options)? else {
+            return Ok(());
+        };
+        print_supervisor_progress(&report, run.total_ticks(), next_progress);
     }
     let finish = run.finish()?;
     write_run_summary(finish, options)
 }
 
-/// Dispatch one sample period, read it back and hand it to the run.
+/// Resume the checkpointed supervisor run and continue it.
+fn resume_supervisor(
+    db_path: &str,
+    supplied: &FullConfig,
+    options: &HeadlessOptions,
+) -> Result<(), HeadlessError> {
+    if !std::path::Path::new(db_path).exists() {
+        return Err(CheckpointError::Missing.into());
+    }
+    let point = load_resume_point(db_path)?;
+    let ResumePoint {
+        run_id,
+        tick,
+        config: stored,
+        state,
+        kernel: checkpoint,
+        physics,
+        food,
+    } = point;
+    if serde_json::to_string(supplied)? != serde_json::to_string(&stored)? {
+        eprintln!(
+            "The supplied config differs from the checkpoint; the checkpoint config is used."
+        );
+    }
+    let population = u32::try_from(stored.governor.population_size).map_err(|_| {
+        SupervisorRunError::SlotRange {
+            slot: stored.governor.population_size - 1,
+        }
+    })?;
+    let food_count = WorldState::new(stored.world.clone()).food_items.len();
+    let mut kernel = GpuKernel::new(population, food_count, &stored.brain, &stored.world);
+    let store = SupervisorStore::reopen_for_resume(db_path, run_id, tick)?;
+    let mut run = SupervisorRun::resume(&mut kernel, &stored, Some(store), state, &checkpoint)?;
+    println!("Supervisor resume | Population: {population} | tick {tick}");
+    let mut next_progress = 1_u64;
+    let report = run.on_sample(&mut kernel, tick, &physics, food.as_deref())?;
+    print_supervisor_progress(&report, run.total_ticks(), &mut next_progress);
+    drive_supervisor(
+        run,
+        &mut kernel,
+        options,
+        SAMPLE_BATCH_TICKS,
+        &mut next_progress,
+    )
+}
+
+/// Dispatch one sample period, read it back and hand it to the run. Returns
+/// `None` when the stop option ended the run right after a checkpoint.
 fn supervisor_step(
     run: &mut SupervisorRun,
     kernel: &mut GpuKernel,
     batch: u32,
-) -> Result<SampleReport, HeadlessError> {
+    options: &HeadlessOptions,
+) -> Result<Option<SampleReport>, HeadlessError> {
     let started = Instant::now();
+    let sample_tick = run.next_sample_tick();
+    if run.checkpoint_due(sample_tick) {
+        kernel.dispatch_ticks(run.tick(), batch);
+        let checkpoint = kernel.read_checkpoint_blocking();
+        run.write_checkpoint(sample_tick, &checkpoint)?;
+        if options
+            .stop_after_checkpoint_at_or_after
+            .is_some_and(|v| sample_tick >= v)
+        {
+            return Ok(None);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            run.note_ticks_per_second(f64::from(batch) / elapsed);
+        }
+        let physics = checkpoint.physics().to_vec();
+        let food = checkpoint.food().map(<[f32]>::to_vec);
+        return Ok(Some(run.on_sample(
+            kernel,
+            sample_tick,
+            &physics,
+            food.as_deref(),
+        )?));
+    }
     kernel.dispatch_batch(run.tick(), batch);
     while !kernel.try_collect_state_snapshot() {
         std::thread::yield_now();
@@ -265,7 +362,12 @@ fn supervisor_step(
     }
     let physics = kernel.cached_state().to_vec();
     let food = kernel.cached_food_state().map(<[f32]>::to_vec);
-    Ok(run.on_sample(kernel, run.next_sample_tick(), &physics, food.as_deref())?)
+    Ok(Some(run.on_sample(
+        kernel,
+        sample_tick,
+        &physics,
+        food.as_deref(),
+    )?))
 }
 
 /// Number of progress steps across a bounded budget.

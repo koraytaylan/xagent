@@ -83,7 +83,7 @@
 //! rename or move markers without updating both the helper and the tests.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use wgpu;
@@ -242,6 +242,9 @@ mod whitening_storage_validation;
 mod whitening_validation;
 #[cfg(test)]
 mod workgroup_initialization_validation;
+
+mod checkpoint;
+pub use checkpoint::{KernelCheckpoint, KernelCpuState, KernelRestoreError, KernelSection};
 
 /// Replacement for the subgroup-accelerated bitonic sort. Loaded from a
 /// dedicated WGSL file so the fragment stays validator-friendly.
@@ -1093,6 +1096,8 @@ pub struct GpuKernel {
     /// Number of `queue.submit` calls made by `dispatch_ticks` — lets a reader
     /// confirm full batches actually fuse (submits ≪ batches at high speed).
     probe_submits: u64,
+    /// Every `queue.submit` this kernel has made, counted by `submit_counted`.
+    queue_submits: AtomicU64,
     /// Drops last so the process-wide Vulkan gate stays held while the wgpu
     /// resources above are destroyed. See `vulkan_gate`.
     vulkan_lock_tail: vulkan_gate::LockTail,
@@ -1761,7 +1766,9 @@ impl GpuKernel {
         let brain_config_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kernel_brain_config"),
             size: (CONFIG_SIZE * 4) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let dispatch_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2572,6 +2579,7 @@ impl GpuKernel {
             probe_complete_nanos: 0,
             probe_batches: 0,
             probe_submits: 0,
+            queue_submits: AtomicU64::new(0),
             vulkan_lock_tail: vulkan_gate::LockTail,
         };
         if std::env::var("XAGENT_BRAIN_PACKED_ENCODER").as_deref() == Ok("1") {
@@ -2825,7 +2833,7 @@ impl GpuKernel {
                     pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 12);
                 }
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             cycle = chunk_end;
         }
 
@@ -2853,7 +2861,7 @@ impl GpuKernel {
             0,
             buf_size,
         );
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
         self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
 
         self.active_config_index = 1 - self.active_config_index;
@@ -3053,6 +3061,18 @@ impl GpuKernel {
             && self.probe.kernel_pass_limit == COMPLETE_BRAIN_PASSES
     }
 
+    /// Submit one command buffer and count it. Every production submit goes
+    /// through here.
+    fn submit_counted(&self, commands: wgpu::CommandBuffer) {
+        self.queue_submits.fetch_add(1, Ordering::Relaxed);
+        self.queue.submit(std::iter::once(commands));
+    }
+
+    /// Total `queue.submit` calls this kernel has made.
+    pub fn queue_submit_count(&self) -> u64 {
+        self.queue_submits.load(Ordering::Relaxed)
+    }
+
     /// Scalar brain writes make the private vector copy stale; public storage
     /// stays authoritative and is copied only before packed execution resumes.
     fn invalidate_packed_encoder(&self) {
@@ -3216,7 +3236,7 @@ impl GpuKernel {
                     }
                 }
 
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.submit_counted(encoder.finish());
                 self.probe_submits += 1;
                 batch = chunk_end;
             }
@@ -3256,7 +3276,7 @@ impl GpuKernel {
                     pass.dispatch_workgroups(self.vision_workgroups, 1, 1);
                 }
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
             self.probe_batches += 1;
             tick_cursor += rem_ticks as u64;
@@ -3280,7 +3300,7 @@ impl GpuKernel {
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
         }
 
@@ -3382,7 +3402,7 @@ impl GpuKernel {
                     }
                 }
 
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.submit_counted(encoder.finish());
                 self.probe_submits += 1;
                 batch = chunk_end;
             }
@@ -3433,7 +3453,7 @@ impl GpuKernel {
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
             self.probe_batches += 1;
             tick_cursor += rem_ticks as u64;
@@ -3456,7 +3476,7 @@ impl GpuKernel {
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
         }
 
@@ -3607,7 +3627,7 @@ impl GpuKernel {
                     }
                 }
 
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.submit_counted(encoder.finish());
                 self.probe_submits += 1;
                 batch = chunk_end;
             }
@@ -3649,7 +3669,7 @@ impl GpuKernel {
                 pass.set_bind_group(0, &self.bind_groups[self.active_config_index], &[]);
                 pass.dispatch_workgroups_indirect(&self.dispatch_args_buffer, 0);
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
             self.probe_batches += 1;
             tick_cursor += rem_ticks as u64;
@@ -3672,7 +3692,7 @@ impl GpuKernel {
                 pass.set_push_constants(0, bytemuck::cast_slice(&pc));
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_counted(encoder.finish());
             self.probe_submits += 1;
         }
 
@@ -3777,7 +3797,7 @@ impl GpuKernel {
             0,
             trail_size,
         );
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         self.staging_trackers[slot_index].reset();
         self.staging_trackers[slot_index].install(self.state_staging[slot_index].slice(..buf_size));
@@ -3896,7 +3916,7 @@ impl GpuKernel {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&self.agent_phys_buffer, 0, &staging, 0, buf_size);
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -4187,7 +4207,7 @@ impl GpuKernel {
             pat_size,
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         // Aggregate completion/error for both staging buffers in a single tracker.
         let tracker = ReadbackTracker::new(2);
@@ -4372,7 +4392,7 @@ impl GpuKernel {
                 label: Some("kernel_read_copy"),
             });
         encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -4582,7 +4602,7 @@ impl GpuKernel {
             phys_size,
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         // Aggregate completion/error for all 4 staging buffers in a single tracker.
         let tracker = ReadbackTracker::new(4);
@@ -4749,7 +4769,7 @@ impl GpuKernel {
         cpass.set_bind_group(0, bg, &[]);
         cpass.dispatch_workgroups(n, 1, 1);
         drop(cpass);
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
     }
 
     /// Test-only: blocking readback of the brain_scratch buffer (all agents).
@@ -4766,7 +4786,7 @@ impl GpuKernel {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&self.brain_scratch_buffer, 0, &staging, 0, buf_size);
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.submit_counted(encoder.finish());
 
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});

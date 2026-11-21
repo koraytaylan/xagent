@@ -801,6 +801,7 @@ fn main() {
     if cli.no_render {
         let options = headless::HeadlessOptions {
             run_summary: cli.run_summary.clone(),
+            ..headless::HeadlessOptions::default()
         };
         if let Err(e) = headless::run_headless_with_options(config, &cli.db, cli.resume, &options) {
             eprintln!("Error: {}", e);
@@ -849,9 +850,6 @@ fn apply_evolution_cli(cli: &Cli, config: &mut FullConfig) -> Result<(), String>
         };
     }
     let supervisor = config.governor.evolution_mode == EvolutionMode::Supervisor;
-    if supervisor && cli.resume {
-        return Err("--resume is not supported in supervisor mode".to_string());
-    }
     if !supervisor && cli.supervisor_inheritance.is_some() {
         return Err("--supervisor-inheritance requires supervisor evolution mode".to_string());
     }
@@ -1076,9 +1074,9 @@ mod tests {
     }
 
     #[test]
-    fn evolution_cli_resume_with_supervisor_is_error() {
+    fn evolution_cli_resume_with_supervisor_resolves() {
         let (cli, mut config) = evo(&["--evolution-mode", "supervisor", "--resume"]);
-        assert!(apply_evolution_cli(&cli, &mut config).is_err());
+        assert!(apply_evolution_cli(&cli, &mut config).is_ok());
     }
 
     #[test]

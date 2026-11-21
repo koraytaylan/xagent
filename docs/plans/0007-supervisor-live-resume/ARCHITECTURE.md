@@ -24,7 +24,8 @@ by the same code from the same inputs.
   `GpuKernel::read_checkpoint_blocking() -> KernelCheckpoint`, which records
   every captured buffer's copy into one staging buffer in **one command
   encoder and one `queue.submit`**, and returns the physics rows and food rows
-  as well. Headless calls `dispatch_ticks` (not `dispatch_batch`) on that batch.
+  as well; a terminal map failure is logged and panics, as in
+  `read_full_state_blocking` (approved exception, AUTHORIZATION.md). Headless calls `dispatch_ticks` (not `dispatch_batch`) on that batch.
   No compute pass is added.
 - **Kernel state (`crates/xagent-brain/src/gpu_kernel/checkpoint.rs`).**
   `KernelCheckpoint { sections: Vec<KernelSection>, cpu: KernelCpuState }`,

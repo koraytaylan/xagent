@@ -9,6 +9,7 @@
 //! connection that never writes to the database.
 
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Result as SqlResult};
@@ -20,6 +21,7 @@ use crate::supervisor::{
     Archive, ArchiveChange, ArchiveEntry, BoundaryDetail, EligibilityGround, ParentRef,
     ReplaceReason, ReplacementOutcome, ReplacementPlan, SlotLedger,
 };
+use crate::supervisor_checkpoint::{FORMAT_VERSION, MAX_CHECKPOINT_BYTES};
 use crate::supervisor_telemetry::{BoundaryRecord, TelemetryFrame};
 use serde_json::json;
 
@@ -70,6 +72,22 @@ pub enum StoreError {
     Range,
     /// A configuration could not be serialised.
     Json(serde_json::Error),
+    /// A stored checkpoint payload is larger than the allowed maximum.
+    CheckpointTooLarge {
+        /// Stored payload length in bytes.
+        len: i64,
+        /// Largest payload length accepted.
+        max: usize,
+    },
+    /// The stored checkpoint of a run is not at the requested tick.
+    CheckpointTickMismatch {
+        /// Run the resume targets.
+        run_id: i64,
+        /// Tick of the stored checkpoint, or `None` when there is none.
+        stored: Option<i64>,
+        /// Tick the resume asked for.
+        requested: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -81,6 +99,26 @@ impl fmt::Display for StoreError {
             Self::Mismatch => write!(f, "archive entries of one write disagree"),
             Self::Range => write!(f, "value exceeds the database integer range"),
             Self::Json(err) => write!(f, "configuration could not be serialised: {err}"),
+            Self::CheckpointTooLarge { len, max } => {
+                write!(
+                    f,
+                    "stored checkpoint of {len} bytes exceeds the {max} byte limit"
+                )
+            }
+            Self::CheckpointTickMismatch {
+                run_id,
+                stored,
+                requested,
+            } => match stored {
+                Some(stored) => write!(
+                    f,
+                    "run {run_id} has a checkpoint at tick {stored}, not tick {requested}"
+                ),
+                None => write!(
+                    f,
+                    "run {run_id} has no checkpoint to resume at tick {requested}"
+                ),
+            },
         }
     }
 }
@@ -276,7 +314,9 @@ pub fn ensure_schema(db: &Connection) -> SqlResult<()> {
             next_flip_tick INTEGER,
             ticks_per_second REAL,
             PRIMARY KEY (run_id, tick)
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_checkpoint (run_id INTEGER PRIMARY KEY REFERENCES run(id), tick INTEGER NOT NULL, format_version INTEGER NOT NULL, simulation_ticks INTEGER, payload BLOB NOT NULL);",
     )
 }
 
@@ -833,6 +873,187 @@ impl SupervisorStore {
         tx.commit()?;
         Ok(())
     }
+
+    /// Replaces the run's single checkpoint row with `payload` taken at `tick`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Range`] when `tick` exceeds the database range,
+    /// and [`StoreError::Sqlite`] when the run row is missing or a statement fails.
+    pub fn write_checkpoint(&mut self, tick: u64, payload: &[u8]) -> Result<(), StoreError> {
+        let tick = db_int(tick)?;
+        let tx = self.db.transaction()?;
+        let changed = tx.execute(
+            "INSERT OR REPLACE INTO supervisor_checkpoint
+                (run_id, tick, format_version, simulation_ticks, payload)
+             SELECT id, ?1, ?2, simulation_ticks, ?3 FROM run WHERE id = ?4",
+            params![tick, i64::from(FORMAT_VERSION), payload, self.run_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The governor, brain and world configuration JSON of the run row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the run row cannot be read.
+    pub fn run_configs(&self) -> Result<(String, String, String), StoreError> {
+        Ok(self.db.query_row(
+            "SELECT governor_config, brain_config, world_config FROM run WHERE id = ?1",
+            params![self.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
+    }
+
+    /// Reopens the database for a resume at `tick` of run `run_id`, deleting
+    /// the run's rows at or after `tick` in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::CheckpointTickMismatch`] when the run is not a
+    /// supervisor run or its checkpoint is not at `tick`, and other
+    /// [`StoreError`]s when a statement fails.
+    pub fn reopen_for_resume(db_path: &str, run_id: i64, tick: u64) -> Result<Self, StoreError> {
+        let requested = db_int(tick)?;
+        let mut db = Connection::open(db_path)?;
+        db.execute_batch(STORE_PRAGMAS)?;
+        let stored: Option<i64> = db
+            .query_row(
+                "SELECT c.tick FROM supervisor_checkpoint c JOIN run r ON r.id = c.run_id
+                 WHERE c.run_id = ?1 AND r.mode = ?2",
+                params![run_id, MODE_SUPERVISOR],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored != Some(requested) {
+            return Err(StoreError::CheckpointTickMismatch {
+                run_id,
+                stored,
+                requested: tick,
+            });
+        }
+        let tx = db.transaction()?;
+        let names: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT m.name FROM sqlite_master m WHERE m.type = 'table'
+                 AND m.name NOT LIKE 'sqlite_%'
+                 AND m.name NOT IN ('supervisor_checkpoint', 'supervisor_archive')
+                 AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = 'run_id')
+                 AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = 'tick')",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<SqlResult<Vec<String>>>()?
+        };
+        for name in names {
+            let quoted = name.replace('"', "\"\"");
+            tx.execute(
+                &format!("DELETE FROM \"{quoted}\" WHERE run_id = ?1 AND tick >= ?2"),
+                params![run_id, requested],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM supervisor_archive WHERE run_id = ?1 AND retired_tick >= ?2",
+            params![run_id, requested],
+        )?;
+        tx.execute(
+            "UPDATE run SET simulation_ticks =
+                (SELECT simulation_ticks FROM supervisor_checkpoint WHERE run_id = ?1)
+             WHERE id = ?1
+               AND (SELECT simulation_ticks FROM supervisor_checkpoint WHERE run_id = ?1)
+                   IS NOT NULL",
+            params![run_id],
+        )?;
+        tx.commit()?;
+        Ok(Self { db, run_id })
+    }
+}
+
+/// A checkpoint row read back from a supervisor database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCheckpoint {
+    /// Run the checkpoint belongs to.
+    pub run_id: i64,
+    /// Tick the checkpoint was taken at.
+    pub tick: u64,
+    /// Envelope format version the payload was written with.
+    pub format_version: u32,
+    /// Opaque checkpoint bytes.
+    pub payload: Vec<u8>,
+}
+
+/// An integer column that does not fit its unsigned type.
+fn out_of_range(index: usize, value: i64) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+/// Loads the checkpoint of the newest supervisor run without writing to or
+/// creating the database; a missing file, run or checkpoint gives `None`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::CheckpointTooLarge`] when the payload exceeds
+/// [`MAX_CHECKPOINT_BYTES`], and other [`StoreError`]s when a read fails.
+pub fn read_checkpoint(db_path: &str) -> Result<Option<StoredCheckpoint>, StoreError> {
+    if !Path::new(db_path).exists() {
+        return Ok(None);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let db = Connection::open_with_flags(db_path, flags)?;
+    db.busy_timeout(STORE_BUSY_TIMEOUT)?;
+    let tables: i64 = db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+         AND name IN ('run', 'supervisor_checkpoint')",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables < 2 {
+        return Ok(None);
+    }
+    let run_id: Option<i64> = db
+        .query_row(
+            "SELECT id FROM run WHERE mode = ?1 ORDER BY id DESC LIMIT 1",
+            params![MODE_SUPERVISOR],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let meta: Option<(i64, i64, i64)> = db
+        .query_row(
+            "SELECT tick, format_version, length(payload) FROM supervisor_checkpoint
+             WHERE run_id = ?1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((tick, format_version, len)) = meta else {
+        return Ok(None);
+    };
+    if usize::try_from(len).map_or(true, |len| len > MAX_CHECKPOINT_BYTES) {
+        return Err(StoreError::CheckpointTooLarge {
+            len,
+            max: MAX_CHECKPOINT_BYTES,
+        });
+    }
+    let tick = u64::try_from(tick).map_err(|_| out_of_range(0, tick))?;
+    let format_version =
+        u32::try_from(format_version).map_err(|_| out_of_range(1, format_version))?;
+    let payload: Vec<u8> = db.query_row(
+        "SELECT payload FROM supervisor_checkpoint WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(StoredCheckpoint {
+        run_id,
+        tick,
+        format_version,
+        payload,
+    }))
 }
 
 /// An archive entry read back from a supervisor database.
@@ -1015,6 +1236,197 @@ mod tests {
         let mut config = FullConfig::default();
         config.world.seed = TEST_WORLD_SEED;
         config
+    }
+
+    /// Checkpoints written by the overwrite test.
+    const OVERWRITE_COUNT: u64 = 50;
+    /// Tick the rewind tests checkpoint at.
+    const REWIND_TICK: u64 = 10;
+    /// Offset above `REWIND_TICK` of the first row written after the checkpoint.
+    const REWIND_NEXT_TICK_OFFSET: u64 = 1;
+    /// Offset above `REWIND_TICK` of the second row written after the checkpoint.
+    const REWIND_LATE_TICK_OFFSET: u64 = 2;
+    /// Offset above `REWIND_TICK` at which `next_ids` inserts its probe rows.
+    const PROBE_TICK_OFFSET: u64 = 5;
+    /// Checkpoint payload used by the rewind history.
+    const CHECKPOINT_PAYLOAD: [u8; 1] = [9];
+    /// Checkpoint payload used by the read-back round trip.
+    const ROUND_TRIP_PAYLOAD: [u8; 3] = [1, 2, 3];
+    /// Outcome of the archive rows the rewind fixture inserts.
+    const FIXTURE_OUTCOME: f64 = 0.5;
+    /// Ticks seeded for each run, below, at and after `REWIND_TICK`.
+    const REWIND_TICKS: [u64; 4] = [
+        REWIND_TICK - 1,
+        REWIND_TICK,
+        REWIND_TICK + REWIND_NEXT_TICK_OFFSET,
+        REWIND_TICK + REWIND_LATE_TICK_OFFSET,
+    ];
+
+    #[test]
+    fn store_checkpoint_single_row_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "ckpt.db");
+        let mut store = SupervisorStore::create(&path, &supervisor_config()).unwrap();
+        for tick in 1..=OVERWRITE_COUNT {
+            let payload = tick.to_le_bytes();
+            store.write_checkpoint(tick, &payload).unwrap();
+        }
+        let (count, tick, payload): (i64, i64, Vec<u8>) = store
+            .db
+            .query_row(
+                "SELECT COUNT(*), tick, payload FROM supervisor_checkpoint",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(tick.cast_unsigned(), OVERWRITE_COUNT);
+        assert_eq!(payload, OVERWRITE_COUNT.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn store_checkpoint_read_only_does_not_create_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "absent.db");
+        assert_eq!(read_checkpoint(&path).unwrap(), None);
+        assert!(!Path::new(&path).exists());
+    }
+
+    #[test]
+    fn store_checkpoint_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "none.db");
+        let mut store = SupervisorStore::create(&path, &supervisor_config()).unwrap();
+        assert_eq!(read_checkpoint(&path).unwrap(), None);
+        store
+            .write_checkpoint(REWIND_TICK, &ROUND_TRIP_PAYLOAD)
+            .unwrap();
+        let stored = read_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(stored.run_id, store.run_id());
+        assert_eq!(stored.tick, REWIND_TICK);
+        assert_eq!(stored.format_version, FORMAT_VERSION);
+        assert_eq!(stored.payload, ROUND_TRIP_PAYLOAD.to_vec());
+    }
+
+    /// Inserts one row per table for `run_id` at `tick`.
+    fn insert_rewind_rows(db: &Connection, run_id: i64, tick: u64) {
+        let tick = tick.cast_signed();
+        db.execute(
+            "INSERT INTO supervisor_event (run_id, tick, kind) VALUES (?1, ?2, 'idle')",
+            params![run_id, tick],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO test_extra (run_id, tick) VALUES (?1, ?2)",
+            params![run_id, tick],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO supervisor_archive
+                (run_id, entry_id, occupant_id, born_tick, retired_tick, outcome,
+                 config_json, birth_brain)
+             VALUES (?1, ?2, 1, 0, ?2, ?3, 'c', X'00')",
+            params![run_id, tick, FIXTURE_OUTCOME],
+        )
+        .unwrap();
+    }
+
+    /// Builds the two-run history; returns the first run id and its store.
+    fn seed_rewind_history(path: &str) -> (i64, SupervisorStore) {
+        let mut store = SupervisorStore::create(path, &supervisor_config()).unwrap();
+        let first = store.run_id();
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE test_extra (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL,
+                 tick INTEGER NOT NULL);",
+            )
+            .unwrap();
+        store
+            .write_checkpoint(REWIND_TICK, &CHECKPOINT_PAYLOAD)
+            .unwrap();
+        for tick in REWIND_TICKS {
+            insert_rewind_rows(&store.db, first, tick);
+        }
+        store
+            .db
+            .execute(
+                "INSERT INTO run (seed, governor_config, brain_config, world_config, mode)
+                 VALUES (1, '{}', '{}', '{}', 'supervisor')",
+                [],
+            )
+            .unwrap();
+        let second = store.db.last_insert_rowid();
+        for tick in REWIND_TICKS {
+            insert_rewind_rows(&store.db, second, tick);
+        }
+        (first, store)
+    }
+
+    /// Rows of `table` for `run_id`, as ticks in ascending order.
+    fn run_ticks(db: &Connection, table: &str, column: &str, run_id: i64) -> Vec<i64> {
+        let mut stmt = db
+            .prepare(&format!(
+                "SELECT {column} FROM {table} WHERE run_id = ?1 ORDER BY {column}"
+            ))
+            .unwrap();
+        let rows = stmt.query_map(params![run_id], |row| row.get(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// Inserts one probe row per table at a fixed tick and returns the ids
+    /// assigned to those rows.
+    fn next_ids(db: &Connection, run_id: i64) -> Vec<i64> {
+        insert_rewind_rows(db, run_id, REWIND_TICK + PROBE_TICK_OFFSET);
+        ["supervisor_event", "test_extra", "supervisor_archive"]
+            .iter()
+            .map(|table| {
+                db.query_row(&format!("SELECT MAX(id) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn store_reopen_rewinds_rows_at_or_after_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "rewind.db");
+        let (first, store) = seed_rewind_history(&path);
+        let second = first + 1;
+        drop(store);
+        let reopened = SupervisorStore::reopen_for_resume(&path, first, REWIND_TICK).unwrap();
+        assert_eq!(reopened.run_id(), first);
+        let below = vec![(REWIND_TICK - 1).cast_signed()];
+        let full: Vec<i64> = REWIND_TICKS.iter().map(|tick| tick.cast_signed()).collect();
+        for (table, column) in [
+            ("supervisor_event", "tick"),
+            ("test_extra", "tick"),
+            ("supervisor_archive", "retired_tick"),
+        ] {
+            assert_eq!(run_ticks(&reopened.db, table, column, first), below);
+            assert_eq!(run_ticks(&reopened.db, table, column, second), full);
+        }
+        assert_eq!(row_count(&reopened.db, "supervisor_checkpoint"), 1);
+        let rewound_ids = next_ids(&reopened.db, second);
+
+        let path_b = db_path(&dir, "plain.db");
+        let (_, plain) = seed_rewind_history(&path_b);
+        assert_eq!(next_ids(&plain.db, second), rewound_ids);
+
+        drop(reopened);
+        let err =
+            SupervisorStore::reopen_for_resume(&path, first, REWIND_TICK + REWIND_NEXT_TICK_OFFSET)
+                .err()
+                .unwrap();
+        assert!(matches!(
+            err,
+            StoreError::CheckpointTickMismatch {
+                stored: Some(_),
+                ..
+            }
+        ));
     }
 
     /// Creates a store, offers `outcomes` to a bounded archive and mirrors

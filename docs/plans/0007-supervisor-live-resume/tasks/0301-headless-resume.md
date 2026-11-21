@@ -12,8 +12,9 @@ touches:
   - crates/xagent-sandbox/src/main.rs
   - crates/xagent-sandbox/tests/supervisor_headless.rs
   - crates/xagent-sandbox/tests/evolution_cli_exit.rs
-status: todo
-merged_as: ""
+  - crates/xagent-sandbox/tests/generation_run_summary.rs
+status: done
+merged_as: "48806b28873b3cc180ef951a5bcc5f998911b92d"
 checks:
   - name: focused-proof
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_headless
@@ -41,7 +42,9 @@ checkpointed run from its stored `supervisor_checkpoint` row and continues the
 same loop to completion (INV-10). With no checkpoint it fails with
 `HeadlessError::Checkpoint(CheckpointError::Missing)` and leaves the database
 untouched. The CLI no longer refuses `--resume` in supervisor mode. Generation-mode
-resume is unchanged. Only the four `touches` files change.
+resume is unchanged. Only the five `touches` files change; in
+`tests/generation_run_summary.rs` the only change is adding
+`..HeadlessOptions::default()` to its one `HeadlessOptions` struct literal.
 
 ## Prerequisites used (not reimplemented)
 
@@ -106,7 +109,10 @@ From `supervisor-run-resume` (and its transitive tasks `kernel-checkpoint`,
 1. In `headless.rs`, delete `HeadlessError::ResumeInSupervisorMode` and its
    `Display` arm. Add `Checkpoint(CheckpointError)` with a `From` impl and a
    `Display` that delegates. Add `stop_after_checkpoint_at_or_after: Option<u64>`
-   to `HeadlessOptions`; `HeadlessOptions::default()` must still build.
+   to `HeadlessOptions`; `HeadlessOptions::default()` must still build. The task
+   rewrites the one `HeadlessOptions { run_summary: .. }` literal in
+   `tests/generation_run_summary.rs` to end with `..HeadlessOptions::default()`
+   so it still compiles; nothing else in that file changes.
 2. In `headless.rs`, replace the supervisor refusal branch of
    `run_headless_with_options` with the resume path from Decisions: absent-file
    check, `load_resume_point`, the one-line config notice, `GpuKernel::new` from

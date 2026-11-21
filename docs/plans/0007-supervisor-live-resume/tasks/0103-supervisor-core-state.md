@@ -9,8 +9,8 @@ depends_on:
 gated: false
 touches:
   - crates/xagent-sandbox/src/supervisor.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "34f2bebbfb73c159c2994982a34f7166377de4c9"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib supervisor::"

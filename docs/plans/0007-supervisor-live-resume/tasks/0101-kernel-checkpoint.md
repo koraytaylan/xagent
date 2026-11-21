@@ -10,8 +10,8 @@ touches:
   - crates/xagent-brain/src/gpu_kernel.rs
   - crates/xagent-brain/src/gpu_kernel/checkpoint.rs
   - crates/xagent-brain/tests/kernel_checkpoint.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "feaf8f6b37c799500f8bf3f49b1ba55bf6924941"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-brain --test kernel_checkpoint"
@@ -109,6 +109,12 @@ shader edit, no compute pass, no extra readback.
    `device.poll(Maintain::Wait)`, then slices the staging buffer into sections,
    fills `KernelCpuState` from the CPU fields, and updates `state_cache`,
    `food_cache` and the staging sequence like `read_full_state_blocking`.
+   The signature stays infallible. A terminal `map_async` failure (the callback
+   reports an error or is dropped) is the one approved exception to the
+   CONTRIBUTING.md Result/Option rule for this function: capture the map result,
+   and on failure log the error with `log::error!` and then panic, as
+   `read_full_state_blocking` already does on the same path. It must not retry,
+   return cached or partial state, or substitute any value (INV-5).
 5. Implement `restore_checkpoint(&mut self, &KernelCheckpoint) ->
    Result<(), KernelRestoreError>`: validate all section names, lengths and the
    CPU state length first, returning the error with no write on failure. Then

@@ -54,6 +54,7 @@ fn run(config: FullConfig) -> (RunSummary, Connection, tempfile::TempDir) {
     let summary_path = dir.path().join("summary.json");
     let options = HeadlessOptions {
         run_summary: Some(summary_path.clone()),
+        ..HeadlessOptions::default()
     };
     run_headless_with_options(
         config,

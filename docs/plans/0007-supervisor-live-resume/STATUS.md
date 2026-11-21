@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: supervisor live resume
@@ -16,3 +16,7 @@ Progress: 0/8 tasks complete.
 | headless-resume | Headless and CLI supervisor resume | todo |
 | worker-resume | Simulation worker start from checkpoint | todo |
 | resume-digest-gate | Stop-and-resume digest and refusal gate | todo |
+
+## Factory runs
+
+- 2026-11-21 13:56:19Z — completed 8/8; final plan gates passed

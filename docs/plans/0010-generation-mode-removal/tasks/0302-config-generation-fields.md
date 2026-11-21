@@ -5,6 +5,8 @@ workstream: "0300"
 kind: task
 depends_on:
   - governor-removal
+  - sandbox-mode-test-users
+  - sandbox-governor-default-users
 gated: false
 role: developer
 touches:
@@ -41,9 +43,10 @@ unknown fields by default, so no `deny_unknown_fields` is added. The one-line
 warning about dead keys is emitted by the sandbox config loader, not here, so
 this task adds no dependency: `Cargo.toml` and `Cargo.lock` are not touched.
 
-This task runs after `governor-removal`. Every other user of the removed
-fields and of `EvolutionMode` was removed by an earlier task, so the workspace
-compiles once this task lands.
+This task runs after `governor-removal`, `sandbox-mode-test-users` and
+`sandbox-governor-default-users`, which remove the last sandbox users of the
+removed fields and of `EvolutionMode`, so the workspace compiles once this
+task lands.
 
 ## Decisions
 
@@ -148,7 +151,10 @@ compiles once this task lands.
            "migration_interval",
            "evolution_mode",
        ] {
-           assert!(!out.contains(key), "re-serialized config keeps {key}");
+           assert!(
+               !out.contains(&format!("\"{key}\"")),
+               "re-serialized config keeps {key}"
+           );
        }
    }
 
@@ -171,6 +177,7 @@ compiles once this task lands.
 
    The JSON omits `brain` and `world`, which are `#[serde(default)]` in
    `FullConfig`. Do not write `"brain": {}`: `BrainConfig` has required fields.
+   The quoted-key match avoids `agent_tick_budget`, a kept key.
 6. Run the checks `shared-tests`, `config-generation-free` and
    `all-targets-compile` on the host. `shared-tests` must report all tests passed,
    including `legacy_generation_governor_json_loads`,

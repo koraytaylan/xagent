@@ -93,6 +93,12 @@ preflight_checks:
   - name: pf-config-generation-fields
     command: |-
       sh -c 'grep -qF "pub enum EvolutionMode {" crates/xagent-shared/src/config.rs && grep -qF "pub evolution_mode: EvolutionMode," crates/xagent-shared/src/config.rs && grep -qF "pub migration_interval: u32," crates/xagent-shared/src/config.rs && grep -qF "pub momentum_decay: f32," crates/xagent-shared/src/config.rs && grep -qF "pub supervisor: SupervisorConfig," crates/xagent-shared/src/config.rs && grep -qF "EvolutionMode" crates/xagent-shared/src/lib.rs && ! grep -qF "deny_unknown_fields" crates/xagent-shared/src/config.rs'
+  - name: pf-sandbox-mode-test-users
+    command: |-
+      sh -c 'cd crates/xagent-sandbox/tests && test -f sense_block_parity.rs && for f in supervisor_digest.rs supervisor_resume_digest.rs supervisor_run_resume.rs supervisor_sense_parity.rs supervisor_tick_window_digest.rs; do grep -qF "config.governor.evolution_mode = EvolutionMode::Supervisor;" $f || exit 1; done'
+  - name: pf-sandbox-governor-default-users
+    command: |-
+      sh -c 'grep -qF "tick_budget: xagent_shared::GovernorConfig::default().tick_budget," crates/xagent-sandbox/src/ui.rs && grep -qF "pub struct EvolutionSnapshot {" crates/xagent-sandbox/src/ui.rs && grep -qF "pub fn steering_population(" crates/xagent-sandbox/src/agent/mod.rs'
   - name: pf-docs-supervisor-only
     command: |-
       sh -c 'grep -qF "evolution state machine, SQLite persistence" CLAUDE.md && grep -qF "runs 221 total tests" CLAUDE.md && grep -qF "governor.rs" CONTRIBUTING.md && test -f EVOLUTION_JOURNEY.md && test -f README.md && test -f crates/xagent-sandbox/README.md && grep -qF "(\"crates/xagent-sandbox/src/governor.rs\", 1)," crates/xagent-sandbox/tests/contributing_guard.rs'
@@ -109,6 +115,8 @@ execution_checks:
       - headless-supervisor-only
       - headless-champion-source
       - config-generation-fields
+      - sandbox-mode-test-users
+      - sandbox-governor-default-users
       - guard-baseline
       - docs-supervisor-only
     role: developer
@@ -218,6 +226,28 @@ execution_checks:
           - name: pf-config-generation-fields
             command: |-
               sh -c 'grep -qF "pub enum EvolutionMode {" crates/xagent-shared/src/config.rs && grep -qF "pub evolution_mode: EvolutionMode," crates/xagent-shared/src/config.rs && grep -qF "pub migration_interval: u32," crates/xagent-shared/src/config.rs && grep -qF "pub momentum_decay: f32," crates/xagent-shared/src/config.rs && grep -qF "pub supervisor: SupervisorConfig," crates/xagent-shared/src/config.rs && grep -qF "EvolutionMode" crates/xagent-shared/src/lib.rs && ! grep -qF "deny_unknown_fields" crates/xagent-shared/src/config.rs'
+      - task: sandbox-mode-test-users
+        name: sandbox-mode-test-users-lines
+        sources:
+          - crates/xagent-sandbox/tests/sense_block_parity.rs
+          - crates/xagent-sandbox/tests/supervisor_digest.rs
+          - crates/xagent-sandbox/tests/supervisor_resume_digest.rs
+          - crates/xagent-sandbox/tests/supervisor_run_resume.rs
+          - crates/xagent-sandbox/tests/supervisor_sense_parity.rs
+          - crates/xagent-sandbox/tests/supervisor_tick_window_digest.rs
+        checks:
+          - name: pf-sandbox-mode-test-users
+            command: |-
+              sh -c 'cd crates/xagent-sandbox/tests && test -f sense_block_parity.rs && for f in supervisor_digest.rs supervisor_resume_digest.rs supervisor_run_resume.rs supervisor_sense_parity.rs supervisor_tick_window_digest.rs; do grep -qF "config.governor.evolution_mode = EvolutionMode::Supervisor;" $f || exit 1; done'
+      - task: sandbox-governor-default-users
+        name: sandbox-governor-default-lines
+        sources:
+          - crates/xagent-sandbox/src/ui.rs
+          - crates/xagent-sandbox/src/agent/mod.rs
+        checks:
+          - name: pf-sandbox-governor-default-users
+            command: |-
+              sh -c 'grep -qF "tick_budget: xagent_shared::GovernorConfig::default().tick_budget," crates/xagent-sandbox/src/ui.rs && grep -qF "pub struct EvolutionSnapshot {" crates/xagent-sandbox/src/ui.rs && grep -qF "pub fn steering_population(" crates/xagent-sandbox/src/agent/mod.rs'
       - task: guard-baseline
         name: guard-baseline-row
         sources:
@@ -381,9 +411,11 @@ contributing-guard baseline (0400).
 4. **Headless (`headless-supervisor-only`, `headless-champion-source`).** `run_headless` runs only the
    supervisor, refuses legacy databases, and the generation driver, tree dump,
    validation A/B code, champion source and generation measurement go.
-5. **Removal (`governor-removal`, `config-generation-fields`).** Delete
-   `governor.rs` (and `replay.rs` unless 0009 still imports from it), then the
-   generation-only `GovernorConfig` fields and `EvolutionMode`.
+5. **Removal (`governor-removal`, `sandbox-mode-test-users`,
+   `sandbox-governor-default-users`, `config-generation-fields`).** Delete
+   `governor.rs` (and `replay.rs` unless 0009 still imports from it), drop the
+   last sandbox users of `EvolutionMode` and `GovernorConfig::tick_budget`, then
+   the generation-only `GovernorConfig` fields and `EvolutionMode`.
 6. **Guard and docs (`guard-baseline`, `docs-supervisor-only`).** README.md, CLAUDE.md (architecture notes
    and test counts), CONTRIBUTING.md, EVOLUTION_JOURNEY.md and the sandbox
    README describe the supervisor-only system; the contributing-guard baseline

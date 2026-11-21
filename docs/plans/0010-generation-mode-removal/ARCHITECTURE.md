@@ -110,5 +110,7 @@ or not `'supervisor'`; `generation` is `MAX(node.generation)` when readable.
 | headless-champion-source | `BrainSource` and the champion tests in `food_kind_free_life.rs` and `free_life.rs` exist | grep on headless and tests | pf-headless-champion-source |
 | governor-removal | `lib.rs` declares `governor` and `replay`; `pathway_route_state.rs` imports `Governor` | grep on `lib.rs`, governor, test | pf-governor-removal |
 | config-generation-fields | `EvolutionMode`, the eight dead fields and the four survivors exist; no `deny_unknown_fields` in config | grep on `config.rs`, `lib.rs` | pf-config-generation-fields |
+| sandbox-mode-test-users | the five supervisor tests set `evolution_mode = EvolutionMode::Supervisor`; `sense_block_parity.rs` exists (its line comes from sense-parity-supervisor) | grep on the six tests | pf-sandbox-mode-test-users |
+| sandbox-governor-default-users | `EvolutionSnapshot::default` reads `GovernorConfig::default().tick_budget`; `steering_population` exists | grep on `ui.rs`, `agent/mod.rs` | pf-sandbox-governor-default-users |
 | guard-baseline | guard baseline row for `governor.rs` exists | grep on guard | pf-docs-supervisor-only |
 | docs-supervisor-only | CLAUDE.md governor line and 221 count; CONTRIBUTING governor rule | grep on docs | pf-docs-supervisor-only |

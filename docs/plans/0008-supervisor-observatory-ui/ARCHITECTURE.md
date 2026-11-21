@@ -159,6 +159,29 @@ All paths are under `crates/xagent-sandbox/src/`. `lib.rs` gains
 | plan 0006 telemetry events from the worker | folded through the same capped `fold`; non-finite floats render as `n/a`; slot indexes at or beyond `MAX_SLOTS` are ignored |
 | plan 0007 resume refusal | shown truncated to `MAX_DISPLAY_TEXT_BYTES`; never retried automatically |
 
+## Session wiring decisions
+
+Binding decisions of task `session-wiring` (tasks/0402-session-wiring.md), kept here so the packet stays under the packet size limit.
+
+- **Plan-level prerequisites.** Plans 0006 and 0007 must have landed (PLAN.md
+  `depends_on`). At baseline `sim_runtime.rs` has only `SimEvent::SupervisorSample`
+  (lines 212-240) and `SupervisorWorkerInit { config, db_path }` (lines 244-247). The
+  implementer reads the landed names: plan 0006 telemetry `SimEvent` variants and
+  record types, the plan 0006 run writer used by the test fixture, and the plan 0007
+  resume field on `SupervisorWorkerInit` or `SimInit`. If one is absent at dispatch,
+  report file and line as a blocker. Do not invent names.
+- **Live fold.** gpu_orchestration.rs gets a free fn `observatory_record(model:
+  &ObservatoryModel, event: &SimEvent) -> Vec<ObservatoryRecord>`, the single place the
+  drain converts events into records. It only matches the `SimEvent` variant: for
+  `SupervisorBoundary` it returns the one parent-resolved `model.boundary_record`; for
+  `SupervisorTelemetry` it returns every record the frame carries (`model.slot_record`
+  per slot, the `From` conversions for each intake row and the progress record, and
+  `ObservatoryRecord::series_from_frame`), all delegating to `observatory/mod.rs` (owned
+  by `observatory-model`); for every other event it returns an empty Vec. One event may
+  therefore yield several records. The event drain calls it per event and, when
+  `evo_snapshot.observatory` is `Some(m)`, calls `m.fold(r)` for each returned record;
+  the drain holds no other record conversion. Keep the `SupervisorSample` arm.
+
 ## Feasibility
 
 | task | constraints and sources | compatibility witness | preflight check |

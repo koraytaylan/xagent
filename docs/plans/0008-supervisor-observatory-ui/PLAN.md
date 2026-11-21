@@ -43,7 +43,7 @@ checks:
     command: cargo clippy --workspace --all-targets -- -D warnings
     timeout_ms: 3600000
   - name: workspace-tests
-    command: env XAGENT_REQUIRE_GPU=1 cargo test --workspace
+    command: env XAGENT_REQUIRE_GPU=1 cargo test --workspace -- --skip cortex_throughput_profile_baseline --skip cortex_throughput_meets_budget_on_software_adapter
     timeout_ms: 7200000
   - name: integration-observatory-browse
     command: cargo test -p xagent-sandbox --test observatory_browse

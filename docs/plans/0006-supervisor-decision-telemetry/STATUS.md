@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: supervisor decision telemetry
@@ -18,3 +18,7 @@ Progress: 0/10 tasks complete.
 | supervisor-sense-parity | Supervisor sense-parity golden | todo |
 | supervisor-gpu-parity | Supervisor fused/split GPU parity | todo |
 | supervisor-food-kind-gate | Supervisor food-kind default and season gate | todo |
+
+## Factory runs
+
+- 2026-11-21 11:59:22Z — completed 10/10; final plan gates passed

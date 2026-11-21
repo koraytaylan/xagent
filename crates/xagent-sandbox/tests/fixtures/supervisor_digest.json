@@ -1,0 +1,7 @@
+{
+  "seed": 5,
+  "agent_tick_budget": 600000,
+  "inheritance": "weight_copy",
+  "digest": "0aa395e9f0294ec9",
+  "adapter": "llvmpipe (LLVM 21.1.8, 256 bits) (Vulkan)"
+}

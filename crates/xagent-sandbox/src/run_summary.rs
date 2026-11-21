@@ -385,6 +385,13 @@ impl RunSummaryAccumulator {
         })
     }
 
+    /// Totals of the seasons closed so far; `None` when food kinds are off.
+    /// The open season is not included.
+    #[must_use]
+    pub fn closed_totals(&self) -> Option<&KindWindowTotals> {
+        self.kinds_on.then_some(&self.totals)
+    }
+
     /// Classifies the open season's intervals into early and late windows.
     fn close_season(&mut self) {
         let Some(open) = self.open.take() else {
@@ -557,6 +564,20 @@ mod tests {
     fn run_summary_agent_ticks_overflow_is_error() {
         let a = acc(2, false);
         assert_eq!(a.finish(u64::MAX), Err(RunSummaryError::SizeOverflow));
+    }
+
+    #[test]
+    fn closed_totals_matches_after_begin_season() {
+        let mut accumulator = acc(1, true);
+        accumulator.begin_season(0, Some(FoodKind::First)).unwrap();
+        run_meals(10, &mut accumulator, false);
+        accumulator.begin_season(10, Some(FoodKind::First)).unwrap();
+        let closed = accumulator.closed_totals().unwrap().clone();
+        assert_eq!(closed.late_nourishing_meals, 3);
+        assert_eq!(closed.early_nourishing_meals, 3);
+        run_meals(1, &mut accumulator, false);
+        assert_eq!(accumulator.closed_totals(), Some(&closed));
+        assert!(acc(1, false).closed_totals().is_none());
     }
 
     #[test]

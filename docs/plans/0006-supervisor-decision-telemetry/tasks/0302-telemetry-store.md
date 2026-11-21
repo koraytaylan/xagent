@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - telemetry-records
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "fca284f66d6f44d15438ce2d7b9db3d4a7279841"
 touches:
   - crates/xagent-sandbox/src/supervisor_store.rs
 checks:

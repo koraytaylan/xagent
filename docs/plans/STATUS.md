@@ -7,3 +7,4 @@
 | 0003 | 0003-uniform-sense-motor-route | ✅ Complete | 16/16 | — | [status](0003-uniform-sense-motor-route/STATUS.md) |
 | 0004 | 0004-food-contingency-learning | ✅ Complete | 17/17 | — | [status](0004-food-contingency-learning/STATUS.md) |
 | 0005 | 0005-continuous-life-supervisor | ✅ Complete | 15/15 | — | [status](0005-continuous-life-supervisor/STATUS.md) |
+| 0006 | 0006-supervisor-decision-telemetry | ✅ Complete | 10/10 | — | [status](0006-supervisor-decision-telemetry/STATUS.md) |

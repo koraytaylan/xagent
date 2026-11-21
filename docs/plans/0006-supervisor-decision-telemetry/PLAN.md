@@ -30,7 +30,7 @@ objective: >-
   supervisor_run.rs, supervisor_store.rs and only the supervisor path of
   sim_runtime.rs. Does not delete or change generation mode.
 depends_on: []
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

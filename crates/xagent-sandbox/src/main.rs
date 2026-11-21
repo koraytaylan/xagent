@@ -199,7 +199,7 @@ struct Cli {
     #[arg(long)]
     agent_tick_budget: Option<u64>,
 
-    /// Supervisor inheritance: darwinian or weight-copy (default: keep config)
+    /// Supervisor inheritance: darwinian or weight-copy (default: kept from the config, whose default is weight-copy)
     #[arg(long, value_enum)]
     supervisor_inheritance: Option<InheritanceArg>,
 
@@ -987,6 +987,22 @@ mod tests {
     use super::*;
     use xagent_brain::buffers::TrunkLesions;
     use xagent_shared::config::{EvolutionMode, Inheritance};
+
+    #[test]
+    fn evolution_cli_darwinian_still_selectable() {
+        use xagent_shared::config::Inheritance;
+        let (cli, mut config) = evo(&[
+            "--evolution-mode",
+            "supervisor",
+            "--supervisor-inheritance",
+            "darwinian",
+        ]);
+        apply_evolution_cli(&cli, &mut config).unwrap();
+        assert_eq!(
+            config.governor.supervisor.inheritance,
+            Inheritance::Darwinian
+        );
+    }
 
     fn evo(args: &[&str]) -> (Cli, FullConfig) {
         let mut argv = vec!["xagent"];

@@ -24,6 +24,7 @@ use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
 use xagent_sandbox::supervisor_run::{SampleReport, SupervisorRun};
 use xagent_sandbox::supervisor_store::SupervisorStore;
+use xagent_sandbox::supervisor_telemetry::{BoundaryRecord, TelemetryFrame};
 use xagent_shared::{BrainConfig, FullConfig, WorldConfig, SUPERVISOR_SAMPLE_TICKS};
 
 use crate::app::{PendingUpload, SIM_DT};
@@ -233,6 +234,14 @@ pub enum SimEvent {
     // The payload is consumed by the UI consumer, which a later task adds.
     #[allow(dead_code)]
     SupervisorSample(SampleReport),
+    /// One telemetry frame per supervisor sample (latest-wins; sent with
+    /// `try_send` and dropped under back-pressure).
+    #[allow(dead_code)]
+    SupervisorTelemetry(Box<TelemetryFrame>),
+    /// A boundary record, delivered as a control event ahead of the
+    /// `SupervisorSample` of the same sample.
+    #[allow(dead_code)]
+    SupervisorBoundary(Box<BoundaryRecord>),
     /// Human-readable worker log line.
     Log(String),
     /// Worker error (e.g. no GPU adapter); the worker may be degraded.
@@ -429,6 +438,11 @@ struct Worker {
     supervisor_mode: bool,
     /// Control events queued for blocking delivery on the next step.
     supervisor_events: Vec<SimEvent>,
+    /// Newest telemetry frame awaiting a non-blocking send; a newer frame
+    /// replaces an older one.
+    pending_telemetry: Option<Box<TelemetryFrame>>,
+    /// Wall-clock instant and tick of the previous supervisor sample.
+    supervisor_sample_clock: Option<(Instant, u64)>,
 }
 
 /// Start the supervisor run on `kernel`, opening the store when configured.
@@ -591,6 +605,8 @@ impl Worker {
             supervisor,
             supervisor_mode,
             supervisor_events,
+            pending_telemetry: None,
+            supervisor_sample_clock: None,
         }
     }
 
@@ -765,6 +781,10 @@ impl Worker {
         for event in self.supervisor_events.drain(..) {
             let _ = event_tx.send(event);
         }
+        // Telemetry is latest-wins: never block, drop when the channel is full.
+        if let Some(frame) = self.pending_telemetry.take() {
+            let _ = event_tx.try_send(SimEvent::SupervisorTelemetry(frame));
+        }
 
         if self.paused {
             return false;
@@ -869,7 +889,15 @@ impl Worker {
             return;
         }
         let physics = self.kernel.read_full_state_blocking().to_vec();
-        match run.on_sample(&mut self.kernel, self.tick, &physics, None) {
+        let food = self.kernel.cached_food_state().map(<[f32]>::to_vec);
+        if let Some((at, tick0)) = self.supervisor_sample_clock {
+            let elapsed = at.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                run.note_ticks_per_second((self.tick - tick0) as f64 / elapsed);
+            }
+        }
+        self.supervisor_sample_clock = Some((Instant::now(), self.tick));
+        match run.on_sample(&mut self.kernel, self.tick, &physics, food.as_deref()) {
             Ok(report) => {
                 if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
                     match run.birth_state(slot) {
@@ -884,6 +912,13 @@ impl Worker {
                     }
                 }
                 let finished = report.finished;
+                if let Some(frame) = run.take_frame() {
+                    if let Some(record) = frame.boundary.as_ref() {
+                        self.supervisor_events
+                            .push(SimEvent::SupervisorBoundary(Box::new(record.clone())));
+                    }
+                    self.pending_telemetry = Some(Box::new(frame));
+                }
                 if report.boundary.is_some() || report.season.is_some() || finished {
                     self.supervisor_events
                         .push(SimEvent::SupervisorSample(report));
@@ -1856,6 +1891,184 @@ mod tests {
     /// Delta that yields roughly `ticks` ticks of accumulation at speed 1.
     fn supervisor_dt(ticks: f64) -> f64 {
         (ticks + 0.01) * f64::from(SIM_DT)
+    }
+
+    /// Tick a boundary record was decided at.
+    fn boundary_record_tick(record: &BoundaryRecord) -> u64 {
+        match &record.detail {
+            xagent_sandbox::supervisor::BoundaryDetail::Replaced { tick, .. }
+            | xagent_sandbox::supervisor::BoundaryDetail::Idle { tick, .. } => *tick,
+        }
+    }
+
+    /// Advance until `target` ticks or pause, returning every queued event in
+    /// order. When `discard` is set, telemetry frames and boundary events are
+    /// dropped as they appear.
+    fn supervisor_collect_events(
+        worker: &mut Worker,
+        dt: f64,
+        target: u64,
+        discard: bool,
+    ) -> Vec<SimEvent> {
+        let mut events = Vec::new();
+        for _ in 0..1_000_000 {
+            if worker.tick >= target || worker.paused {
+                break;
+            }
+            worker.advance_compute(dt);
+            if discard {
+                worker.pending_telemetry = None;
+                worker
+                    .supervisor_events
+                    .retain(|event| !matches!(event, SimEvent::SupervisorBoundary(_)));
+            }
+            events.append(&mut worker.supervisor_events);
+        }
+        events
+    }
+
+    #[test]
+    fn supervisor_telemetry_partition_keeps_new_variants_in_order() {
+        use xagent_sandbox::supervisor::{BoundaryDetail, IdleReason};
+        use xagent_sandbox::supervisor_telemetry::ProgressRecord;
+
+        let record = BoundaryRecord {
+            detail: BoundaryDetail::Idle {
+                tick: 1_000,
+                standings: Vec::new(),
+                reason: IdleReason {
+                    too_young: 0,
+                    no_full_window: 0,
+                    no_peer_median: 0,
+                    at_or_above_median: 0,
+                },
+            },
+            newborn_occupant: None,
+            config_diff: Vec::new(),
+            retired_lifespan_ticks: None,
+        };
+        let frame = TelemetryFrame {
+            tick: 1_000,
+            slots: Vec::new(),
+            boundary: None,
+            series: Vec::new(),
+            intake: Vec::new(),
+            progress: ProgressRecord {
+                tick: 1_000,
+                total_ticks: None,
+                agent_tick_budget: 0,
+                ticks_to_boundary: 0,
+                nourishing: None,
+                next_flip_tick: None,
+                ticks_per_second: None,
+            },
+            persist: false,
+        };
+        let events = vec![
+            SimEvent::SupervisorBoundary(Box::new(record)),
+            SimEvent::Log("a".into()),
+            SimEvent::SupervisorTelemetry(Box::new(frame)),
+        ];
+        let (latest, control) = partition_events(events, 0);
+        assert!(latest.is_none());
+        assert_eq!(control.len(), 3);
+        assert!(matches!(control[0], SimEvent::SupervisorBoundary(_)));
+        assert!(matches!(control[1], SimEvent::Log(_)));
+        assert!(matches!(control[2], SimEvent::SupervisorTelemetry(_)));
+    }
+
+    #[test]
+    fn supervisor_telemetry_boundary_control_events_follow_samples() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let mut init = supervisor_init(&config, None);
+        init.speed_multiplier = 1_000;
+        let mut worker = Worker::new(init);
+        let events = supervisor_collect_events(&mut worker, 0.05, 3_000, false);
+
+        let mut boundary_reports = 0_usize;
+        let mut boundary_events = 0_usize;
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                SimEvent::SupervisorBoundary(_) => boundary_events += 1,
+                SimEvent::SupervisorSample(report) if report.boundary.is_some() => {
+                    boundary_reports += 1;
+                    assert!(index > 0, "a boundary sample must follow its boundary");
+                    match &events[index - 1] {
+                        SimEvent::SupervisorBoundary(record) => {
+                            assert_eq!(boundary_record_tick(record), report.tick);
+                        }
+                        _ => panic!("sample at {} lacks a preceding boundary", report.tick),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(boundary_reports >= 2, "got {boundary_reports} boundaries");
+        assert_eq!(boundary_events, boundary_reports);
+    }
+
+    #[test]
+    fn supervisor_telemetry_frame_dropped_when_channel_full() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let mut init = supervisor_init(&config, None);
+        init.speed_multiplier = 1_000;
+        let mut worker = Worker::new(init);
+        let (event_tx, event_rx) = sync_channel::<SimEvent>(1);
+        event_tx
+            .send(SimEvent::Log("full".into()))
+            .expect("channel has room");
+        let before = worker.counters.dispatch_calls;
+        for _ in 0..10_000_000 {
+            if worker.tick >= 900 || worker.paused {
+                break;
+            }
+            worker.step(&event_tx);
+        }
+        assert!(worker.tick >= 900, "worker stalled at {}", worker.tick);
+        assert!(worker.counters.dispatch_calls > before);
+        assert!(matches!(event_rx.try_recv(), Ok(SimEvent::Log(_))));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn supervisor_telemetry_dispatch_schedule_unchanged_when_frames_discarded() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let build = || {
+            let mut init = supervisor_init(&config, None);
+            init.speed_multiplier = 1_000;
+            Worker::new(init)
+        };
+        let reports = |events: Vec<SimEvent>| -> Vec<SampleReport> {
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    SimEvent::SupervisorSample(report) => Some(report),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut a = build();
+        let mut b = build();
+        let reports_a = reports(supervisor_collect_events(&mut a, 0.05, 3_000, false));
+        let reports_b = reports(supervisor_collect_events(&mut b, 0.05, 3_000, true));
+        assert_eq!(a.tick, b.tick);
+        assert_eq!(a.counters.dispatch_calls, b.counters.dispatch_calls);
+        assert_eq!(
+            a.kernel.probe_kernel_batches(),
+            b.kernel.probe_kernel_batches()
+        );
+        assert_eq!(reports_a, reports_b);
+        let batch = u64::from(a.kernel.kernel_batch_size());
+        assert_eq!(a.kernel.probe_kernel_batches(), a.tick / batch);
     }
 
     #[test]

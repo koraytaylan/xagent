@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - inheritance-default
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "dfeee201720d38c28e583d541e90a4d351de4cb4"
 touches:
   - crates/xagent-sandbox/tests/supervisor_gpu_parity.rs
 checks:

@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - inheritance-default
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "2507e9cfb22a2d1180fd2a7503329e043aa3c232"
 touches:
   - crates/xagent-sandbox/tests/supervisor_food_kind.rs
 checks:

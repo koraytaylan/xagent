@@ -7,8 +7,8 @@ role: developer
 depends_on:
   - run-recording
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "99693e99d6b8c07c22b5954b52d9961f61729dca"
 touches:
   - crates/xagent-sandbox/src/sim_runtime.rs
   - crates/xagent-sandbox/src/gpu_orchestration.rs

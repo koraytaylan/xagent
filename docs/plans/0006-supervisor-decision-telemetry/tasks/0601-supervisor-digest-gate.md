@@ -8,8 +8,8 @@ depends_on:
   - inheritance-default
   - run-recording
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "506305c6180113870b2bfbb09ab4b942f9ba2fe1"
 touches:
   - crates/xagent-sandbox/tests/supervisor_digest.rs
   - crates/xagent-sandbox/tests/fixtures/supervisor_digest.json

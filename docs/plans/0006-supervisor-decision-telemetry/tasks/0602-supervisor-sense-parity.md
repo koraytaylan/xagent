@@ -7,8 +7,8 @@ role: architect
 depends_on:
   - inheritance-default
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "3897d1c53e7133eb747a5b015bed26761e87067a"
 touches:
   - crates/xagent-sandbox/tests/supervisor_sense_parity.rs
   - crates/xagent-sandbox/tests/fixtures/supervisor_sense_parity.golden

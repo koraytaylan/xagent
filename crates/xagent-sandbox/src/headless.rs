@@ -207,6 +207,20 @@ fn run_supervisor(
     db_path: &str,
     options: &HeadlessOptions,
 ) -> Result<(), HeadlessError> {
+    run_supervisor_with_recording(config, db_path, options, true)
+}
+
+/// Run the supervisor loop, persisting decision telemetry only when `record` is set.
+///
+/// # Errors
+///
+/// Returns a [`HeadlessError`] for a failed store, run or summary write.
+pub fn run_supervisor_with_recording(
+    config: FullConfig,
+    db_path: &str,
+    options: &HeadlessOptions,
+    record: bool,
+) -> Result<(), HeadlessError> {
     let store = SupervisorStore::create(db_path, &config)?;
     // A population past u32 has a last slot index the kernel cannot address.
     let population = u32::try_from(config.governor.population_size).map_err(|_| {
@@ -223,6 +237,7 @@ fn run_supervisor(
         Some(store),
         options.run_summary.is_some(),
     )?;
+    run.set_recording(record);
     println!("Supervisor run | Population: {population}");
     let mut next_progress = 1_u64;
     while !run.is_finished() {
@@ -239,9 +254,14 @@ fn supervisor_step(
     kernel: &mut GpuKernel,
     batch: u32,
 ) -> Result<SampleReport, HeadlessError> {
+    let started = Instant::now();
     kernel.dispatch_batch(run.tick(), batch);
     while !kernel.try_collect_state_snapshot() {
         std::thread::yield_now();
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    if elapsed > 0.0 {
+        run.note_ticks_per_second(f64::from(batch) / elapsed);
     }
     let physics = kernel.cached_state().to_vec();
     let food = kernel.cached_food_state().map(<[f32]>::to_vec);

@@ -17,10 +17,12 @@ use xagent_shared::{
 use crate::agent::Agent;
 use crate::run_summary::{RunSummary, RunSummaryAccumulator, RunSummaryError};
 use crate::supervisor::{
-    stream_seed, ArchiveChange, ParentRef, ReplaceReason, ReplacementPlan, SampleDecision,
-    SlotCounters, Supervisor, SupervisorError, TickSchedule, SEASON_STREAM,
+    stream_seed, ArchiveChange, ParentRef, ReplaceReason, ReplacementOutcome, ReplacementPlan,
+    SampleDecision, SlotCounters, SlotStanding, Supervisor, SupervisorError, TickSchedule,
+    SEASON_STREAM,
 };
 use crate::supervisor_store::{StoreError, SupervisorStore};
+use crate::supervisor_telemetry::{NewbornInput, SampleInput, TelemetryBuilder, TelemetryFrame};
 use crate::world::WorldState;
 
 /// Tag xor-ed into the world seed to seed the kernel's initial agent reset.
@@ -217,7 +219,16 @@ pub struct SupervisorRun {
     budget: u64,
     /// Occupant id the core assigns to the next newborn (mirrors the core's counter).
     next_occupant: u64,
+    telemetry: TelemetryBuilder,
+    recording: bool,
+    telemetry_stats: Option<RunSummaryAccumulator>,
+    last_ticks_per_second: Option<f64>,
+    last_frame: Option<TelemetryFrame>,
+    telemetry_warned: bool,
 }
+
+/// Boundary report and replacement outcome of one sample.
+type BoundaryResult = (Option<BoundaryReport>, Option<ReplacementOutcome>);
 
 impl SupervisorRun {
     /// Validates, uploads the initial population and records the slots.
@@ -253,6 +264,16 @@ impl SupervisorRun {
                 kinds_on,
             )
         });
+        let telemetry_stats = kinds_on.then(|| {
+            RunSummaryAccumulator::new(
+                EvolutionMode::Supervisor,
+                Some(config.governor.supervisor.inheritance),
+                seed,
+                population,
+                kinds_on,
+            )
+        });
+        let recording = store.is_some();
         let sup = &config.governor.supervisor;
         let next_occupant = u64::try_from(population)
             .map_err(|_| SupervisorRunError::SlotRange { slot: population })?;
@@ -268,9 +289,20 @@ impl SupervisorRun {
             tick: 0,
             budget: sup.agent_tick_budget,
             next_occupant,
+            telemetry: TelemetryBuilder::new(population),
+            recording,
+            telemetry_stats,
+            last_ticks_per_second: None,
+            last_frame: None,
+            telemetry_warned: false,
         };
         run.upload_population(kernel, config)?;
         run.begin_run_season(kernel)?;
+        if let (Some(stats), Some(kind)) = (run.telemetry_stats.as_mut(), run.nourishing) {
+            if let Err(e) = stats.begin_season(0, Some(kind)) {
+                run.telemetry_failed(&e);
+            }
+        }
         Ok(run)
     }
 
@@ -421,15 +453,126 @@ impl SupervisorRun {
         if let Some(acc) = self.accumulator.as_mut() {
             acc.record_physics_sample(tick, physics, food)?;
         }
+        self.telemetry_physics(tick, physics, food);
         self.tick = tick;
+        let standings = self.core.standings(tick);
+        let had_boundary = !matches!(decision, SampleDecision::Recorded);
         let season = self.flip_season(kernel, tick)?;
-        let boundary = self.boundary(kernel, tick, decision)?;
+        if let Some(kind) = season {
+            self.telemetry_season(tick, kind);
+        }
+        let (boundary, outcome) = self.boundary(kernel, tick, decision)?;
+        self.build_frame(
+            tick,
+            &standings,
+            had_boundary,
+            outcome.as_ref(),
+            season.is_some(),
+        );
         Ok(SampleReport {
             tick,
             boundary,
             season,
             finished: self.is_finished(),
         })
+    }
+
+    /// Turns recording off after a telemetry failure and reports it once.
+    fn telemetry_failed(&mut self, error: &dyn fmt::Display) {
+        self.recording = false;
+        self.telemetry_stats = None;
+        if !self.telemetry_warned {
+            self.telemetry_warned = true;
+            log::warn!("supervisor telemetry stopped: {error}");
+        }
+    }
+
+    /// Feeds the telemetry accumulator one physics sample.
+    fn telemetry_physics(&mut self, tick: u64, physics: &[f32], food: Option<&[f32]>) {
+        if let Some(stats) = self.telemetry_stats.as_mut() {
+            if let Err(e) = stats.record_physics_sample(tick, physics, food) {
+                self.telemetry_failed(&e);
+            }
+        }
+    }
+
+    /// Opens a telemetry season and hands the closed totals to the builder.
+    fn telemetry_season(&mut self, tick: u64, kind: FoodKind) {
+        let Some(stats) = self.telemetry_stats.as_mut() else {
+            return;
+        };
+        if let Err(e) = stats.begin_season(tick, Some(kind)) {
+            self.telemetry_failed(&e);
+            return;
+        }
+        if let Some(totals) = stats.closed_totals() {
+            self.telemetry.on_season_closed(tick, totals);
+        }
+    }
+
+    /// Builds this sample's frame and persists it when recording.
+    fn build_frame(
+        &mut self,
+        tick: u64,
+        standings: &[SlotStanding],
+        had_boundary: bool,
+        outcome: Option<&ReplacementOutcome>,
+        season_flipped: bool,
+    ) {
+        let archive_outcomes: Vec<f32> = self
+            .core
+            .archive()
+            .entries()
+            .iter()
+            .map(|e| e.outcome)
+            .collect();
+        let frame = self.telemetry.on_sample(SampleInput {
+            tick,
+            standings,
+            boundary: if had_boundary {
+                self.core.last_boundary()
+            } else {
+                None
+            },
+            replacement: outcome.map(|o| NewbornInput {
+                newborn_occupant: o.occupant_id,
+                parent_config: &o.parent_config,
+                newborn_config: &o.newborn_config,
+            }),
+            archive_outcomes: &archive_outcomes,
+            total_ticks: self.total_ticks(),
+            agent_tick_budget: self.budget,
+            next_boundary_tick: self.core.next_boundary_tick(),
+            nourishing: self.nourishing,
+            next_flip_tick: self.kinds_on.then(|| self.season.next_tick()),
+            ticks_per_second: self.last_ticks_per_second,
+            season_flipped,
+        });
+        if self.recording && frame.persist {
+            if let Some(store) = self.store.as_mut() {
+                if let Err(e) = store.record_telemetry(&frame) {
+                    self.telemetry_failed(&e);
+                }
+            }
+        }
+        self.last_frame = Some(frame);
+    }
+
+    /// Turns telemetry persistence on or off.
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on && self.store.is_some();
+    }
+
+    /// Stores the latest observed ticks per second; non-finite rates are ignored.
+    pub fn note_ticks_per_second(&mut self, rate: f64) {
+        if rate.is_finite() {
+            self.last_ticks_per_second = Some(rate);
+        }
+    }
+
+    /// Takes the frame of the last sample.
+    pub fn take_frame(&mut self) -> Option<TelemetryFrame> {
+        self.last_frame.take()
     }
 
     fn counters(&self, physics: &[f32]) -> Result<Vec<SlotCounters>, SupervisorRunError> {
@@ -470,16 +613,19 @@ impl SupervisorRun {
         kernel: &GpuKernel,
         tick: u64,
         decision: SampleDecision,
-    ) -> Result<Option<BoundaryReport>, SupervisorRunError> {
+    ) -> Result<BoundaryResult, SupervisorRunError> {
         match decision {
-            SampleDecision::Recorded => Ok(None),
+            SampleDecision::Recorded => Ok((None, None)),
             SampleDecision::Idle => {
                 if let Some(store) = self.store.as_mut() {
                     store.record_idle_boundary(tick)?;
                 }
-                Ok(Some(self.report(tick, None, None)))
+                Ok((Some(self.report(tick, None, None)), None))
             }
-            SampleDecision::Replace(plan) => self.replace(kernel, tick, plan).map(Some),
+            SampleDecision::Replace(plan) => {
+                let (report, outcome) = self.replace(kernel, tick, plan)?;
+                Ok((Some(report), Some(outcome)))
+            }
         }
     }
 
@@ -488,7 +634,7 @@ impl SupervisorRun {
         kernel: &GpuKernel,
         tick: u64,
         plan: ReplacementPlan,
-    ) -> Result<BoundaryReport, SupervisorRunError> {
+    ) -> Result<(BoundaryReport, ReplacementOutcome), SupervisorRunError> {
         // Every fallible conversion runs before the core commits.
         let slot = slot_index(plan.slot)?;
         let id =
@@ -519,10 +665,16 @@ impl SupervisorRun {
         if let Some(acc) = self.accumulator.as_mut() {
             acc.reset_agent_baseline(plan.slot)?;
         }
+        if let Some(stats) = self.telemetry_stats.as_mut() {
+            if let Err(e) = stats.reset_agent_baseline(plan.slot) {
+                self.telemetry_failed(&e);
+            }
+        }
         if let Some(store) = self.store.as_mut() {
             store.record_boundary(tick, &plan, &outcome, outcome.archived.as_ref())?;
         }
-        Ok(self.report(tick, Some(&plan), Some(outcome.occupant_id)))
+        let report = self.report(tick, Some(&plan), Some(outcome.occupant_id));
+        Ok((report, outcome))
     }
 
     fn report(

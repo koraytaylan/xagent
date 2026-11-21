@@ -1,7 +1,9 @@
 //! SQLite persistence of a supervisor run.
 //!
 //! The store adds three tables to the governor schema: the occupant of each
-//! slot, the bounded archive of retired lives and an event log. Every change a
+//! slot, the bounded archive of retired lives and an event log. It also adds
+//! six telemetry tables: slot snapshots, boundaries, boundary candidates,
+//! series points, occupant intake and run progress. Every change a
 //! boundary, season, idle sample or run end makes is written in one
 //! transaction. Archive entries are loaded back through a read-only
 //! connection that never writes to the database.
@@ -15,9 +17,11 @@ use xagent_shared::{BrainConfig, FoodKind, FullConfig};
 
 use crate::governor::{decode_brain_state, encode_brain_state, init_schema};
 use crate::supervisor::{
-    Archive, ArchiveChange, ArchiveEntry, ParentRef, ReplaceReason, ReplacementOutcome,
-    ReplacementPlan, SlotLedger,
+    Archive, ArchiveChange, ArchiveEntry, BoundaryDetail, EligibilityGround, ParentRef,
+    ReplaceReason, ReplacementOutcome, ReplacementPlan, SlotLedger,
 };
+use crate::supervisor_telemetry::{BoundaryRecord, TelemetryFrame};
+use serde_json::json;
 
 /// Busy timeout of the writer and of a read-only archive load.
 pub const STORE_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -190,8 +194,235 @@ pub fn ensure_schema(db: &Connection) -> SqlResult<()> {
             parent_ref INTEGER,
             outcome REAL,
             nourishing_kind TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_slot_snapshot (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            slot INTEGER NOT NULL,
+            occupant_id INTEGER NOT NULL,
+            age_ticks INTEGER NOT NULL,
+            alive INTEGER NOT NULL,
+            meals INTEGER NOT NULL,
+            deaths INTEGER NOT NULL,
+            window_score REAL,
+            peer_median REAL,
+            ground TEXT NOT NULL,
+            parent_kind TEXT,
+            parent_ref INTEGER,
+            PRIMARY KEY (run_id, tick, slot)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_boundary (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            outcome TEXT NOT NULL,
+            slot INTEGER,
+            reason TEXT,
+            tiebreak_pool TEXT,
+            tiebreak_index INTEGER,
+            parent_kind TEXT,
+            parent_ref INTEGER,
+            parent_state TEXT,
+            parent_pool_len INTEGER,
+            parent_index INTEGER,
+            retired_occupant INTEGER,
+            retired_lifespan_ticks INTEGER,
+            newborn_occupant INTEGER,
+            config_diff TEXT,
+            idle_too_young INTEGER,
+            idle_no_full_window INTEGER,
+            idle_no_peer_median INTEGER,
+            idle_at_or_above_median INTEGER,
+            PRIMARY KEY (run_id, tick)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_boundary_candidate (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            slot INTEGER NOT NULL,
+            occupant_id INTEGER NOT NULL,
+            ground TEXT NOT NULL,
+            score REAL,
+            median REAL,
+            age_ticks INTEGER NOT NULL,
+            PRIMARY KEY (run_id, tick, slot)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_series (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            metric TEXT NOT NULL,
+            value REAL,
+            PRIMARY KEY (run_id, tick, metric)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_occupant_intake (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            occupant_id INTEGER NOT NULL,
+            age_ticks INTEGER NOT NULL,
+            slot INTEGER NOT NULL,
+            meals INTEGER NOT NULL,
+            PRIMARY KEY (run_id, occupant_id, age_ticks)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_progress (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            total_ticks INTEGER,
+            agent_tick_budget INTEGER NOT NULL,
+            ticks_to_boundary INTEGER NOT NULL,
+            nourishing_kind TEXT,
+            next_flip_tick INTEGER,
+            ticks_per_second REAL,
+            PRIMARY KEY (run_id, tick)
         );",
     )
+}
+
+/// A real number as a database value; non-finite numbers become NULL.
+fn finite_real(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+/// The stored text of an eligibility ground.
+fn ground_text(ground: &EligibilityGround) -> &'static str {
+    match ground {
+        EligibilityGround::Death => "death",
+        EligibilityGround::BelowMedian { .. } => "below_median",
+        EligibilityGround::TooYoung => "too_young",
+        EligibilityGround::NoFullWindow => "no_full_window",
+        EligibilityGround::NoPeerMedian => "no_peer_median",
+        EligibilityGround::AtOrAboveMedian { .. } => "at_or_above_median",
+    }
+}
+
+/// Kind, reference and brain state of a parent.
+fn parent_columns(parent: ParentRef) -> Result<(&'static str, i64, &'static str), StoreError> {
+    Ok(match parent {
+        ParentRef::ArchiveEntry(id) => (PARENT_KIND_ARCHIVE, db_int(id)?, "birth"),
+        ParentRef::PeerBirth(peer) => (PARENT_KIND_PEER_BIRTH, db_index(peer)?, "birth"),
+        ParentRef::PeerLearned(peer) => (PARENT_KIND_PEER_LEARNED, db_index(peer)?, "learned"),
+    })
+}
+
+/// Writes the boundary row and candidate rows of one frame.
+fn insert_boundary(
+    tx: &Connection,
+    run_id: i64,
+    tick: u64,
+    record: &BoundaryRecord,
+) -> Result<(), StoreError> {
+    let tick = db_int(tick)?;
+    match &record.detail {
+        BoundaryDetail::Replaced {
+            candidates,
+            slot,
+            reason,
+            tiebreak,
+            parent,
+            parent_draw,
+            ..
+        } => {
+            let reason = match reason {
+                ReplaceReason::Death => REASON_DEATH,
+                ReplaceReason::Underperformer => REASON_UNDERPERFORMER,
+            };
+            let pool = serde_json::to_string(&tiebreak.pool)?;
+            let (kind, reference, state) = parent_columns(*parent)?;
+            let (pool_len, draw_index) = match parent_draw {
+                Some(draw) => (
+                    Some(db_index(draw.pool_len)?),
+                    Some(db_index(draw.drawn_index)?),
+                ),
+                None => (None, None),
+            };
+            let diff: Vec<serde_json::Value> = record
+                .config_diff
+                .iter()
+                .map(|d| json!({"field": d.field, "parent": d.parent, "newborn": d.newborn}))
+                .collect();
+            let diff = serde_json::to_string(&diff)?;
+            tx.execute(
+                "INSERT INTO supervisor_boundary
+                    (run_id, tick, outcome, slot, reason, tiebreak_pool, tiebreak_index,
+                     parent_kind, parent_ref, parent_state, parent_pool_len, parent_index,
+                     retired_occupant, retired_lifespan_ticks, newborn_occupant, config_diff)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    run_id,
+                    tick,
+                    EVENT_REPLACE,
+                    db_index(*slot)?,
+                    reason,
+                    pool,
+                    db_index(tiebreak.drawn_index)?,
+                    kind,
+                    reference,
+                    state,
+                    pool_len,
+                    draw_index,
+                    replaced_retired(&record.detail)?,
+                    record.retired_lifespan_ticks.map(db_int).transpose()?,
+                    record.newborn_occupant.map(db_int).transpose()?,
+                    diff
+                ],
+            )?;
+            for standing in candidates {
+                let (score, median) = match standing.ground {
+                    EligibilityGround::Death => (None, None),
+                    EligibilityGround::BelowMedian { score, median } => (
+                        finite_real(f64::from(score)),
+                        finite_real(f64::from(median)),
+                    ),
+                    _ => continue,
+                };
+                tx.execute(
+                    "INSERT INTO supervisor_boundary_candidate
+                        (run_id, tick, slot, occupant_id, ground, score, median, age_ticks)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        run_id,
+                        tick,
+                        db_index(standing.slot)?,
+                        db_int(standing.occupant_id)?,
+                        ground_text(&standing.ground),
+                        score,
+                        median,
+                        db_int(standing.age_ticks)?
+                    ],
+                )?;
+            }
+        }
+        BoundaryDetail::Idle { reason, .. } => {
+            tx.execute(
+                "INSERT INTO supervisor_boundary
+                    (run_id, tick, outcome, idle_too_young, idle_no_full_window,
+                     idle_no_peer_median, idle_at_or_above_median)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    run_id,
+                    tick,
+                    EVENT_IDLE,
+                    db_index(reason.too_young)?,
+                    db_index(reason.no_full_window)?,
+                    db_index(reason.no_peer_median)?,
+                    db_index(reason.at_or_above_median)?
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The retired occupant of a replaced boundary, NULL for an idle one.
+fn replaced_retired(detail: &BoundaryDetail) -> Result<Option<i64>, StoreError> {
+    match detail {
+        BoundaryDetail::Replaced {
+            retired_occupant, ..
+        } => Ok(Some(db_int(*retired_occupant)?)),
+        BoundaryDetail::Idle { .. } => Ok(None),
+    }
 }
 
 /// A `u64` as a database integer.
@@ -491,6 +722,102 @@ impl SupervisorStore {
         Ok(())
     }
 
+    /// Writes one telemetry frame in one transaction.
+    ///
+    /// A frame that is not marked for persistence writes nothing. A key that
+    /// is already stored is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when a value is out of range, serialisation
+    /// fails or a statement fails.
+    pub fn record_telemetry(&mut self, frame: &TelemetryFrame) -> Result<(), StoreError> {
+        if !frame.persist {
+            return Ok(());
+        }
+        let run_id = self.run_id;
+        let tick = db_int(frame.tick)?;
+        let tx = self.db.transaction()?;
+        for standing in &frame.slots {
+            let parent = standing.parent.map(parent_columns).transpose()?;
+            tx.execute(
+                "INSERT INTO supervisor_slot_snapshot
+                    (run_id, tick, slot, occupant_id, age_ticks, alive, meals, deaths,
+                     window_score, peer_median, ground, parent_kind, parent_ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    run_id,
+                    tick,
+                    db_index(standing.slot)?,
+                    db_int(standing.occupant_id)?,
+                    db_int(standing.age_ticks)?,
+                    i64::from(standing.alive),
+                    i64::from(standing.meals),
+                    i64::from(standing.deaths),
+                    standing
+                        .window_score
+                        .and_then(|v| finite_real(f64::from(v))),
+                    standing.peer_median.and_then(|v| finite_real(f64::from(v))),
+                    ground_text(&standing.ground),
+                    parent.map(|p| p.0),
+                    parent.map(|p| p.1)
+                ],
+            )?;
+        }
+        if let Some(record) = &frame.boundary {
+            insert_boundary(&tx, run_id, frame.tick, record)?;
+        }
+        for point in &frame.series {
+            tx.execute(
+                "INSERT INTO supervisor_series (run_id, tick, metric, value)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    run_id,
+                    db_int(point.tick)?,
+                    point.metric.as_str(),
+                    finite_real(point.value)
+                ],
+            )?;
+        }
+        for row in &frame.intake {
+            tx.execute(
+                "INSERT INTO supervisor_occupant_intake
+                    (run_id, occupant_id, age_ticks, slot, meals)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    run_id,
+                    db_int(row.occupant_id)?,
+                    db_int(row.age_ticks)?,
+                    db_index(row.slot)?,
+                    i64::from(row.meals)
+                ],
+            )?;
+        }
+        let progress = &frame.progress;
+        let nourishing = progress
+            .nourishing
+            .map(|kind| serde_json::to_string(&kind))
+            .transpose()?;
+        tx.execute(
+            "INSERT INTO supervisor_progress
+                (run_id, tick, total_ticks, agent_tick_budget, ticks_to_boundary,
+                 nourishing_kind, next_flip_tick, ticks_per_second)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                db_int(progress.tick)?,
+                progress.total_ticks.map(db_int).transpose()?,
+                db_int(progress.agent_tick_budget)?,
+                db_int(progress.ticks_to_boundary)?,
+                nourishing,
+                progress.next_flip_tick.map(db_int).transpose()?,
+                progress.ticks_per_second.and_then(finite_real)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Records the cumulative simulation ticks of the run.
     ///
     /// # Errors
@@ -736,6 +1063,403 @@ mod tests {
             1,
         )
         .unwrap();
+    }
+
+    /// Tables the telemetry schema adds.
+    const TELEMETRY_TABLES: [&str; 6] = [
+        "supervisor_slot_snapshot",
+        "supervisor_boundary",
+        "supervisor_boundary_candidate",
+        "supervisor_series",
+        "supervisor_occupant_intake",
+        "supervisor_progress",
+    ];
+
+    fn row_count(db: &Connection, table: &str) -> i64 {
+        db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Age in ticks of every fixture standing.
+    const TEST_STANDING_AGE_TICKS: u64 = 500;
+    /// Meal count of every fixture standing and intake row.
+    const TEST_STANDING_MEALS: u32 = 3;
+    /// Peer median of every fixture standing and below/above-median ground.
+    const TEST_PEER_MEDIAN: f32 = 0.5;
+    /// Score of the fixture candidate below the median.
+    const TEST_LOW_SCORE: f32 = 0.1;
+    /// Score of the fixture candidate above the median.
+    const TEST_HIGH_SCORE: f32 = 0.9;
+    /// Window score of the fixture slot snapshot.
+    const TEST_SNAPSHOT_SCORE: f32 = 0.2;
+    /// Tick of the fixture frame holding a replacement boundary.
+    const TEST_REPLACE_TICK: u64 = 100;
+    /// Tick of the fixture frame holding an idle boundary.
+    const TEST_IDLE_TICK: u64 = 200;
+    /// Tick of the fixture frame that is not persisted.
+    const TEST_SKIPPED_TICK: u64 = 300;
+    /// Occupant id of the fixture slot zero occupant.
+    const TEST_OCCUPANT_A: u64 = 10;
+    /// Occupant id of the fixture slot one occupant.
+    const TEST_OCCUPANT_B: u64 = 11;
+    /// Occupant id of the fixture slot two occupant.
+    const TEST_OCCUPANT_C: u64 = 12;
+    /// Occupant id of the fixture newborn.
+    const TEST_NEWBORN: u64 = 20;
+    /// Agent tick budget of the fixture progress record.
+    const TEST_TICK_BUDGET: u64 = 1000;
+    /// Ticks to the next boundary in the fixture progress record.
+    const TEST_TICKS_TO_BOUNDARY: u64 = 10;
+    /// Series value of the fixture series point.
+    const TEST_SERIES_VALUE: f64 = 0.25;
+    /// Entry id of the fixture archive parent.
+    const TEST_PARENT_ENTRY: u64 = 4;
+    /// Peer slot of the fixture learned parent.
+    const TEST_PEER_SLOT: usize = 2;
+    /// Parent pool length of the fixture parent draw.
+    const TEST_POOL_LEN: usize = 3;
+    /// Retired lifespan in ticks of the fixture replacement.
+    const TEST_LIFESPAN: u64 = 100;
+    /// Idle counts of the fixture idle boundary, in field order.
+    const TEST_IDLE_COUNTS: [usize; 4] = [1, 2, 3, 4];
+    /// Value carried by the newborn side of the fixture config difference.
+    const TEST_NEWBORN_FIELD_VALUE: u64 = 2;
+    /// Occupant id hand-inserted into the pre-existing slot row of the migration test.
+    const TEST_MIGRATION_OCCUPANT: i64 = 5;
+    /// Tick hand-inserted into the pre-existing event row of the migration test.
+    const TEST_MIGRATION_EVENT_TICK: i64 = 9;
+    /// Number of candidate rows a replaced boundary with one death and one below-median standing writes.
+    const TEST_CANDIDATE_ROWS: i64 = 2;
+
+    fn standing(
+        slot: usize,
+        occupant_id: u64,
+        ground: EligibilityGround,
+        window_score: Option<f32>,
+    ) -> crate::supervisor::SlotStanding {
+        crate::supervisor::SlotStanding {
+            slot,
+            occupant_id,
+            age_ticks: TEST_STANDING_AGE_TICKS,
+            alive: true,
+            meals: TEST_STANDING_MEALS,
+            deaths: 1,
+            window_score,
+            peer_median: Some(TEST_PEER_MEDIAN),
+            ground,
+            parent: Some(ParentRef::PeerLearned(TEST_PEER_SLOT)),
+        }
+    }
+
+    fn progress(tick: u64) -> crate::supervisor_telemetry::ProgressRecord {
+        crate::supervisor_telemetry::ProgressRecord {
+            tick,
+            total_ticks: None,
+            agent_tick_budget: TEST_TICK_BUDGET,
+            ticks_to_boundary: TEST_TICKS_TO_BOUNDARY,
+            nourishing: Some(FoodKind::First),
+            next_flip_tick: None,
+            ticks_per_second: Some(f64::NAN),
+        }
+    }
+
+    fn frame(tick: u64, persist: bool) -> TelemetryFrame {
+        use crate::supervisor::{IdleReason, TieBreak};
+        use crate::supervisor_telemetry::{ConfigFieldDiff, IntakeRow, Metric, SeriesPoint};
+        let boundary = if tick == TEST_REPLACE_TICK {
+            BoundaryRecord {
+                detail: BoundaryDetail::Replaced {
+                    tick,
+                    candidates: vec![
+                        standing(0, TEST_OCCUPANT_A, EligibilityGround::Death, None),
+                        standing(
+                            1,
+                            TEST_OCCUPANT_B,
+                            EligibilityGround::BelowMedian {
+                                score: TEST_LOW_SCORE,
+                                median: TEST_PEER_MEDIAN,
+                            },
+                            Some(TEST_LOW_SCORE),
+                        ),
+                        standing(
+                            TEST_PEER_SLOT,
+                            TEST_OCCUPANT_C,
+                            EligibilityGround::AtOrAboveMedian {
+                                score: TEST_HIGH_SCORE,
+                                median: TEST_PEER_MEDIAN,
+                            },
+                            Some(TEST_HIGH_SCORE),
+                        ),
+                    ],
+                    slot: 0,
+                    reason: ReplaceReason::Death,
+                    tiebreak: TieBreak {
+                        pool: vec![0, 1],
+                        drawn_index: 0,
+                    },
+                    parent: ParentRef::ArchiveEntry(TEST_PARENT_ENTRY),
+                    parent_draw: Some(crate::supervisor::ParentDraw {
+                        pool_len: TEST_POOL_LEN,
+                        drawn_index: 1,
+                    }),
+                    retired_occupant: TEST_OCCUPANT_A,
+                    retired_born_tick: 0,
+                },
+                newborn_occupant: Some(TEST_NEWBORN),
+                config_diff: vec![ConfigFieldDiff {
+                    field: "a".to_string(),
+                    parent: json!(1),
+                    newborn: json!(TEST_NEWBORN_FIELD_VALUE),
+                }],
+                retired_lifespan_ticks: Some(TEST_LIFESPAN),
+            }
+        } else {
+            BoundaryRecord {
+                detail: BoundaryDetail::Idle {
+                    tick,
+                    standings: Vec::new(),
+                    reason: IdleReason {
+                        too_young: TEST_IDLE_COUNTS[0],
+                        no_full_window: TEST_IDLE_COUNTS[1],
+                        no_peer_median: TEST_IDLE_COUNTS[2],
+                        at_or_above_median: TEST_IDLE_COUNTS[3],
+                    },
+                },
+                newborn_occupant: None,
+                config_diff: Vec::new(),
+                retired_lifespan_ticks: None,
+            }
+        };
+        TelemetryFrame {
+            tick,
+            slots: vec![standing(
+                0,
+                TEST_OCCUPANT_A,
+                EligibilityGround::TooYoung,
+                Some(TEST_SNAPSHOT_SCORE),
+            )],
+            boundary: Some(boundary),
+            series: vec![SeriesPoint {
+                tick,
+                metric: Metric::FoodPerAgentTick,
+                value: TEST_SERIES_VALUE,
+            }],
+            intake: vec![IntakeRow {
+                occupant_id: TEST_OCCUPANT_A,
+                slot: 0,
+                age_ticks: tick,
+                meals: TEST_STANDING_MEALS,
+            }],
+            progress: progress(tick),
+            persist,
+        }
+    }
+
+    #[test]
+    fn telemetry_migration_keeps_old_rows_and_adds_tables_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "old.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(STORE_PRAGMAS).unwrap();
+        init_schema(&db).unwrap();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS supervisor_slot (
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            slot INTEGER NOT NULL,
+            occupant_id INTEGER NOT NULL,
+            born_tick INTEGER NOT NULL,
+            config_json TEXT NOT NULL,
+            birth_brain BLOB NOT NULL,
+            PRIMARY KEY (run_id, slot)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_archive (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            entry_id INTEGER NOT NULL,
+            occupant_id INTEGER NOT NULL,
+            born_tick INTEGER NOT NULL,
+            retired_tick INTEGER NOT NULL,
+            outcome REAL NOT NULL,
+            config_json TEXT NOT NULL,
+            birth_brain BLOB NOT NULL,
+            UNIQUE (run_id, entry_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_event (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES run(id),
+            tick INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            slot INTEGER,
+            reason TEXT,
+            occupant_id INTEGER,
+            parent_kind TEXT,
+            parent_ref INTEGER,
+            outcome REAL,
+            nourishing_kind TEXT
+        );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO run (seed, governor_config, brain_config, world_config, mode)
+             VALUES (1, '{}', '{}', '{}', 'supervisor')",
+            [],
+        )
+        .unwrap();
+        let run_id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO supervisor_slot VALUES (?1, 0, ?2, 6, 'c', X'00')",
+            params![run_id, TEST_MIGRATION_OCCUPANT],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO supervisor_archive
+                (run_id, entry_id, occupant_id, born_tick, retired_tick, outcome,
+                 config_json, birth_brain)
+             VALUES (?1, 1, 2, 3, 4, 0.5, 'c', X'00')",
+            params![run_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO supervisor_event (run_id, tick, kind) VALUES (?1, ?2, 'idle')",
+            params![run_id, TEST_MIGRATION_EVENT_TICK],
+        )
+        .unwrap();
+        ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        for table in ["supervisor_slot", "supervisor_archive", "supervisor_event"] {
+            assert_eq!(row_count(&db, table), 1, "{table}");
+        }
+        let occupant: i64 = db
+            .query_row("SELECT occupant_id FROM supervisor_slot", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(occupant, TEST_MIGRATION_OCCUPANT);
+        let tick: i64 = db
+            .query_row("SELECT tick FROM supervisor_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tick, TEST_MIGRATION_EVENT_TICK);
+        for table in TELEMETRY_TABLES {
+            let tables: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 1, "{table}");
+            let notnull: i64 = db
+                .query_row(
+                    &format!("SELECT \"notnull\" FROM pragma_table_info('{table}') WHERE name = 'run_id'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(notnull, 1, "{table}");
+            let fk: i64 = db
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_foreign_key_list('{table}')
+                         WHERE \"table\" = 'run' AND \"from\" = 'run_id' AND \"to\" = 'id'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fk, 1, "{table}");
+        }
+    }
+
+    #[test]
+    fn telemetry_writer_round_trips_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "telemetry.db");
+        let mut store = SupervisorStore::create(&path, &supervisor_config()).unwrap();
+        store
+            .record_telemetry(&frame(TEST_REPLACE_TICK, true))
+            .unwrap();
+        assert_eq!(
+            row_count(&store.db, "supervisor_boundary_candidate"),
+            TEST_CANDIDATE_ROWS
+        );
+        assert_eq!(row_count(&store.db, "supervisor_slot_snapshot"), 1);
+        let outcome: String = store
+            .db
+            .query_row("SELECT outcome FROM supervisor_boundary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(outcome, "replace");
+        let ground: String = store
+            .db
+            .query_row(
+                "SELECT ground FROM supervisor_boundary_candidate WHERE slot = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ground, "death");
+        store
+            .record_telemetry(&frame(TEST_IDLE_TICK, true))
+            .unwrap();
+        let (idle, diff): (i64, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT idle_too_young, config_diff FROM supervisor_boundary WHERE tick = ?1",
+                params![i64::try_from(TEST_IDLE_TICK).unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(idle, 1);
+        assert!(diff.is_none());
+        assert_eq!(
+            row_count(&store.db, "supervisor_boundary_candidate"),
+            TEST_CANDIDATE_ROWS
+        );
+        let before: Vec<i64> = TELEMETRY_TABLES
+            .iter()
+            .map(|t| row_count(&store.db, t))
+            .collect();
+        store
+            .record_telemetry(&frame(TEST_SKIPPED_TICK, false))
+            .unwrap();
+        let after: Vec<i64> = TELEMETRY_TABLES
+            .iter()
+            .map(|t| row_count(&store.db, t))
+            .collect();
+        assert_eq!(before, after);
+        assert!(store
+            .record_telemetry(&frame(TEST_REPLACE_TICK, true))
+            .is_err());
+        let after_error: Vec<i64> = TELEMETRY_TABLES
+            .iter()
+            .map(|t| row_count(&store.db, t))
+            .collect();
+        assert_eq!(before, after_error);
+    }
+
+    #[test]
+    fn telemetry_nan_score_is_stored_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "nan.db");
+        let mut store = SupervisorStore::create(&path, &supervisor_config()).unwrap();
+        let mut nan_frame = frame(TEST_IDLE_TICK, true);
+        nan_frame.slots = vec![standing(
+            0,
+            TEST_OCCUPANT_A,
+            EligibilityGround::TooYoung,
+            Some(f32::NAN),
+        )];
+        store.record_telemetry(&nan_frame).unwrap();
+        let score: Option<f64> = store
+            .db
+            .query_row(
+                "SELECT window_score FROM supervisor_slot_snapshot",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(score.is_none());
     }
 
     #[test]

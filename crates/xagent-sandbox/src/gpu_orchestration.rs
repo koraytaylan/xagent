@@ -229,6 +229,9 @@ impl App {
                 }
                 // Plain snapshots are folded into latest-wins above.
                 SimEvent::Snapshot(_) => {}
+                // The observatory consumes these.
+                SimEvent::SupervisorTelemetry(_) => {}
+                SimEvent::SupervisorBoundary(_) => {}
                 SimEvent::SupervisorSample(report) => {
                     if let Some(sup) = self.evo_snapshot.supervisor.as_mut() {
                         sup.apply(&report);

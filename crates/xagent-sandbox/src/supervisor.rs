@@ -258,7 +258,7 @@ fn cell_count(len: usize) -> u32 {
 }
 
 /// Median of the values; the mean of the middle two when the count is even.
-fn median(mut values: Vec<f32>) -> Option<f32> {
+pub(crate) fn median(mut values: Vec<f32>) -> Option<f32> {
     if values.is_empty() {
         return None;
     }
@@ -282,6 +282,8 @@ pub struct SlotLedger {
     pub birth_brain: AgentBrainState,
     /// The heritable configuration the occupant was born with.
     pub config: BrainConfig,
+    /// Where the occupant's parent came from; `None` for initial occupants.
+    pub parent: Option<ParentRef>,
     pending_death: bool,
     window_len: usize,
     window: VecDeque<SlotCounters>,
@@ -307,6 +309,7 @@ impl SlotLedger {
             born_tick,
             birth_brain,
             config,
+            parent: None,
             pending_death: false,
             window_len,
             window,
@@ -398,26 +401,134 @@ pub enum ReplaceReason {
     Underperformer,
 }
 
-/// Slots eligible at a boundary: death-eligible and underperformers, each in
-/// slot order.
-fn eligible_slots(
+/// Why a slot stands where it does at a boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EligibilityGround {
+    /// The occupant died since it was born.
+    Death,
+    /// The window score is below the peer median.
+    BelowMedian {
+        /// The slot's window score.
+        score: f32,
+        /// Median of the peers' window scores.
+        median: f32,
+    },
+    /// The occupant is younger than the minimum age.
+    TooYoung,
+    /// The score window is not yet full.
+    NoFullWindow,
+    /// No peer has a finite window score.
+    NoPeerMedian,
+    /// The window score is at or above the peer median.
+    AtOrAboveMedian {
+        /// The slot's window score.
+        score: f32,
+        /// Median of the peers' window scores.
+        median: f32,
+    },
+}
+
+/// The standing of one slot at a tick.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotStanding {
+    /// Slot index.
+    pub slot: usize,
+    /// Occupant of the slot.
+    pub occupant_id: u64,
+    /// Ticks the occupant has lived.
+    pub age_ticks: u64,
+    /// Whether the occupant is alive in the latest sample.
+    pub alive: bool,
+    /// Meals in the occupant's life per the latest sample; 0 before a sample.
+    pub meals: u32,
+    /// Deaths in the occupant's life per the latest sample; 0 before a sample.
+    pub deaths: u32,
+    /// Score over a full window, when there is one.
+    pub window_score: Option<f32>,
+    /// Median of the peers' finite window scores, when there is one.
+    pub peer_median: Option<f32>,
+    /// The ground the slot stands on.
+    pub ground: EligibilityGround,
+    /// Where the occupant's parent came from.
+    pub parent: Option<ParentRef>,
+}
+
+/// The tie-break draw among equally eligible slots.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TieBreak {
+    /// The slots drawn from, in slot order.
+    pub pool: Vec<usize>,
+    /// Index into the pool that was drawn.
+    pub drawn_index: usize,
+}
+
+/// A parent draw from the archive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParentDraw {
+    /// Number of archive entries drawn from.
+    pub pool_len: usize,
+    /// Index into the archive that was drawn.
+    pub drawn_index: usize,
+}
+
+/// Counts of slots by the ground that kept a boundary idle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdleReason {
+    /// Slots younger than the minimum age.
+    pub too_young: usize,
+    /// Slots without a full window.
+    pub no_full_window: usize,
+    /// Slots with no finite peer median.
+    pub no_peer_median: usize,
+    /// Slots at or above the peer median.
+    pub at_or_above_median: usize,
+}
+
+/// Everything a boundary looked at and decided.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundaryDetail {
+    /// A slot was chosen for replacement.
+    Replaced {
+        /// Boundary tick.
+        tick: u64,
+        /// Standings of every slot that was a candidate.
+        candidates: Vec<SlotStanding>,
+        /// Slot replaced.
+        slot: usize,
+        /// Why it was replaced.
+        reason: ReplaceReason,
+        /// The tie-break draw.
+        tiebreak: TieBreak,
+        /// Parent of the newborn.
+        parent: ParentRef,
+        /// The archive draw, when the parent came from the archive.
+        parent_draw: Option<ParentDraw>,
+        /// Occupant retired.
+        retired_occupant: u64,
+        /// Tick the retired occupant was born.
+        retired_born_tick: u64,
+    },
+    /// No slot was eligible.
+    Idle {
+        /// Boundary tick.
+        tick: u64,
+        /// Standings of every slot.
+        standings: Vec<SlotStanding>,
+        /// Counts by ground.
+        reason: IdleReason,
+    },
+}
+
+/// One standing per slot plus the death-eligible and underperforming slots,
+/// each list in slot order.
+fn eligibility_pass(
     slots: &[SlotLedger],
     tick: u64,
     config: &SupervisorConfig,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<usize>, Vec<SlotStanding>) {
     let scores: Vec<Option<f32>> = slots.iter().map(SlotLedger::full_window_score).collect();
-    let (mut deaths, mut under) = (Vec::new(), Vec::new());
+    let (mut deaths, mut under, mut standings) = (Vec::new(), Vec::new(), Vec::new());
     for (index, slot) in slots.iter().enumerate() {
-        if slot.pending_death {
-            deaths.push(index);
-            continue;
-        }
-        let Some(own) = scores[index] else {
-            continue;
-        };
-        if slot.age(tick) < config.min_age_ticks {
-            continue;
-        }
         let peers: Vec<f32> = scores
             .iter()
             .enumerate()
@@ -425,15 +536,64 @@ fn eligible_slots(
             .filter_map(|(_, score)| *score)
             .filter(|score| !score.is_nan())
             .collect();
-        if median(peers).is_some_and(|middle| own < middle) {
-            under.push(index);
-        }
+        let peer_median = median(peers);
+        let own = scores[index];
+        let ground = if slot.pending_death {
+            deaths.push(index);
+            EligibilityGround::Death
+        } else if let Some(own) = own {
+            if slot.age(tick) < config.min_age_ticks {
+                EligibilityGround::TooYoung
+            } else if let Some(middle) = peer_median {
+                if own < middle {
+                    under.push(index);
+                    EligibilityGround::BelowMedian {
+                        score: own,
+                        median: middle,
+                    }
+                } else {
+                    EligibilityGround::AtOrAboveMedian {
+                        score: own,
+                        median: middle,
+                    }
+                }
+            } else {
+                EligibilityGround::NoPeerMedian
+            }
+        } else {
+            EligibilityGround::NoFullWindow
+        };
+        let latest = slot.window.back();
+        standings.push(SlotStanding {
+            slot: index,
+            occupant_id: slot.occupant_id,
+            age_ticks: slot.age(tick),
+            alive: latest.is_some_and(|s| s.alive),
+            meals: latest.and_then(|s| count_u32(s.food)).unwrap_or(0),
+            deaths: latest.and_then(|s| count_u32(s.deaths)).unwrap_or(0),
+            window_score: own,
+            peer_median,
+            ground,
+            parent: slot.parent,
+        });
     }
+    (deaths, under, standings)
+}
+
+/// Slots eligible at a boundary: death-eligible and underperformers, each in
+/// slot order.
+fn eligible_slots(
+    slots: &[SlotLedger],
+    tick: u64,
+    config: &SupervisorConfig,
+) -> (Vec<usize>, Vec<usize>) {
+    let (deaths, under, _) = eligibility_pass(slots, tick, config);
     (deaths, under)
 }
 
 /// Picks the slot to replace: death-eligible first, else underperformers, with
-/// exactly one draw when any candidate exists.
+/// exactly one draw when any candidate exists. The drawn index is the position
+/// of the returned slot in the chosen pool, which holds distinct slots.
 fn choose_candidate(
     deaths: &[usize],
     under: &[usize],
@@ -446,7 +606,8 @@ fn choose_candidate(
     } else {
         return None;
     };
-    Some((pool[rng.random_range(0..pool.len())], reason))
+    let drawn = rng.random_range(0..pool.len());
+    Some((pool[drawn], reason))
 }
 
 /// One retired life held by the archive.
@@ -590,6 +751,8 @@ pub struct ReplacementOutcome {
     pub newborn_brain: AgentBrainState,
     /// The newborn's heritable configuration.
     pub newborn_config: BrainConfig,
+    /// The parent's configuration, before mutation.
+    pub parent_config: BrainConfig,
     /// Occupant id given to the newborn.
     pub occupant_id: u64,
     /// The retired occupant's archive entry, when it was admitted.
@@ -623,6 +786,8 @@ pub struct Supervisor {
     next_tick: u64,
     next_occupant: u64,
     retired: Option<RetiredSlot>,
+    parent_draw: Option<ParentDraw>,
+    last_boundary: Option<BoundaryDetail>,
 }
 
 /// The archive admission of a retiring occupant, held until its replacement completes.
@@ -679,6 +844,8 @@ impl Supervisor {
             parent_rng: SmallRng::seed_from_u64(stream_seed(run_seed, PARENT_STREAM)),
             next_tick: SUPERVISOR_SAMPLE_TICKS,
             retired: None,
+            parent_draw: None,
+            last_boundary: None,
         })
     }
 
@@ -732,8 +899,38 @@ impl Supervisor {
         }
         self.boundary.advance();
         let (deaths, under) = eligible_slots(&self.slots, tick, &self.config);
+        let standings = eligibility_pass(&self.slots, tick, &self.config).2;
         let Some((slot, reason)) = choose_candidate(&deaths, &under, &mut self.tiebreak_rng) else {
+            let mut idle = IdleReason {
+                too_young: 0,
+                no_full_window: 0,
+                no_peer_median: 0,
+                at_or_above_median: 0,
+            };
+            for standing in &standings {
+                match standing.ground {
+                    EligibilityGround::TooYoung => idle.too_young += 1,
+                    EligibilityGround::NoFullWindow => idle.no_full_window += 1,
+                    EligibilityGround::NoPeerMedian => idle.no_peer_median += 1,
+                    EligibilityGround::AtOrAboveMedian { .. } => idle.at_or_above_median += 1,
+                    EligibilityGround::Death | EligibilityGround::BelowMedian { .. } => {}
+                }
+            }
+            self.last_boundary = Some(BoundaryDetail::Idle {
+                tick,
+                standings,
+                reason: idle,
+            });
             return Ok(SampleDecision::Idle);
+        };
+        let pool = if deaths.is_empty() { under } else { deaths };
+        let drawn_index = pool
+            .iter()
+            .position(|&s| s == slot)
+            .expect("chosen slot is in its pool");
+        let (retired_occupant, retired_born_tick) = {
+            let ledger = &self.slots[slot];
+            (ledger.occupant_id, ledger.born_tick)
         };
         // Retire first: the retiree joins the archive before the parent draw.
         let entry = self.entry_for(slot, tick);
@@ -744,6 +941,27 @@ impl Supervisor {
             evicted,
         });
         let parent = self.plan_parent(slot);
+        let parent_draw = self.parent_draw.take();
+        let candidates = standings
+            .into_iter()
+            .filter(|s| {
+                matches!(
+                    s.ground,
+                    EligibilityGround::Death | EligibilityGround::BelowMedian { .. }
+                )
+            })
+            .collect();
+        self.last_boundary = Some(BoundaryDetail::Replaced {
+            tick,
+            candidates,
+            slot,
+            reason,
+            tiebreak: TieBreak { pool, drawn_index },
+            parent,
+            parent_draw,
+            retired_occupant,
+            retired_born_tick,
+        });
         Ok(SampleDecision::Replace(ReplacementPlan {
             slot,
             reason,
@@ -752,10 +970,30 @@ impl Supervisor {
         }))
     }
 
+    /// Standing of every slot at `tick`, in slot order. Reads only; draws nothing.
+    pub fn standings(&self, tick: u64) -> Vec<SlotStanding> {
+        eligibility_pass(&self.slots, tick, &self.config).2
+    }
+
+    /// Detail of the most recent boundary, when one has passed.
+    pub fn last_boundary(&self) -> Option<&BoundaryDetail> {
+        self.last_boundary.as_ref()
+    }
+
+    /// Tick of the next boundary.
+    pub fn next_boundary_tick(&self) -> u64 {
+        self.boundary.next_tick()
+    }
+
     fn plan_parent(&mut self, slot: usize) -> ParentRef {
         match self.config.inheritance {
             Inheritance::Darwinian if !self.archive.is_empty() => {
-                let pick = self.parent_rng.random_range(0..self.archive.len());
+                let pool_len = self.archive.len();
+                let pick = self.parent_rng.random_range(0..pool_len);
+                self.parent_draw = Some(ParentDraw {
+                    pool_len,
+                    drawn_index: pick,
+                });
                 ParentRef::ArchiveEntry(self.archive.entries()[pick].entry_id)
             }
             Inheritance::Darwinian => ParentRef::PeerBirth(self.best_peer(slot)),
@@ -850,9 +1088,11 @@ impl Supervisor {
             newborn_config.clone(),
             window_len,
         );
+        self.slots[plan.slot].parent = Some(plan.parent);
         Ok(ReplacementOutcome {
             newborn_brain,
             newborn_config,
+            parent_config,
             occupant_id,
             archived,
             evicted,
@@ -1457,6 +1697,189 @@ mod tests {
                 .unwrap_err(),
             SupervisorError::LearnedStateUnexpected
         );
+    }
+
+    /// Tick at which the detail runs raise the fast slots' rate.
+    const RATE_SHIFT_TICK: u64 = 2000;
+    /// Tick from which the detail runs kill slot 1.
+    const DEATH_FROM_TICK: u64 = 6000;
+    /// Sample-driving limit of the detail runs.
+    const DETAIL_HORIZON: u64 = 14000;
+    /// Slot count of the detail runs.
+    const DETAIL_SLOTS: usize = 4;
+    /// Slot that dies late in the detail runs.
+    const DOOMED: usize = 1;
+    /// Rate of the fast slots after the shift.
+    const SHIFTED_RATE: u32 = 3;
+
+    /// One recorded step: the decision, the completed outcome and the archive.
+    type Step = (SampleDecision, Option<String>, String);
+
+    /// Drives a supervisor through many boundaries. With `query`, the three
+    /// read-only queries run after every sample and the boundary details seen
+    /// are counted with the checks of the detail contract applied.
+    fn detail_run(inheritance: Inheritance, query: bool) -> (Vec<Step>, usize, usize, usize) {
+        let mut sup = supervisor(inheritance, DETAIL_SLOTS);
+        let (mut steps, mut replaced, mut idle, mut archive_draws) = (Vec::new(), 0, 0, 0);
+        while sup.next_sample_tick() <= DETAIL_HORIZON {
+            let tick = sup.next_sample_tick();
+            let rates = if tick < RATE_SHIFT_TICK {
+                [1, 1, 1, 1]
+            } else {
+                [1, SHIFTED_RATE, SHIFTED_RATE, SHIFTED_RATE]
+            };
+            let dead: &[usize] = if tick >= DEATH_FROM_TICK {
+                &[DOOMED]
+            } else {
+                &[]
+            };
+            let counters = counters_at(tick, &rates, dead);
+            let boundary = query.then(|| sup.next_boundary_tick());
+            let decision = sup.record_sample(tick, &counters).expect("sample accepted");
+            if let Some(boundary) = boundary {
+                assert_eq!(
+                    tick == boundary,
+                    !matches!(decision, SampleDecision::Recorded)
+                );
+            }
+            let mut outcome = None;
+            if let SampleDecision::Replace(plan) = &decision {
+                if query && check_replaced(&sup, plan) {
+                    archive_draws += 1;
+                }
+                let learned = match plan.parent {
+                    ParentRef::PeerLearned(peer) => {
+                        Some(sup.slot(peer).expect("peer").birth_brain.clone())
+                    }
+                    _ => None,
+                };
+                let done = sup
+                    .complete_replacement(plan.clone(), tick, learned.as_ref())
+                    .expect("completes");
+                assert_eq!(sup.slot(plan.slot).expect("slot").parent, Some(plan.parent));
+                assert_eq!(
+                    sup.slot(plan.slot).expect("slot").occupant_id,
+                    done.occupant_id
+                );
+                outcome = Some(format!("{done:?}"));
+                replaced += 1;
+            }
+            if query {
+                let _ = sup.standings(tick);
+                let _ = sup.next_boundary_tick();
+                if let Some(BoundaryDetail::Idle {
+                    standings, reason, ..
+                }) = sup.last_boundary()
+                {
+                    if matches!(decision, SampleDecision::Idle) {
+                        let sum = reason.too_young
+                            + reason.no_full_window
+                            + reason.no_peer_median
+                            + reason.at_or_above_median;
+                        assert_eq!(sum, standings.len());
+                        assert_eq!(sum, DETAIL_SLOTS);
+                        idle += 1;
+                    }
+                }
+            }
+            steps.push((decision, outcome, format!("{:?}", sup.archive().entries())));
+        }
+        (steps, replaced, idle, archive_draws)
+    }
+
+    /// INV-4 checks for the `Replaced` detail just produced for `plan`;
+    /// returns whether the parent came from an archive draw.
+    fn check_replaced(sup: &Supervisor, plan: &ReplacementPlan) -> bool {
+        let Some(BoundaryDetail::Replaced {
+            candidates,
+            slot,
+            reason,
+            tiebreak,
+            parent,
+            parent_draw,
+            ..
+        }) = sup.last_boundary()
+        else {
+            panic!("replacement without a replaced detail");
+        };
+        assert_eq!(
+            (*slot, *reason, *parent),
+            (plan.slot, plan.reason, plan.parent)
+        );
+        assert_eq!(*slot, tiebreak.pool[tiebreak.drawn_index]);
+        if plan.tick >= DEATH_FROM_TICK {
+            let dead: Vec<_> = candidates
+                .iter()
+                .filter(|c| matches!(c.ground, EligibilityGround::Death))
+                .map(|c| c.slot)
+                .collect();
+            assert_eq!(dead, vec![DOOMED]);
+        }
+        for candidate in candidates {
+            match &candidate.ground {
+                EligibilityGround::BelowMedian { score, median } => assert!(score < median),
+                EligibilityGround::Death => {
+                    assert!(candidate.deaths >= 1);
+                    assert_eq!(candidate.slot, DOOMED);
+                }
+                other => panic!("unexpected candidate ground {other:?}"),
+            }
+        }
+        match (parent, parent_draw) {
+            (ParentRef::ArchiveEntry(id), Some(draw)) => {
+                assert_eq!(draw.pool_len, sup.archive().len());
+                assert_eq!(sup.archive().entries()[draw.drawn_index].entry_id, *id);
+                true
+            }
+            (ParentRef::ArchiveEntry(_), None) => panic!("archive parent without a draw"),
+            (_, draw) => {
+                assert!(draw.is_none());
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_detail_queries_do_not_change_decisions() {
+        for inheritance in [Inheritance::Darwinian, Inheritance::WeightCopy] {
+            let (quiet, replaced, _, _) = detail_run(inheritance, false);
+            let (queried, replaced_q, idle, archive_draws) = detail_run(inheritance, true);
+            if inheritance == Inheritance::Darwinian {
+                assert!(archive_draws >= 1, "no archive parent was checked");
+            }
+            assert!(replaced >= 3 && replaced == replaced_q);
+            assert!(idle >= 1);
+            assert_eq!(quiet, queried);
+        }
+    }
+
+    #[test]
+    fn standings_cover_every_slot_in_order() {
+        let mut sup = supervisor(Inheritance::Darwinian, DETAIL_SLOTS);
+        let tick = sup.next_sample_tick();
+        let before = sup.standings(tick);
+        assert_eq!(before.len(), DETAIL_SLOTS);
+        assert!(before.iter().enumerate().all(|(i, s)| s.slot == i));
+        assert!(before.iter().all(|s| s.parent.is_none() && !s.alive));
+        sup.record_sample(tick, &counters_at(tick, &[1, 1, 1, 1], &[]))
+            .expect("sample");
+        assert!(sup.last_boundary().is_none() || sup.next_boundary_tick() > tick);
+        assert!(sup.standings(tick).iter().all(|s| s.alive));
+    }
+
+    #[test]
+    fn boundary_detail_newborn_records_parent_and_parent_config() {
+        let mut sup = supervisor(Inheritance::Darwinian, CAPACITY);
+        let plan = drive(&mut sup, &[0, FAST, FAST], &[], HORIZON).expect("plan");
+        let ParentRef::ArchiveEntry(id) = plan.parent else {
+            panic!("the retiree is archived before the parent draw");
+        };
+        let expected = format!("{:?}", sup.archive().get(id).expect("entry").config);
+        let outcome = sup
+            .complete_replacement(plan.clone(), plan.tick, None)
+            .expect("completes");
+        assert_eq!(sup.slot(plan.slot).expect("slot").parent, Some(plan.parent));
+        assert_eq!(format!("{:?}", outcome.parent_config), expected);
     }
 
     fn sample(deaths: f32, food: f32, distance: f32, energy: f32, cell: u16) -> SlotCounters {

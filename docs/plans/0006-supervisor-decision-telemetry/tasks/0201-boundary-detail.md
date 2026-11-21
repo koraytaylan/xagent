@@ -6,8 +6,8 @@ kind: task
 role: developer
 depends_on: []
 gated: false
-status: todo
-merged_as: ""
+status: done
+merged_as: "922cbaf2bb99dd11ba8b73deac3bb143f502c824"
 touches:
   - crates/xagent-sandbox/src/supervisor.rs
 checks:
@@ -61,8 +61,13 @@ replacement outcome. Every random stream keeps its draw count and order.
   latest window sample (`alive` false and counters 0 before any sample; counters
   via `count_u32`, 0 when `None`); `window_score = full_window_score()`;
   `peer_median`; the ground; `parent` from the ledger.
-- `choose_candidate` keeps its single `random_range` draw and also returns the
-  drawn index into the chosen pool.
+- `choose_candidate` keeps its name, its `Option<(usize, ReplaceReason)>` return
+  (the existing tests destructure and compare it as that pair) and its single
+  `random_range` draw, and stays on the production decision path. The boundary
+  detail records the drawn index into the chosen pool as the chosen slot's
+  position in that pool, whose entries are distinct slots, so `slot ==
+  pool[drawn_index]` and no extra draw is made. `choose_candidate` is not
+  required to return the index.
 - `plan_parent(&mut self, slot: usize) -> ParentRef {` keeps this exact line
   (the plan preflight greps it). Only the archive draw (`Darwinian` with a
   non-empty archive) stores `ParentDraw { pool_len, drawn_index }` in a new
@@ -94,7 +99,7 @@ replacement outcome. Every random stream keeps its draw count and order.
    Change `median` to `pub(crate)`. The existing tests still compile unchanged.
 2. Add the six public types with doc comments. Add `eligibility_pass` in the
    ground order; make `eligible_slots` return the same two lists by delegating.
-   Make `choose_candidate` also return the drawn index.
+   Keep `choose_candidate`'s return type; record its drawn index as above.
 3. Add the private `parent_draw` and `last_boundary` fields, initialised in
    `Supervisor::new`. Record the archive draw in `plan_parent`, keeping its
    signature line.

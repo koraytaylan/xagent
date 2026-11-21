@@ -676,10 +676,10 @@ pub enum EvolutionMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Inheritance {
-    /// Mutated birth genome only.
-    #[default]
+    /// Selectable alternative: the newborn gets a mutated birth genome only.
     Darwinian,
-    /// Copy of a living agent's learned state (comparison arm only).
+    /// Default newborn inheritance: copy of a living agent's learned state.
+    #[default]
     WeightCopy,
 }
 
@@ -1224,6 +1224,31 @@ impl Default for AgentDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_inheritance_default_is_weight_copy() {
+        assert_eq!(Inheritance::default(), Inheritance::WeightCopy);
+    }
+
+    #[test]
+    fn supervisor_inheritance_omitted_json_is_weight_copy() {
+        let c = serde_json::from_str::<SupervisorConfig>("{}").unwrap();
+        assert_eq!(c.inheritance, Inheritance::WeightCopy);
+    }
+
+    #[test]
+    fn supervisor_inheritance_darwinian_json_selects_darwinian() {
+        let c = serde_json::from_str::<SupervisorConfig>(r#"{"inheritance":"darwinian"}"#).unwrap();
+        assert_eq!(c.inheritance, Inheritance::Darwinian);
+    }
+
+    #[test]
+    fn supervisor_inheritance_weight_copy_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Inheritance::WeightCopy).unwrap(),
+            "\"weight_copy\""
+        );
+    }
 
     #[test]
     fn supervisor_config_defaults_when_omitted() {

@@ -12,6 +12,7 @@ touches:
   - crates/xagent-sandbox/tests/archive_free_life.rs
   - crates/xagent-sandbox/tests/free_life.rs
   - crates/xagent-sandbox/tests/food_kind_free_life.rs
+  - crates/xagent-sandbox/tests/lesion_matrix_record.rs
 status: todo
 merged_as: ""
 checks:
@@ -59,14 +60,31 @@ imports `governor`.
   the `evolution_mode` assignment and the `EvolutionMode` import, the
   `champion_node_id` and `champion_generation` assertions and the two
   `champion_*` keys of the expected JSON. Every other test stays.
+- **`lesion_matrix_record.rs`.** This test only reads the frozen history record
+  `docs/measurements/trunk-lesions/lesion-matrix.json` and its `DECISION.md`,
+  which stay unedited (Non-goals). In `check_report` delete only the
+  `let champion = r.brain_source == "champion"` line and the
+  `r.champion_node_id` and `r.champion_generation` assertions, which read the
+  deleted report fields. `SOURCES` keeps `["fresh", "champion"]`,
+  `matrix_is_complete_and_finite` stays exactly as on the base, including its
+  existing total-count assertion
+  `assert_eq!(matrix.len(), SOURCES.len() * all_arms().len() * SEEDS.len())`
+  that requires all 48 recorded runs (the base never had a per-source
+  filter-and-count form there; do not introduce one), and the
+  verdict recomputation stays champion-inclusive as `DECISION.md` documents:
+  the `"champion"` string there is a label of historical recorded runs, not a
+  birth-brain source, so this file is outside `champion-free` and INV-7 (it
+  builds no Governor, runs no generation driver and ships no generation
+  database). Narrowing `SOURCES` or editing the measurement record is not
+  required and is out of scope.
 
 **Steps:**
 
 1. In `headless.rs` delete the champion source, constant, error variants,
    `Display` arms, birth branch, birth fields, report fields and governor
    imports, and set `fresh_brains: true` as in Decisions.
-2. In the three test files make the edits in Decisions.
+2. In the four test files make the edits in Decisions.
 3. Remove imports and helpers left unused, with no `#[allow(dead_code)]` and no
    planning reference in source.
 
-- **Done when:** `focused-proof` passes with the remaining `archive_free_life`, `free_life` and `food_kind_free_life` tests reported ok, and `headless-unit`, `champion-free` and `all-targets-compile` pass, proving no champion source or generation-database fixture survives in headless or its tests (INV-1, INV-7).
+- **Done when:** `focused-proof` passes with the remaining `archive_free_life`, `free_life` and `food_kind_free_life` tests reported ok, and `headless-unit`, `champion-free` and `all-targets-compile` pass, proving no champion source or generation-database fixture survives in headless or its tests (INV-1, INV-7); `lesion_matrix_record.rs` keeps its historical `"champion"` run labels as Decisions state, and `all-targets-compile` proves it compiles without the deleted report fields.

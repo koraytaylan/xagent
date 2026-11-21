@@ -143,6 +143,43 @@ pub enum EvolutionState {
     Running,
     /// Evolution is paused (user hit Pause).
     Paused,
+    /// A stored supervisor run was found; the user chooses resume or browse.
+    SupervisorSession,
+    /// A stored supervisor run is shown read-only.
+    BrowsingSupervisor,
+}
+
+/// Tab selected in the observatory panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObservatoryTab {
+    #[default]
+    Slots,
+    Boundaries,
+    Charts,
+    Learning,
+    Lineage,
+    Archive,
+    Timeline,
+}
+
+/// Per-view state of the observatory panel.
+#[derive(Clone, Debug, Default)]
+pub struct ObservatoryViewState {
+    pub tab: ObservatoryTab,
+    pub slots: crate::observatory::tables::SlotsViewState,
+    pub boundaries: crate::observatory::tables::BoundaryViewState,
+    pub learning: crate::observatory::plots::LearningViewState,
+    pub lineage: crate::observatory::history::LineageViewState,
+    pub timeline: crate::observatory::history::TimelineViewState,
+}
+
+/// The user's answer to the "Supervisor run found" dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionChoice {
+    #[default]
+    None,
+    ResumeLive,
+    Browse,
 }
 
 /// Actions the evolution tab can request from the main loop.
@@ -234,6 +271,16 @@ pub struct EvolutionSnapshot {
     pub gpu_storage_buffer_limit: u64,
     /// Supervisor session state; `None` outside supervisor mode.
     pub supervisor: Option<SupervisorSnapshot>,
+    /// Observatory model for the supervisor panel.
+    pub observatory: Option<crate::observatory::ObservatoryModel>,
+    /// View state of the observatory panel.
+    pub observatory_view: ObservatoryViewState,
+    /// Stored supervisor run offered by the session dialog.
+    pub supervisor_session: Option<crate::observatory::store_read::SupervisorRunSummary>,
+    /// Why a live resume failed, shown in the session dialog.
+    pub supervisor_resume_error: Option<String>,
+    /// The user's dialog choice.
+    pub session_choice: SessionChoice,
 }
 
 impl Default for EvolutionSnapshot {
@@ -270,7 +317,47 @@ impl Default for EvolutionSnapshot {
                 as u64)
                 .min(wgpu::Limits::default().max_buffer_size),
             supervisor: None,
+            observatory: None,
+            observatory_view: ObservatoryViewState::default(),
+            supervisor_session: None,
+            supervisor_resume_error: None,
+            session_choice: SessionChoice::None,
         }
+    }
+}
+
+/// Renders the observatory header, tab row and the selected view.
+pub fn render_observatory(
+    ui: &mut egui::Ui,
+    model: &crate::observatory::ObservatoryModel,
+    view: &mut ObservatoryViewState,
+) {
+    use crate::observatory::{history, plots, tables};
+    tables::show_header(ui, model);
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        let tabs = [
+            (ObservatoryTab::Slots, "Slots"),
+            (ObservatoryTab::Boundaries, "Boundaries"),
+            (ObservatoryTab::Charts, "Charts"),
+            (ObservatoryTab::Learning, "Learning"),
+            (ObservatoryTab::Lineage, "Lineage"),
+            (ObservatoryTab::Archive, "Archive"),
+            (ObservatoryTab::Timeline, "Timeline"),
+        ];
+        for (tab, label) in tabs {
+            ui.selectable_value(&mut view.tab, tab, label);
+        }
+    });
+    ui.separator();
+    match view.tab {
+        ObservatoryTab::Slots => tables::show_slots(ui, model, &mut view.slots),
+        ObservatoryTab::Boundaries => tables::show_boundaries(ui, model, &mut view.boundaries),
+        ObservatoryTab::Charts => plots::show_charts(ui, model),
+        ObservatoryTab::Learning => plots::show_learning(ui, model, &mut view.learning),
+        ObservatoryTab::Lineage => history::show_lineage(ui, model, &mut view.lineage),
+        ObservatoryTab::Archive => history::show_archive(ui, model),
+        ObservatoryTab::Timeline => history::show_timeline(ui, model, &mut view.timeline),
     }
 }
 
@@ -295,7 +382,7 @@ const MAX_VISION_PROBE_PIXELS: usize =
 /// The vision grid linearly inflates three per-agent storage buffers —
 /// `sensory_stride`, `brain_stride` (the raw-vision encoder input, when the
 /// visual cortex is off), and `brain_scratch_stride` — each bound as a single
-/// buffer of `population * stride * 4` bytes in `GpuKernel::new`. The tightest
+/// buffer of `population * stride * 4` bytes in the kernel constructor. The tightest
 /// of the three sets the ceiling. `storage_buffer_limit_bytes` is the kernel's
 /// effective single-buffer limit (`min(max_storage_buffer_binding_size,
 /// max_buffer_size)`), so a grid the editor allows can never exceed what the
@@ -1524,9 +1611,69 @@ impl<'a> TabContext<'a> {
             EvolutionState::Running | EvolutionState::Paused => {
                 Self::render_running_dashboard(ui, evo);
             }
+
+            EvolutionState::SupervisorSession => {
+                Self::render_session_dialog(ui, evo);
+            }
+
+            EvolutionState::BrowsingSupervisor => {
+                ui.label("Browsing a stored supervisor run (read-only).");
+                ui.add_space(8.0);
+                Self::render_observatory_for(ui, evo);
+            }
         }
 
         action
+    }
+
+    /// Maps a dialog button to the choice it records.
+    fn choice_for(resume_live: bool) -> SessionChoice {
+        if resume_live {
+            SessionChoice::ResumeLive
+        } else {
+            SessionChoice::Browse
+        }
+    }
+
+    fn render_session_dialog(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
+        ui.heading("Supervisor run found");
+        ui.add_space(8.0);
+        if let Some(run) = &evo.supervisor_session {
+            ui.label(format!("Run id: {}", run.run_id));
+            ui.label(format!("Last tick: {}", run.last_tick));
+            let budget = run
+                .budget_ticks
+                .map_or_else(|| "unlimited".to_string(), |t| t.to_string());
+            ui.label(format!("Budget: {budget}"));
+        }
+        if let Some(err) = &evo.supervisor_resume_error {
+            let mut end = err.len().min(crate::observatory::MAX_DISPLAY_TEXT_BYTES);
+            while !err.is_char_boundary(end) {
+                end -= 1;
+            }
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &err[..end]);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Resume live").clicked() {
+                evo.session_choice = Self::choice_for(true);
+            }
+            if ui.button("Browse read-only").clicked() {
+                evo.session_choice = Self::choice_for(false);
+            }
+        });
+    }
+
+    fn render_observatory_for(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
+        let local;
+        let model = match evo.observatory.as_ref() {
+            Some(model) => model,
+            None => {
+                local = crate::observatory::ObservatoryModel::default();
+                &local
+            }
+        };
+        render_observatory(ui, model, &mut evo.observatory_view);
     }
 
     fn render_config_editor(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
@@ -1906,28 +2053,8 @@ impl<'a> TabContext<'a> {
     }
 
     fn render_running_dashboard(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
-        if let Some(sup) = &evo.supervisor {
-            ui.label(egui::RichText::new("Supervisor").strong().size(13.0));
-            let total = sup
-                .total_ticks
-                .map_or_else(|| "unlimited".to_string(), |t| t.to_string());
-            ui.label(format!("Tick: {} / {}", sup.tick, total));
-            ui.label(format!("Replacements: {}", sup.replacements));
-            ui.label(format!(
-                "Last replacement: {}",
-                sup.last_replacement.as_deref().unwrap_or("none")
-            ));
-            let best = sup
-                .best_outcome
-                .map_or_else(|| "n/a".to_string(), |b| format!("{b:.3}"));
-            ui.label(format!("Archive: {} (best {})", sup.archive_len, best));
-            let kind = sup
-                .nourishing_kind
-                .map_or_else(|| "n/a".to_string(), |k| format!("{k:?}"));
-            ui.label(format!("Nourishing kind: {kind}"));
-            if sup.finished {
-                ui.label("Finished");
-            }
+        if evo.supervisor.is_some() {
+            Self::render_observatory_for(ui, evo);
             return;
         }
         // ── Fitness chart at top of tab (always visible) ────────
@@ -2557,6 +2684,71 @@ mod tests {
         }
     }
 
+    fn rendered_text(evo: &mut EvolutionSnapshot) -> String {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::TabContext::render_running_dashboard(ui, evo);
+            });
+        });
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                text.push_str(t.galley.text());
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn observatory_snapshot_default_has_no_observatory() {
+        let evo = EvolutionSnapshot::default();
+        assert!(evo.observatory.is_none());
+        assert!(evo.supervisor_session.is_none());
+        assert!(evo.supervisor_resume_error.is_none());
+        assert_eq!(evo.session_choice, super::SessionChoice::None);
+        assert_eq!(evo.observatory_view.tab, super::ObservatoryTab::Slots);
+    }
+
+    #[test]
+    fn observatory_dialog_buttons_set_session_choice() {
+        assert_eq!(
+            super::TabContext::choice_for(true),
+            super::SessionChoice::ResumeLive
+        );
+        assert_eq!(
+            super::TabContext::choice_for(false),
+            super::SessionChoice::Browse
+        );
+    }
+
+    #[test]
+    fn observatory_dashboard_renders_without_six_labels() {
+        let mut evo = EvolutionSnapshot {
+            supervisor: Some(SupervisorSnapshot::default()),
+            ..Default::default()
+        };
+        let text = rendered_text(&mut evo);
+        for prefix in [
+            "Replacements: ",
+            "Last replacement: ",
+            "Nourishing kind: ",
+            "Archive: ",
+        ] {
+            assert!(
+                !text.lines().any(|l| l.starts_with(prefix)),
+                "unexpected {prefix}"
+            );
+        }
+
+        let mut generation = EvolutionSnapshot::default();
+        generation
+            .fitness_history
+            .insert(0, vec![(0, 0.1, 0.1), (1, 0.2, 0.15)]);
+        assert!(rendered_text(&mut generation).contains("Island 0"));
+    }
+
     #[test]
     fn supervisor_snapshot_default_is_none() {
         assert!(EvolutionSnapshot::default().supervisor.is_none());
@@ -2618,7 +2810,7 @@ mod vision_cap_tests {
     use xagent_brain::buffers::BrainLayout;
     use xagent_shared::BrainConfig;
 
-    /// Recompute the per-agent buffer footprint the way `GpuKernel::new` sizes
+    /// Recompute the per-agent buffer footprint the way the kernel constructor sizes
     /// the storage buffers, so the test verifies against the real layout math
     /// rather than a duplicated formula.
     fn fits(pixels: usize, population: usize, cortex: bool, danger: bool, limit: u64) -> bool {

@@ -14,11 +14,50 @@ use rand::Rng;
 use xagent_brain::AgentBrainState;
 use xagent_sandbox::agent::{mutate_config, Agent, MAX_AGENTS};
 use xagent_sandbox::governor::{reset_database, AdvanceResult, Governor};
-use xagent_sandbox::ui::{EvolutionAction, EvolutionSnapshot, EvolutionState, SupervisorSnapshot};
+use xagent_sandbox::observatory::store_read::{load_run, SupervisorRunSummary};
+use xagent_sandbox::observatory::{ModelSource, ObservatoryModel};
+use xagent_sandbox::ui::{
+    EvolutionAction, EvolutionSnapshot, EvolutionState, SessionChoice, SupervisorSnapshot,
+};
 use xagent_shared::BrainConfig;
 
 use crate::app::{App, PendingGeneration};
 use crate::sim_runtime::{InheritedBrain, ResetRequest, SimCommand};
+
+/// Longest resume error shown in the session dialog, in bytes.
+const MAX_RESUME_ERROR_BYTES: usize = 256;
+
+/// `text` cut to at most [`MAX_RESUME_ERROR_BYTES`] on a char boundary.
+fn truncate_error(text: &str) -> String {
+    let mut end = text.len().min(MAX_RESUME_ERROR_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// Enter the read-only browse view of a loaded run; no worker starts.
+pub(crate) fn apply_browse_supervisor(snapshot: &mut EvolutionSnapshot, model: ObservatoryModel) {
+    snapshot.observatory = Some(model);
+    snapshot.state = EvolutionState::BrowsingSupervisor;
+    snapshot.supervisor = None;
+    snapshot.supervisor_session = None;
+    snapshot.supervisor_resume_error = None;
+}
+
+/// Return to the session dialog after a refused live resume.
+pub(crate) fn apply_resume_refusal(
+    snapshot: &mut EvolutionSnapshot,
+    message: &str,
+    summary: SupervisorRunSummary,
+) {
+    println!("[SUPERVISOR] Resume refused: {message}");
+    snapshot.supervisor = None;
+    snapshot.observatory = None;
+    snapshot.supervisor_resume_error = Some(truncate_error(message));
+    snapshot.supervisor_session = Some(summary);
+    snapshot.state = EvolutionState::SupervisorSession;
+}
 
 impl App {
     /// Spawn a new agent with the given BrainConfig at a safe random position
@@ -41,7 +80,73 @@ impl App {
         self.agents.push(agent);
     }
 
+    /// Act on the answer to the supervisor-run dialog, if one was given.
+    fn handle_session_choice(&mut self) {
+        let choice = std::mem::take(&mut self.evo_snapshot.session_choice);
+        if choice == SessionChoice::None {
+            return;
+        }
+        let Some(summary) = self.evo_snapshot.supervisor_session.clone() else {
+            return;
+        };
+        let loaded = load_run(&self.db_path, summary.run_id);
+        let mut model = match loaded {
+            Ok(model) => model,
+            Err(e) => {
+                self.evo_snapshot.supervisor_resume_error = Some(truncate_error(&e.to_string()));
+                self.log_msg(format!("[SUPERVISOR] Could not load run: {e}"));
+                return;
+            }
+        };
+        if choice == SessionChoice::Browse {
+            apply_browse_supervisor(&mut self.evo_snapshot, model);
+            self.log_msg("[SUPERVISOR] Browsing stored run".into());
+            return;
+        }
+        model.source = ModelSource::Live;
+        let gov_config = {
+            let mut config = self.evo_snapshot.edit_governor.clone();
+            config.evolution_mode = xagent_shared::EvolutionMode::Supervisor;
+            config
+        };
+        self.governor_config = gov_config;
+        self.brain_config = self.evo_snapshot.edit_brain.clone();
+        self.evo_snapshot.observatory = Some(model);
+        self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
+            total_ticks: summary.budget_ticks,
+            ..Default::default()
+        });
+        self.evo_snapshot.supervisor_session = None;
+        self.evo_snapshot.supervisor_resume_error = None;
+        self.supervisor_resume = Some(true);
+        self.resume_pending = Some(summary.clone());
+        self.evo_snapshot.state = EvolutionState::Running;
+        self.evo_wall_accumulated = 0.0;
+        self.session_tick_count = 0;
+        self.evo_wall_segment_start = Some(Instant::now());
+        self.tps_tick_count = 0;
+        self.tps_last_reset = Instant::now();
+        self.tps_display = 0.0;
+        self.paused = false;
+        self.stop_sim_worker();
+        self.spawn_evolution_population();
+        self.start_sim_worker();
+        if self.sim_runtime.is_none() {
+            self.resume_pending = None;
+            self.supervisor_resume = None;
+            apply_resume_refusal(
+                &mut self.evo_snapshot,
+                "the simulation worker did not start",
+                summary,
+            );
+            self.paused = true;
+            return;
+        }
+        self.log_msg("[SUPERVISOR] Resumed supervisor run".into());
+    }
+
     pub(crate) fn handle_evolution_action(&mut self, action: EvolutionAction) {
+        self.handle_session_choice();
         match action {
             EvolutionAction::None => {}
             EvolutionAction::Start => {
@@ -60,6 +165,10 @@ impl App {
                     self.evo_snapshot.state = EvolutionState::Running;
                     self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
                         total_ticks,
+                        ..Default::default()
+                    });
+                    self.evo_snapshot.observatory = Some(ObservatoryModel {
+                        source: ModelSource::Live,
                         ..Default::default()
                     });
                     self.evo_wall_accumulated = 0.0;
@@ -170,6 +279,9 @@ impl App {
                     self.log_msg(format!("[EVOLUTION] Failed to reset DB: {}", e));
                 }
                 self.evo_snapshot = EvolutionSnapshot::default();
+                self.evo_snapshot.observatory = None;
+                self.resume_pending = None;
+                self.supervisor_resume = None;
                 self.evo_snapshot.edit_brain = self.brain_config.clone();
                 self.evo_snapshot.edit_governor = self.governor_config.clone();
                 self.log_msg("[EVOLUTION] Reset — ready to start fresh".into());
@@ -490,5 +602,58 @@ impl App {
         );
 
         self.agents.push(child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_browse_supervisor, apply_resume_refusal, MAX_RESUME_ERROR_BYTES};
+    use xagent_sandbox::observatory::store_read::SupervisorRunSummary;
+    use xagent_sandbox::observatory::{ModelSource, ObservatoryModel};
+    use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, SupervisorSnapshot};
+
+    /// Run id of the sample summary.
+    const SAMPLE_RUN: i64 = 3;
+    /// Message length that exceeds the error cap.
+    const LONG_MESSAGE_BYTES: usize = 1000;
+
+    fn summary() -> SupervisorRunSummary {
+        SupervisorRunSummary {
+            run_id: SAMPLE_RUN,
+            last_tick: 0,
+            budget_ticks: None,
+        }
+    }
+
+    #[test]
+    fn observatory_session_browse_sets_state_without_worker() {
+        let mut snapshot = EvolutionSnapshot::default();
+        snapshot.supervisor = Some(SupervisorSnapshot::default());
+        snapshot.supervisor_session = Some(summary());
+        let model = ObservatoryModel {
+            source: ModelSource::Browse { run_id: SAMPLE_RUN },
+            ..Default::default()
+        };
+        apply_browse_supervisor(&mut snapshot, model);
+        assert_eq!(snapshot.state, EvolutionState::BrowsingSupervisor);
+        assert!(snapshot.supervisor.is_none());
+        assert!(snapshot.supervisor_session.is_none());
+        let model = snapshot.observatory.expect("model set");
+        assert_eq!(model.source, ModelSource::Browse { run_id: SAMPLE_RUN });
+    }
+
+    #[test]
+    fn observatory_session_resume_refusal_keeps_dialog() {
+        let mut snapshot = EvolutionSnapshot::default();
+        snapshot.supervisor = Some(SupervisorSnapshot::default());
+        snapshot.observatory = Some(ObservatoryModel::default());
+        let message = "e".repeat(LONG_MESSAGE_BYTES);
+        apply_resume_refusal(&mut snapshot, &message, summary());
+        assert_eq!(snapshot.state, EvolutionState::SupervisorSession);
+        assert!(snapshot.supervisor.is_none());
+        assert!(snapshot.observatory.is_none());
+        let error = snapshot.supervisor_resume_error.expect("error set");
+        assert!(error.len() <= MAX_RESUME_ERROR_BYTES);
+        assert_eq!(snapshot.supervisor_session, Some(summary()));
     }
 }

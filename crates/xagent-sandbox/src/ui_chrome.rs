@@ -69,6 +69,17 @@ pub(crate) fn draw_top_bar(
                 EvolutionState::Paused => {
                     ui.label(egui::RichText::new("⏸ PAUSED").color(egui::Color32::YELLOW));
                 }
+                EvolutionState::SupervisorSession => {
+                    ui.label(
+                        egui::RichText::new("Supervisor run found")
+                            .color(egui::Color32::from_rgb(100, 180, 255)),
+                    );
+                }
+                EvolutionState::BrowsingSupervisor => {
+                    ui.label(
+                        egui::RichText::new("Browsing (read-only)").color(egui::Color32::GRAY),
+                    );
+                }
             }
             if matches!(
                 state.evo_state,

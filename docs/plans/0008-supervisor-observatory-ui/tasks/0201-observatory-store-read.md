@@ -10,8 +10,8 @@ gated: false
 touches:
   - crates/xagent-sandbox/src/observatory/store_read.rs
   - crates/xagent-sandbox/tests/observatory_browse.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "84cab78be6b54a4453a0ba2c7c994b835ca612a5"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --test observatory_browse

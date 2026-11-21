@@ -6,6 +6,7 @@
 //! `render_pipeline`, `snapshot`) to keep each responsibility focused.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use winit::window::Window;
 
 use xagent_sandbox::agent::Agent;
 use xagent_sandbox::governor::{check_existing_session, AdvanceResult, Governor};
+use xagent_sandbox::observatory::store_read::{detect_supervisor_run, SupervisorRunSummary};
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, Renderer};
@@ -183,6 +185,11 @@ pub(crate) struct App {
     // Simulation worker — owns the GPU kernel and all simulation-cadence state.
     // `None` until evolution starts; recreated on Start/Resume, dropped on Reset.
     pub(crate) sim_runtime: Option<crate::sim_runtime::SimRuntime>,
+    /// Resume input for the next supervisor worker start; taken by the start.
+    pub(crate) supervisor_resume: Option<bool>,
+    /// Run a live resume started from, held until the first supervisor sample
+    /// so an early worker error can restore the session dialog.
+    pub(crate) resume_pending: Option<SupervisorRunSummary>,
     /// Latest food state published by the worker, authoritative for the food
     /// mesh and mini-map once a snapshot has arrived.
     pub(crate) cached_food_state: Option<Vec<f32>>,
@@ -216,6 +223,36 @@ pub(crate) struct App {
     pub(crate) replay_state: ReplayState,
 }
 
+/// What the database at startup holds.
+#[allow(clippy::large_enum_variant)] // Built once at startup.
+pub(crate) enum StartupSession {
+    /// A supervisor run; the user chooses to resume it live or browse it.
+    Supervisor(SupervisorRunSummary),
+    /// A generation-mode session.
+    Generation((u32, GovernorConfig, BrainConfig)),
+    /// No usable session.
+    None,
+}
+
+/// Classifies the database at `db_path` without creating or writing it.
+pub(crate) fn startup_session(db_path: &str) -> StartupSession {
+    // `check_existing_session` opens read-write, which would create the file.
+    if !Path::new(db_path).exists() {
+        return StartupSession::None;
+    }
+    match detect_supervisor_run(db_path) {
+        Ok(Some(summary)) => StartupSession::Supervisor(summary),
+        Err(e) => {
+            println!("[SUPERVISOR] Could not inspect {db_path}: {e}");
+            StartupSession::None
+        }
+        Ok(None) => match check_existing_session(db_path) {
+            Some(session) => StartupSession::Generation(session),
+            None => StartupSession::None,
+        },
+    }
+}
+
 impl App {
     pub(crate) fn new(
         brain_config: BrainConfig,
@@ -228,8 +265,16 @@ impl App {
         evo_snapshot.edit_brain = brain_config.clone();
         evo_snapshot.edit_governor = governor_config.clone();
 
-        match check_existing_session(db_path) {
-            Some((gen, prev_gov, prev_brain)) => {
+        match startup_session(db_path) {
+            StartupSession::Supervisor(summary) => {
+                println!(
+                    "[SUPERVISOR] Found supervisor run {} at tick {} in {}",
+                    summary.run_id, summary.last_tick, db_path
+                );
+                evo_snapshot.state = EvolutionState::SupervisorSession;
+                evo_snapshot.supervisor_session = Some(summary);
+            }
+            StartupSession::Generation((gen, prev_gov, prev_brain)) => {
                 evo_snapshot.state = EvolutionState::HasSession { generation: gen };
                 evo_snapshot.generation = gen;
                 evo_snapshot.current_config = Some(prev_brain);
@@ -256,7 +301,7 @@ impl App {
                     gen, db_path
                 );
             }
-            None => {
+            StartupSession::None => {
                 evo_snapshot.state = EvolutionState::Idle;
                 println!("[GOVERNOR] No previous session — ready to configure");
             }
@@ -320,6 +365,8 @@ impl App {
             champion_request_counter: 0,
             generation_epoch: 0,
             sim_runtime: None,
+            supervisor_resume: None,
+            resume_pending: None,
             cached_food_state: None,
             sent_speed: None,
             sent_paused: None,
@@ -351,5 +398,72 @@ impl App {
         println!("Living agents: {}", self.agents.len());
         println!("Total deaths: {}", total_deaths);
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{startup_session, StartupSession};
+    use xagent_sandbox::governor::{check_existing_session, Governor};
+    use xagent_sandbox::supervisor_store::SupervisorStore;
+    use xagent_shared::{BrainConfig, FullConfig, GovernorConfig};
+
+    /// Seed of the generation fixture.
+    const FIXTURE_SEED: u64 = 7;
+
+    fn path_in(dir: &tempfile::TempDir, name: &str) -> String {
+        dir.path().join(name).to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn observatory_session_startup_supervisor_db_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir, "run.db");
+        let store = SupervisorStore::create(&path, &FullConfig::default()).unwrap();
+        drop(store);
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let mode: String = db
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            startup_session(&path),
+            StartupSession::Supervisor(_)
+        ));
+        let after = std::fs::read(&path).unwrap();
+        assert!(before == after, "startup changed the database file");
+    }
+
+    #[test]
+    fn observatory_session_startup_missing_db_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir, "missing.db");
+        assert!(matches!(startup_session(&path), StartupSession::None));
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn observatory_session_startup_generation_db_unchanged_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir, "gen.db");
+        let gov = Governor::new_seeded(
+            &path,
+            GovernorConfig::default(),
+            &BrainConfig::default(),
+            "{}",
+            FIXTURE_SEED,
+        )
+        .unwrap();
+        drop(gov);
+        let expected = check_existing_session(&path).expect("generation session");
+        match startup_session(&path) {
+            StartupSession::Generation((generation, _, _)) => {
+                assert_eq!(generation, expected.0);
+            }
+            _ => panic!("expected a generation session"),
+        }
     }
 }

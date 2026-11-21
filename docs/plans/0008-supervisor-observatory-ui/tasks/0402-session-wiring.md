@@ -12,8 +12,8 @@ touches:
   - crates/xagent-sandbox/src/app.rs
   - crates/xagent-sandbox/src/evolution.rs
   - crates/xagent-sandbox/src/gpu_orchestration.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "8b67336c7b33f74a4f4bde4a8c9e9b860821952f"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --bin xagent -- observatory_session_

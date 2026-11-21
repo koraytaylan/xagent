@@ -9,8 +9,8 @@ depends_on:
 gated: false
 touches:
   - crates/xagent-sandbox/src/observatory/history.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "e7f8128a060a441bd2d7011dc2f876e6dcc76af6"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --lib observatory::history::tests

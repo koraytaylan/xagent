@@ -26,7 +26,7 @@ objective: >-
 depends_on:
   - 0006-supervisor-decision-telemetry
   - 0007-supervisor-live-resume
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

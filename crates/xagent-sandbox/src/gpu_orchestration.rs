@@ -23,6 +23,7 @@ use xagent_brain::buffers::{
     TRAIL_RECORD_STRIDE,
 };
 use xagent_brain::AgentTelemetry;
+use xagent_sandbox::observatory::{ObservatoryModel, ObservatoryRecord};
 
 use crate::app::{App, PendingUpload};
 use crate::sim_runtime::{
@@ -38,6 +39,7 @@ fn supervisor_worker_init(
     world: &WorldConfig,
     db_path: &str,
     session_active: bool,
+    resume: Option<bool>,
 ) -> Option<SupervisorWorkerInit> {
     if governor.evolution_mode != EvolutionMode::Supervisor || !session_active {
         return None;
@@ -49,8 +51,27 @@ fn supervisor_worker_init(
             governor: governor.clone(),
         },
         db_path: Some(db_path.to_string()),
-        resume: false,
+        resume: resume.unwrap_or(false),
     })
+}
+
+/// The model records a supervisor event carries, empty for other events.
+fn observatory_record(model: &ObservatoryModel, event: &SimEvent) -> Vec<ObservatoryRecord> {
+    match event {
+        SimEvent::SupervisorBoundary(boundary) => vec![model.boundary_record(boundary)],
+        SimEvent::SupervisorTelemetry(frame) => {
+            let mut records: Vec<ObservatoryRecord> = frame
+                .slots
+                .iter()
+                .map(|standing| model.slot_record(standing))
+                .collect();
+            records.extend(frame.intake.iter().map(ObservatoryRecord::from));
+            records.push(ObservatoryRecord::from(&frame.progress));
+            records.extend(ObservatoryRecord::series_from_frame(frame));
+            records
+        }
+        _ => Vec::new(),
+    }
 }
 
 impl App {
@@ -120,6 +141,7 @@ impl App {
             &world_config,
             &self.db_path,
             session_active,
+            self.supervisor_resume.take(),
         );
         let supervisor_mode = supervisor.is_some();
         let init = SimInit {
@@ -222,6 +244,11 @@ impl App {
         }
 
         for event in control {
+            if let Some(model) = self.evo_snapshot.observatory.as_mut() {
+                for r in observatory_record(model, &event) {
+                    model.fold(r);
+                }
+            }
             match event {
                 SimEvent::KernelReady { agent_count } => {
                     self.log_msg(format!(
@@ -234,6 +261,7 @@ impl App {
                 SimEvent::SupervisorTelemetry(_) => {}
                 SimEvent::SupervisorBoundary(_) => {}
                 SimEvent::SupervisorSample(report) => {
+                    self.resume_pending = None;
                     if let Some(sup) = self.evo_snapshot.supervisor.as_mut() {
                         sup.apply(&report);
                     }
@@ -256,7 +284,19 @@ impl App {
                     self.on_champion_state(request_id, state);
                 }
                 SimEvent::Log(message) => self.log_msg(message),
-                SimEvent::Error(message) => self.log_msg(format!("[GPU] {message}")),
+                SimEvent::Error(message) => {
+                    if let Some(summary) = self.resume_pending.take() {
+                        self.stop_sim_worker();
+                        crate::evolution::apply_resume_refusal(
+                            &mut self.evo_snapshot,
+                            &message,
+                            summary,
+                        );
+                        self.paused = true;
+                        return;
+                    }
+                    self.log_msg(format!("[GPU] {message}"));
+                }
             }
         }
     }
@@ -440,7 +480,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::supervisor_worker_init;
+    use super::{observatory_record, supervisor_worker_init};
+    use crate::sim_runtime::SimEvent;
+    use xagent_sandbox::observatory::ObservatoryModel;
     use xagent_shared::{BrainConfig, EvolutionMode, GovernorConfig, WorldConfig};
 
     #[test]
@@ -450,18 +492,36 @@ mod tests {
         let mut governor = GovernorConfig::default();
 
         governor.evolution_mode = EvolutionMode::Generations;
-        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", true).is_none());
+        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", true, None).is_none());
 
         governor.evolution_mode = EvolutionMode::Supervisor;
-        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", false).is_none());
+        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", false, None).is_none());
 
-        let init = supervisor_worker_init(&governor, &brain, &world, "a.db", true)
+        let init = supervisor_worker_init(&governor, &brain, &world, "a.db", true, None)
             .expect("supervisor session yields init");
+        assert!(!init.resume);
         assert_eq!(
             init.config.governor.evolution_mode,
             EvolutionMode::Supervisor
         );
         assert_eq!(init.db_path.as_deref(), Some("a.db"));
+    }
+
+    #[test]
+    fn observatory_session_orchestration_never_loads_store() {
+        let source = include_str!("gpu_orchestration.rs");
+        assert!(!source.contains(concat!("store_read", "::")));
+    }
+
+    #[test]
+    fn observatory_session_non_supervisor_events_yield_no_records() {
+        let model = ObservatoryModel::default();
+        for event in [
+            SimEvent::Log("line".to_string()),
+            SimEvent::Error("failure".to_string()),
+        ] {
+            assert!(observatory_record(&model, &event).is_empty());
+        }
     }
 
     #[test]

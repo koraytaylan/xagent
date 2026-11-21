@@ -14,8 +14,8 @@ touches:
   - crates/xagent-sandbox/src/ui.rs
   - crates/xagent-sandbox/src/ui_chrome.rs
   - crates/xagent-sandbox/tests/observatory_purity.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "2dbb4f47d4ffe9d88040ed839738189b1ac91ccc"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --test observatory_purity

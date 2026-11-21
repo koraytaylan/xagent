@@ -11,6 +11,7 @@ pub mod free_life;
 pub mod governor;
 pub mod headless;
 pub mod momentum;
+pub mod observatory;
 pub mod overlay;
 pub mod physics;
 pub mod pooling_study;

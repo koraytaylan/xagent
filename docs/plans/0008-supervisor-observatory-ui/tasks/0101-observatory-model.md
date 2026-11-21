@@ -13,8 +13,8 @@ touches:
   - crates/xagent-sandbox/src/observatory/tables.rs
   - crates/xagent-sandbox/src/observatory/plots.rs
   - crates/xagent-sandbox/src/observatory/history.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "ef9321997d66da9a2e9950b628bb98598d82e9a8"
 checks:
   - name: focused-proof
     command: cargo test -p xagent-sandbox --lib observatory::tests

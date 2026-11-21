@@ -171,6 +171,8 @@ pub struct ObservatoryViewState {
     pub learning: crate::observatory::plots::LearningViewState,
     pub lineage: crate::observatory::history::LineageViewState,
     pub timeline: crate::observatory::history::TimelineViewState,
+    /// Tick the user asked to replay; the owner takes it.
+    pub replay_jump_request: Option<u64>,
 }
 
 /// The user's answer to the "Supervisor run found" dialog.
@@ -358,6 +360,12 @@ pub fn render_observatory(
         ObservatoryTab::Lineage => history::show_lineage(ui, model, &mut view.lineage),
         ObservatoryTab::Archive => history::show_archive(ui, model),
         ObservatoryTab::Timeline => history::show_timeline(ui, model, &mut view.timeline),
+    }
+    if let Some(t) = view.timeline.replay_request.take() {
+        view.replay_jump_request = Some(t);
+    }
+    if let Some(t) = view.boundaries.replay_request.take() {
+        view.replay_jump_request = Some(t);
     }
 }
 
@@ -2674,6 +2682,30 @@ mod tests {
     use crate::supervisor::ReplaceReason;
     use crate::supervisor_run::{BoundaryReport, SampleReport};
     use xagent_shared::FoodKind;
+
+    #[test]
+    fn observatory_render_moves_replay_request() {
+        const TICK: u64 = 4242;
+        let model = crate::observatory::ObservatoryModel::default();
+        let ctx = egui::Context::default();
+        let mut view = super::ObservatoryViewState::default();
+        view.timeline.replay_request = Some(TICK);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::render_observatory(ui, &model, &mut view);
+            });
+        });
+        assert_eq!(view.replay_jump_request, Some(TICK));
+        assert_eq!(view.timeline.replay_request, None);
+
+        let mut fresh = super::ObservatoryViewState::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::render_observatory(ui, &model, &mut fresh);
+            });
+        });
+        assert_eq!(fresh.replay_jump_request, None);
+    }
 
     fn report(tick: u64) -> SampleReport {
         SampleReport {

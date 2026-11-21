@@ -23,5 +23,7 @@ pub mod supervisor_checkpoint;
 pub mod supervisor_run;
 pub mod supervisor_store;
 pub mod supervisor_telemetry;
+pub mod tick_window;
+pub mod tick_window_store;
 pub mod ui;
 pub mod world;

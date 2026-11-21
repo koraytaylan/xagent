@@ -18,12 +18,17 @@ use xagent_sandbox::observatory::store_read::{detect_supervisor_run, SupervisorR
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::hud::HudBar;
 use xagent_sandbox::renderer::{GpuMesh, Renderer};
+use xagent_sandbox::tick_window::{TickWindow, TickWindowConfig};
+use xagent_sandbox::tick_window_store;
 use xagent_sandbox::ui::{
     AgentSnapshot, EguiIntegration, EvolutionSnapshot, EvolutionState, ReplayState, SortMode, Tab,
     WorldSnapshot,
 };
 use xagent_sandbox::world::WorldState;
 use xagent_shared::{BrainConfig, GovernorConfig, WorldConfig};
+
+use crate::gpu_orchestration::BrowseTickWindow;
+use crate::tick_window_view::{self, TickWindowView};
 
 /// Base simulation rate in Hz. The simulation runs at this rate (scaled by
 /// speed multiplier) regardless of rendering frame rate.
@@ -169,6 +174,11 @@ pub(crate) struct App {
     pub(crate) tps_last_reset: Instant,
     pub(crate) tps_display: f64,
     pub(crate) db_path: String,
+    /// Rolling window of the live supervisor run, fed from applied snapshots.
+    pub(crate) tick_window: Option<TickWindow>,
+    pub(crate) tick_window_view: TickWindowView,
+    /// Read-only window of a browsed database's supervisor run.
+    pub(crate) browse_tick_window: BrowseTickWindow,
     pub(crate) governor_config: GovernorConfig,
 
     // In-flight generation handoff (worker reached the tick budget; awaiting
@@ -377,9 +387,39 @@ impl App {
             recording: None,
             last_recording: None,
             replay_state: ReplayState::default(),
+            tick_window: None,
+            tick_window_view: TickWindowView::default(),
+            browse_tick_window: BrowseTickWindow::default(),
         }
     }
+}
 
+/// Per-frame playback step, run after the UI pass: forwards a Replay request,
+/// syncs the browse window, then renders the browse window when present, else
+/// the live window.
+pub(crate) fn drive_tick_window(
+    ui: &mut egui::Ui,
+    evo_snapshot: &mut EvolutionSnapshot,
+    db_path: &str,
+    tick_window_view: &mut TickWindowView,
+    browse_tick_window: &mut BrowseTickWindow,
+    live: Option<&TickWindow>,
+) {
+    crate::gpu_orchestration::forward_replay_request(
+        &mut evo_snapshot.observatory_view,
+        tick_window_view,
+    );
+    browse_tick_window.sync(
+        db_path,
+        crate::gpu_orchestration::browse_run(evo_snapshot),
+        |p, r| tick_window_store::load_read_only(p, r, TickWindowConfig::default()),
+    );
+    if let Some(window) = browse_tick_window.window.as_ref().or(live) {
+        tick_window_view::render(ui, tick_window_view, window);
+    }
+}
+
+impl App {
     pub(crate) fn log_msg(&mut self, message: String) {
         println!("{}", message);
         self.console_log.push_back(message);

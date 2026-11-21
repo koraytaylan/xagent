@@ -19,7 +19,7 @@ objective: >-
 depends_on:
   - 0006-supervisor-decision-telemetry
   - 0008-supervisor-observatory-ui
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

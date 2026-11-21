@@ -10,8 +10,8 @@ touches:
   - crates/xagent-sandbox/src/observatory/history.rs
   - crates/xagent-sandbox/src/observatory/tables.rs
   - crates/xagent-sandbox/src/ui.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "1b01f9e7f0d874900c4fc66f8b26164a5e904e46"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --lib observatory::"

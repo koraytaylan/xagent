@@ -155,6 +155,8 @@ pub struct TimelineViewState {
     pub from_text: String,
     /// Text of the last-tick field.
     pub to_text: String,
+    /// Tick of the row whose Replay button was clicked.
+    pub replay_request: Option<u64>,
 }
 
 impl TimelineViewState {
@@ -241,12 +243,17 @@ pub fn show_timeline(ui: &mut egui::Ui, model: &ObservatoryModel, state: &mut Ti
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
     egui::ScrollArea::vertical().show_rows(ui, row_height, events.len(), |ui, range| {
         for event in events.iter().skip(range.start).take(range.len()) {
-            ui.label(format!(
-                "{} {:?} {}",
-                event.tick,
-                event.kind,
-                truncate_display(&event.text)
-            ));
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} {:?} {}",
+                    event.tick,
+                    event.kind,
+                    truncate_display(&event.text)
+                ));
+                if ui.small_button("Replay").clicked() {
+                    state.replay_request = Some(event.tick);
+                }
+            });
         }
     });
 }
@@ -309,6 +316,67 @@ mod tests {
             model.fold(record);
         }
         model
+    }
+
+    /// Tick of the clicked timeline row.
+    const CLICK_TICK: u64 = 4242;
+
+    fn find_replay_center(shape: &egui::Shape) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == "Replay" => {
+                Some(text.visual_bounding_rect().center())
+            }
+            egui::Shape::Vec(inner) => inner.iter().find_map(find_replay_center),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn timeline_replay_click_records_row_tick() {
+        let model = model_of(vec![ObservatoryRecord::Event(
+            crate::observatory::TimelineEvent {
+                tick: CLICK_TICK,
+                kind: TimelineKind::Death,
+                text: String::new(),
+            },
+        )]);
+        let mut state = TimelineViewState::default();
+        let ctx = egui::Context::default();
+        let mut center = None;
+        for frame in 0..4 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            if let Some(pos) = center {
+                match frame {
+                    1 => input.events.push(egui::Event::PointerMoved(pos)),
+                    2 | 3 => input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    }),
+                    _ => {}
+                }
+            }
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_timeline(ui, &model, &mut state);
+                });
+            });
+            if frame == 0 {
+                center = output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| find_replay_center(&clipped.shape));
+                assert!(center.is_some());
+            }
+        }
+        assert_eq!(state.replay_request, Some(CLICK_TICK));
     }
 
     #[test]

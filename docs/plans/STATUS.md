@@ -10,3 +10,4 @@
 | 0006 | 0006-supervisor-decision-telemetry | ✅ Complete | 10/10 | — | [status](0006-supervisor-decision-telemetry/STATUS.md) |
 | 0007 | 0007-supervisor-live-resume | ✅ Complete | 8/8 | — | [status](0007-supervisor-live-resume/STATUS.md) |
 | 0008 | 0008-supervisor-observatory-ui | ✅ Complete | 7/7 | — | [status](0008-supervisor-observatory-ui/STATUS.md) |
+| 0009 | 0009-supervisor-tick-window-replay | ✅ Complete | 6/6 | — | [status](0009-supervisor-tick-window-replay/STATUS.md) |

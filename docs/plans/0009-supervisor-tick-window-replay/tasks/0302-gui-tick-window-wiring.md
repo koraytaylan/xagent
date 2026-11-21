@@ -6,9 +6,9 @@ kind: task
 role: developer
 depends_on: [tick-window-view, replay-jump-request]
 gated: false
-touches: [crates/xagent-sandbox/src/app.rs, crates/xagent-sandbox/src/gpu_orchestration.rs]
-status: todo
-merged_as: ""
+touches: [crates/xagent-sandbox/src/app.rs, crates/xagent-sandbox/src/gpu_orchestration.rs, crates/xagent-sandbox/src/render_pipeline.rs, crates/xagent-sandbox/src/tick_window_view.rs]
+status: done
+merged_as: "2b81bd6c75401e2f4f6936279315f50a35607d3f"
 checks:
   - name: focused-proof
     command: "cargo test -p xagent-sandbox --bin xagent gpu_orchestration::"
@@ -36,9 +36,11 @@ and passed to the view's `request_jump`.
 - `app.rs`: fields `tick_window: Option<TickWindow>`, `tick_window_view:
   TickWindowView`, `browse_tick_window: BrowseTickWindow` on `App`, initialised
   to `None`, `TickWindowView::default()` and `BrowseTickWindow::default()` in
-  `App::new`; imports; the per-frame calls in Steps.
-- `ui.rs`, `main.rs`, `observatory/*.rs`, `tick_window*.rs` and
-  `tick_window_view.rs` are not edited.
+  `App::new`; imports; `drive_tick_window` (Step 4).
+- `render_pipeline.rs`: one `drive_tick_window` call in the egui closure right
+  after the `DockArea` `show_inside`, before `self.evo_snapshot = evo_snap;`.
+- `tick_window_view.rs`: only the import move in Step 4.
+- `ui.rs`, `main.rs`, `observatory/*.rs` and `tick_window*.rs` are not edited.
 
 ## Non-goals
 
@@ -82,15 +84,22 @@ and passed to the view's `request_jump`.
    slot }` at the sample tick for a non-idle replacement boundary and
    `PinKind::SeasonFlip` for a season flip; idle boundaries pin nothing.
 4. In `app.rs`, add the three `App` fields, their `App::new` initialisers and
-   imports (`tick_window_store`, `TickWindowConfig`, `BrowseTickWindow`). Each
-   frame, after the `ui.rs` pass, in this order: (a) `crate::gpu_orchestration::
-   forward_replay_request(&mut self.evo_snapshot.observatory_view, &mut
-   self.tick_window_view);` (b) `self.browse_tick_window.sync(&self.db_path,
-   crate::gpu_orchestration::browse_run(&self.evo_snapshot), |p, r|
-   tick_window_store::load_read_only(p, r, TickWindowConfig::default()));` using
-   direct field access so borrows stay disjoint; (c) `tick_window_view::render`
-   with `self.browse_tick_window.window` when `Some`, else the live
-   `tick_window`. Change nothing else.
+   imports (`tick_window_store`, `TickWindowConfig`, `BrowseTickWindow`). Add
+   `pub(crate) fn drive_tick_window(ui: &mut egui::Ui, evo_snapshot: &mut
+   EvolutionSnapshot, db_path: &str, tick_window_view: &mut TickWindowView,
+   browse_tick_window: &mut BrowseTickWindow, live: Option<&TickWindow>)`
+   which, in this order: (a) `crate::gpu_orchestration::forward_replay_request(
+   &mut evo_snapshot.observatory_view, tick_window_view);` (b)
+   `browse_tick_window.sync(db_path, crate::gpu_orchestration::browse_run(
+   evo_snapshot), |p, r| tick_window_store::load_read_only(p, r,
+   TickWindowConfig::default()));` (c) `tick_window_view::render` with
+   `browse_tick_window.window` when `Some`, else `live`. It carries no
+   `allow(dead_code)`. Each frame, after the `ui.rs` pass, call `crate::app::drive_tick_window(ui,
+   &mut evo_snap, &self.db_path, &mut self.tick_window_view, &mut
+   self.browse_tick_window, self.tick_window.as_ref())` from the Scope's
+   `render_pipeline.rs` site (`evo_snap` is the taken-out `self.evo_snapshot`). In `tick_window_view.rs`, move the unused top-level
+   `record_from_physics_row` import into its `mod tests`, its only user, so the
+   `clippy` check passes. Change nothing else.
 5. In the `#[cfg(test)] mod tests` of `gpu_orchestration.rs`: update
    `gui_jump_request_opens_view_at_requested_tick` to start from
    `ObservatoryViewState::default()` with `replay_jump_request = Some(20)`, a

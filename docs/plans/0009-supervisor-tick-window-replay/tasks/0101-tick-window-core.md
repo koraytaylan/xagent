@@ -7,8 +7,8 @@ role: developer
 depends_on: []
 gated: false
 touches: [crates/xagent-sandbox/src/lib.rs, crates/xagent-sandbox/src/tick_window.rs, crates/xagent-sandbox/src/tick_window_store.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "6c5bb8479811b97ae2314fffa9578fd133f2729e"
 checks:
   - {name: focused-proof, command: "cargo test -p xagent-sandbox --lib tick_window"}
 ---

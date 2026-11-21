@@ -51,6 +51,8 @@ use crate::governor::{
     compute_danger_dwell_fraction, load_champion_read_only, AdvanceResult, ChampionCapture,
     ChampionLoadError, Governor,
 };
+use crate::tick_window::{frame_from_snapshot, Pin, PinKind, TickWindow, TickWindowConfig};
+use crate::tick_window_store::TickWindowStore;
 use crate::world::WorldState;
 
 /// Chunk size for dispatch_batch calls in the standard headless run.
@@ -108,6 +110,8 @@ pub enum HeadlessError {
     Summary(std::io::Error),
     /// The agent-tick budget is not a whole number of generations.
     InvalidAgentTickBudget,
+    /// The tick window could not be captured or stored.
+    TickWindow(String),
 }
 
 impl fmt::Display for HeadlessError {
@@ -117,6 +121,7 @@ impl fmt::Display for HeadlessError {
             Self::Store(e) => write!(f, "{e}"),
             Self::SupervisorRun(e) => write!(f, "{e}"),
             Self::Summary(e) => write!(f, "run summary could not be written: {e}"),
+            Self::TickWindow(message) => write!(f, "tick window failed: {message}"),
             Self::InvalidAgentTickBudget => write!(
                 f,
                 "the agent-tick budget must be a positive whole multiple of population times tick budget"
@@ -202,7 +207,7 @@ pub fn run_headless_with_options(
             if resume {
                 return resume_supervisor(db_path, &config, options);
             }
-            run_supervisor(config, db_path, options)
+            run_supervisor(config, db_path, options, None)
         }
     }
 }
@@ -213,13 +218,34 @@ const SAMPLE_BATCH_TICKS: u32 = {
     SUPERVISOR_SAMPLE_TICKS as u32
 };
 
+/// Run a fresh supervisor session with an optional tick window.
+///
+/// # Errors
+///
+/// Returns [`HeadlessError::TickWindow`] when the config is not in supervisor
+/// mode (before any database write), or any error of the supervisor run.
+pub fn run_headless_supervisor_with_tick_window(
+    config: FullConfig,
+    db_path: &str,
+    options: &HeadlessOptions,
+    tick_window: Option<TickWindowConfig>,
+) -> Result<(), HeadlessError> {
+    if config.governor.evolution_mode != EvolutionMode::Supervisor {
+        return Err(HeadlessError::TickWindow(
+            "the tick window needs the supervisor evolution mode".to_owned(),
+        ));
+    }
+    run_supervisor(config, db_path, options, tick_window)
+}
+
 /// Run the supervisor loop on one kernel and write the summary when asked.
 fn run_supervisor(
     config: FullConfig,
     db_path: &str,
     options: &HeadlessOptions,
+    tick_window: Option<TickWindowConfig>,
 ) -> Result<(), HeadlessError> {
-    run_supervisor_with_recording(config, db_path, options, true)
+    run_supervisor_inner(config, db_path, options, true, tick_window)
 }
 
 /// Run the supervisor loop, persisting decision telemetry only when `record` is set.
@@ -232,6 +258,16 @@ pub fn run_supervisor_with_recording(
     db_path: &str,
     options: &HeadlessOptions,
     record: bool,
+) -> Result<(), HeadlessError> {
+    run_supervisor_inner(config, db_path, options, record, None)
+}
+
+fn run_supervisor_inner(
+    config: FullConfig,
+    db_path: &str,
+    options: &HeadlessOptions,
+    record: bool,
+    tick_window: Option<TickWindowConfig>,
 ) -> Result<(), HeadlessError> {
     let store = SupervisorStore::create(db_path, &config)?;
     // A population past u32 has a last slot index the kernel cannot address.
@@ -250,9 +286,62 @@ pub fn run_supervisor_with_recording(
         options.run_summary.is_some(),
     )?;
     run.set_recording(record);
+    let mut capture = match tick_window {
+        Some(window_config) => {
+            let window = TickWindow::new(window_config.clone()).map_err(window_error)?;
+            let store = TickWindowStore::open_for_latest_supervisor_run(db_path, window_config)
+                .map_err(window_error)?;
+            Some((window, store))
+        }
+        None => None,
+    };
     println!("Supervisor run | Population: {population}");
     let mut next_progress = 1_u64;
-    drive_supervisor(run, &mut kernel, options, batch, &mut next_progress)
+    drive_supervisor(
+        run,
+        &mut kernel,
+        options,
+        batch,
+        &mut next_progress,
+        capture.as_mut(),
+    )
+}
+
+/// Convert a tick-window failure into a [`HeadlessError`].
+fn window_error(err: impl fmt::Display) -> HeadlessError {
+    HeadlessError::TickWindow(err.to_string())
+}
+
+/// Record one sample's frame and pins after the run has consumed it.
+fn capture_sample(
+    window: &mut TickWindow,
+    store: &mut TickWindowStore,
+    report: &SampleReport,
+    physics: &[f32],
+    food: Option<&[f32]>,
+) -> Result<(), HeadlessError> {
+    let frame =
+        frame_from_snapshot(report.tick, physics, food.unwrap_or(&[])).map_err(window_error)?;
+    window.capture(frame.clone());
+    store.record_frame(&frame).map_err(window_error)?;
+    let mut pins = Vec::new();
+    if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
+        pins.push(Pin {
+            tick: report.tick,
+            kind: PinKind::Replacement { slot },
+        });
+    }
+    if report.season.is_some() {
+        pins.push(Pin {
+            tick: report.tick,
+            kind: PinKind::SeasonFlip,
+        });
+    }
+    for pin in pins {
+        window.pin(pin);
+        store.record_pin(pin).map_err(window_error)?;
+    }
+    Ok(())
 }
 
 /// Run the loop to completion (or the stop option) and write the summary.
@@ -262,9 +351,12 @@ fn drive_supervisor(
     options: &HeadlessOptions,
     batch: u32,
     next_progress: &mut u64,
+    mut capture: Option<&mut (TickWindow, TickWindowStore)>,
 ) -> Result<(), HeadlessError> {
     while !run.is_finished() {
-        let Some(report) = supervisor_step(&mut run, kernel, batch, options)? else {
+        let Some((report, _physics, _food)) =
+            supervisor_step(&mut run, kernel, batch, options, capture.as_deref_mut())?
+        else {
             return Ok(());
         };
         print_supervisor_progress(&report, run.total_ticks(), next_progress);
@@ -316,17 +408,23 @@ fn resume_supervisor(
         options,
         SAMPLE_BATCH_TICKS,
         &mut next_progress,
+        None,
     )
 }
 
+/// A sample report with the physics and food copies it was made from.
+type StepSample = (SampleReport, Vec<f32>, Option<Vec<f32>>);
+
 /// Dispatch one sample period, read it back and hand it to the run. Returns
-/// `None` when the stop option ended the run right after a checkpoint.
+/// `None` when the stop option ended the run right after a checkpoint. When a
+/// tick window is given, the sample is captured after `on_sample` returns.
 fn supervisor_step(
     run: &mut SupervisorRun,
     kernel: &mut GpuKernel,
     batch: u32,
     options: &HeadlessOptions,
-) -> Result<Option<SampleReport>, HeadlessError> {
+    mut capture: Option<&mut (TickWindow, TickWindowStore)>,
+) -> Result<Option<StepSample>, HeadlessError> {
     let started = Instant::now();
     let sample_tick = run.next_sample_tick();
     if run.checkpoint_due(sample_tick) {
@@ -345,12 +443,11 @@ fn supervisor_step(
         }
         let physics = checkpoint.physics().to_vec();
         let food = checkpoint.food().map(<[f32]>::to_vec);
-        return Ok(Some(run.on_sample(
-            kernel,
-            sample_tick,
-            &physics,
-            food.as_deref(),
-        )?));
+        let report = run.on_sample(kernel, sample_tick, &physics, food.as_deref())?;
+        if let Some((window, store)) = capture.as_deref_mut() {
+            capture_sample(window, store, &report, &physics, food.as_deref())?;
+        }
+        return Ok(Some((report, physics, food)));
     }
     kernel.dispatch_batch(run.tick(), batch);
     while !kernel.try_collect_state_snapshot() {
@@ -362,12 +459,11 @@ fn supervisor_step(
     }
     let physics = kernel.cached_state().to_vec();
     let food = kernel.cached_food_state().map(<[f32]>::to_vec);
-    Ok(Some(run.on_sample(
-        kernel,
-        sample_tick,
-        &physics,
-        food.as_deref(),
-    )?))
+    let report = run.on_sample(kernel, sample_tick, &physics, food.as_deref())?;
+    if let Some((window, store)) = capture {
+        capture_sample(window, store, &report, &physics, food.as_deref())?;
+    }
+    Ok(Some((report, physics, food)))
 }
 
 /// Number of progress steps across a bounded budget.

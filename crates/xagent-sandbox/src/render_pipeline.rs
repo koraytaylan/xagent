@@ -565,6 +565,14 @@ impl App {
                                         egui_dock::DockArea::new(dock_state)
                                             .style(egui_dock::Style::from_egui(ui.style().as_ref()))
                                             .show_inside(ui, &mut tab_ctx);
+                                        crate::app::drive_tick_window(
+                                            ui,
+                                            &mut evo_snap,
+                                            &self.db_path,
+                                            &mut self.tick_window_view,
+                                            &mut self.browse_tick_window,
+                                            self.tick_window.as_ref(),
+                                        );
                                     },
                                 );
                             },

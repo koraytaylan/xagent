@@ -87,7 +87,9 @@ the button, since only they draw the rows; `ui.rs` moves the request:
   forward_replay_request(view_state: &mut ObservatoryViewState, view: &mut
   TickWindowView)` takes `replay_jump_request` and calls
   `TickWindowView::request_jump`; `App` calls it on
-  `self.evo_snapshot.observatory_view` each frame after the UI pass.
+  `self.evo_snapshot.observatory_view` each frame after the UI pass, from the
+  egui closure in `render_pipeline.rs` through `crate::app::drive_tick_window`
+  while that snapshot is taken out as `evo_snap` for the UI pass.
 
 Browse route (task `gui-tick-window-wiring`): `pub(crate) struct
 BrowseTickWindow { pub window: Option<TickWindow>, pub loaded_run:
@@ -110,11 +112,11 @@ browse session.
 
 | id | invariant | guards | enforced at |
 |---|---|---|---|
-| INV-1 | Capture never alters a seeded supervisor run: the 0006 supervisor digest, every non-replay table row and the run summary are identical with capture on and off. | determinism of decisions | `crates/xagent-sandbox/tests/supervisor_tick_window_digest.rs` (`headless-tick-window`) |
+| INV-1 | Capture never alters a seeded supervisor run: the 0006 supervisor digest, every non-replay table row and the run summary are identical with capture on and off, excluding only timestamp columns and measured wall-clock throughput (`supervisor_progress.ticks_per_second`; checkpoint payload fields `run.last_ticks_per_second_bits` and `run.last_frame.progress.ticks_per_second`, masked after decoding while the rest of the payload is compared). | determinism of decisions | `crates/xagent-sandbox/tests/supervisor_tick_window_digest.rs` (`headless-tick-window`) |
 | INV-2 | Capture adds no GPU dispatch or readback: frames are built only from physics/food slices already copied (headless sample copies, worker published snapshot, main-thread applied snapshot); `tick_window*.rs` and `tick_window_view.rs` never name `GpuKernel`. | GPU budget, CLAUDE.md redraw rule | unit test in `tick_window.rs` scanning `include_str!` sources (`tick-window-core`); probe-count assertion in the digest test (`headless-tick-window`); worker test (`worker-tick-window`) |
 | INV-3 | In-memory retention is bounded: unpinned frames older than `newest - window_ticks` are dropped and at most `max_frames` rolling frames, `max_pins` pins (oldest evicted) and `max_frames_per_pin` frames per pin are held. | memory | unit tests in `tick_window.rs` (`tick-window-core`) |
 | INV-4 | On-disk retention has the same bounds: after every write, `supervisor_replay_frame` holds only frames inside the rolling window or a retained pin's range, and `supervisor_replay_pin` at most `max_pins` rows per run. | disk | unit tests in `tick_window_store.rs` (`tick-window-core`) |
-| INV-5 | Frames inside `[t - H, t + H]` of every retained replacement-boundary or season-flip pin survive rolling eviction, both in memory and on disk, and pins are recorded only for replacements (not idle boundaries) and season flips. | replay of inspector/timeline events | `tick_window.rs` and `tick_window_store.rs` tests (`tick-window-core`); digest test pinned-frame assertion (`headless-tick-window`) |
+| INV-5 | The nearest `max_frames_per_pin` frames (by distance, then tick) inside `[t - H, t + H]` of every retained replacement-boundary or season-flip pin survive rolling eviction, both in memory and on disk (in-range frames beyond that per-pin cap are not protected by the pin and follow the rolling rules), and pins are recorded only for replacements (not idle boundaries) and season flips. | replay of inspector/timeline events | `tick_window.rs` and `tick_window_store.rs` tests (`tick-window-core`); digest test pinned-frame assertion (`headless-tick-window`) |
 | INV-6 | The schema change is additive and idempotent: `ensure_schema` twice succeeds, and a database written before it (generation or supervisor) loads unchanged. | serialization compatibility | `tick_window_store.rs` tests (`tick-window-core`) |
 | INV-7 | Browsing never writes: `load_read_only` opens read-only and the database file bytes are unchanged after loading. | user data | `tick_window_store.rs` test (`tick-window-core`); `gpu_orchestration.rs` browse test (`gui-tick-window-wiring`) |
 | INV-8 | Untrusted frame blobs and rows are bounded: a wrong version, truncated blob, oversized count or non-finite position is an error, never a panic or unbounded allocation. | robustness | codec tests in `tick_window.rs` (`tick-window-core`) |

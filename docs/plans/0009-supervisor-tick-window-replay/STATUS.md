@@ -1,5 +1,5 @@
 ---
-status: todo
+status: completed
 ---
 
 # Status: supervisor tick-window replay
@@ -14,3 +14,7 @@ Progress: 0/6 tasks complete.
 | tick-window-view | Tick-window playback view | todo |
 | replay-jump-request | Replay jump request from timeline and boundary rows | todo |
 | gui-tick-window-wiring | Live and read-only browse playback wiring | todo |
+
+## Factory runs
+
+- 2026-11-21 18:42:12Z — completed 6/6; final plan gates passed

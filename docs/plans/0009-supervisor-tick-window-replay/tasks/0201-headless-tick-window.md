@@ -7,8 +7,8 @@ role: developer
 depends_on: [tick-window-core]
 gated: false
 touches: [crates/xagent-sandbox/src/headless.rs, crates/xagent-sandbox/tests/supervisor_tick_window_digest.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "df34a2889896afac807bef6d21aa20f1e23aacaf"
 checks:
   - {name: focused-proof, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_tick_window_digest", timeout_ms: 3600000}
   - {name: supervisor-headless, command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_headless", timeout_ms: 3600000}
@@ -47,7 +47,7 @@ checks:
 - **Helper**: `fn capture_sample(window: &mut TickWindow, store: &mut TickWindowStore, report: &SampleReport, physics: &[f32], food: Option<&[f32]>) -> Result<(), HeadlessError>`. Its parameter list has no `kernel` argument, and its body names no kernel type.
 - **Digest in the test**: the 0006 digest helper is test-local in the 0006 test files. Recompute the supervisor digest in the new test with the same inputs and the same fold that `tests/supervisor_headless.rs` uses in `supervisor_headless_store_is_reproducible`. Do not edit that file.
 - **Seeded config**: copy `supervisor_config()` from `tests/supervisor_headless.rs` into the new file. Use the shortest tick budget that yields at least one replacement pin and at least one season-flip pin. The test asserts both counts, so a budget that produces neither fails the test instead of passing silently.
-- **Timestamp columns**: exclude any column whose name ends in `_at` or contains `time`, listed explicitly in the test after reading the schema.
+- **Timestamp columns**: exclude any column whose name ends in `_at` or contains `time`, listed explicitly in the test after reading the schema. **Wall-clock throughput**: additionally exclude exactly the `supervisor_progress.ticks_per_second` column, and in `supervisor_checkpoint.payload` decode the payload and mask only the fields `run.last_ticks_per_second_bits` and `run.last_frame.progress.ticks_per_second`, comparing every other payload field and every other column (including `id`); these hold measured wall-clock throughput from `note_ticks_per_second` and differ even between two capture-off runs. Nothing else is excluded; the run-summary bytes are compared unmasked.
 - **INV-2 proof**: the test reads `headless.rs` with `include_str!`, extracts the text of `fn capture_sample` up to its closing brace, and asserts it contains no `kernel` substring. It also asserts the `capture_sample` call site is after the `on_sample` call inside `supervisor_step`.
 - **GPU guard**: the file starts with the `gpu_adapter_present_when_required` pattern from `tests/supervisor_headless.rs`. It returns early only when no adapter is present and `XAGENT_REQUIRE_GPU` is unset. It panics when the adapter is absent and `XAGENT_REQUIRE_GPU` is set.
 
@@ -58,7 +58,7 @@ checks:
 2. In `headless.rs`, change `supervisor_step` to return `(on_sample result, physics, food)` using the copies it already makes. Update its call sites only. Keep the `on_sample` call and its arguments unchanged.
 3. In `headless.rs`, add `capture_sample` with the signature in Decisions. Inside `run_supervisor`, when the window config is `Some`, open `TickWindowStore::open_for_latest_supervisor_run` after `SupervisorRun::start` and call `capture_sample` after each sample. Leave the no-window path unchanged.
 4. Create `tests/supervisor_tick_window_digest.rs` with the GPU guard, a copy of `supervisor_config()`, a temp-directory helper, and a helper that runs the headless supervisor with capture off (`None`) and on (`Some(TickWindowConfig::default())`) into two tempfile databases.
-5. In the same file, add test (1): assert equal recomputed supervisor digests, equal rows in every table except `supervisor_replay_frame` and `supervisor_replay_pin` (with timestamp columns excluded), equal run-summary JSON bytes, and that the capture-on database has at least one replacement pin and one season-flip pin.
+5. In the same file, add test (1): assert equal recomputed supervisor digests, equal rows in every table except `supervisor_replay_frame` and `supervisor_replay_pin` (with timestamp columns and the wall-clock throughput values named in Decisions excluded, and nothing else), equal run-summary JSON bytes, and that the capture-on database has at least one replacement pin and one season-flip pin.
 6. In the same file, add test (2) for the bounds of captured frames and pins (INV-5 proof: every replacement pin has at least one frame in `[t - H, t + H]`, with `H = PIN_HALF_WINDOW_TICKS`), and test (3) for the INV-2 source scan described in Decisions.
 
 - **Done when:** the check `focused-proof` passes with the tests in step 5 and step 6 reported ok: capture-on and capture-off digests, non-replay table rows and run-summary bytes are identical (INV-1); the capture-on database holds frames within `MAX_WINDOW_FRAMES` and `MAX_FRAMES_PER_PIN` bounds and the INV-2 source scan finds no kernel call in `capture_sample` (INV-2); and every recorded replacement pin has frames inside `[t - H, t + H]` (INV-5); and the check `supervisor-headless` also passes with no test failing.

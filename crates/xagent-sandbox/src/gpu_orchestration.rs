@@ -23,13 +23,19 @@ use xagent_brain::buffers::{
     TRAIL_RECORD_STRIDE,
 };
 use xagent_brain::AgentTelemetry;
-use xagent_sandbox::observatory::{ObservatoryModel, ObservatoryRecord};
+use xagent_sandbox::observatory::{ModelSource, ObservatoryModel, ObservatoryRecord};
+use xagent_sandbox::tick_window::{
+    frame_from_snapshot, Pin, PinKind, TickWindow, TickWindowConfig, TickWindowError,
+};
+use xagent_sandbox::tick_window_store::TickWindowStoreError;
+use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, ObservatoryViewState};
 
 use crate::app::{App, PendingUpload};
 use crate::sim_runtime::{
     partition_events, SimCommand, SimEvent, SimInit, SimRuntime, StateSnapshot,
     SupervisorWorkerInit,
 };
+use crate::tick_window_view::TickWindowView;
 use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, GovernorConfig, WorldConfig};
 
 /// Worker init for a supervisor session, or `None` outside one.
@@ -53,6 +59,93 @@ fn supervisor_worker_init(
         db_path: Some(db_path.to_string()),
         resume: resume.unwrap_or(false),
     })
+}
+
+/// Forwards a pending Replay request to the playback view.
+pub(crate) fn forward_replay_request(
+    view_state: &mut ObservatoryViewState,
+    view: &mut TickWindowView,
+) {
+    if let Some(tick) = view_state.replay_jump_request.take() {
+        view.request_jump(tick);
+    }
+}
+
+/// Read-only window of a browsed supervisor run, loaded once per session.
+#[derive(Default)]
+pub(crate) struct BrowseTickWindow {
+    pub window: Option<TickWindow>,
+    pub loaded_run: Option<i64>,
+    pub loads: u32,
+}
+
+impl BrowseTickWindow {
+    /// Loads the browsed run's window once; clears it when browsing ends.
+    pub(crate) fn sync(
+        &mut self,
+        db_path: &str,
+        browse_run: Option<i64>,
+        mut load: impl FnMut(&str, Option<i64>) -> Result<TickWindow, TickWindowStoreError>,
+    ) {
+        match browse_run {
+            Some(run) if self.loaded_run != Some(run) => {
+                self.loads += 1;
+                self.window = match load(db_path, Some(run)) {
+                    Ok(window) => Some(window),
+                    Err(e) => {
+                        log::warn!("browse tick window load failed: {e}");
+                        TickWindow::new(TickWindowConfig::default()).ok()
+                    }
+                };
+                self.loaded_run = Some(run);
+            }
+            Some(_) => {}
+            None => {
+                self.window = None;
+                self.loaded_run = None;
+            }
+        }
+    }
+}
+
+/// The browsed run id, only while a supervisor database is being browsed.
+pub(crate) fn browse_run(evo: &EvolutionSnapshot) -> Option<i64> {
+    if evo.state != EvolutionState::BrowsingSupervisor {
+        return None;
+    }
+    match evo.observatory.as_ref().map(|m| &m.source) {
+        Some(ModelSource::Browse { run_id }) => Some(*run_id),
+        _ => None,
+    }
+}
+
+/// The live window a worker start creates: supervisor mode only.
+fn live_tick_window(supervisor_mode: bool) -> Option<TickWindow> {
+    if !supervisor_mode {
+        return None;
+    }
+    match TickWindow::new(TickWindowConfig::default()) {
+        Ok(window) => Some(window),
+        Err(e) => {
+            log::warn!("tick window unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// Captures one snapshot into the window; no effect without a window.
+pub(crate) fn capture_tick_window_snapshot(
+    window: Option<&mut TickWindow>,
+    tick: u64,
+    physics: &[f32],
+    food: &[f32],
+) -> Result<(), TickWindowError> {
+    let Some(window) = window else {
+        return Ok(());
+    };
+    let frame = frame_from_snapshot(tick, physics, food)?;
+    window.capture(frame);
+    Ok(())
 }
 
 /// The model records a supervisor event carries, empty for other events.
@@ -165,6 +258,7 @@ impl App {
             supervisor,
         };
 
+        self.tick_window = live_tick_window(supervisor_mode);
         self.sim_runtime = Some(SimRuntime::start(init));
         self.sent_speed = Some(self.speed_multiplier);
         self.sent_paused = Some(self.paused);
@@ -177,6 +271,7 @@ impl App {
     pub(crate) fn stop_sim_worker(&mut self) {
         // Dropping the handle requests Shutdown and joins the worker thread.
         self.sim_runtime = None;
+        self.tick_window = None;
         self.sent_speed = None;
         self.sent_paused = None;
         self.sent_selected_agent = None;
@@ -268,6 +363,20 @@ impl App {
                     if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
                         self.log_msg(format!("[SUPERVISOR] replaced slot {slot}"));
                     }
+                    if let Some(window) = self.tick_window.as_mut() {
+                        if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
+                            window.pin(Pin {
+                                tick: report.tick,
+                                kind: PinKind::Replacement { slot },
+                            });
+                        }
+                        if report.season.is_some() {
+                            window.pin(Pin {
+                                tick: report.tick,
+                                kind: PinKind::SeasonFlip,
+                            });
+                        }
+                    }
                     self.snap_dirty = true;
                 }
                 SimEvent::Telemetry {
@@ -315,6 +424,17 @@ impl App {
         self.tps_tick_count += advanced_ticks;
         self.session_tick_count += advanced_ticks;
         self.tick = snapshot.tick;
+        if self.tick_window.is_some() {
+            if let Err(e) = capture_tick_window_snapshot(
+                self.tick_window.as_mut(),
+                snapshot.tick,
+                &snapshot.physics,
+                &snapshot.food,
+            ) {
+                log::warn!("tick window capture failed: {e}");
+                self.tick_window = None;
+            }
+        }
         // Sync the governor's per-generation counter from the snapshot to keep
         // the evolution UI's progress accurate.
         if let Some(governor) = self.governor.as_mut() {
@@ -480,9 +600,19 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{observatory_record, supervisor_worker_init};
+    use super::{
+        browse_run, capture_tick_window_snapshot, forward_replay_request, live_tick_window,
+        observatory_record, supervisor_worker_init, BrowseTickWindow,
+    };
     use crate::sim_runtime::SimEvent;
-    use xagent_sandbox::observatory::ObservatoryModel;
+    use crate::tick_window_view::TickWindowView;
+    use xagent_brain::buffers::PHYS_STRIDE;
+    use xagent_sandbox::observatory::{ModelSource, ObservatoryModel};
+    use xagent_sandbox::tick_window::{
+        record_from_physics_row, Pin, PinKind, TickWindow, TickWindowConfig, WindowFrame,
+    };
+    use xagent_sandbox::tick_window_store;
+    use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, ObservatoryViewState};
     use xagent_shared::{BrainConfig, EvolutionMode, GovernorConfig, WorldConfig};
 
     #[test]
@@ -537,11 +667,140 @@ mod tests {
             concat!("SupervisorRun", "::"),
             concat!("read_full_state", "_blocking"),
             concat!("on_", "sample("),
+            concat!("TickWindow", "Store::open"),
         ];
         for (name, source) in sources {
             for needle in needles {
                 assert!(!source.contains(needle), "{name} names {needle}");
             }
         }
+    }
+
+    fn empty_window() -> TickWindow {
+        TickWindow::new(TickWindowConfig::default()).expect("default config")
+    }
+
+    fn test_frame(tick: u64) -> WindowFrame {
+        WindowFrame {
+            tick,
+            agents: vec![record_from_physics_row(&[0.0; PHYS_STRIDE])],
+            food: vec![],
+        }
+    }
+
+    #[test]
+    fn gui_jump_request_opens_view_at_requested_tick() {
+        let mut view_state = ObservatoryViewState::default();
+        view_state.replay_jump_request = Some(20);
+        let mut window = empty_window();
+        for tick in [10, 20, 30] {
+            window.capture(test_frame(tick));
+        }
+        let mut view = TickWindowView::default();
+        forward_replay_request(&mut view_state, &mut view);
+        view.advance(&window, 1);
+        assert_eq!(view.current_frame(&window).map(|f| f.tick), Some(20));
+        assert_eq!(view_state.replay_jump_request, None);
+    }
+
+    #[test]
+    fn gui_supervisor_snapshot_is_captured_and_pins_replacement_and_season() {
+        let mut window = empty_window();
+        let physics = vec![0.0f32; PHYS_STRIDE];
+        capture_tick_window_snapshot(Some(&mut window), 5, &physics, &[]).expect("captured");
+        window.pin(Pin {
+            tick: 5,
+            kind: PinKind::Replacement { slot: 0 },
+        });
+        window.pin(Pin {
+            tick: 5,
+            kind: PinKind::SeasonFlip,
+        });
+        assert_eq!(window.len(), 1);
+        assert_eq!(window.newest_tick(), Some(5));
+        assert_eq!(window.pins().len(), 2);
+    }
+
+    #[test]
+    fn gui_generation_mode_captures_nothing() {
+        let physics = vec![0.0f32; PHYS_STRIDE];
+        let mut supervisor = live_tick_window(true).expect("supervisor mode creates a window");
+        assert!(capture_tick_window_snapshot(Some(&mut supervisor), 5, &physics, &[]).is_ok());
+        assert_eq!(supervisor.len(), 1);
+        let mut generation = live_tick_window(false);
+        assert!(generation.is_none());
+        assert_eq!(
+            capture_tick_window_snapshot(generation.as_mut(), 6, &physics, &[]),
+            Ok(())
+        );
+        assert_eq!(supervisor.len(), 1);
+        assert_eq!(supervisor.newest_tick(), Some(5));
+    }
+
+    #[test]
+    fn gui_browse_sync_loads_once_and_clears_on_leave() {
+        let mut browse = BrowseTickWindow::default();
+        let mut calls = 0u32;
+        let mut load = |_: &str, _: Option<i64>| {
+            calls += 1;
+            Ok(empty_window())
+        };
+        for _ in 0..3 {
+            browse.sync("a.db", Some(7), &mut load);
+        }
+        assert_eq!(browse.loads, 1);
+        assert!(browse.window.is_some());
+        assert_eq!(browse.loaded_run, Some(7));
+        browse.sync("a.db", None, &mut load);
+        assert!(browse.window.is_none());
+        assert_eq!(browse.loaded_run, None);
+        browse.sync("a.db", Some(7), &mut load);
+        assert_eq!(browse.loads, 2);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn gui_browse_run_only_in_browsing_supervisor() {
+        let mut evo = EvolutionSnapshot::default();
+        let mut model = ObservatoryModel::default();
+        model.source = ModelSource::Browse { run_id: 7 };
+        evo.observatory = Some(model);
+        evo.state = EvolutionState::BrowsingSupervisor;
+        assert_eq!(browse_run(&evo), Some(7));
+        evo.state = EvolutionState::Idle;
+        assert_eq!(browse_run(&evo), None);
+        evo.state = EvolutionState::BrowsingSupervisor;
+        if let Some(m) = evo.observatory.as_mut() {
+            m.source = ModelSource::Live;
+        }
+        assert_eq!(browse_run(&evo), None);
+    }
+
+    #[test]
+    fn gui_browse_load_leaves_db_bytes_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        let path_str = path.to_str().expect("utf8 path").to_string();
+        let run_id: i64;
+        {
+            let db = rusqlite::Connection::open(&path).expect("open");
+            db.execute_batch("CREATE TABLE run (id INTEGER PRIMARY KEY, mode TEXT);")
+                .expect("run table");
+            tick_window_store::ensure_schema(&db).expect("schema");
+            db.execute("INSERT INTO run (mode) VALUES ('supervisor')", [])
+                .expect("insert");
+            run_id = db.last_insert_rowid();
+        }
+        let before = std::fs::read(&path).expect("read");
+        let mut browse = BrowseTickWindow::default();
+        let mut load = |p: &str, r: Option<i64>| {
+            tick_window_store::load_read_only(p, r, TickWindowConfig::default())
+        };
+        browse.sync(&path_str, Some(run_id), &mut load);
+        let after = std::fs::read(&path).expect("read");
+        assert_eq!(before, after);
+        assert_eq!(browse.loads, 1);
+        browse.sync(&path_str, Some(run_id), &mut load);
+        assert_eq!(browse.loads, 1);
     }
 }

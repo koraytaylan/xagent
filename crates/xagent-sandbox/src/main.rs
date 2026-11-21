@@ -5,6 +5,7 @@ mod render_pipeline;
 mod replay_coord;
 mod sim_runtime;
 mod snapshot;
+mod tick_window_view;
 mod ui_chrome;
 
 use std::path::PathBuf;

@@ -24,6 +24,8 @@ pub struct SlotsViewState {
 pub struct BoundaryViewState {
     /// Tick of the boundary selected by the user.
     pub selected_tick: Option<u64>,
+    /// Tick of the boundary whose Replay button was clicked.
+    pub replay_request: Option<u64>,
 }
 
 fn state_text(state: InheritedState) -> &'static str {
@@ -171,6 +173,9 @@ pub fn show_slots(ui: &mut egui::Ui, model: &ObservatoryModel, state: &mut Slots
 /// Draws the boundary inspector, newest first; the caller owns scrolling.
 pub fn show_boundaries(ui: &mut egui::Ui, model: &ObservatoryModel, state: &mut BoundaryViewState) {
     for record in model.boundaries.iter().rev() {
+        if ui.small_button("Replay").clicked() {
+            state.replay_request = Some(record.tick);
+        }
         let title = format!("tick {}", record.tick);
         let header = egui::CollapsingHeader::new(title)
             .id_salt(("observatory_boundary", record.tick))
@@ -234,6 +239,72 @@ mod tests {
             source: ParentSource::Peer { slot: 3 },
             state: InheritedState::Learned,
         }
+    }
+
+    /// Tick of the clicked boundary row.
+    const CLICK_TICK: u64 = 5151;
+
+    fn find_replay_center(shape: &egui::Shape) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == "Replay" => {
+                Some(text.visual_bounding_rect().center())
+            }
+            egui::Shape::Vec(inner) => inner.iter().find_map(find_replay_center),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn boundary_replay_click_records_row_tick() {
+        let mut model = ObservatoryModel::default();
+        model.fold(crate::observatory::ObservatoryRecord::Boundary(
+            BoundaryRecord {
+                tick: CLICK_TICK,
+                eligible: Vec::new(),
+                picked: None,
+                tie_break: None,
+                parent: None,
+                config_diff: Vec::new(),
+                idle_reason: Some("idle".to_string()),
+            },
+        ));
+        let mut state = BoundaryViewState::default();
+        let ctx = egui::Context::default();
+        let mut center = None;
+        for frame in 0..4 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            if let Some(pos) = center {
+                match frame {
+                    1 => input.events.push(egui::Event::PointerMoved(pos)),
+                    2 | 3 => input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    }),
+                    _ => {}
+                }
+            }
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_boundaries(ui, &model, &mut state);
+                });
+            });
+            if frame == 0 {
+                center = output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| find_replay_center(&clipped.shape));
+                assert!(center.is_some());
+            }
+        }
+        assert_eq!(state.replay_request, Some(CLICK_TICK));
     }
 
     #[test]

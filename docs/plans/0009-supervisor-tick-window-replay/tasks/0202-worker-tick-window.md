@@ -7,8 +7,8 @@ role: developer
 depends_on: [tick-window-core]
 gated: false
 touches: [crates/xagent-sandbox/src/sim_runtime.rs]
-status: todo
-merged_as: ""
+status: done
+merged_as: "a140080b1ac0a501f22778e22635d979beae9539"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --bin xagent sim_runtime::"

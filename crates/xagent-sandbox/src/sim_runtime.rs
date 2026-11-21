@@ -26,6 +26,8 @@ use xagent_sandbox::supervisor_checkpoint::CheckpointError;
 use xagent_sandbox::supervisor_run::{load_resume_point, SampleReport, SupervisorRun};
 use xagent_sandbox::supervisor_store::SupervisorStore;
 use xagent_sandbox::supervisor_telemetry::{BoundaryRecord, TelemetryFrame};
+use xagent_sandbox::tick_window::{frame_from_snapshot, Pin, PinKind, TickWindowConfig};
+use xagent_sandbox::tick_window_store::TickWindowStore;
 use xagent_shared::{BrainConfig, FullConfig, WorldConfig, SUPERVISOR_SAMPLE_TICKS};
 
 use crate::app::{PendingUpload, SIM_DT};
@@ -447,6 +449,9 @@ struct Worker {
     pending_telemetry: Option<Box<TelemetryFrame>>,
     /// Wall-clock instant and tick of the previous supervisor sample.
     supervisor_sample_clock: Option<(Instant, u64)>,
+    /// Persistent tick-window capture; `None` without a supervisor database or
+    /// after a store failure.
+    tick_window_store: Option<TickWindowStore>,
 }
 
 /// Start the supervisor run on `kernel`, opening the store when configured.
@@ -585,6 +590,7 @@ impl Worker {
         let mut tick_budget = init.tick_budget;
         let mut supervisor = None;
         let mut supervisor_events = Vec::new();
+        let mut tick_window_store: Option<TickWindowStore> = None;
         let birth_states;
         let mut initial_tick = 0;
         if let Some(sup_init) = init.supervisor.as_ref() {
@@ -596,6 +602,18 @@ impl Worker {
                             birth_states = states;
                             supervisor = Some(run);
                             initial_tick = start_tick;
+                            if let Some(path) = sup_init.db_path.as_deref() {
+                                match TickWindowStore::open_for_latest_supervisor_run(
+                                    path,
+                                    TickWindowConfig::default(),
+                                ) {
+                                    Ok(store) => tick_window_store = Some(store),
+                                    Err(error) => {
+                                        let line = format!("tick window disabled: open: {error}");
+                                        supervisor_events.push(SimEvent::Log(line));
+                                    }
+                                }
+                            }
                             if let Some(report) = replay {
                                 if report.boundary.is_some()
                                     || report.season.is_some()
@@ -670,6 +688,7 @@ impl Worker {
             supervisor_events,
             pending_telemetry: None,
             supervisor_sample_clock: None,
+            tick_window_store,
         }
     }
 
@@ -940,6 +959,23 @@ impl Worker {
         true
     }
 
+    /// Log `reason` once and stop capturing tick windows; the run continues.
+    fn disable_tick_window(&mut self, reason: String) {
+        self.supervisor_events
+            .push(SimEvent::Log(format!("tick window disabled: {reason}")));
+        self.tick_window_store = None;
+    }
+
+    /// Record a pin at the current tick, disabling capture on failure.
+    fn record_tick_window_pin(&mut self, kind: PinKind) {
+        let tick = self.tick;
+        if let Some(store) = self.tick_window_store.as_mut() {
+            if let Err(error) = store.record_pin(Pin { tick, kind }) {
+                self.disable_tick_window(format!("pin failed: {error}"));
+            }
+        }
+    }
+
     /// Hand the supervisor its sample when the tick reaches the next sample
     /// tick. Fails closed: an error or the end of the run drops the run and
     /// pauses, so nothing dispatches afterwards.
@@ -985,6 +1021,12 @@ impl Worker {
                             log::error!("[SIM] supervisor birth state {slot} failed: {error}");
                         }
                     }
+                }
+                if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
+                    self.record_tick_window_pin(PinKind::Replacement { slot });
+                }
+                if report.season.is_some() {
+                    self.record_tick_window_pin(PinKind::SeasonFlip);
                 }
                 let finished = report.finished;
                 if let Some(frame) = run.take_frame() {
@@ -1094,8 +1136,24 @@ impl Worker {
     /// (latest-wins): the next snapshot carries newer state, so a dropped one is
     /// never missed. The generation boundary delivers its final state through
     /// the always-sent [`SimEvent::GenerationBudgetReached`] instead.
-    fn publish_snapshot(&self, event_tx: &SyncSender<SimEvent>) {
+    fn publish_snapshot(&mut self, event_tx: &SyncSender<SimEvent>) {
         let snapshot = self.build_snapshot();
+        if self.tick_window_store.is_some() {
+            match frame_from_snapshot(self.tick, &snapshot.physics, &snapshot.food) {
+                Ok(frame) => {
+                    let recorded = self
+                        .tick_window_store
+                        .as_mut()
+                        .map(|store| store.record_frame(&frame));
+                    if let Some(Err(error)) = recorded {
+                        self.disable_tick_window(format!("frame failed: {error}"));
+                    }
+                }
+                Err(error) => {
+                    self.disable_tick_window(format!("frame build failed: {error}"));
+                }
+            }
+        }
         if let Err(TrySendError::Full(_)) = event_tx.try_send(SimEvent::Snapshot(snapshot)) {
             // Channel full: dropping this snapshot is the intended latest-wins
             // back-pressure.
@@ -2118,6 +2176,95 @@ mod tests {
         assert_eq!(worker.supervisor_events.len(), 1);
         assert!(matches!(worker.supervisor_events[0], SimEvent::Error(_)));
         assert!(worker.paused);
+    }
+
+    /// Collect a fresh state snapshot and publish it through the worker.
+    fn collect_and_publish(worker: &mut Worker, event_tx: &SyncSender<SimEvent>) {
+        while !worker.kernel.request_state_snapshot() {
+            std::hint::spin_loop();
+        }
+        while !worker.kernel.try_collect_state_snapshot() {
+            std::hint::spin_loop();
+        }
+        worker.publish_snapshot(event_tx);
+    }
+
+    #[test]
+    fn tick_window_store_persists_frames_in_bounds() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let dt = supervisor_dt(10.0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("w.db").to_string_lossy().into_owned();
+        let (event_tx, _event_rx) = sync_channel(4);
+        let mut worker = Worker::new(supervisor_init(&config, Some(path.clone())));
+        assert!(worker.tick_window_store.is_some());
+        for step in 1..=5 {
+            supervisor_run_to(&mut worker, dt, step * 200);
+            collect_and_publish(&mut worker, &event_tx);
+        }
+        assert!(!worker.paused);
+        let final_tick = worker.tick;
+        drop(worker);
+        let db = rusqlite::Connection::open(&path).expect("open");
+        let ticks: Vec<i64> = db
+            .prepare("SELECT tick FROM supervisor_replay_frame")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert!(!ticks.is_empty());
+        for tick in ticks {
+            assert!(tick >= 0);
+            assert!(u64::try_from(tick).expect("non-negative") <= final_tick);
+        }
+    }
+
+    #[test]
+    fn tick_window_absent_without_database() {
+        let config = supervisor_test_config();
+        if supervisor_gpu_or_skip() {
+            let worker = Worker::new(supervisor_init(&config, None));
+            assert!(worker.tick_window_store.is_none());
+            let worker = Worker::new(test_init(0, false, 1));
+            assert!(worker.tick_window_store.is_none());
+        }
+    }
+
+    #[test]
+    fn tick_window_store_failure_logs_and_continues() {
+        if !supervisor_gpu_or_skip() {
+            return;
+        }
+        let config = supervisor_test_config();
+        let dt = supervisor_dt(10.0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.db").to_string_lossy().into_owned();
+        let (event_tx, _event_rx) = sync_channel(4);
+        let mut worker = Worker::new(supervisor_init(&config, Some(path.clone())));
+        assert!(worker.tick_window_store.is_some());
+        {
+            let db = rusqlite::Connection::open(&path).expect("open");
+            db.execute_batch("DROP TABLE supervisor_replay_frame;")
+                .expect("drop");
+        }
+        supervisor_run_to(&mut worker, dt, 200);
+        collect_and_publish(&mut worker, &event_tx);
+        let logs = worker
+            .supervisor_events
+            .iter()
+            .filter(|event| matches!(event, SimEvent::Log(_)))
+            .count();
+        assert_eq!(logs, 1);
+        assert!(worker.tick_window_store.is_none());
+        assert!(!worker.paused);
+        let before = worker.tick;
+        supervisor_run_to(&mut worker, dt, before + 200);
+        assert!(worker.tick > before);
+        assert!(!worker.paused);
     }
 
     #[test]

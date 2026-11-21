@@ -15,7 +15,7 @@ touches:
 checks:
   - name: generation-tests-removed
     command: |-
-      sh -c 'test ! -e crates/xagent-sandbox/tests/seeded_headless_digest.rs && test ! -e crates/xagent-sandbox/tests/fixtures/seeded_headless_digest.json && test ! -e crates/xagent-sandbox/tests/generation_run_summary.rs && test -f crates/xagent-sandbox/tests/supervisor_seeded_digest.rs'
+      sh -c 'test ! -e crates/xagent-sandbox/tests/seeded_headless_digest.rs && test ! -e crates/xagent-sandbox/tests/fixtures/seeded_headless_digest.json && test ! -e crates/xagent-sandbox/tests/generation_run_summary.rs && test -f crates/xagent-sandbox/tests/supervisor_digest.rs'
   - name: all-targets-compile
     command: cargo check --workspace --all-targets
     timeout_ms: 3600000
@@ -29,7 +29,7 @@ Delete exactly three files, and edit no other file:
 
 - `crates/xagent-sandbox/tests/seeded_headless_digest.rs` (the generation digest
   test). Its replacement is the 0006 supervisor digest gate
-  `crates/xagent-sandbox/tests/supervisor_seeded_digest.rs`, which is a PLAN
+  `crates/xagent-sandbox/tests/supervisor_digest.rs`, which is a PLAN
   check (`supervisor-seeded-digest`) and is not touched here.
 - `crates/xagent-sandbox/tests/fixtures/seeded_headless_digest.json` (the
   generation digest fixture, read only by the file above).
@@ -40,7 +40,7 @@ Delete exactly three files, and edit no other file:
   the test file that calls it.
 
 Deletion is allowed only because the 0006 gate file exists. If
-`crates/xagent-sandbox/tests/supervisor_seeded_digest.rs` is absent when this
+`crates/xagent-sandbox/tests/supervisor_digest.rs` is absent when this
 task runs, or if the 0006 gate is named differently, stop and report a plan
 correction for the `supervisor-seeded-digest` check. Do not delete anything in
 that case.
@@ -67,7 +67,7 @@ and Cargo auto-discovers test targets, so no manifest entry needs editing.
 
 **Steps:**
 
-1. Confirm `crates/xagent-sandbox/tests/supervisor_seeded_digest.rs` exists.
+1. Confirm `crates/xagent-sandbox/tests/supervisor_digest.rs` exists.
    Search `crates/xagent-sandbox/src/` for `seeded_headless_digest` and confirm
    there are no hits, so nothing in `src/` reads the fixture. If the gate
    is absent, stop and report a plan correction instead of deleting.

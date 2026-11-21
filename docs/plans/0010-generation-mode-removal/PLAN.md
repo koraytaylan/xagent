@@ -51,7 +51,7 @@ checks:
     command: env XAGENT_REQUIRE_GPU=1 cargo test --workspace
     timeout_ms: 7200000
   - name: supervisor-seeded-digest
-    command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_seeded_digest
+    command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_digest
     timeout_ms: 3600000
   - name: sense-parity
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored

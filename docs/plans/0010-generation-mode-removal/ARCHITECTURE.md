@@ -15,7 +15,7 @@ or open a generation database except to prove it is refused.
 | Dependent | Verdict | What survives / where | Task |
 | --- | --- | --- | --- |
 | `crates/xagent-sandbox/tests/integration.rs` | port | Tests of surviving APIs stay; every test of the Governor, generation config fields, `EvolutionMode`, the generation handoff, the generation UI members, per-generation replay, `reset_database` and `check_existing_session` is deleted. Literals of `GovernorConfig` are rewritten as `GovernorConfig { population_size, mutation_strength, momentum_decay, supervisor, ..Default::default() }` using only the surviving fields. | integration-tests |
-| `tests/seeded_headless_digest.rs` + `tests/fixtures/seeded_headless_digest.json` | delete | Replaced by the 0006 supervisor digest gate `tests/supervisor_seeded_digest.rs`, which is in PLAN.md `checks` (`supervisor-seeded-digest`) and in the deleting task's own checks. | generation-test-files |
+| `tests/seeded_headless_digest.rs` + `tests/fixtures/seeded_headless_digest.json` | delete | Replaced by the 0006 supervisor digest gate `tests/supervisor_digest.rs`, which is in PLAN.md `checks` (`supervisor-seeded-digest`) and in the deleting task's own checks. | generation-test-files |
 | `tests/generation_run_summary.rs` | delete | Only measured generation runs and `max_generations_for_agent_ticks`; the supervisor run summary is covered by `supervisor_headless.rs` and `supervisor_run.rs`. | generation-test-files |
 | `tests/evolution_cli_exit.rs` | port | Becomes the removed-flag and bad-budget exit test (INV-5). | cli-supervisor-only |
 | `tests/sense_block_parity.rs` + golden + `sense_block_champion.db` | port | Sense-layout parity stays; every scenario runs a supervisor headless run; the generation-database champion fixture is deleted and the champion replay reads the rank-0 archive brain of the seeded supervisor run through `supervisor_store::load_archive_entry_read_only`. If 0006 already ported it, only residual generation references and the fixture are removed. | sense-parity-supervisor |
@@ -44,7 +44,7 @@ inside its own touches and stops referencing members owned by later tasks:
 
 ## Interfaces relied on
 
-- 0006: the supervisor digest gate `crates/xagent-sandbox/tests/supervisor_seeded_digest.rs`; supervisor telemetry tables written through `SupervisorStore`.
+- 0006: the supervisor digest gate `crates/xagent-sandbox/tests/supervisor_digest.rs`; supervisor telemetry tables written through `SupervisorStore`.
 - 0007: checkpoint/resume code and any `--resume` meaning it set; its store opens go through `SupervisorStore` or call `supervisor_store::inspect_database` first.
 - 0008: the observatory views in `ui.rs` and the browse/resume offer; it is the surviving session UI.
 - 0009: tick-window replay; record types it imports from `replay.rs` survive.

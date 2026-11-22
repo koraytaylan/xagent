@@ -498,8 +498,6 @@ impl App {
                         let mut chart_win = self.chart_window;
                         let mut sort_mode = self.sort_mode;
                         let dock_state = &mut self.dock_state;
-                        let replay_state = &mut self.replay_state;
-                        let last_recording = self.last_recording.as_ref();
                         let orbit_mode = &mut self.orbit_mode;
 
                         let top_bar = TopBarState {
@@ -558,8 +556,6 @@ impl App {
                                             evolution: &mut evo_snap,
                                             evolution_action: &mut evo_action,
                                             world: &world_snap,
-                                            replay: replay_state,
-                                            recording: last_recording,
                                             orbit_mode,
                                         };
                                         egui_dock::DockArea::new(dock_state)

@@ -22,8 +22,8 @@ touches:
   - crates/xagent-sandbox/src/lib.rs
   - crates/xagent-sandbox/tests/pathway_route_state.rs
   - crates/xagent-sandbox/src/observatory/store_read.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "4241da08c28cb6878ad710e0501cf5cc4379876f"
 checks:
   - name: focused-proof
     command: "sh -c 'test ! -e crates/xagent-sandbox/src/governor.rs && test ! -e crates/xagent-sandbox/tests/pathway_route_state.rs && ! grep -nF \"pub mod governor;\" crates/xagent-sandbox/src/lib.rs && ! grep -rnE --include=*.rs \"crate::governor|xagent_sandbox::governor|generation_recording\" crates/'"

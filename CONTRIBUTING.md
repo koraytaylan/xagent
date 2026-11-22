@@ -99,7 +99,7 @@ Use conventional commit prefixes: `feat:`, `fix:`, `perf:`, `refactor:`, `doc:`,
 - Track in-flight state explicitly. Never overwrite a pending `map_async` operation without unmapping/cleaning up the previous one first.
 - Always handle both success and failure paths. If any `map_async` callback fails, the system must clean up and allow retry — "stuck forever" states are bugs.
 - Establish data authority. When physics readback and telemetry readback both provide the same field, document which is authoritative and never overwrite fresher data with stale async results.
-- Unmap staging buffers on all paths: success, error, agent switch, and generation reset.
+- Unmap staging buffers on all paths: success, error, agent switch, and population reset.
 
 ## State Invariants
 
@@ -147,14 +147,13 @@ Use conventional commit prefixes: `feat:`, `fix:`, `perf:`, `refactor:`, `doc:`,
 We do not require a big-bang rewrite. Existing code is cleaned up file-by-file
 as it is touched. Priority targets:
 
-1. `governor.rs` — extract magic numbers into named constants; split `advance()`.
-2. `buffers.rs` / kernel WGSL — replace short abbreviations (`gw`, `go`, `fc`)
+1. `buffers.rs` / kernel WGSL — replace short abbreviations (`gw`, `go`, `fc`)
    and spell out the descriptive words in buffer-layout constants
    (`P_POS_*` → `P_POSITION_*`; `O_*` abbreviations such as `ENC`, `HAB`,
    `FWD`). These are shared with the shaders, so rename the Rust definition,
    the WGSL definition, and every concatenated shader together. The food-state
    constants (`FOOD_POSITION_*`, `FOOD_RESPAWN_TIMER`) are already done.
-3. `ui.rs` — rename `ppp`; extract inline RGB colors into a palette module.
+2. `ui.rs` — rename `ppp`; extract inline RGB colors into a palette module.
 
 Files that already meet the standard (e.g., `config.rs`, `body.rs`) should be
 left as-is.

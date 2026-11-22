@@ -15,9 +15,7 @@ use xagent_brain::gpu_kernel::{
     SlotReplaceError, SlotSpawn,
 };
 use xagent_brain::GpuKernel;
-use xagent_shared::{
-    EvolutionMode, FoodKind, FullConfig, SupervisorConfigError, SUPERVISOR_SAMPLE_TICKS,
-};
+use xagent_shared::{FoodKind, FullConfig, SupervisorConfigError, SUPERVISOR_SAMPLE_TICKS};
 
 use crate::agent::Agent;
 use crate::run_summary::{KindTotalsBits, RunSummary, RunSummaryAccumulator, RunSummaryError};
@@ -558,7 +556,6 @@ impl SupervisorRun {
         let kinds_on = config.world.food_kinds_enabled;
         let accumulator = measure.then(|| {
             RunSummaryAccumulator::new(
-                EvolutionMode::Supervisor,
                 Some(config.governor.supervisor.inheritance),
                 seed,
                 population,
@@ -567,7 +564,6 @@ impl SupervisorRun {
         });
         let telemetry_stats = kinds_on.then(|| {
             RunSummaryAccumulator::new(
-                EvolutionMode::Supervisor,
                 Some(config.governor.supervisor.inheritance),
                 seed,
                 population,

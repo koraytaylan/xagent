@@ -44,7 +44,7 @@ The result is a platform for observing genuinely emergent cognition. An agent pl
 |-------|------|
 | **`xagent-shared`** | Interface contract. Defines `SensoryFrame`, `MotorCommand`, `BodyState`, `BrainConfig`, and `WorldConfig`. No logic — just types. |
 | **`xagent-brain`** | GPU-resident cognitive runtime. Owns the `GpuKernel` that holds all per-agent brain state in GPU buffers and runs predictive processing (sensory encoding, pattern memory, state prediction, homeostatic monitoring, action selection) inside a fused compute kernel. |
-| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support with evolution, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, and replay controls, console), per-generation replay recording/playback, and the main event loop. |
+| **`xagent-sandbox`** | 3D world simulation + application. Procedural terrain with biomes, food/hazard systems, physics, multi-agent support under the continuous supervisor, wgpu-based rendering, egui IDE-like UI (sortable sidebar, agent detail tabs with vision display, mini-map, decision stream, console), and the main event loop. |
 
 ### Communication Flow
 
@@ -86,7 +86,7 @@ Sandbox                                                GpuKernel (GPU)
   │       and per-agent telemetry                            │
   │◄──────────────────────────────────────────────────────── │
   │                                                          │
-  │  4. Update UI snapshots, replay records, meshes          │
+  │  4. Update UI snapshots, meshes                  │
   │                                                          │
   └──────────────────────────────────────────────────────────┘
 ```
@@ -161,13 +161,13 @@ See the [brain crate README](crates/xagent-brain/README.md) for a deep dive into
 
 ### Intent & Awareness as Observational Lenses
 
-Two count-based intent signals measure whether the learned steering behavior aligns with sensed state — **approach-intent** (fraction of in-range ticks the motor turn rotated toward food) and **avoidance-intent** (fraction of ticks with hazard ahead in view, the agent off it, on which it rotated away from danger). These are **measurement-only**: they have zero impact on learning, fitness computation, or agent selection. They serve as an observational lens on emergence — when steering consistently aligns with sensed food/danger, intent is high and behavior appears deliberate; when uncorrelated, motion is incidental. The counters are generation-cumulative (preserved across respawn) and exposed on `AgentTelemetry` for per-frame sampling; the population fractions are computed at each fitness evaluation and recorded in the `behavior_metric` table. A baseline distribution measured under pure homeostatic learning (post-Plan-0012) provides the reference for future comparisons. See the [brain crate README § Intent & Awareness Telemetry](crates/xagent-brain/README.md#8-intent--awareness-telemetry) for detailed computation and interpretation.
+Two count-based intent signals measure whether the learned steering behavior aligns with sensed state — **approach-intent** (fraction of in-range ticks the motor turn rotated toward food) and **avoidance-intent** (fraction of ticks with hazard ahead in view, the agent off it, on which it rotated away from danger). These are **measurement-only**: they have zero impact on learning, fitness computation, or agent selection. They serve as an observational lens on emergence — when steering consistently aligns with sensed food/danger, intent is high and behavior appears deliberate; when uncorrelated, motion is incidental. The counters are life-cumulative (preserved across respawn) and exposed on `AgentTelemetry` for per-frame sampling. A baseline distribution measured under pure homeostatic learning (post-Plan-0012) provides the reference for future comparisons. See the [brain crate README § Intent & Awareness Telemetry](crates/xagent-brain/README.md#8-intent--awareness-telemetry) for detailed computation and interpretation.
 
 ---
 
 ## 4. The Sandbox World
 
-The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides: a **top bar** (FPS, agent count, evolution state, wall time, ticks/sec, pause/resume/reset controls), a sortable **left sidebar** with the agent list, a **main dock area** with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, decision stream, and replay playback controls), and a **bottom console** for evolution event logs.
+The sandbox is a real-time 3D environment rendered with **wgpu** (WebGPU/Vulkan/Metal/DX12 backend), wrapped in an **IDE-like UI** built with **egui 0.31 + egui_dock 0.16**. The UI provides: a **top bar** (FPS, agent count, supervisor status, wall time, ticks/sec, pause/resume controls), a sortable **left sidebar** with the agent list, a **main dock area** with the 3D viewport and agent detail tabs (featuring vision display, top-down mini-map, and decision stream), and a **bottom console** for supervisor event logs.
 
 ### Terrain & Biomes
 
@@ -212,10 +212,7 @@ All alive agents render their movement history simultaneously as **linear ribbon
 
 - Up to 100 concurrent agents (raised from 20)
 - **Food respawn**: 10-second timer, relocates to a new random food-rich position — prevents camping, forces foraging
-- **Reproduction**: currently disabled to focus on individual learning rather than evolution
-- **Directed mutations**: Per-parameter momentum vectors (one per island) bias mutations toward directions that previously improved fitness. Momentum tracks the *relative* change winners made (so parameters of any scale are comparable) and shifts the multiplicative mutation factor by at most ±0.25. It decays each generation (configurable via `momentum_decay`) so stale signals fade. This provides directional bias, emergent correlated mutations, and selective mutation focus — all without hardcoded parameter relationships.
-- **Selection against the champion**: Every generation evaluates the current champion unmutated in its first repeat group, in the same world as its mutated groups. A generation is accepted when its best mutated group beats that champion group by one standard error of a group difference, so a parent's single lucky score never becomes a bar its own children cannot reach. After `patience` failures in a row the search backtracks to the parent node.
-- **Champion brain lineage**: Each accepted node stores the brain its champion (the best agent of the best config group) was born with — the genome its fitness was earned with. What the champion learned during its life, including its memories, is not passed on; each generation learns again from birth. Every generation inherits the stored champion of the node its configs were bred from, so rejected generations and backtracks never leak a different lineage's weights.
+- **Replacement**: the continuous supervisor retires lives and spawns newborns into their slots, keeping a bounded archive of retired lives
 
 See the sandbox crate source for full implementation details.
 
@@ -256,6 +253,16 @@ cargo run --release -- --dump-config > experiment.json
 cargo run --release -- --config experiment.json
 ```
 
+### Continuous supervisor (the only mode)
+
+The continuous-life supervisor is the only mode. Agent slots live continuously; the supervisor keeps a ledger per slot and a bounded archive of retired lives, and replaces retired lives with newborns. It is a pure deterministic core (`supervisor.rs`) driven by a shared kernel-facing driver (`supervisor_run.rs`) and persisted by a SQLite store (`supervisor_store.rs`). The same driver serves the GUI and the headless run.
+
+Current flags: `--brain-preset`, `--world-preset`, `--config`, `--seed`, `--tick-rate`, `--no-render`, `--dump-config`, `--db`, `--resume`, `--bench`, `--bench-ticks`, `--bench-agents`, `--world-size`, `--bench-profile`, `--bench-phase-ab`, `--bench-agent-sweep`, `--bench-visual-cortex`, `--free-life`, `--free-life-agents`, `--free-life-ticks`, `--free-life-lesion`, `--free-life-log`, `--free-life-out`, `--agent-tick-budget`, `--supervisor-inheritance`, `--run-summary`, `--free-life-archive-db`, `--free-life-archive-rank`, `--food-kinds`, `--freeze-policy`, `--food-kind-summary`.
+
+The removed generation-era flags `generations`, `dump-tree`, `evolution-mode`, `validate-innate-instincts`, `validate-danger-percept`, `validation-*`, `free-life-champion-db` and `free-life-champion-node` exit with status 2 and a message that generation mode was removed.
+
+A generation-era database (one that `supervisor_store::inspect_database` classifies as `LegacyGenerations`) is refused by the GUI and the headless driver. The file is never modified and no sidecar file is created beside it.
+
 ---
 
 ## 6. Controls Reference
@@ -289,9 +296,6 @@ cargo run --release -- --config experiment.json
 | Double-click agent in sidebar | Open an agent detail tab in the dock area |
 | Drag / scroll on viewport pane | Camera rotation / zoom (only when hovering the viewport) |
 | Pause / Resume button (top bar) | Pause or resume the simulation (visible during Running/Paused) |
-| Reset button (top bar) | Reset the evolution run (visible during Running/Paused) |
-| "Replay Gen N" button (detail tab) | Enter replay mode for the last completed generation |
-| Timeline scrubber (replay mode) | Scrub through recorded ticks |
 | Close detail tab | Click the × on the tab header |
 
 Camera controls (drag, scroll) are routed to the 3D viewport only when the pointer is hovering over it; interacting with the sidebar or detail tabs does not move the camera.
@@ -316,8 +320,8 @@ Camera controls (drag, scroll) are routed to the 3D viewport only when the point
 |-----------|-----------------|
 | `memory_capacity` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
-| `visual_encoding_size` | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (the structured `retina_*` / `gabor_*` / `dog_*` config and the `coop_visual_cortex` pass). No kernel stage reads this field and it is no longer editable in the UI or carried through breeding; it is retained only so older saved configs still deserialize (issue #106 resolved). |
-| `representation_dimension` | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The GPU kernel sizes encoder weights, predictor weights, and workgroup arrays from that constant — WGSL cannot resize them at runtime. The config field is a read-only echo; mismatched values log a warning and are ignored. Not mutated by evolution, not exposed in the UI (see issues #103, #106). |
+| `visual_encoding_size` | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (the structured `retina_*` / `gabor_*` / `dog_*` config and the `coop_visual_cortex` pass). No kernel stage reads this field and it is no longer editable in the UI; it is retained only so older saved configs still deserialize (issue #106 resolved). |
+| `representation_dimension` | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`. The GPU kernel sizes encoder weights, predictor weights, and workgroup arrays from that constant — WGSL cannot resize them at runtime. The config field is a read-only echo; mismatched values log a warning and are ignored. Not mutated, not exposed in the UI (see issues #103, #106). |
 | `learning_rate` | Base rate for weight updates (encoder, predictor, memory). Higher → faster adaptation but less stability. |
 | `decay_rate` | Rate of memory decay per tick. Higher → more aggressive forgetting, favoring recent experience. |
 | `distress_exponent` | Distress curve shape (default 2.0). Higher → calm longer, panic harder at critical levels. Heritable. |
@@ -404,8 +408,7 @@ This means an agent that avoids danger but starves (high urgency) cannot reach A
 
 ### Key Metrics to Watch
 
-These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning). Completed generations can be replayed via the built-in replay system.
-
+These metrics are visible in the **sidebar** (compact vitals, phase label, sortable by any metric) and in **agent detail tabs** (vitals/motor display, vision display showing what the agent sees, mini-map showing the agent's position in the world, scrollable history charts, and a real-time decision stream showing per-tick brain reasoning).
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
 | `prediction_error` (avg) | Decreasing over time | Stuck high or oscillating |
@@ -495,8 +498,10 @@ xagent/
 │       │   │   ├── camera.rs   # Free-fly camera with mouse look
 │       │   │   ├── hud.rs      # HUD bar overlay (energy, integrity, etc.)
 │       │   │   └── font.rs     # Bitmap font atlas + text rendering
-│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot, WorldSnapshot, ReplayState)
-│       │   ├── replay.rs       # Per-generation replay recording & playback (TickRecord, GenerationRecording)
+│       │   ├── ui.rs            # egui integration (EguiIntegration, TabViewer, AgentSnapshot, WorldSnapshot)
+│       │   ├── supervisor.rs   # Pure deterministic core of the continuous-life supervisor
+│       │   ├── supervisor_run.rs   # Shared kernel-facing supervisor driver
+│       │   ├── supervisor_store.rs # SQLite persistence of a supervisor run
 │       └── tests/
 │           └── integration.rs  # 32 integration tests
 ```
@@ -533,8 +538,8 @@ The simulation's throughput depends on keeping per-tick work on the GPU. These r
 
 - **Per-tick simulation logic belongs in WGSL shaders, never in Rust.** Physics, brain passes, food detection, death/respawn -- all of it runs in compute shaders. Adding per-tick logic on the CPU side defeats the fused-kernel architecture.
 - **The CPU main loop submits GPU dispatches (batched) and collects async readback results (non-blocking).** The Rust side orchestrates dispatches, maps readback buffers, and feeds the UI. It never steps the simulation itself.
-- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** Replay recording and UI snapshot updates happen at frame cadence, not tick cadence.
-- **No CPU-side simulation work should scale with `ticks_to_run` beyond trivial bookkeeping.** The GPU tick budget is capped at 64,000 ticks per frame, and execution may be split across multiple batched dispatches. Rust may still do lightweight per-tick accounting (for example, counters or governance bookkeeping), but any per-tick simulation, physics, sensing, or brain computation on the CPU violates this invariant.
+- **Recording, telemetry, and history functions run once per frame, sampling the latest state.** UI snapshot updates happen at frame cadence, not tick cadence.
+- **No CPU-side simulation work should scale with `ticks_to_run` beyond trivial bookkeeping.** The GPU tick budget is capped at 64,000 ticks per frame, and execution may be split across multiple batched dispatches. Rust may still do lightweight per-tick accounting (for example, counters or supervisor bookkeeping), but any per-tick simulation, physics, sensing, or brain computation on the CPU violates this invariant.
 
 ---
 
@@ -568,7 +573,7 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 |-------|------:|-------|
 | **xagent-brain** | 38 | GPU buffer layout (sensory packing, init, config alignment), per-shader unit tests (feature extraction, encoding, habituation, cosine similarity scoring, top-K selection, motor output validation, weight learning, pattern storage), full pipeline integration (tick produces valid motors), state read/write roundtrip, death signal, resize, multi-agent variance, learning convergence, memory filling, fused kernel tick loop, deterministic bench |
 | **xagent-shared** | 1 | Config defaults (vision_stride) |
-| **xagent-sandbox** | 95 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), evolution (config mutation/crossover, fitness evaluation), compute backend probe, benchmark determinism |
+| **xagent-sandbox** | 95 | Physics (movement, rotation, gravity, NaN sanitization, metabolic brain drain, parallel step_pure correctness), agent lifecycle (energy depletion, death, food consumption, deferred consumption dedup), terrain (determinism, interpolation smoothness, input validation), sensory extraction (vision dimensions, interoception accuracy, GPU/CPU vision parity), spatial grids (FoodGrid query/remove/insert/rebuild, AgentGrid query/rebuild), supervisor (ledgers, archive, replacement, store), compute backend probe, benchmark determinism |
 
 ---
 
@@ -576,22 +581,16 @@ cargo test -p xagent-brain -- brain_prediction_error_decreases_with_repeated_inp
 
 A core research question for emergent cognition is: does learned behavior reflect deliberate goal-directed steering, or does it arise by chance?
 
-xagent provides two **count-based intent metrics** for answering this empirically. Each agent accumulates generation-cumulative counters tracking whether steering aligns with sensed food or danger:
+xagent provides two **count-based intent metrics** for answering this empirically. Each agent accumulates life-cumulative counters tracking whether steering aligns with sensed food or danger:
 
 - **Approach-Intent Fraction** = (brain cycles the agent turned *toward* sensed food) / (brain cycles food was in sensory range). Measures food-seeking alignment.
 - **Avoidance-Intent Fraction** = (brain cycles the agent turned *away* from hazard ahead) / (brain cycles a hazard cell was within sensory range inside the agent's horizontal field of view, with the agent off hazard ground). Measures danger-avoidance alignment.
 - **Avoidance turn away** = Σ (motor turn · side of the hazard, positive = away) / the same brain cycles: the mean turn away, weighted by size, 0 at chance. Unlike the sign count it registers a small lean away under larger turning.
-- **Steps onto hazard ground** per agent per generation, alongside the share of distance travelled on it (`danger_dwell_fraction`). The evolution panel charts these per generation.
+- **Steps onto hazard ground** per agent life, alongside the share of distance travelled on it (`danger_dwell_fraction`).
 
 ### Telemetry & Aggregation
 
-Per-agent counters are exposed on `AgentTelemetry` (captured once per frame for selected agent) and on every agent's `Agent` cache (updated every state readback). At each fitness evaluation, the population fractions are computed and recorded in the `behavior_metric` table:
-
-```sql
-SELECT generation, approach_intent_fraction, avoidance_intent_fraction FROM behavior_metric;
-```
-
-These columns aggregate across all agents in the population, providing a generation-level summary of emergent steering alignment.
+Per-agent counters are exposed on `AgentTelemetry` (captured once per frame for selected agent) and on every agent's `Agent` cache (updated every state readback). The supervisor's telemetry tables record them per slot snapshot, providing a summary of emergent steering alignment across the population.
 
 ### Baseline Distribution
 
@@ -643,7 +642,7 @@ That validation harness is deferred because defensible thresholds can only be se
 - **Neural network encoder option** — A pluggable CNN-based encoder for richer visual representations, with the tradeoff of reduced inspectability.
 - **Hierarchical prediction** — Multiple levels of temporal abstraction, predicting at different timescales (next tick vs. next 100 ticks).
 - **Distributed simulation** — Run thousands of agents across multiple machines to study population-level emergent phenomena.
-- **Persistent evolution** — Save and reload agent lineages across simulation runs, building long-term evolutionary histories.
+- **Richer persistence** — Save and reload more of a supervisor run across simulation runs, building longer-term life histories.
 
 ---
 

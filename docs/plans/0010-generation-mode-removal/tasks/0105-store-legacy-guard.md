@@ -9,8 +9,8 @@ role: developer
 touches:
   - crates/xagent-sandbox/src/supervisor_store.rs
   - crates/xagent-sandbox/src/supervisor.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "82b0958d991d09dcb26d2f150b4e2fc97d1c54ac"
 checks:
   - name: store-unit
     command: "cargo test -p xagent-sandbox --lib supervisor_store"

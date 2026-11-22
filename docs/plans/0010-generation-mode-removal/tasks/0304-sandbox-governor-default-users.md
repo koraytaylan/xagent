@@ -10,8 +10,8 @@ role: developer
 touches:
   - crates/xagent-sandbox/src/ui.rs
   - crates/xagent-sandbox/src/agent/mod.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "2a07d96c9f7223a37d0bb1896910299354be486e"
 checks:
   - name: governor-default-users-free
     command: "sh -c '! grep -nF \"GovernorConfig::default().tick_budget\" crates/xagent-sandbox/src/ui.rs && grep -qF \"const DEFAULT_SNAPSHOT_TICK_BUDGET: u64 = 1_000_000;\" crates/xagent-sandbox/src/ui.rs && ! grep -nF \"eval_repeats\" crates/xagent-sandbox/src/agent/mod.rs'"

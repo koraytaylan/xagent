@@ -17,8 +17,8 @@ touches:
   - crates/xagent-sandbox/src/supervisor_run.rs
   - crates/xagent-sandbox/tests/supervisor_headless.rs
   - crates/xagent-sandbox/tests/supervisor_run.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "fbf33da583b1fb9cbc275235cdccb35de7034ad0"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test supervisor_headless --test supervisor_run"

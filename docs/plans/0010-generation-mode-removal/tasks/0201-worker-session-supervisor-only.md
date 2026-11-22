@@ -14,8 +14,8 @@ touches:
   - crates/xagent-sandbox/src/app.rs
   - crates/xagent-sandbox/src/evolution.rs
   - crates/xagent-sandbox/src/snapshot.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "0cdbe14612c9fc8616dea9cda7f141f86dcc33b3"
 checks:
   - name: bin-unit
     command: "cargo test -p xagent-sandbox --bin xagent"

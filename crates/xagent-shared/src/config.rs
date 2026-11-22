@@ -618,58 +618,27 @@ pub struct FullConfig {
     pub governor: GovernorConfig,
 }
 
-/// Configuration for the evolution governor.
+/// Settings for the supervisor-only evolution driver: population, mutation
+/// strength, momentum decay and the supervisor schedule. Config files that
+/// still carry the removed generation keys load with those keys ignored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernorConfig {
-    /// Number of agents per generation. The default is sized to the GPU
-    /// occupancy knee (see [`default_population_size`]); configs that omit the
-    /// field deserialize to that same knee.
+    /// Number of agents per run. The default is sized to the GPU occupancy
+    /// knee (see [`default_population_size`]); configs that omit the field
+    /// deserialize to that same knee.
     #[serde(default = "default_population_size")]
     pub population_size: usize,
-    /// Simulation ticks per generation before evaluation.
-    pub tick_budget: u64,
-    /// Number of top configs remembered for island migration. Breeding copies
-    /// the spawn parent and does not consult this list.
-    pub elitism_count: usize,
-    /// Maximum number of generations to run (0 = unlimited).
-    pub max_generations: u64,
-    /// Consecutive generations of fitness regression before backtracking.
-    pub patience: u32,
     /// Base strength of the turn-policy mutation. Scales up with failed
     /// attempts, from this value toward 0.5.
     #[serde(default = "default_mutation_strength")]
     pub mutation_strength: f32,
-    /// How many agents share one steering genome per generation. Their fitness
-    /// is averaged.
-    #[serde(default = "default_eval_repeats")]
-    pub eval_repeats: usize,
-    /// Number of independent evolutionary lineages (island model).
-    #[serde(default = "default_num_islands")]
-    pub num_islands: usize,
-    /// Generations between best-config migration across islands.
-    #[serde(default = "default_migration_interval")]
-    pub migration_interval: u32,
-    /// Decay factor for per-island mutation momentum (0.0–1.0).
+    /// Decay factor for mutation momentum (0.0–1.0).
     /// Higher = longer memory of winning mutation directions.
     #[serde(default = "default_momentum_decay")]
     pub momentum_decay: f32,
-    /// How evolution is driven: fixed generations or a continuous supervisor.
-    #[serde(default)]
-    pub evolution_mode: EvolutionMode,
-    /// Settings used only in supervisor mode.
+    /// Supervisor schedule settings.
     #[serde(default)]
     pub supervisor: SupervisorConfig,
-}
-
-/// How evolution is driven.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvolutionMode {
-    /// Fixed-length generations (the original behaviour).
-    #[default]
-    Generations,
-    /// One continuous life with local replacement.
-    Supervisor,
 }
 
 /// What a supervisor newborn inherits from its parent.
@@ -882,7 +851,7 @@ impl SupervisorConfig {
     }
 }
 
-/// Default population (agents per generation).
+/// Default population (agents per run).
 ///
 /// The GPU occupancy knee — where useful throughput (agent-ticks/sec) peaks —
 /// is far higher (≈200 on the reference GPU, ~10× the raw GPU throughput of a
@@ -892,33 +861,17 @@ impl SupervisorConfig {
 /// per-capita foraging and multiplies deaths-per-food. Enlarging the world so
 /// per-agent food is preserved (`world_size ∝ √population`) removes that
 /// competition — per-capita behavior then matches this default — but evaluating
-/// more genomes per generation buys no measured fitness gain (the limiter is
+/// more genomes per run buys no measured fitness gain (the limiter is
 /// learner strength, not search breadth) while costing proportionally more wall
-/// time per generation. Until genomes are evaluated in independent arenas with a
+/// time per run. Until genomes are evaluated in independent arenas with a
 /// world-size-invariant fitness, a small population is the validated,
-/// fastest-per-generation choice.
+/// fastest-per-run choice.
 fn default_population_size() -> usize {
     10
 }
 
 fn default_mutation_strength() -> f32 {
     0.1
-}
-
-fn default_eval_repeats() -> usize {
-    2
-}
-
-fn default_num_islands() -> usize {
-    // One lineage by default. With a small shared-world population the per-island
-    // round-robin split the generation's already-thin foraging signal across
-    // separate trees; concentrating it in a single lineage gives selection the
-    // full population to compare each generation.
-    1
-}
-
-fn default_migration_interval() -> u32 {
-    5
 }
 
 fn default_momentum_decay() -> f32 {
@@ -929,16 +882,8 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             population_size: default_population_size(),
-            tick_budget: 1_000_000,
-            elitism_count: 3,
-            max_generations: 0,
-            patience: 5,
             mutation_strength: 0.1,
-            eval_repeats: 2,
-            num_islands: 1,
-            migration_interval: 5,
             momentum_decay: 0.9,
-            evolution_mode: EvolutionMode::default(),
             supervisor: SupervisorConfig::default(),
         }
     }
@@ -1253,20 +1198,17 @@ mod tests {
     #[test]
     fn supervisor_config_defaults_when_omitted() {
         let full: FullConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(full.governor.evolution_mode, EvolutionMode::Generations);
         assert_eq!(full.governor.supervisor, SupervisorConfig::default());
         let gov: GovernorConfig = serde_json::from_str(
             r#"{"tick_budget":1,"elitism_count":1,"max_generations":0,"patience":1}"#,
         )
         .unwrap();
-        assert_eq!(gov.evolution_mode, EvolutionMode::Generations);
         assert_eq!(gov.supervisor, SupervisorConfig::default());
     }
 
     #[test]
     fn supervisor_config_round_trip() {
         let mut gov = GovernorConfig::default();
-        gov.evolution_mode = EvolutionMode::Supervisor;
         gov.supervisor.inheritance = Inheritance::WeightCopy;
         gov.supervisor.archive_capacity = 7;
         gov.supervisor.boundary_interval_ticks = 800;
@@ -1274,8 +1216,69 @@ mod tests {
         assert!(json.contains("\"supervisor\""));
         assert!(json.contains("\"weight_copy\""));
         let back: GovernorConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.evolution_mode, EvolutionMode::Supervisor);
         assert_eq!(back.supervisor, gov.supervisor);
+    }
+
+    #[test]
+    fn legacy_generation_governor_json_loads() {
+        let json = r#"{
+            "governor": {
+                "population_size": 12,
+                "tick_budget": 1000000,
+                "elitism_count": 3,
+                "max_generations": 0,
+                "patience": 5,
+                "mutation_strength": 0.25,
+                "eval_repeats": 2,
+                "num_islands": 1,
+                "migration_interval": 5,
+                "momentum_decay": 0.8,
+                "evolution_mode": "generations",
+                "supervisor": { "archive_capacity": 7 }
+            }
+        }"#;
+        let full: FullConfig = serde_json::from_str(json).expect("legacy governor JSON loads");
+        assert_eq!(full.governor.population_size, 12);
+        assert_eq!(full.governor.mutation_strength, 0.25);
+        assert_eq!(full.governor.momentum_decay, 0.8);
+        assert_eq!(full.governor.supervisor.archive_capacity, 7);
+        let out = serde_json::to_string(&full).unwrap();
+        for key in [
+            "tick_budget",
+            "elitism_count",
+            "max_generations",
+            "patience",
+            "eval_repeats",
+            "num_islands",
+            "migration_interval",
+            "evolution_mode",
+        ] {
+            assert!(
+                !out.contains(&format!("\"{key}\"")),
+                "re-serialized config keeps {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn governor_config_keys_are_supervisor_only() {
+        let value = serde_json::to_value(GovernorConfig::default()).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "momentum_decay",
+                "mutation_strength",
+                "population_size",
+                "supervisor"
+            ]
+        );
     }
 
     #[test]
@@ -1337,7 +1340,6 @@ mod tests {
         let json = serde_json::to_string(&BrainConfig::default()).unwrap();
         for key in [
             "supervisor",
-            "evolution_mode",
             "inheritance",
             "boundary_interval_ticks",
             "min_age_ticks",
@@ -1519,7 +1521,8 @@ mod tests {
     #[test]
     fn governor_config_tuned_defaults() {
         let config = GovernorConfig::default();
-        assert_eq!(config.tick_budget, 1_000_000);
+        assert_eq!(config.mutation_strength, 0.1);
+        assert_eq!(config.momentum_decay, 0.9);
     }
 
     #[test]

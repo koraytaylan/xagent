@@ -9,13 +9,15 @@ Enforcement, strongest first:
 
 ## Build & Test
 - `cargo check -p xagent-sandbox` — quick compile check for the sandbox crate
-- `cargo test -p xagent-sandbox` — runs 221 total tests (109 lib unit + 14 bin unit + 96 integration + 2 doctests). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
+- `cargo test -p xagent-sandbox` — runs 544 total tests (252 lib unit + 67 bin unit + 225 integration + 0 doctests). GPU tests self-skip without an adapter; CI/dev installs Mesa lavapipe.
 
 ## Architecture
-- `crates/xagent-sandbox/src/governor.rs` — evolution state machine, SQLite persistence
-- `crates/xagent-sandbox/src/ui.rs` — egui 0.31 immediate-mode UI, `EvolutionSnapshot` bridges governor↔UI
-- `crates/xagent-sandbox/src/sim_runtime.rs` — simulation worker thread: owns `GpuKernel` and all sim-cadence scheduling, advances ticks on a wall-clock cadence, enforces the generation tick budget, and publishes CPU-visible state to the main thread via bounded `SimCommand`/`SimEvent` channels (latest-wins snapshots)
-- `crates/xagent-sandbox/src/main.rs` — app loop: drains worker events, applies the newest snapshot to CPU agent caches, drives the generation handoff, and renders (no GPU dispatch/readback in the redraw path)
+- `crates/xagent-sandbox/src/supervisor.rs` — pure deterministic core of the continuous-life supervisor (per-slot ledgers, bounded archive, replacement streams; no GPU, database or file I/O)
+- `crates/xagent-sandbox/src/supervisor_run.rs` — shared kernel-facing supervisor driver used by the GUI and the headless run; hands each 100-tick readback to `SupervisorRun::on_sample`
+- `crates/xagent-sandbox/src/supervisor_store.rs` — SQLite persistence of a supervisor run; refuses a generation-era database (via `inspect_database`) before any write
+- `crates/xagent-sandbox/src/ui.rs` — egui 0.31 immediate-mode UI, the observatory and `SupervisorSnapshot` bridge supervisor↔UI
+- `crates/xagent-sandbox/src/sim_runtime.rs` — simulation worker thread: owns `GpuKernel` and all sim-cadence scheduling, advances ticks on a wall-clock cadence, and publishes CPU-visible state to the main thread via bounded `SimCommand`/`SimEvent` channels (latest-wins snapshots)
+- `crates/xagent-sandbox/src/main.rs` — app loop: drains worker events, applies the newest snapshot to CPU agent caches, and renders (no GPU dispatch/readback in the redraw path)
 - `crates/xagent-sandbox/src/gpu_orchestration.rs` — main-thread side of the worker boundary: start/stop worker, drain events, apply snapshots, forward speed/pause/selection on change
 - DB migrations are idempotent: `let _ = db.execute_batch("ALTER TABLE ... ADD COLUMN ...");`
 - `crates/xagent-brain/src/gpu_kernel.rs` — fused kernel: single dispatch(agent_count,1,1) per vision-stride cycle, the sole GPU abstraction for all simulation. Compute (`dispatch_ticks`) is split from CPU-visible publication (`request_state_snapshot` / `try_collect_state_snapshot`); `dispatch_batch` is the combined compatibility wrapper

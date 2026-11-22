@@ -10,8 +10,8 @@ pub mod sensory;
 
 pub use body::{BodyState, InternalState};
 pub use config::{
-    AgentDescriptor, BrainConfig, CriticInput, EvolutionMode, FoodKind, FullConfig, GovernorConfig,
-    Inheritance, SupervisorConfig, SupervisorConfigError, WorldConfig, DEFAULT_CRITIC_INPUT,
+    AgentDescriptor, BrainConfig, CriticInput, FoodKind, FullConfig, GovernorConfig, Inheritance,
+    SupervisorConfig, SupervisorConfigError, WorldConfig, DEFAULT_CRITIC_INPUT,
     DEFAULT_FORWARD_PATHWAY_ENABLED, DOG_SURROUND_RATIO_MAX, DOG_SURROUND_RATIO_MIN,
     GABOR_ASPECT_RATIO_MAX, GABOR_ASPECT_RATIO_MIN, GABOR_WAVELENGTH_MAX, GABOR_WAVELENGTH_MIN,
     HORIZONTAL_FOV_MAX, HORIZONTAL_FOV_MIN, INSTINCT_DANGER_STRENGTH_MAX,

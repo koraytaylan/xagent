@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use xagent_brain::GpuKernel;
 use xagent_sandbox::headless::{run_headless_with_options, HeadlessError, HeadlessOptions};
 use xagent_sandbox::supervisor_checkpoint::CheckpointError;
-use xagent_shared::{EvolutionMode, FullConfig};
+use xagent_shared::FullConfig;
 
 /// World seed of the run.
 const SEED: u64 = 5;
@@ -176,7 +176,6 @@ fn digest_database(db_path: &Path) -> String {
 fn seeded_config() -> FullConfig {
     let mut config = FullConfig::default();
     config.world.seed = SEED;
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = AGENTS;
     config.governor.supervisor.agent_tick_budget = AGENT_TICK_BUDGET;
     config

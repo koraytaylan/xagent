@@ -14,8 +14,8 @@ touches:
   - crates/xagent-sandbox/src/replay_coord.rs
   - crates/xagent-sandbox/src/app.rs
   - crates/xagent-sandbox/src/evolution.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "36008f95d89005fc07cee22a37f8bca5814dbf55"
 checks:
   - name: ui-unit
     command: "cargo test -p xagent-sandbox --lib ui::"

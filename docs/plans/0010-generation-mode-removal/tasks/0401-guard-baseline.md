@@ -20,8 +20,8 @@ gated: false
 role: developer
 touches:
   - crates/xagent-sandbox/tests/contributing_guard.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "c416c90a80dac4c09f6d051b150785fd7e04c561"
 checks:
   - name: contributing-guard
     command: cargo test -p xagent-sandbox --test contributing_guard

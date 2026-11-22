@@ -26,14 +26,18 @@ touches:
   - EVOLUTION_JOURNEY.md
   - crates/xagent-sandbox/README.md
   - crates/xagent-shared/README.md
-status: todo
-merged_as: ""
+status: done
+merged_as: "a1498f49f79db200f557080d64992c662012a295"
 checks:
   - name: contributing-guard
     command: cargo test -p xagent-sandbox --test contributing_guard
     timeout_ms: 1800000
   - name: sandbox-tests
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox
+    timeout_ms: 7200000
+  - name: sandbox-test-totals
+    command: |-
+      bash -o pipefail -c 'env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox 2>&1 | grep -E "Running|Doc-tests|test result:"'
     timeout_ms: 7200000
   - name: docs-generation-free
     command: |-
@@ -95,11 +99,11 @@ read from the tree as it is at execution time.
    line. Reword the `ui.rs` line that names `governor↔UI` to name the surviving
    observatory and supervisor snapshot. Update the test-count line
    (`cargo test -p xagent-sandbox` — runs N total tests (...)) from the
-   `sandbox-tests` output. Count, for each target kind, the sum of `passed` plus
+   `sandbox-test-totals` output (the `sandbox-tests` run filtered to its target and `test result:` lines). Count, for each target kind, the sum of `passed` plus
    `ignored` over its `test result:` lines: lib unit (`Running unittests src/lib.rs`),
    bin unit (`Running unittests src/main.rs`), integration (every
    `Running tests/<name>.rs` target together), and doctests (`Doc-tests`).
-   Write the total and the four parts exactly, and correct the line until it equals the `sandbox-tests` totals.
+   Write the total and the four parts exactly, and correct the line until it equals the `sandbox-test-totals` totals.
 2. In `README.md` and `crates/xagent-sandbox/README.md`, remove or rewrite every
    passage that describes generation mode: the generation search and selection
    sections, the generation tree and detail panels, the Reset and "Replay Gen N"
@@ -124,13 +128,13 @@ read from the tree as it is at execution time.
    the continuous supervisor is the only mode; that generation-era databases are
    refused and never modified; and that the decision is the user's, recorded in
    `docs/measurements/continuous-supervisor/INHERITANCE-DEFAULT.md`.
-- **Done when:** the checks `contributing-guard`, `sandbox-tests` and `docs-generation-free` pass, and the CLAUDE.md test-count line equals the totals of the `sandbox-tests` output, proving the docs describe the supervisor-only system (INV-10).
+- **Done when:** the checks `contributing-guard`, `sandbox-tests`, `sandbox-test-totals` and `docs-generation-free` pass, and the CLAUDE.md test-count line equals the totals of the `sandbox-test-totals` output, proving the docs describe the supervisor-only system (INV-10).
 
 ## Non-goals
 
 - No change to any `.rs` source file.
 - No edit of history records under `docs/decisions/`, `docs/measurements/` or
   other plans, and no rewrite of EVOLUTION_JOURNEY chapters 1 to 24.
-- No new dependency, Cargo file, release identifier or check beyond the three
+- No new dependency, Cargo file, release identifier or check beyond the four
   listed.
 - No Git operation. The host commits the packet.

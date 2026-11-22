@@ -11,7 +11,7 @@ use xagent_sandbox::headless::{
     FreeLifeReport, HeadlessOptions,
 };
 use xagent_sandbox::supervisor_store::{load_archive_entry_read_only, ArchiveLoadError};
-use xagent_shared::{EvolutionMode, FullConfig, Inheritance, SupervisorConfig};
+use xagent_shared::{FullConfig, Inheritance, SupervisorConfig};
 
 /// Agents in the supervisor run.
 const SUPERVISOR_AGENTS: usize = 10;
@@ -81,7 +81,6 @@ fn gpu_or_skip() -> bool {
 
 fn supervisor_config() -> FullConfig {
     let mut config = FullConfig::default();
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = SUPERVISOR_AGENTS;
     config.governor.supervisor = SupervisorConfig {
         boundary_interval_ticks: BOUNDARY_TICKS,
@@ -176,8 +175,6 @@ fn archive_free_life_runs_rank_zero_entry() {
     assert_eq!(report.agent_count, FREE_LIFE_AGENTS);
     assert_eq!(report.agents.len(), FREE_LIFE_AGENTS);
     assert_eq!(report.ticks, opts.ticks);
-    assert_eq!(report.champion_node_id, None);
-    assert_eq!(report.champion_generation, None);
 }
 
 #[test]
@@ -229,7 +226,7 @@ fn archive_free_life_is_reproducible() {
 #[test]
 fn free_life_report_without_archive_field_deserializes() {
     let json = r#"{"agent_count":1,"ticks":10,"seed":3,"brain_source":"fresh",
-        "champion_node_id":null,"champion_generation":null,"lesions":[],
+        "lesions":[],
         "kernel_batch_size":1,"brain_ticks":0,"agents":[]}"#;
     let report: FreeLifeReport = serde_json::from_str(json).expect("deserialize");
     assert_eq!(report.archive_entry_id, None);

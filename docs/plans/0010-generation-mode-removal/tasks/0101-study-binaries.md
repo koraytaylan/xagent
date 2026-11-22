@@ -6,8 +6,8 @@ kind: task
 depends_on: []
 gated: false
 role: architect
-status: todo
-merged_as: ""
+status: done
+merged_as: "84a1ba260ecc372a2d10263f27a20a5236ac6e3c"
 touches:
   - crates/xagent-sandbox/src/bin/food_kind_verdict.rs
   - crates/xagent-sandbox/src/bin/pathway_route_gate.rs

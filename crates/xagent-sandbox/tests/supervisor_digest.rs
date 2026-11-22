@@ -9,7 +9,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use xagent_brain::GpuKernel;
 use xagent_sandbox::headless::HeadlessOptions;
-use xagent_shared::{EvolutionMode, FullConfig, Inheritance};
+use xagent_shared::{FullConfig, Inheritance};
 
 /// World seed of the recorded run.
 const SEED: u64 = 5;
@@ -118,7 +118,6 @@ fn hash_section(h: &mut Fnv1a, conn: &Connection, tag: &str, sql: &str, skip: &[
 fn seeded_config() -> FullConfig {
     let mut config = FullConfig::default();
     config.world.seed = SEED;
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = POPULATION;
     config.governor.supervisor.agent_tick_budget = AGENT_TICK_BUDGET;
     config

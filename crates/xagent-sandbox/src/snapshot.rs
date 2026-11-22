@@ -142,23 +142,9 @@ impl App {
         }
     }
 
-    /// Refresh the evolution snapshot fields the UI reads (governor progress,
-    /// accumulated wall time, and the once-per-second ticks/sec average).
+    /// Refresh the evolution snapshot fields the UI reads (accumulated wall
+    /// time and the once-per-second ticks/sec average).
     pub(crate) fn update_evo_snapshot(&mut self) {
-        if let Some(gov) = &mut self.governor {
-            self.evo_snapshot.gen_tick = gov.gen_tick;
-            self.evo_snapshot.generation = gov.generation;
-            self.evo_snapshot.tree_nodes = gov.tree_nodes();
-            self.evo_snapshot.current_node_id = gov.current_node_id;
-            self.evo_snapshot
-                .fitness_history
-                .clone_from(gov.fitness_history_by_island());
-            let hazard_history = gov.hazard_history();
-            if self.evo_snapshot.hazard_history.len() != hazard_history.len() {
-                self.evo_snapshot.hazard_history = hazard_history.to_vec();
-            }
-            self.evo_snapshot.best_fitness = gov.best_score();
-        }
         let wall = self.evo_wall_accumulated
             + self
                 .evo_wall_segment_start

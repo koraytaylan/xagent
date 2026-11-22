@@ -1,19 +1,17 @@
 //! Application state container for the windowed sandbox binary.
 //!
-//! Centralises the `App` struct, the non-blocking generation-transition state
-//! machine, and the pending-upload staging type.  Behavioural methods live
-//! in sibling binary modules (`gpu_orchestration`, `evolution`,
-//! `render_pipeline`, `snapshot`) to keep each responsibility focused.
+//! Centralises the `App` struct and the startup database classification.
+//! Behavioural methods live in sibling binary modules (`gpu_orchestration`,
+//! `evolution`, `render_pipeline`, `snapshot`) to keep each responsibility
+//! focused.
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::window::Window;
 
 use xagent_sandbox::agent::Agent;
-use xagent_sandbox::governor::{check_existing_session, AdvanceResult, Governor};
 use xagent_sandbox::observatory::store_read::{detect_supervisor_run, SupervisorRunSummary};
 use xagent_sandbox::renderer::camera::Camera;
 use xagent_sandbox::renderer::hud::HudBar;
@@ -27,6 +25,9 @@ use xagent_sandbox::ui::{
 use xagent_sandbox::world::WorldState;
 use xagent_shared::{BrainConfig, GovernorConfig, WorldConfig};
 
+use crate::evolution::{
+    apply_database_refusal, apply_legacy_choice, inspect_offer, ResetState, SessionOffer,
+};
 use crate::gpu_orchestration::BrowseTickWindow;
 use crate::tick_window_view::{self, TickWindowView};
 
@@ -39,24 +40,12 @@ pub(crate) const SIM_DT: f32 = 1.0 / SIM_RATE;
 /// At 100 ms (10 Hz) the visual difference is indistinguishable from per-frame.
 pub(crate) const REBUILD_THROTTLE: Duration = Duration::from_millis(100);
 
-/// Data collected on the main thread for upload once the background-created
-/// fused kernel is ready.  Avoids passing world/agent refs across threads.
-pub(crate) struct PendingUpload {
-    pub(crate) heights: Vec<f32>,
-    pub(crate) biomes: Vec<u32>,
-    pub(crate) food_pos: Vec<(f32, f32, f32)>,
-    pub(crate) food_consumed: Vec<bool>,
-    pub(crate) food_timers: Vec<f32>,
-    pub(crate) agent_data: Vec<(glam::Vec3, f32, f32, usize, usize)>,
-    pub(crate) agent_configs: Vec<BrainConfig>,
-}
-
 /// Render-side instrumentation for the runtime-decoupling work.
 ///
 /// The simulation half of the baseline (ticks advanced, dispatches, snapshot /
 /// telemetry requests and collections) lives in the worker thread (see
 /// `sim_runtime::Worker`). The main thread only counts what it observes:
-/// frames rendered and snapshots/generation-boundaries consumed. Together the
+/// frames rendered and snapshots consumed. Together the
 /// two halves show simulation progress is independent of render cadence. These
 /// are diagnostic only — emitted through `log::debug!` roughly once per second
 /// (see `App::log_runtime_counters`) and carry no UI surface.
@@ -66,23 +55,6 @@ pub(crate) struct RuntimeCounters {
     pub(crate) frames_rendered: u64,
     /// State snapshots received from the worker and applied to CPU caches.
     pub(crate) snapshots_applied: u64,
-    /// Generation-boundary events received from the worker.
-    pub(crate) generation_boundaries: u64,
-}
-
-/// In-flight generation handoff: the worker reached the tick budget and the
-/// main thread has evaluated fitness and requested the brain the champion was
-/// born with.
-///
-/// When the champion `BirthState` reply arrives, the main thread spawns the
-/// next population and sends `ResetPopulation` to the worker. `Finished`
-/// results complete immediately and never produce a pending handoff.
-pub(crate) struct PendingGeneration {
-    pub(crate) result: AdvanceResult,
-    /// Identifies the matching `RequestBirthState` / `BirthState` pair.
-    pub(crate) champion_request_id: u64,
-    /// The accepted node whose champion brain the pending request captures.
-    pub(crate) champion_node_id: i64,
 }
 
 pub(crate) struct App {
@@ -161,14 +133,11 @@ pub(crate) struct App {
     // Console log buffer for the bottom panel
     pub(crate) console_log: VecDeque<String>,
 
-    // Evolution governor (created on Start/Resume, not on App init)
-    pub(crate) governor: Option<Governor>,
     pub(crate) evo_snapshot: EvolutionSnapshot,
     pub(crate) evo_wall_accumulated: f64,
     pub(crate) evo_wall_segment_start: Option<Instant>,
     pub(crate) tps_tick_count: u64,
-    /// Simulation ticks the current run has advanced, seeded on resume from the
-    /// count persisted at the last generation boundary; drives the top-bar
+    /// Simulation ticks the current run has advanced; drives the top-bar
     /// simulated-time clock.
     pub(crate) session_tick_count: u64,
     pub(crate) tps_last_reset: Instant,
@@ -181,19 +150,13 @@ pub(crate) struct App {
     pub(crate) browse_tick_window: BrowseTickWindow,
     pub(crate) governor_config: GovernorConfig,
 
-    // In-flight generation handoff (worker reached the tick budget; awaiting
-    // champion brain-state reply before sending the population reset).
-    pub(crate) pending_generation: Option<PendingGeneration>,
-    /// Monotonic id source pairing `RequestBirthState` with its `BirthState`.
-    pub(crate) champion_request_counter: u64,
-    /// Epoch of the population the main thread currently accepts snapshots
-    /// for. Advanced when a generation boundary continues to a new population
-    /// and handed to the worker with the reset, so snapshots of the evaluated
-    /// generation are never applied to the next one.
-    pub(crate) generation_epoch: u64,
+    /// The legacy-database choice has been shown for the current path.
+    pub(crate) legacy_offered: Option<String>,
+    /// Progress of the two-step database reset.
+    pub(crate) reset_state: ResetState,
 
     // Simulation worker — owns the GPU kernel and all simulation-cadence state.
-    // `None` until evolution starts; recreated on Start/Resume, dropped on Reset.
+    // `None` until a session starts; recreated on Start/Resume, dropped on Reset.
     pub(crate) sim_runtime: Option<crate::sim_runtime::SimRuntime>,
     /// Resume input for the next supervisor worker start; taken by the start.
     pub(crate) supervisor_resume: Option<bool>,
@@ -225,10 +188,6 @@ pub(crate) struct App {
     // World snapshot for mini-map UI
     pub(crate) world_snapshot: WorldSnapshot,
 
-    // Replay recording
-    pub(crate) recording: Option<xagent_sandbox::replay::GenerationRecording>,
-    pub(crate) last_recording: Option<xagent_sandbox::replay::GenerationRecording>,
-
     // Replay playback state
     pub(crate) replay_state: ReplayState,
 }
@@ -238,27 +197,32 @@ pub(crate) struct App {
 pub(crate) enum StartupSession {
     /// A supervisor run; the user chooses to resume it live or browse it.
     Supervisor(SupervisorRunSummary),
-    /// A generation-mode session.
-    Generation((u32, GovernorConfig, BrainConfig)),
+    /// A generations database: only quit or start in a new file.
+    Legacy {
+        body: String,
+        generation: Option<u64>,
+    },
+    /// A database that could not be inspected.
+    Refused(String),
     /// No usable session.
     None,
 }
 
 /// Classifies the database at `db_path` without creating or writing it.
 pub(crate) fn startup_session(db_path: &str) -> StartupSession {
-    // `check_existing_session` opens read-write, which would create the file.
-    if !Path::new(db_path).exists() {
-        return StartupSession::None;
-    }
-    match detect_supervisor_run(db_path) {
-        Ok(Some(summary)) => StartupSession::Supervisor(summary),
-        Err(e) => {
-            println!("[SUPERVISOR] Could not inspect {db_path}: {e}");
-            StartupSession::None
-        }
-        Ok(None) => match check_existing_session(db_path) {
-            Some(session) => StartupSession::Generation(session),
-            None => StartupSession::None,
+    let (offer, body, generation) = inspect_offer(db_path);
+    match (offer, body) {
+        (SessionOffer::LegacyChoice, Some(body)) => StartupSession::Legacy { body, generation },
+        (SessionOffer::Refuse, Some(body)) => StartupSession::Refused(body),
+        // Detection opens the file, which would create a missing one.
+        _ if !std::path::Path::new(db_path).exists() => StartupSession::None,
+        _ => match detect_supervisor_run(db_path) {
+            Ok(Some(summary)) => StartupSession::Supervisor(summary),
+            Err(e) => {
+                log::warn!("[SUPERVISOR] Could not inspect {db_path}: {e}");
+                StartupSession::None
+            }
+            Ok(None) => StartupSession::None,
         },
     }
 }
@@ -274,46 +238,32 @@ impl App {
         let mut evo_snapshot = EvolutionSnapshot::default();
         evo_snapshot.edit_brain = brain_config.clone();
         evo_snapshot.edit_governor = governor_config.clone();
+        // Set by the first Start on a legacy file, once the choice is shown.
+        let legacy_offered: Option<String> = None;
 
         match startup_session(db_path) {
             StartupSession::Supervisor(summary) => {
-                println!(
+                log::info!(
                     "[SUPERVISOR] Found supervisor run {} at tick {} in {}",
-                    summary.run_id, summary.last_tick, db_path
+                    summary.run_id,
+                    summary.last_tick,
+                    db_path
                 );
                 evo_snapshot.state = EvolutionState::SupervisorSession;
                 evo_snapshot.supervisor_session = Some(summary);
             }
-            StartupSession::Generation((gen, prev_gov, prev_brain)) => {
-                evo_snapshot.state = EvolutionState::HasSession { generation: gen };
-                evo_snapshot.generation = gen;
-                evo_snapshot.current_config = Some(prev_brain);
-                evo_snapshot.population_size = prev_gov.population_size;
-                evo_snapshot.tick_budget = prev_gov.tick_budget;
-                evo_snapshot.elitism_count = prev_gov.elitism_count;
-                evo_snapshot.patience = prev_gov.patience;
-                evo_snapshot.max_generations = prev_gov.max_generations;
-                evo_snapshot.eval_repeats = prev_gov.eval_repeats;
-                evo_snapshot.num_islands = prev_gov.num_islands;
-                evo_snapshot.migration_interval = prev_gov.migration_interval;
-                // Also load tree/fitness from DB for the summary view
-                if let Ok(mut gov) = Governor::resume(db_path) {
-                    evo_snapshot.tree_nodes = gov.tree_nodes();
-                    evo_snapshot.current_node_id = gov.current_node_id;
-                    evo_snapshot
-                        .fitness_history
-                        .clone_from(gov.fitness_history_by_island());
-                    evo_snapshot.hazard_history = gov.hazard_history().to_vec();
-                    evo_snapshot.best_fitness = gov.best_score();
-                }
-                println!(
-                    "[GOVERNOR] Found previous session at generation {} in {}",
-                    gen, db_path
-                );
+            StartupSession::Legacy { body, generation } => {
+                log::warn!("[SESSION] {body}");
+                log::debug!("[SESSION] Legacy database last generation: {generation:?}");
+                apply_legacy_choice(&mut evo_snapshot, body);
+            }
+            StartupSession::Refused(body) => {
+                log::warn!("[SESSION] Could not inspect {db_path}: {body}");
+                apply_database_refusal(&mut evo_snapshot, body);
             }
             StartupSession::None => {
                 evo_snapshot.state = EvolutionState::Idle;
-                println!("[GOVERNOR] No previous session — ready to configure");
+                log::info!("[SESSION] No previous session — ready to configure");
             }
         }
 
@@ -361,7 +311,6 @@ impl App {
             bearing_gpu: None,
             egui: None,
             console_log: VecDeque::new(),
-            governor: None,
             evo_snapshot,
             evo_wall_accumulated: 0.0,
             evo_wall_segment_start: None,
@@ -371,9 +320,8 @@ impl App {
             tps_display: 0.0,
             db_path: db_path.to_string(),
             governor_config,
-            pending_generation: None,
-            champion_request_counter: 0,
-            generation_epoch: 0,
+            legacy_offered,
+            reset_state: ResetState::Idle,
             sim_runtime: None,
             supervisor_resume: None,
             resume_pending: None,
@@ -384,8 +332,6 @@ impl App {
             dock_state: egui_dock::DockState::new(vec![Tab::Evolution, Tab::Sandbox]),
             sort_mode: SortMode::Id,
             world_snapshot: WorldSnapshot::default(),
-            recording: None,
-            last_recording: None,
             replay_state: ReplayState::default(),
             tick_window: None,
             tick_window_view: TickWindowView::default(),
@@ -428,6 +374,20 @@ impl App {
         }
     }
 
+    /// Advance replay playback by the configured speed while a recording plays,
+    /// clamping at the final tick and stopping playback once it is reached.
+    pub(crate) fn advance_replay_playback(&mut self) {
+        if !(self.replay_state.active && self.replay_state.playing) {
+            return;
+        }
+        let advance = (self.replay_state.speed as u64).max(1);
+        self.replay_state.current_tick = (self.replay_state.current_tick + advance)
+            .min(self.replay_state.total_ticks.saturating_sub(1));
+        if self.replay_state.current_tick >= self.replay_state.total_ticks.saturating_sub(1) {
+            self.replay_state.playing = false;
+        }
+    }
+
     pub(crate) fn print_session_summary(&self) {
         let total_deaths: u32 = self.agents.iter().map(|a| a.death_count).sum();
 
@@ -444,12 +404,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{startup_session, StartupSession};
-    use xagent_sandbox::governor::{check_existing_session, Governor};
-    use xagent_sandbox::supervisor_store::SupervisorStore;
-    use xagent_shared::{BrainConfig, FullConfig, GovernorConfig};
+    use xagent_sandbox::supervisor_store::{StoreError, SupervisorStore};
+    use xagent_shared::FullConfig;
 
-    /// Seed of the generation fixture.
-    const FIXTURE_SEED: u64 = 7;
+    /// Generation stored in the legacy fixture.
+    const FIXTURE_GENERATION: i64 = 5;
 
     fn path_in(dir: &tempfile::TempDir, name: &str) -> String {
         dir.path().join(name).to_str().unwrap().to_string()
@@ -486,24 +445,30 @@ mod tests {
     }
 
     #[test]
-    fn observatory_session_startup_generation_db_unchanged_behaviour() {
+    fn startup_legacy_db_is_refused_with_store_message_and_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(&dir, "gen.db");
-        let gov = Governor::new_seeded(
-            &path,
-            GovernorConfig::default(),
-            &BrainConfig::default(),
-            "{}",
-            FIXTURE_SEED,
-        )
-        .unwrap();
-        drop(gov);
-        let expected = check_existing_session(&path).expect("generation session");
-        match startup_session(&path) {
-            StartupSession::Generation((generation, _, _)) => {
-                assert_eq!(generation, expected.0);
-            }
-            _ => panic!("expected a generation session"),
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE node (id INTEGER PRIMARY KEY, generation INTEGER);
+                 INSERT INTO node (generation) VALUES ({FIXTURE_GENERATION});"
+            ))
+            .unwrap();
         }
+        let before = std::fs::read(&path).unwrap();
+        match startup_session(&path) {
+            StartupSession::Legacy { body, generation } => {
+                let expected = StoreError::LegacyGenerations {
+                    path: path.clone(),
+                    generation,
+                }
+                .to_string();
+                assert_eq!(body, expected);
+                assert_eq!(generation, u64::try_from(FIXTURE_GENERATION).ok());
+            }
+            _ => panic!("expected a legacy session"),
+        }
+        assert_eq!(before, std::fs::read(&path).unwrap());
     }
 }

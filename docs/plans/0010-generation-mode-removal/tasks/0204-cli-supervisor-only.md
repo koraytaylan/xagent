@@ -11,8 +11,8 @@ touches:
   - crates/xagent-sandbox/src/main.rs
   - crates/xagent-sandbox/src/replay_coord.rs
   - crates/xagent-sandbox/tests/evolution_cli_exit.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "9b97a97e1cfef314d0ff14e4a64739d970accc28"
 checks:
   - name: bin-unit
     command: "cargo test -p xagent-sandbox --bin xagent"

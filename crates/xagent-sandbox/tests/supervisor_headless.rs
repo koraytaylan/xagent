@@ -1,5 +1,4 @@
-//! Headless driver selection: the supervisor loop, its refusals and the default
-//! generation driver.
+//! Headless supervisor driver and its refusals.
 
 use rusqlite::types::Value;
 use rusqlite::Connection;
@@ -7,7 +6,7 @@ use xagent_brain::GpuKernel;
 use xagent_sandbox::headless::{run_headless_with_options, HeadlessError, HeadlessOptions};
 use xagent_sandbox::run_summary::RunSummary;
 use xagent_sandbox::supervisor_checkpoint::CheckpointError;
-use xagent_shared::{EvolutionMode, FullConfig, Inheritance, SupervisorConfig};
+use xagent_shared::{FullConfig, Inheritance, SupervisorConfig};
 
 /// Agents in every run.
 const AGENTS: usize = 10;
@@ -25,12 +24,8 @@ const BUDGET: u64 = 10 * 20_000;
 const ARCHIVE: usize = 8;
 /// World seed of a run.
 const SEED: u64 = 5;
-/// Population of the generation-mode run.
-const GENERATION_POPULATION: usize = 5;
-/// Tick budget of the generation-mode run.
-const GENERATION_TICKS: u64 = 200;
-/// Generations of the generation-mode run.
-const GENERATION_COUNT: u64 = 2;
+/// Highest generation stored in the legacy database.
+const LEGACY_LAST_GENERATION: i64 = 3670;
 
 /// What a guard does for an adapter state and the `XAGENT_REQUIRE_GPU` value.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,7 +62,6 @@ fn gpu_or_skip() -> bool {
 
 fn supervisor_config() -> FullConfig {
     let mut config = FullConfig::default();
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = AGENTS;
     config.governor.supervisor = SupervisorConfig {
         boundary_interval_ticks: BOUNDARY_TICKS,
@@ -107,13 +101,6 @@ fn rows(db: &Connection, table: &str) -> Vec<Vec<Value>> {
     .expect("query")
     .map(|r| r.expect("row"))
     .collect()
-}
-
-fn count(db: &Connection, table: &str) -> i64 {
-    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-        row.get(0)
-    })
-    .expect("count")
 }
 
 #[test]
@@ -179,7 +166,7 @@ fn supervisor_headless_writes_run_summary() {
     .expect("supervisor run");
     let text = std::fs::read_to_string(&summary_path).expect("summary written");
     let summary: RunSummary = serde_json::from_str(&text).expect("summary parses");
-    assert_eq!(summary.mode, EvolutionMode::Supervisor);
+    assert_eq!(summary.agent_count, AGENTS);
 }
 
 #[test]
@@ -221,35 +208,49 @@ fn supervisor_headless_stop_and_resume_finishes() {
     run_headless_with_options(supervisor_config(), path, true, &options).expect("resumed run");
     let text = std::fs::read_to_string(&summary_path).expect("summary written");
     let summary: RunSummary = serde_json::from_str(&text).expect("summary parses");
-    assert_eq!(summary.mode, EvolutionMode::Supervisor);
+    assert_eq!(summary.agent_count, AGENTS);
 }
 
 #[test]
-fn generation_mode_is_the_default_driver() {
-    if !gpu_or_skip() {
-        return;
-    }
+fn headless_refuses_legacy_generation_db() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("generations.db");
-    let mut config = FullConfig::default();
-    config.governor.population_size = GENERATION_POPULATION;
-    config.governor.tick_budget = GENERATION_TICKS;
-    config.governor.max_generations = GENERATION_COUNT;
-    run_headless_with_options(
-        config,
+    let db_path = dir.path().join("legacy.db");
+    {
+        let db = Connection::open(&db_path).expect("create");
+        db.execute_batch("CREATE TABLE node (id INTEGER PRIMARY KEY, generation INTEGER NOT NULL)")
+            .expect("create node table");
+        for generation in 0..=LEGACY_LAST_GENERATION {
+            db.execute("INSERT INTO node (generation) VALUES (?1)", [generation])
+                .expect("insert node");
+        }
+    }
+    let entries = |dir: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let bytes_before = std::fs::read(&db_path).expect("read before");
+    let entries_before = entries(dir.path());
+    let result = run_headless_with_options(
+        supervisor_config(),
         db_path.to_str().expect("utf8 path"),
         false,
         &HeadlessOptions::default(),
-    )
-    .expect("generation run");
-    let db = Connection::open(&db_path).expect("open");
-    assert!(count(&db, "node") > 0, "generation nodes were written");
-    let tables: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'supervisor_%'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("tables");
-    assert_eq!(tables, 0, "no supervisor tables in generation mode");
+    );
+    let message = result
+        .expect_err("a legacy database is refused")
+        .to_string();
+    assert!(
+        message.contains("generation 3670"),
+        "message names the generation: {message}"
+    );
+    assert!(
+        message.contains("cannot run it"),
+        "message says it cannot run: {message}"
+    );
+    assert_eq!(std::fs::read(&db_path).expect("read after"), bytes_before);
+    assert_eq!(entries(dir.path()), entries_before, "no sibling file");
 }

@@ -75,7 +75,7 @@ or not `'supervisor'`; `generation` is `MAX(node.generation)` when readable.
 | INV-7 | No generation mode lives on in test-only form: no test constructs a Governor, runs a generation driver or ships a generation-database fixture except a raw-SQL legacy fixture built to prove refusal. | objective | owning tasks' grep checks |
 | INV-8 | The brain-blob codec keeps decoding legacy (pre-upgrade) blobs as before. | archive blobs, checkpoint blobs | `supervisor_store` unit tests |
 | INV-9 | The redraw path still makes no GPU dispatch or readback, and worker-to-main channels stay bounded latest-wins. | CLAUDE.md worker boundary | `sim_runtime.rs` unit tests |
-| INV-10 | README.md, CLAUDE.md, CONTRIBUTING.md, EVOLUTION_JOURNEY.md and `crates/xagent-sandbox/README.md` describe the supervisor-only system; CLAUDE.md test counts equal the `sandbox-tests` output; the contributing-guard baseline matches the tree. | docs | `docs-supervisor-only` and `guard-baseline` checks |
+| INV-10 | README.md, CLAUDE.md, CONTRIBUTING.md, EVOLUTION_JOURNEY.md and `crates/xagent-sandbox/README.md` describe the supervisor-only system; CLAUDE.md test counts equal the `sandbox-test-totals` output (the filtered `sandbox-tests` run); the contributing-guard baseline matches the tree. | docs | `docs-supervisor-only` and `guard-baseline` checks |
 
 ## State
 

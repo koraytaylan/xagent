@@ -9,7 +9,7 @@ use xagent_sandbox::supervisor::{stream_seed, ParentRef, TickSchedule, SEASON_ST
 use xagent_sandbox::supervisor_run::{SampleReport, SupervisorRun, SupervisorRunError};
 use xagent_sandbox::supervisor_store::SupervisorStore;
 use xagent_sandbox::world::WorldState;
-use xagent_shared::{EvolutionMode, FullConfig, Inheritance, SupervisorConfig};
+use xagent_shared::{FullConfig, Inheritance, SupervisorConfig};
 
 /// Agents in every run.
 const AGENTS: usize = 10;
@@ -330,7 +330,6 @@ fn supervisor_run_summary_counts_agent_ticks() {
     let config = config(true, Inheritance::Darwinian);
     let driven = drive(&config, true);
     let summary = driven.summary.expect("summary is measured");
-    assert_eq!(summary.mode, EvolutionMode::Supervisor);
     assert_eq!(summary.inheritance, Some(Inheritance::Darwinian));
     assert_eq!(summary.agent_ticks, BUDGET);
     assert!(summary.seasons >= 1);

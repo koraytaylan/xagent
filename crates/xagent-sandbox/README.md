@@ -16,7 +16,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 | wgpu-based rendering (Vulkan / Metal) | `renderer/` |
 | egui IDE-like UI (sidebar, docked tabs, console) | `ui.rs` |
 | HUD overlay & bitmap font text | `renderer/hud.rs`, `renderer/font.rs` |
-| Per-generation replay recording & playback | `replay.rs` |
+| Continuous-life supervisor (the only mode): pure core, kernel-facing driver, SQLite store | `supervisor.rs`, `supervisor_run.rs`, `supervisor_store.rs` |
 | Event loop & orchestration | `main.rs` |
 
 ---
@@ -28,9 +28,9 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  main.rs  (winit ApplicationHandler – event loop & orchestration)         │
 │                                                                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │   replay   │  │
+│  │ renderer │  │  world   │  │ physics  │  │  agent   │  │ supervisor │  │
 │  │          │  │          │  │          │  │          │  │            │  │
-│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │  replay.rs │  │
+│  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │ mod.rs   │  │supervisor* │  │
 │  │ camera.rs│  │terrain.rs│  │          │  │ senses.rs│  │            │  │
 │  │ hud.rs   │  │ biome.rs │  │          │  │          │  │            │  │
 │  │ font.rs  │  │ entity.rs│  │          │  │          │  │            │  │
@@ -60,9 +60,9 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │  1. Input events → camera update                  │         │          │
 │  │  2. Drain sim-worker events → apply newest        │         │          │
 │  │     snapshot to agent caches (latest-wins)        │         │          │
-│  │  3. On fresh snapshot: replay + history/heatmap/  │         │          │
-│  │     trail updates                                 │         │          │
-│  │  4. Generation handoff events + replay playback   │         │          │
+│  │  3. On fresh snapshot: history/heatmap/trail      │         │          │
+│  │     updates                                       │         │          │
+│  │  4. Supervisor snapshot for the observatory       │         │          │
 │  │  5. Rebuild meshes + HUD bars                     │         │          │
 │  │  6. render_with_hud(meshes, vp, bars, panels, …)  │─────────┘          │
 │  │  7. Forward speed/pause/selection to worker       │                    │
@@ -73,7 +73,7 @@ hazards to avoid, eyes to see through, and a physics engine to obey.
 │  │  • Advance ticks on a wall-clock cadence           │                    │
 │  │  • Dispatch one kernel-batch per loop iteration    │                    │
 │  │  • Request state @60 Hz / telemetry @30 Hz         │                    │
-│  │  • Enforce generation tick budget                  │                    │
+│  │  • Run supervisor boundaries on 100-tick samples   │                    │
 │  │  • Publish snapshots/telemetry over channels       │                    │
 │  └───────────────────────────────────────────────────┘                    │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -85,7 +85,7 @@ External crates:
                   with all per-tick simulation in WGSL)
 ```
 
-> **Runtime contract.** The sandbox does not own a per-agent `Brain` object. Each `Agent` carries a `brain_idx` (its slot in the kernel's storage buffers) and a `BrainConfig` copy used for evolution and metabolic accounting. All per-tick computation — physics, vision, food detection, death/respawn, and the seven brain stages — runs inside `xagent_brain::GpuKernel`, which is owned by a **simulation worker thread** (`sim_runtime.rs`). The worker advances ticks on a simulation-owned cadence and calls `dispatch_ticks` to advance compute, `request_state_snapshot` to stage a CPU-visible state copy, and `try_collect_state_snapshot` / `try_collect_telemetry` to surface readbacks. It publishes the results to the render/UI thread as latest-wins `SimEvent::Snapshot` / `Telemetry` messages over a bounded channel; the render loop only drains events and renders the cached state — it never touches `GpuKernel` directly. (`dispatch_batch` remains as a wrapper that advances compute and requests a snapshot in one call, used by the headless and bench paths.)
+> **Runtime contract.** The sandbox does not own a per-agent `Brain` object. Each `Agent` carries a `brain_idx` (its slot in the kernel's storage buffers) and a `BrainConfig` copy used for metabolic accounting. All per-tick computation — physics, vision, food detection, death/respawn, and the seven brain stages — runs inside `xagent_brain::GpuKernel`, which is owned by a **simulation worker thread** (`sim_runtime.rs`). The worker advances ticks on a simulation-owned cadence and calls `dispatch_ticks` to advance compute, `request_state_snapshot` to stage a CPU-visible state copy, and `try_collect_state_snapshot` / `try_collect_telemetry` to surface readbacks. It publishes the results to the render/UI thread as latest-wins `SimEvent::Snapshot` / `Telemetry` messages over a bounded channel; the render loop only drains events and renders the cached state — it never touches `GpuKernel` directly. (`dispatch_batch` remains as a wrapper that advances compute and requests a snapshot in one call, used by the headless and bench paths.)
 
 ---
 
@@ -203,30 +203,24 @@ The IDE-like UI is built with **egui 0.31** and **egui_dock 0.16**, rendered as 
 | Type | Role |
 |---|---|
 | `EguiIntegration` | Owns the egui context, winit integration state, wgpu renderer, and the offscreen texture that embeds the 3D viewport inside an egui panel. |
-| `Tab` | Enum — `Sandbox` (3D viewport, always open), `Evolution` (evolution dashboard), or `AgentDetail(u32)` (per-agent detail view). |
+| `Tab` | Enum — `Sandbox` (3D viewport, always open), `Evolution` (the supervisor observatory tab), or `AgentDetail(u32)` (per-agent detail view). |
 | `SortMode` | Enum — 7 sorting options for the sidebar agent list: Id, Energy, Integrity, Deaths, LongestLife, PredictionError, Fitness. |
 | `AgentSnapshot` | Per-frame copy of an agent's vitals, brain metrics, motor output, decision log, vision data, position, and history buffers — decouples the UI from the simulation's mutable state. |
 | `WorldSnapshot` | Per-frame world state for the mini-map: world size, food positions, and a cached 256x256 biome texture. |
-| `ReplayState` | Playback state for the replay system: active flag, current tick, playing/paused, speed multiplier, total ticks, selected agent index. |
-| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, agent snapshots, world snapshot, replay state, and last generation recording. |
+| `SupervisorSnapshot` | Per-frame copy of the supervisor's state that the observatory renders. |
+| `TabContext` | Transient context passed to `TabViewer` each frame: viewport texture ID, pixel-per-point scale, desired viewport size, hover flag, chart zoom level, agent snapshots, world snapshot, and the supervisor snapshot. |
 
 #### Layout
 
-- **Top bar** — App title, FPS, agent count, evolution state indicator, wall time and ticks/sec (when running/paused), pause/resume and reset buttons (right-aligned, when running/paused).
+- **Top bar** — App title, FPS, agent count, supervisor status indicator, wall time and ticks/sec (when running/paused), pause/resume button (right-aligned, when running/paused).
 - **Left sidebar** — Sort dropdown (by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, Fitness), agent list with colored dots, compact energy/integrity bars, phase label, death count, food consumed, and best life duration.
-- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; the **Evolution** tab shows the evolution dashboard; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
-- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, speed selector 0.5x–8x, live/replay toggle).
-- **Bottom console** — Scrollable log of evolution events.
+- **Main dock area** — Tabbed region. The **Sandbox** tab displays the 3D viewport; the **Evolution** tab shows the supervisor observatory; double-clicking an agent in the sidebar opens an **Agent Detail** tab.
+- **Agent detail tabs** — Color dot + heading + phase label, two-column vitals/motor display (energy/integrity bars, continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture with food dots, agent markers, and facing direction arrow), **History** chart (4-line: E/I/P/X with legend, scroll-to-zoom 30–10k ticks), **Decision Stream** (scrollable per-tick log with color-coded credit, motor output, gradient, urgency, and patterns recalled).
+- **Bottom console** — Scrollable log of supervisor events.
 
-#### Evolution Tab
+#### Evolution Tab (supervisor observatory)
 
-The Evolution tab uses a top/bottom split layout:
-
-- **Top — Fitness chart**: one colored line per island (up to 8 distinct colors), so each island's evolutionary trajectory is independently visible. Data comes from `fitness_history_by_island()`, which groups `EvolutionSnapshot.fitness_history` (`HashMap<i64, Vec<(u32, f32, f32)>>`) by island ID.
-- **Below it — Hazard chart**: per generation, steps onto hazard ground per agent (red) and the share of distance travelled on it (orange), each scaled to its own maximum; the legend shows the latest values and the mean size-weighted turn away from hazard ahead. Both lines falling is the lineage learning to keep off hazard ground. Data comes from `Governor::hazard_history()` (the `behavior_metric` columns `hazard_entries_per_agent`, `danger_dwell_fraction` and `avoidance_turn_away`) via `EvolutionSnapshot.hazard_history`.
-- **Left pane — Generation tree** (25% width, resizable): file explorer style, each node is a generation entry. Clicking a node selects it and populates the right panel with its details (status, island ID, fitness, mutations applied, full `BrainConfig`). Dead-end branches (failed/exhausted generations) are collapsed by default but can be manually expanded for post-mortem inspection. A draggable vertical separator between the panes allows resizing.
-- **Right pane — Generation detail** (75% width, resizable): shows the selected node's fields when a tree node is clicked; otherwise shows aggregate stats for the current run. Both panes fill the remaining vertical space below the fitness chart.
-- **Generation progress bar**: rendered in `TopBottomPanel::top("top_bar")` — always visible regardless of which tab is active. Displays ticks elapsed vs. tick budget for the current generation.
+The tab shows the continuous supervisor's snapshot. There is no generation tree, generation detail panel or generation progress bar.
 
 #### Viewport Integration
 
@@ -356,8 +350,7 @@ pub struct FoodItem {
 15. **Integrity regen** — if `energy_signal > 0.5` and not full, `integrity += regen_rate`.
 16. **Auto-consume food** — find nearest non-consumed food within 2.5 units regardless
     of action. Consume it: `energy += food_energy_value` (capped at max). Returns
-    `Some(food_index)` with the consumed item's index (used by the replay recording
-    system to track food events), or `None` if no food was consumed.
+    `Some(food_index)` with the consumed item's index, or `None` if no food was consumed.
 17. **Death check** — if `energy ≤ 0` or `integrity ≤ 0`, set `alive = false`.
 
 #### Agent-Agent Collision
@@ -391,7 +384,7 @@ pub struct Agent {
     pub id: u32,
     pub body: AgentBody,
     pub brain_idx: u32,            // slot in GpuKernel's storage buffers
-    pub brain_config: BrainConfig, // heritable config (kept on CPU for evolution)
+    pub brain_config: BrainConfig, // heritable config (kept on CPU)
     pub color: [f32; 3],           // static palette color (matches sidebar)
     pub birth_tick: u64,
     pub death_count: u32,
@@ -426,7 +419,7 @@ pub struct Agent {
 }
 ```
 
-The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation, evolution mutation, and JSON serialization.
+The `Agent` struct never owns brain state directly — the GPU kernel owns it. `brain_idx` is the agent's slot in `GpuKernel`'s `brain_state` / `pattern_buffer` storage rows; `brain_config` is kept on CPU for metabolic-drain computation and JSON serialization.
 
 **Agent palette colors** — Each agent is assigned a static palette color at spawn. The same color is used in the 3D viewport (with an sRGB→linear conversion for correct GPU rendering) and in the egui sidebar. Dead agents render as dark gray `[0.3, 0.3, 0.3]` (the `DEAD_COLOR` constant in `crates/xagent-sandbox/src/agent/mod.rs`).
 
@@ -436,8 +429,8 @@ The `Agent` struct never owns brain state directly — the GPU kernel owns it. `
 **`MAX_AGENTS`** = 100. Hard cap — spawn requests are rejected beyond this.
 
 **`REPRODUCTION_THRESHOLD`** = 5000 ticks. Minimum age before an agent can reproduce.
-Reproduction is currently disabled (commented out) to focus on individual learning
-rather than evolution.
+Reproduction is currently disabled (commented out) to focus on individual learning;
+the continuous supervisor handles replacement.
 
 #### Sensory Extraction (`agent/senses.rs`)
 
@@ -515,39 +508,15 @@ nearby agents in addition to touch contacts.
 
 ---
 
-### 3.5 Telemetry & Replay (`replay.rs`)
+### 3.5 Supervisor & Telemetry
 
-#### Per-Generation Replay Recording
+The continuous-life supervisor is the only mode.
 
-The replay system captures per-tick agent state during evolution runs, enabling
-post-hoc playback of any completed generation.
+- `supervisor.rs` — the pure deterministic core. It owns one ledger per agent slot, a bounded archive of retired lives and the random streams that drive replacement. It sees only per-sample counters and performs no GPU work, database access or file I/O.
+- `supervisor_run.rs` — the shared kernel-facing driver. It borrows the caller's `GpuKernel`, owns the pure core, its own `WorldState` for newborn spawn positions, an optional store and an optional run-summary accumulator. The caller dispatches batches and hands each 100-tick readback to `SupervisorRun::on_sample`. The GUI and the headless driver share it.
+- `supervisor_store.rs` — SQLite persistence of a supervisor run: the occupant of each slot, the archive of retired lives, an event log and telemetry tables. Every change a boundary, season, idle sample or run end makes is written in one transaction. Archive entries are loaded back through a read-only connection.
 
-**Data Structures:**
-
-| Struct | Purpose |
-|--------|---------|
-| `TickRecord` | Per-tick per-agent snapshot: position, yaw, alive, energy, integrity, motor output, exploration rate, prediction error, gradient, urgency, credit magnitude, patterns recalled, phase, and optional vision keyframe |
-| `FoodEvent` | Sparse food state change: tick, food index, consumed flag, new position (on respawn) |
-| `GenerationRecording` | Complete generation recording: agent info, flat-array tick records (`tick * agent_count + agent_idx`), sparse food events, initial food positions |
-
-**Storage Strategy:**
-- Tick records are stored in a flat `Vec<TickRecord>` indexed as `tick * agent_count + agent_idx`
-- Vision data (192 floats per agent) is only stored at keyframes (every 30 ticks) to save memory
-- Food events are sparse — only recorded when food is consumed or respawns
-- Initial food positions are stored once for reconstruction via `food_at_tick()`
-
-**Integration Points:**
-- Recording starts when a new generation spawns (`spawn_evolution_population` / `spawn_population_from_configs`)
-- Per-tick data is captured after physics and collision resolution
-- Food consumption events are captured when `physics::step()` returns `Some(food_index)`
-- Food respawn events are captured from `WorldState::last_respawned_indices()`
-- When a generation completes, the recording moves to `last_recording` for playback
-
-**Playback:**
-- The agent detail tab shows a "Replay Gen N" button when a recording is available
-- Timeline scrubber, play/pause, and speed controls (0.5x–8x)
-- Builds temporary `AgentSnapshot` and `WorldSnapshot` from recorded data at the current tick
-- Food positions are reconstructed by replaying food events up to the current tick
+A generation-era database (one that `supervisor_store::inspect_database` classifies as `LegacyGenerations`) is refused by the GUI and the headless driver. The file is never modified and no sidecar file is created beside it.
 
 #### Console Telemetry
 
@@ -563,7 +532,7 @@ Printed every 100 ticks for the selected agent:
   Position: (12.3, 2.1, -8.5) | Facing: (0.71, 0.00, 0.71)
 ```
 
-Window title is static ("xagent") — runtime stats (FPS, agent count, evolution state, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 1000k×`) turns yellow when above 1×.
+Window title is static ("xagent") — runtime stats (FPS, agent count, supervisor status, wall time, speed multiplier indicator, ticks/sec) are displayed in the egui top bar, with selected-agent info on the HUD overlay. The speed indicator (`⏩ 1×` .. `⏩ 1000k×`) turns yellow when above 1×.
 
 ---
 
@@ -608,22 +577,10 @@ The worker accumulates wall time × `speed_multiplier` into a tick budget and di
 - **N key** — spawns a clone of the base `BrainConfig` (generation 0).
 - **M key** — spawns a mutated variant (±10% per parameter, generation 0).
 
-#### Evolution: Reproduction (Currently Disabled)
+#### Replacement
 
 Reproduction is currently disabled (commented out) to focus on individual learning.
-When enabled, `agent.can_reproduce(tick)` is true (alive, age ≥ 5000 ticks) and
-`has_reproduced` is false and total agents < `MAX_AGENTS`:
-
-1. Parent's `has_reproduced` is set to `true`.
-2. `mutate_config()` perturbs the parent's `BrainConfig`:
-   - Floats (`learning_rate`, `decay_rate`): multiplied by uniform random in [0.9, 1.1],
-     clamped to ≥ 0.0001.
-   - Integers (`memory_capacity`, `processing_slots`):
-     multiplied by [0.9, 1.1], rounded, clamped to ≥ 1.
-   - `representation_dimension` is **not mutated** — it is locked to prevent weight inheritance breakage across generations.
-   - `visual_encoding_size` is a **retired legacy field** (issue #106): superseded by the plan 0008 visual-cortex config (`retina_*`, `gabor_*`). It is no longer mutated *or* carried through crossover — each child resets it to the serde default; the field survives only so older saved configs still deserialize.
-3. Child spawns near parent (±5 units offset), generation = parent generation + 1.
-4. Child gets a fresh brain with the mutated config.
+Replacement of retired lives is handled by the continuous supervisor (see 3.5).
 
 #### Death & Respawn
 
@@ -639,9 +596,9 @@ The CPU side learns about deaths only by reading `physics_state[P_DEATH_COUNT]` 
 
 #### Headless Mode
 
-`--no-render` skips all window/GPU code and runs a tight loop with a single agent:
-sleep `1/tick_rate` seconds between ticks, print telemetry every 100 ticks.
-On death the agent is respawned with a **fresh brain** (no persistence in headless).
+`--no-render` skips the window and runs the headless continuous-supervisor driver,
+which shares `SupervisorRun` with the GUI. It uses `--db` and `--resume` for its
+supervisor store and `--run-summary` for its run summary.
 
 ---
 
@@ -674,7 +631,7 @@ On death the agent is respawned with a **fresh brain** (no persistence in headle
 |---|---|---|---|---|
 | `memory_capacity` | 24 | 128 | 512 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel pattern memory is fixed at `MEMORY_CAP = 128` (see issue #106). |
 | `processing_slots` | 8 | 16 | 32 | **Proxy (metabolic cost).** Feeds per-tick energy drain only. Kernel recall width is fixed at `RECALL_K = 16` (see issue #106). |
-| `visual_encoding_size` | 32 | 64 | 128 | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (`retina_*` / `gabor_*` config + `coop_visual_cortex` pass). No kernel stage reads it; not editable in the UI and not carried through breeding — retained only so older saved configs still deserialize (issue #106 resolved). |
+| `visual_encoding_size` | 32 | 64 | 128 | **Legacy / superseded.** Replaced by the plan 0008 Hubel-Wiesel visual cortex (`retina_*` / `gabor_*` config + `coop_visual_cortex` pass). No kernel stage reads it; not editable in the UI — retained only so older saved configs still deserialize (issue #106 resolved). |
 | `representation_dimension` | 128 | 128 | 128 | **Locked (compile-time).** Must equal `xagent_brain::buffers::ENCODED_DIMENSION = 128`; mismatched config values log a warning and are ignored (see issues #103, #106). |
 | `learning_rate` | 0.08 | 0.05 | 0.03 | Association update rate |
 | `decay_rate` | 0.002 | 0.001 | 0.0005 | Unreinforced pattern decay per tick |
@@ -689,12 +646,23 @@ OPTIONS:
     --brain-preset <PRESET>   Brain preset: tiny, default, large [default: default]
     --world-preset <PRESET>   World preset: easy, normal, hard   [default: normal]
     --config <PATH>           Load full config from a JSON file
-    --seed <SEED>             Override random seed for world generation (a new
-                              headless evolution run reproduces from it)
+    --seed <SEED>             Override random seed for world generation
     --tick-rate <RATE>        Override simulation ticks per second
     --no-render               Run headless (no window, just simulation + logging)
     --dump-config             Print the resolved config as JSON and exit
+    --db <PATH>               Supervisor database path [default: xagent.db]
+    --resume                  Resume from the database
+    --bench, --bench-ticks, --bench-agents, --world-size, --bench-profile,
+    --bench-phase-ab, --bench-agent-sweep, --bench-visual-cortex
+                              Benchmark modes and their parameters
+    --free-life, --free-life-agents, --free-life-ticks, --free-life-lesion,
+    --free-life-log, --free-life-out, --agent-tick-budget,
+    --supervisor-inheritance, --run-summary, --free-life-archive-db,
+    --free-life-archive-rank, --food-kinds, --freeze-policy,
+    --food-kind-summary       Headless continuous-supervisor run and its options
 ```
+
+The continuous supervisor is the only mode. The removed generation-era flags `generations`, `dump-tree`, `evolution-mode`, `validate-innate-instincts`, `validate-danger-percept`, `validation-*`, `free-life-champion-db` and `free-life-champion-node` exit with status 2 and a message that generation mode was removed. A generation-era database is refused and never modified (see 3.5).
 
 **Examples:**
 
@@ -785,7 +753,7 @@ Each loop iteration (`Worker::step`):
 ```
 1. Collect + publish any ready readbacks:
    - try_collect_state_snapshot() → build an owned StateSnapshot (physics +
-     food + tick + generation_tick) and try_send it (latest-wins; dropped
+     food + tick) and try_send it (latest-wins; dropped
      under back-pressure).
    - try_collect_telemetry() → send selected-agent telemetry.
 
@@ -798,16 +766,11 @@ Each loop iteration (`Worker::step`):
    a. Accumulate dt × speed_multiplier into sim_accumulator (capped so a
       stall cannot dump a giant catch-up batch).
    b. Dispatch one kernel-batch — min(accumulated, gpu_tick_budget,
-      kernel_batch_size) ticks, clamped to the remaining generation budget,
-      gated to ≥ brain_tick_stride so every dispatch holds a full brain cycle.
+      kernel_batch_size) ticks, gated to ≥ brain_tick_stride so every dispatch holds a full brain cycle.
       Capping at one kernel-batch keeps vision amortized (perception
       unchanged) and lets state publish frequently. A backlog drains across
       iterations rather than in one giant submit.
-   c. kernel.dispatch_ticks(tick, ticks_to_run); advance tick + gen_tick.
-
-4. When gen_tick reaches the generation tick budget, force a final snapshot,
-   emit GenerationBudgetReached, and pause until the handoff resets the
-   population (ResetPopulation command).
+   c. kernel.dispatch_ticks(tick, ticks_to_run); advance tick.
 
 The worker only sleeps when caught up or paused; otherwise it loops so the
 backlog drains at GPU speed (queue.submit back-pressure paces it).
@@ -824,17 +787,16 @@ Each frame, when the window requests a redraw:
    StateSnapshot (latest-wins) to agent caches — position, yaw, energy,
    integrity, velocity, facing, food_consumed, death count, and the cached
    motor/gradient/urgency/prediction/exploration/fatigue fields — and sync
-   the governor's gen_tick for the UI. Telemetry events update the selected
+   the supervisor snapshot for the UI. Telemetry events update the selected
    agent's vision/derived fields.
 
-3. On a fresh snapshot only: record a replay TickRecord, sample
-   heatmap/trail occupancy and per-agent sparkline histories, and mark the
-   food/heatmap caches dirty. (CPU histories and replay sample the published
-   state at publication cadence, not every simulated tick.)
+3. On a fresh snapshot only: sample heatmap/trail occupancy and per-agent
+   sparkline histories, and mark the food/heatmap caches dirty. (CPU
+   histories sample the published state at publication cadence, not every
+   simulated tick.)
 
-4. Generation handoff: a GenerationBudgetReached event evaluates fitness,
-   requests the champion's brain state from the worker, then sends
-   ResetPopulation for the next generation. Advance replay playback.
+4. Supervisor: hand each 100-tick sample to the supervisor driver, which
+   applies boundaries, replacements and persistence.
 
 5. Fix selected_agent_idx if agents were added/removed.
 
@@ -907,7 +869,7 @@ colors. These are related but not identical:
 
 ---
 
-## Multi-Agent & Evolution
+## Multi-Agent & Supervisor
 
 ### Agent Management
 
@@ -939,12 +901,10 @@ death/respawn.
 
 ### Reproduction
 
-- **Currently disabled** (commented out) to focus on individual learning over evolution.
-- When enabled: agent must survive 5000 ticks continuously.
-- **Once per life**: `has_reproduced` flag prevents repeated spawning.
+- **Currently disabled** (commented out) to focus on individual learning.
 - **Population cap**: `MAX_AGENTS = 100`.
-- **Mutation**: Each `BrainConfig` parameter is perturbed using momentum-biased perturbation. Each island maintains a per-parameter momentum vector that learns which mutation directions improve fitness. The perturbation combines random noise (±strength%) with a directional nudge from momentum. Parameters with strong momentum are pushed toward winning values; parameters with weak momentum get mostly random exploration. `representation_dimension` is preserved (locked to prevent weight inheritance breakage across generations). `visual_encoding_size` is a retired legacy field (issue #106): superseded by the plan 0008 visual-cortex config and reset to its default on every breed rather than carried.
-- **Generation tracking**: Generation increments on each death/respawn, tracking how many lives the agent has lived.
+- **Life counter**: `Agent::generation` increments on each death/respawn, tracking how many lives the agent has lived.
+- Replacement of retired lives is done by the continuous supervisor.
 
 ### Telemetry Focus
 
@@ -952,8 +912,8 @@ Clicking an agent in the **sidebar** selects it; double-clicking opens a dedicat
 detail tab in the dock area. The selected agent is indicated by a yellow diamond
 marker floating above it in the 3D viewport. Its data drives:
 - **Sidebar**: colored dot, compact energy/integrity bars, phase label, death count, food consumed, best life. Sortable by ID, Energy, Integrity, Deaths, Longest Life, Prediction Error, or Fitness via dropdown.
-- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled), and **Replay Controls** (timeline scrubber, play/pause, 0.5x–8x speed, live/replay toggle).
-- **Bottom console**: scrollable log of evolution events
+- **Agent detail tab**: header with phase label, two-column vitals/motor display (energy/integrity bars + continuous forward/turn motor gauges with weight norms), side-by-side **Agent Vision** (8x6 upscaled color grid) and **Mini-Map** (top-down biome texture + food dots + agent markers with facing arrows), scrollable History chart (energy/integrity/prediction error/exploration, 30–10k ticks), **Decision Stream** (per-tick log with color-coded credit, motor output, gradient, urgency, patterns recalled).
+- **Bottom console**: scrollable log of supervisor events
 - Trail ribbon showing full life path (up to 4000 distance-sampled points, dirty-flag rebuild)
 - Heatmap overlay (when enabled with `H`)
 
@@ -1106,5 +1066,5 @@ All per-agent work happens on the GPU. With `MAX_AGENTS = 100` the practical lim
 | No weather or lighting | No day/night cycle, rain, temperature, or lighting changes that would affect senses. |
 | Single food type | All food items are identical — no nutritional variation or toxicity. |
 | No inter-agent communication | Agents perceive each other via touch only — no signaling, vocalizations, or shared state. |
-| Headless mode is single-agent | The `--no-render` mode runs only one agent with no persistence. |
+| Headless mode has no window | The `--no-render` mode runs the same continuous supervisor as the GUI, without a window. |
 | Food only in FoodRich biomes | Food never spawns in Barren or Danger zones, limiting foraging strategies. |

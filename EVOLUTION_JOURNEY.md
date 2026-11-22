@@ -315,6 +315,14 @@ Learning (credit assignment) then builds on this reactive foundation, associatin
 
 **Lesson:** "Latest-wins" is only safe while every message describes the same population. Once the population changes, snapshots need an identity, not just a timestamp.
 
+### 25. Generation mode removed (2026-11-21)
+
+**Change:** The Governor generation state machine, the generation database, the generation handoff and per-generation replay were removed. The continuous supervisor is now the only mode.
+
+**Databases:** A generation-era database is refused by the GUI and the headless driver. The file is never modified and no sidecar file is created beside it.
+
+**Decision:** This is the user's decision, recorded in `docs/measurements/continuous-supervisor/INHERITANCE-DEFAULT.md`.
+
 ---
 
 ## Current Parameter Roles

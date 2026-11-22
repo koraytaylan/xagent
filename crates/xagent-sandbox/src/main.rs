@@ -2,7 +2,6 @@ mod app;
 mod evolution;
 mod gpu_orchestration;
 mod render_pipeline;
-mod replay_coord;
 mod sim_runtime;
 mod snapshot;
 mod tick_window_view;
@@ -74,14 +73,6 @@ struct Cli {
     #[arg(long)]
     resume: bool,
 
-    /// Maximum generations to run (0 = unlimited)
-    #[arg(long)]
-    generations: Option<u64>,
-
-    /// Print evolution tree from database and exit
-    #[arg(long)]
-    dump_tree: bool,
-
     /// Run headless benchmark (no UI, no DB) and print ticks/sec
     #[arg(long)]
     bench: bool,
@@ -120,45 +111,6 @@ struct Cli {
     #[arg(long)]
     bench_visual_cortex: bool,
 
-    /// Run innate-instinct validation: A/B test with innate_instincts_enabled
-    /// OFF (baseline) vs ON, measuring survival, alignment, and food-per-death.
-    #[arg(long)]
-    validate_innate_instincts: bool,
-
-    /// Run danger-percept production A/B: danger_percept_enabled OFF (baseline) vs ON,
-    /// measuring avoidance-intent, approach-intent, ticks_alive, and steering_alignment
-    /// with bootstrap 95% CI across N replicates.
-    #[arg(long)]
-    validate_danger_percept: bool,
-
-    /// Number of generations for validation (default: 50 for production scale)
-    #[arg(long, default_value_t = 50)]
-    validation_generations: u64,
-
-    /// Population size for validation A/B (default: 100 for production scale)
-    #[arg(long, default_value_t = 100)]
-    validation_population: u32,
-
-    /// Number of bootstrap replicates for validation (default: 100 for full production CI;
-    /// reduce to 5-10 for quick local checks where GPU time is limited)
-    #[arg(long, default_value_t = 100)]
-    validation_replicates: usize,
-
-    /// Override the per-generation tick budget for validation A/B runs (default: 0 = use
-    /// the governor's configured tick_budget, typically 1_000_000). Setting a smaller value
-    /// (e.g., 10_000) dramatically reduces wall-clock time while preserving the evolutionary
-    /// signal across 50 generations; both A/B arms always use the same budget, so the
-    /// relative comparison is unbiased. Values must be a non-zero multiple of
-    /// vision_stride × brain_tick_stride (10 at default strides); 0 means no override.
-    #[arg(long, default_value_t = 0)]
-    validation_tick_budget: u64,
-
-    /// Offset added to the world seed before the bootstrap loop starts. Use to shard N=100
-    /// replicates across parallel processes: run N=10 with seed-start 0, 10, 20 ... 90 in
-    /// parallel, then merge the per-shard JSON files (default: 0, no offset).
-    #[arg(long, default_value_t = 0)]
-    validation_seed_start: u64,
-
     /// Run one seeded free life and print its JSON report; `--seed` seeds it
     #[arg(long)]
     free_life: bool,
@@ -170,14 +122,6 @@ struct Cli {
     /// Simulation ticks in a free life
     #[arg(long, default_value_t = headless::DEFAULT_FREE_LIFE_TICKS)]
     free_life_ticks: u64,
-
-    /// Governor database to load the birth champion from (default: fresh brain)
-    #[arg(long)]
-    free_life_champion_db: Option<String>,
-
-    /// Champion node to load; requires --free-life-champion-db (default: newest)
-    #[arg(long)]
-    free_life_champion_node: Option<i64>,
 
     /// Comma list of trunk lesions: turn-weights, forward-weights,
     /// memory-blend, critic, all, none
@@ -191,10 +135,6 @@ struct Cli {
     /// Write the free-life JSON report to this file instead of stdout
     #[arg(long)]
     free_life_out: Option<PathBuf>,
-
-    /// Evolution driver: generations or supervisor (default: keep config)
-    #[arg(long, value_enum)]
-    evolution_mode: Option<EvolutionModeArg>,
 
     /// Total agent-tick budget for the run
     #[arg(long)]
@@ -213,11 +153,7 @@ struct Cli {
     free_life_archive_db: Option<String>,
 
     /// Archive rank to load, best first; requires --free-life-archive-db (default: 0)
-    #[arg(
-        long,
-        requires = "free_life_archive_db",
-        conflicts_with = "free_life_champion_db"
-    )]
+    #[arg(long, requires = "free_life_archive_db")]
     free_life_archive_rank: Option<usize>,
 
     /// Free life with two food kinds and per-kind measurement; needs --free-life
@@ -231,6 +167,84 @@ struct Cli {
     /// Write the food-kind run summary JSON to this file
     #[arg(long)]
     food_kind_summary: Option<PathBuf>,
+
+    // ── Removed generation-mode flags (hidden; refused at startup) ──
+    #[arg(long, hide = true)]
+    generations: Option<String>,
+    #[arg(long, hide = true)]
+    dump_tree: bool,
+    #[arg(long, hide = true)]
+    evolution_mode: Option<String>,
+    #[arg(long, hide = true)]
+    validate_innate_instincts: bool,
+    #[arg(long, hide = true)]
+    validate_danger_percept: bool,
+    #[arg(long, hide = true)]
+    validation_generations: Option<String>,
+    #[arg(long, hide = true)]
+    validation_population: Option<String>,
+    #[arg(long, hide = true)]
+    validation_replicates: Option<String>,
+    #[arg(long, hide = true)]
+    validation_tick_budget: Option<String>,
+    #[arg(long, hide = true)]
+    validation_seed_start: Option<String>,
+    #[arg(long, hide = true)]
+    free_life_champion_db: Option<String>,
+    #[arg(long, hide = true)]
+    free_life_champion_node: Option<String>,
+}
+
+/// Name the first removed generation-mode flag present on the command line.
+fn removed_flag(cli: &Cli) -> Option<&'static str> {
+    let present = [
+        ("generations", cli.generations.is_some()),
+        ("dump-tree", cli.dump_tree),
+        ("evolution-mode", cli.evolution_mode.is_some()),
+        ("validate-innate-instincts", cli.validate_innate_instincts),
+        ("validate-danger-percept", cli.validate_danger_percept),
+        (
+            "validation-generations",
+            cli.validation_generations.is_some(),
+        ),
+        ("validation-population", cli.validation_population.is_some()),
+        ("validation-replicates", cli.validation_replicates.is_some()),
+        (
+            "validation-tick-budget",
+            cli.validation_tick_budget.is_some(),
+        ),
+        ("validation-seed-start", cli.validation_seed_start.is_some()),
+        ("free-life-champion-db", cli.free_life_champion_db.is_some()),
+        (
+            "free-life-champion-node",
+            cli.free_life_champion_node.is_some(),
+        ),
+    ];
+    present.iter().find(|(_, on)| *on).map(|(name, _)| *name)
+}
+
+/// Generation-era keys that may still appear under a config file's `governor` object.
+const IGNORED_GOVERNOR_KEYS: [&str; 8] = [
+    "tick_budget",
+    "elitism_count",
+    "max_generations",
+    "patience",
+    "eval_repeats",
+    "num_islands",
+    "migration_interval",
+    "evolution_mode",
+];
+
+/// List the generation-era keys present under the `governor` object, in canonical order.
+fn ignored_governor_keys(json: &serde_json::Value) -> Vec<&'static str> {
+    match json.get("governor").and_then(|g| g.as_object()) {
+        Some(gov) => IGNORED_GOVERNOR_KEYS
+            .iter()
+            .copied()
+            .filter(|k| gov.contains_key(*k))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn resolve_config(cli: &Cli) -> FullConfig {
@@ -239,10 +253,19 @@ fn resolve_config(cli: &Cli) -> FullConfig {
             eprintln!("Error: Failed to read config file '{}': {}", path, e);
             std::process::exit(1);
         });
-        serde_json::from_str::<FullConfig>(&data).unwrap_or_else(|e| {
+        let parse_fail = |e: serde_json::Error| -> ! {
             eprintln!("Error: Failed to parse config file '{}': {}", path, e);
             std::process::exit(1);
-        })
+        };
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_else(|e| parse_fail(e));
+        let ignored = ignored_governor_keys(&json);
+        if !ignored.is_empty() {
+            log::warn!(
+                "ignored generation-era governor keys: {}",
+                ignored.join(", ")
+            );
+        }
+        serde_json::from_value::<FullConfig>(json).unwrap_or_else(|e| parse_fail(e))
     } else {
         let brain = match cli.brain_preset.as_str() {
             "tiny" => BrainConfig::tiny(),
@@ -680,6 +703,12 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
+    if let Some(flag) = removed_flag(&cli) {
+        eprintln!(
+            "error: --{flag} was removed with generation mode; this version runs only the continuous supervisor"
+        );
+        std::process::exit(2);
+    }
 
     info!("xagent sandbox starting...");
     // Banner goes to stderr so stdout stays pure for data-producing modes
@@ -688,12 +717,7 @@ fn main() {
 
     let mut config = resolve_config(&cli);
 
-    // Override generations from CLI
-    if let Some(gens) = cli.generations {
-        config.governor.max_generations = gens;
-    }
-
-    if let Err(e) = apply_evolution_cli(&cli, &mut config) {
+    if let Err(e) = apply_supervisor_cli(&cli, &mut config) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -767,31 +791,6 @@ fn main() {
         return;
     }
 
-    if cli.dump_tree {
-        headless::dump_tree(&cli.db);
-        return;
-    }
-
-    if cli.validate_innate_instincts {
-        headless::validate_innate_instincts(config, cli.validation_generations);
-        return;
-    }
-
-    if cli.validate_danger_percept {
-        // Apply seed-start offset so parallel shards use non-overlapping seed ranges.
-        if cli.validation_seed_start > 0 {
-            config.world.seed = config.world.seed.wrapping_add(cli.validation_seed_start);
-        }
-        headless::validate_danger_percept(
-            config,
-            cli.validation_generations,
-            cli.validation_population,
-            cli.validation_replicates,
-            cli.validation_tick_budget,
-        );
-        return;
-    }
-
     if cli.free_life {
         run_free_life_cli(&cli, &config);
         return;
@@ -817,15 +816,6 @@ fn main() {
 
 // ── Pure helpers (extracted for testability) ─────────────────────────────
 
-/// Evolution driver choice on the command line.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum EvolutionModeArg {
-    /// Fixed-length generations.
-    Generations,
-    /// One continuous life with local replacement.
-    Supervisor,
-}
-
 /// Supervisor inheritance choice on the command line.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum InheritanceArg {
@@ -835,47 +825,22 @@ enum InheritanceArg {
     WeightCopy,
 }
 
-/// Apply the evolution flags to the resolved config, validating combinations.
-fn apply_evolution_cli(cli: &Cli, config: &mut FullConfig) -> Result<(), String> {
-    use xagent_shared::config::{EvolutionMode, Inheritance};
-    if let Some(mode) = cli.evolution_mode {
-        config.governor.evolution_mode = match mode {
-            EvolutionModeArg::Generations => EvolutionMode::Generations,
-            EvolutionModeArg::Supervisor => EvolutionMode::Supervisor,
-        };
-    }
+/// Apply the supervisor flags to the resolved config, validating the budget.
+fn apply_supervisor_cli(cli: &Cli, config: &mut FullConfig) -> Result<(), String> {
+    use xagent_shared::config::Inheritance;
     if let Some(inh) = cli.supervisor_inheritance {
         config.governor.supervisor.inheritance = match inh {
             InheritanceArg::Darwinian => Inheritance::Darwinian,
             InheritanceArg::WeightCopy => Inheritance::WeightCopy,
         };
     }
-    let supervisor = config.governor.evolution_mode == EvolutionMode::Supervisor;
-    if !supervisor && cli.supervisor_inheritance.is_some() {
-        return Err("--supervisor-inheritance requires supervisor evolution mode".to_string());
-    }
     if let Some(budget) = cli.agent_tick_budget {
-        if supervisor {
-            config.governor.supervisor.agent_tick_budget = budget;
-            config
-                .governor
-                .supervisor
-                .validate(config.governor.population_size)
-                .map_err(|e| e.to_string())?;
-        } else {
-            if cli.generations.is_some() {
-                return Err(
-                    "--agent-tick-budget conflicts with --generations in generations mode"
-                        .to_string(),
-                );
-            }
-            config.governor.max_generations = headless::max_generations_for_agent_ticks(
-                budget,
-                config.governor.population_size,
-                config.governor.tick_budget,
-            )
+        config.governor.supervisor.agent_tick_budget = budget;
+        config
+            .governor
+            .supervisor
+            .validate(config.governor.population_size)
             .map_err(|e| e.to_string())?;
-        }
     }
     Ok(())
 }
@@ -894,20 +859,13 @@ fn free_life_options_from_cli(
     if cli.free_life_ticks == 0 {
         return Err("--free-life-ticks must be greater than 0".to_string());
     }
-    if cli.free_life_champion_node.is_some() && cli.free_life_champion_db.is_none() {
-        return Err("--free-life-champion-node requires --free-life-champion-db".to_string());
-    }
     let lesions = headless::parse_lesions(&cli.free_life_lesion).map_err(|e| e.to_string())?;
-    let brain_source = match (&cli.free_life_archive_db, &cli.free_life_champion_db) {
-        (Some(db_path), _) => headless::BrainSource::Archive {
+    let brain_source = match &cli.free_life_archive_db {
+        Some(db_path) => headless::BrainSource::Archive {
             db_path: db_path.clone(),
             rank: cli.free_life_archive_rank.unwrap_or(0),
         },
-        (None, Some(db_path)) => headless::BrainSource::Champion {
-            db_path: db_path.clone(),
-            node_id: cli.free_life_champion_node,
-        },
-        (None, None) => headless::BrainSource::Fresh,
+        None => headless::BrainSource::Fresh,
     };
     Ok(headless::FreeLifeOptions {
         agent_count: cli.free_life_agents,
@@ -985,23 +943,7 @@ fn speed_label(multiplier: u32) -> &'static str {
 mod tests {
     use super::*;
     use xagent_brain::buffers::TrunkLesions;
-    use xagent_shared::config::{EvolutionMode, Inheritance};
-
-    #[test]
-    fn evolution_cli_darwinian_still_selectable() {
-        use xagent_shared::config::Inheritance;
-        let (cli, mut config) = evo(&[
-            "--evolution-mode",
-            "supervisor",
-            "--supervisor-inheritance",
-            "darwinian",
-        ]);
-        apply_evolution_cli(&cli, &mut config).unwrap();
-        assert_eq!(
-            config.governor.supervisor.inheritance,
-            Inheritance::Darwinian
-        );
-    }
+    use xagent_shared::config::Inheritance;
 
     fn evo(args: &[&str]) -> (Cli, FullConfig) {
         let mut argv = vec!["xagent"];
@@ -1013,23 +955,104 @@ mod tests {
     }
 
     #[test]
-    fn evolution_cli_defaults_leave_config_unchanged() {
+    fn ignored_governor_keys_lists_dead_keys_once() {
+        let json = serde_json::json!({
+            "governor": {
+                "evolution_mode": "Generations",
+                "patience": 3,
+                "tick_budget": 1,
+                "population_size": 10,
+                "max_generations": 0
+            }
+        });
+        assert_eq!(
+            ignored_governor_keys(&json),
+            vec![
+                "tick_budget",
+                "max_generations",
+                "patience",
+                "evolution_mode"
+            ]
+        );
+        assert!(ignored_governor_keys(&serde_json::json!({"governor": 5})).is_empty());
+        assert!(
+            ignored_governor_keys(&serde_json::json!({"governor": {"population_size": 1}}))
+                .is_empty()
+        );
+        assert!(ignored_governor_keys(&serde_json::json!([])).is_empty());
+    }
+
+    #[test]
+    fn removed_flag_names_the_first_removed_flag() {
+        let (cli, _) = evo(&[]);
+        assert_eq!(removed_flag(&cli), None);
+        let (cli, _) = evo(&["--free-life-champion-node", "x", "--generations", "3"]);
+        assert_eq!(removed_flag(&cli), Some("generations"));
+        let (cli, _) = evo(&["--validation-seed-start", "1", "--dump-tree"]);
+        assert_eq!(removed_flag(&cli), Some("dump-tree"));
+        for (args, want) in [
+            (vec!["--evolution-mode", "anything"], "evolution-mode"),
+            (
+                vec!["--validate-innate-instincts"],
+                "validate-innate-instincts",
+            ),
+            (vec!["--validate-danger-percept"], "validate-danger-percept"),
+            (
+                vec!["--validation-generations", "1"],
+                "validation-generations",
+            ),
+            (
+                vec!["--validation-population", "1"],
+                "validation-population",
+            ),
+            (
+                vec!["--validation-replicates", "1"],
+                "validation-replicates",
+            ),
+            (
+                vec!["--validation-tick-budget", "1"],
+                "validation-tick-budget",
+            ),
+            (
+                vec!["--validation-seed-start", "1"],
+                "validation-seed-start",
+            ),
+            (
+                vec!["--free-life-champion-db", "c.db"],
+                "free-life-champion-db",
+            ),
+            (
+                vec!["--free-life-champion-node", "3"],
+                "free-life-champion-node",
+            ),
+        ] {
+            let (cli, _) = evo(&args);
+            assert_eq!(removed_flag(&cli), Some(want));
+        }
+    }
+
+    #[test]
+    fn supervisor_cli_darwinian_still_selectable() {
+        let (cli, mut config) = evo(&["--supervisor-inheritance", "darwinian"]);
+        apply_supervisor_cli(&cli, &mut config).unwrap();
+        assert_eq!(
+            config.governor.supervisor.inheritance,
+            Inheritance::Darwinian
+        );
+    }
+
+    #[test]
+    fn supervisor_cli_defaults_leave_config_unchanged() {
         let (cli, mut config) = evo(&[]);
         let before = serde_json::to_string(&config).expect("serialize");
-        apply_evolution_cli(&cli, &mut config).expect("ok");
+        apply_supervisor_cli(&cli, &mut config).expect("ok");
         assert_eq!(before, serde_json::to_string(&config).expect("serialize"));
     }
 
     #[test]
-    fn evolution_cli_mode_and_inheritance_set_config() {
-        let (cli, mut config) = evo(&[
-            "--evolution-mode",
-            "supervisor",
-            "--supervisor-inheritance",
-            "weight-copy",
-        ]);
-        apply_evolution_cli(&cli, &mut config).expect("ok");
-        assert_eq!(config.governor.evolution_mode, EvolutionMode::Supervisor);
+    fn supervisor_cli_weight_copy_sets_config() {
+        let (cli, mut config) = evo(&["--supervisor-inheritance", "weight-copy"]);
+        apply_supervisor_cli(&cli, &mut config).expect("ok");
         assert_eq!(
             config.governor.supervisor.inheritance,
             Inheritance::WeightCopy
@@ -1037,53 +1060,22 @@ mod tests {
     }
 
     #[test]
-    fn evolution_cli_supervisor_budget_sets_and_validates() {
-        let (cli, mut config) = evo(&[
-            "--evolution-mode",
-            "supervisor",
-            "--agent-tick-budget",
-            "10000",
-        ]);
+    fn supervisor_cli_budget_sets_and_validates() {
+        let (cli, mut config) = evo(&["--agent-tick-budget", "10000"]);
         config.governor.population_size = 10;
-        apply_evolution_cli(&cli, &mut config).expect("ok");
+        apply_supervisor_cli(&cli, &mut config).expect("ok");
         assert_eq!(config.governor.supervisor.agent_tick_budget, 10_000);
-        let (cli, mut config) =
-            evo(&["--evolution-mode", "supervisor", "--agent-tick-budget", "7"]);
+        let (cli, mut config) = evo(&["--agent-tick-budget", "7"]);
         config.governor.population_size = 10;
-        let err = apply_evolution_cli(&cli, &mut config).expect_err("rejected");
+        let err = apply_supervisor_cli(&cli, &mut config).expect_err("rejected");
         assert!(err.contains("agent_tick_budget"), "{err}");
     }
 
     #[test]
-    fn evolution_cli_generation_budget_sets_max_generations() {
-        let (cli, mut config) = evo(&["--agent-tick-budget", "20000000"]);
-        let expected = headless::max_generations_for_agent_ticks(
-            20_000_000,
-            config.governor.population_size,
-            config.governor.tick_budget,
-        )
-        .expect("converts");
-        apply_evolution_cli(&cli, &mut config).expect("ok");
-        assert_eq!(config.governor.max_generations, expected);
-        assert_eq!(expected, 3);
-    }
-
-    #[test]
-    fn evolution_cli_generation_budget_conflicts_with_generations() {
-        let (cli, mut config) = evo(&["--agent-tick-budget", "1000000", "--generations", "3"]);
-        assert!(apply_evolution_cli(&cli, &mut config).is_err());
-    }
-
-    #[test]
-    fn evolution_cli_resume_with_supervisor_resolves() {
-        let (cli, mut config) = evo(&["--evolution-mode", "supervisor", "--resume"]);
-        assert!(apply_evolution_cli(&cli, &mut config).is_ok());
-    }
-
-    #[test]
-    fn evolution_cli_inheritance_with_generations_is_error() {
-        let (cli, mut config) = evo(&["--supervisor-inheritance", "darwinian"]);
-        assert!(apply_evolution_cli(&cli, &mut config).is_err());
+    fn supervisor_cli_resume_resolves() {
+        let (cli, mut config) = evo(&["--resume"]);
+        assert!(cli.resume);
+        assert!(apply_supervisor_cli(&cli, &mut config).is_ok());
     }
 
     #[test]
@@ -1115,20 +1107,6 @@ mod tests {
     #[test]
     fn evolution_cli_archive_rank_requires_db() {
         assert!(Cli::try_parse_from(["xagent", "--free-life-archive-rank", "1"]).is_err());
-    }
-
-    #[test]
-    fn evolution_cli_archive_conflicts_with_champion() {
-        assert!(Cli::try_parse_from([
-            "xagent",
-            "--free-life-archive-db",
-            "a.db",
-            "--free-life-archive-rank",
-            "1",
-            "--free-life-champion-db",
-            "c.db",
-        ])
-        .is_err());
     }
 
     fn parse_options(args: &[&str]) -> Result<headless::FreeLifeOptions, String> {
@@ -1178,15 +1156,6 @@ mod tests {
     }
 
     #[test]
-    fn free_life_champion_node_without_db_is_rejected() {
-        let err = parse_options(&["--free-life-champion-node", "3"]).expect_err("rejected");
-        assert_eq!(
-            err,
-            "--free-life-champion-node requires --free-life-champion-db"
-        );
-    }
-
-    #[test]
     fn free_life_agent_count_outside_range_is_rejected() {
         let err = parse_options(&["--free-life-agents", "0"]).expect_err("rejected");
         assert_eq!(
@@ -1202,32 +1171,6 @@ mod tests {
     #[test]
     fn free_life_zero_ticks_is_rejected() {
         assert!(parse_options(&["--free-life-ticks", "0"]).is_err());
-    }
-
-    #[test]
-    fn free_life_champion_db_and_node_map_to_champion_source() {
-        let o = parse_options(&[
-            "--free-life-champion-db",
-            "x.db",
-            "--free-life-champion-node",
-            "3",
-        ])
-        .expect("valid");
-        assert_eq!(
-            o.brain_source,
-            headless::BrainSource::Champion {
-                db_path: "x.db".to_string(),
-                node_id: Some(3),
-            }
-        );
-        let o = parse_options(&["--free-life-champion-db", "x.db"]).expect("valid");
-        assert_eq!(
-            o.brain_source,
-            headless::BrainSource::Champion {
-                db_path: "x.db".to_string(),
-                node_id: None,
-            }
-        );
     }
 
     // ── speed_label ──────────────────────────────────────────────────

@@ -31,7 +31,7 @@ depends_on:
   - 0007-supervisor-live-resume
   - 0008-supervisor-observatory-ui
   - 0009-supervisor-tick-window-replay
-status: todo
+status: completed
 toolchains:
   - cargo
   - rustc

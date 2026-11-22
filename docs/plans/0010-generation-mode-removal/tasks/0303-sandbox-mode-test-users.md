@@ -14,8 +14,8 @@ touches:
   - crates/xagent-sandbox/tests/supervisor_run_resume.rs
   - crates/xagent-sandbox/tests/supervisor_sense_parity.rs
   - crates/xagent-sandbox/tests/supervisor_tick_window_digest.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "f9b9645c5650cfbec3be9d96c09c3c0271d0de79"
 checks:
   - name: mode-test-users-free
     command: "sh -c 'cd crates/xagent-sandbox/tests && ! grep -nE \"EvolutionMode|evolution_mode\" sense_block_parity.rs supervisor_digest.rs supervisor_resume_digest.rs supervisor_run_resume.rs supervisor_sense_parity.rs supervisor_tick_window_digest.rs'"

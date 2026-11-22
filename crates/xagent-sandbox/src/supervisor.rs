@@ -30,7 +30,6 @@ use crate::agent::{
     fresh_brain_state, mutate_sensory_genes, mutate_steering_weights, steering_population,
     HEATMAP_RES,
 };
-use crate::governor::{composite_fitness, exploration_grid_cells};
 use crate::momentum::MutationMomentum;
 
 /// Stream tag of the replacement-boundary schedule.
@@ -62,6 +61,55 @@ const ALIVE_THRESHOLD: f32 = 0.5;
 
 /// Largest counter an `f32` holds exactly (2^24).
 const COUNT_EXACT_LIMIT: f32 = 16_777_216.0;
+
+/// Food per unit energy for a competent forager earning full foraging credit.
+const FORAGING_ENERGY_TARGET: f32 = 0.294;
+/// Minimum energy before the foraging rate counts.
+const ENERGY_FLOOR: f32 = 1.0;
+/// Minimum distance before the per-distance rate counts.
+const DISTANCE_FLOOR: f32 = 0.1;
+/// Cells explored per unit distance for a competent forager earning full
+/// exploration credit.
+const EXPLORATION_RATE_TARGET: f32 = 0.0005;
+/// Lower bound on the survival multiplier.
+const SURVIVAL_FLOOR: f32 = 0.25;
+/// Per-death penalty inside the survival multiplier.
+const DEATH_PENALTY: f32 = 0.5;
+/// Foraging is the primary objective.
+const FORAGING_WEIGHT: f32 = 0.85;
+/// Exploration is a smaller secondary term.
+const EXPLORATION_WEIGHT: f32 = 0.15;
+
+/// Composite fitness: foraging-primary with a bounded survival multiplier.
+/// `total_grid_cells` is the exploration denominator.
+pub(crate) fn composite_fitness(
+    death_count: u32,
+    food_consumed: u32,
+    cells_explored: u32,
+    total_grid_cells: f32,
+    distance_traveled: f32,
+    energy_spent: f32,
+) -> f32 {
+    // Bounded survival multiplier: 1.0 at zero deaths, asymptotes to the floor.
+    let survival =
+        SURVIVAL_FLOOR + (1.0 - SURVIVAL_FLOOR) / (1.0 + death_count as f32 * DEATH_PENALTY);
+
+    let foraging =
+        ((food_consumed as f32 / energy_spent.max(ENERGY_FLOOR)) / FORAGING_ENERGY_TARGET).min(1.0);
+
+    let coverage = (cells_explored as f32 / total_grid_cells).min(1.0);
+    let cells_per_distance =
+        (cells_explored as f32 / distance_traveled.max(DISTANCE_FLOOR) / EXPLORATION_RATE_TARGET)
+            .min(1.0);
+    let exploration = coverage.min(cells_per_distance);
+
+    survival * (foraging * FORAGING_WEIGHT + exploration * EXPLORATION_WEIGHT)
+}
+
+/// Per-generation exploration denominator: a quarter of the heatmap grid.
+pub(crate) fn exploration_grid_cells() -> f32 {
+    (HEATMAP_RES * HEATMAP_RES / 4) as f32
+}
 
 /// Derives the seed of one random stream: splitmix64 of `run_seed ^ tag`.
 pub fn stream_seed(run_seed: u64, tag: u64) -> u64 {

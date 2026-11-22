@@ -15,9 +15,7 @@ use xagent_sandbox::supervisor_run::{
 };
 use xagent_sandbox::supervisor_store::SupervisorStore;
 use xagent_sandbox::world::WorldState;
-use xagent_shared::{
-    EvolutionMode, FoodKind, FullConfig, Inheritance, SupervisorConfig, SUPERVISOR_SAMPLE_TICKS,
-};
+use xagent_shared::{FoodKind, FullConfig, Inheritance, SupervisorConfig, SUPERVISOR_SAMPLE_TICKS};
 
 /// Agents in every run.
 const AGENTS: usize = 10;
@@ -81,7 +79,6 @@ fn gpu_or_skip() -> bool {
 
 fn supervisor_config() -> FullConfig {
     let mut config = FullConfig::default();
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = AGENTS;
     config.governor.supervisor = SupervisorConfig {
         boundary_interval_ticks: BOUNDARY_TICKS,
@@ -325,13 +322,8 @@ fn supervisor_run_resume_refuses_config_mismatch() {
 
 #[test]
 fn run_summary_accumulator_serde_round_trip() {
-    let mut original = RunSummaryAccumulator::new(
-        EvolutionMode::Supervisor,
-        Some(Inheritance::Darwinian),
-        SEED,
-        ACCUMULATOR_AGENTS,
-        true,
-    );
+    let mut original =
+        RunSummaryAccumulator::new(Some(Inheritance::Darwinian), SEED, ACCUMULATOR_AGENTS, true);
     original
         .begin_season(0, Some(FoodKind::First))
         .expect("first season");

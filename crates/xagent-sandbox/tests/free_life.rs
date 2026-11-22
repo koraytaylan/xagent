@@ -1,19 +1,15 @@
 //! Free-life run: lesion parsing (CPU) and seeded runs (GPU).
 
-use std::path::Path;
-
-use rand::SeedableRng;
 use tempfile::TempDir;
 use xagent_brain::buffers::TrunkLesions;
 use xagent_brain::GpuKernel;
-use xagent_sandbox::agent::{fresh_brain_state, MAX_AGENTS};
+use xagent_sandbox::agent::MAX_AGENTS;
 use xagent_sandbox::free_life::tick_log::read_tick_log;
-use xagent_sandbox::governor::Governor;
 use xagent_sandbox::headless::{
     lesion_names, parse_lesions, run_free_life, BrainSource, FreeLifeError, FreeLifeOptions,
     FreeLifeReport,
 };
-use xagent_shared::{FullConfig, GovernorConfig};
+use xagent_shared::FullConfig;
 
 /// Agents in a standard test run.
 const TEST_AGENTS: usize = 3;
@@ -23,12 +19,6 @@ const TARGET_TICKS: u64 = 3_000;
 const TEST_SEED: u64 = 5;
 /// Seed that differs from the standard one.
 const OTHER_SEED: u64 = 6;
-/// Seed of the fixture governor database.
-const FIXTURE_SEED: u64 = 9;
-/// Seed of the fixture birth brain.
-const FIXTURE_BRAIN_SEED: u64 = 11;
-/// Node id no fixture database holds.
-const MISSING_NODE: i64 = 987_654;
 /// Vision stride the runner rejects.
 const BAD_VISION_STRIDE: u32 = 2;
 /// Agents in a bare kernel used only to read its batch size or defaults.
@@ -43,14 +33,10 @@ const ONE_TICK: u64 = 1;
 const UNIT_BATCH: u64 = 1;
 /// Offset from the row count to the index of the last log row.
 const LAST_ROW_OFFSET: usize = 1;
-/// Column index of the generation in the stored node query.
-const GENERATION_COLUMN: usize = 0;
 /// An agent count below the accepted range.
 const ZERO_AGENTS: usize = 0;
 /// Distance above the maximum agent count that must be rejected.
 const OVER_MAX_OFFSET: usize = 1;
-/// Name of the fixture database file.
-const FIXTURE_DB: &str = "governor.db";
 /// Name of the tick log file.
 const LOG_FILE: &str = "free-life.log";
 /// Column that holds the brain tick in the tick log.
@@ -96,40 +82,6 @@ fn options(config: &FullConfig) -> FreeLifeOptions {
 
 fn run(config: &FullConfig, options: &FreeLifeOptions) -> FreeLifeReport {
     run_free_life(config, options).expect("free life runs")
-}
-
-/// Create a governor database whose current node holds `brain_state`.
-fn fixture_db(
-    dir: &Path,
-    config: &FullConfig,
-    mutate: impl FnOnce(&mut Vec<f32>),
-) -> (String, i64) {
-    let path = dir.join(FIXTURE_DB).to_string_lossy().into_owned();
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(FIXTURE_BRAIN_SEED);
-    let mut brain = fresh_brain_state(&config.brain, &mut rng);
-    mutate(&mut brain.brain_state);
-    let governor = Governor::new_seeded(
-        &path,
-        GovernorConfig::default(),
-        &config.brain,
-        "{}",
-        FIXTURE_SEED,
-    )
-    .expect("governor database");
-    let node = governor.current_node_id.expect("current node");
-    assert!(governor.store_champion_brain(node, &brain));
-    drop(governor);
-    (path, node)
-}
-
-fn stored_generation(db_path: &str, node: i64) -> i64 {
-    let db =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open fixture");
-    db.query_row("SELECT generation FROM node WHERE id = ?1", [node], |r| {
-        r.get(GENERATION_COLUMN)
-    })
-    .expect("generation")
 }
 
 #[test]
@@ -209,7 +161,6 @@ fn free_life_brain_ticks_and_samples_match_ticks() {
     assert_eq!(report.agents.len(), TEST_AGENTS);
     assert_eq!(report.agent_count, TEST_AGENTS);
     assert_eq!(report.brain_source, "fresh");
-    assert_eq!(report.champion_node_id, None);
     for agent in &report.agents {
         assert_eq!(agent.whole.samples, report.brain_ticks);
         assert!(agent.late.samples <= agent.whole.samples);
@@ -253,72 +204,6 @@ fn free_life_leaves_fresh_kernel_with_lesions_off() {
     );
     assert!(kernel.trunk_lesions().is_none());
     assert!(!kernel.brain_tick_probe_enabled());
-}
-
-#[test]
-fn free_life_champion_source_reports_node_and_generation() {
-    if !gpu_ready() {
-        return;
-    }
-    let config = FullConfig::default();
-    let dir = TempDir::new().expect("tempdir");
-    let (db_path, node) = fixture_db(dir.path(), &config, |_| {});
-    let generation = stored_generation(&db_path, node);
-    let opts = FreeLifeOptions {
-        brain_source: BrainSource::Champion {
-            db_path,
-            node_id: None,
-        },
-        ..options(&config)
-    };
-    let report = run(&config, &opts);
-    assert_eq!(report.brain_source, "champion");
-    assert_eq!(report.champion_node_id, Some(node));
-    assert_eq!(report.champion_generation, Some(generation));
-}
-
-#[test]
-fn free_life_champion_wrong_layout_is_rejected() {
-    if !gpu_ready() {
-        return;
-    }
-    let config = FullConfig::default();
-    let dir = TempDir::new().expect("tempdir");
-    let (db_path, _) = fixture_db(dir.path(), &config, |state| {
-        state.pop();
-    });
-    let opts = FreeLifeOptions {
-        brain_source: BrainSource::Champion {
-            db_path,
-            node_id: None,
-        },
-        ..options(&config)
-    };
-    assert!(matches!(
-        run_free_life(&config, &opts),
-        Err(FreeLifeError::ChampionLayout { .. })
-    ));
-}
-
-#[test]
-fn free_life_missing_champion_node_is_reported() {
-    if !gpu_ready() {
-        return;
-    }
-    let config = FullConfig::default();
-    let dir = TempDir::new().expect("tempdir");
-    let (db_path, _) = fixture_db(dir.path(), &config, |_| {});
-    let opts = FreeLifeOptions {
-        brain_source: BrainSource::Champion {
-            db_path,
-            node_id: Some(MISSING_NODE),
-        },
-        ..options(&config)
-    };
-    assert!(matches!(
-        run_free_life(&config, &opts),
-        Err(FreeLifeError::ChampionLoad(_))
-    ));
 }
 
 #[test]

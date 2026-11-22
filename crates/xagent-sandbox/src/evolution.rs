@@ -1,31 +1,131 @@
-//! Evolution action handling, population spawning, and the async
-//! generation-transition state machine.
+//! Evolution action handling, population spawning and the database gate.
 //!
-//! This module hosts `App::handle_evolution_action` plus the cluster of
-//! methods that together drive a generation boundary — evaluating fitness,
-//! fetching the brain the champion was born with, resetting or recreating the
-//! GPU kernel, and spawning the next generation's agents.
+//! This module hosts `App::handle_evolution_action`: starting, resuming,
+//! pausing and resetting the supervisor session. The database is classified
+//! read-only before any open; a legacy generations file is refused untouched.
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glam::Vec3;
 use rand::Rng;
 
-use xagent_brain::AgentBrainState;
 use xagent_sandbox::agent::{mutate_config, Agent, MAX_AGENTS};
-use xagent_sandbox::governor::{reset_database, AdvanceResult, Governor};
 use xagent_sandbox::observatory::store_read::{load_run, SupervisorRunSummary};
 use xagent_sandbox::observatory::{ModelSource, ObservatoryModel};
+use xagent_sandbox::supervisor_store::{inspect_database, DatabaseKind, StoreError};
 use xagent_sandbox::ui::{
     EvolutionAction, EvolutionSnapshot, EvolutionState, SessionChoice, SupervisorSnapshot,
 };
 use xagent_shared::BrainConfig;
 
-use crate::app::{App, PendingGeneration};
-use crate::sim_runtime::{InheritedBrain, ResetRequest, SimCommand};
+use crate::app::App;
 
 /// Longest resume error shown in the session dialog, in bytes.
 const MAX_RESUME_ERROR_BYTES: usize = 256;
+
+/// What the session may do with the database at its path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionOffer {
+    /// The file may be opened as a supervisor store.
+    Open,
+    /// The file holds a generations run: only quit or start in a new file.
+    LegacyChoice,
+    /// The file could not be inspected.
+    Refuse,
+}
+
+/// The offer for a database of `kind`.
+pub(crate) fn session_offer(kind: DatabaseKind) -> SessionOffer {
+    match kind {
+        DatabaseKind::Missing | DatabaseKind::Empty | DatabaseKind::Supervisor => {
+            SessionOffer::Open
+        }
+        DatabaseKind::LegacyGenerations { .. } => SessionOffer::LegacyChoice,
+    }
+}
+
+/// Classify the database at `path` read-only: the offer and, when it is not
+/// `Open`, the message to show. The legacy message is the store's own text.
+pub(crate) fn inspect_offer(path: &str) -> (SessionOffer, Option<String>, Option<u64>) {
+    match inspect_database(Path::new(path)) {
+        Ok(kind) => {
+            let (body, generation) = match &kind {
+                DatabaseKind::LegacyGenerations { generation } => (
+                    Some(
+                        StoreError::LegacyGenerations {
+                            path: path.to_owned(),
+                            generation: *generation,
+                        }
+                        .to_string(),
+                    ),
+                    *generation,
+                ),
+                _ => (None, None),
+            };
+            (session_offer(kind), body, generation)
+        }
+        Err(error) => (SessionOffer::Refuse, Some(error.to_string()), None),
+    }
+}
+
+/// The first of `<stem>.supervisor.db`, `<stem>.supervisor-2.db`, ... in the
+/// directory of `path` for which `exists` is false.
+pub(crate) fn next_fresh_db_path(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "xagent".to_string());
+    let mut number = 1_u32;
+    loop {
+        let name = if number == 1 {
+            format!("{stem}.supervisor.db")
+        } else {
+            format!("{stem}.supervisor-{number}.db")
+        };
+        let candidate = path.with_file_name(name);
+        if !exists(&candidate) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+/// Two-step confirmation of a database reset.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ResetState {
+    /// No reset requested.
+    #[default]
+    Idle,
+    /// A first request named this database; a second one deletes it.
+    Armed(PathBuf),
+}
+
+/// Whether a reset request for `path` is the confirming second one.
+pub(crate) fn reset_confirmed(state: &ResetState, path: &Path) -> bool {
+    matches!(state, ResetState::Armed(armed) if armed == path)
+}
+
+/// Show the legacy choice: the store's message, offering only "Quit" or
+/// "Start in a new file".
+pub(crate) fn apply_legacy_choice(snapshot: &mut EvolutionSnapshot, body: String) {
+    snapshot.supervisor = None;
+    snapshot.observatory = None;
+    snapshot.supervisor_session = None;
+    snapshot.supervisor_resume_error = Some(body);
+    snapshot.legacy_choice = true;
+    snapshot.state = EvolutionState::Idle;
+}
+
+/// Show why the database could not be inspected; nothing is offered.
+pub(crate) fn apply_database_refusal(snapshot: &mut EvolutionSnapshot, body: String) {
+    snapshot.supervisor = None;
+    snapshot.observatory = None;
+    snapshot.supervisor_session = None;
+    snapshot.supervisor_resume_error = Some(body);
+    snapshot.legacy_choice = false;
+    snapshot.state = EvolutionState::Idle;
+}
 
 /// `text` cut to at most [`MAX_RESUME_ERROR_BYTES`] on a char boundary.
 fn truncate_error(text: &str) -> String {
@@ -51,7 +151,7 @@ pub(crate) fn apply_resume_refusal(
     message: &str,
     summary: SupervisorRunSummary,
 ) {
-    println!("[SUPERVISOR] Resume refused: {message}");
+    log::warn!("[SUPERVISOR] Resume refused: {message}");
     snapshot.supervisor = None;
     snapshot.observatory = None;
     snapshot.supervisor_resume_error = Some(truncate_error(message));
@@ -80,10 +180,38 @@ impl App {
         self.agents.push(agent);
     }
 
+    /// Classify the database before any open and show a legacy or refused
+    /// file. Returns the offer; only `Open` may proceed.
+    fn gate_database(&mut self) -> SessionOffer {
+        let (offer, body, _) = inspect_offer(&self.db_path);
+        match (offer, body) {
+            (SessionOffer::LegacyChoice, Some(body)) => {
+                apply_legacy_choice(&mut self.evo_snapshot, body);
+                self.legacy_offered = Some(self.db_path.clone());
+                self.log_msg(
+                    "[SESSION] Legacy generations database: quit or start in a new file".into(),
+                );
+            }
+            (SessionOffer::Refuse, Some(body)) => {
+                self.log_msg(format!("[SESSION] Could not inspect database: {body}"));
+                apply_database_refusal(&mut self.evo_snapshot, body);
+            }
+            _ => {}
+        }
+        if offer != SessionOffer::LegacyChoice {
+            self.legacy_offered = None;
+            self.evo_snapshot.legacy_choice = false;
+        }
+        offer
+    }
+
     /// Act on the answer to the supervisor-run dialog, if one was given.
     fn handle_session_choice(&mut self) {
         let choice = std::mem::take(&mut self.evo_snapshot.session_choice);
         if choice == SessionChoice::None {
+            return;
+        }
+        if self.gate_database() != SessionOffer::Open {
             return;
         }
         let Some(summary) = self.evo_snapshot.supervisor_session.clone() else {
@@ -104,12 +232,7 @@ impl App {
             return;
         }
         model.source = ModelSource::Live;
-        let gov_config = {
-            let mut config = self.evo_snapshot.edit_governor.clone();
-            config.evolution_mode = xagent_shared::EvolutionMode::Supervisor;
-            config
-        };
-        self.governor_config = gov_config;
+        self.governor_config = self.evo_snapshot.edit_governor.clone();
         self.brain_config = self.evo_snapshot.edit_brain.clone();
         self.evo_snapshot.observatory = Some(model);
         self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
@@ -147,109 +270,69 @@ impl App {
 
     pub(crate) fn handle_evolution_action(&mut self, action: EvolutionAction) {
         self.handle_session_choice();
+        if action != EvolutionAction::Reset && action != EvolutionAction::None {
+            self.reset_state = ResetState::Idle;
+        }
         match action {
             EvolutionAction::None => {}
             EvolutionAction::Start => {
-                let brain_config = self.evo_snapshot.edit_brain.clone();
-                let gov_config = self.evo_snapshot.edit_governor.clone();
-                if gov_config.evolution_mode == xagent_shared::EvolutionMode::Supervisor {
-                    let population = gov_config.population_size as u64;
-                    let budget = gov_config.supervisor.agent_tick_budget;
-                    let total_ticks = if budget > 0 && population > 0 {
-                        Some(budget / population)
-                    } else {
-                        None
-                    };
-                    self.governor_config = gov_config;
-                    self.brain_config = brain_config;
-                    self.evo_snapshot.state = EvolutionState::Running;
-                    self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
-                        total_ticks,
-                        ..Default::default()
-                    });
-                    self.evo_snapshot.observatory = Some(ObservatoryModel {
-                        source: ModelSource::Live,
-                        ..Default::default()
-                    });
-                    self.evo_wall_accumulated = 0.0;
-                    self.session_tick_count = 0;
-                    self.evo_wall_segment_start = Some(Instant::now());
-                    self.tps_tick_count = 0;
-                    self.tps_last_reset = Instant::now();
-                    self.tps_display = 0.0;
-                    self.paused = false;
-                    self.stop_sim_worker();
-                    self.spawn_evolution_population();
-                    self.start_sim_worker();
-                    self.log_msg("[EVOLUTION] Started supervisor run".into());
+                // A plain Start on a legacy file only shows the choice.
+                if self.gate_database() != SessionOffer::Open {
                     return;
                 }
-                let world_json = serde_json::to_string(&self.world_config).unwrap_or_default();
-                match Governor::new_seeded(
-                    &self.db_path,
-                    gov_config.clone(),
-                    &brain_config,
-                    &world_json,
-                    self.world_config.seed,
-                ) {
-                    Ok(gov) => {
-                        self.governor = Some(gov);
-                        self.governor_config = gov_config.clone();
-                        self.brain_config = brain_config;
-                        self.evo_snapshot.state = EvolutionState::Running;
-                        self.evo_snapshot.population_size = gov_config.population_size;
-                        self.evo_snapshot.tick_budget = gov_config.tick_budget;
-                        self.evo_snapshot.elitism_count = gov_config.elitism_count;
-                        self.evo_snapshot.patience = gov_config.patience;
-                        self.evo_snapshot.max_generations = gov_config.max_generations;
-                        self.evo_snapshot.eval_repeats = gov_config.eval_repeats;
-                        self.evo_snapshot.num_islands = gov_config.num_islands;
-                        self.evo_snapshot.migration_interval = gov_config.migration_interval;
-                        self.evo_wall_accumulated = 0.0;
-                        self.session_tick_count = 0;
-                        self.evo_wall_segment_start = Some(Instant::now());
-                        self.tps_tick_count = 0;
-                        self.tps_last_reset = Instant::now();
-                        self.tps_display = 0.0;
-                        self.paused = false;
-                        self.stop_sim_worker();
-                        self.spawn_evolution_population();
-                        self.start_sim_worker();
-                        self.log_msg("[EVOLUTION] Started new run".into());
-                    }
-                    Err(e) => {
-                        self.log_msg(format!("[EVOLUTION] Failed to start: {}", e));
-                    }
+                let brain_config = self.evo_snapshot.edit_brain.clone();
+                let gov_config = self.evo_snapshot.edit_governor.clone();
+                let population = gov_config.population_size as u64;
+                let budget = gov_config.supervisor.agent_tick_budget;
+                let total_ticks = if budget > 0 && population > 0 {
+                    Some(budget / population)
+                } else {
+                    None
+                };
+                self.governor_config = gov_config;
+                self.brain_config = brain_config;
+                self.evo_snapshot.state = EvolutionState::Running;
+                self.evo_snapshot.supervisor = Some(SupervisorSnapshot {
+                    total_ticks,
+                    ..Default::default()
+                });
+                self.evo_snapshot.observatory = Some(ObservatoryModel {
+                    source: ModelSource::Live,
+                    ..Default::default()
+                });
+                self.evo_wall_accumulated = 0.0;
+                self.session_tick_count = 0;
+                self.evo_wall_segment_start = Some(Instant::now());
+                self.tps_tick_count = 0;
+                self.tps_last_reset = Instant::now();
+                self.tps_display = 0.0;
+                self.paused = false;
+                self.stop_sim_worker();
+                self.spawn_evolution_population();
+                self.start_sim_worker();
+                self.log_msg("[EVOLUTION] Started supervisor run".into());
+            }
+            EvolutionAction::Resume => {
+                // While the legacy choice is showing for this path, Resume is
+                // the explicit "Start in a new file" answer.
+                if self.legacy_offered.as_deref() == Some(self.db_path.as_str())
+                    && self.gate_database() == SessionOffer::LegacyChoice
+                {
+                    let fresh = next_fresh_db_path(Path::new(&self.db_path), |p| p.exists());
+                    self.db_path = fresh.to_string_lossy().into_owned();
+                    self.legacy_offered = None;
+                    self.evo_snapshot.supervisor_resume_error = None;
+                    self.log_msg(format!("[SESSION] Starting in new file {}", self.db_path));
+                    self.handle_evolution_action(EvolutionAction::Start);
+                    return;
+                }
+                if self.gate_database() == SessionOffer::Open {
+                    self.log_msg(
+                        "[EVOLUTION] Resume applies to supervisor runs through the session dialog"
+                            .into(),
+                    );
                 }
             }
-            EvolutionAction::Resume => match Governor::resume(&self.db_path) {
-                Ok(gov) => {
-                    let cfg = gov.current_config();
-                    self.evo_snapshot.state = EvolutionState::Running;
-                    self.evo_snapshot.generation = gov.generation;
-                    self.governor_config = gov.config.clone();
-                    if let Some(c) = &cfg {
-                        self.brain_config = c.clone();
-                    }
-                    // The resumed generation restarts from tick 0, so the clock
-                    // continues from the ticks persisted at the last boundary.
-                    self.session_tick_count = gov.simulation_ticks();
-                    self.governor = Some(gov);
-                    self.evo_wall_accumulated = 0.0;
-                    self.evo_wall_segment_start = Some(Instant::now());
-                    self.tps_tick_count = 0;
-                    self.tps_last_reset = Instant::now();
-                    self.tps_display = 0.0;
-                    self.paused = false;
-                    self.stop_sim_worker();
-                    self.spawn_evolution_population();
-                    self.start_sim_worker();
-                    self.log_msg("[EVOLUTION] Resumed from database".into());
-                }
-                Err(e) => {
-                    self.log_msg(format!("[EVOLUTION] Failed to resume: {}", e));
-                }
-            },
             EvolutionAction::Pause => {
                 self.evo_snapshot.state = EvolutionState::Paused;
                 self.paused = true;
@@ -269,13 +352,23 @@ impl App {
                 self.log_msg("[EVOLUTION] Resumed".into());
             }
             EvolutionAction::Reset => {
-                self.governor = None;
+                let path = PathBuf::from(&self.db_path);
+                if !matches!(inspect_database(&path), Ok(DatabaseKind::Supervisor)) {
+                    self.log_msg("[EVOLUTION] Reset applies only to a supervisor database".into());
+                    return;
+                }
+                if !reset_confirmed(&self.reset_state, &path) {
+                    self.reset_state = ResetState::Armed(path);
+                    self.log_msg("[EVOLUTION] Reset again to delete the database file".into());
+                    return;
+                }
+                self.reset_state = ResetState::Idle;
                 self.stop_sim_worker();
                 self.agents.clear();
                 self.next_agent_id = 0;
                 self.tick = 0;
                 self.paused = true;
-                if let Err(e) = reset_database(&self.db_path) {
+                if let Err(e) = std::fs::remove_file(&path) {
                     self.log_msg(format!("[EVOLUTION] Failed to reset DB: {}", e));
                 }
                 self.evo_snapshot = EvolutionSnapshot::default();
@@ -293,257 +386,12 @@ impl App {
         self.agents.clear();
         self.next_agent_id = 0;
         self.tick = 0;
-        let seed = if let Some(gov) = &self.governor {
-            gov.current_config().unwrap_or(self.brain_config.clone())
-        } else {
-            self.brain_config.clone()
-        };
+        let seed = self.brain_config.clone();
         let pop_size = self.governor_config.population_size;
-        // Every agent carries the spawn parent's config. The worker groups
-        // agents by `eval_repeats` and gives each group one steering genome.
+        // Every agent carries the spawn parent's config.
         for _ in 0..pop_size {
             self.spawn_agent(seed.clone(), 0);
         }
-
-        // Start replay recording
-        if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> =
-                self.agents.iter().map(|a| (a.id, a.color)).collect();
-            let initial_food: Vec<[f32; 3]> = world
-                .food_items
-                .iter()
-                .map(|f| [f.position.x, f.position.y, f.position.z])
-                .collect();
-            let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
-            self.recording = Some(xagent_sandbox::replay::GenerationRecording::new(
-                gen,
-                &agent_info,
-                &initial_food,
-                self.governor_config.tick_budget as usize,
-                self.brain_config.vision_width,
-                self.brain_config.vision_height,
-            ));
-        }
-    }
-
-    pub(crate) fn spawn_population_from_configs(&mut self, configs: &[BrainConfig]) {
-        self.agents.clear();
-        self.next_agent_id = 0;
-        self.tick = 0;
-        for cfg in configs {
-            self.spawn_agent(cfg.clone(), 0);
-        }
-
-        // Start replay recording
-        if let Some(world) = &self.world {
-            let agent_info: Vec<(u32, [f32; 3])> =
-                self.agents.iter().map(|a| (a.id, a.color)).collect();
-            let initial_food: Vec<[f32; 3]> = world
-                .food_items
-                .iter()
-                .map(|f| [f.position.x, f.position.y, f.position.z])
-                .collect();
-            let gen = self.governor.as_ref().map_or(0, |g| g.generation as u32);
-            self.recording = Some(xagent_sandbox::replay::GenerationRecording::new(
-                gen,
-                &agent_info,
-                &initial_food,
-                self.governor_config.tick_budget as usize,
-                self.brain_config.vision_width,
-                self.brain_config.vision_height,
-            ));
-        }
-    }
-
-    /// Handle the worker reaching the generation tick budget.
-    ///
-    /// The end-of-generation snapshot has already been applied to the CPU
-    /// agents by the event drain. Persist the recording, evaluate fitness, and
-    /// — when evolution continues — resolve the brain the next generation
-    /// inherits. An accepted generation first fetches the brain its champion
-    /// was born with from the worker and stores it for the node; the next
-    /// generation then inherits the stored champion of the node its configs
-    /// were bred from. What the champion learned in its life is not passed on.
-    /// `Finished` results pause the run (the worker has already paused itself
-    /// at the budget).
-    pub(crate) fn on_generation_budget_reached(&mut self) {
-        // Persist the recording to SQLite before moving to the next generation.
-        if let (Some(ref recording), Some(ref mut gov)) = (&self.recording, &mut self.governor) {
-            gov.store_recording(recording);
-        }
-        self.last_recording = self.recording.take();
-        let wall_secs = self.evo_wall_accumulated
-            + self
-                .evo_wall_segment_start
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
-
-        let (result, champion_brain_idx) = {
-            let gov = match self.governor.as_mut() {
-                Some(g) => g,
-                None => return,
-            };
-
-            let fitness = gov.evaluate(&self.agents);
-            gov.log_generation(&fitness);
-            gov.update_wall_time(wall_secs);
-            gov.update_simulation_ticks(self.session_tick_count);
-
-            let result = gov.advance(&fitness);
-
-            // An accepted generation names the agent whose brain becomes the
-            // node's champion; map its array index to its kernel brain index
-            // for the readback request.
-            let champion_brain_idx = match &result {
-                AdvanceResult::Continue {
-                    champion_capture: Some(capture),
-                    ..
-                } => self.agents.get(capture.agent_index).map(|a| a.brain_idx),
-                _ => None,
-            };
-
-            (result, champion_brain_idx)
-        };
-
-        if matches!(result, AdvanceResult::Continue { .. }) {
-            // The evaluated population is final: from here on, snapshots the
-            // paused worker keeps publishing for it are stale. The next
-            // population's reset carries this epoch to the worker.
-            self.generation_epoch = self.generation_epoch.wrapping_add(1);
-        }
-
-        match result {
-            AdvanceResult::Continue {
-                champion_capture, ..
-            } => match (champion_capture, champion_brain_idx) {
-                (Some(capture), Some(brain_idx)) => {
-                    let request_id = self.champion_request_counter;
-                    self.champion_request_counter += 1;
-                    if let Some(runtime) = &self.sim_runtime {
-                        runtime.send(SimCommand::RequestBirthState {
-                            agent_index: brain_idx,
-                            request_id,
-                        });
-                    }
-                    self.pending_generation = Some(PendingGeneration {
-                        result,
-                        champion_request_id: request_id,
-                        champion_node_id: capture.node_id,
-                    });
-                }
-                _ => {
-                    // Nothing to capture (rejected generation, or no agents):
-                    // inherit the spawn parent's stored champion right away.
-                    let inherited = self.inherited_brain(&result, None);
-                    self.finish_generation_continue(result, inherited);
-                }
-            },
-            AdvanceResult::Finished { messages } => {
-                for msg in &messages {
-                    self.log_msg(msg.clone());
-                }
-                self.evo_snapshot.state = EvolutionState::Paused;
-                self.paused = true;
-            }
-        }
-    }
-
-    /// Store the worker's reply with the champion's birth brain for the
-    /// accepted node and start the next generation, ignoring a reply whose id
-    /// does not match the pending request. A missing reply (`None`) stores
-    /// nothing; the next generation then inherits whatever the breeding node
-    /// has stored.
-    pub(crate) fn on_champion_state(&mut self, request_id: u64, state: Option<AgentBrainState>) {
-        let Some(pending) = self.pending_generation.take() else {
-            return;
-        };
-        if pending.champion_request_id != request_id {
-            // Stale reply (a newer request superseded it) — keep waiting.
-            self.pending_generation = Some(pending);
-            return;
-        }
-        if let (Some(governor), Some(champion)) = (self.governor.as_ref(), state.as_ref()) {
-            governor.store_champion_brain(pending.champion_node_id, champion);
-        }
-        let captured = state.map(|champion| (pending.champion_node_id, champion));
-        let inherited = self.inherited_brain(&pending.result, captured);
-        self.finish_generation_continue(pending.result, inherited);
-    }
-
-    /// The brain the next generation inherits: the stored champion of the node
-    /// its configs were bred from (`inherit_from_node`). `captured` is the
-    /// champion's birth brain just fetched for an accepted node; it is
-    /// returned directly when that node is the breeding node, skipping the
-    /// database round trip.
-    fn inherited_brain(
-        &self,
-        result: &AdvanceResult,
-        captured: Option<(i64, AgentBrainState)>,
-    ) -> Option<AgentBrainState> {
-        let AdvanceResult::Continue {
-            inherit_from_node: Some(node_id),
-            ..
-        } = result
-        else {
-            return None;
-        };
-        if let Some((captured_node, champion)) = captured {
-            if captured_node == *node_id {
-                return Some(champion);
-            }
-        }
-        self.governor.as_ref()?.champion_brain(*node_id)
-    }
-
-    /// Spawn the next generation and command the worker to reset to it.
-    ///
-    /// The first `eval_repeats` slots inherit the champion's exact brain state;
-    /// the rest inherit mutated copies. The worker applies the inheritance and
-    /// resumes (unless the user paused during the handoff).
-    fn finish_generation_continue(
-        &mut self,
-        result: AdvanceResult,
-        champion_state: Option<AgentBrainState>,
-    ) {
-        let AdvanceResult::Continue {
-            configs,
-            messages,
-            mutation_strength,
-            ..
-        } = result
-        else {
-            self.pending_generation = None;
-            return;
-        };
-        for msg in &messages {
-            self.log_msg(msg.clone());
-        }
-        self.spawn_population_from_configs(&configs);
-
-        let Some(upload) = self.build_pending_upload() else {
-            self.pending_generation = None;
-            return;
-        };
-        let champion_slots = self.governor_config.eval_repeats.max(1);
-        let inherited = champion_state.map(|champion| InheritedBrain {
-            champion,
-            mutation_strength,
-            champion_slots,
-        });
-        let resume = !self.paused;
-        let request = ResetRequest {
-            upload,
-            brain_config: self.brain_config.clone(),
-            tick_budget: self.governor_config.tick_budget,
-            inherited,
-            resume,
-            generation_epoch: self.generation_epoch,
-            search_steering_genome: true,
-        };
-        if let Some(runtime) = &self.sim_runtime {
-            runtime.send(SimCommand::ResetPopulation(Box::new(request)));
-        }
-        self.pending_generation = None;
     }
 
     /// Spawn a child agent near a parent, with mutated config.
@@ -607,9 +455,14 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_browse_supervisor, apply_resume_refusal, MAX_RESUME_ERROR_BYTES};
+    use super::{
+        apply_browse_supervisor, apply_resume_refusal, inspect_offer, next_fresh_db_path,
+        reset_confirmed, session_offer, ResetState, SessionOffer, MAX_RESUME_ERROR_BYTES,
+    };
+    use std::path::{Path, PathBuf};
     use xagent_sandbox::observatory::store_read::SupervisorRunSummary;
     use xagent_sandbox::observatory::{ModelSource, ObservatoryModel};
+    use xagent_sandbox::supervisor_store::{DatabaseKind, StoreError};
     use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, SupervisorSnapshot};
 
     /// Run id of the sample summary.
@@ -623,6 +476,90 @@ mod tests {
             last_tick: 0,
             budget_ticks: None,
         }
+    }
+
+    /// Generation stored in the legacy fixtures.
+    const LEGACY_GENERATION: u64 = 4;
+
+    #[test]
+    fn session_offer_legacy_is_quit_or_fresh_only() {
+        assert_eq!(session_offer(DatabaseKind::Missing), SessionOffer::Open);
+        assert_eq!(session_offer(DatabaseKind::Empty), SessionOffer::Open);
+        assert_eq!(session_offer(DatabaseKind::Supervisor), SessionOffer::Open);
+        assert_eq!(
+            session_offer(DatabaseKind::LegacyGenerations {
+                generation: Some(LEGACY_GENERATION)
+            }),
+            SessionOffer::LegacyChoice
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        {
+            let db = rusqlite::Connection::open(&path).expect("open");
+            db.execute_batch(
+                "CREATE TABLE node (id INTEGER PRIMARY KEY, generation INTEGER);
+                 INSERT INTO node (generation) VALUES (4);",
+            )
+            .expect("legacy schema");
+        }
+        let before = std::fs::read(&path).expect("read");
+        let path_text = path.to_string_lossy().into_owned();
+        let (offer, body, generation) = inspect_offer(&path_text);
+        assert_eq!(offer, SessionOffer::LegacyChoice);
+        assert_eq!(generation, Some(LEGACY_GENERATION));
+        let expected = StoreError::LegacyGenerations {
+            path: path_text,
+            generation: Some(LEGACY_GENERATION),
+        }
+        .to_string();
+        assert_eq!(body.as_deref(), Some(expected.as_str()));
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn session_offer_inspection_error_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.db");
+        std::fs::write(&path, b"this is not a sqlite database at all, just text").expect("write");
+        let (offer, body, _) = inspect_offer(&path.to_string_lossy());
+        assert_eq!(offer, SessionOffer::Refuse);
+        assert!(body.is_some());
+    }
+
+    #[test]
+    fn next_fresh_db_path_skips_existing_siblings() {
+        let base = Path::new("/data/run.db");
+        let taken = |names: &'static [&'static str]| {
+            move |p: &Path| {
+                names
+                    .iter()
+                    .any(|n| p == Path::new("/data").join(n).as_path())
+            }
+        };
+        assert_eq!(
+            next_fresh_db_path(base, taken(&[])),
+            PathBuf::from("/data/run.supervisor.db")
+        );
+        assert_eq!(
+            next_fresh_db_path(base, taken(&["run.supervisor.db"])),
+            PathBuf::from("/data/run.supervisor-2.db")
+        );
+        assert_eq!(
+            next_fresh_db_path(base, taken(&["run.supervisor.db", "run.supervisor-2.db"])),
+            PathBuf::from("/data/run.supervisor-3.db")
+        );
+    }
+
+    #[test]
+    fn reset_needs_two_confirmations_on_same_path() {
+        let first = Path::new("/data/a.db");
+        let other = Path::new("/data/b.db");
+        let idle = ResetState::Idle;
+        assert!(!reset_confirmed(&idle, first));
+        let armed = ResetState::Armed(first.to_path_buf());
+        assert!(!reset_confirmed(&armed, other));
+        assert!(reset_confirmed(&armed, first));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use xagent_brain::buffers::{
     FOOD_STATE_STRIDE, PHYS_STRIDE, P_ALIVE, P_DEATH_COUNT, P_FACING_X, P_FACING_Z, P_FOOD_COUNT,
     P_HARMFUL_MEAL_COUNT, P_MOTOR_TURN_OUT, P_POS_X, P_POS_Z,
 };
-use xagent_shared::{EvolutionMode, FoodKind, Inheritance, SCENT_RANGE};
+use xagent_shared::{FoodKind, Inheritance, SCENT_RANGE};
 
 use crate::food_kind_metrics::nearest_food_of_kind;
 
@@ -24,9 +24,7 @@ pub const COUNTER_EXACT_LIMIT: f32 = 16_777_216.0;
 /// Totals of one run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
-    /// Evolution mode of the run.
-    pub mode: EvolutionMode,
-    /// Inheritance policy; `None` in generation mode.
+    /// Inheritance policy of the run.
     pub inheritance: Option<Inheritance>,
     /// Run seed.
     pub seed: u64,
@@ -204,7 +202,6 @@ struct OpenSeason {
 /// Collects a [`RunSummary`] from physics samples.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunSummaryAccumulator {
-    mode: EvolutionMode,
     inheritance: Option<Inheritance>,
     seed: u64,
     agent_count: usize,
@@ -261,14 +258,12 @@ impl RunSummaryAccumulator {
     /// Creates an accumulator with all baselines at zero.
     #[must_use]
     pub fn new(
-        mode: EvolutionMode,
         inheritance: Option<Inheritance>,
         seed: u64,
         agent_count: usize,
         food_kinds_enabled: bool,
     ) -> Self {
         Self {
-            mode,
             inheritance,
             seed,
             agent_count,
@@ -331,7 +326,7 @@ impl RunSummaryAccumulator {
         Ok(())
     }
 
-    /// Sets every baseline to zero (generation start).
+    /// Sets every agent's baseline to zero.
     pub fn reset_all_baselines(&mut self) {
         self.baselines.fill([0; 3]);
     }
@@ -447,7 +442,6 @@ impl RunSummaryAccumulator {
             .ok_or(RunSummaryError::SizeOverflow)?;
         self.close_season();
         Ok(RunSummary {
-            mode: self.mode,
             inheritance: self.inheritance,
             seed: self.seed,
             agent_count: self.agent_count,
@@ -501,7 +495,7 @@ mod tests {
     }
 
     fn acc(agents: usize, kinds: bool) -> RunSummaryAccumulator {
-        RunSummaryAccumulator::new(EvolutionMode::default(), None, 7, agents, kinds)
+        RunSummaryAccumulator::new(None, 7, agents, kinds)
     }
 
     #[test]

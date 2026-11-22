@@ -13,10 +13,9 @@
 //!   ten-agent world run for 3000 ticks with the visual cortex off and on.
 //!   The full physics state and every agent's brain state and patterns are
 //!   hashed.
-//! - `headless_run` and `champion_replay` (GPU): a seeded two-generation
-//!   headless evolution run, hashed from its stored brains and node fitness,
-//!   and a 2000-tick replay of the lowest-id stored champion from the
-//!   committed database fixture `tests/fixtures/sense_block_champion.db`.
+//! - `headless_run` and `champion_replay` (GPU): a seeded supervisor headless
+//!   run, hashed from its stored archive rows, and a 2000-tick replay of the
+//!   run's rank-0 archive brain read from the run's own database.
 //!
 //! No separate route scenario exists: the critic reads the encoding by default
 //! and the forward pathway route is off by default, and neither alternative
@@ -25,8 +24,7 @@
 //!
 //! Modes: compare is the default. With `XAGENT_RECORD_SENSE_PARITY=1` a
 //! scenario rewrites only its own golden line (creating the file when absent)
-//! and does not compare; the headless scenario also rewrites the champion
-//! fixture. Record with `--test-threads=1`.
+//! and does not compare. Record with `--test-threads=1`.
 //!
 //! The GPU hashes are specific to the host and adapter that recorded them.
 //! The GPU scenarios are ignored by default and run only with
@@ -36,15 +34,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rand::SeedableRng;
+use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use xagent_brain::buffers::PHYS_STRIDE;
 use xagent_brain::buffers::{P_DEATH_COUNT, P_HARMFUL_MEAL_COUNT};
-use xagent_brain::{AgentBrainState, BrainLayout, GpuKernel};
+use xagent_brain::{BrainLayout, GpuKernel};
 use xagent_sandbox::agent::{fresh_brain_state, steering_population};
-use xagent_sandbox::governor::Governor;
-use xagent_sandbox::headless;
+use xagent_sandbox::headless::{self, HeadlessOptions};
+use xagent_sandbox::supervisor_store::load_archive_entry_read_only;
 use xagent_sandbox::world::WorldState;
-use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
+use xagent_shared::{BrainConfig, FullConfig, Inheritance, SupervisorConfig, WorldConfig};
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -55,10 +54,6 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const RECORD_VARIABLE: &str = "XAGENT_RECORD_SENSE_PARITY";
 /// Golden file, relative to the crate root.
 const GOLDEN_PATH: &str = "tests/fixtures/sense_block_parity.golden";
-/// Champion database fixture, relative to the crate root.
-const CHAMPION_FIXTURE_PATH: &str = "tests/fixtures/sense_block_champion.db";
-/// Largest accepted champion fixture size in bytes (2 MB).
-const CHAMPION_FIXTURE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// SQLite busy timeout for every connection the test opens.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -87,12 +82,22 @@ const AGENT_CAPACITY: f32 = 100.0;
 /// Energy and integrity capacity of agent 0, low enough that it dies.
 const DYING_AGENT_CAPACITY: f32 = 1.0;
 
-/// Headless population size.
-const HEADLESS_POPULATION: usize = 4;
-/// Headless ticks per generation.
-const HEADLESS_TICK_BUDGET: u64 = 2000;
-/// Headless generation count.
-const HEADLESS_GENERATIONS: u64 = 2;
+/// Agents in the supervisor headless run.
+const SUPERVISOR_AGENTS: usize = 10;
+/// Supervisor boundary interval in ticks.
+const SUPERVISOR_BOUNDARY_TICKS: u64 = 1_000;
+/// Minimum age before an underperformer can be replaced.
+const SUPERVISOR_MIN_AGE_TICKS: u64 = 2_000;
+/// Supervisor score window in ticks.
+const SUPERVISOR_WINDOW_TICKS: u64 = 1_000;
+/// Supervisor season period in ticks.
+const SUPERVISOR_SEASON_TICKS: u64 = 3_000;
+/// Agent-tick budget of the supervisor run.
+const SUPERVISOR_BUDGET: u64 = 10 * 20_000;
+/// Archive capacity of the supervisor run.
+const SUPERVISOR_ARCHIVE: usize = 8;
+/// World seed of the supervisor run.
+const SUPERVISOR_SEED: u64 = 5;
 
 /// Folds `bytes` into an FNV-1a 64-bit hash state.
 fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -309,87 +314,57 @@ fn cortex_trajectory_matches_golden() {
     check_golden("trajectory_cortex", trajectory_hash(&brain));
 }
 
-/// Hash of `node_brain` rows by `node_id` then `node` rows by `id`.
+/// Configuration of the seeded supervisor headless run.
+fn supervisor_config() -> FullConfig {
+    let mut config = FullConfig::default();
+    config.governor.population_size = SUPERVISOR_AGENTS;
+    config.governor.supervisor = SupervisorConfig {
+        boundary_interval_ticks: SUPERVISOR_BOUNDARY_TICKS,
+        min_age_ticks: SUPERVISOR_MIN_AGE_TICKS,
+        score_window_ticks: SUPERVISOR_WINDOW_TICKS,
+        archive_capacity: SUPERVISOR_ARCHIVE,
+        season_period_ticks: SUPERVISOR_SEASON_TICKS,
+        inheritance: Inheritance::Darwinian,
+        agent_tick_budget: SUPERVISOR_BUDGET,
+    };
+    config.world.food_kinds_enabled = true;
+    config.world.seed = SUPERVISOR_SEED;
+    config
+}
+
+/// Hash of `supervisor_archive` rows ordered by `entry_id`, over the columns
+/// `entry_id, occupant_id, born_tick, retired_tick, outcome, config_json,
+/// birth_brain`. Integers and `outcome` hash as little-endian bytes, text as
+/// UTF-8, a blob as its bytes, and NULL as no bytes.
 fn headless_hash(connection: &Connection) -> u64 {
     let mut bytes = Vec::new();
-    let mut brains = connection
-        .prepare("SELECT node_id, data FROM node_brain ORDER BY node_id")
-        .expect("query node_brain");
-    let rows = brains
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .expect("read node_brain");
-    for row in rows {
-        let (node, data) = row.expect("node_brain row");
-        bytes.extend(node.to_le_bytes());
-        bytes.extend(data);
+    let mut statement = connection
+        .prepare(
+            "SELECT entry_id, occupant_id, born_tick, retired_tick, outcome, \
+             config_json, birth_brain FROM supervisor_archive ORDER BY entry_id",
+        )
+        .expect("query supervisor_archive");
+    let mut rows = statement.query([]).expect("read supervisor_archive");
+    while let Some(row) = rows.next().expect("supervisor_archive row") {
+        for column in 0..7 {
+            match row.get_ref(column).expect("supervisor_archive column") {
+                ValueRef::Null => {}
+                ValueRef::Integer(value) => bytes.extend(value.to_le_bytes()),
+                ValueRef::Real(value) => bytes.extend(value.to_le_bytes()),
+                ValueRef::Text(text) | ValueRef::Blob(text) => bytes.extend_from_slice(text),
+            }
+        }
     }
-    let mut nodes = connection
-        .prepare("SELECT id, best_fitness, avg_fitness FROM node ORDER BY id")
-        .expect("query node");
-    let rows = nodes
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<f64>>(1)?,
-                row.get::<_, Option<f64>>(2)?,
-            ))
-        })
-        .expect("read node");
-    for row in rows {
-        let (id, best, avg) = row.expect("node row");
-        bytes.extend(id.to_le_bytes());
-        bytes.extend(best.unwrap_or(f64::NAN).to_le_bytes());
-        bytes.extend(avg.unwrap_or(f64::NAN).to_le_bytes());
-    }
-    assert!(!bytes.is_empty(), "the headless run stored no nodes");
+    assert!(
+        !bytes.is_empty(),
+        "the supervisor run stored no archive rows"
+    );
     hash_bytes(&bytes)
 }
 
-/// Strips recordings and wall-clock run metadata (`run.started_at`,
-/// `run.wall_time_secs`, `node.created_at`) from `source`, so re-recording is
-/// byte-identical, then compacts it and copies it to the fixture.
-fn record_champion_fixture(source: &Path) {
-    let connection = Connection::open(source).expect("open the headless database");
-    connection
-        .busy_timeout(BUSY_TIMEOUT)
-        .expect("set busy timeout");
-    connection
-        .execute_batch(
-            "DELETE FROM generation_recording; \
-             UPDATE run SET started_at = NULL, wall_time_secs = 0; \
-             UPDATE node SET created_at = NULL; \
-             PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; VACUUM;",
-        )
-        .expect("compact the headless database");
-    drop(connection);
-    let fixture = crate_path(CHAMPION_FIXTURE_PATH);
-    fs::copy(source, &fixture).expect("copy the champion fixture");
-}
-
-/// Lowest node id with a stored champion brain in `governor`'s database.
-fn lowest_champion(governor: &Governor, db_path: &Path) -> AgentBrainState {
-    let connection = Connection::open(db_path).expect("open the champion fixture copy");
-    connection
-        .busy_timeout(BUSY_TIMEOUT)
-        .expect("set busy timeout");
-    let mut statement = connection
-        .prepare("SELECT id FROM node ORDER BY id")
-        .expect("query node ids");
-    let ids: Vec<i64> = statement
-        .query_map([], |row| row.get::<_, i64>(0))
-        .expect("read node ids")
-        .map(|id| id.expect("node id"))
-        .collect();
-    ids.into_iter()
-        .find_map(|id| governor.champion_brain(id))
-        .expect("the champion fixture holds a champion brain")
-}
-
-/// A seeded headless evolution run hashes to the `headless_run` line, and the
-/// lowest-id champion of the committed fixture has the default brain stride
-/// and replays for 2000 ticks to the `champion_replay` line.
+/// A seeded supervisor headless run hashes to the `headless_run` line, and the
+/// run's rank-0 archive brain has the default brain stride and replays for
+/// 2000 ticks to the `champion_replay` line.
 #[test]
 #[ignore = "requires a GPU; run explicitly with --include-ignored"]
 fn headless_run_and_champion_replay_match_golden() {
@@ -397,50 +372,30 @@ fn headless_run_and_champion_replay_match_golden() {
     let run_dir = tempfile::tempdir().expect("temp dir");
     let db = run_dir.path().join("headless.db");
     let db_path = db.to_str().expect("utf-8 temp path");
-    let config = FullConfig {
-        brain: BrainConfig::default(),
-        world: world_config(),
-        governor: GovernorConfig {
-            population_size: HEADLESS_POPULATION,
-            tick_budget: HEADLESS_TICK_BUDGET,
-            max_generations: HEADLESS_GENERATIONS,
-            ..Default::default()
-        },
-    };
-    headless::run_headless(config, db_path, false, true);
+    headless::run_headless_with_options(
+        supervisor_config(),
+        db_path,
+        false,
+        &HeadlessOptions::default(),
+    )
+    .expect("supervisor headless run");
     let connection = Connection::open(&db).expect("open the headless database");
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .expect("set busy timeout");
     check_golden("headless_run", headless_hash(&connection));
     drop(connection);
-    if record_mode() {
-        record_champion_fixture(&db);
-    }
 
-    let fixture = crate_path(CHAMPION_FIXTURE_PATH);
-    let size = fs::metadata(&fixture)
-        .expect("champion fixture is present")
-        .len();
-    assert!(
-        size < CHAMPION_FIXTURE_MAX_BYTES,
-        "champion fixture is {size} bytes, limit {CHAMPION_FIXTURE_MAX_BYTES}"
-    );
-    let replay_dir = tempfile::tempdir().expect("temp dir");
-    let replay_db = replay_dir.path().join("champion.db");
-    fs::copy(&fixture, &replay_db).expect("copy the champion fixture");
-    let governor = Governor::resume(replay_db.to_str().expect("utf-8 temp path"))
-        .expect("resume the champion fixture");
-    let champion = lowest_champion(&governor, &replay_db);
+    let entry = load_archive_entry_read_only(db_path, 0).expect("load the rank-0 archive entry");
     let brain = BrainConfig::default();
     assert_eq!(
-        champion.brain_state.len(),
+        entry.brain.brain_state.len(),
         BrainLayout::from_config(&brain).brain_stride,
-        "champion brain state length differs from the default brain stride"
+        "archive brain state length differs from the default brain stride"
     );
     let mut kernel = seeded_kernel(&brain);
     for agent in 0..AGENTS {
-        kernel.write_agent_state(agent, &champion);
+        kernel.write_agent_state(agent, &entry.brain);
     }
     run_chunked(&mut kernel, REPLAY_TICKS);
     check_golden(

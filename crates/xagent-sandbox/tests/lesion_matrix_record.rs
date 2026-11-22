@@ -139,13 +139,6 @@ fn check_report(r: &FreeLifeReport) {
     assert_eq!(r.ticks, TICK_COUNT, "{label}: ticks");
     let product = r.brain_ticks.checked_mul(u64::from(r.kernel_batch_size));
     assert_eq!(product, Some(r.ticks), "{label}: brain_ticks * batch");
-    let champion = r.brain_source == "champion";
-    assert_eq!(r.champion_node_id.is_some(), champion, "{label}: node id");
-    assert_eq!(
-        r.champion_generation.is_some(),
-        champion,
-        "{label}: generation"
-    );
     for agent in &r.agents {
         assert!(
             window_finite(&agent.whole),

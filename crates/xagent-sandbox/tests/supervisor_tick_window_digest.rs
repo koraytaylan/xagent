@@ -9,7 +9,7 @@ use xagent_sandbox::supervisor_checkpoint::decode;
 use xagent_sandbox::tick_window::{
     TickWindowConfig, MAX_FRAMES_PER_PIN, MAX_WINDOW_FRAMES, PIN_HALF_WINDOW_TICKS,
 };
-use xagent_shared::{EvolutionMode, FullConfig, Inheritance, SupervisorConfig};
+use xagent_shared::{FullConfig, Inheritance, SupervisorConfig};
 
 /// Agents in every run.
 const AGENTS: usize = 10;
@@ -48,7 +48,6 @@ fn gpu_adapter_present_when_required() -> bool {
 
 fn supervisor_config() -> FullConfig {
     let mut config = FullConfig::default();
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = AGENTS;
     config.governor.supervisor = SupervisorConfig {
         boundary_interval_ticks: BOUNDARY_TICKS,

@@ -10,8 +10,8 @@ touches:
   - crates/xagent-sandbox/tests/sense_block_parity.rs
   - crates/xagent-sandbox/tests/fixtures/sense_block_parity.golden
   - crates/xagent-sandbox/tests/fixtures/sense_block_champion.db
-status: todo
-merged_as: ""
+status: done
+merged_as: "b1701677123ff9dbc6e4382b850203fa79dfc6be"
 checks:
   - name: sense-parity-focused
     command: env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test sense_block_parity -- --include-ignored --test-threads=1

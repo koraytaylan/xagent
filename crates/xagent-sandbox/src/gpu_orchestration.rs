@@ -30,13 +30,13 @@ use xagent_sandbox::tick_window::{
 use xagent_sandbox::tick_window_store::TickWindowStoreError;
 use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, ObservatoryViewState};
 
-use crate::app::{App, PendingUpload};
+use crate::app::App;
 use crate::sim_runtime::{
     partition_events, SimCommand, SimEvent, SimInit, SimRuntime, StateSnapshot,
     SupervisorWorkerInit,
 };
 use crate::tick_window_view::TickWindowView;
-use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, GovernorConfig, WorldConfig};
+use xagent_shared::{BrainConfig, FullConfig, GovernorConfig, WorldConfig};
 
 /// Worker init for a supervisor session, or `None` outside one.
 fn supervisor_worker_init(
@@ -47,7 +47,7 @@ fn supervisor_worker_init(
     session_active: bool,
     resume: Option<bool>,
 ) -> Option<SupervisorWorkerInit> {
-    if governor.evolution_mode != EvolutionMode::Supervisor || !session_active {
+    if !session_active {
         return None;
     }
     Some(SupervisorWorkerInit {
@@ -168,54 +168,16 @@ fn observatory_record(model: &ObservatoryModel, event: &SimEvent) -> Vec<Observa
 }
 
 impl App {
-    /// Build the world + agent upload for the current population, or `None`
-    /// when there is no world. Shared by worker startup and generation reset.
-    pub(crate) fn build_pending_upload(&self) -> Option<PendingUpload> {
-        let world = self.world.as_ref()?;
-        Some(PendingUpload {
-            heights: world.terrain.heights.clone(),
-            biomes: world.biome_map.grid_as_u32(),
-            food_pos: world
-                .food_items
-                .iter()
-                .map(|f| (f.position.x, f.position.y, f.position.z))
-                .collect(),
-            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
-            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
-            agent_data: self
-                .agents
-                .iter()
-                .map(|a| {
-                    (
-                        a.body.body.position,
-                        a.body.body.internal.max_energy,
-                        a.body.body.internal.max_integrity,
-                        a.brain_config.memory_capacity,
-                        a.brain_config.processing_slots,
-                    )
-                })
-                .collect(),
-            agent_configs: self
-                .agents
-                .iter()
-                .map(|agent| agent.brain_config.clone())
-                .collect(),
-        })
-    }
-
     /// Start the simulation worker for the current world and population.
     ///
-    /// Builds the initial world/agent upload and kernel-creation parameters,
-    /// spawns the worker, and seeds the forwarded-control cache so the first
-    /// `sync_worker_controls` only sends commands that actually changed. No-op
-    /// when there is no world or population yet.
+    /// Builds the kernel-creation parameters, spawns the worker, and seeds the
+    /// forwarded-control cache so the first `sync_worker_controls` only sends
+    /// commands that actually changed. No-op when there is no world or
+    /// population yet.
     pub(crate) fn start_sim_worker(&mut self) {
         if self.agents.is_empty() {
             return;
         }
-        let Some(upload) = self.build_pending_upload() else {
-            return;
-        };
         let (food_count, world_config) = match &self.world {
             Some(world) => (world.food_items.len(), world.config.clone()),
             None => return,
@@ -242,19 +204,9 @@ impl App {
             food_count,
             brain_config: self.brain_config.clone(),
             world_config,
-            upload,
-            tick_budget: if supervisor_mode {
-                0
-            } else {
-                self.governor_config.tick_budget
-            },
             speed_multiplier: self.speed_multiplier,
             paused: self.paused,
             selected_agent,
-            generation_epoch: self.generation_epoch,
-            search_steering_genome: !supervisor_mode && self.governor.is_some(),
-            steering_group_size: self.governor_config.eval_repeats.max(1),
-            steering_mutation_strength: self.governor_config.mutation_strength,
             supervisor,
         };
 
@@ -275,15 +227,10 @@ impl App {
         self.sent_speed = None;
         self.sent_paused = None;
         self.sent_selected_agent = None;
-        self.pending_generation = None;
         self.cached_food_state = None;
     }
 
     /// Forward speed, pause, and selection to the worker, but only on change.
-    ///
-    /// The worker pauses itself at a generation boundary and resumes only on
-    /// `ResetPopulation`, so while a handoff is pending the main thread keeps
-    /// the worker paused regardless of the user's running state.
     pub(crate) fn sync_worker_controls(&mut self) {
         if self.sim_runtime.is_none() {
             return;
@@ -297,7 +244,7 @@ impl App {
             self.sent_speed = Some(speed);
         }
 
-        let desired_paused = self.paused || self.pending_generation.is_some();
+        let desired_paused = self.paused;
         if self.sent_paused != Some(desired_paused) {
             if let Some(runtime) = &self.sim_runtime {
                 runtime.send(SimCommand::SetPaused(desired_paused));
@@ -320,8 +267,8 @@ impl App {
     }
 
     /// Drain all pending worker events, applying the newest snapshot and
-    /// processing control events (kernel-ready, telemetry, generation boundary,
-    /// champion state, logs) in order.
+    /// processing control events (kernel-ready, telemetry, supervisor samples,
+    /// logs) in order.
     pub(crate) fn drain_sim_events(&mut self) {
         let Some(runtime) = &self.sim_runtime else {
             return;
@@ -330,7 +277,7 @@ impl App {
         if events.is_empty() {
             return;
         }
-        let (latest_snapshot, control) = partition_events(events, self.generation_epoch);
+        let (latest_snapshot, control) = partition_events(events);
 
         // Latest-wins: apply only the newest plain snapshot.
         if let Some(snapshot) = latest_snapshot {
@@ -383,15 +330,6 @@ impl App {
                     agent_index,
                     telemetry,
                 } => self.apply_telemetry(agent_index, telemetry),
-                SimEvent::GenerationBudgetReached(snapshot) => {
-                    self.apply_state_snapshot(&snapshot);
-                    self.on_fresh_snapshot();
-                    self.runtime_counters.generation_boundaries += 1;
-                    self.on_generation_budget_reached();
-                }
-                SimEvent::BirthState { request_id, state } => {
-                    self.on_champion_state(request_id, state);
-                }
                 SimEvent::Log(message) => self.log_msg(message),
                 SimEvent::Error(message) => {
                     if let Some(summary) = self.resume_pending.take() {
@@ -417,9 +355,7 @@ impl App {
     /// plus the food state that backs the food mesh and mini-map.
     fn apply_state_snapshot(&mut self, snapshot: &StateSnapshot) {
         // The worker owns tick advancement, so derive the ticks/sec display from
-        // the delta between published snapshots (it resets to 0 across a
-        // generation boundary, which `saturating_sub` reports as no progress
-        // rather than a spurious spike).
+        // the delta between published snapshots.
         let advanced_ticks = snapshot.tick.saturating_sub(self.tick);
         self.tps_tick_count += advanced_ticks;
         self.session_tick_count += advanced_ticks;
@@ -434,11 +370,6 @@ impl App {
                 log::warn!("tick window capture failed: {e}");
                 self.tick_window = None;
             }
-        }
-        // Sync the governor's per-generation counter from the snapshot to keep
-        // the evolution UI's progress accurate.
-        if let Some(governor) = self.governor.as_mut() {
-            governor.gen_tick = snapshot.generation_tick;
         }
         let state = &snapshot.physics;
         let death_reference_tick = snapshot.tick.saturating_sub(1);
@@ -506,15 +437,6 @@ impl App {
             }
         }
 
-        // Feed the population's cumulative foraging totals to the governor's
-        // within-life tracker (it snapshots them at each quarter of the tick
-        // budget). Summed before the mutable governor borrow below.
-        let cumulative_food: u64 = self.agents.iter().map(|a| u64::from(a.food_consumed)).sum();
-        let cumulative_alive: u64 = self.agents.iter().map(|a| a.total_ticks_alive).sum();
-        if let Some(governor) = self.governor.as_mut() {
-            governor.record_within_life_sample(cumulative_food, cumulative_alive);
-        }
-
         // Keep the previous food cache rather than overwriting with the empty
         // vector the worker sends before its first food readback.
         if !snapshot.food.is_empty() {
@@ -549,10 +471,9 @@ impl App {
     }
 
     /// Sample per-snapshot CPU-side state that follows the published cadence:
-    /// overlays/histories, replay, and the food/heatmap dirty flags.
+    /// overlays/histories and the food/heatmap dirty flags.
     fn on_fresh_snapshot(&mut self) {
         self.record_overlays_and_histories();
-        self.record_replay_tick();
         self.heatmap_dirty = true;
         self.food_dirty = true;
     }
@@ -590,10 +511,9 @@ impl App {
         self.last_counters_log = Instant::now();
         let counters = &self.runtime_counters;
         log::debug!(
-            "[RENDER] frames={} snapshots_applied={} generation_boundaries={}",
+            "[RENDER] frames={} snapshots_applied={}",
             counters.frames_rendered,
             counters.snapshots_applied,
-            counters.generation_boundaries,
         );
     }
 }
@@ -613,27 +533,19 @@ mod tests {
     };
     use xagent_sandbox::tick_window_store;
     use xagent_sandbox::ui::{EvolutionSnapshot, EvolutionState, ObservatoryViewState};
-    use xagent_shared::{BrainConfig, EvolutionMode, GovernorConfig, WorldConfig};
+    use xagent_shared::{BrainConfig, GovernorConfig, WorldConfig};
 
     #[test]
     fn gui_supervisor_worker_init_only_in_supervisor_mode() {
         let brain = BrainConfig::default();
         let world = WorldConfig::default();
-        let mut governor = GovernorConfig::default();
+        let governor = GovernorConfig::default();
 
-        governor.evolution_mode = EvolutionMode::Generations;
-        assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", true, None).is_none());
-
-        governor.evolution_mode = EvolutionMode::Supervisor;
         assert!(supervisor_worker_init(&governor, &brain, &world, "a.db", false, None).is_none());
 
         let init = supervisor_worker_init(&governor, &brain, &world, "a.db", true, None)
             .expect("supervisor session yields init");
         assert!(!init.resume);
-        assert_eq!(
-            init.config.governor.evolution_mode,
-            EvolutionMode::Supervisor
-        );
         assert_eq!(init.db_path.as_deref(), Some("a.db"));
     }
 

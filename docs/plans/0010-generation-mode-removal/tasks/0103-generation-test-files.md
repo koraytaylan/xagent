@@ -6,8 +6,8 @@ kind: task
 depends_on: []
 gated: false
 role: architect
-status: todo
-merged_as: ""
+status: done
+merged_as: "8180036961bc69bd511701bfb16335428563738d"
 touches:
   - crates/xagent-sandbox/tests/seeded_headless_digest.rs
   - crates/xagent-sandbox/tests/fixtures/seeded_headless_digest.json

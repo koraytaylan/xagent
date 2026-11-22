@@ -12,8 +12,8 @@ role: developer
 touches:
   - crates/xagent-shared/src/config.rs
   - crates/xagent-shared/src/lib.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "cf09bfc17b8204b01669eb0a0ad89b20ec44d86a"
 checks:
   - name: shared-tests
     command: "cargo test -p xagent-shared"

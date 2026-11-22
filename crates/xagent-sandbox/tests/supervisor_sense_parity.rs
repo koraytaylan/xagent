@@ -25,7 +25,7 @@ use xagent_brain::GpuKernel;
 use xagent_sandbox::supervisor::{ParentRef, ReplaceReason};
 use xagent_sandbox::supervisor_run::{BoundaryReport, SupervisorRun};
 use xagent_sandbox::world::WorldState;
-use xagent_shared::{BrainConfig, EvolutionMode, FullConfig, SupervisorConfig};
+use xagent_shared::{BrainConfig, FullConfig, SupervisorConfig};
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -151,7 +151,6 @@ fn check_golden(scenario: &str, hash: u64) {
 fn config(visual_cortex_enabled: bool) -> FullConfig {
     let mut config = FullConfig::default();
     config.world.seed = SEED;
-    config.governor.evolution_mode = EvolutionMode::Supervisor;
     config.governor.population_size = AGENTS;
     config.brain = BrainConfig {
         visual_cortex_enabled,

@@ -2,26 +2,25 @@
 //!
 //! The render/UI loop no longer drives simulation progress. Instead a
 //! background worker thread owns the fused [`GpuKernel`], advances ticks on a
-//! wall-clock-driven cadence, enforces the generation tick budget, and
+//! wall-clock-driven cadence, runs the supervisor, and
 //! publishes CPU-visible state to the main thread through bounded channels.
-//! The main thread sends [`SimCommand`]s (speed, pause, selection, champion
-//! readback, population reset, shutdown) and drains [`SimEvent`]s (snapshots,
-//! telemetry, generation-boundary, champion state, logs, errors), applying the
-//! newest snapshot to its CPU-side caches and rendering from those.
+//! The main thread sends [`SimCommand`]s (speed, pause, selection, shutdown)
+//! and drains [`SimEvent`]s (snapshots, telemetry, supervisor samples, logs,
+//! errors), applying the newest snapshot to its CPU-side caches and rendering
+//! from those.
 //!
 //! Snapshots and telemetry are *sampled observations*: the channel drops stale
 //! snapshots under back-pressure and the consumer keeps only the newest
-//! (latest-wins). Control events (kernel-ready, generation-boundary, champion
-//! state) are always delivered. The worker exits on [`SimCommand::Shutdown`] or
-//! command-channel disconnect and is joined in [`SimRuntime`]'s `Drop`.
+//! (latest-wins). Control events (kernel-ready, supervisor boundaries and
+//! samples) are always delivered. The worker exits on [`SimCommand::Shutdown`]
+//! or command-channel disconnect and is joined in [`SimRuntime`]'s `Drop`.
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use xagent_brain::buffers::{BrainLayout, TrailSample, PATTERN_STRIDE};
-use xagent_brain::{AgentBrainState, AgentTelemetry, GpuKernel};
-use xagent_sandbox::agent::{fresh_brain_state, mutate_brain_state, steering_population};
+use xagent_brain::buffers::TrailSample;
+use xagent_brain::{AgentTelemetry, GpuKernel};
 use xagent_sandbox::supervisor_checkpoint::CheckpointError;
 use xagent_sandbox::supervisor_run::{load_resume_point, SampleReport, SupervisorRun};
 use xagent_sandbox::supervisor_store::SupervisorStore;
@@ -30,7 +29,7 @@ use xagent_sandbox::tick_window::{frame_from_snapshot, Pin, PinKind, TickWindowC
 use xagent_sandbox::tick_window_store::TickWindowStore;
 use xagent_shared::{BrainConfig, FullConfig, WorldConfig, SUPERVISOR_SAMPLE_TICKS};
 
-use crate::app::{PendingUpload, SIM_DT};
+use crate::app::SIM_DT;
 
 /// Maximum CPU-visible physics-snapshot publication rate. Display smoothness
 /// does not require more than one authoritative state sample per 60 Hz frame,
@@ -67,33 +66,6 @@ const COMMAND_CAPACITY: usize = 64;
 /// Bounded capacity for the event channel (worker → main). Snapshots/telemetry
 /// are dropped under back-pressure (latest-wins); control events block briefly.
 const EVENT_CAPACITY: usize = 256;
-
-/// Clamp a requested tick batch to the remaining generation budget.
-///
-/// Returns the number of ticks that may be dispatched without overshooting
-/// `tick_budget`, together with whether the clamp actually reduced the batch
-/// (so the caller can count generation-boundary clamps). A generation ends
-/// exactly at its configured `tick_budget`: once `gen_tick` reaches it the
-/// remaining budget is zero and no further ticks dispatch. A `tick_budget` of
-/// zero means "unlimited" and never clamps.
-fn clamp_ticks_to_generation_budget(
-    ticks_to_run: u32,
-    tick_budget: u64,
-    gen_tick: u64,
-) -> (u32, bool) {
-    if tick_budget == 0 {
-        return (ticks_to_run, false);
-    }
-    let remaining = tick_budget.saturating_sub(gen_tick);
-    // A 64-bit remaining budget can exceed `u32`; saturate so the clamp never
-    // truncates a large budget down to a small `u32` and stalls the batch.
-    let remaining_ticks = u32::try_from(remaining).unwrap_or(u32::MAX);
-    if remaining_ticks < ticks_to_run {
-        (remaining_ticks, true)
-    } else {
-        (ticks_to_run, false)
-    }
-}
 
 /// Clamp a requested tick batch so it ends on the next supervisor sample tick.
 ///
@@ -151,47 +123,6 @@ pub struct StateSnapshot {
     /// snapshot (latest-wins) still sees every sample the ring retains.
     pub trail_samples: Vec<TrailSample>,
     pub tick: u64,
-    pub generation_tick: u64,
-    /// Generation epoch of the population this state belongs to (the epoch the
-    /// worker adopted at its last start or reset). The main thread drops plain
-    /// snapshots whose epoch is not its current one, so state published before
-    /// a population reset is never applied to the next generation's agents.
-    pub generation_epoch: u64,
-}
-
-/// Champion brain state to seed into the next generation on reset.
-///
-/// The first `champion_slots` agents inherit the champion's exact brain. The
-/// rest inherit mutated copies. When the reset freezes steering weights, each
-/// following group of `champion_slots` agents shares one mutation of the turn
-/// weights and the turn bias, and every other weight stays equal to the
-/// champion's.
-pub struct InheritedBrain {
-    pub champion: AgentBrainState,
-    pub mutation_strength: f32,
-    pub champion_slots: usize,
-}
-
-/// Everything the worker needs to reset to the next generation's population.
-pub struct ResetRequest {
-    /// World + agent rows for the next generation.
-    pub upload: PendingUpload,
-    /// Brain config used to reseed brain state before inheritance is applied.
-    pub brain_config: BrainConfig,
-    /// Generation tick budget for the next generation (0 = unlimited).
-    pub tick_budget: u64,
-    /// Inherited champion state, or `None` to keep the freshly reseeded state.
-    pub inherited: Option<InheritedBrain>,
-    /// Whether the worker should resume (unpause) once the reset completes.
-    pub resume: bool,
-    /// Vary the turn-policy weights across repeat-groups (the steering
-    /// genome search) instead of varying `BrainConfig`. Lifetime learning
-    /// keeps updating them, but a lineage passes on the weights its champion
-    /// was born with, not what it learned.
-    pub search_steering_genome: bool,
-    /// Generation epoch of the new population; every snapshot the worker
-    /// publishes after the reset carries it.
-    pub generation_epoch: u64,
 }
 
 /// Commands from the main thread to the simulation worker.
@@ -202,12 +133,6 @@ pub enum SimCommand {
     SetSpeed(u32),
     /// Set the selected agent (by kernel brain index) for telemetry.
     SelectAgent(u32),
-    /// Request the brain an agent was born with this generation: the genome
-    /// its fitness was earned with, before any lifetime learning.
-    RequestBirthState { agent_index: u32, request_id: u64 },
-    /// Reset to the next generation's population (boxed: much larger than the
-    /// other variants, which would otherwise bloat every `SimCommand`).
-    ResetPopulation(Box<ResetRequest>),
     /// Drain pending readbacks and exit the worker thread.
     Shutdown,
 }
@@ -223,14 +148,6 @@ pub enum SimEvent {
     Telemetry {
         agent_index: u32,
         telemetry: AgentTelemetry,
-    },
-    /// The generation tick budget was reached; carries the final state of the
-    /// generation. The worker has paused itself and awaits the handoff.
-    GenerationBudgetReached(StateSnapshot),
-    /// Reply to [`SimCommand::RequestBirthState`].
-    BirthState {
-        request_id: u64,
-        state: Option<AgentBrainState>,
     },
     /// A supervisor sample that carried a boundary, a season flip or the end of
     /// the run.
@@ -267,54 +184,28 @@ pub struct SimInit {
     pub food_count: usize,
     pub brain_config: BrainConfig,
     pub world_config: WorldConfig,
-    pub upload: PendingUpload,
-    pub tick_budget: u64,
     pub speed_multiplier: u32,
     pub paused: bool,
     /// Selected agent brain index for telemetry.
     pub selected_agent: u32,
-    /// Generation epoch of the initial population (see
-    /// [`StateSnapshot::generation_epoch`]).
-    pub generation_epoch: u64,
-    /// Search the turn policy across repeat-groups (see
-    /// [`ResetRequest::search_steering_genome`]). Free play and tests leave
-    /// this false.
-    pub search_steering_genome: bool,
-    /// Agents that share one steering genome. Matches `eval_repeats`.
-    pub steering_group_size: usize,
-    /// Turn-policy mutation strength for the first generation, before a
-    /// champion brain exists. Later generations use [`InheritedBrain`].
-    pub steering_mutation_strength: f32,
-    /// Supervisor mode: the worker owns one `SupervisorRun` instead of
-    /// generations. `None` keeps generation mode.
+    /// The run the worker owns; `None` leaves the worker idle.
     pub supervisor: Option<SupervisorWorkerInit>,
 }
 
-/// Partition a batch of drained events into the newest current-epoch state
-/// snapshot (latest-wins) and the ordered control events.
+/// Partition a batch of drained events into the newest state snapshot
+/// (latest-wins) and the ordered control events.
 ///
 /// Intermediate [`SimEvent::Snapshot`]s are superseded by the most recent one.
-/// Snapshots whose `generation_epoch` differs from `current_epoch` are dropped:
-/// they describe a population the main thread has already evaluated (published
-/// while the worker sat paused at the budget, or in flight when a reset was
-/// sent), and applying them would feed the previous generation's positions,
-/// counters and cumulative food into the next generation. Every other event —
-/// including [`SimEvent::GenerationBudgetReached`], whose snapshot is the
-/// authoritative end-of-generation state and which the worker emits exactly
-/// once per population — is returned in arrival order so the consumer
-/// processes them deterministically.
-pub fn partition_events(
-    events: Vec<SimEvent>,
-    current_epoch: u64,
-) -> (Option<StateSnapshot>, Vec<SimEvent>) {
+/// Every other event is returned in arrival order so the consumer processes
+/// them deterministically.
+pub fn partition_events(events: Vec<SimEvent>) -> (Option<StateSnapshot>, Vec<SimEvent>) {
     let mut latest_snapshot = None;
     let mut control = Vec::new();
     for event in events {
         match event {
-            SimEvent::Snapshot(snapshot) if snapshot.generation_epoch == current_epoch => {
+            SimEvent::Snapshot(snapshot) => {
                 latest_snapshot = Some(snapshot);
             }
-            SimEvent::Snapshot(_) => {}
             other => control.push(other),
         }
     }
@@ -401,28 +292,17 @@ struct WorkerCounters {
     state_snapshots_collected: u64,
     telemetry_requests: u64,
     telemetry_snapshots_collected: u64,
-    generation_clamps: u64,
 }
 
 /// Owns the GPU kernel and all simulation-cadence scheduling state.
 struct Worker {
     kernel: GpuKernel,
-    brain_config: BrainConfig,
-    world_config: WorldConfig,
 
     paused: bool,
     speed_multiplier: u32,
     selected_agent: u32,
 
     tick: u64,
-    gen_tick: u64,
-    /// Epoch stamped on every published snapshot; adopted from `SimInit` and
-    /// from each `ResetRequest`.
-    generation_epoch: u64,
-    tick_budget: u64,
-    /// Set once `GenerationBudgetReached` has been emitted for the current
-    /// generation, cleared on reset, so the boundary event fires exactly once.
-    budget_reached: bool,
 
     sim_accumulator: f64,
     last_frame: Instant,
@@ -433,12 +313,7 @@ struct Worker {
 
     counters: WorkerCounters,
     last_counters_log: Instant,
-    steering_group_size: usize,
-    steering_mutation_strength: f32,
-    /// Each agent's brain as written at the start of the current generation,
-    /// indexed by brain index. What a champion passes on.
-    birth_states: Vec<AgentBrainState>,
-    /// The supervisor driver; `None` in generation mode or after it ended.
+    /// The supervisor driver; `None` after it ended or failed to start.
     supervisor: Option<SupervisorRun>,
     /// Whether the worker was built for supervisor mode.
     supervisor_mode: bool,
@@ -517,65 +392,6 @@ fn resume_supervisor(
     Ok((run, point.tick, report))
 }
 
-/// Birth brains of every slot of `run`, indexed by slot.
-fn supervisor_birth_states(
-    run: &SupervisorRun,
-    population: u32,
-) -> Result<Vec<AgentBrainState>, String> {
-    (0..usize::try_from(population).unwrap_or(0))
-        .map(|slot| {
-            run.birth_state(slot)
-                .cloned()
-                .map_err(|e| format!("supervisor birth state {slot}: {e}"))
-        })
-        .collect()
-}
-
-/// Read back every agent's brain before the generation's first tick
-/// (blocking; the worker is between generations). Inheritance passes these
-/// on, so offspring get a champion's genome rather than what it learned in
-/// its life.
-fn read_birth_states(kernel: &GpuKernel) -> Vec<AgentBrainState> {
-    (0..kernel.agent_count())
-        .map(|index| kernel.read_agent_state(index))
-        .collect()
-}
-
-/// Whether an inherited champion brain matches the layout `brain_config`
-/// builds, so it can be written without misplacing offsets. A stored brain can
-/// disagree when the run's vision or retina settings changed since it was
-/// captured; it is then skipped (and logged) and the agents keep fresh brains.
-fn inherited_brain_fits(champion: &AgentBrainState, brain_config: &BrainConfig) -> bool {
-    let brain_stride = BrainLayout::from_config(brain_config).brain_stride;
-    let fits =
-        champion.brain_state.len() == brain_stride && champion.patterns.len() == PATTERN_STRIDE;
-    if !fits {
-        log::warn!(
-            "[SIM] inherited brain skipped: {} brain / {} pattern values, layout expects {} / {}",
-            champion.brain_state.len(),
-            champion.patterns.len(),
-            brain_stride,
-            PATTERN_STRIDE
-        );
-    }
-    fits
-}
-
-/// Patch per-agent heritable config tail slots into the GPU kernel.
-/// Called after world/agent uploads and after inherited brain states are written,
-/// because write_agent_state overwrites the entire brain-state buffer.
-fn patch_agent_configs(kernel: &GpuKernel, configs: &[BrainConfig]) {
-    for (index, config) in configs.iter().enumerate() {
-        let Ok(agent_index) = u32::try_from(index) else {
-            break;
-        };
-        if agent_index >= kernel.agent_count() {
-            break;
-        }
-        kernel.write_agent_heritable_config(agent_index, config);
-    }
-}
-
 impl Worker {
     /// Create the kernel and upload the initial world + agents.
     fn new(init: SimInit) -> Self {
@@ -587,92 +403,45 @@ impl Worker {
         );
         let supervisor_mode = init.supervisor.is_some();
         let mut paused = init.paused;
-        let mut tick_budget = init.tick_budget;
         let mut supervisor = None;
         let mut supervisor_events = Vec::new();
         let mut tick_window_store: Option<TickWindowStore> = None;
-        let birth_states;
         let mut initial_tick = 0;
         if let Some(sup_init) = init.supervisor.as_ref() {
-            tick_budget = 0;
             match start_supervisor(&mut kernel, sup_init, (init.agent_count, init.food_count)) {
                 Ok((run, start_tick, replay)) => {
-                    match supervisor_birth_states(&run, kernel.agent_count()) {
-                        Ok(states) => {
-                            birth_states = states;
-                            supervisor = Some(run);
-                            initial_tick = start_tick;
-                            if let Some(path) = sup_init.db_path.as_deref() {
-                                match TickWindowStore::open_for_latest_supervisor_run(
-                                    path,
-                                    TickWindowConfig::default(),
-                                ) {
-                                    Ok(store) => tick_window_store = Some(store),
-                                    Err(error) => {
-                                        let line = format!("tick window disabled: open: {error}");
-                                        supervisor_events.push(SimEvent::Log(line));
-                                    }
-                                }
-                            }
-                            if let Some(report) = replay {
-                                if report.boundary.is_some()
-                                    || report.season.is_some()
-                                    || report.finished
-                                {
-                                    supervisor_events.push(SimEvent::SupervisorSample(report));
-                                }
+                    supervisor = Some(run);
+                    initial_tick = start_tick;
+                    if let Some(path) = sup_init.db_path.as_deref() {
+                        match TickWindowStore::open_for_latest_supervisor_run(
+                            path,
+                            TickWindowConfig::default(),
+                        ) {
+                            Ok(store) => tick_window_store = Some(store),
+                            Err(error) => {
+                                let line = format!("tick window disabled: open: {error}");
+                                supervisor_events.push(SimEvent::Log(line));
                             }
                         }
-                        Err(message) => {
-                            birth_states = Vec::new();
-                            paused = true;
-                            supervisor_events.push(SimEvent::Error(message));
+                    }
+                    if let Some(report) = replay {
+                        if report.boundary.is_some() || report.season.is_some() || report.finished {
+                            supervisor_events.push(SimEvent::SupervisorSample(report));
                         }
                     }
                 }
                 Err(message) => {
-                    birth_states = Vec::new();
                     paused = true;
                     supervisor_events.push(SimEvent::Error(message));
                 }
             }
-        } else {
-            kernel.upload_world(
-                &init.upload.heights,
-                &init.upload.biomes,
-                &init.upload.food_pos,
-                &init.upload.food_consumed,
-                &init.upload.food_timers,
-            );
-            kernel.upload_agents(&init.upload.agent_data);
-            if init.search_steering_genome {
-                let mut rng = rand::rng();
-                let birth = fresh_brain_state(&init.brain_config, &mut rng);
-                let count = usize::try_from(kernel.agent_count()).unwrap_or(0);
-                let genomes = steering_population(
-                    &birth,
-                    count,
-                    init.steering_group_size,
-                    init.steering_mutation_strength,
-                    &mut rng,
-                );
-                kernel.batch_write_agent_states(count, |index| genomes[index].clone());
-            }
-            patch_agent_configs(&kernel, &init.upload.agent_configs);
-            birth_states = read_birth_states(&kernel);
         }
         Self {
             kernel,
-            brain_config: init.brain_config,
-            world_config: init.world_config,
             paused,
             speed_multiplier: init.speed_multiplier,
             selected_agent: init.selected_agent,
             tick: initial_tick,
-            gen_tick: 0,
-            generation_epoch: init.generation_epoch,
-            tick_budget,
-            budget_reached: false,
             sim_accumulator: 0.0,
             last_frame: Instant::now(),
             last_state_snapshot_request: None,
@@ -680,9 +449,6 @@ impl Worker {
             last_telemetry_agent: None,
             counters: WorkerCounters::default(),
             last_counters_log: Instant::now(),
-            steering_group_size: init.steering_group_size.max(1),
-            steering_mutation_strength: init.steering_mutation_strength,
-            birth_states,
             supervisor,
             supervisor_mode,
             supervisor_events,
@@ -693,7 +459,7 @@ impl Worker {
     }
 
     /// Apply a command. Returns `true` if the worker should exit.
-    fn handle_command(&mut self, command: SimCommand, event_tx: &SyncSender<SimEvent>) -> bool {
+    fn handle_command(&mut self, command: SimCommand) -> bool {
         match command {
             SimCommand::SetPaused(paused) => {
                 self.paused = paused;
@@ -703,126 +469,14 @@ impl Worker {
             }
             SimCommand::SetSpeed(speed) => self.speed_multiplier = speed.max(1),
             SimCommand::SelectAgent(index) => self.selected_agent = index,
-            SimCommand::RequestBirthState {
-                agent_index,
-                request_id,
-            } => {
-                let state = usize::try_from(agent_index)
-                    .ok()
-                    .and_then(|index| self.birth_states.get(index))
-                    .cloned();
-                let _ = event_tx.send(SimEvent::BirthState { request_id, state });
-            }
-            SimCommand::ResetPopulation(_) if self.supervisor_mode => {
-                log::warn!("[SIM] ResetPopulation ignored in supervisor mode");
-            }
-            SimCommand::ResetPopulation(request) => {
-                let resume = request.resume;
-                self.reset_population(*request);
-                let _ = event_tx.send(SimEvent::Log(format!(
-                    "[SIM] reset to {} agents ({})",
-                    self.kernel.agent_count(),
-                    if resume { "running" } else { "paused" },
-                )));
-            }
             SimCommand::Shutdown => return true,
         }
         false
     }
 
-    /// Reset the kernel to the next generation's population, applying inherited
-    /// champion/mutant brain states, then optionally resume.
-    fn reset_population(&mut self, request: ResetRequest) {
-        let next_agent_count = u32::try_from(request.upload.agent_data.len()).unwrap_or(u32::MAX);
-        self.brain_config = request.brain_config;
-        self.generation_epoch = request.generation_epoch;
-
-        if self.kernel.agent_count() == next_agent_count {
-            // Population size unchanged — reseed in place. Spin on the
-            // non-blocking reset until the staging buffers drain, draining
-            // readbacks each iteration. Bounded so a stuck slot can't hang the
-            // worker forever.
-            let mut reset_done = false;
-            for _ in 0..10_000 {
-                if self.kernel.try_reset_agents(&self.brain_config) {
-                    reset_done = true;
-                    break;
-                }
-                self.kernel.try_collect_state_snapshot();
-                std::thread::sleep(RUNNING_SLEEP);
-            }
-            if !reset_done {
-                log::error!("[SIM] agent reset did not complete; staging buffers stuck");
-            }
-        } else {
-            // Population size changed — rebuild the kernel from scratch.
-            self.kernel = GpuKernel::new(
-                next_agent_count,
-                request.upload.food_pos.len(),
-                &self.brain_config,
-                &self.world_config,
-            );
-            self.kernel.upload_world(
-                &request.upload.heights,
-                &request.upload.biomes,
-                &request.upload.food_pos,
-                &request.upload.food_consumed,
-                &request.upload.food_timers,
-            );
-        }
-        self.kernel.upload_agents(&request.upload.agent_data);
-
-        let inherited = request
-            .inherited
-            .filter(|inherited| inherited_brain_fits(&inherited.champion, &self.brain_config));
-        if request.search_steering_genome {
-            let mut rng = rand::rng();
-            let (template, strength, group_size) = if let Some(inherited) = inherited {
-                (
-                    inherited.champion,
-                    inherited.mutation_strength,
-                    inherited.champion_slots,
-                )
-            } else {
-                (
-                    fresh_brain_state(&self.brain_config, &mut rng),
-                    self.steering_mutation_strength,
-                    self.steering_group_size,
-                )
-            };
-            let count = usize::try_from(self.kernel.agent_count()).unwrap_or(0);
-            let genomes = steering_population(&template, count, group_size, strength, &mut rng);
-            self.kernel
-                .batch_write_agent_states(count, |index| genomes[index].clone());
-        } else if let Some(inherited) = inherited {
-            let count = usize::try_from(self.kernel.agent_count()).unwrap_or(0);
-            let champion = inherited.champion;
-            let strength = inherited.mutation_strength;
-            let champion_slots = inherited.champion_slots;
-            self.kernel.batch_write_agent_states(count, |index| {
-                if index < champion_slots {
-                    champion.clone()
-                } else {
-                    mutate_brain_state(&champion, strength)
-                }
-            });
-        }
-        patch_agent_configs(&self.kernel, &request.upload.agent_configs);
-        self.birth_states = read_birth_states(&self.kernel);
-
-        self.tick_budget = request.tick_budget;
-        self.tick = 0;
-        self.gen_tick = 0;
-        self.budget_reached = false;
-        self.sim_accumulator = 0.0;
-        self.last_state_snapshot_request = None;
-        self.last_frame = Instant::now();
-        self.paused = !request.resume;
-    }
-
     /// One scheduler iteration: collect/publish readbacks, request the next
     /// state/telemetry samples on their own cadence, then advance compute
-    /// (unless paused) and enforce the generation budget.
+    /// (unless paused).
     ///
     /// Returns `true` if a compute dispatch happened, so the caller can skip the
     /// idle sleep and keep draining a backlog at GPU speed.
@@ -871,11 +525,7 @@ impl Worker {
         if self.paused {
             return false;
         }
-        let dispatched = self.advance_compute(dt);
-        if dispatched {
-            self.check_generation_budget(event_tx);
-        }
-        dispatched
+        self.advance_compute(dt)
     }
 
     /// Accumulate wall time and dispatch one clamped kernel-batch when due.
@@ -901,9 +551,10 @@ impl Worker {
 
         // Hand `dispatch_ticks` up to `MAX_FUSED_BATCHES` kernel-batches so a
         // high-speed backlog fuses into one submit instead of paying the
-        // per-100-tick submit tax. The generation-budget clamp below stays
-        // UPSTREAM of `dispatch_ticks`, so a fused batch still stops exactly at
-        // `tick_budget`. At low speed `raw_ticks` stays small (the accumulator
+        // per-100-tick submit tax. The supervisor sample clamp
+        // (`clamp_ticks_to_supervisor_sample`) below stays UPSTREAM of
+        // `dispatch_ticks`, so a fused batch still stops exactly at the next
+        // sample tick. At low speed `raw_ticks` stays small (the accumulator
         // only fills at `dt * speed`), so a single batch still dispatches and
         // interactive cadence is unchanged.
         let dispatch_cap = self
@@ -933,12 +584,6 @@ impl Worker {
             0
         };
 
-        let (clamped, did_clamp) =
-            clamp_ticks_to_generation_budget(ticks_to_run, self.tick_budget, self.gen_tick);
-        ticks_to_run = clamped;
-        if did_clamp {
-            self.counters.generation_clamps += 1;
-        }
         if self.supervisor.is_some() {
             ticks_to_run =
                 clamp_ticks_to_supervisor_sample(ticks_to_run, self.tick, SUPERVISOR_SAMPLE_TICKS);
@@ -954,7 +599,6 @@ impl Worker {
 
         self.sim_accumulator -= ticks_to_run as f64 * sim_delta_time;
         self.tick += u64::from(ticks_to_run);
-        self.gen_tick = self.gen_tick.saturating_add(u64::from(ticks_to_run));
         self.on_supervisor_sample();
         true
     }
@@ -1011,18 +655,6 @@ impl Worker {
         match run.on_sample(&mut self.kernel, self.tick, &physics, food.as_deref()) {
             Ok(report) => {
                 if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
-                    match run.birth_state(slot) {
-                        Ok(state) => {
-                            if let Some(entry) = self.birth_states.get_mut(slot) {
-                                *entry = state.clone();
-                            }
-                        }
-                        Err(error) => {
-                            log::error!("[SIM] supervisor birth state {slot} failed: {error}");
-                        }
-                    }
-                }
-                if let Some(slot) = report.boundary.as_ref().and_then(|b| b.slot) {
                     self.record_tick_window_pin(PinKind::Replacement { slot });
                 }
                 if report.season.is_some() {
@@ -1076,45 +708,6 @@ impl Worker {
         }
     }
 
-    /// Emit `GenerationBudgetReached` exactly once when the budget is reached,
-    /// then pause so the handoff can proceed.
-    fn check_generation_budget(&mut self, event_tx: &SyncSender<SimEvent>) {
-        if self.tick_budget == 0 || self.budget_reached || self.gen_tick < self.tick_budget {
-            return;
-        }
-        let snapshot = self.force_snapshot();
-        // Control event: deliver even under snapshot back-pressure.
-        let _ = event_tx.send(SimEvent::GenerationBudgetReached(snapshot));
-        self.paused = true;
-        self.budget_reached = true;
-    }
-
-    /// Read the exact end-of-generation state synchronously.
-    ///
-    /// The generation boundary drives fitness evaluation and champion selection,
-    /// so it must publish the precise final physics — not whatever the async
-    /// staging ring happens to have collected, which can be several ticks stale
-    /// or a not-yet-final slot. A blocking readback is appropriate here: it runs
-    /// once per generation while the worker is paused. Food state is display-only
-    /// at the boundary (it is not an input to fitness), so the latest cached food
-    /// is sufficient.
-    fn force_snapshot(&mut self) -> StateSnapshot {
-        let physics = self.kernel.read_full_state_blocking().to_vec();
-        let food = self
-            .kernel
-            .cached_food_state()
-            .map(<[f32]>::to_vec)
-            .unwrap_or_default();
-        StateSnapshot {
-            physics,
-            food,
-            trail_samples: self.kernel.collected_trail_samples(),
-            tick: self.tick,
-            generation_tick: self.gen_tick,
-            generation_epoch: self.generation_epoch,
-        }
-    }
-
     /// Build an owned snapshot from the kernel's latest collected caches.
     fn build_snapshot(&self) -> StateSnapshot {
         let food = self
@@ -1127,15 +720,12 @@ impl Worker {
             food,
             trail_samples: self.kernel.collected_trail_samples(),
             tick: self.tick,
-            generation_tick: self.gen_tick,
-            generation_epoch: self.generation_epoch,
         }
     }
 
     /// Publish the latest collected snapshot, dropping it under back-pressure
     /// (latest-wins): the next snapshot carries newer state, so a dropped one is
-    /// never missed. The generation boundary delivers its final state through
-    /// the always-sent [`SimEvent::GenerationBudgetReached`] instead.
+    /// never missed.
     fn publish_snapshot(&mut self, event_tx: &SyncSender<SimEvent>) {
         let snapshot = self.build_snapshot();
         if self.tick_window_store.is_some() {
@@ -1193,18 +783,14 @@ impl Worker {
         log::debug!(
             "[SIM-WORKER] sim_ticks={} dispatch_calls={} state_requests={} \
              state_collected={} telemetry_requests={} telemetry_collected={} \
-             generation_clamps={} tick={} gen_tick={}/{} \
-             brain_tick_stride={} kernel_batch={}",
+             tick={} brain_tick_stride={} kernel_batch={}",
             counters.sim_ticks,
             counters.dispatch_calls,
             counters.state_snapshot_requests,
             counters.state_snapshots_collected,
             counters.telemetry_requests,
             counters.telemetry_snapshots_collected,
-            counters.generation_clamps,
             self.tick,
-            self.gen_tick,
-            self.tick_budget,
             self.kernel.brain_tick_stride(),
             self.kernel.kernel_batch_size(),
         );
@@ -1266,7 +852,7 @@ fn run_worker(init: SimInit, command_rx: &Receiver<SimCommand>, event_tx: &SyncS
         loop {
             match command_rx.try_recv() {
                 Ok(command) => {
-                    if worker.handle_command(command, event_tx) {
+                    if worker.handle_command(command) {
                         return;
                     }
                 }
@@ -1290,7 +876,7 @@ fn run_worker(init: SimInit, command_rx: &Receiver<SimCommand>, event_tx: &SyncS
 mod tests {
     use super::*;
 
-    // ── generation-budget clamp ──────────────────────────────────────
+    // ── dispatch alignment ───────────────────────────────────────────
 
     #[test]
     fn align_keeps_whole_batches_from_a_boundary() {
@@ -1341,70 +927,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clamp_leaves_batch_untouched_with_budget_to_spare() {
-        let (clamped, did_clamp) = clamp_ticks_to_generation_budget(64, 1000, 800);
-        assert_eq!(clamped, 64);
-        assert!(!did_clamp);
-    }
-
-    #[test]
-    fn clamp_caps_batch_to_remaining_budget() {
-        // tick_budget 100, gen_tick 97 → only 3 ticks remain; a 50-tick batch
-        // must be clamped to 3 so the generation stops exactly at the budget.
-        let (clamped, did_clamp) = clamp_ticks_to_generation_budget(50, 100, 97);
-        assert_eq!(clamped, 3);
-        assert!(did_clamp);
-    }
-
-    #[test]
-    fn clamp_to_exact_boundary_yields_zero_and_flags_clamp() {
-        let (clamped, did_clamp) = clamp_ticks_to_generation_budget(10, 100, 100);
-        assert_eq!(clamped, 0);
-        assert!(did_clamp);
-    }
-
-    #[test]
-    fn clamp_treats_zero_budget_as_unlimited() {
-        let (clamped, did_clamp) = clamp_ticks_to_generation_budget(500, 0, 1_000_000);
-        assert_eq!(clamped, 500);
-        assert!(!did_clamp);
-    }
-
-    // ── inherited-brain layout guard ─────────────────────────────────
-
-    #[test]
-    fn inherited_brain_fits_only_the_configured_layout() {
-        let config = BrainConfig::default();
-        let brain_stride = BrainLayout::from_config(&config).brain_stride;
-
-        assert!(inherited_brain_fits(
-            &AgentBrainState::new_for(brain_stride),
-            &config
-        ));
-        assert!(!inherited_brain_fits(
-            &AgentBrainState::new_for(brain_stride + 1),
-            &config
-        ));
-        let mut short_patterns = AgentBrainState::new_for(brain_stride);
-        short_patterns.patterns.pop();
-        assert!(!inherited_brain_fits(&short_patterns, &config));
-    }
-
     // ── latest-wins event partitioning ───────────────────────────────
 
     fn snapshot_with_tick(tick: u64) -> StateSnapshot {
-        snapshot_with_tick_and_epoch(tick, 0)
-    }
-
-    fn snapshot_with_tick_and_epoch(tick: u64, generation_epoch: u64) -> StateSnapshot {
         StateSnapshot {
             physics: Vec::new(),
             food: Vec::new(),
             trail_samples: Vec::new(),
             tick,
-            generation_tick: tick,
-            generation_epoch,
         }
     }
 
@@ -1416,7 +946,7 @@ mod tests {
             SimEvent::Snapshot(snapshot_with_tick(2)),
             SimEvent::Snapshot(snapshot_with_tick(3)),
         ];
-        let (latest, control) = partition_events(events, 0);
+        let (latest, control) = partition_events(events);
         assert_eq!(latest.expect("a snapshot is present").tick, 3);
         // The single non-snapshot event is preserved.
         assert_eq!(control.len(), 1);
@@ -1424,93 +954,14 @@ mod tests {
     }
 
     #[test]
-    fn partition_events_preserves_control_order_and_budget_snapshot() {
-        let events = vec![
-            SimEvent::KernelReady { agent_count: 4 },
-            SimEvent::Snapshot(snapshot_with_tick(10)),
-            SimEvent::GenerationBudgetReached(snapshot_with_tick(99)),
-            SimEvent::BirthState {
-                request_id: 7,
-                state: None,
-            },
-        ];
-        let (latest, control) = partition_events(events, 0);
-        // The regular snapshot at tick 10 is the newest plain snapshot.
-        assert_eq!(latest.expect("a snapshot is present").tick, 10);
-        // Control events keep arrival order; the budget snapshot is NOT folded
-        // into latest-wins (it is the authoritative end-of-generation state).
-        assert_eq!(control.len(), 3);
-        assert!(matches!(
-            control[0],
-            SimEvent::KernelReady { agent_count: 4 }
-        ));
-        assert!(matches!(
-            control[1],
-            SimEvent::GenerationBudgetReached(ref s) if s.tick == 99
-        ));
-        assert!(matches!(
-            control[2],
-            SimEvent::BirthState { request_id: 7, .. }
-        ));
-    }
-
-    #[test]
-    fn partition_events_drops_snapshots_from_other_epochs() {
-        // Epoch 0 is the population already evaluated: its snapshots (even a
-        // newer tick) must not win over the current epoch's.
-        let events = vec![
-            SimEvent::Snapshot(snapshot_with_tick_and_epoch(100_000, 0)),
-            SimEvent::Snapshot(snapshot_with_tick_and_epoch(12, 1)),
-            SimEvent::Snapshot(snapshot_with_tick_and_epoch(100_000, 0)),
-        ];
-        let (latest, control) = partition_events(events, 1);
-        let latest = latest.expect("the current-epoch snapshot is kept");
-        assert_eq!(latest.generation_epoch, 1);
-        assert_eq!(latest.tick, 12);
-        assert!(control.is_empty());
-
-        let only_stale = vec![SimEvent::Snapshot(snapshot_with_tick_and_epoch(100_000, 0))];
-        let (latest, _) = partition_events(only_stale, 1);
-        assert!(latest.is_none(), "a stale-epoch snapshot must be dropped");
-    }
-
-    #[test]
     fn partition_events_handles_no_snapshot() {
         let events = vec![SimEvent::Log("only logs".into())];
-        let (latest, control) = partition_events(events, 0);
+        let (latest, control) = partition_events(events);
         assert!(latest.is_none());
         assert_eq!(control.len(), 1);
     }
 
     // ── worker orchestration ──────────────────────────────────────────
-
-    /// Build a single-agent world upload from a fresh default world.
-    fn test_upload() -> (PendingUpload, usize) {
-        use xagent_sandbox::world::WorldState;
-        use xagent_shared::WorldConfig;
-
-        let world = WorldState::new(WorldConfig::default());
-        let upload = PendingUpload {
-            heights: world.terrain.heights.clone(),
-            biomes: world.biome_map.grid_as_u32(),
-            food_pos: world
-                .food_items
-                .iter()
-                .map(|f| (f.position.x, f.position.y, f.position.z))
-                .collect(),
-            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
-            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
-            agent_data: vec![(
-                world.safe_spawn_position(),
-                100.0,
-                100.0,
-                BrainConfig::default().memory_capacity,
-                BrainConfig::default().processing_slots,
-            )],
-            agent_configs: vec![BrainConfig::default()],
-        };
-        (upload, world.food_items.len())
-    }
 
     /// Serialize GPU-heavy tests: the guard is parked in a thread-local and
     /// released when the test thread exits.
@@ -1532,224 +983,22 @@ mod tests {
         });
     }
 
-    fn test_init(tick_budget: u64, paused: bool, speed_multiplier: u32) -> SimInit {
+    /// Init for a worker with no run: the kernel is built and nothing else.
+    fn test_init(paused: bool, speed_multiplier: u32) -> SimInit {
         hold_gpu_test_lock();
-        let (upload, food_count) = test_upload();
+        let food_count = xagent_sandbox::world::WorldState::new(WorldConfig::default())
+            .food_items
+            .len();
         SimInit {
             agent_count: 1,
             food_count,
             brain_config: BrainConfig::default(),
             world_config: WorldConfig::default(),
-            upload,
-            tick_budget,
             speed_multiplier,
             paused,
             selected_agent: 0,
-            generation_epoch: 0,
-            search_steering_genome: false,
-            steering_group_size: 1,
-            steering_mutation_strength: 0.0,
             supervisor: None,
         }
-    }
-
-    /// Build a two-agent world upload whose per-agent configs differ only in
-    /// `gabor_wavelength` (the first Gabor visual-genome tail slot). Both
-    /// agents spawn at the same safe position; the population size is fixed so
-    /// `reset_population` takes the in-place reseed path. Returns the upload and
-    /// the world's food count (mirrors `test_upload`).
-    fn two_agent_upload_with_wavelengths(
-        wavelength_a: f32,
-        wavelength_b: f32,
-    ) -> (PendingUpload, usize) {
-        use xagent_sandbox::world::WorldState;
-        use xagent_shared::WorldConfig;
-
-        let world = WorldState::new(WorldConfig::default());
-        let spawn = world.safe_spawn_position();
-        let make_config = |wavelength: f32| BrainConfig {
-            gabor_wavelength: wavelength,
-            ..BrainConfig::default()
-        };
-        let config_a = make_config(wavelength_a);
-        let config_b = make_config(wavelength_b);
-        let agent_row = |config: &BrainConfig| {
-            (
-                spawn,
-                100.0,
-                100.0,
-                config.memory_capacity,
-                config.processing_slots,
-            )
-        };
-        let upload = PendingUpload {
-            heights: world.terrain.heights.clone(),
-            biomes: world.biome_map.grid_as_u32(),
-            food_pos: world
-                .food_items
-                .iter()
-                .map(|f| (f.position.x, f.position.y, f.position.z))
-                .collect(),
-            food_consumed: world.food_items.iter().map(|f| f.consumed).collect(),
-            food_timers: world.food_items.iter().map(|f| f.respawn_timer).collect(),
-            agent_data: vec![agent_row(&config_a), agent_row(&config_b)],
-            agent_configs: vec![config_a, config_b],
-        };
-        (upload, world.food_items.len())
-    }
-
-    /// Read agent `index`'s `O_GABOR_WAVELENGTH` brain-state tail slot. The tail
-    /// base is derived from the read-back length (the dynamic `brain_stride`),
-    /// never a hardcoded stride, so this works for any `BrainLayout`.
-    fn read_gabor_wavelength(kernel: &GpuKernel, index: u32) -> f32 {
-        use xagent_brain::buffers::{
-            fixed_tail_base, O_GABOR_WAVELENGTH, O_PREDICTOR_CONTEXT_WEIGHT,
-        };
-
-        let state = kernel.read_agent_state(index);
-        let tail_base = fixed_tail_base(state.brain_state.len());
-        let slot = tail_base + (O_GABOR_WAVELENGTH - O_PREDICTOR_CONTEXT_WEIGHT);
-        state.brain_state[slot]
-    }
-
-    /// The interactive worker must re-apply each agent's heritable visual genome
-    /// after inheritance overwrites the brain-state tail. Inheritance writes the
-    /// champion's exact state (carrying the champion's `gabor_wavelength`) into
-    /// every champion slot; `patch_agent_configs` then restores each agent's own
-    /// config. Without that patch step every agent's vision silently reverts to
-    /// the champion's, so this test fails on the un-patched worker and passes
-    /// once the patch covers the visual tail slots with per-agent genome values.
-    /// GPU-gated.
-    #[test]
-    fn worker_reset_applies_visual_genome_after_inheritance() {
-        if !GpuKernel::is_available() {
-            eprintln!("Skipping: no GPU/fallback adapter available");
-            return;
-        }
-
-        const WAVELENGTH_A: f32 = 3.0;
-        const WAVELENGTH_B: f32 = 9.0;
-
-        // Two agents with distinct gabor_wavelength. `Worker::new` runs
-        // `patch_agent_configs`, so agent 0's tail already carries WAVELENGTH_A.
-        let (upload, food_count) = two_agent_upload_with_wavelengths(WAVELENGTH_A, WAVELENGTH_B);
-        let mut worker = Worker::new(SimInit {
-            agent_count: 2,
-            food_count,
-            brain_config: BrainConfig::default(),
-            world_config: WorldConfig::default(),
-            upload,
-            tick_budget: 0,
-            speed_multiplier: 1,
-            paused: true,
-            selected_agent: 0,
-            generation_epoch: 0,
-            search_steering_genome: false,
-            steering_group_size: 1,
-            steering_mutation_strength: 0.0,
-            supervisor: None,
-        });
-
-        // The champion is agent 0's inherited state: it carries WAVELENGTH_A in
-        // its tail. Seeding it into *both* champion slots overwrites both tails
-        // with WAVELENGTH_A — so if the worker fails to re-patch, agent 1 keeps
-        // the champion's WAVELENGTH_A instead of its own WAVELENGTH_B.
-        let champion = worker.kernel.read_agent_state(0);
-        assert!(
-            (read_gabor_wavelength(&worker.kernel, 0) - WAVELENGTH_A).abs() < 1e-4,
-            "precondition: Worker::new should have patched agent 0's wavelength"
-        );
-
-        let (reset_upload, _) = two_agent_upload_with_wavelengths(WAVELENGTH_A, WAVELENGTH_B);
-        worker.reset_population(ResetRequest {
-            upload: reset_upload,
-            brain_config: BrainConfig::default(),
-            tick_budget: 0,
-            inherited: Some(InheritedBrain {
-                champion,
-                mutation_strength: 0.0,
-                champion_slots: 2,
-            }),
-            resume: false,
-            generation_epoch: 1,
-            search_steering_genome: false,
-        });
-
-        // Snapshots published after the reset carry the request's epoch.
-        assert_eq!(worker.build_snapshot().generation_epoch, 1);
-
-        let agent_0 = read_gabor_wavelength(&worker.kernel, 0);
-        let agent_1 = read_gabor_wavelength(&worker.kernel, 1);
-        assert!(
-            (agent_0 - WAVELENGTH_A).abs() < 1e-4,
-            "agent 0 wavelength {agent_0} != own config {WAVELENGTH_A}"
-        );
-        assert!(
-            (agent_1 - WAVELENGTH_B).abs() < 1e-4,
-            "agent 1 wavelength {agent_1} reverted to champion's instead of own \
-             config {WAVELENGTH_B} — worker did not re-apply the visual genome \
-             after inheritance"
-        );
-    }
-
-    /// A champion passes on the brain it was born with, not what it learned:
-    /// after a stretch of lifetime learning, the worker's reply to
-    /// `RequestBirthState` must still equal the state written before the
-    /// first tick. GPU-gated.
-    #[test]
-    fn worker_passes_on_the_birth_brain_not_the_learned_one() {
-        if !GpuKernel::is_available() {
-            eprintln!("Skipping: no GPU/fallback adapter available");
-            return;
-        }
-
-        const LIFETIME_TICKS: u32 = 300;
-        const REQUEST_ID: u64 = 3;
-
-        let (upload, food_count) = two_agent_upload_with_wavelengths(5.0, 5.0);
-        let mut worker = Worker::new(SimInit {
-            agent_count: 2,
-            food_count,
-            brain_config: BrainConfig::default(),
-            world_config: WorldConfig::default(),
-            upload,
-            tick_budget: 0,
-            speed_multiplier: 1,
-            paused: true,
-            selected_agent: 0,
-            generation_epoch: 0,
-            search_steering_genome: true,
-            steering_group_size: 1,
-            steering_mutation_strength: 0.1,
-            supervisor: None,
-        });
-        let birth = worker.kernel.read_agent_state(0);
-        worker.kernel.dispatch_batch(0, LIFETIME_TICKS);
-        let learned = worker.kernel.read_agent_state(0);
-        assert_ne!(
-            learned.brain_state, birth.brain_state,
-            "precondition: {LIFETIME_TICKS} ticks of lifetime learning should change the brain"
-        );
-
-        let (event_tx, event_rx) = sync_channel(1);
-        worker.handle_command(
-            SimCommand::RequestBirthState {
-                agent_index: 0,
-                request_id: REQUEST_ID,
-            },
-            &event_tx,
-        );
-        let Ok(SimEvent::BirthState {
-            request_id: REQUEST_ID,
-            state: Some(passed_on),
-        }) = event_rx.try_recv()
-        else {
-            panic!("the worker should reply with agent 0's birth state");
-        };
-        assert!(
-            passed_on.brain_state == birth.brain_state && passed_on.patterns == birth.patterns,
-            "the champion passed on its learned brain instead of its birth brain"
-        );
     }
 
     /// Drain events through `pick`, returning the first non-`None` mapping or
@@ -1776,89 +1025,10 @@ mod tests {
     /// (No GPU required.)
     #[test]
     fn sim_runtime_starts_and_shuts_down() {
-        let runtime = SimRuntime::start(test_init(100, true, 1));
+        let runtime = SimRuntime::start(test_init(true, 1));
         runtime.send(SimCommand::Shutdown);
         // Dropping the runtime joins the worker; reaching the end of the test
         // without hanging proves clean shutdown.
-        drop(runtime);
-    }
-
-    /// End-to-end generation handoff at the worker boundary: the worker reaches
-    /// the tick budget and emits `GenerationBudgetReached`, replies to a champion
-    /// `RequestBirthState` while paused, and resumes the next generation on
-    /// `ResetPopulation`. Exercises the orchestration the kernel-level tests do
-    /// not. GPU-gated.
-    #[test]
-    fn worker_runs_generation_budget_handoff() {
-        if !GpuKernel::is_available() {
-            eprintln!("Skipping: no GPU/fallback adapter available");
-            return;
-        }
-        const BUDGET: u64 = 400;
-        let runtime = SimRuntime::start(test_init(BUDGET, false, 100));
-
-        // 1. The worker stops exactly at the budget and emits the boundary.
-        let budget_tick = drain_until(&runtime, |event| match event {
-            SimEvent::GenerationBudgetReached(snapshot) => Some(snapshot.generation_tick),
-            _ => None,
-        })
-        .expect("GenerationBudgetReached should arrive");
-        assert!(
-            budget_tick >= BUDGET,
-            "boundary fired at gen_tick {budget_tick}, expected >= {BUDGET}"
-        );
-
-        // 2. Champion brain-state readback while paused.
-        runtime.send(SimCommand::RequestBirthState {
-            agent_index: 0,
-            request_id: 42,
-        });
-        let champion = drain_until(&runtime, |event| match event {
-            SimEvent::BirthState {
-                request_id: 42,
-                state,
-            } => Some(state),
-            _ => None,
-        })
-        .expect("BirthState reply should arrive");
-        assert!(champion.is_some(), "champion brain state should read back");
-
-        // 3. Reset to the next generation and resume.
-        let (upload, _) = test_upload();
-        runtime.send(SimCommand::ResetPopulation(Box::new(ResetRequest {
-            upload,
-            brain_config: BrainConfig::default(),
-            tick_budget: BUDGET,
-            inherited: champion.map(|champion| InheritedBrain {
-                champion,
-                mutation_strength: 0.1,
-                champion_slots: 1,
-            }),
-            resume: true,
-            generation_epoch: 1,
-            search_steering_genome: false,
-        })));
-
-        // The worker logs the reset once it processes the command...
-        let reset_logged = drain_until(&runtime, |event| match event {
-            SimEvent::Log(message) if message.contains("reset to") => Some(()),
-            _ => None,
-        });
-        assert!(
-            reset_logged.is_some(),
-            "worker should log the population reset"
-        );
-
-        // ...and then resumes dispatch, publishing fresh snapshots again.
-        let resumed = drain_until(&runtime, |event| match event {
-            SimEvent::Snapshot(_) => Some(()),
-            _ => None,
-        });
-        assert!(
-            resumed.is_some(),
-            "worker should resume publishing after reset"
-        );
-
         drop(runtime);
     }
 
@@ -1872,9 +1042,9 @@ mod tests {
             eprintln!("Skipping: no GPU/fallback adapter available");
             return;
         }
-        // Unlimited budget so the only events are snapshots/telemetry, which use
-        // non-blocking sends — the worker cannot stall on a full channel here.
-        let runtime = SimRuntime::start(test_init(0, false, 100));
+        // The only events are snapshots/telemetry, which use non-blocking
+        // sends — the worker cannot stall on a full channel here.
+        let runtime = SimRuntime::start(test_init(false, 100));
 
         let max_tick = |runtime: &SimRuntime| {
             runtime
@@ -1986,16 +1156,14 @@ mod tests {
     }
 
     fn supervisor_init(config: &FullConfig, db_path: Option<String>) -> SimInit {
-        let (upload, _) = test_upload();
         let food_count = xagent_sandbox::world::WorldState::new(config.world.clone())
             .food_items
             .len();
-        let mut init = test_init(0, false, 1);
+        let mut init = test_init(false, 1);
         init.agent_count = u32::try_from(config.governor.population_size).expect("fits");
         init.food_count = food_count;
         init.brain_config = config.brain.clone();
         init.world_config = config.world.clone();
-        init.upload = upload;
         init.supervisor = Some(SupervisorWorkerInit {
             config: config.clone(),
             db_path,
@@ -2229,7 +1397,7 @@ mod tests {
         if supervisor_gpu_or_skip() {
             let worker = Worker::new(supervisor_init(&config, None));
             assert!(worker.tick_window_store.is_none());
-            let worker = Worker::new(test_init(0, false, 1));
+            let worker = Worker::new(test_init(false, 1));
             assert!(worker.tick_window_store.is_none());
         }
     }
@@ -2338,7 +1506,7 @@ mod tests {
             SimEvent::Log("a".into()),
             SimEvent::SupervisorTelemetry(Box::new(frame)),
         ];
-        let (latest, control) = partition_events(events, 0);
+        let (latest, control) = partition_events(events);
         assert!(latest.is_none());
         assert_eq!(control.len(), 3);
         assert!(matches!(control[0], SimEvent::SupervisorBoundary(_)));
@@ -2540,23 +1708,6 @@ mod tests {
 
         supervisor_run_to(&mut worker, 0.05, 1_500);
         check(&worker);
-        let (event_tx, _event_rx) = sync_channel(8);
-        let (upload, _) = test_upload();
-        let before = worker.kernel.probe_kernel_batches();
-        worker.handle_command(
-            SimCommand::ResetPopulation(Box::new(ResetRequest {
-                upload,
-                brain_config: BrainConfig::default(),
-                tick_budget: 0,
-                inherited: None,
-                resume: true,
-                generation_epoch: 1,
-                search_steering_genome: false,
-            })),
-            &event_tx,
-        );
-        assert_eq!(worker.kernel.probe_kernel_batches(), before);
-        check(&worker);
 
         supervisor_run_to(&mut worker, 0.05, 3_000);
         assert!(worker.tick >= 3_000 && worker.tick % SUPERVISOR_SAMPLE_TICKS == 0);
@@ -2565,38 +1716,6 @@ mod tests {
             worker.kernel.agent_count(),
             u32::try_from(config.governor.population_size).expect("fits")
         );
-    }
-
-    #[test]
-    fn supervisor_worker_ignores_reset_population() {
-        if !supervisor_gpu_or_skip() {
-            return;
-        }
-        let config = supervisor_test_config();
-        let mut worker = Worker::new(supervisor_init(&config, None));
-        supervisor_run_to(&mut worker, 0.05, 200);
-        let (tick, agents) = (worker.tick, worker.kernel.agent_count());
-        let (event_tx, event_rx) = sync_channel(8);
-        let (upload, _) = test_upload();
-        worker.handle_command(
-            SimCommand::ResetPopulation(Box::new(ResetRequest {
-                upload,
-                brain_config: BrainConfig::default(),
-                tick_budget: 50,
-                inherited: None,
-                resume: false,
-                generation_epoch: 9,
-                search_steering_genome: false,
-            })),
-            &event_tx,
-        );
-        assert_eq!(worker.tick, tick);
-        assert_eq!(worker.kernel.agent_count(), agents);
-        assert_eq!(worker.tick_budget, 0);
-        assert_eq!(worker.generation_epoch, 0);
-        assert!(!worker.paused);
-        assert!(worker.supervisor.is_some());
-        assert!(event_rx.try_recv().is_err(), "no reset log expected");
     }
 
     #[test]
@@ -2617,44 +1736,5 @@ mod tests {
         worker.paused = false;
         assert!(!worker.advance_compute(0.05));
         assert_eq!(worker.counters.dispatch_calls, dispatches);
-    }
-
-    #[test]
-    fn supervisor_worker_answers_birth_state_from_ledger() {
-        if !supervisor_gpu_or_skip() {
-            return;
-        }
-        let config = supervisor_test_config();
-        let mut init = supervisor_init(&config, None);
-        init.speed_multiplier = 1_000;
-        let mut worker = Worker::new(init);
-        assert_eq!(worker.birth_states.len(), SUPERVISOR_TEST_AGENTS);
-        supervisor_run_to(&mut worker, 0.05, 3_000);
-        let bits = |s: &AgentBrainState| -> Vec<u32> {
-            s.brain_state
-                .iter()
-                .chain(&s.patterns)
-                .map(|v| v.to_bits())
-                .collect()
-        };
-        let (event_tx, event_rx) = sync_channel(SUPERVISOR_TEST_AGENTS);
-        for slot in 0..SUPERVISOR_TEST_AGENTS {
-            worker.handle_command(
-                SimCommand::RequestBirthState {
-                    agent_index: u32::try_from(slot).expect("fits"),
-                    request_id: u64::try_from(slot).expect("fits"),
-                },
-                &event_tx,
-            );
-            let Ok(SimEvent::BirthState {
-                state: Some(state), ..
-            }) = event_rx.try_recv()
-            else {
-                panic!("slot {slot} should answer a birth state");
-            };
-            let run = worker.supervisor.as_ref().expect("run is live");
-            let ledger = run.birth_state(slot).expect("slot exists");
-            assert_eq!(bits(&state), bits(ledger), "slot {slot}");
-        }
     }
 }

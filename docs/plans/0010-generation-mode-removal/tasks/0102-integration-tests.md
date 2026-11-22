@@ -6,8 +6,8 @@ kind: task
 depends_on: []
 gated: false
 role: developer
-status: todo
-merged_as: ""
+status: done
+merged_as: "5055b8f6debc29196d341d0615a68f3f5260ed58"
 touches:
   - crates/xagent-sandbox/tests/integration.rs
 checks:

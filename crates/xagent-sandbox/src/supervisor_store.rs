@@ -1,6 +1,6 @@
 //! SQLite persistence of a supervisor run.
 //!
-//! The store adds three tables to the governor schema: the occupant of each
+//! The store creates its own run table and three supervisor tables: the occupant of each
 //! slot, the bounded archive of retired lives and an event log. It also adds
 //! six telemetry tables: slot snapshots, boundaries, boundary candidates,
 //! series points, occupant intake and run progress. Every change a
@@ -16,7 +16,6 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Result as SqlRe
 use xagent_brain::buffers::AgentBrainState;
 use xagent_shared::{BrainConfig, FoodKind, FullConfig};
 
-use crate::governor::{decode_brain_state, encode_brain_state, init_schema};
 use crate::supervisor::{
     Archive, ArchiveChange, ArchiveEntry, BoundaryDetail, EligibilityGround, ParentRef,
     ReplaceReason, ReplacementOutcome, ReplacementPlan, SlotLedger,
@@ -28,7 +27,7 @@ use serde_json::json;
 /// Busy timeout of the writer and of a read-only archive load.
 pub const STORE_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
-/// Pragmas the writer connection opens with; they match the governor's.
+/// Pragmas the writer connection opens with; they are the settings every writer connection uses.
 pub const STORE_PRAGMAS: &str =
     "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;";
 
@@ -88,11 +87,29 @@ pub enum StoreError {
         /// Tick the resume asked for.
         requested: u64,
     },
+    /// The database holds a generation-mode run.
+    LegacyGenerations {
+        /// Path of the refused database.
+        path: String,
+        /// Greatest generation stored, when it could be read.
+        generation: Option<u64>,
+    },
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LegacyGenerations { path, generation } => {
+                write!(f, "{path} holds a generation-mode run")?;
+                if let Some(generation) = generation {
+                    write!(f, " (generation {generation})")?;
+                }
+                write!(
+                    f,
+                    ". This version runs only the continuous supervisor and cannot run it. \
+                     The file was not changed; choose another database with --db."
+                )
+            }
             Self::Sqlite(err) => write!(f, "supervisor store query failed: {err}"),
             Self::Encode => write!(f, "brain state could not be encoded"),
             Self::NotFresh => write!(f, "database already holds a run"),
@@ -161,11 +178,14 @@ pub enum ArchiveLoadError {
     },
     /// SQLite reported an error.
     Sqlite(rusqlite::Error),
+    /// The store refused or could not inspect the database.
+    Store(StoreError),
 }
 
 impl fmt::Display for ArchiveLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Store(err) => write!(f, "{err}"),
             Self::NoSupervisorRun => write!(f, "database holds no supervisor run"),
             Self::RankOutOfRange { rank, len } => {
                 write!(f, "rank {rank} is beyond the {len} archived entries")
@@ -189,13 +209,209 @@ impl From<rusqlite::Error> for ArchiveLoadError {
     }
 }
 
-/// Creates the governor schema and, idempotently, the supervisor tables.
+/// Bytes per little-endian word (`u32` header field or `f32` value) in a
+/// stored brain blob.
+const BRAIN_BLOB_WORD_BYTES: usize = 4;
+/// Header words in a stored brain blob: the `brain_state` length and the
+/// `patterns` length, each a little-endian `u32`.
+const BRAIN_BLOB_HEADER_WORDS: usize = 2;
+
+/// Serialize a brain to the stored blob format.
+///
+/// Layout (all little-endian): `u32 brain_state_len`, `u32 patterns_len`, then
+/// `brain_state_len` `f32`s followed by `patterns_len` `f32`s. Returns `None`
+/// if a length does not fit a `u32` or the byte size overflows.
+pub(crate) fn encode_brain_state(state: &AgentBrainState) -> Option<Vec<u8>> {
+    let brain_len = u32::try_from(state.brain_state.len()).ok()?;
+    let pattern_len = u32::try_from(state.patterns.len()).ok()?;
+    let word_count = state
+        .brain_state
+        .len()
+        .checked_add(state.patterns.len())?
+        .checked_add(BRAIN_BLOB_HEADER_WORDS)?;
+    let mut bytes = Vec::with_capacity(word_count.checked_mul(BRAIN_BLOB_WORD_BYTES)?);
+    bytes.extend_from_slice(&brain_len.to_le_bytes());
+    bytes.extend_from_slice(&pattern_len.to_le_bytes());
+    for value in state.brain_state.iter().chain(&state.patterns) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(bytes)
+}
+
+/// Decode a blob written by [`encode_brain_state`]. Returns `None`
+/// when the header is missing or the payload size disagrees with the lengths
+/// the header declares, or when the brain length matches no known layout.
+/// Blobs of the previous layout gain a zero pathway-route block.
+pub(crate) fn decode_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
+    let raw = decode_raw_brain_state(bytes)?;
+    let brain_state = xagent_brain::buffers::upgrade_legacy_brain_state(&raw.brain_state)?;
+    Some(AgentBrainState {
+        brain_state,
+        patterns: raw.patterns,
+    })
+}
+
+/// Decode a blob's framing only, without checking or upgrading
+/// the brain layout. `None` when the header or payload size is malformed.
+fn decode_raw_brain_state(bytes: &[u8]) -> Option<AgentBrainState> {
+    let header_bytes = BRAIN_BLOB_HEADER_WORDS * BRAIN_BLOB_WORD_BYTES;
+    if bytes.len() < header_bytes || bytes.len() % BRAIN_BLOB_WORD_BYTES != 0 {
+        return None;
+    }
+    let read_word = |index: usize| -> [u8; BRAIN_BLOB_WORD_BYTES] {
+        let start = index * BRAIN_BLOB_WORD_BYTES;
+        [
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]
+    };
+    let brain_len = usize::try_from(u32::from_le_bytes(read_word(0))).ok()?;
+    let pattern_len = usize::try_from(u32::from_le_bytes(read_word(1))).ok()?;
+    let expected_words = brain_len
+        .checked_add(pattern_len)?
+        .checked_add(BRAIN_BLOB_HEADER_WORDS)?;
+    if bytes.len() / BRAIN_BLOB_WORD_BYTES != expected_words {
+        return None;
+    }
+    let values: Vec<f32> = (BRAIN_BLOB_HEADER_WORDS..expected_words)
+        .map(|index| f32::from_le_bytes(read_word(index)))
+        .collect();
+    let (brain_state, patterns) = values.split_at(brain_len);
+    Some(AgentBrainState {
+        brain_state: brain_state.to_vec(),
+        patterns: patterns.to_vec(),
+    })
+}
+
+/// What a database file holds, as classified by [`inspect_database`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseKind {
+    /// No file exists at the path.
+    Missing,
+    /// The file holds no run and no generation nodes.
+    Empty,
+    /// The file holds only supervisor runs.
+    Supervisor,
+    /// The file holds a generation-mode run.
+    LegacyGenerations {
+        /// Greatest generation stored, when it could be read.
+        generation: Option<u64>,
+    },
+}
+
+/// Greatest stored node generation, `None` when the query fails or is empty.
+fn max_generation(db: &Connection, node_exists: bool) -> Option<u64> {
+    if !node_exists {
+        return None;
+    }
+    db.query_row("SELECT MAX(generation) FROM node", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+    .and_then(|generation| u64::try_from(generation).ok())
+}
+
+/// Classifies the database at `path` through a read-only immutable
+/// connection, so nothing is created or changed.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Sqlite`] when a query fails.
+pub fn inspect_database(path: &Path) -> Result<DatabaseKind, StoreError> {
+    if let Err(err) = std::fs::metadata(path) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(DatabaseKind::Missing);
+        }
+    }
+    let encoded = path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('#', "%23");
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let db = Connection::open_with_flags(format!("file:{encoded}?immutable=1"), flags)?;
+    let table_exists = |name: &str| -> SqlResult<bool> {
+        db.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+    };
+    let run_exists = table_exists("run")?;
+    let node_exists = table_exists("node")?;
+    let node_rows = if node_exists {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM node)", [], |row| {
+            row.get::<_, bool>(0)
+        })?
+    } else {
+        false
+    };
+    if node_rows {
+        return Ok(DatabaseKind::LegacyGenerations {
+            generation: max_generation(&db, node_exists),
+        });
+    }
+    let mut run_rows = 0_i64;
+    if run_exists {
+        let statement = db.prepare("SELECT * FROM run LIMIT 0")?;
+        let has_mode = statement.column_names().contains(&"mode");
+        drop(statement);
+        run_rows = db.query_row("SELECT COUNT(*) FROM run", [], |row| row.get(0))?;
+        if run_rows > 0 {
+            let foreign = if has_mode {
+                db.query_row(
+                    "SELECT COUNT(*) FROM run WHERE mode IS NULL OR mode <> 'supervisor'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? > 0
+            } else {
+                true
+            };
+            if foreign {
+                return Ok(DatabaseKind::LegacyGenerations {
+                    generation: max_generation(&db, node_exists),
+                });
+            }
+        }
+    }
+    if run_rows == 0 {
+        Ok(DatabaseKind::Empty)
+    } else {
+        Ok(DatabaseKind::Supervisor)
+    }
+}
+
+/// Creates the run table and, idempotently, the supervisor tables.
 ///
 /// # Errors
 ///
 /// Returns the SQLite error when a statement fails.
 pub fn ensure_schema(db: &Connection) -> SqlResult<()> {
-    init_schema(db)?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS run (
+            id INTEGER PRIMARY KEY,
+            seed INTEGER NOT NULL,
+            governor_config TEXT NOT NULL,
+            brain_config TEXT NOT NULL,
+            world_config TEXT NOT NULL,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            wall_time_secs REAL DEFAULT 0,
+            best_score REAL DEFAULT -1,
+            spawn_parent_id INTEGER,
+            momentum_json TEXT DEFAULT '[]',
+            simulation_ticks INTEGER DEFAULT 0,
+            mode TEXT
+        );",
+    )?;
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN momentum_json TEXT DEFAULT '[]';");
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN simulation_ticks INTEGER DEFAULT 0;");
+    let _ = db.execute_batch("ALTER TABLE run ADD COLUMN mode TEXT DEFAULT 'generations';");
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS supervisor_slot (
             run_id INTEGER NOT NULL REFERENCES run(id),
@@ -587,6 +803,15 @@ impl SupervisorStore {
     /// Returns [`StoreError::NotFresh`] when the database already holds a run,
     /// and other [`StoreError`]s when a statement or serialisation fails.
     pub fn create(db_path: &str, config: &FullConfig) -> Result<Self, StoreError> {
+        match inspect_database(Path::new(db_path))? {
+            DatabaseKind::LegacyGenerations { generation } => {
+                return Err(StoreError::LegacyGenerations {
+                    path: db_path.to_owned(),
+                    generation,
+                });
+            }
+            DatabaseKind::Missing | DatabaseKind::Empty | DatabaseKind::Supervisor => {}
+        }
         let mut db = Connection::open(db_path)?;
         db.execute_batch(STORE_PRAGMAS)?;
         ensure_schema(&db)?;
@@ -1104,6 +1329,15 @@ pub fn load_archive_entry_read_only(
     db_path: &str,
     rank: usize,
 ) -> Result<StoredArchiveEntry, ArchiveLoadError> {
+    match inspect_database(Path::new(db_path)).map_err(ArchiveLoadError::Store)? {
+        DatabaseKind::LegacyGenerations { generation } => {
+            return Err(ArchiveLoadError::Store(StoreError::LegacyGenerations {
+                path: db_path.to_owned(),
+                generation,
+            }));
+        }
+        DatabaseKind::Missing | DatabaseKind::Empty | DatabaseKind::Supervisor => {}
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = Connection::open_with_flags(db_path, flags)?;
     db.busy_timeout(STORE_BUSY_TIMEOUT)?;
@@ -1176,11 +1410,9 @@ mod tests {
 
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
-    use xagent_shared::GovernorConfig;
 
     use super::*;
     use crate::agent::fresh_brain_state;
-    use crate::governor::Governor;
     use crate::supervisor::Admission;
 
     /// Seed of the random streams the tests draw brains from.
@@ -1466,15 +1698,39 @@ mod tests {
         hasher.finish()
     }
 
+    /// Generation stored in the legacy fixture's node row.
+    const LEGACY_GENERATION: i64 = 3;
+    /// Divisor that keeps only the leading fraction of a blob when truncating.
+    const TRUNCATED_FRACTION_DIVISOR: usize = 2;
+
+    /// Writes a generation-mode database with raw SQL.
     fn generation_database(path: &str) {
-        let _gov = Governor::new_seeded(
-            path,
-            GovernorConfig::default(),
-            &BrainConfig::default(),
-            "{}",
-            1,
-        )
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(&format!(
+            "CREATE TABLE run (id INTEGER PRIMARY KEY, seed INTEGER NOT NULL,
+                governor_config TEXT NOT NULL, brain_config TEXT NOT NULL,
+                world_config TEXT NOT NULL, mode TEXT DEFAULT 'generations');
+             CREATE TABLE node (id INTEGER PRIMARY KEY, run_id INTEGER,
+                generation INTEGER NOT NULL, config_json TEXT NOT NULL);
+             INSERT INTO run (seed, governor_config, brain_config, world_config)
+                VALUES (1, '{{}}', '{{}}', '{{}}');
+             INSERT INTO node (run_id, generation, config_json)
+                VALUES (1, {LEGACY_GENERATION}, '{{}}');"
+        ))
         .unwrap();
+    }
+
+    fn fresh_state() -> AgentBrainState {
+        let mut rng = SmallRng::seed_from_u64(TEST_BRAIN_SEED);
+        fresh_brain_state(&BrainConfig::default(), &mut rng)
+    }
+
+    /// Range of the pathway block inside a brain state.
+    fn block_range(state: &AgentBrainState) -> std::ops::Range<usize> {
+        let len = state.brain_state.len();
+        let feature_count = xagent_brain::buffers::feature_count_for_brain_stride(len).unwrap();
+        let end = len - feature_count;
+        end - xagent_brain::buffers::PATHWAY_ROUTE_SLOT_COUNT..end
     }
 
     /// Tables the telemetry schema adds.
@@ -1675,7 +1931,12 @@ mod tests {
         let path = db_path(&dir, "old.db");
         let db = Connection::open(&path).unwrap();
         db.execute_batch(STORE_PRAGMAS).unwrap();
-        init_schema(&db).unwrap();
+        db.execute_batch(
+            "CREATE TABLE run (id INTEGER PRIMARY KEY, seed INTEGER NOT NULL,
+                governor_config TEXT NOT NULL, brain_config TEXT NOT NULL,
+                world_config TEXT NOT NULL, mode TEXT);",
+        )
+        .unwrap();
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS supervisor_slot (
             run_id INTEGER NOT NULL REFERENCES run(id),
@@ -1905,7 +2166,7 @@ mod tests {
     fn store_refuses_non_fresh_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = db_path(&dir, "used.db");
-        generation_database(&path);
+        drop(SupervisorStore::create(&path, &supervisor_config()).unwrap());
         let result = SupervisorStore::create(&path, &supervisor_config());
         assert!(matches!(result, Err(StoreError::NotFresh)));
         let db = Connection::open(&path).unwrap();
@@ -1913,22 +2174,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM run", [], |row| row.get(0))
             .unwrap();
         assert_eq!(runs, 1);
-    }
-
-    #[test]
-    fn store_schema_on_generation_database_keeps_it_resumable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = db_path(&dir, "resumable.db");
-        generation_database(&path);
-        let db = Connection::open(&path).unwrap();
-        ensure_schema(&db).unwrap();
-        drop(db);
-        assert!(Governor::resume(&path).is_ok());
-        let db = Connection::open(&path).unwrap();
-        let mode: String = db
-            .query_row("SELECT mode FROM run", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(mode, "generations");
     }
 
     #[test]
@@ -2002,12 +2247,133 @@ mod tests {
     }
 
     #[test]
-    fn archive_loader_rejects_generation_database() {
+    fn archive_loader_refuses_legacy() {
         let dir = tempfile::tempdir().unwrap();
         let path = db_path(&dir, "generations.db");
         generation_database(&path);
         let result = load_archive_entry_read_only(&path, 0);
-        assert!(matches!(result, Err(ArchiveLoadError::NoSupervisorRun)));
+        assert!(matches!(
+            result,
+            Err(ArchiveLoadError::Store(StoreError::LegacyGenerations {
+                generation: Some(generation),
+                ..
+            })) if generation.cast_signed() == LEGACY_GENERATION
+        ));
+    }
+
+    #[test]
+    fn inspect_missing_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "missing.db");
+        let kind = inspect_database(Path::new(&path)).unwrap();
+        assert_eq!(kind, DatabaseKind::Missing);
+        assert!(!Path::new(&path).exists());
+    }
+
+    #[test]
+    fn inspect_empty_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "empty.db");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            inspect_database(Path::new(&path)).unwrap(),
+            DatabaseKind::Empty
+        );
+    }
+
+    #[test]
+    fn inspect_supervisor_run_is_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "sup.db");
+        let store = SupervisorStore::create(&path, &supervisor_config()).unwrap();
+        drop(store);
+        assert_eq!(
+            inspect_database(Path::new(&path)).unwrap(),
+            DatabaseKind::Supervisor
+        );
+    }
+
+    #[test]
+    fn inspect_generation_db_is_legacy_with_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "gen.db");
+        generation_database(&path);
+        assert_eq!(
+            inspect_database(Path::new(&path)).unwrap(),
+            DatabaseKind::LegacyGenerations {
+                generation: Some(u64::try_from(LEGACY_GENERATION).unwrap())
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_premode_run_row_is_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "premode.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE run (id INTEGER PRIMARY KEY, seed INTEGER NOT NULL);
+             INSERT INTO run (seed) VALUES (1);",
+        )
+        .unwrap();
+        drop(db);
+        assert_eq!(
+            inspect_database(Path::new(&path)).unwrap(),
+            DatabaseKind::LegacyGenerations { generation: None }
+        );
+    }
+
+    #[test]
+    fn create_refuses_legacy_and_leaves_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir, "legacy.db");
+        generation_database(&path);
+        let before = std::fs::read(&path).unwrap();
+        let listing = |dir: &tempfile::TempDir| {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let names = listing(&dir);
+        let result = SupervisorStore::create(&path, &supervisor_config());
+        assert!(matches!(result, Err(StoreError::LegacyGenerations { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(listing(&dir), names);
+    }
+
+    #[test]
+    fn codec_legacy_blob_upgrades() {
+        let current = fresh_state();
+        let range = block_range(&current);
+        let mut legacy = current.clone();
+        legacy.brain_state.drain(range.clone());
+        let bytes = encode_brain_state(&legacy).unwrap();
+        let loaded = decode_brain_state(&bytes).unwrap();
+        assert_eq!(loaded.brain_state.len(), current.brain_state.len());
+        assert!(loaded.brain_state[range.clone()].iter().all(|v| *v == 0.0));
+        let mut without_block = loaded.brain_state.clone();
+        without_block.drain(range);
+        assert_eq!(without_block, legacy.brain_state);
+        assert_eq!(loaded.patterns, legacy.patterns);
+    }
+
+    #[test]
+    fn codec_current_blob_roundtrips() {
+        let current = fresh_state();
+        let bytes = encode_brain_state(&current).unwrap();
+        let loaded = decode_brain_state(&bytes).unwrap();
+        assert_eq!(loaded.brain_state, current.brain_state);
+        assert_eq!(loaded.patterns, current.patterns);
+    }
+
+    #[test]
+    fn codec_wrong_layout_rejected() {
+        let bytes = encode_brain_state(&fresh_state()).unwrap();
+        let truncated = &bytes[..bytes.len() / TRUNCATED_FRACTION_DIVISOR];
+        assert!(decode_brain_state(truncated).is_none());
     }
 
     #[test]

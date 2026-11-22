@@ -1,4 +1,4 @@
-//! Food-kind free life: champion guard, frozen control and summary file.
+//! Food-kind free life: frozen control and summary file.
 
 use std::path::PathBuf;
 
@@ -6,8 +6,7 @@ use xagent_brain::buffers::TrunkLesions;
 use xagent_brain::GpuKernel;
 use xagent_sandbox::food_kind_metrics::{Arm, RunFoodKindSummary};
 use xagent_sandbox::headless::{
-    run_free_life_food_kind, BrainSource, FoodKindOutcome, FoodKindRun, FreeLifeError,
-    FreeLifeOptions,
+    run_free_life_food_kind, BrainSource, FoodKindOutcome, FoodKindRun, FreeLifeOptions,
 };
 use xagent_sandbox::world::WorldState;
 use xagent_shared::FullConfig;
@@ -67,29 +66,6 @@ fn run(config: &FullConfig, freeze: bool, path: Option<PathBuf>) -> FoodKindOutc
 }
 
 #[test]
-fn food_kind_free_life_refuses_champion_brain() {
-    let config = FullConfig::default();
-    let opts = FreeLifeOptions {
-        agent_count: TEST_AGENTS,
-        ticks: TARGET_TICKS,
-        seed: TEST_SEED,
-        brain_source: BrainSource::Champion {
-            db_path: "no-such-governor.db".to_string(),
-            node_id: None,
-        },
-        lesions: TrunkLesions::NONE,
-        log_path: None,
-    };
-    let run = FoodKindRun {
-        freeze_policy: false,
-        summary_path: None,
-    };
-    let err = run_free_life_food_kind(&config, &opts, &run).expect_err("champion is refused");
-    assert!(matches!(err, FreeLifeError::FoodKindChampion));
-    assert!(err.to_string().contains("--food-kinds"), "{err}");
-}
-
-#[test]
 fn food_kind_free_life_frozen_arm_keeps_turn_weights() {
     if !gpu_or_skip() {
         return;
@@ -129,10 +105,10 @@ fn food_kind_free_life_summary_is_complete() {
         return;
     }
     let config = FullConfig::default();
-    let path = std::env::temp_dir().join(format!("{SUMMARY_FILE}-{}.json", std::process::id()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(SUMMARY_FILE);
     let outcome = run(&config, false, Some(path.clone()));
     let text = std::fs::read_to_string(&path).expect("summary file is written");
-    let _removed = std::fs::remove_file(&path);
     let summary: RunFoodKindSummary = serde_json::from_str(&text).expect("summary parses");
     assert_eq!(summary, outcome.summary);
     assert_eq!(summary.agent_count, TEST_AGENTS);

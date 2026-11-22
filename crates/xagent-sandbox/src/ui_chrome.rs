@@ -54,12 +54,6 @@ pub(crate) fn draw_top_bar(
                 EvolutionState::Idle => {
                     ui.label(egui::RichText::new("⏹ IDLE").color(egui::Color32::GRAY));
                 }
-                EvolutionState::HasSession { generation } => {
-                    ui.label(
-                        egui::RichText::new(format!("💾 SESSION @ Gen {}", generation))
-                            .color(egui::Color32::from_rgb(100, 180, 255)),
-                    );
-                }
                 EvolutionState::Running => {
                     ui.label(
                         egui::RichText::new("▶ RUNNING")

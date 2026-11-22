@@ -17,11 +17,10 @@ use super::{
     TimelineEvent, TimelineKind, MAX_ARCHIVE_ROWS, MAX_BOUNDARY_RECORDS, MAX_DISPLAY_TEXT_BYTES,
     MAX_INTAKE_POINTS, MAX_SERIES_POINTS, MAX_SLOTS, MAX_TIMELINE_EVENTS, MAX_TRACKED_OCCUPANTS,
 };
-use crate::governor::decode_brain_state;
 use crate::supervisor::ParentRef as SourceParent;
 use crate::supervisor_store::{
-    EVENT_ARCHIVE, EVENT_EVICT, EVENT_IDLE, EVENT_REPLACE, EVENT_SEASON, MODE_SUPERVISOR,
-    STORE_BUSY_TIMEOUT,
+    decode_brain_state, EVENT_ARCHIVE, EVENT_EVICT, EVENT_IDLE, EVENT_REPLACE, EVENT_SEASON,
+    MODE_SUPERVISOR, STORE_BUSY_TIMEOUT,
 };
 use crate::supervisor_telemetry::{IntakeRow, Metric, ProgressRecord};
 

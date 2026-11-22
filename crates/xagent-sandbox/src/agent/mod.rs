@@ -671,8 +671,8 @@ pub fn mutate_steering_weights_for(
 }
 
 /// One brain per agent. Group 0 keeps `template`. Each later group of
-/// `group_size` agents shares one [`mutate_steering_weights`] draw, matching
-/// the way fitness is averaged over `eval_repeats` slots.
+/// `group_size` agents shares one [`mutate_steering_weights`] draw,
+/// so every agent in a group starts from the same mutated weights.
 pub fn steering_population(
     template: &AgentBrainState,
     count: usize,

@@ -13,8 +13,8 @@ touches:
   - crates/xagent-sandbox/tests/free_life.rs
   - crates/xagent-sandbox/tests/food_kind_free_life.rs
   - crates/xagent-sandbox/tests/lesion_matrix_record.rs
-status: todo
-merged_as: ""
+status: done
+merged_as: "7009df924124e7afbca6e39e14bb1c47ca7ed320"
 checks:
   - name: focused-proof
     command: "env XAGENT_REQUIRE_GPU=1 cargo test -p xagent-sandbox --test archive_free_life --test free_life --test food_kind_free_life"

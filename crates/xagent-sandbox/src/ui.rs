@@ -137,8 +137,6 @@ pub struct AgentSnapshot {
 pub enum EvolutionState {
     /// No session in the DB — user should configure params and press Start.
     Idle,
-    /// A previous session was found — show summary, offer Resume or Reset.
-    HasSession { generation: u32 },
     /// Evolution is actively running.
     Running,
     /// Evolution is paused (user hit Pause).
@@ -189,6 +187,7 @@ pub enum SessionChoice {
 pub enum EvolutionAction {
     None,
     Start,
+    /// Answers the legacy-database modal with "Start in a new file".
     Resume,
     Pause,
     Unpause,
@@ -240,27 +239,12 @@ pub struct EvolutionSnapshot {
     pub gen_tick: u64,
     pub tick_budget: u64,
     pub population_size: usize,
-    pub elitism_count: usize,
-    pub patience: u32,
-    pub max_generations: u64,
-    pub eval_repeats: usize,
-    pub num_islands: usize,
-    pub migration_interval: u32,
     pub wall_time_secs: f64,
     /// Simulated time of the current session: ticks advanced divided by
     /// [`SIMULATION_TICKS_PER_SECOND`].
     pub simulation_time_secs: f64,
     pub ticks_per_sec: f64,
     pub best_fitness: f32,
-    pub tree_nodes: Vec<crate::governor::TreeNode>,
-    pub current_node_id: Option<i64>,
-    pub current_config: Option<xagent_shared::BrainConfig>,
-    pub fitness_history: std::collections::HashMap<i64, Vec<(u32, f32, f32)>>, // island_id → (generation, best, avg)
-    /// Per-generation hazard-avoidance measures, oldest first.
-    pub hazard_history: Vec<crate::governor::HazardPoint>,
-    pub selected_node_id: Option<i64>,
-    /// Fraction of available width for the tree pane (0.0–1.0). Persisted across frames.
-    pub tree_pane_fraction: f32,
     // Editable fields for Idle state (pre-start configuration)
     pub edit_brain: xagent_shared::BrainConfig,
     pub edit_governor: xagent_shared::GovernorConfig,
@@ -281,9 +265,16 @@ pub struct EvolutionSnapshot {
     pub supervisor_session: Option<crate::observatory::store_read::SupervisorRunSummary>,
     /// Why a live resume failed, shown in the session dialog.
     pub supervisor_resume_error: Option<String>,
+    /// The database is a legacy generations file: `supervisor_resume_error`
+    /// holds the store's message and the modal offers "Quit" or a new file.
+    pub legacy_choice: bool,
     /// The user's dialog choice.
     pub session_choice: SessionChoice,
 }
+
+/// Default `EvolutionSnapshot::tick_budget` shown before a run starts; the
+/// default UI displays this per-generation budget.
+const DEFAULT_SNAPSHOT_TICK_BUDGET: u64 = 1_000_000;
 
 impl Default for EvolutionSnapshot {
     fn default() -> Self {
@@ -291,25 +282,12 @@ impl Default for EvolutionSnapshot {
             state: EvolutionState::Idle,
             generation: 0,
             gen_tick: 0,
-            tick_budget: xagent_shared::GovernorConfig::default().tick_budget,
+            tick_budget: DEFAULT_SNAPSHOT_TICK_BUDGET,
             population_size: 10,
-            elitism_count: 3,
-            patience: 5,
-            max_generations: 0,
-            eval_repeats: 2,
-            num_islands: 3,
-            migration_interval: 5,
             wall_time_secs: 0.0,
             simulation_time_secs: 0.0,
             ticks_per_sec: 0.0,
             best_fitness: -1.0,
-            tree_nodes: Vec::new(),
-            current_node_id: None,
-            current_config: None,
-            fitness_history: std::collections::HashMap::new(),
-            hazard_history: Vec::new(),
-            selected_node_id: None,
-            tree_pane_fraction: 0.25,
             edit_brain: xagent_shared::BrainConfig::default(),
             edit_governor: xagent_shared::GovernorConfig::default(),
             // Conservative floor before the renderer reports the real adapter
@@ -323,6 +301,7 @@ impl Default for EvolutionSnapshot {
             observatory_view: ObservatoryViewState::default(),
             supervisor_session: None,
             supervisor_resume_error: None,
+            legacy_choice: false,
             session_choice: SessionChoice::None,
         }
     }
@@ -509,8 +488,6 @@ pub struct TabContext<'a> {
     pub evolution: &'a mut EvolutionSnapshot,
     pub evolution_action: &'a mut EvolutionAction,
     pub world: &'a WorldSnapshot,
-    pub replay: &'a mut ReplayState,
-    pub recording: Option<&'a crate::replay::GenerationRecording>,
     pub orbit_mode: &'a mut bool,
 }
 
@@ -800,8 +777,6 @@ impl<'a> egui_dock::TabViewer for TabContext<'a> {
                                 self.chart_window,
                                 self.world,
                                 self.agents,
-                                self.replay,
-                                self.recording,
                             );
                         });
                 } else {
@@ -823,8 +798,6 @@ impl<'a> TabContext<'a> {
         chart_window: &mut usize,
         world: &WorldSnapshot,
         all_agents: &[AgentSnapshot],
-        replay: &mut ReplayState,
-        recording: Option<&crate::replay::GenerationRecording>,
     ) {
         let color = egui::Color32::from_rgb(
             (snap.color[0] * 255.0) as u8,
@@ -855,218 +828,9 @@ impl<'a> TabContext<'a> {
         });
         ui.separator();
 
-        // ── Replay Controls ──
-        if let Some(rec) = recording {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if replay.active {
-                    if ui.button("Live").clicked() {
-                        replay.active = false;
-                        replay.playing = false;
-                    }
-                } else if ui
-                    .button(format!("Replay Gen {}", rec.generation))
-                    .clicked()
-                {
-                    replay.active = true;
-                    replay.current_tick = 0;
-                    replay.total_ticks = rec.total_ticks;
-                    replay.playing = false;
-                    replay.selected_agent_idx = rec
-                        .agent_info
-                        .iter()
-                        .position(|(id, _)| *id == snap.id)
-                        .unwrap_or(0);
-                }
-
-                if replay.active {
-                    ui.separator();
-                    if replay.playing {
-                        if ui.button("Pause").clicked() {
-                            replay.playing = false;
-                        }
-                    } else if ui.button("Play").clicked() {
-                        replay.playing = true;
-                    }
-
-                    if ui.button("Reset").clicked() {
-                        replay.current_tick = 0;
-                    }
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("Speed:").small());
-                    for &spd in &[0.5_f32, 1.0, 2.0, 4.0, 8.0] {
-                        let label = if spd == 1.0 {
-                            "1x".to_string()
-                        } else {
-                            format!("{}x", spd)
-                        };
-                        if ui
-                            .selectable_label((replay.speed - spd).abs() < 0.01, &label)
-                            .clicked()
-                        {
-                            replay.speed = spd;
-                        }
-                    }
-
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Tick {}/{}",
-                            replay.current_tick, replay.total_ticks
-                        ))
-                        .monospace()
-                        .small(),
-                    );
-                }
-            });
-
-            if replay.active {
-                let mut tick_f = replay.current_tick as f32;
-                let max_f = replay.total_ticks.saturating_sub(1).max(1) as f32;
-                ui.add(egui::Slider::new(&mut tick_f, 0.0..=max_f).show_value(false));
-                replay.current_tick = tick_f as u64;
-            }
-            ui.separator();
-        }
-
-        // If replay is active, build snapshot from recording
-        let replay_snap;
-        let effective_snap = if replay.active {
-            if let Some(rec) = recording {
-                if let Some(record) = rec.get(replay.current_tick, replay.selected_agent_idx) {
-                    let (id, color) = rec.agent_info[replay.selected_agent_idx];
-                    replay_snap = AgentSnapshot {
-                        id,
-                        generation: rec.generation,
-                        energy: record.energy,
-                        max_energy: 1.0,
-                        integrity: record.integrity,
-                        max_integrity: 1.0,
-                        alive: record.alive,
-                        deaths: 0,
-                        color,
-                        longest_life: 0,
-                        exploration_rate: record.exploration_rate,
-                        prediction_error: record.prediction_error,
-                        forward_weight_norm: 0.0,
-                        turn_weight_norm: 0.0,
-                        prediction_error_history: Vec::new(),
-                        exploration_rate_history: Vec::new(),
-                        energy_history: Vec::new(),
-                        integrity_history: Vec::new(),
-
-                        gradient: record.gradient,
-                        urgency: record.urgency,
-                        food_consumed: 0,
-                        total_ticks_alive: replay.current_tick,
-                        motor_forward: record.motor_forward,
-                        motor_turn: record.motor_turn,
-                        phase: crate::replay::GenerationRecording::phase_label(record.phase),
-                        vision_color: record.vision_color.clone().unwrap_or_default(),
-                        vision_width: rec.vision_width,
-                        vision_height: rec.vision_height,
-                        position: record.position,
-                        yaw: record.yaw,
-                        mean_attenuation: record.mean_attenuation,
-                        curiosity_bonus: record.curiosity_bonus,
-                        fatigue_factor: record.fatigue_factor,
-                        staleness: record.staleness,
-                        fatigue_history: Vec::new(),
-                    };
-                    &replay_snap
-                } else {
-                    snap
-                }
-            } else {
-                snap
-            }
-        } else {
-            snap
-        };
-
-        // Build effective world for replay (food positions from recording)
-        let replay_world;
-        let effective_world = if replay.active {
-            if let Some(rec) = recording {
-                let food = rec.food_at_tick(replay.current_tick);
-                replay_world = WorldSnapshot {
-                    world_size: world.world_size,
-                    food_positions: food
-                        .iter()
-                        .filter(|(_, consumed)| !consumed)
-                        .map(|(p, _)| [p[0], p[2]])
-                        .collect(),
-                    biome_texture: world.biome_texture.clone(),
-                };
-                &replay_world
-            } else {
-                world
-            }
-        } else {
-            world
-        };
-
-        // Build effective agents for replay (all agents at this tick)
-        let replay_agents;
-        let effective_agents = if replay.active {
-            if let Some(rec) = recording {
-                if let Some(tick_records) = rec.get_tick(replay.current_tick) {
-                    replay_agents = tick_records
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
-                            let (id, color) = rec.agent_info[i];
-                            AgentSnapshot {
-                                id,
-                                generation: rec.generation,
-                                energy: r.energy,
-                                max_energy: 1.0,
-                                integrity: r.integrity,
-                                max_integrity: 1.0,
-                                alive: r.alive,
-                                deaths: 0,
-                                color,
-                                longest_life: 0,
-                                exploration_rate: r.exploration_rate,
-                                prediction_error: r.prediction_error,
-                                forward_weight_norm: 0.0,
-                                turn_weight_norm: 0.0,
-                                prediction_error_history: Vec::new(),
-                                exploration_rate_history: Vec::new(),
-                                energy_history: Vec::new(),
-                                integrity_history: Vec::new(),
-
-                                gradient: r.gradient,
-                                urgency: r.urgency,
-                                food_consumed: 0,
-                                total_ticks_alive: 0,
-                                motor_forward: r.motor_forward,
-                                motor_turn: r.motor_turn,
-                                phase: crate::replay::GenerationRecording::phase_label(r.phase),
-                                vision_color: Vec::new(),
-                                vision_width: rec.vision_width,
-                                vision_height: rec.vision_height,
-                                position: r.position,
-                                yaw: r.yaw,
-                                mean_attenuation: r.mean_attenuation,
-                                curiosity_bonus: r.curiosity_bonus,
-                                fatigue_factor: r.fatigue_factor,
-                                staleness: r.staleness,
-                                fatigue_history: Vec::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    &replay_agents[..]
-                } else {
-                    all_agents
-                }
-            } else {
-                all_agents
-            }
-        } else {
-            all_agents
-        };
+        let effective_snap = snap;
+        let effective_world = world;
+        let effective_agents = all_agents;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // -- Vitals + Motor --
@@ -1558,6 +1322,10 @@ impl<'a> TabContext<'a> {
 
         let state = evo.state.clone();
         match state {
+            EvolutionState::Idle if evo.legacy_choice => {
+                action = Self::render_legacy_modal(ui, evo);
+            }
+
             EvolutionState::Idle => {
                 ui.heading("🧬 New Evolution Run");
                 ui.add_space(8.0);
@@ -1578,44 +1346,6 @@ impl<'a> TabContext<'a> {
                 }
             }
 
-            EvolutionState::HasSession { generation } => {
-                ui.heading("🧬 Previous Session Found");
-                ui.add_space(8.0);
-                ui.label(format!(
-                    "An evolution run was found at generation {}.",
-                    generation,
-                ));
-                ui.add_space(8.0);
-
-                Self::render_config_summary(ui, evo);
-                ui.add_space(12.0);
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("▶  Resume").strong())
-                                .min_size(egui::vec2(140.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = EvolutionAction::Resume;
-                    }
-                    ui.add_space(16.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("🗑  Reset & Start Fresh")
-                                    .color(egui::Color32::from_rgb(220, 80, 80)),
-                            )
-                            .min_size(egui::vec2(180.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = EvolutionAction::Reset;
-                    }
-                });
-            }
-
             EvolutionState::Running | EvolutionState::Paused => {
                 Self::render_running_dashboard(ui, evo);
             }
@@ -1631,6 +1361,25 @@ impl<'a> TabContext<'a> {
             }
         }
 
+        action
+    }
+
+    /// The legacy-database modal: the store's message with "Quit" and
+    /// "Start in a new file". The second answer is the `Resume` action.
+    fn render_legacy_modal(ui: &mut egui::Ui, evo: &EvolutionSnapshot) -> EvolutionAction {
+        let mut action = EvolutionAction::None;
+        if let Some(body) = &evo.supervisor_resume_error {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), body);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Quit").clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if ui.button("Start in a new file").clicked() {
+                action = EvolutionAction::Resume;
+            }
+        });
         action
     }
 
@@ -1685,19 +1434,6 @@ impl<'a> TabContext<'a> {
     }
 
     fn render_config_editor(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
-        ui.horizontal(|ui| {
-            ui.label("Mode");
-            ui.radio_value(
-                &mut evo.edit_governor.evolution_mode,
-                xagent_shared::EvolutionMode::Generations,
-                "Generations",
-            );
-            ui.radio_value(
-                &mut evo.edit_governor.evolution_mode,
-                xagent_shared::EvolutionMode::Supervisor,
-                "Supervisor",
-            );
-        });
         ui.collapsing("🧠 Brain Config", |ui| {
             egui::Grid::new("brain_edit_grid")
                 .num_columns(2)
@@ -1934,745 +1670,14 @@ impl<'a> TabContext<'a> {
                     ui.add(egui::DragValue::new(&mut ps).range(1..=100).speed(1));
                     g.population_size = ps.max(1) as usize;
                     ui.end_row();
-
-                    ui.label("tick_budget");
-                    let mut tb = g.tick_budget as i64;
-                    ui.add(
-                        egui::DragValue::new(&mut tb)
-                            .range(1000..=1_000_000)
-                            .speed(1000),
-                    );
-                    g.tick_budget = tb.max(1000) as u64;
-                    ui.end_row();
-
-                    ui.label("elitism_count");
-                    let mut ec = g.elitism_count as i32;
-                    ui.add(egui::DragValue::new(&mut ec).range(1..=50).speed(1));
-                    g.elitism_count = ec.max(1) as usize;
-                    ui.end_row();
-
-                    ui.label("max_generations");
-                    let mut mg = g.max_generations as i64;
-                    ui.add(egui::DragValue::new(&mut mg).range(0..=100_000).speed(1));
-                    g.max_generations = mg.max(0) as u64;
-                    ui.end_row();
-
-                    ui.label("patience");
-                    let mut p = g.patience as i32;
-                    ui.add(egui::DragValue::new(&mut p).range(1..=20).speed(1));
-                    g.patience = p.max(1) as u32;
-                    ui.end_row();
-
-                    ui.label("eval_repeats");
-                    let mut er = g.eval_repeats as i32;
-                    ui.add(egui::DragValue::new(&mut er).range(1..=5).speed(1));
-                    g.eval_repeats = er.max(1) as usize;
-                    ui.end_row();
-
-                    ui.label("num_islands");
-                    let mut ni = g.num_islands as i32;
-                    ui.add(egui::DragValue::new(&mut ni).range(1..=10).speed(1));
-                    g.num_islands = ni.max(1) as usize;
-                    ui.end_row();
-
-                    ui.label("migration_interval");
-                    let mut mi = g.migration_interval as i32;
-                    ui.add(egui::DragValue::new(&mut mi).range(0..=50).speed(1));
-                    g.migration_interval = mi.max(0) as u32;
-                    ui.end_row();
                 });
         });
-    }
-
-    fn render_config_summary(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
-        if let Some(cfg) = &evo.current_config {
-            ui.collapsing("🧠 Brain Config", |ui| {
-                egui::Grid::new("brain_summary_grid")
-                    .num_columns(2)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("memory_capacity")
-                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.memory_capacity));
-                        ui.end_row();
-                        ui.label("processing_slots")
-                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.processing_slots));
-                        ui.end_row();
-                        ui.label("learning_rate");
-                        ui.monospace(format!("{:.5}", cfg.learning_rate));
-                        ui.end_row();
-                        ui.label("decay_rate");
-                        ui.monospace(format!("{:.5}", cfg.decay_rate));
-                        ui.end_row();
-                    });
-            });
-        }
-
-        ui.collapsing("⚙ Governor Config", |ui| {
-            egui::Grid::new("gov_summary_grid")
-                .num_columns(2)
-                .spacing([20.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("population_size");
-                    ui.monospace(format!("{}", evo.population_size));
-                    ui.end_row();
-                    ui.label("tick_budget");
-                    ui.monospace(format!("{}", evo.tick_budget));
-                    ui.end_row();
-                    ui.label("elitism_count");
-                    ui.monospace(format!("{}", evo.elitism_count));
-                    ui.end_row();
-                    ui.label("max_generations");
-                    ui.monospace(format!("{}", evo.max_generations));
-                    ui.end_row();
-                    ui.label("patience");
-                    ui.monospace(format!("{}", evo.patience));
-                    ui.end_row();
-                    ui.label("eval_repeats");
-                    ui.monospace(format!("{}", evo.eval_repeats));
-                    ui.end_row();
-                    ui.label("num_islands");
-                    ui.monospace(format!("{}", evo.num_islands));
-                    ui.end_row();
-                    ui.label("migration_interval");
-                    ui.monospace(format!("{}", evo.migration_interval));
-                    ui.end_row();
-                });
-        });
-
-        if !evo.fitness_history.is_empty() {
-            Self::render_fitness_chart(ui, &evo.fitness_history);
-        }
-        if !evo.hazard_history.is_empty() {
-            Self::render_hazard_chart(ui, &evo.hazard_history);
-        }
-
-        if !evo.tree_nodes.is_empty() {
-            ui.collapsing("Evolution Tree", |ui| {
-                Self::render_tree(
-                    ui,
-                    &evo.tree_nodes,
-                    evo.current_node_id,
-                    &mut evo.selected_node_id,
-                );
-            });
-        }
     }
 
     fn render_running_dashboard(ui: &mut egui::Ui, evo: &mut EvolutionSnapshot) {
         if evo.supervisor.is_some() {
             Self::render_observatory_for(ui, evo);
-            return;
         }
-        // ── Fitness chart at top of tab (always visible) ────────
-        if !evo.fitness_history.is_empty() {
-            Self::render_fitness_chart(ui, &evo.fitness_history);
-        }
-        if !evo.hazard_history.is_empty() {
-            Self::render_hazard_chart(ui, &evo.hazard_history);
-        }
-
-        let tree_has_nodes = !evo.tree_nodes.is_empty();
-
-        if tree_has_nodes {
-            let tree_nodes = evo.tree_nodes.clone();
-            let current_node_id = evo.current_node_id;
-
-            let selected_node_id = evo.selected_node_id;
-            let generation = evo.generation;
-            let current_config = &evo.current_config;
-
-            // Reserve the full remaining rect for the two-pane layout
-            let pane_rect = ui.available_rect_before_wrap();
-            let gap = 4.0;
-            let sep_x = pane_rect.left() + pane_rect.width() * evo.tree_pane_fraction;
-
-            // Draggable separator
-            let sep_interact_rect =
-                egui::Rect::from_x_y_ranges((sep_x - gap)..=(sep_x + gap), pane_rect.y_range());
-            let sep_id = ui.id().with("evo_pane_sep");
-            let sep_sense = ui.interact(sep_interact_rect, sep_id, egui::Sense::drag());
-            if sep_sense.dragged() {
-                let new_x = sep_x + sep_sense.drag_delta().x;
-                evo.tree_pane_fraction =
-                    ((new_x - pane_rect.left()) / pane_rect.width()).clamp(0.15, 0.85);
-            }
-            if sep_sense.hovered() || sep_sense.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
-            ui.painter().vline(
-                sep_x,
-                pane_rect.y_range(),
-                ui.visuals().widgets.noninteractive.bg_stroke,
-            );
-
-            // Left pane: tree
-            let left_rect =
-                egui::Rect::from_x_y_ranges(pane_rect.left()..=(sep_x - gap), pane_rect.y_range());
-            let vertical = egui::Layout::top_down(egui::Align::LEFT);
-            let mut left_ui =
-                ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(vertical));
-            left_ui.group(|ui| {
-                ui.set_min_size(egui::vec2(
-                    left_rect.width() - 8.0,
-                    left_rect.height() - 8.0,
-                ));
-                ui.label(egui::RichText::new("Evolution Tree").strong().size(13.0));
-                ui.add_space(4.0);
-                let scroll_width = ui.available_width();
-                egui::ScrollArea::both()
-                    .id_salt("evo_tree_scroll")
-                    .min_scrolled_width(scroll_width)
-                    .show(ui, |ui| {
-                        ui.set_min_width(scroll_width);
-                        Self::render_tree(
-                            ui,
-                            &tree_nodes,
-                            current_node_id,
-                            &mut evo.selected_node_id,
-                        );
-                    });
-            });
-
-            // Right pane: detail / overview
-            let right_rect =
-                egui::Rect::from_x_y_ranges((sep_x + gap)..=pane_rect.right(), pane_rect.y_range());
-            let mut right_ui =
-                ui.new_child(egui::UiBuilder::new().max_rect(right_rect).layout(vertical));
-            right_ui.group(|ui| {
-                ui.set_min_size(egui::vec2(
-                    right_rect.width() - 8.0,
-                    right_rect.height() - 8.0,
-                ));
-                if let Some(sel_id) = selected_node_id {
-                    let heading_text = tree_nodes
-                        .iter()
-                        .find(|n| n.id == sel_id)
-                        .map(|n| format!("Generation {}", n.generation))
-                        .unwrap_or_else(|| format!("Generation {}", generation));
-                    ui.heading(heading_text);
-                } else {
-                    ui.heading(format!("Generation {}", generation));
-                }
-                ui.add_space(4.0);
-                let scroll_width = ui.available_width();
-                egui::ScrollArea::vertical()
-                    .id_salt("evo_detail_scroll")
-                    .min_scrolled_width(scroll_width)
-                    .show(ui, |ui| {
-                        ui.set_min_width(scroll_width);
-                        if let Some(sel_id) = selected_node_id {
-                            Self::render_node_detail(ui, &tree_nodes, sel_id);
-                        }
-
-                        if let Some(cfg) = current_config {
-                            ui.collapsing("Best Config", |ui| {
-                                egui::Grid::new("config_grid")
-                                    .num_columns(2)
-                                    .spacing([20.0, 4.0])
-                                    .show(ui, |ui| {
-                                        ui.label("memory_capacity")
-                                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
-                                        ui.monospace(format!("{}", cfg.memory_capacity));
-                                        ui.end_row();
-                                        ui.label("processing_slots")
-                                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
-                                        ui.monospace(format!("{}", cfg.processing_slots));
-                                        ui.end_row();
-                                        ui.label("learning_rate");
-                                        ui.monospace(format!("{:.5}", cfg.learning_rate));
-                                        ui.end_row();
-                                        ui.label("decay_rate");
-                                        ui.monospace(format!("{:.5}", cfg.decay_rate));
-                                        ui.end_row();
-                                    });
-                            });
-                            ui.add_space(4.0);
-                        }
-                    });
-            });
-
-            // Tell the parent layout we consumed the full rect
-            ui.advance_cursor_after_rect(pane_rect);
-        } else {
-            ui.heading(format!("Generation {}", evo.generation));
-            ui.add_space(4.0);
-            if let Some(cfg) = &evo.current_config {
-                ui.collapsing("Best Config", |ui| {
-                    egui::Grid::new("config_grid")
-                        .num_columns(2)
-                        .spacing([20.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("memory_capacity")
-                                .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
-                            ui.monospace(format!("{}", cfg.memory_capacity));
-                            ui.end_row();
-                            ui.label("processing_slots")
-                                .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
-                            ui.monospace(format!("{}", cfg.processing_slots));
-                            ui.end_row();
-                            ui.label("learning_rate");
-                            ui.monospace(format!("{:.5}", cfg.learning_rate));
-                            ui.end_row();
-                            ui.label("decay_rate");
-                            ui.monospace(format!("{:.5}", cfg.decay_rate));
-                            ui.end_row();
-                        });
-                });
-                ui.add_space(4.0);
-            }
-        }
-    }
-
-    fn render_fitness_chart(
-        ui: &mut egui::Ui,
-        fitness_history: &std::collections::HashMap<i64, Vec<(u32, f32, f32)>>,
-    ) {
-        {
-            let ui = &mut *ui;
-            let avail = ui.available_width().max(200.0);
-            let chart_height = 150.0;
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(avail, chart_height), egui::Sense::hover());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
-
-            if fitness_history.is_empty() {
-                return;
-            }
-
-            // Per-island colors (up to 8 islands, wraps)
-            let island_colors = [
-                egui::Color32::from_rgb(50, 200, 80),   // green
-                egui::Color32::from_rgb(80, 140, 255),  // blue
-                egui::Color32::from_rgb(255, 140, 50),  // orange
-                egui::Color32::from_rgb(200, 80, 200),  // purple
-                egui::Color32::from_rgb(255, 220, 50),  // yellow
-                egui::Color32::from_rgb(50, 220, 220),  // cyan
-                egui::Color32::from_rgb(255, 80, 80),   // red
-                egui::Color32::from_rgb(180, 180, 180), // grey
-            ];
-
-            // Find global max fitness and generation range across all islands
-            let mut global_max_fit: f32 = 0.01;
-            let mut global_min_gen: u32 = u32::MAX;
-            let mut global_max_gen: u32 = 0;
-            for points in fitness_history.values() {
-                for &(gen, best, _) in points {
-                    global_max_fit = global_max_fit.max(best);
-                    global_min_gen = global_min_gen.min(gen);
-                    global_max_gen = global_max_gen.max(gen);
-                }
-            }
-
-            if global_min_gen == u32::MAX {
-                return; // all vecs were empty — nothing to draw
-            }
-
-            let gen_range = (global_max_gen - global_min_gen).max(1) as f32;
-
-            // Sort island keys for deterministic rendering
-            let mut island_keys: Vec<i64> = fitness_history.keys().copied().collect();
-            island_keys.sort();
-
-            // Draw best-fitness line per island
-            for &island_id in &island_keys {
-                let points = &fitness_history[&island_id];
-                if points.len() < 2 {
-                    continue;
-                }
-                let color = island_colors[island_id.unsigned_abs() as usize % island_colors.len()];
-
-                let pts: Vec<egui::Pos2> = points
-                    .iter()
-                    .map(|&(gen, best, _)| {
-                        egui::pos2(
-                            rect.left()
-                                + ((gen - global_min_gen) as f32 / gen_range) * rect.width(),
-                            rect.bottom() - (best / global_max_fit) * rect.height(),
-                        )
-                    })
-                    .collect();
-                for pair in pts.windows(2) {
-                    painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0_f32, color));
-                }
-            }
-
-            // Legend
-            ui.horizontal(|ui| {
-                for &island_id in &island_keys {
-                    let color =
-                        island_colors[island_id.unsigned_abs() as usize % island_colors.len()];
-                    let label = if island_id < 0 {
-                        "Global".to_string()
-                    } else {
-                        format!("Island {}", island_id)
-                    };
-                    ui.colored_label(color, label);
-                }
-                ui.label(format!("Max: {:.4}", global_max_fit));
-            });
-        }
-        ui.add_space(4.0);
-    }
-
-    /// Per-generation hazard avoidance: steps onto hazard ground per agent
-    /// and the share of distance travelled on it, each scaled to its own
-    /// maximum, with the latest values (and the size-weighted turn away from
-    /// hazard ahead) in the legend. Both lines falling is the lineage learning
-    /// to keep off hazard ground.
-    fn render_hazard_chart(ui: &mut egui::Ui, history: &[crate::governor::HazardPoint]) {
-        const CHART_HEIGHT: f32 = 90.0;
-        const MIN_WIDTH: f32 = 200.0;
-        const STROKE: f32 = 2.0;
-        const PERCENT: f32 = 100.0;
-        let entries_color = egui::Color32::from_rgb(255, 80, 80);
-        let dwell_color = egui::Color32::from_rgb(255, 160, 60);
-
-        let avail = ui.available_width().max(MIN_WIDTH);
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(avail, CHART_HEIGHT), egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
-        let (Some(first), Some(last)) = (history.first(), history.last()) else {
-            return;
-        };
-        let gen_range = (last.generation.saturating_sub(first.generation)).max(1) as f32;
-        let max_entries = history
-            .iter()
-            .map(|p| p.hazard_entries_per_agent)
-            .fold(f32::EPSILON, f32::max);
-        let max_dwell = history
-            .iter()
-            .map(|p| p.danger_dwell_fraction)
-            .fold(f32::EPSILON, f32::max);
-        let point = |p: &crate::governor::HazardPoint, value: f32, max: f32| {
-            egui::pos2(
-                rect.left() + (p.generation - first.generation) as f32 / gen_range * rect.width(),
-                rect.bottom() - (value / max) * rect.height(),
-            )
-        };
-        for pair in history.windows(2) {
-            painter.line_segment(
-                [
-                    point(&pair[0], pair[0].hazard_entries_per_agent, max_entries),
-                    point(&pair[1], pair[1].hazard_entries_per_agent, max_entries),
-                ],
-                egui::Stroke::new(STROKE, entries_color),
-            );
-            painter.line_segment(
-                [
-                    point(&pair[0], pair[0].danger_dwell_fraction, max_dwell),
-                    point(&pair[1], pair[1].danger_dwell_fraction, max_dwell),
-                ],
-                egui::Stroke::new(STROKE, dwell_color),
-            );
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.colored_label(
-                entries_color,
-                format!(
-                    "Steps onto hazard / agent: {:.1}",
-                    last.hazard_entries_per_agent
-                ),
-            );
-            ui.colored_label(
-                dwell_color,
-                format!(
-                    "Path on hazard: {:.1}%",
-                    last.danger_dwell_fraction * PERCENT
-                ),
-            );
-            ui.label(format!(
-                "Turn away from hazard ahead: {:+.3}",
-                last.avoidance_turn_away
-            ));
-        });
-        ui.add_space(4.0);
-    }
-
-    fn render_node_detail(ui: &mut egui::Ui, nodes: &[crate::governor::TreeNode], node_id: i64) {
-        let node = match nodes.iter().find(|n| n.id == node_id) {
-            Some(n) => n,
-            None => {
-                ui.label("Node not found.");
-                return;
-            }
-        };
-
-        egui::Grid::new("node_detail_grid")
-            .num_columns(2)
-            .spacing([20.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Status");
-                let status_color = match node.status.as_str() {
-                    "failed" => egui::Color32::from_rgb(180, 60, 60),
-                    "exhausted" => egui::Color32::GRAY,
-                    "successful" => egui::Color32::from_rgb(100, 200, 100),
-                    "active" => egui::Color32::from_rgb(80, 220, 120),
-                    _ => egui::Color32::from_gray(180),
-                };
-                ui.colored_label(status_color, &node.status);
-                ui.end_row();
-
-                if let Some(island) = node.island_id {
-                    ui.label("Island");
-                    ui.monospace(format!("{}", island));
-                    ui.end_row();
-                }
-
-                if let Some(fit) = node.best_fitness {
-                    ui.label("Best Fitness");
-                    ui.monospace(format!("{:.6}", fit));
-                    ui.end_row();
-                }
-                if let Some(avg) = node.avg_fitness {
-                    ui.label("Avg Fitness");
-                    ui.monospace(format!("{:.6}", avg));
-                    ui.end_row();
-                }
-            });
-
-        if !node.mutations.is_empty() {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Mutations").strong());
-            egui::Grid::new("node_mutations_grid")
-                .num_columns(2)
-                .spacing([20.0, 4.0])
-                .show(ui, |ui| {
-                    for (param, dir) in &node.mutations {
-                        let arrow = if *dir > 0.0 { "+" } else { "-" };
-                        ui.label(param);
-                        ui.monospace(format!("{}{:.4}", arrow, dir.abs()));
-                        ui.end_row();
-                    }
-                });
-        }
-
-        if let Some(cfg) = &node.config {
-            ui.add_space(8.0);
-            ui.collapsing("Config", |ui| {
-                egui::Grid::new("node_config_grid")
-                    .num_columns(2)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("memory_capacity")
-                            .on_hover_text(MEMORY_CAPACITY_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.memory_capacity));
-                        ui.end_row();
-                        ui.label("processing_slots")
-                            .on_hover_text(PROCESSING_SLOTS_TOOLTIP);
-                        ui.monospace(format!("{}", cfg.processing_slots));
-                        ui.end_row();
-                        ui.label("learning_rate");
-                        ui.monospace(format!("{:.5}", cfg.learning_rate));
-                        ui.end_row();
-                        ui.label("decay_rate");
-                        ui.monospace(format!("{:.5}", cfg.decay_rate));
-                        ui.end_row();
-                        ui.label("distress_exponent");
-                        ui.monospace(format!("{:.2}", cfg.distress_exponent));
-                        ui.end_row();
-                        ui.label("habituation_sensitivity");
-                        ui.monospace(format!("{:.1}", cfg.habituation_sensitivity));
-                        ui.end_row();
-                        ui.label("max_curiosity_bonus");
-                        ui.monospace(format!("{:.2}", cfg.max_curiosity_bonus));
-                        ui.end_row();
-                        ui.label("fatigue_floor");
-                        ui.monospace(format!("{:.2}", cfg.fatigue_floor));
-                        ui.end_row();
-                        ui.label("movement_speed");
-                        ui.monospace(format!("{:.1}", cfg.movement_speed));
-                        ui.end_row();
-                        // Heritable Gabor visual-genome genes.
-                        ui.label("gabor_wavelength");
-                        ui.monospace(format!("{:.2}", cfg.gabor_wavelength));
-                        ui.end_row();
-                        ui.label("gabor_aspect_ratio");
-                        ui.monospace(format!("{:.2}", cfg.gabor_aspect_ratio));
-                        ui.end_row();
-                        ui.label("dog_surround_ratio");
-                        ui.monospace(format!("{:.2}", cfg.dog_surround_ratio));
-                        ui.end_row();
-                        ui.label("orientation_offset");
-                        ui.monospace(format!("{:.3}", cfg.orientation_offset));
-                        ui.end_row();
-                        // Heritable sensory genes.
-                        ui.label("horizontal_fov_degrees");
-                        ui.monospace(format!("{:.1}", cfg.horizontal_fov_degrees));
-                        ui.end_row();
-                        ui.label("vertical_fov_degrees");
-                        ui.monospace(format!("{:.1}", cfg.vertical_fov_degrees));
-                        ui.end_row();
-                        ui.label("smell_strength");
-                        ui.monospace(format!("{:.2}", cfg.smell_strength));
-                        ui.end_row();
-                        ui.label("vision_plasticity");
-                        ui.monospace(format!("{:.2}", cfg.vision_plasticity));
-                        ui.end_row();
-                    });
-            });
-        }
-    }
-
-    fn render_tree(
-        ui: &mut egui::Ui,
-        nodes: &[crate::governor::TreeNode],
-        current_id: Option<i64>,
-        selected_node_id: &mut Option<i64>,
-    ) {
-        if nodes.is_empty() {
-            return;
-        }
-
-        let mut children_map: std::collections::HashMap<
-            Option<i64>,
-            Vec<&crate::governor::TreeNode>,
-        > = std::collections::HashMap::new();
-        for node in nodes {
-            children_map.entry(node.parent_id).or_default().push(node);
-        }
-
-        let mut expanded_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        if let Some(current) = current_id {
-            let node_map: std::collections::HashMap<i64, &crate::governor::TreeNode> =
-                nodes.iter().map(|n| (n.id, n)).collect();
-            let mut id = Some(current);
-            while let Some(nid) = id {
-                expanded_ids.insert(nid);
-                id = node_map.get(&nid).and_then(|n| n.parent_id);
-            }
-        }
-
-        // Sort children: active/successful first, then exhausted, then failed
-        for children in children_map.values_mut() {
-            children.sort_unstable_by_key(|node| match node.status.as_str() {
-                "active" => 0,
-                "successful" => 1,
-                "exhausted" => 2,
-                "failed" => 3,
-                _ => 4,
-            });
-        }
-
-        if let Some(roots) = children_map.get(&None) {
-            for root in roots {
-                Self::render_tree_node(
-                    ui,
-                    root,
-                    &children_map,
-                    &expanded_ids,
-                    current_id,
-                    selected_node_id,
-                );
-            }
-        }
-    }
-
-    fn render_tree_node(
-        ui: &mut egui::Ui,
-        node: &crate::governor::TreeNode,
-        children_map: &std::collections::HashMap<Option<i64>, Vec<&crate::governor::TreeNode>>,
-        expanded_ids: &std::collections::HashSet<i64>,
-        current_id: Option<i64>,
-        selected_node_id: &mut Option<i64>,
-    ) {
-        let has_children = children_map
-            .get(&Some(node.id))
-            .map_or(false, |c| !c.is_empty());
-        let is_current = Some(node.id) == current_id;
-        let is_on_path = expanded_ids.contains(&node.id);
-        let is_selected = *selected_node_id == Some(node.id);
-
-        let label = Self::format_tree_label(node, is_current);
-        let mut color = match node.status.as_str() {
-            "failed" => egui::Color32::from_rgb(180, 60, 60),
-            "exhausted" => egui::Color32::GRAY,
-            "successful" => egui::Color32::from_rgb(100, 200, 100),
-            _ if is_current => egui::Color32::from_rgb(80, 220, 120),
-            _ => egui::Color32::from_gray(180),
-        };
-        if is_selected {
-            color = egui::Color32::from_rgb(120, 200, 255);
-        }
-
-        if has_children {
-            let id = ui.make_persistent_id(node.id);
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                is_on_path,
-            );
-
-            let mut label_clicked = false;
-            let header_resp = state.show_header(ui, |ui| {
-                let resp = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&label)
-                            .color(color)
-                            .monospace()
-                            .size(11.0),
-                    )
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-                );
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                label_clicked = resp.clicked();
-            });
-            if label_clicked {
-                *selected_node_id = Some(node.id);
-            }
-
-            header_resp.body(|ui| {
-                if let Some(children) = children_map.get(&Some(node.id)) {
-                    for child in children {
-                        Self::render_tree_node(
-                            ui,
-                            child,
-                            children_map,
-                            expanded_ids,
-                            current_id,
-                            selected_node_id,
-                        );
-                    }
-                }
-            });
-        } else {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                let resp = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&label)
-                            .color(color)
-                            .monospace()
-                            .size(11.0),
-                    )
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-                );
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if resp.clicked() {
-                    *selected_node_id = Some(node.id);
-                }
-            });
-        }
-    }
-
-    fn format_tree_label(node: &crate::governor::TreeNode, is_current: bool) -> String {
-        let fitness_str = node
-            .best_fitness
-            .map(|f| format!("{:.4}", f))
-            .unwrap_or_else(|| "—".into());
-
-        let current_marker = if is_current { ">> " } else { "" };
-
-        format!("{}Gen {} {}", current_marker, node.generation, fitness_str)
     }
 }
 
@@ -2773,12 +1778,6 @@ mod tests {
                 "unexpected {prefix}"
             );
         }
-
-        let mut generation = EvolutionSnapshot::default();
-        generation
-            .fitness_history
-            .insert(0, vec![(0, 0.1, 0.1), (1, 0.2, 0.15)]);
-        assert!(rendered_text(&mut generation).contains("Island 0"));
     }
 
     #[test]
